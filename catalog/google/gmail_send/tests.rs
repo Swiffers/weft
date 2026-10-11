@@ -20,7 +20,9 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("sends_the_assembled_raw_message", sends),
         NodeTest::fake("attachments_and_reply_threading_ride_the_raw_message", attachments_and_reply),
-        NodeTest::fake("from_an_accepted_alias_names_it_as_the_sender", from_alias),
+        NodeTest::fake("from_an_accepted_alias_sends_as_gmail_keeps_it", from_alias),
+        NodeTest::fake("a_named_from_keeps_its_name_and_is_checked_by_its_address", from_named_alias),
+        NodeTest::fake("a_named_own_address_needs_no_send_as_read", from_named_own),
         NodeTest::fake("from_an_address_off_the_send_as_list_fails_naming_the_allowed_ones", from_unknown),
         NodeTest::fake("no_recipient_refuses_before_any_call", no_recipient),
         NodeTest::fake("a_refused_send_fails_the_run_when_error_is_unwired", refused_unwired),
@@ -132,39 +134,86 @@ async fn sends(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// The account's Send mail as list as Gmail answers it: the primary
-/// (no verificationStatus), a verified alias, and one still pending.
+/// (no verificationStatus), a verified alias with the name and reply-to
+/// address Gmail keeps for it, and one still pending.
 fn send_as_list(rig: &FakeRig) {
     rig.respond(
         "GET",
         "/gmail/v1/users/me/settings/sendAs",
         json!({ "sendAs": [
             { "sendAsEmail": "me@example.com", "isPrimary": true },
-            { "sendAsEmail": "Team@Example.com", "verificationStatus": "accepted" },
+            { "sendAsEmail": "Team@Example.com", "verificationStatus": "accepted",
+              "displayName": "The Team", "replyToAddress": "help@example.com" },
             { "sendAsEmail": "pending@example.com", "verificationStatus": "pending" },
         ]}),
     );
 }
 
-async fn from_alias(rig: FakeRig) -> WeftResult<()> {
-    send_as_list(&rig);
+/// The raw message the run sent, as text: the last request's body.
+fn sent_mime(rig: &FakeRig) -> String {
+    let sent = rig.requests();
+    let body = sent.last().and_then(|r| r.body.clone()).expect("send body");
+    let mime = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body["raw"].as_str().expect("raw message"))
+        .expect("raw is base64url");
+    String::from_utf8_lossy(&mime).into_owned()
+}
+
+fn the_send(rig: &FakeRig) {
     rig.respond(
         "POST",
         "/gmail/v1/users/me/messages/send",
         json!({ "id": "m3", "threadId": "t3" }),
     );
+}
+
+/// A bare alias is sent the way Gmail sends from it: under the name
+/// Gmail keeps for it, with its reply-to address.
+async fn from_alias(rig: FakeRig) -> WeftResult<()> {
+    send_as_list(&rig);
+    the_send(&rig);
     let mut mail = a_mail();
     // Matched case-insensitively; the header keeps it as given.
     mail["from"] = json!("team@example.com");
     rig.run(&GmailSendNode, mail).await.ok()?;
 
-    let sent = rig.requests();
-    assert_eq!(sent.len(), 2, "read the Send mail as list, then send");
-    let body = sent[1].body.clone().expect("send body");
-    let mime = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(body["raw"].as_str().expect("raw message"))
-        .expect("raw is base64url");
-    let mime = String::from_utf8_lossy(&mime);
-    assert!(mime.contains("From: team@example.com"), "{mime}");
+    assert_eq!(rig.requests().len(), 2, "read the Send mail as list, then send");
+    let mime = sent_mime(&rig);
+    assert!(mime.contains("From: \"The Team\" <team@example.com>") || mime.contains("From: The Team <team@example.com>"), "{mime}");
+    assert!(mime.contains("Reply-To: help@example.com"), "{mime}");
+    Ok(())
+}
+
+/// A `from` with a name is checked by its address alone, and the name it
+/// gives is the one the mail carries.
+async fn from_named_alias(rig: FakeRig) -> WeftResult<()> {
+    send_as_list(&rig);
+    the_send(&rig);
+    let mut mail = a_mail();
+    mail["from"] = json!("Quentin Feuillade--Montixi <team@example.com>");
+    rig.run(&GmailSendNode, mail).await.ok()?;
+
+    let mime = sent_mime(&rig);
+    assert!(
+        mime.contains("From: \"Quentin Feuillade--Montixi\" <team@example.com>")
+            || mime.contains("From: Quentin Feuillade--Montixi <team@example.com>"),
+        "{mime}"
+    );
+    Ok(())
+}
+
+/// The account's own address, named, is sent from as it is: no Send mail
+/// as list to read, so no permission beyond Send mail.
+async fn from_named_own(rig: FakeRig) -> WeftResult<()> {
+    the_send(&rig);
+    let mut mail = a_mail();
+    mail["from"] = json!("Me Myself <ME@example.com>");
+    rig.run(&GmailSendNode, mail).await.ok()?;
+
+    assert_eq!(rig.requests().len(), 1, "only the send");
+    let mime = sent_mime(&rig);
+    assert!(mime.contains("From: \"Me Myself\" <ME@example.com>") || mime.contains("From: Me Myself <ME@example.com>"), "{mime}");
+    assert!(!mime.contains("Reply-To:"), "{mime}");
     Ok(())
 }
 

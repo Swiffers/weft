@@ -24,8 +24,8 @@ use crate::scope::ScopeCache;
 pub const BROKER_CHANNELS: &[&str] = &[
     weft_task_store::tasks::TASK_READY_CHANNEL,
     weft_task_store::terminal::TERMINAL_CHANNEL,
-    // What a worker holding for the answers of a run it drives waits on
-    // (`crate::records`).
+    // An answer handed to a run a worker drives, which its line pushes
+    // (`crate::line`).
     weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     // What a line pushes to the workers following it (`crate::line`).
@@ -110,6 +110,9 @@ pub struct BrokerSettings {
     pub public_base_url: String,
     pub internet_url: Option<String>,
     pub object_store_public_internet: bool,
+    /// How long this process's platform lets one line live before cutting
+    /// it, `None` when it never does (`crate::line::LineFanout::start`).
+    pub line_max_age: Option<std::time::Duration>,
 }
 
 impl BrokerState {
@@ -143,7 +146,7 @@ impl BrokerState {
             crate::caller_auth::verifiers_changed,
             |_| true,
         )?;
-        let lines = crate::line::LineFanout::start(&signals);
+        let lines = crate::line::LineFanout::start(signals.subscribe(), settings.line_max_age);
         let tasks: Arc<dyn TaskStoreClient> = Arc::new(PostgresTaskStoreClient::new(pool.clone(), signals.clone())?);
         // A public infra endpoint's address is handed to whoever calls in
         // (a provider's webhook target), so it is built on the address the

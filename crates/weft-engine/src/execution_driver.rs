@@ -201,6 +201,10 @@ pub(crate) struct RunDrive<'a> {
     /// How the run is asked to let go of this worker. `None` for a run
     /// nobody asks that of.
     pub(crate) hand_back: Option<&'a HandBack>,
+    /// How the run says it only waits on something outside it, so its
+    /// worker may stop ticking (`crate::run_holds`). `None` for a run no
+    /// worker's tick looks at.
+    pub(crate) hold: Option<crate::run_holds::RunHold>,
 }
 
 /// Run one execution to a terminal state or a pause. `replica` stamps
@@ -242,7 +246,7 @@ pub(crate) async fn run_one_execution_observed(
     replica: &str,
     tenant_id: &str,
 ) -> anyhow::Result<Drove> {
-    let RunDrive { execution_id, journal, program, starts_from, cancellation, exchange, hand_back } = run;
+    let RunDrive { execution_id, journal, program, starts_from, cancellation, exchange, hand_back, hold } = run;
     // The run's spend still being worked out, which goes on its record
     // before its ending (`crate::metering`).
     let record = RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() };
@@ -284,6 +288,7 @@ pub(crate) async fn run_one_execution_observed(
         waits,
         bus_coordinator.clone(),
         hand_back,
+        hold.as_ref(),
     )))
     .await
     {
@@ -583,6 +588,7 @@ async fn drive_execution_id(
     waits: Arc<crate::wait_tracker::WaitTracker>,
     bus_coordinator: Arc<crate::context::BusCoordinator>,
     hand_back: Option<&HandBack>,
+    hold: Option<&crate::run_holds::RunHold>,
 ) -> anyhow::Result<Drove> {
     let project_arc = program.project.clone();
     let project = &*project_arc;
@@ -683,6 +689,7 @@ async fn drive_execution_id(
         settings,
         &mut fold,
         hand_back,
+        hold,
     )
     .await?;
 
@@ -1295,6 +1302,8 @@ async fn drive(
     fold: &mut RunFold,
     // See `run_one_execution`.
     hand_back: Option<&HandBack>,
+    // See `RunDrive::hold`.
+    hold: Option<&crate::run_holds::RunHold>,
 ) -> anyhow::Result<ExecutionOutcome> {
     let project: &ProjectDefinition = &program.project;
     let program_idx = &program.index;
@@ -1356,16 +1365,20 @@ async fn drive(
     // The answers the run waits for while this worker keeps it: a wait
     // held in a node's call (`crate::held_waits`), and a suspended step
     // while a bus keeps the worker (drive() never returns while a bus is
-    // open, so without this its answer would never reach it). The ask is
-    // one held read (it ends when an answer comes, or the hold runs out),
-    // kept across turns of the loop: a chatty bus turns the loop many
-    // times a second, and an ask started afresh on every turn would ask
-    // the broker as often. `taken` is every wait whose answer this drive
-    // took, which the broker leaves out.
+    // open, so without this its answer would never reach it). The ask
+    // ([`answers_once_told`]) reads once as the run starts waiting and
+    // again only when the line says an answer was handed to it, kept
+    // across turns of the loop: a chatty bus turns the loop many times a
+    // second, and an ask started afresh on every turn would read as often.
+    // `taken` is every wait whose answer this drive took, which the broker
+    // leaves out.
     let mut taken: Vec<String> = Vec::new();
     // When the run went quiet: every running step waiting, and one of
     // those waits ended only from outside (see the stuck-check below).
     let mut quiet_since: Option<std::time::Instant> = None;
+    // When the run's hold gives up (unix seconds), while it is quiet
+    // (`crate::run_holds`): set once as it goes quiet.
+    let mut quiet_until: Option<i64> = None;
     let mut resume_wait: Option<futures::future::BoxFuture<'_, anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>>> = None;
     loop {
         // Poison checkpoint: a journal write failed somewhere since
@@ -2674,20 +2687,23 @@ async fn drive(
         // otherwise, so the common path never asks.
         if waits.held().pending() || waiting_count(executions) > 0 {
             if resume_wait.is_none() {
-                let (runs, taken) = (clients.runs.clone(), taken.clone());
-                resume_wait = Some(Box::pin(async move {
-                    runs.answers(execution_id, &taken, weft_task_store::pg_signal::MAX_HOLD).await
-                }));
+                resume_wait = Some(Box::pin(answers_once_told(clients.runs.clone(), execution_id, taken.clone())));
             }
         } else {
             resume_wait = None;
         }
         // The hold runs out `holdSecs` after the run went quiet.
-        let hold = std::time::Duration::from_secs(settings.hold_secs().into());
+        let hold_for = std::time::Duration::from_secs(settings.hold_secs().into());
         let quiet_for = quiet_since.map(|since| clients.clock.now().saturating_duration_since(since));
+        // While quiet, its worker may stop ticking, vouching for itself
+        // until the run's hold gives up.
+        quiet_until = quiet_for.map(|quiet_for| quiet_until.unwrap_or_else(|| hold_ends_unix(crate::now_unix(), hold_for.saturating_sub(quiet_for))));
+        if let Some(hold) = hold {
+            hold.quiet(quiet_until.map(|until| crate::run_holds::Quiet { until, can_pause: unsuspendable(caller, bus_coordinator, settings).is_none() }));
+        }
         let held_out = async {
             match quiet_for {
-                Some(quiet_for) => clients.clock.sleep(hold.saturating_sub(quiet_for)).await,
+                Some(quiet_for) => clients.clock.sleep(hold_for.saturating_sub(quiet_for)).await,
                 None => std::future::pending().await,
             }
         };
@@ -2735,9 +2751,8 @@ async fn drive(
                 // resumes it in place (`resume_answered`). Any other answer
                 // is a held wait's: it goes to the node's call holding it,
                 // which records it, or is kept for the step that holds or
-                // suspends on it next (`HeldWaits::answer`). An empty
-                // answer is the broker's hold running out: nothing moved,
-                // and the next turn asks again.
+                // suspends on it next (`HeldWaits::answer`). The ask answers
+                // only once it found some, so something moved.
                 resume_wait = None;
                 let answers = answers?;
                 moved = !answers.is_empty();
@@ -2851,7 +2866,56 @@ async fn drive(
         if moved {
             quiet_since = None;
         }
+        // Moved, or its hold gave up: quiet no longer, before it goes on.
+        if quiet_since.is_none() && quiet_until.take().is_some() {
+            if let Some(hold) = hold {
+                hold.quiet(None);
+            }
+        }
     }
+}
+
+/// The answers waiting for run `execution_id`'s waits but the ones
+/// `taken`, once there are some: read now (the run starts waiting, or just
+/// took an answer), and again each time the line says one was handed to
+/// this run, or may have missed some. Nothing else reads: a run that waits a
+/// day leaves the database asleep all that time.
+async fn answers_once_told(
+    runs: Arc<dyn crate::context::RunClient>,
+    execution_id: ExecutionId,
+    taken: Vec<String>,
+) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+    // Subscribed before the first read, so an answer handed between an
+    // empty read and the wait still wakes it.
+    let mut told = runs.told();
+    loop {
+        let answers = runs.answers(execution_id, &taken).await?;
+        if !answers.is_empty() {
+            return Ok(answers);
+        }
+        loop {
+            match told.next().await? {
+                weft_task_store::pg_signal::Heard::Signal { channel, payload }
+                    if channel == weft_task_store::parked_fires::PARKED_FIRE_CHANNEL
+                        && weft_task_store::runs::parse_run_payload(&payload).is_some_and(|(_, run)| run == execution_id) =>
+                {
+                    break
+                }
+                weft_task_store::pg_signal::Heard::Recheck => break,
+                // Another run's news, the line lost (a recheck follows once
+                // it is back), the broker hearing again after a quiet spell:
+                // nothing missed here.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// When the hold of a run that went quiet gives up (unix seconds), `now`
+/// being the moment and `left` what is left of it, rounded up.
+fn hold_ends_unix(now: u64, left: std::time::Duration) -> i64 {
+    let secs = now.saturating_add(left.as_secs()).saturating_add(u64::from(left.subsec_nanos() > 0));
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 /// Every running step waits on another and nothing outside will end it:

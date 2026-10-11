@@ -18,7 +18,7 @@ weft-compiler = { path = "../weft-compiler", features = ["build"] }
 # The catalog a version compiles against (`build::source`).
 weft-catalog = { workspace = true }
 weft-journal = { workspace = true }
-weft-task-store = { workspace = true }
+weft-task-store = { workspace = true, features = ["serve"] }
 weft-access-store = { workspace = true }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }

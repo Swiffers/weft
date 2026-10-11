@@ -689,6 +689,11 @@ async fn seed_worker(pool: &PgPool, replica: &str, project_id: Uuid, binary_hash
     .unwrap();
 }
 
+/// The install's news the writes left for `run`, by kind, oldest first.
+async fn news_of(pool: &PgPool, run: weft_core::ExecutionId) -> Vec<(Uuid, String)> {
+    sqlx::query_as("SELECT project_id, kind FROM weft_news WHERE execution_id = $1 ORDER BY seq").bind(run).fetch_all(pool).await.unwrap()
+}
+
 /// Claim queued run `execution_id` of `project_id` for `owner`, the way
 /// a worker takes it.
 async fn claim(pool: &PgPool, execution_id: weft_core::ExecutionId, project_id: Uuid, owner: &str) {
@@ -770,6 +775,86 @@ async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast(pool: PgPoo
     assert_eq!(journal.let_go_of_lost(fast, now, None).await.unwrap(), Lost::NotLost, "an ended run is not lost");
 }
 
+/// A worker whose runs only wait vouched for itself until their waits
+/// give up: its lease holds that long through the broker's tick, held to
+/// the longest a wait can hold; its runs are still worked on and not lost,
+/// it still counts among its program's copies, and the loops that watch
+/// lapsed leases look once the vouch could lapse, not before. Once the
+/// vouch passed with the worker gone, its run is lost.
+#[sqlx::test]
+async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: PgPool) {
+    use std::time::Duration;
+    use weft_dispatcher::journal::Lost;
+    use weft_task_store::runs::in_flight;
+    use weft_task_store::worker_door::lease_until;
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let now = weft_dispatcher::lease::now_unix();
+    let run = queued_run(&journal, id).await;
+    claim(&pool, run, id, "worker-a").await;
+    let tick = |replica: &'static str, vouch: Option<i64>| {
+        let pool = pool.clone();
+        async move {
+            let answer: serde_json::Value = sqlx::query_scalar("SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
+                .bind(replica)
+                .bind(id)
+                .bind(TENANT)
+                .bind("bin-A")
+                .bind(lease_until(now, 15, vouch))
+                .bind(json!({ "t1": 1 }))
+                .bind(0i64)
+                .bind(Vec::<String>::new())
+                .bind(Vec::<i64>::new())
+                .bind(Vec::<String>::new())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            answer["copies"].as_i64().unwrap()
+        }
+    };
+    assert_eq!(tick("worker-a", Some(now + 600)).await, 1);
+    assert_eq!(tick("worker-b", None).await, 2, "the vouching copy still counts");
+    assert!(in_flight(&pool, run).await.unwrap(), "vouched: still worked on");
+    assert_eq!(journal.let_go_of_lost(run, now + 500, None).await.unwrap(), Lost::NotLost, "its own until its vouch passes");
+    sqlx::query("DELETE FROM worker_lease WHERE replica = 'worker-b'").execute(&pool).await.unwrap();
+    let next = weft_dispatcher::reaper::in_motion(&pool).await.unwrap().expect("its vouch could lapse");
+    assert!(next > Duration::from_secs(600) && next <= Duration::from_secs(620), "looked at once the vouch could lapse: {next:?}");
+    assert_eq!(journal.let_go_of_lost(run, now + 700, None).await.unwrap(), Lost::Ended, "its vouch passed and its worker gone: lost");
+}
+
+/// A cancel asked of a run a worker drives, and an answer handed to one,
+/// wake this process's news teller once they commit, which tells them.
+#[sqlx::test]
+async fn a_cancel_and_a_handed_answer_are_told_as_news(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let bus = std::sync::Arc::new(weft_platform_traits::FakeNews::default());
+    weft_task_store::announce::tell_news_through(&pool, bus.clone());
+    let told = |kind: weft_platform_traits::NewsKind, run: weft_core::ExecutionId| {
+        let bus = bus.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !bus.announced.lock().iter().flatten().any(|news| news.kind == kind && news.execution == run) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{kind:?} of {run} told"));
+        }
+    };
+    let answered = queued_run(&journal, id).await;
+    claim(&pool, answered, id, "worker-a").await;
+    seed_wait(&journal, "tok-told", id, answered).await;
+    assert!(matches!(journal.answer("tok-told", &weft_core::primitive::WaitAnswer::Given { value: json!(1) }).await.unwrap(), weft_dispatcher::journal::Answered::Reached { .. }));
+    told(weft_platform_traits::NewsKind::Answer, answered).await;
+    let cancelled = queued_run(&journal, id).await;
+    claim(&pool, cancelled, id, "worker-a").await;
+    assert!(journal.cancel_execution(cancelled, None, &weft_core::exec::CancelCause::User).await.unwrap().requested);
+    told(weft_platform_traits::NewsKind::Cancel, cancelled).await;
+}
+
 /// A cancel ends a run nobody drives on the spot, after its last row; a
 /// run a worker drives is asked to stop, and its worker writes the ending.
 #[sqlx::test]
@@ -791,6 +876,8 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool)
     claim(&pool, driven, id, "worker-a").await;
     let written = journal.cancel_execution(driven, None, &cause).await.unwrap();
     assert!(written.requested, "its worker is asked");
+    assert_eq!(news_of(&pool, driven).await, vec![(id, "cancel".to_string())], "and the install's news says so, with the write");
+    assert!(news_of(&pool, waiting).await.is_empty(), "a run nobody drives makes no news");
     assert_eq!(written.node_cancellations, None);
     assert_eq!(run_column::<String>(&pool, "state", driven).await.as_deref(), Some("running"), "its worker ends it");
     let asked: Option<serde_json::Value> = run_column(&pool, "cancel_requested", driven).await;
@@ -1071,7 +1158,18 @@ async fn an_answer_reaches_its_run_once(pool: PgPool) {
     let driven = queued_run(&journal, project).await;
     claim(&pool, driven, project, "worker-a").await;
     seed_wait(&journal, "tok-driven", project, driven).await;
+    static CHANNELS: &[&str] = &[weft_task_store::parked_fires::PARKED_FIRE_CHANNEL];
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
+    let mut heard = watch.subscribe();
     assert!(matches!(journal.answer("tok-driven", &weft_core::primitive::WaitAnswer::Given { value: json!(2) }).await.unwrap(), Answered::Reached { .. }));
+    assert_eq!(news_of(&pool, driven).await, vec![(project, "answer".to_string())], "the install's news says it was handed, with the write");
+    assert!(news_of(&pool, parked_run).await.is_empty(), "an answer written into a record makes no news");
+    let named = weft_task_store::runs::run_payload(project, driven);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert!(
+        heard.woken_before(deadline, |c, p| c == weft_task_store::parked_fires::PARKED_FIRE_CHANNEL && p == named).await.unwrap(),
+        "the database announces the answer handed, naming its run"
+    );
     assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
     assert_eq!(
         weft_task_store::parked_fires::answers_for(&pool, driven).await.unwrap(),

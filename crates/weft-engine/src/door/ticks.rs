@@ -15,6 +15,17 @@
 //! reported nothing in flight and every count, so the broker's picture is
 //! the latest one.
 //!
+//! A worker whose every run only waits on something outside it
+//! (`crate::run_holds`) sleeps too, once a tick landed with every count and
+//! vouched for the worker until the earliest of those waits gives up, and a
+//! lease's length past it: the broker keeps its lease that long, so those
+//! runs, the door's own included, stay the worker's and the copy stays
+//! counted with what it last reported, and a database that sleeps once
+//! nothing queries it can sleep through a wait of hours. When that wait
+//! ends its run moves and the tick goes again, vouching for the next one
+//! (shorter or longer: it vouches again whenever what it would vouch for
+//! changed).
+//!
 //! The lease is what the tick keeps: a run on record as this worker's is
 //! read as lost once the lease lapsed and a margin as long again went by
 //! (`weft_dispatcher::worker_door`). Every way a run comes onto this worker
@@ -27,9 +38,66 @@ use std::time::Duration;
 /// How often the loop ticks while something is under way (scaled).
 pub(super) const TICK_EVERY: Duration = Duration::from_secs(1);
 
-/// What the worker says it still holds, besides the door's own runs: true
-/// while the tick has to go on.
-pub type WorkUnderWay = Box<dyn Fn() -> bool + Send + Sync>;
+/// What the worker says it has under way, besides the door's own count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderWay {
+    /// Nothing: the door sleeps once its own runs are done too.
+    Nothing,
+    /// Runs, every one of them (the door's own included) only waiting on
+    /// something outside it, and every record written: the door sleeps
+    /// once a tick landed with every count and vouched for the worker until
+    /// `vouch_until` (unix seconds).
+    OnlyQuiet { vouch_until: i64 },
+    /// Work: the tick goes on.
+    Working,
+}
+
+impl UnderWay {
+    /// What a worker has under way, from whether its records are all
+    /// written, how many runs it drives, how many of those only wait and
+    /// the earliest moment one of those waits gives up, and how long its
+    /// lease holds without a tick (`lease_secs`).
+    pub fn of(records_written: bool, driving: usize, (quiet, earliest): (usize, Option<i64>), lease_secs: i64) -> Self {
+        match (records_written, driving, earliest) {
+            (false, _, _) => UnderWay::Working,
+            (true, 0, _) => UnderWay::Nothing,
+            (true, driving, Some(earliest)) if driving <= quiet => UnderWay::OnlyQuiet { vouch_until: earliest.saturating_add(lease_secs) },
+            (true, _, _) => UnderWay::Working,
+        }
+    }
+
+    /// What the tick vouches for: until when the worker's lease must hold
+    /// without another tick.
+    pub fn vouch_until(self) -> Option<i64> {
+        match self {
+            UnderWay::OnlyQuiet { vouch_until } => Some(vouch_until),
+            UnderWay::Nothing | UnderWay::Working => None,
+        }
+    }
+}
+
+/// What the worker says it has under way, asked before each sleep.
+pub type WorkUnderWay = Box<dyn Fn() -> UnderWay + Send + Sync>;
+
+/// What the last tick that landed said: whether nothing was in flight,
+/// and until when it vouched for the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Landed {
+    pub(super) nothing_in_flight: bool,
+    pub(super) vouched_until: Option<i64>,
+}
+
+/// Whether the tick loop may sleep: the worker has `under_way`, the last
+/// tick `landed` (`None` when it failed), the door's own runs are all done
+/// (`door_idle`) and every count it took was reported (`counts_reported`).
+pub(super) fn may_sleep(under_way: UnderWay, landed: Option<Landed>, door_idle: bool, counts_reported: bool) -> bool {
+    let Some(landed) = landed else { return false };
+    match under_way {
+        UnderWay::Nothing => landed.nothing_in_flight && door_idle && counts_reported,
+        UnderWay::OnlyQuiet { vouch_until } => counts_reported && landed.vouched_until == Some(vouch_until),
+        UnderWay::Working => false,
+    }
+}
 
 /// The tick's sleep and wake (see the module doc).
 pub struct Ticking {
@@ -86,9 +154,14 @@ mod tests {
     /// A door serving `x`, ticking, with nothing under way but what
     /// `busy` says.
     async fn ticking(busy: impl Fn() -> bool + Send + Sync + 'static) -> (Arc<Door>, Arc<FakeDoorBroker>) {
+        ticking_with(move || if busy() { UnderWay::Working } else { UnderWay::Nothing }).await
+    }
+
+    /// A door serving `x`, ticking, the worker saying it has `under_way`.
+    async fn ticking_with(under_way: impl Fn() -> UnderWay + Send + Sync + 'static) -> (Arc<Door>, Arc<FakeDoorBroker>) {
         let broker = FakeDoorBroker::new(vec![route("t1", "route", "x")]);
         let door = door(broker.clone());
-        door.start_ticks(Box::new(busy)).await.unwrap();
+        door.start_ticks(Box::new(under_way)).await.unwrap();
         (door, broker)
     }
 
@@ -234,7 +307,7 @@ mod tests {
         armed(&mut trigger).spec.limits = weft_core::signal::EntryLimits { per_minute: Some(1), ..Default::default() };
         let broker = FakeDoorBroker::new(vec![trigger]);
         let door = door(broker.clone());
-        door.start_ticks(Box::new(|| false)).await.unwrap();
+        door.start_ticks(Box::new(|| UnderWay::Nothing)).await.unwrap();
         sleep(secs(20.0)).await;
         assert_eq!(ticks(&broker).len(), 1, "asleep since the first tick");
 
@@ -268,6 +341,75 @@ mod tests {
         let asked = Instant::now();
         let Arrived::Run(_admitted, _) = arrive(&door, &HeaderMap::new()).await else { panic!("admitted") };
         assert_eq!(asked.elapsed(), Duration::ZERO, "no wait while ticking");
+    }
+
+    /// A run of the door that only waits outside lets the door sleep after
+    /// a tick that vouches for the worker until the earliest wait gives up,
+    /// even though the run is still going (and still counted); a later
+    /// wait, or a shorter one, vouches again before the door sleeps on; once
+    /// the run moves, the door ticks at once and vouches no more.
+    #[tokio::test(start_paused = true)]
+    async fn a_door_whose_only_run_waits_vouches_until_its_wait_ends_and_sleeps() {
+        let quiet = Arc::new(std::sync::Mutex::new(None::<i64>));
+        let (door, broker) = ticking_with({
+            let quiet = quiet.clone();
+            move || match *quiet.lock().unwrap() {
+                Some(vouch_until) => UnderWay::OnlyQuiet { vouch_until },
+                None => UnderWay::Working,
+            }
+        })
+        .await;
+        let Arrived::Run(_admitted, _) = arrive(&door, &HeaderMap::new()).await else { panic!("admitted") };
+        sleep(secs(3.5)).await;
+        *quiet.lock().unwrap() = Some(5_000);
+        sleep(secs(30.0)).await;
+        let asleep = ticks(&broker);
+        let last = asleep.last().unwrap();
+        assert_eq!(last.vouch_until, Some(5_000), "the last tick vouched until the wait ends");
+        assert_eq!(last.in_flight.get("t1"), Some(&1), "the waiting run is still going, and counted");
+        assert_eq!(asleep.iter().filter(|tick| tick.vouch_until.is_some()).count(), 1, "one vouching tick, then sleep");
+
+        *quiet.lock().unwrap() = Some(9_000);
+        door.wake();
+        sleep(secs(30.0)).await;
+        let again = ticks(&broker);
+        assert_eq!(again.len(), asleep.len() + 1, "a later wait vouches once more, then sleep");
+        assert_eq!(again.last().unwrap().vouch_until, Some(9_000));
+
+        *quiet.lock().unwrap() = Some(7_000);
+        door.wake();
+        sleep(secs(30.0)).await;
+        let shorter = ticks(&broker);
+        assert_eq!(shorter.len(), again.len() + 1, "a shorter wait vouches again too");
+        assert_eq!(shorter.last().unwrap().vouch_until, Some(7_000));
+        let again = shorter;
+
+        *quiet.lock().unwrap() = None;
+        door.wake();
+        sleep(secs(0.5)).await;
+        let moved = ticks(&broker);
+        assert_eq!(moved.len(), again.len() + 1, "the run moved: the door ticks at once");
+        assert_eq!(moved.last().unwrap().vouch_until, None);
+    }
+
+    #[test]
+    fn what_a_worker_has_under_way_decides_whether_its_door_sleeps() {
+        assert_eq!(UnderWay::of(false, 0, (0, None), 15), UnderWay::Working, "a record still to write");
+        assert_eq!(UnderWay::of(true, 0, (0, None), 15), UnderWay::Nothing);
+        assert_eq!(UnderWay::of(true, 2, (2, Some(100)), 15), UnderWay::OnlyQuiet { vouch_until: 115 }, "the earliest wait, and a lease past it");
+        assert_eq!(UnderWay::of(true, 2, (1, Some(100)), 15), UnderWay::Working, "one run still moves");
+        assert_eq!(UnderWay::of(true, 1, (2, Some(100)), 15), UnderWay::OnlyQuiet { vouch_until: 115 }, "a quiet run a moment after it left");
+        let landed = |vouched_until| Some(Landed { nothing_in_flight: false, vouched_until });
+        let idle = Some(Landed { nothing_in_flight: true, vouched_until: None });
+        assert!(may_sleep(UnderWay::Nothing, idle, true, true));
+        assert!(!may_sleep(UnderWay::Nothing, idle, false, true), "a run of the door still going");
+        assert!(may_sleep(UnderWay::OnlyQuiet { vouch_until: 115 }, landed(Some(115)), false, true), "the door's own runs are the quiet ones");
+        assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 115 }, landed(None), false, true), "no tick vouched yet");
+        assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 200 }, landed(Some(115)), false, true), "a later wait is not vouched for yet");
+        assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 100 }, landed(Some(115)), false, true), "nor a shorter one: a dead worker must not keep its lease past it");
+        assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 115 }, None, false, true), "the last tick failed");
+        assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 115 }, landed(Some(115)), false, false), "a count not reported yet");
+        assert!(!may_sleep(UnderWay::Working, idle, true, true));
     }
 
     /// A wake that comes before the loop starts waiting is kept for it: the

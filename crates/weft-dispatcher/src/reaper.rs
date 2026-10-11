@@ -42,28 +42,51 @@ fn woken_reaper_safety() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(60))
 }
 
-/// Whether anything in the install is in motion: a task of the
-/// dispatcher's claimed, a run queued for a worker or being driven by one,
-/// an activation or a build under way, a lifecycle command not finished.
-/// While nothing is, no lease can lapse and no driver can die mid-way, so
-/// the loops that watch for that have nothing to watch. A run parked on a
-/// person keeps nothing here, so it does not keep the install awake.
-pub async fn in_motion(pool: &sqlx::PgPool) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
+/// When anything in the install is next in motion: now (`Some(ZERO)`), in
+/// a while, or never until a write says so (`None`). Moving now is a task
+/// of the dispatcher's claimed, a run queued for a worker, an activation or
+/// a build under way, a lifecycle command not finished. A run a worker
+/// drives moves once its worker's lease could have lapsed for longer than
+/// the lost-run sweep's margin (`crate::worker_door`): a lease nobody
+/// renews any more is the only thing to watch for there, and a worker
+/// whose runs only wait vouched for itself until their waits give up, so
+/// the install looks once then rather than every safety interval. While
+/// nothing is in motion, no lease can lapse and no driver can die mid-way,
+/// so the loops that watch for that have nothing to watch. A run parked on
+/// a person keeps nothing here, so it does not keep the install awake.
+pub async fn in_motion(pool: &sqlx::PgPool) -> anyhow::Result<Option<Duration>> {
+    let (now, lapse_in): (bool, Option<i64>) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed') \
-             OR EXISTS (SELECT 1 FROM run WHERE state = 'running') \
              OR EXISTS (SELECT 1 FROM run WHERE state = 'queued') \
              OR EXISTS (SELECT 1 FROM trigger_activation WHERE status IN ('activating', 'deactivating')) \
              OR EXISTS (SELECT 1 FROM project WHERE transition <> 'none') \
-             OR EXISTS (SELECT 1 FROM infra_lifecycle_command WHERE completed_at_unix IS NULL)",
+             OR EXISTS (SELECT 1 FROM infra_lifecycle_command WHERE completed_at_unix IS NULL), \
+         (SELECT MIN(COALESCE(l.leased_until_unix, 0)) - EXTRACT(EPOCH FROM NOW())::BIGINT \
+              FROM run r LEFT JOIN worker_lease l ON l.replica = r.owner WHERE r.state = 'running')",
     )
     .fetch_one(pool)
-    .await?)
+    .await?;
+    Ok(next_motion(now, lapse_in, crate::worker_door::lost_margin_secs()))
 }
 
-/// `inner`, looked at again at its safety interval after it ran dry for as
-/// long as anything is in motion ([`in_motion`]), and left to sleep until
-/// a write wakes it once nothing is.
+/// [`in_motion`]'s answer from what it read: something moves `now`, or
+/// the earliest lease of a running run's worker lapses `lapse_in` seconds
+/// from now (a run with no lease lapsed long ago), which the sweep judges
+/// once its `margin` passed too.
+fn next_motion(now: bool, lapse_in: Option<i64>, margin: i64) -> Option<Duration> {
+    match (now, lapse_in) {
+        (true, _) => Some(Duration::ZERO),
+        (false, Some(lapse_in)) => {
+            let judged_in = lapse_in.saturating_add(margin);
+            Some(if judged_in < 0 { Duration::ZERO } else { Duration::from_secs(judged_in.unsigned_abs() + 1) })
+        }
+        (false, None) => None,
+    }
+}
+
+/// `inner`, looked at again once it ran dry when anything is next in
+/// motion ([`in_motion`]), at its safety interval at the soonest, and left
+/// to sleep until a write wakes it once nothing is.
 pub fn while_in_motion(state: &DispatcherState, inner: DrainLoop) -> DrainLoop {
     let state = state.clone();
     let (drain, safety) = (inner.drain.clone(), inner.safety);
@@ -71,7 +94,10 @@ pub fn while_in_motion(state: &DispatcherState, inner: DrainLoop) -> DrainLoop {
         let (state, drain) = (state.clone(), drain.clone());
         async move {
             match drain().await? {
-                DrainStep::Done if in_motion(&state.pg_pool).await? => Ok(DrainStep::RetryIn(safety)),
+                DrainStep::Done => Ok(match in_motion(&state.pg_pool).await? {
+                    Some(after) => DrainStep::RetryIn(after.max(safety)),
+                    None => DrainStep::Done,
+                }),
                 step => Ok(step),
             }
         }
@@ -417,4 +443,21 @@ async fn sweep_tasks(state: DispatcherState) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Something moving now wins; a running run's worker is looked at once
+    /// its lease could have lapsed past the margin (now when it already
+    /// did); with nothing, the loops sleep.
+    #[test]
+    fn a_running_run_is_looked_at_when_its_workers_lease_could_lapse() {
+        assert_eq!(next_motion(true, Some(300), 15), Some(Duration::ZERO));
+        assert_eq!(next_motion(false, Some(300), 15), Some(Duration::from_secs(316)), "a vouched lease: one look, past it");
+        assert_eq!(next_motion(false, Some(-10), 15), Some(Duration::from_secs(6)), "lapsed, the margin not passed yet");
+        assert_eq!(next_motion(false, Some(-100), 15), Some(Duration::ZERO), "lapsed past the margin: now");
+        assert_eq!(next_motion(false, None, 15), None);
+    }
 }

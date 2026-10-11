@@ -48,7 +48,7 @@ use weft_core::signal::{LiveConnectionConfig, Protocol};
 pub use broker::{DoorBroker, HeldDoorBroker, HeldEntry, HeldTrigger, RunFacts, Triggers};
 pub use limits::{Going, Limits};
 pub use permits::{Busy, RunPermit, RunPermits};
-pub use ticks::WorkUnderWay;
+pub use ticks::{UnderWay, WorkUnderWay};
 
 /// What the install allows at its public edge, as the worker holds it.
 #[derive(Debug, Clone, Copy, Default)]
@@ -569,24 +569,26 @@ impl Door {
 
     /// While the worker has work under way, every second: state this
     /// worker's counts, hear the other copies and keep the worker's lease
-    /// (`/v1/door/tick`); with nothing under way, nothing (`ticks`). A tick
-    /// that fails is made again the next second; the limits hold to what
-    /// was last heard. `busy` is what the worker holds besides the door's
-    /// own runs.
+    /// (`/v1/door/tick`); with nothing under way, or only runs that wait
+    /// outside, nothing once a tick vouched for the worker (`ticks`). A
+    /// tick that fails is made again the next second; the limits hold to
+    /// what was last heard. `under_way` is what the worker says it has
+    /// under way.
     ///
     /// The first tick is made before this returns, so the worker is known
     /// alive before it takes its first call: a worker that cannot make it
     /// does not start, and says why.
-    pub async fn start_ticks(self: &Arc<Self>, busy: WorkUnderWay) -> anyhow::Result<()> {
-        let quiet = self.tick().await.map_err(|e| e.context("the worker's first word to the broker (its lease, and its door's counts)"))?;
+    pub async fn start_ticks(self: &Arc<Self>, under_way: WorkUnderWay) -> anyhow::Result<()> {
+        let vouch = under_way().vouch_until();
+        let nothing_in_flight = self.tick(vouch).await.map_err(|e| e.context("the worker's first word to the broker (its lease, and its door's counts)"))?;
         let door = Arc::downgrade(self);
         let ticking = self.ticking.clone();
         tokio::spawn(async move {
             let every_second = weft_core::time_scale::scaled(ticks::TICK_EVERY);
             let mut every = tokio::time::interval_at(tokio::time::Instant::now() + every_second, every_second);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The last tick landed and reported nothing in flight.
-            let mut quiet = quiet;
+            // What the last tick said, when it landed.
+            let mut landed = Some(ticks::Landed { nothing_in_flight, vouched_until: vouch });
             // The loop slept since its last tick: the next one goes at once.
             let mut slept = false;
             loop {
@@ -594,7 +596,10 @@ impl Door {
                     // The last tick said all there is: sleep until work
                     // comes, then look again (a wake left while the loop
                     // was ticking finds nothing new and sleeps on).
-                    Some(strong) if quiet && strong.limits.settled() && !busy() => {
+                    Some(strong) if {
+                        let (door_idle, counts_reported) = strong.limits.idle_and_reported();
+                        ticks::may_sleep(under_way(), landed, door_idle, counts_reported)
+                    } => {
                         // Asleep, this copy hears nothing of the others,
                         // whose leases may lapse meanwhile.
                         strong.limits.asleep();
@@ -614,11 +619,12 @@ impl Door {
                     every.tick().await;
                 }
                 let Some(door) = door.upgrade() else { return };
-                quiet = match door.tick().await {
-                    Ok(quiet) => quiet,
+                let vouch = under_way().vouch_until();
+                landed = match door.tick(vouch).await {
+                    Ok(nothing_in_flight) => Some(ticks::Landed { nothing_in_flight, vouched_until: vouch }),
                     Err(e) => {
                         tracing::warn!(target: "weft_engine::door", error = %format!("{e:#}"), "a tick of the door's counts failed; the next second tries again");
-                        false
+                        None
                     }
                 };
             }
@@ -626,9 +632,10 @@ impl Door {
         Ok(())
     }
 
-    /// One tick: whether it reported nothing in flight. Its counts are
-    /// marked heard once it lands.
-    async fn tick(&self) -> anyhow::Result<bool> {
+    /// One tick, vouching for the worker until `vouch_until` when it is
+    /// about to sleep with only waiting runs: whether it reported nothing
+    /// in flight. Its counts are marked heard once it lands.
+    async fn tick(&self, vouch_until: Option<i64>) -> anyhow::Result<bool> {
         let now = crate::now_unix() as i64;
         let (window_start, mine, mark) = self.limits.mine(now);
         let in_flight = self.limits.going();
@@ -641,6 +648,7 @@ impl Door {
                 window_start,
                 counts: mine.into_iter().map(|(key, hits)| DoorCount { key, hits }).collect(),
                 tokens,
+                vouch_until,
             };
             self.broker.tick(&request).await
         }
@@ -650,10 +658,10 @@ impl Door {
         Ok(quiet)
     }
 
-    /// A run came onto this worker other than through the door (a claim of
-    /// a queued run), once it is counted where the tick looks: the tick
-    /// goes out now and renews the lease behind the run, which does not
-    /// wait for it (`ticks`).
+    /// Something the tick looks at changed (a run came onto this worker, or
+    /// one of its runs went quiet or moved again), once it is counted where
+    /// the tick looks: the tick goes out now and renews the lease behind
+    /// it, which does not wait for it (`ticks`).
     pub(crate) fn wake(&self) {
         self.ticking.wake();
     }

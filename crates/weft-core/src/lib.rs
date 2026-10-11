@@ -23,6 +23,8 @@ pub mod comma_list;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
 #[cfg(feature = "runtime")]
+pub mod deadline;
+#[cfg(feature = "runtime")]
 pub mod context;
 pub mod deactivation;
 pub mod deref;

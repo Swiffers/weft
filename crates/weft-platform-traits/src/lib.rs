@@ -19,6 +19,8 @@
 //!   - `frontends`: hosting a project's frontend on the install's cloud.
 //!   - `domains`: the door in front of the install's own domains.
 //!   - `holder_pool`: how many holders keep held connections open.
+//!   - `news`: telling the install's other copies what happened to a run,
+//!     without the database.
 //!   - `clock`: time, abstracted so tests advance it deterministically.
 //!   - `unit_agent`: what weft asks the agent beside an infra unit.
 //!
@@ -34,6 +36,7 @@ pub mod holder_pool;
 pub mod identity;
 pub mod images;
 pub mod infra_host;
+pub mod news;
 pub mod object_store;
 pub mod roles;
 pub mod runner;
@@ -48,6 +51,7 @@ pub use frontends::{FrontendHosting, FrontendSite, HostedFrontend};
 pub use holder_pool::HolderPool;
 pub use images::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted, Staging};
 pub use infra_host::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
+pub use news::{Listening, News, NewsHeard, NewsKind, RunNews};
 pub use object_store::{
     object_store_for, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,
     S3ObjectStore, SharedObjectStore,
@@ -66,6 +70,8 @@ pub use frontends::fake::{FakeFrontendHosting, FrontendCall};
 pub use holder_pool::fake::FakeHolderPool;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use images::FakeImageBuilder;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use news::fake::FakeNews;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use object_store::fake::{FakeCall as ObjectStoreFakeCall, FakeObjectStore};
 #[cfg(any(test, feature = "test-helpers"))]

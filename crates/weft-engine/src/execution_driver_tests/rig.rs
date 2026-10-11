@@ -213,23 +213,40 @@
         }
     }
     /// The broker's side of the runs a rig drives: the answers a test
-    /// gives, handed to whoever asks next (held until one comes, or the
-    /// hold runs out), and the runs let go of.
-    #[derive(Default)]
+    /// gives, handed to whoever reads next, each one told on the run's line
+    /// (as the broker pushes it); every read counted; the runs let go of.
     pub(crate) struct Answers {
         waiting: StdMutex<Vec<weft_broker_client::protocol::RunAnswer>>,
-        came: tokio::sync::Notify,
+        /// The run's line, as the broker pushes onto it.
+        pub(crate) line: tokio::sync::broadcast::Sender<weft_task_store::pg_signal::Heard>,
+        /// How many times the answers were read.
+        pub(crate) reads: std::sync::atomic::AtomicUsize,
         pub(crate) let_go: StdMutex<Vec<(ExecutionId, weft_broker_client::protocol::LetGo)>>,
     }
+    impl Default for Answers {
+        fn default() -> Self {
+            Self {
+                waiting: StdMutex::default(),
+                line: tokio::sync::broadcast::channel(64).0,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                let_go: StdMutex::default(),
+            }
+        }
+    }
     impl Answers {
-        /// An answer to the wait `token`, as the install parks one for the
-        /// run's worker to take.
+        /// An answer to the wait `token`, as the install hands one to the
+        /// run's worker: kept for it, and told on its line (a recheck stands
+        /// for the run's own notice, which needs the run's id).
         pub(crate) fn answer(&self, token: impl Into<String>, value: Value) {
             self.waiting.lock().unwrap().push(weft_broker_client::protocol::RunAnswer {
                 token: token.into(),
                 answer: weft_core::primitive::WaitAnswer::Given { value },
             });
-            self.came.notify_waiters();
+            let _ = self.line.send(weft_task_store::pg_signal::Heard::Recheck);
+        }
+
+        pub(crate) fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
     #[async_trait]
@@ -241,17 +258,12 @@
             self.let_go.lock().unwrap().push((execution_id, why));
             Ok(())
         }
-        async fn answers(&self, _execution_id: ExecutionId, _taken: &[String], wait: std::time::Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
-            let deadline = tokio::time::Instant::now() + wait;
-            loop {
-                let came = self.came.notified();
-                tokio::pin!(came);
-                came.as_mut().enable();
-                let answers = std::mem::take(&mut *self.waiting.lock().unwrap());
-                if !answers.is_empty() || tokio::time::timeout_at(deadline, came).await.is_err() {
-                    return Ok(answers);
-                }
-            }
+        async fn answers(&self, _execution_id: ExecutionId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::mem::take(&mut *self.waiting.lock().unwrap()))
+        }
+        fn told(&self) -> weft_task_store::pg_signal::Subscription {
+            self.line.subscribe().into()
         }
         async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
             Ok(Vec::new())
@@ -725,6 +737,26 @@
         caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
         hand_back: Option<&HandBack>,
     ) -> anyhow::Result<Drove> {
+        // Quiet runs counted the way a worker counts them, with no door to
+        // tell.
+        let holds = crate::run_holds::Holds::new(Box::new(|| {}));
+        run_on_holding(project, catalog, clients, execution_id, journal, first, cancellation, caller, hand_back, &holds).await
+    }
+
+    /// [`run_on`], the run's quiet spells counted in `holds`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_on_holding(
+        project: Arc<ProjectDefinition>,
+        catalog: Arc<dyn NodeCatalog>,
+        clients: &EngineClients,
+        execution_id: ExecutionId,
+        journal: Arc<crate::journal_writer::DriveJournal>,
+        first: Vec<ExecEvent>,
+        cancellation: Arc<CancellationFlag>,
+        caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+        hand_back: Option<&HandBack>,
+        holds: &Arc<crate::run_holds::Holds>,
+    ) -> anyhow::Result<Drove> {
         // The tables a worker's claim builds for the run: the program and
         // the part of it its birth names.
         let selection = first.iter().find_map(|event| match event {
@@ -733,7 +765,8 @@
         });
         let program = Arc::new(crate::plan::ProgramTables::new(project, selection));
         let starts_from = crate::execution_driver::StartsFrom::Record(first);
-        let run = RunDrive { execution_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back };
+        let hold = Some(holds.of(execution_id));
+        let run = RunDrive { execution_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back, hold };
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
             run_one_execution_observed(catalog, clients, run, "instance-test", "tenant-test"),

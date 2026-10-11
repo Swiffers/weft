@@ -348,6 +348,7 @@ async fn keep_lease(broker: Arc<dyn crate::door::DoorBroker>) {
             window_start: weft_core::signal::limits::window(crate::now_unix() as i64).0,
             counts: Vec::new(),
             tokens: Vec::new(),
+            vouch_until: None,
         };
         if let Err(e) = broker.tick(&tick).await {
             tracing::warn!(target: "weft_engine::test_rig", error = %format!("{e:#}"), "the test's lease could not be renewed; the next second tries again");

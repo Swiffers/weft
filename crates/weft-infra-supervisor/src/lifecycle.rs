@@ -227,6 +227,10 @@ pub async fn drain(
     work(state, changes, Until::Idle).await
 }
 
+/// How long one claim sleeps on the broker while commands run, before
+/// [`work`] asks again.
+const CLAIM_HOLD: Duration = Duration::from_secs(25);
+
 /// How long [`work`] goes on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Until {
@@ -251,7 +255,7 @@ async fn work(
         // them. A pass with nothing running asks once and ends on nothing.
         let hold = match (until, busy.is_empty()) {
             (Until::Idle, true) => Duration::ZERO,
-            _ => weft_broker_client::protocol::MAX_HOLD,
+            _ => CLAIM_HOLD,
         };
         let busy_commands: Vec<i64> = busy.values().map(|(_, command, _)| *command).collect();
         // Ownership first: a claim can only hand out a project this supervisor

@@ -15,6 +15,9 @@
 //! on something outside it), on a task of its own so one run never holds
 //! up the next delivery. On a platform that stops a worker nobody is
 //! calling (Cloud Run), that held call is what keeps the run's worker up.
+//! The database is listened to only around this side's own reads and
+//! writes, never for the length of the call: a run that waits a day for a
+//! person leaves the database free to sleep meanwhile.
 
 use std::time::Duration;
 
@@ -63,13 +66,7 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
             let full = taken.len() as i64 == BATCH;
             for delivery in taken {
                 let state = state.clone();
-                // A run being handed over is work until it lands: the
-                // database is listened to meanwhile, for what it writes.
-                let busy = state.signals.busy().await;
-                tokio::spawn(async move {
-                    let _busy = busy;
-                    deliver(&state, delivery).await
-                });
+                tokio::spawn(async move { deliver(&state, delivery).await });
             }
             Ok(if full { DrainStep::More } else { DrainStep::Done })
         }
@@ -142,13 +139,18 @@ pub async fn worker_target(
 
 async fn deliver(state: &DispatcherState, delivery: Delivery) {
     let execution_id = delivery.execution_id;
+    // What this side reads and writes around the call is work: the
+    // database is listened to for it, and only for it.
+    let busy = state.signals.busy().await;
     let Some(binary_hash) = &delivery.binary_hash else {
         if let Err(e) = end_undeliverable(state, execution_id, "it runs no program").await {
             tracing::error!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not end an undeliverable run; its delivery runs out and it is tried again");
         }
         return;
     };
-    let outcome = match worker_target(state, &delivery.tenant_id, delivery.project_id, binary_hash).await {
+    let target = worker_target(state, &delivery.tenant_id, delivery.project_id, binary_hash).await;
+    drop(busy);
+    let outcome = match target {
         Err(e) => Err(e),
         Ok(target) => run_on_worker(state, &target, execution_id).await,
     };
@@ -161,6 +163,7 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
         ),
         Ok(answer) => tracing::debug!(target: "weft_dispatcher::delivery", %execution_id, ?answer, "worker answered"),
         Err(e) => {
+            let _busy = state.signals.busy().await;
             // Nothing claimed it: give the delivery back so the next pass
             // makes it again instead of waiting out the lease. A worker
             // still starting is the platform's bring-up going on without

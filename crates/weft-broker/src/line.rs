@@ -27,15 +27,19 @@ use axum::Router;
 use tokio::sync::mpsc;
 
 use weft_broker_client::line::server::{self, Follower};
-use weft_broker_client::line::{Notice, ACCESS_CHANNEL, CANCEL_CHANNEL, INFRA_STATUS_CHANNEL, LINE_PATH, TRIGGERS_CHANNEL};
+use weft_broker_client::line::{Notice, ACCESS_CHANNEL, CANCEL_CHANNEL, INFRA_STATUS_CHANNEL, LINE_PATH, PARKED_FIRE_CHANNEL, TRIGGERS_CHANNEL};
 use weft_platform_traits::identity::Principal;
-use weft_task_store::pg_signal::{Heard, PgSignalWatch};
+use weft_task_store::pg_signal::{Heard, Subscription};
 
 use crate::state::BrokerState;
 
-/// `api` with the line beside it.
+/// `api` with the line beside it. Each call on a line holds the database's
+/// listening while it is answered, as a request does
+/// (`weft_task_store::pg_signal::keep_listening`), and a line with no call
+/// running holds nothing: a worker whose runs only wait keeps its line
+/// open without keeping the database awake.
 pub fn routes(api: Router, state: Arc<BrokerState>) -> Router {
-    let served = api.clone();
+    let served = api.clone().layer(axum::middleware::from_fn_with_state(state.signals.clone(), weft_task_store::pg_signal::keep_listening));
     Router::new()
         .route(
             LINE_PATH,
@@ -54,15 +58,7 @@ async fn open(state: Arc<BrokerState>, headers: HeaderMap, ws: WebSocketUpgrade,
         Err((status, message)) => return (status, message).into_response(),
     };
     let follower = follower(state.lines.clone(), principal);
-    // A line carries calls that write, and the notices its far end waits
-    // on (a run's cancel), so the database is listened to while it is open.
-    let busy = state.signals.busy().await;
-    server::upgrade(ws)
-        .on_upgrade(move |socket| async move {
-            let _busy = busy;
-            server::serve(socket, api, Some(follower)).await
-        })
-        .into_response()
+    server::upgrade(ws).on_upgrade(move |socket| server::serve(socket, api, Some(follower))).into_response()
 }
 
 /// How many notices a line may fall behind by before the fan-out lets go of
@@ -74,12 +70,14 @@ const LINE_NOTICES: usize = 1024;
 /// losses and rechecks, which the caller's copies need as much as the
 /// notifications). A worker hears its own project and its tenant's shared
 /// connections; weft's own roles keep no copy that needs notices, so their
-/// line follows nothing and says so.
+/// line follows nothing and says so. Either way the line is told how long
+/// this copy keeps one line ([`LineFanout::start`]), so the caller knows
+/// when it is cut.
 fn follower(fanout: Arc<LineFanout>, principal: Principal) -> Follower {
     Box::new(move |notices: mpsc::Sender<Notice>| {
         tokio::spawn(async move {
             let Principal::Worker { tenant, project } = principal else {
-                let _ = notices.send(Notice::Following { listening: false }).await;
+                let _ = notices.send(fanout.following(false)).await;
                 return;
             };
             let project = project.to_string();
@@ -88,11 +86,10 @@ fn follower(fanout: Arc<LineFanout>, principal: Principal) -> Follower {
                 let (handed, mut heard) = mpsc::channel(LINE_NOTICES);
                 let _following = fanout.follow(&tenant, &project, handed);
                 let listening = fanout.listening.load(Ordering::Acquire);
-                let said = match (first, listening) {
-                    (true, listening) => Notice::Following { listening },
+                let said = match first {
+                    true => fanout.following(listening),
                     // Back after falling behind: what was missed is not known.
-                    (false, true) => Notice::Recheck,
-                    (false, false) => Notice::Lost,
+                    false => Notice::Recheck { listening },
                 };
                 first = false;
                 if notices.send(said).await.is_err() {
@@ -111,14 +108,15 @@ fn follower(fanout: Arc<LineFanout>, principal: Principal) -> Follower {
 /// Who a notification on `channel` is for, by its `payload`: an infra
 /// copy's change is its project's; a connection's is its project's, or its
 /// tenant's when it is shared across the tenant's projects
-/// (`tenant:<tenant>`); a cancel is its run's project's
-/// (`<project> <execution>`); a trigger's change is its project's. Every other
-/// channel is for nobody on a line.
-// SYNC: the channels and payloads <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify), crates/weft-task-store/src/tasks.rs (task_ready_notify, cancel_payload), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)
+/// (`tenant:<tenant>`); a cancel, and an answer handed to a run, are the
+/// run's project's (`<project> <execution>`; an event parked for a trigger
+/// names its project alone, and is for nobody on a line); a trigger's
+/// change is its project's. Every other channel is for nobody on a line.
+// SYNC: the channels and payloads <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify), crates/weft-task-store/src/tasks.rs (task_ready_notify), crates/weft-task-store/src/runs.rs (run_payload), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)
 fn audience<'a>(channel: &str, payload: &'a str) -> Option<Audience<'a>> {
     match channel {
         INFRA_STATUS_CHANNEL => Some(Audience::Project(payload)),
-        CANCEL_CHANNEL => payload.split_once(' ').map(|(project, _)| Audience::Project(project)),
+        CANCEL_CHANNEL | PARKED_FIRE_CHANNEL => payload.split_once(' ').map(|(project, _)| Audience::Project(project)),
         ACCESS_CHANNEL => Some(match payload.strip_prefix("tenant:") {
             Some(tenant) => Audience::Tenant(tenant),
             None => Audience::Project(payload),
@@ -141,6 +139,9 @@ pub struct LineFanout {
     /// Whether the broker's database listener hears right now.
     listening: AtomicBool,
     next: AtomicU64,
+    /// How long this copy's platform lets one request (a line) live
+    /// before cutting it, `None` when it never does.
+    max_age: Option<std::time::Duration>,
 }
 
 #[derive(Default)]
@@ -161,7 +162,7 @@ impl Lines {
 }
 
 /// A line's place in the fan-out, given up when it goes.
-struct Following {
+pub(crate) struct Following {
     fanout: Weak<LineFanout>,
     id: u64,
 }
@@ -175,10 +176,10 @@ impl Drop for Following {
 }
 
 impl LineFanout {
-    /// Start following `signals` for every line.
-    pub fn start(signals: &PgSignalWatch) -> Arc<Self> {
-        let mut heard = signals.subscribe();
-        let fanout = Arc::new(Self { lines: Mutex::default(), listening: AtomicBool::new(heard.listening()), next: AtomicU64::new(1) });
+    /// Start following `heard` (the broker's signal watch) for every line,
+    /// each told as it opens that it is cut after `max_age`.
+    pub fn start(mut heard: Subscription, max_age: Option<std::time::Duration>) -> Arc<Self> {
+        let fanout = Arc::new(Self { lines: Mutex::default(), listening: AtomicBool::new(heard.listening()), next: AtomicU64::new(1), max_age });
         let following = Arc::downgrade(&fanout);
         tokio::spawn(async move {
             loop {
@@ -190,11 +191,18 @@ impl LineFanout {
                             fanout.hand(audience, Notice::Signal { channel: channel.to_string(), payload: payload.to_string() });
                         }
                     }
-                    Ok(Heard::Recheck | Heard::Resumed) if heard.listening() => fanout.say_to_all(true),
-                    Ok(Heard::Recheck | Heard::Resumed | Heard::Lost) => fanout.say_to_all(false),
+                    // Looking again, whether or not the database's listener
+                    // hears right now: a recheck may come from the install's
+                    // news while the database sleeps (`crate::news`), and a
+                    // cancel announced in a gap is found by looking.
+                    Ok(Heard::Recheck) => fanout.say_to_all(Notice::Recheck { listening: heard.listening() }),
+                    // Back from a quiet spell, in which what runs wait on
+                    // came as the install's news: nothing to look at again.
+                    Ok(Heard::Resumed) => fanout.say_to_all(Notice::Resumed),
+                    Ok(Heard::Lost) => fanout.say_to_all(Notice::Lost),
                     Err(e) => {
                         tracing::error!(target: "weft_broker::line", error = %format!("{e:#}"), "the broker's database listener stopped; every line says so");
-                        fanout.say_to_all(false);
+                        fanout.say_to_all(Notice::Lost);
                         return;
                     }
                 }
@@ -203,7 +211,13 @@ impl LineFanout {
         fanout
     }
 
-    fn follow(self: &Arc<Self>, tenant: &str, project: &str, line: mpsc::Sender<Notice>) -> Following {
+    /// What a line is told as it opens: whether the listener hears
+    /// (`listening`), and how long it keeps one line.
+    fn following(&self, listening: bool) -> Notice {
+        Notice::Following { listening, max_age_secs: self.max_age.map(|age| age.as_secs()) }
+    }
+
+    pub(crate) fn follow(self: &Arc<Self>, tenant: &str, project: &str, line: mpsc::Sender<Notice>) -> Following {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut lines = self.lines.lock().expect("line fanout");
         lines.by_project.entry(project.to_string()).or_default().insert(id, line.clone());
@@ -226,10 +240,11 @@ impl LineFanout {
         }
     }
 
-    /// The listener hears (`true`) or stopped hearing: every line is told.
-    fn say_to_all(&self, listening: bool) {
+    /// Every line is told `notice`: look again (saying whether the
+    /// listener hears now), the listener hears again, or it stopped.
+    fn say_to_all(&self, notice: Notice) {
+        let listening = matches!(notice, Notice::Recheck { listening: true } | Notice::Resumed);
         self.listening.store(listening, Ordering::Release);
-        let notice = if listening { Notice::Recheck } else { Notice::Lost };
         let mut lines = self.lines.lock().expect("line fanout");
         let behind: Vec<u64> = lines
             .by_project
@@ -487,7 +502,7 @@ mod tests {
                 get(|ws: WebSocketUpgrade| async move {
                     ws.on_upgrade(|mut socket| async move {
                         let _follow = socket.recv().await;
-                        for notice in [Notice::Following { listening: true }, Notice::Signal { channel: INFRA_STATUS_CHANNEL.into(), payload: "p".into() }] {
+                        for notice in [Notice::Following { listening: true, max_age_secs: None }, Notice::Signal { channel: INFRA_STATUS_CHANNEL.into(), payload: "p".into() }] {
                             let text = serde_json::to_string(&notice).unwrap();
                             let _ = socket.send(Message::Text(text.into())).await;
                         }
@@ -509,6 +524,110 @@ mod tests {
         }
     }
 
+    // A line that opens on a copy whose database listener does not hear
+    // (it went quiet while the database sleeps) still looks again (a
+    // cancel announced while the line was down is found so) but trusts
+    // nothing kept on it; a recheck from the install's news does the same.
+    weft_core::stress_test! {
+        name: a_line_opening_on_a_quiet_copy_looks_again_and_trusts_nothing,
+        runs: 10,
+        worker_threads: 4,
+        async fn body() {
+            use axum::extract::ws::Message;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                LINE_PATH,
+                get(|ws: WebSocketUpgrade| async move {
+                    ws.on_upgrade(|mut socket| async move {
+                        let _follow = socket.recv().await;
+                        for notice in [Notice::Following { listening: false, max_age_secs: None }, Notice::Recheck { listening: false }] {
+                            let text = serde_json::to_string(&notice).unwrap();
+                            let _ = socket.send(Message::Text(text.into())).await;
+                        }
+                        std::future::pending::<()>().await;
+                    })
+                }),
+            );
+            let _server = serve(listener, app).await;
+            let link = link(address);
+            let mut heard = link.subscribe();
+            async fn next(heard: &mut weft_task_store::pg_signal::Subscription) -> (Heard, bool) {
+                let heard_now = tokio::time::timeout(Duration::from_secs(10), heard.next()).await.expect("heard in time").expect("the line is up");
+                (heard_now, heard.listening())
+            }
+            assert_eq!(next(&mut heard).await, (Heard::Recheck, false), "opened: look again, trust nothing");
+            assert_eq!(next(&mut heard).await, (Heard::Recheck, false), "news missed: look again, trust nothing");
+        }
+    }
+
+    /// A recheck reaches every line whether or not the database's listener
+    /// hears, saying which; the listener hearing again after a quiet spell
+    /// is said as such (nothing to look at again); a lost listener is said
+    /// as lost.
+    #[tokio::test]
+    async fn a_recheck_reaches_every_line_whatever_the_listener() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let listening = StdArc::new(AtomicBool::new(false));
+        let fanout = LineFanout::start(weft_task_store::pg_signal::Subscription::with_listening(rx, listening.clone()), None);
+        let (line, mut heard) = mpsc::channel(8);
+        let _following = fanout.follow("t", "p", line);
+        async fn next(heard: &mut mpsc::Receiver<Notice>) -> Notice {
+            tokio::time::timeout(Duration::from_secs(10), heard.recv()).await.expect("told in time").unwrap()
+        }
+        tx.send(Heard::Recheck).unwrap();
+        assert_eq!(next(&mut heard).await, Notice::Recheck { listening: false });
+        listening.store(true, Ordering::SeqCst);
+        tx.send(Heard::Resumed).unwrap();
+        assert_eq!(next(&mut heard).await, Notice::Resumed);
+        tx.send(Heard::Lost).unwrap();
+        assert_eq!(next(&mut heard).await, Notice::Lost);
+    }
+
+    /// A line the broker keeps for a while tells its process when the cut
+    /// comes, counted from before the line opened, and stops saying so once
+    /// that line is gone.
+    #[tokio::test]
+    async fn a_line_says_when_the_broker_cuts_it() {
+        use axum::extract::ws::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hang_up = StdArc::new(tokio::sync::Notify::new());
+        let told = StdArc::new(AtomicBool::new(false));
+        let app = Router::new().route(
+            LINE_PATH,
+            get({
+                let hang_up = hang_up.clone();
+                move |ws: WebSocketUpgrade| {
+                    let (hang_up, told) = (hang_up.clone(), told.clone());
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            // The line opened again after the hang-up is
+                            // never followed: what it said stays cleared.
+                            let _follow = socket.recv().await;
+                            if !told.swap(true, Ordering::SeqCst) {
+                                let text = serde_json::to_string(&Notice::Following { listening: true, max_age_secs: Some(3600) }).unwrap();
+                                let _ = socket.send(Message::Text(text.into())).await;
+                            }
+                            hang_up.notified().await;
+                        })
+                    }
+                }
+            }),
+        );
+        let _server = serve(listener, app).await;
+        let link = link(address);
+        let mut cut = link.cut_at();
+        let before = tokio::time::Instant::now();
+        let _held = link.stay_open();
+        tokio::time::timeout(Duration::from_secs(10), cut.wait_for(Option::is_some)).await.expect("told in time").unwrap();
+        let told = cut.borrow_and_update().expect("a cut");
+        assert_eq!(told.max_age, Duration::from_secs(3600));
+        assert!(told.opened >= before && told.opened <= tokio::time::Instant::now(), "counted from the opening");
+        hang_up.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), cut.wait_for(Option::is_none)).await.expect("cleared in time").unwrap();
+    }
+
     #[test]
     fn a_notice_is_for_the_project_or_the_tenant_it_names() {
         let project = uuid::Uuid::from_u128(1).to_string();
@@ -517,6 +636,8 @@ mod tests {
         assert_eq!(audience(ACCESS_CHANNEL, "tenant:t"), Some(Audience::Tenant("t")));
         let cancel = format!("{project} e-1");
         assert_eq!(audience(CANCEL_CHANNEL, &cancel), Some(Audience::Project(&project)));
+        assert_eq!(audience(PARKED_FIRE_CHANNEL, &cancel), Some(Audience::Project(&project)), "an answer handed to a run");
+        assert_eq!(audience(PARKED_FIRE_CHANNEL, &project), None, "an event parked for a trigger rides no line");
         assert_eq!(audience("weft_task_ready", "worker:x"), None);
     }
 
@@ -524,7 +645,7 @@ mod tests {
     /// other, and a line that cannot keep up is let go of.
     #[tokio::test]
     async fn the_fanout_hands_a_notice_to_the_lines_it_names() {
-        let fanout = StdArc::new(LineFanout { lines: Mutex::default(), listening: AtomicBool::new(true), next: AtomicU64::new(1) });
+        let fanout = StdArc::new(LineFanout { lines: Mutex::default(), listening: AtomicBool::new(true), next: AtomicU64::new(1), max_age: None });
         let (mine, mut mine_heard) = mpsc::channel(4);
         let (other, mut other_heard) = mpsc::channel(4);
         let (slow, _slow_heard) = mpsc::channel(1);

@@ -215,6 +215,13 @@ async fn forward_http(
     if let Some((name, value)) = &upstream.auth {
         call = call.header(name, value);
     }
+    // Nothing from here on touches the database, and the upstream's answer
+    // may take as long as the run behind it (a route held while its run
+    // waits on a person): the request lets go of its process's listening
+    // before it waits on the upstream at all.
+    if let Some(listening) = parts.extensions.get::<weft_task_store::pg_signal::RequestListening>() {
+        listening.let_go();
+    }
     let sent = call.body(reqwest::Body::wrap_stream(body.into_data_stream())).send().await;
     let answer = match sent {
         Ok(answer) => answer,

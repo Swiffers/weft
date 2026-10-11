@@ -135,11 +135,13 @@ impl ProcessSettings {
 }
 
 /// What a worker reads off its line to the broker besides answers: the
-/// notices the broker pushes, and a hold that keeps the line open while
-/// the worker must hear them (`weft_broker_client::line`'s module doc).
+/// notices the broker pushes, a hold that keeps the line open while the
+/// worker must hear them, and when the broker cuts the line open now
+/// (`weft_broker_client::line`'s module doc).
 pub trait WorkerLine: Send + Sync {
     fn subscribe(&self) -> weft_task_store::pg_signal::Subscription;
     fn stay_open(&self) -> Box<dyn Send + Sync>;
+    fn cut_at(&self) -> tokio::sync::watch::Receiver<Option<weft_broker_client::line::Cut>>;
 }
 
 impl WorkerLine for weft_broker_client::BrokerLink {
@@ -150,20 +152,26 @@ impl WorkerLine for weft_broker_client::BrokerLink {
     fn stay_open(&self) -> Box<dyn Send + Sync> {
         Box::new(weft_broker_client::BrokerLink::stay_open(self))
     }
+
+    fn cut_at(&self) -> tokio::sync::watch::Receiver<Option<weft_broker_client::line::Cut>> {
+        weft_broker_client::BrokerLink::cut_at(self)
+    }
 }
 
-/// A line whose notices are what a test sends into [`TestLine::pushed`].
+/// A line whose notices are what a test sends into [`TestLine::pushed`],
+/// and whose cut is what it sets in [`TestLine::cut`].
 #[cfg(test)]
 pub(crate) struct TestLine {
     pub pushed: tokio::sync::broadcast::Sender<weft_task_store::pg_signal::Heard>,
     /// How many holds are taken right now.
     pub held: Arc<std::sync::atomic::AtomicUsize>,
+    pub cut: tokio::sync::watch::Sender<Option<weft_broker_client::line::Cut>>,
 }
 
 #[cfg(test)]
 impl TestLine {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self { pushed: tokio::sync::broadcast::channel(64).0, held: Arc::default() })
+        Arc::new(Self { pushed: tokio::sync::broadcast::channel(64).0, held: Arc::default(), cut: tokio::sync::watch::channel(None).0 })
     }
 }
 
@@ -171,6 +179,10 @@ impl TestLine {
 impl WorkerLine for TestLine {
     fn subscribe(&self) -> weft_task_store::pg_signal::Subscription {
         self.pushed.subscribe().into()
+    }
+
+    fn cut_at(&self) -> tokio::sync::watch::Receiver<Option<weft_broker_client::line::Cut>> {
+        self.cut.subscribe()
     }
 
     fn stay_open(&self) -> Box<dyn Send + Sync> {
@@ -268,8 +280,12 @@ pub trait RunClient: Send + Sync {
     /// written, for `why`.
     async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()>;
     /// The answers waiting for `execution_id`'s waits, but the waits in
-    /// `taken`, held up to `wait` until one is there.
-    async fn answers(&self, execution_id: ExecutionId, taken: &[String], wait: Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>;
+    /// `taken`, read once.
+    async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>;
+    /// What the broker pushes about the runs this worker drives: an answer
+    /// handed to one (`weft_broker_client::line::PARKED_FIRE_CHANNEL`,
+    /// naming the run), and a recheck when the line may have missed some.
+    fn told(&self) -> weft_task_store::pg_signal::Subscription;
     /// The cancels waiting for the runs this worker drives.
     async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>>;
 }
@@ -282,8 +298,11 @@ impl RunClient for weft_broker_client::BrokerRunClient {
     async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
         weft_broker_client::BrokerRunClient::let_go(self, execution_id, why).await
     }
-    async fn answers(&self, execution_id: ExecutionId, taken: &[String], wait: Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
-        weft_broker_client::BrokerRunClient::answers(self, execution_id, taken, wait).await
+    async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+        weft_broker_client::BrokerRunClient::answers(self, execution_id, taken).await
+    }
+    fn told(&self) -> weft_task_store::pg_signal::Subscription {
+        weft_broker_client::BrokerRunClient::told(self)
     }
     async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
         weft_broker_client::BrokerRunClient::cancels(self).await

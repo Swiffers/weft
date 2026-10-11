@@ -26,6 +26,14 @@
 //! heard, and the subscription says so ([`Heard::Lost`]) so a copy kept on
 //! it stops trusting itself until the line is back ([`Heard::Recheck`]).
 //!
+//! A broker that cuts a request after a while (Cloud Run's limit on one
+//! request) says so as the line opens (`Notice::Following`'s
+//! `max_age_secs`), and the line tells its process when that cut comes
+//! ([`BrokerLink::cut_at`]). The line is never renewed: a cut is a break
+//! like any other, except for a worker whose runs only wait, which must
+//! not read again and so stops before then; the process that starts in its
+//! place opens a line of its own.
+//!
 //! When the line breaks it comes back by itself. A call that had not been
 //! written yet goes out on the next line if that opens within the call's
 //! wait to send, and fails [`LineError::NotSent`] otherwise. One that had
@@ -47,7 +55,8 @@
 //! zero up for as long as that process lives. While it is closed nothing
 //! is heard, so what is kept on it is not trusted until it is back. A
 //! process that must hear while it asks nothing (a worker driving runs,
-//! which hears their cancels) holds it open ([`BrokerLink::stay_open`]).
+//! which hears their answers and cancels) holds it open
+//! ([`BrokerLink::stay_open`]).
 //!
 //! Byte streams (`ctx.storage` uploads and downloads) stay ordinary
 //! requests: a large body on the line would hold up every call behind it.
@@ -178,16 +187,26 @@ pub enum Notice {
     /// Sent by the caller: it stopped waiting for the call `id`, so the
     /// broker stops working on it.
     Forget { id: u64 },
-    /// The broker follows for this caller; `listening` is whether its own
-    /// database listener hears right now.
-    Following { listening: bool },
+    /// The broker follows for this caller. `listening` is whether its own
+    /// database listener hears right now; `max_age_secs` how long the
+    /// broker keeps one line before cutting it (a request limit), `None`
+    /// when it keeps it for good.
+    Following { listening: bool, max_age_secs: Option<u64> },
     /// One notification this caller may see.
     Signal { channel: String, payload: String },
     /// The broker's database listener lost its connection: nothing is
-    /// heard until a `Recheck`.
+    /// heard until a `Recheck` that says it listens.
     Lost,
-    /// Notifications may have been missed: look again.
-    Recheck,
+    /// Notifications may have been missed: look again. `listening` is
+    /// whether the broker's database listener hears right now: a recheck
+    /// may come while it does not (the install's news, heard while the
+    /// database sleeps), and then nothing kept on the line is trusted yet.
+    Recheck { listening: bool },
+    /// The broker's database listener hears again after a quiet spell. What
+    /// runs wait on (their answers, their cancels) reached it meanwhile as
+    /// the install's news, so nothing needs looking at again; only what is
+    /// kept on the line may follow again.
+    Resumed,
 }
 
 /// Frame `head` and `body` for the line.
@@ -211,8 +230,8 @@ pub fn unframe<H: for<'de> Deserialize<'de>>(bytes: &[u8]) -> anyhow::Result<(H,
 
 /// The notification channels a line may carry, by name: what turns a
 /// name the broker sent back into the `&'static str` a [`Heard`] holds.
-// SYNC: LINE_CHANNELS <-> crates/weft-broker/src/line.rs (audience), crates/weft-task-store/src/runs.rs (CANCEL_CHANNEL), triggers_notify_project, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify)
-pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL, CANCEL_CHANNEL, TRIGGERS_CHANNEL];
+// SYNC: LINE_CHANNELS <-> crates/weft-broker/src/line.rs (audience), crates/weft-task-store/src/runs.rs (CANCEL_CHANNEL), crates/weft-task-store/src/parked_fires.rs (PARKED_FIRE_CHANNEL), triggers_notify_project, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify)
+pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL, CANCEL_CHANNEL, TRIGGERS_CHANNEL, PARKED_FIRE_CHANNEL];
 
 /// Announced with a tenant's id when one of its routes changes: a public
 /// entry armed, re-armed or taken down, or how its activation stands (the
@@ -243,6 +262,12 @@ pub const ACCESS_CHANNEL: &str = "weft_access";
 /// is asked to stop: the worker driving it fires its flag
 /// (`weft_task_store::runs`).
 pub use weft_task_store::runs::CANCEL_CHANNEL;
+
+/// Announced with `<project id> <execution id>` when an answer is handed to
+/// a running execution (and with a project's id alone when an event waits
+/// for its trigger, which rides no line): the worker driving the run reads
+/// its answers (`weft_task_store::parked_fires`).
+pub use weft_task_store::parked_fires::PARKED_FIRE_CHANNEL;
 
 /// A process's way to the broker. Every broker client of the process
 /// holds the same one, so the process has one line, opened on the first
@@ -347,6 +372,13 @@ impl BrokerLink {
         Subscription::with_listening(line.notices.subscribe(), line.listening.clone())
     }
 
+    /// When the broker cuts the line open now, `None` while it is closed
+    /// or when the broker keeps it for good. Told again whenever that
+    /// changes, so a process can stop before the cut (see the module doc).
+    pub fn cut_at(&self) -> tokio::sync::watch::Receiver<Option<Cut>> {
+        self.line().cut.subscribe()
+    }
+
     /// Hold the line open while the guard lives, calls or not, so what the
     /// broker pushes is heard (see the module doc). A line closed for want
     /// of anything to do opens again at once.
@@ -423,6 +455,16 @@ struct Line {
     listening: Arc<AtomicBool>,
     /// Why the line is down, while it is.
     down: Mutex<Option<String>>,
+    /// When the broker cuts the open line, if it said it would.
+    cut: tokio::sync::watch::Sender<Option<Cut>>,
+}
+
+/// When the broker cuts the line open now (`Notice::Following`'s
+/// `max_age_secs`): `max_age` after it `opened`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cut {
+    pub opened: tokio::time::Instant,
+    pub max_age: Duration,
 }
 
 impl Line {
@@ -437,6 +479,7 @@ impl Line {
             notices,
             listening: Arc::new(AtomicBool::new(false)),
             down: Mutex::new(Some("not opened yet".into())),
+            cut: tokio::sync::watch::channel(None).0,
         });
         let task = keep_open(link, Arc::downgrade(&line), ids, closed, idle_after);
         match runtime {
@@ -467,7 +510,7 @@ impl Line {
         };
         tokio::select! {
             result = &mut answered => return landed(result),
-            () = tokio::time::sleep_until(start + to_send) => {}
+            () = tokio::time::sleep_until(weft_core::deadline::after(start, to_send)) => {}
         }
         {
             // Under the lock the writer takes frames with, so a call is
@@ -481,7 +524,7 @@ impl Line {
                 });
             }
         }
-        match tokio::time::timeout_at(start + wait.to_answer, &mut answered).await {
+        match tokio::time::timeout_at(weft_core::deadline::after(start, wait.to_answer), &mut answered).await {
             Ok(result) => landed(result),
             Err(_) => Err(LineError::NoAnswer(wait.to_answer)),
         }
@@ -491,6 +534,7 @@ impl Line {
     /// the unwritten ones wait for the next line.
     fn broke(&self, why: &str) {
         self.listening.store(false, Ordering::Release);
+        self.cut.send_replace(None);
         let _ = self.notices.send(Heard::Lost);
         *self.down.lock().expect("line down") = Some(why.to_string());
         let mut calls = self.calls.lock().expect("line calls");
@@ -506,6 +550,7 @@ impl Line {
     /// it opens again.
     fn idled(&self) {
         self.listening.store(false, Ordering::Release);
+        self.cut.send_replace(None);
         let _ = self.notices.send(Heard::Lost);
         *self.down.lock().expect("line down") = Some("closed while idle; it opens again on the next call".into());
     }
@@ -528,13 +573,31 @@ impl Line {
         self.calls.lock().expect("line calls").get_mut(&id).and_then(|w| w.frame.take())
     }
 
-    fn heard(&self, notice: Notice) {
+    /// What the broker said on the line, which `opened` at that instant.
+    fn heard(&self, notice: Notice, opened: tokio::time::Instant) {
         match notice {
-            Notice::Following { listening: true } | Notice::Recheck => {
-                self.listening.store(true, Ordering::Release);
+            // The line follows again, or may have missed some: every waiter
+            // looks again (a cancel announced while it did not follow is
+            // found so), and copies kept on it are trusted only while the
+            // broker hears. Set before the recheck goes out, so a waiter
+            // reads it with the recheck.
+            Notice::Following { listening, max_age_secs } => {
+                self.cut.send_replace(max_age_secs.map(|secs| Cut { opened, max_age: Duration::from_secs(secs) }));
+                self.listening.store(listening, Ordering::Release);
                 let _ = self.notices.send(Heard::Recheck);
             }
-            Notice::Following { listening: false } | Notice::Lost => {
+            Notice::Recheck { listening } => {
+                self.listening.store(listening, Ordering::Release);
+                let _ = self.notices.send(Heard::Recheck);
+            }
+            // The broker hears again after a quiet spell, in which what
+            // runs wait on reached it as the install's news: nothing to
+            // look at again, but what is kept on the line may follow again.
+            Notice::Resumed => {
+                self.listening.store(true, Ordering::Release);
+                let _ = self.notices.send(Heard::Resumed);
+            }
+            Notice::Lost => {
                 self.listening.store(false, Ordering::Release);
                 let _ = self.notices.send(Heard::Lost);
             }
@@ -570,6 +633,9 @@ async fn keep_open(
         // opens: the last link let go of mid-attempt closes the line.
         let (base_url, token) = (inner.base_url.clone(), inner.token.clone());
         drop(inner);
+        // The broker's limit on one request counts from no earlier than
+        // this.
+        let opening = tokio::time::Instant::now();
         let opened = tokio::select! {
             opened = tokio::time::timeout(CONNECT_WAIT, connect(&base_url, &token)) => {
                 opened.unwrap_or_else(|_| Err(anyhow::anyhow!("opening it took more than {CONNECT_WAIT:?}")))
@@ -580,7 +646,7 @@ async fn keep_open(
             Ok(socket) => {
                 retry = RECONNECT_FIRST;
                 *held.down.lock().expect("line down") = None;
-                match serve(socket, &held, first.take(), &mut outbox, &mut closed, idle_after).await {
+                match serve(socket, opening, &held, first.take(), &mut outbox, &mut closed, idle_after).await {
                     Served::LetGo => return,
                     Served::Broke(why) => {
                         tracing::warn!(target: "weft_broker_client::line", reason = %why, "the line to the broker broke; opening it again");
@@ -663,14 +729,15 @@ fn line_url(base_url: &str) -> anyhow::Result<String> {
     Ok(format!("{rest}{LINE_PATH}"))
 }
 
-/// Serve one open line until it breaks, or until the process lets go of
-/// its last link (`closed`).
+/// Serve one open line, which `opened` at that instant, until it breaks,
+/// or until the process lets go of its last link (`closed`).
 ///
 /// Every write is bounded by [`PONG_WAIT`]: a broker that vanished without
 /// closing leaves the socket's buffer full and a write waiting for minutes,
 /// which would also keep the ping's deadline from ever being looked at.
 async fn serve(
     socket: Socket,
+    opened: tokio::time::Instant,
     line: &Line,
     first: Option<Out>,
     outbox: &mut mpsc::UnboundedReceiver<Out>,
@@ -740,7 +807,7 @@ async fn serve(
                     },
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(&text) {
                         Ok(notice) => {
-                            line.heard(notice);
+                            line.heard(notice, opened);
                             Ok(())
                         }
                         Err(e) => Err(format!("a notice that does not read ({text}): {e}")),
@@ -818,10 +885,11 @@ mod tests {
         for notice in [
             Notice::Follow,
             Notice::Forget { id: 7 },
-            Notice::Following { listening: true },
+            Notice::Following { listening: true, max_age_secs: Some(3600) },
             Notice::Signal { channel: INFRA_STATUS_CHANNEL.into(), payload: "p".into() },
             Notice::Lost,
-            Notice::Recheck,
+            Notice::Recheck { listening: false },
+            Notice::Resumed,
         ] {
             let text = serde_json::to_string(&notice).unwrap();
             assert_eq!(serde_json::from_str::<Notice>(&text).unwrap(), notice);
@@ -962,7 +1030,7 @@ pub mod server {
                         match follower.take() {
                             Some(follow) => following.push(follow(notices)),
                             None => {
-                                let _ = notices.send(Notice::Following { listening: false }).await;
+                                let _ = notices.send(Notice::Following { listening: false, max_age_secs: None }).await;
                             }
                         }
                     }

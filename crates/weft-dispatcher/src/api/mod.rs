@@ -26,10 +26,14 @@ use crate::state::DispatcherState;
 /// webhook payloads. Trusted routes keep axum's default limit.
 const PUBLIC_FIRE_BODY_LIMIT: usize = 256 * 1024;
 
+/// The longest a read of this API is held open waiting for its answer to
+/// change: a client that wants longer asks again, and a hold this short
+/// never meets an idle timeout on the way.
+const MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// `?wait_ms=` on a read whose answer a client waits on: hold the read
-/// for up to that long for the answer to change (never past `MAX_HOLD`;
-/// a client that wants longer asks again). Absent, the read answers at
-/// once.
+/// for up to that long for the answer to change (never past [`MAX_HOLD`]).
+/// Absent, the read answers at once.
 #[derive(serde::Deserialize, Default)]
 pub struct HoldQuery {
     #[serde(default)]
@@ -198,7 +202,7 @@ fn version_note(source: Option<&weft_core::install::WeftSource>, cli_commit: &st
 
 impl HoldQuery {
     pub fn hold(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
+        std::time::Duration::from_millis(self.wait_ms).min(MAX_HOLD)
     }
 }
 

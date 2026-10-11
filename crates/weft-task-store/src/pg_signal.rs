@@ -47,12 +47,6 @@ use anyhow::Result;
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPool, PgPoolOptions};
 use tokio::sync::broadcast;
 
-/// The longest any request is held open waiting on a signal. A client
-/// that wants to wait longer asks again; a hold this short never meets
-/// an idle timeout between a process and the broker, and a lost signal
-/// costs a waiter at most this long.
-pub const MAX_HOLD: Duration = Duration::from_secs(25);
-
 /// What a waiter hears: one notification, or "every waiter should look
 /// at its row again" because notifications may have been lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +139,71 @@ impl Drop for Busy {
     }
 }
 
+/// The watch a request holds busy while it is answered ([`keep_listening`]),
+/// in the request's extensions. A handler that goes on to wait only on what
+/// reaches the process another way (a worker's answer relayed to its
+/// caller, news of a run heard from the install's news) lets go of it, so a
+/// wait of hours leaves the database free to sleep; it holds
+/// [`PgSignalWatch::busy`] itself around whatever it reads or writes.
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+pub struct RequestListening(Arc<Mutex<Option<Busy>>>);
+
+#[cfg(feature = "serve")]
+impl RequestListening {
+    /// The request no longer needs the watch.
+    pub fn let_go(&self) {
+        self.0.lock().expect("a request's listening").take();
+    }
+}
+
+/// Keep `watch` listening while a request is answered, to the end of its
+/// answer's body: a stream of events is listened for until it closes. A
+/// process that scales to zero lets its watch go quiet only between
+/// requests ([`Listening::WhileBusy`]), and every request it answers may
+/// write, so a quiet watch listens again before the request goes on. A
+/// handler that let go ([`RequestListening`]) holds nothing.
+#[cfg(feature = "serve")]
+pub async fn keep_listening(
+    axum::extract::State(watch): axum::extract::State<Arc<PgSignalWatch>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let listening = RequestListening(Arc::new(Mutex::new(Some(watch.busy().await))));
+    request.extensions_mut().insert(listening.clone());
+    let answer = next.run(request).await;
+    let Some(busy) = listening.0.lock().expect("a request's listening").take() else { return answer };
+    answer.map(|body| axum::body::Body::new(Held { body, _busy: busy }))
+}
+
+/// An answer's body, holding its process busy until it ends.
+#[cfg(feature = "serve")]
+struct Held {
+    body: axum::body::Body,
+    _busy: Busy,
+}
+
+#[cfg(feature = "serve")]
+impl http_body::Body for Held {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
 /// The channel a watch proves it can hear on, every time it listens.
 const PROBE_CHANNEL: &str = "weft_listen_probe";
 
@@ -169,6 +228,9 @@ pub struct PgSignalWatch {
     /// either reads the state here.
     listening: Arc<AtomicBool>,
     demand: Arc<Demand>,
+    /// What [`AlsoTold`] sends through: weak, so the pump stays the one
+    /// sender that keeps waiters hearing.
+    told: broadcast::WeakSender<Heard>,
     /// The listening task. It lives exactly as long as the watch: when
     /// the process part that owns the watch goes, so does its connection
     /// (a test's database cannot be dropped while it is held).
@@ -196,6 +258,7 @@ impl PgSignalWatch {
             .await?;
         let listener = listen(&own, channels).await?;
         let (tx, template) = broadcast::channel(FANOUT_CAPACITY);
+        let told = tx.downgrade();
         let listening_now = Arc::new(AtomicBool::new(true));
         let demand = Arc::new(Demand {
             listening,
@@ -206,7 +269,7 @@ impl PgSignalWatch {
             listening_again: Notify::new(),
         });
         let pump = tokio::spawn(pump(listener, own, channels, tx, listening_now.clone(), demand.clone()));
-        Ok(Arc::new(Self { channels, template: Mutex::new(template), listening: listening_now, demand, pump }))
+        Ok(Arc::new(Self { channels, template: Mutex::new(template), listening: listening_now, demand, told, pump }))
     }
 
     /// Hold this while doing work that writes, or that waits on what this
@@ -263,6 +326,12 @@ impl PgSignalWatch {
         held
     }
 
+    /// A way to tell every waiter what this process heard of the database's
+    /// writes another way ([`AlsoTold`]).
+    pub fn also_told(&self) -> AlsoTold {
+        AlsoTold { channels: self.channels, told: self.told.clone() }
+    }
+
     /// Subscribe BEFORE reading the row: a change that lands between the
     /// read and the subscription would otherwise go unheard.
     pub fn subscribe(&self) -> Subscription {
@@ -283,6 +352,46 @@ impl PgSignalWatch {
             self.channels
         );
         Ok(())
+    }
+}
+
+/// What a process heard of the database's writes without its connection
+/// (the install's news, which carries a few announcements while the
+/// database sleeps and the watch is quiet), told to every waiter as the
+/// watch would have told it. A waiter cannot tell the two apart, and hearing
+/// one twice only costs it a look.
+pub struct AlsoTold {
+    channels: &'static [&'static str],
+    told: broadcast::WeakSender<Heard>,
+}
+
+impl AlsoTold {
+    /// Tell to waiters through `told` on `channels` (a test drives waiters
+    /// with it, as [`Subscription::from`] does).
+    pub fn over(told: &broadcast::Sender<Heard>, channels: &'static [&'static str]) -> Self {
+        Self { channels, told: told.downgrade() }
+    }
+
+    /// `payload` was announced on `channel`. Refused on a channel the
+    /// watch does not listen on (no waiter would be waiting on it); `false`
+    /// once the watch stopped.
+    pub fn signal(&self, channel: &str, payload: &str) -> Result<bool> {
+        let Some(channel) = self.channels.iter().find(|c| **c == channel) else {
+            anyhow::bail!("this process's signal watch does not listen on '{channel}' (it listens on {:?})", self.channels);
+        };
+        Ok(self.tell(Heard::Signal { channel, payload: payload.into() }))
+    }
+
+    /// Announcements may have been missed: every waiter looks again.
+    pub fn recheck(&self) -> bool {
+        self.tell(Heard::Recheck)
+    }
+
+    fn tell(&self, heard: Heard) -> bool {
+        let Some(told) = self.told.upgrade() else { return false };
+        // No waiter right now is fine: nobody waits on it.
+        let _ = told.send(heard);
+        true
     }
 }
 
@@ -530,6 +639,24 @@ mod tests {
         assert!(wakes(&signal("a", "x"), &concerns));
         assert!(!wakes(&signal("a", "y"), &concerns));
         assert!(!wakes(&signal("b", "x"), &concerns));
+    }
+
+    /// What a process heard another way reaches every waiter as the watch
+    /// would have told it; a channel nobody listens on is refused, and a
+    /// watch that stopped hears nothing more.
+    #[tokio::test]
+    async fn what_is_told_another_way_reaches_every_waiter() {
+        let (tx, rx) = broadcast::channel(8);
+        let mut subscription = Subscription::from(rx);
+        let told = AlsoTold::over(&tx, &["a"]);
+        assert!(told.signal("a", "x").unwrap());
+        assert!(told.recheck());
+        assert!(told.signal("b", "x").is_err(), "a channel this watch does not listen on");
+        assert_eq!(subscription.next().await.unwrap(), signal("a", "x"));
+        assert_eq!(subscription.next().await.unwrap(), Heard::Recheck);
+        drop(tx);
+        assert!(!told.recheck(), "the watch stopped");
+        assert!(subscription.next().await.is_err(), "and its waiters hear so: telling it another way keeps nothing alive");
     }
 
     #[tokio::test]

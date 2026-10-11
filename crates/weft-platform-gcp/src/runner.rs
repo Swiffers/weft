@@ -30,8 +30,12 @@ use weft_platform_traits::{Patience, Runner, WorkerEndpoint, WorkerSettings, Wor
 use crate::api::{is_status, Google};
 use crate::names;
 
-/// The longest one request may run on Cloud Run.
-const REQUEST_CAP: Duration = Duration::from_secs(3600);
+/// The longest one request may run on the Cloud Run services weft makes:
+/// a project's workers here, and weft's own roles (its Terraform). The
+/// broker tells every line to it this limit, and a worker whose runs only
+/// wait stops before its line reaches it (`weft_broker_client::line`).
+// SYNC: REQUEST_CAP <-> deploy/terraform/gcp/serverless.tf (google_cloud_run_v2_service.role timeout)
+pub const REQUEST_CAP: Duration = Duration::from_secs(3600);
 
 /// How long a bring-up waits for a deploy in flight to settle, and how
 /// often it looks. Cloud Run settles a revision in minutes; past this the
@@ -786,6 +790,7 @@ mod tests {
             build_bucket: "acme-weft-builds".into(),
             builder_service_account: "weft-builder@acme.iam.gserviceaccount.com".into(),
             tasks_queue: "weft-wakes".into(),
+            news_topic: "weft-news".into(),
             core_service_account: "weft-core@acme.iam.gserviceaccount.com".into(),
             holder_pool: "projects/acme/locations/us-central1/workerPools/weft-holder".into(),
             dispatcher_service: "weft-role-dispatcher".into(),

@@ -300,8 +300,8 @@ async fn door_instance_token(
 
 
 /// `POST /v1/door/tick`: see [`DoorTick`]. One statement renews the
-/// worker's lease, stores its counts and reads the other copies', so a
-/// tick is one round trip.
+/// worker's lease (as long as it vouched for, when it did), stores its
+/// counts and reads the other copies', so a tick is one round trip.
 async fn door_tick(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -315,7 +315,11 @@ async fn door_tick(
         .bind(project)
         .bind(tenant)
         .bind(&req.binary_hash)
-        .bind(now + weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS))
+        .bind(weft_task_store::worker_door::lease_until(
+            now,
+            weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS),
+            req.vouch_until,
+        ))
         .bind(sqlx::types::Json(&req.in_flight))
         .bind(req.window_start)
         .bind(&keys)

@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The channel an event parked for a trigger is announced on, with its
-/// project's id: the dispatcher's drain wakes on it, and so does a worker
-/// holding for the answers of a run it drives.
-// SYNC: PARKED_FIRE_CHANNEL <-> 'weft_parked_fire' in parked_fire_notify (GROUP below)
+/// project's id, and an answer handed to a run a worker drives, with that
+/// run (`crate::runs::run_payload`): the dispatcher's drain wakes on it,
+/// and the broker pushes the second down the line of the run's worker,
+/// which then reads the run's answers.
+// SYNC: PARKED_FIRE_CHANNEL <-> 'weft_parked_fire' in parked_fire_notify (GROUP below), weft_broker_client::line::LINE_CHANNELS, crates/weft-broker/src/line.rs (audience)
 pub const PARKED_FIRE_CHANNEL: &str = "weft_parked_fire";
 
 /// The events waiting for their trigger, one row each, first in first out
@@ -67,12 +69,25 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // and a run's worker when an answer is handed to it. Through the
         // outbox (`crate::announce`): these are writes on a run's path, and
         // their writers poke the flusher once they commit.
+        // An event names its trigger's project; an answer handed to a run
+        // names the run, the way every announcement does
+        // (`crate::runs::run_payload`), so whoever holds the run hears it is
+        // for them, and it is the install's news too (`crate::announce`), for
+        // the copy holding the line of the run's worker.
         // SYNC: 'weft_parked_fire' <-> PARKED_FIRE_CHANNEL
+        // SYNC: the handed answer's payload <-> crate::runs::run_payload
+        // SYNC: 'answer' <-> crate::announce::kind_named
         r#"CREATE OR REPLACE FUNCTION parked_fire_notify() RETURNS trigger AS $$
+            DECLARE
+                v_project UUID;
             BEGIN
-                PERFORM weft_announce('weft_parked_fire', COALESCE(
-                    (SELECT s.project_id FROM signal s WHERE s.token = NEW.token),
-                    (SELECT r.project_id FROM run r WHERE r.execution_id = NEW.execution_id))::text);
+                IF NEW.execution_id IS NULL THEN
+                    PERFORM weft_announce('weft_parked_fire', (SELECT s.project_id FROM signal s WHERE s.token = NEW.token)::text);
+                ELSE
+                    SELECT r.project_id INTO v_project FROM run r WHERE r.execution_id = NEW.execution_id;
+                    PERFORM weft_announce('weft_parked_fire', v_project::text || ' ' || NEW.execution_id::text);
+                    PERFORM weft_tell(v_project, NEW.execution_id, 'answer');
+                END IF;
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,

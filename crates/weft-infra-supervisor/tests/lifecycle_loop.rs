@@ -724,7 +724,7 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
 // A `wait`-policy stop on a project whose running count is gated stays
 // mid-drain until the test opens the gate, which is how a command is
 // kept running while the loop's other behavior is observed. The claim
-// holds up to `MAX_HOLD` (25s) when nothing is waiting, so every wait
+// holds up to 25s (`CLAIM_HOLD`) when nothing is waiting, so every wait
 // below is bounded well under it: a loop that failed to ask again would
 // hold past the bound and fail the test.
 

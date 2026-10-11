@@ -11,8 +11,11 @@
 //! exact.
 //!
 //! "At once" is held per copy: each takes its share of the limit, the limit
-//! divided by the copies alive (a copy that sleeps lets its lease lapse, and
-//! so is not counted).
+//! divided by the copies alive. A copy that sleeps with nothing under way
+//! lets its lease lapse, and so is not counted; one that sleeps because its
+//! runs only wait outside vouched for its lease until the first of those
+//! waits gives up, and one lease length past it (`crate::run_holds`), and
+//! is counted until then, with the runs it last said were in flight.
 //!
 //! Right after a copy wakes from a sleep, and until its first tick comes
 //! back (under a second normally, a few seconds when the broker itself is
@@ -218,11 +221,11 @@ impl Limits {
         counts.reported = counts.reported.max(mark);
     }
 
-    /// Nothing of this door is under way: no run going, and the broker
-    /// heard every count.
-    pub fn settled(&self) -> bool {
+    /// Whether no run of this door is going, and whether the broker heard
+    /// every count.
+    pub fn idle_and_reported(&self) -> (bool, bool) {
         let counts = self.state.lock().expect("door limits");
-        counts.going.is_empty() && counts.changes == counts.reported
+        (counts.going.is_empty(), counts.changes == counts.reported)
     }
 
     /// The tick loop goes to sleep: from here on this copy hears nothing,

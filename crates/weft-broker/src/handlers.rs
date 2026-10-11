@@ -173,10 +173,11 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-/// How long a held request may actually be held: what the process asked
-/// for, never more than `MAX_HOLD` (a process that wants longer asks again).
-fn held(wait_ms: u64) -> Duration {
-    Duration::from_millis(wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
+/// When a held call's wait of `wait_ms` ends: as long as the caller asks
+/// (it is held on a line, which has no idle timeout), and forever for a
+/// wait past what the clock holds.
+pub(crate) fn held_until(wait_ms: u64) -> tokio::time::Instant {
+    weft_core::deadline::after(tokio::time::Instant::now(), Duration::from_millis(wait_ms))
 }
 
 // ---------- Tasks ----------
@@ -427,7 +428,7 @@ pub async fn task_wait_terminal(
     require_task_owned_by(&state, &caller, req.task_id).await?;
     let outcome = state
         .tasks
-        .wait_for_terminal(req.task_id, held(req.wait_ms))
+        .wait_for_terminal(req.task_id, Duration::from_millis(req.wait_ms))
         .await
         .map_err(internal)?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
@@ -1162,7 +1163,7 @@ pub async fn supervisor_claim_command(
     // own ticks): the answer then says so, and the process takes ownership
     // at once instead of on its next tick. Only after a wake, so a
     // supervisor woken by a command it cannot take yet does not spin.
-    let deadline = tokio::time::Instant::now() + held(req.wait_ms);
+    let deadline = held_until(req.wait_ms);
     let mut heard = state.signals.subscribe();
     let mut woken_once = false;
     loop {
@@ -1686,7 +1687,7 @@ pub async fn infra_wait_apply(
     }
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let deadline = tokio::time::Instant::now() + held(req.wait_ms);
+    let deadline = held_until(req.wait_ms);
     let mut heard = state.signals.subscribe();
     loop {
         let answer = apply_command_state(&state, &req).await?;

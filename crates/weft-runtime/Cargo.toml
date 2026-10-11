@@ -22,7 +22,7 @@ weft-broker = { path = "../weft-broker" }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-listener = { path = "../weft-listener" }
 weft-infra-supervisor = { path = "../weft-infra-supervisor" }
-weft-task-store = { workspace = true }
+weft-task-store = { workspace = true, features = ["serve"] }
 weft-platform-traits = { workspace = true }
 weft-platform-local = { workspace = true }
 weft-platform-gcp = { workspace = true, features = ["control"] }
@@ -41,7 +41,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
-http-body = "1"
 
 [dev-dependencies]
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }

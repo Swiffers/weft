@@ -143,14 +143,19 @@ struct Cancels {
     /// Told whenever a run leaves, for a claim waiting on its run's last
     /// drive here to end ([`Self::claim_once_left`]).
     left: tokio::sync::Notify,
+    /// Told whenever a run comes, once it is registered: the door's tick
+    /// (`crate::door::Door::wake`), which must keep the worker's lease for
+    /// it however the door slept.
+    came: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Cancels {
-    fn new() -> Arc<Self> {
+    fn new(came: Box<dyn Fn() + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
             shards: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
             changed: tokio::sync::Notify::new(),
             left: tokio::sync::Notify::new(),
+            came,
         })
     }
 
@@ -175,6 +180,7 @@ impl Cancels {
             shard.insert(execution_id, flag.clone());
         }
         self.changed.notify_one();
+        (self.came)();
         Some(Registered { cancels: self.clone(), execution_id, flag })
     }
 
@@ -209,6 +215,12 @@ impl Cancels {
             tracing::info!(target: "weft_engine::worker", %execution_id, %cause, "firing the run's cancel");
             flag.cancel_because(cause);
         }
+    }
+
+    /// Every run driven here with its flag, held still: no run comes or
+    /// goes until the guards go.
+    fn held_still(&self) -> Vec<std::sync::MutexGuard<'_, HashMap<ExecutionId, Arc<CancellationFlag>>>> {
+        self.shards.iter().map(|shard| shard.lock().expect("cancel registry")).collect()
     }
 
     /// How many runs this worker drives.
@@ -251,6 +263,10 @@ struct Worker {
     replica: String,
     tenant_id: String,
     cancels: Arc<Cancels>,
+    /// The runs it holds while they only wait outside (`crate::run_holds`).
+    holds: Arc<crate::run_holds::Holds>,
+    /// Told whenever one of [`Self::holds`] goes quiet or moves again.
+    quiet_changed: Arc<tokio::sync::Notify>,
     /// What this worker keeps of its programs and of the runs its triggers
     /// start (`crate::plan`).
     plans: Arc<crate::plan::Plans>,
@@ -360,6 +376,41 @@ struct RunStart {
 }
 
 impl Worker {
+    /// What this worker has under way, its lease holding `lease_secs`
+    /// without a tick: what its door ticks or sleeps on.
+    fn under_way(&self, lease_secs: i64) -> crate::door::UnderWay {
+        crate::door::UnderWay::of(self.clients.writer.settled(), self.cancels.count(), self.holds.quiet(), lease_secs)
+    }
+
+    /// Stop for the cut of its line (`cut`), in one step with the look
+    /// that decides it, if at this instant it drives runs, every one of
+    /// them only waits outside and every record is written (the state its
+    /// door sleeps in). With no run able to come, go, go quiet or move
+    /// again meanwhile, it takes no new run from here on, which also hands
+    /// back each of those runs that can pause, and ends the others, which
+    /// hold their waits in this worker, at the cut ([`Limit::LineCut`]).
+    /// Otherwise nothing is done, and the answer says what stood in the
+    /// way.
+    fn stopped_for_cut(&self, cut: weft_broker_client::line::Cut) -> CutLook {
+        let quiet = self.holds.held_still();
+        let driven = self.cancels.held_still();
+        let runs = || driven.iter().flat_map(|shard| shard.iter());
+        if runs().next().is_none() || runs().any(|(execution_id, _)| !quiet.contains_key(execution_id)) {
+            return CutLook::Moving;
+        }
+        if !self.clients.writer.settled() {
+            return CutLook::RecordsPending;
+        }
+        self.stopping.cancel();
+        let left = (cut.opened + cut.max_age).saturating_duration_since(tokio::time::Instant::now());
+        for (execution_id, flag) in runs() {
+            if quiet.get(execution_id).is_some_and(|how| !how.can_pause) {
+                Limit::LineCut { cut: cut.max_age, left }.end(flag, *execution_id);
+            }
+        }
+        CutLook::Stopped
+    }
+
     /// Claim queued run `execution_id` and carry it on to its end, on a
     /// task of its own so whoever handed it here can go away without
     /// stopping it (a run stops itself before the platform's cap, see
@@ -374,10 +425,14 @@ impl Worker {
             () = self.stopping.cancelled() => return Ok(None),
             registered = self.cancels.claim_once_left(execution_id) => registered,
         };
+        // Stopped as it registered (a stop decides with every registration
+        // held still, `Worker::stopped_for_cut`): it goes no further.
+        if self.stopping.is_cancelled() {
+            return Ok(None);
+        }
         // The claim makes the run this worker's on record, which its lease
-        // keeps: the registration counts it where the door's tick looks, so
-        // the tick goes out now, and the claim does not wait for it.
-        self.door.wake();
+        // keeps: the registration woke the door's tick, and the claim does
+        // not wait for it.
         let Some(claimed) = self.clients.runs.claim(execution_id).await.context("claim the run")? else {
             return Ok(Some(RunAnswer::NothingToRun));
         };
@@ -465,7 +520,16 @@ impl Worker {
         let run = run_one_execution(
             self.catalog.clone(),
             &self.clients,
-            crate::execution_driver::RunDrive { execution_id, journal, program, starts_from, cancellation: cancellation.clone(), exchange, hand_back: Some(&hand_back) },
+            crate::execution_driver::RunDrive {
+                execution_id,
+                journal,
+                program,
+                starts_from,
+                cancellation: cancellation.clone(),
+                exchange,
+                hand_back: Some(&hand_back),
+                hold: Some(self.holds.of(execution_id)),
+            },
             &self.replica,
             &self.tenant_id,
         );
@@ -579,10 +643,7 @@ impl Worker {
                 outcome = &mut run => return outcome,
                 () = &mut capped, if !cap_fired => {
                     cap_fired = true;
-                    if !cancellation.is_cancelled() {
-                        let cap = cap.expect("armed only with a cap");
-                        cancellation.cancel_because(weft_core::exec::CancelCause::Runtime { detail: run_cap_reached(execution_id, cap, live) });
-                    }
+                    Limit::RunCap { cap: cap.expect("armed only with a cap"), live }.end(cancellation, execution_id);
                 }
                 () = &mut caller_left, if !left => {
                     left = true;
@@ -948,7 +1009,7 @@ fn spawn_cancel_watch(worker: Worker) {
             };
             match next {
                 Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload }) if channel == weft_task_store::runs::CANCEL_CHANNEL => {
-                    let Some((project, execution_id)) = weft_task_store::runs::parse_cancel_payload(&payload) else {
+                    let Some((project, execution_id)) = weft_task_store::runs::parse_run_payload(&payload) else {
                         tracing::error!(target: "weft_engine::worker", %payload, "a cancel announcement that names no run");
                         continue;
                     };
@@ -956,7 +1017,10 @@ fn spawn_cancel_watch(worker: Worker) {
                         fire_cancels(&worker).await;
                     }
                 }
-                Ok(weft_task_store::pg_signal::Heard::Recheck | weft_task_store::pg_signal::Heard::Resumed) if driving => fire_cancels(&worker).await,
+                // The line may have missed some (it was lost, or its copy
+                // missed news). The broker hearing again after a quiet spell
+                // (`Resumed`) says nothing missed, and reads nothing.
+                Ok(weft_task_store::pg_signal::Heard::Recheck) if driving => fire_cancels(&worker).await,
                 Ok(_) => {}
                 Err(e) => {
                     tracing::error!(target: "weft_engine::worker", error = %format!("{e:#}"), "the cancel watch stopped hearing the line");
@@ -1000,33 +1064,95 @@ async fn fire_cancels_once(worker: &Worker) -> Result<()> {
     Ok(())
 }
 
-/// Why a run was stopped at the platform's cap, and what to do.
-fn run_cap_reached(execution_id: ExecutionId, cap: std::time::Duration, live: bool) -> String {
-    let minutes = cap.as_secs() / 60;
-    if live {
-        format!(
-            "execution {execution_id} stopped a minute before the {minutes} minute limit this platform puts on one \
-             connection. A conversation meant to last longer keeps its state outside the run and \
-             has its client reconnect, each connection its own run",
-        )
-    } else {
-        format!(
-            "execution {execution_id} stopped a minute before the {minutes} minute limit this platform puts on one \
-             stretch of a run. A run that pauses whole (every branch waiting on a timer or a form) picks \
-             back up with a fresh {minutes} minutes, so split long work with a pause",
-        )
+/// A platform limit a run reaches, which ends it before the limit with a
+/// cause that says how early and what to do ([`Limit::end`]): the one way
+/// a limit ends a run, whichever limit it is.
+#[derive(Debug, Clone, Copy)]
+enum Limit {
+    /// The cap on one stretch of a run (`WorkerConfig::run_cap`), reached
+    /// [`RUN_CAP_MARGIN`] early; `live` when a caller is on the line, whose
+    /// connection the cap bounds.
+    RunCap { cap: std::time::Duration, live: bool },
+    /// The cut of the worker's line to the broker after `cut`, reached by
+    /// a run that waits without being able to pause, `left` before it
+    /// (see [`stop_before_line_cut`]).
+    LineCut { cut: std::time::Duration, left: std::time::Duration },
+}
+
+impl Limit {
+    /// End run `execution_id` through its cancel `flag`, unless something
+    /// already did.
+    fn end(self, flag: &CancellationFlag, execution_id: ExecutionId) {
+        if !flag.is_cancelled() {
+            tracing::info!(target: "weft_engine::worker", %execution_id, limit = ?self, "the run reached a platform limit");
+            flag.cancel_because(self.cause(execution_id));
+        }
+    }
+
+    /// What run `execution_id` is ended with: the limit, how early, and
+    /// the way out that fits it.
+    fn cause(self, execution_id: ExecutionId) -> weft_core::exec::CancelCause {
+        let detail = match self {
+            Limit::RunCap { cap, live: true } => format!(
+                "execution {execution_id} stopped {} before the {} minute limit this platform puts on one \
+                 connection. A conversation meant to last longer keeps its state outside the run and \
+                 has its client reconnect, each connection its own run",
+                seconds(RUN_CAP_MARGIN),
+                cap.as_secs() / 60,
+            ),
+            Limit::RunCap { cap, live: false } => format!(
+                "execution {execution_id} stopped {} before the {minutes} minute limit this platform puts on one \
+                 stretch of a run. A run that pauses whole (every branch waiting on a timer or a form) picks \
+                 back up with a fresh {minutes} minutes, so split long work with a pause",
+                seconds(RUN_CAP_MARGIN),
+                minutes = cap.as_secs() / 60,
+            ),
+            Limit::LineCut { cut, left } => format!(
+                "execution {execution_id} stopped {} before the {} minute limit this platform puts on the \
+                 connection between a worker and weft, which a run that waits without being able to pause keeps open. \
+                 A run that can pause (recorded, not tied to its caller, no bus open) lets go of its worker while it \
+                 waits, and may wait as long as it needs",
+                seconds(left),
+                cut.as_secs() / 60,
+            ),
+        };
+        weft_core::exec::CancelCause::Runtime { detail }
+    }
+}
+
+/// `d` in whole seconds, said the way a person reads it.
+fn seconds(d: std::time::Duration) -> String {
+    match d.as_secs() {
+        1 => "1 second".into(),
+        secs => format!("{secs} seconds"),
     }
 }
 
 fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &WorkerConfig, door: Arc<crate::door::Door>) -> Worker {
+    // A run going quiet or moving again wakes the door's tick, and the
+    // watch on the line's cut (`stop_before_line_cut`).
+    let quiet_changed = Arc::new(tokio::sync::Notify::new());
+    let holds = crate::run_holds::Holds::new({
+        let (door, quiet_changed) = (door.clone(), quiet_changed.clone());
+        Box::new(move || {
+            door.wake();
+            quiet_changed.notify_one();
+        })
+    });
+    let cancels = Cancels::new({
+        let door = door.clone();
+        Box::new(move || door.wake())
+    });
     Worker {
+        holds,
+        quiet_changed,
         door,
         project_id: config.project_id,
         catalog,
         clients,
         replica: config.replica.clone(),
         tenant_id: config.tenant_id.clone(),
-        cancels: Cancels::new(),
+        cancels,
         plans: Arc::new(crate::plan::Plans::new(config.project_id)),
         background: weft_core::in_flight::InFlight::new("worker execution"),
         stopping: tokio_util::sync::CancellationToken::new(),
@@ -1118,9 +1244,12 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     // the broker until it is back (`weft_task_store::held_copy`).
     let worker = new_worker(catalog, clients, &config, door.clone());
     // The door ticks while this worker owns anything on record: a run it
-    // drives, or a record still on its way.
-    let (cancels, writer) = (worker.cancels.clone(), worker.clients.writer.clone());
-    door.start_ticks(Box::new(move || cancels.count() > 0 || !writer.settled())).await?;
+    // drives that does more than wait outside, or a record still on its
+    // way. With only waiting runs, it vouches for the worker until the
+    // earliest of their waits gives up, and sleeps.
+    let lease = weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS);
+    let under_way = worker.clone();
+    door.start_ticks(Box::new(move || under_way.under_way(lease))).await?;
     spawn_cancel_watch(worker.clone());
     // What the runs share goes once nothing used it for the idle window.
     worker.clients.shared.sweep_every(std::time::Duration::from_secs(30));
@@ -1138,9 +1267,11 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         starter: Arc::new(LiveStarter { worker: worker.clone() }),
     }));
     let app = app.layer(axum::middleware::from_fn_with_state(crate::busy::MemoryGuard::sampling(), crate::busy::refuse_when_busy));
-    // Told to stop, the worker hands its recorded runs back and takes no
-    // new call, while the calls it holds go on to their end.
+    // Told to stop, or nearing the cut of its line while its runs only
+    // wait, the worker hands its recorded runs back and takes no new call,
+    // while the calls it holds go on to their end.
     stop_on_signal(&worker);
+    stop_before_line_cut(&worker);
     let stopping = worker.stopping.clone();
     crate::caller_conn::serve(
         app.layer(axum::middleware::map_response(mark_worker_answer)),
@@ -1186,16 +1317,100 @@ async fn wind_down(worker: &Worker) {
     worker.clients.writer.written().await;
 }
 
-/// Fire [`Worker::stopping`] once the platform says to stop, and
-/// [`Worker::stopping_overdue`] [`HAND_BACK_GRACE`] later.
+/// What a look at stopping before the line's cut found
+/// ([`Worker::stopped_for_cut`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutLook {
+    /// Every run only waited, every record was written: it stopped.
+    Stopped,
+    /// No run, or one that does more than wait.
+    Moving,
+    /// Every run only waits, but records are still on their way.
+    RecordsPending,
+}
+
+/// Once [`Worker::stopping`] fired, which takes no new run and hands back
+/// every run that can be suspended once its running steps end: fire
+/// [`Worker::stopping_overdue`] [`HAND_BACK_GRACE`] later, which stops
+/// the steps still running.
+async fn overdue_after_grace(worker: &Worker) {
+    tokio::time::sleep(HAND_BACK_GRACE).await;
+    worker.stopping_overdue.cancel();
+}
+
+/// Stop the worker once the platform says to. A run that cannot be
+/// suspended carries on until the platform ends the process.
 fn stop_on_signal(worker: &Worker) {
-    let (stopping, overdue) = (worker.stopping.clone(), worker.stopping_overdue.clone());
+    let worker = worker.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!(target: "weft_engine::worker", "told to stop: every run that can be suspended is handed back once its running steps end; the others carry on until the process goes");
-        stopping.cancel();
-        tokio::time::sleep(HAND_BACK_GRACE).await;
-        overdue.cancel();
+        worker.stopping.cancel();
+        overdue_after_grace(&worker).await;
+    });
+}
+
+/// Stop the worker once its line is within [`RUN_CAP_MARGIN`] of the cut
+/// the broker said it makes, if every run it drives only waits (the state
+/// its door sleeps in): what those runs wait on is pushed down that line,
+/// and a worker whose runs only wait never opens another, since the reads
+/// after a new line would wake the database. Decided as the margin is
+/// reached, then again whenever that state may have been entered (a run
+/// going quiet, a run leaving, the records written) until the line goes,
+/// each time in one step with the stop ([`Worker::stopped_for_cut`]). A
+/// busy worker lets its line be cut and opens another: its work keeps the
+/// database awake anyway. A line that closed for want of anything to do
+/// and opened again is a new line, counted afresh. Nothing ends the
+/// process from outside then: it winds down, and the platform starts a
+/// fresh worker on the next request.
+fn stop_before_line_cut(worker: &Worker) {
+    let mut cut = worker.clients.line.cut_at();
+    let worker = worker.clone();
+    tokio::spawn(async move {
+        'lines: loop {
+            let Some(told) = *cut.borrow_and_update() else {
+                if cut.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            };
+            let within_margin = told.opened + told.max_age.saturating_sub(RUN_CAP_MARGIN);
+            tokio::select! {
+                changed = cut.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    continue 'lines;
+                }
+                () = tokio::time::sleep_until(within_margin) => {}
+            }
+            loop {
+                // Armed before the look, so a change between the look and
+                // the wait still wakes it.
+                let left = worker.cancels.left.notified();
+                tokio::pin!(left);
+                left.as_mut().enable();
+                let looked = worker.stopped_for_cut(told);
+                if looked == CutLook::Stopped {
+                    tracing::info!(target: "weft_engine::worker", line_cut_secs = told.max_age.as_secs(), "every run only waits and weft cuts this worker's line soon, on which they hear their answers: the ones that can pause are handed back, the others end, and the next request starts a fresh worker");
+                    overdue_after_grace(&worker).await;
+                    return;
+                }
+                // `written` answers at once if the records went out since
+                // the look.
+                tokio::select! {
+                    changed = cut.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        continue 'lines;
+                    }
+                    () = worker.quiet_changed.notified() => {}
+                    () = &mut left => {}
+                    () = worker.clients.writer.written(), if looked == CutLook::RecordsPending => {}
+                }
+            }
+        }
     });
 }
 
@@ -1540,16 +1755,31 @@ mod tests {
     use super::*;
     use crate::execution_driver::engine_test_rig::{clients, MemJournal};
 
-    /// A run stopped at the platform's cap is told the way out that fits
-    /// it: a pause for one nobody is talking to, and for one with a caller
-    /// a reconnect over kept state.
+    /// Every platform limit ends a run through the same cancel, told the
+    /// way out that fits it: a pause for a run nobody is talking to, a
+    /// reconnect over kept state for one with a caller, a run that can
+    /// pause for one that waited on the worker's line; each says how early
+    /// it stopped: the margin for the cap, what was left for the line.
     #[test]
-    fn the_cap_names_the_way_out_that_fits_the_run() {
-        let cap = std::time::Duration::from_secs(3600);
-        let live = run_cap_reached(ExecutionId::nil(), cap, true);
-        assert!(live.contains("60 minute limit") && live.contains("reconnect"), "{live}");
-        let plain = run_cap_reached(ExecutionId::nil(), cap, false);
-        assert!(plain.contains("60 minute limit") && plain.contains("pause"), "{plain}");
+    fn a_limit_ends_a_run_naming_the_way_out_that_fits_it() {
+        let hour = std::time::Duration::from_secs(3600);
+        let margin = RUN_CAP_MARGIN.as_secs();
+        for (limit, early, way_out) in [
+            (Limit::RunCap { cap: hour, live: true }, margin, "reconnect"),
+            (Limit::RunCap { cap: hour, live: false }, margin, "split long work with a pause"),
+            (Limit::LineCut { cut: hour, left: std::time::Duration::from_secs(37) }, 37, "A run that can pause"),
+        ] {
+            let early = format!("{early} seconds before the 60 minute limit");
+            let flag = CancellationFlag::new_arc();
+            limit.end(&flag, ExecutionId::nil());
+            let detail = match flag.cause() {
+                Some(weft_core::exec::CancelCause::Runtime { detail }) => detail,
+                other => panic!("{limit:?} ended the run with {other:?}"),
+            };
+            assert!(detail.contains(&early) && detail.contains(way_out), "{detail}");
+            Limit::RunCap { cap: hour, live: false }.end(&flag, ExecutionId::nil());
+            assert!(matches!(flag.cause(), Some(weft_core::exec::CancelCause::Runtime { detail: again }) if again == detail), "the first ending stands");
+        }
     }
 
     #[test]
@@ -1586,7 +1816,10 @@ mod tests {
         async fn let_go(&self, _execution_id: ExecutionId, _why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
             unreachable!("nothing is driven here")
         }
-        async fn answers(&self, _execution_id: ExecutionId, _taken: &[String], _wait: std::time::Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+        async fn answers(&self, _execution_id: ExecutionId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+            unreachable!("nothing is driven here")
+        }
+        fn told(&self) -> weft_task_store::pg_signal::Subscription {
             unreachable!("nothing is driven here")
         }
         async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
@@ -1744,7 +1977,7 @@ mod tests {
     fn cancel_heard(execution_id: ExecutionId) -> weft_task_store::pg_signal::Heard {
         weft_task_store::pg_signal::Heard::Signal {
             channel: weft_task_store::runs::CANCEL_CHANNEL,
-            payload: weft_task_store::runs::cancel_payload(uuid::Uuid::from_u128(1), execution_id).into(),
+            payload: weft_task_store::runs::run_payload(uuid::Uuid::from_u128(1), execution_id).into(),
         }
     }
 
@@ -1769,9 +2002,11 @@ mod tests {
     }
 
     // A cancel the line announces for a run driven here reaches its flag;
-    // one for a run driven elsewhere asks nothing; the line is held open
-    // exactly while something is driven; and a line that opens again asks
-    // for the cancels of every run driven.
+    // one for a run driven elsewhere asks nothing; the broker hearing again
+    // after a quiet spell, and a line lost, ask nothing; the line is held
+    // open exactly while something is driven; and a line that opens again
+    // (or may have missed some) asks once for the cancels of every run
+    // driven.
     weft_core::stress_test! {
         name: a_heard_cancel_fires_the_flag_of_the_run_driven,
         runs: 20,
@@ -1791,6 +2026,8 @@ mod tests {
             line.pushed.send(cancel_heard(driven)).unwrap();
             cancelled(&flag).await;
             assert_eq!(runs.asked.load(std::sync::atomic::Ordering::SeqCst), 1, "a cancel of a run driven elsewhere asks nothing");
+            line.pushed.send(weft_task_store::pg_signal::Heard::Resumed).unwrap();
+            line.pushed.send(weft_task_store::pg_signal::Heard::Lost).unwrap();
 
             let missed = weft_core::new_execution_id();
             let _missed = worker.cancels.claim(missed).expect("a fresh run");
@@ -1798,6 +2035,7 @@ mod tests {
             runs.cancels.lock().unwrap().push(missed);
             line.pushed.send(weft_task_store::pg_signal::Heard::Recheck).unwrap();
             cancelled(&flag).await;
+            assert_eq!(runs.asked.load(std::sync::atomic::Ordering::SeqCst), 2, "only the recheck asked again");
 
             drop(registered);
             drop(_missed);
@@ -1805,11 +2043,253 @@ mod tests {
         }
     }
 
+    /// The race a sleeping door must never lose: the door sleeps because
+    /// its only run waits outside, having vouched for the worker; a caller
+    /// is admitted and its run registered while it sleeps. The registration
+    /// itself wakes the tick, which then keeps the lease for the new run.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_registered_while_the_door_sleeps_on_waiting_runs_wakes_it() {
+        let (worker, broker) = worker_firing(|_, _| {});
+        let (cancels, holds) = (worker.cancels.clone(), worker.holds.clone());
+        worker.door.start_ticks(Box::new(move || crate::door::UnderWay::of(true, cancels.count(), holds.quiet(), 15))).await.unwrap();
+        let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        let quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        quiet.quiet(Some(crate::run_holds::Quiet { until: 5_000, can_pause: false }));
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let asleep = broker.ticks.lock().unwrap().clone();
+        assert_eq!(asleep.last().unwrap().vouch_until, Some(5_015), "vouched until the wait ends, and a lease past it");
+
+        let _caller = worker.cancels.claim(uuid::Uuid::from_u128(2)).expect("a fresh run");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let woken = broker.ticks.lock().unwrap().clone();
+        assert_eq!(woken.len(), asleep.len() + 1, "the new run woke the tick at once");
+        assert_eq!(woken.last().unwrap().vouch_until, None, "a run that moves: one lease length at a time again");
+        drop((waiting, quiet));
+    }
+
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// A worker watching its line's cut, the line opened now and cut after
+    /// an hour.
+    fn watching_its_line() -> (Worker, Arc<crate::context::TestLine>) {
+        let line = crate::context::TestLine::new();
+        let worker = worker_over(Arc::new(Runs::default()), line.clone());
+        stop_before_line_cut(&worker);
+        line.cut.send_replace(Some(weft_broker_client::line::Cut { opened: tokio::time::Instant::now(), max_age: HOUR }));
+        (worker, line)
+    }
+
+    /// A run holding its waits in the worker until its hold, far off.
+    fn holding() -> Option<crate::run_holds::Quiet> {
+        Some(crate::run_holds::Quiet { until: i64::MAX, can_pause: false })
+    }
+
+    /// Whether `flag` was ended at the line's cut, `left` before it.
+    fn ended_at_the_cut(flag: &CancellationFlag, left: &str) -> bool {
+        matches!(
+            flag.cause(),
+            Some(weft_core::exec::CancelCause::Runtime { detail })
+                if detail.contains("between a worker and weft") && detail.contains(&format!("stopped {left} before"))
+        )
+    }
+
+    /// Let the watch on the line's cut act on what just changed, no time
+    /// passing.
+    async fn settled() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A worker whose only run waits stops as its line comes within the
+    /// margin of its cut, not before, and that run ends naming the time
+    /// that was left; the hand-back is overdue after the grace. A line
+    /// closed and opened again counts afresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_whose_runs_only_wait_stops_before_its_line_is_cut() {
+        let (worker, line) = watching_its_line();
+        let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        let quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        quiet.quiet(holding());
+        tokio::time::sleep(HOUR / 2).await;
+        // Closed while idle, opened again: a new line, counted from now.
+        line.cut.send_replace(None);
+        line.cut.send_replace(Some(weft_broker_client::line::Cut { opened: tokio::time::Instant::now(), max_age: HOUR }));
+        tokio::time::sleep(HOUR - RUN_CAP_MARGIN - std::time::Duration::from_secs(1)).await;
+        assert!(!worker.stopping.is_cancelled(), "the new line still has time");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(worker.stopping.is_cancelled(), "stopping within the margin of the cut");
+        let left = format!("{} seconds", RUN_CAP_MARGIN.as_secs());
+        assert!(ended_at_the_cut(&waiting.flag, &left), "the waiting run ends naming the time left: {:?}", waiting.flag.cause());
+        tokio::time::sleep(HAND_BACK_GRACE).await;
+        assert!(worker.stopping_overdue.is_cancelled(), "steps still running are stopped after the grace");
+        drop((waiting, quiet));
+    }
+
+    /// A busy worker lets its line be cut: it does not stop within the
+    /// margin while a run moves, and stops the moment that run comes to
+    /// only wait, even in the last second before the cut.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_worker_stops_the_moment_its_runs_only_wait() {
+        let (worker, _line) = watching_its_line();
+        let moving = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        tokio::time::sleep(HOUR - std::time::Duration::from_secs(1)).await;
+        assert!(!worker.stopping.is_cancelled(), "a busy worker carries on into the margin");
+        assert!(!moving.flag.is_cancelled());
+        let quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        quiet.quiet(holding());
+        settled().await;
+        assert!(worker.stopping.is_cancelled(), "only waiting in the last second: it stops at once");
+        assert!(ended_at_the_cut(&moving.flag, "1 second"), "{:?}", moving.flag.cause());
+        drop((moving, quiet));
+    }
+
+    /// The look and the stop are one step: a run that moves again (its
+    /// answer came) as the margin arrives keeps the worker running and
+    /// watching, as does another run that moves; once that one leaves and
+    /// the first waits again, the worker stops then.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_moves_as_the_margin_arrives_keeps_the_worker_watching() {
+        let (worker, _line) = watching_its_line();
+        let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        let quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        quiet.quiet(holding());
+        let other = worker.cancels.claim(uuid::Uuid::from_u128(2)).expect("a fresh run");
+        tokio::time::sleep(HOUR - RUN_CAP_MARGIN - std::time::Duration::from_millis(1)).await;
+        // Answered as the margin arrives.
+        quiet.quiet(None);
+        drop(other);
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(!worker.stopping.is_cancelled(), "a run moves: no stop");
+        assert!(!waiting.flag.is_cancelled());
+        quiet.quiet(holding());
+        settled().await;
+        assert!(worker.stopping.is_cancelled(), "every run waits again within the margin: it stops then");
+        assert!(ended_at_the_cut(&waiting.flag, "50 seconds"), "{:?}", waiting.flag.cause());
+        drop((waiting, quiet));
+    }
+
+    /// Another run that moves keeps a worker whose first run waits from
+    /// stopping; once it leaves, the worker stops at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_stops_once_its_last_moving_run_leaves() {
+        let (worker, _line) = watching_its_line();
+        let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        let quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        quiet.quiet(holding());
+        let moving = worker.cancels.claim(uuid::Uuid::from_u128(2)).expect("a fresh run");
+        tokio::time::sleep(HOUR - std::time::Duration::from_secs(30)).await;
+        assert!(!worker.stopping.is_cancelled(), "a run moves: no stop");
+        drop(moving);
+        settled().await;
+        assert!(worker.stopping.is_cancelled(), "the last moving run left: it stops then");
+        assert!(ended_at_the_cut(&waiting.flag, "30 seconds"), "{:?}", waiting.flag.cause());
+        drop((waiting, quiet));
+    }
+
+    /// In one stop, a waiting run that can pause is left to the stopping
+    /// path, which hands it back, and one that holds its waits in the
+    /// worker ends at the cut.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_hands_back_what_can_pause_and_ends_what_cannot() {
+        let (worker, _line) = watching_its_line();
+        let pausable = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        let pausable_quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        pausable_quiet.quiet(Some(crate::run_holds::Quiet { until: i64::MAX, can_pause: true }));
+        let held = worker.cancels.claim(uuid::Uuid::from_u128(2)).expect("a fresh run");
+        let held_quiet = worker.holds.of(uuid::Uuid::from_u128(2));
+        held_quiet.quiet(holding());
+        let asked = worker.stopping.child_token();
+        tokio::time::sleep(HOUR - RUN_CAP_MARGIN + std::time::Duration::from_secs(1)).await;
+        assert!(asked.is_cancelled(), "asked to leave: the run that can pause is handed back");
+        assert!(!pausable.flag.is_cancelled(), "a run that can pause is never ended at the cut");
+        let left = format!("{} seconds", RUN_CAP_MARGIN.as_secs());
+        assert!(ended_at_the_cut(&held.flag, &left), "{:?}", held.flag.cause());
+        drop((pausable, pausable_quiet, held, held_quiet));
+    }
+
+    /// A record that writes only when let through.
+    struct GatedRecord {
+        record: Arc<MemJournal>,
+        through: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl weft_journal::RecordClient for GatedRecord {
+        async fn record_batch(&self, batch: Vec<u8>) -> Result<weft_journal::frame::BatchAnswer, weft_journal::BatchError> {
+            self.through.acquire().await.expect("the gate stays").forget();
+            self.record.record_batch(batch).await
+        }
+        async fn record_of(&self, execution_id: ExecutionId) -> anyhow::Result<weft_journal::record::RawRecord> {
+            self.record.record_of(execution_id).await
+        }
+        async fn give_up(&self, execution_id: ExecutionId, why: String) -> Result<(), weft_journal::BatchError> {
+            self.record.give_up(execution_id, why).await
+        }
+    }
+
+    /// Every run only waits but its records are still on their way at the
+    /// margin: no stop yet; once they are written, the worker stops then,
+    /// however soon after the look they landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_stops_once_the_records_of_its_waiting_runs_are_written() {
+        let gate = Arc::new(GatedRecord { record: Arc::new(MemJournal::default()), through: tokio::sync::Semaphore::new(0) });
+        let mut clients = clients(Arc::new(MemJournal::default()));
+        clients.writer = crate::journal_writer::WorkerJournal::start(gate.clone(), Default::default(), &crate::context::io_runtime().expect("the io runtime starts"));
+        let line = crate::context::TestLine::new();
+        clients.line = line.clone();
+        let worker = worker_with(clients);
+        stop_before_line_cut(&worker);
+        line.cut.send_replace(Some(weft_broker_client::line::Cut { opened: tokio::time::Instant::now(), max_age: HOUR }));
+
+        let execution_id = uuid::Uuid::from_u128(1);
+        let waiting = worker.cancels.claim(execution_id).expect("a fresh run");
+        let quiet = worker.holds.of(execution_id);
+        quiet.quiet(holding());
+        let journal = worker.clients.writer.run(crate::journal_writer::RunSpec {
+            execution_id,
+            settings: Default::default(),
+            keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+            epoch: 1,
+            next_seq: 0,
+            redaction: Default::default(),
+        });
+        journal.hand(&ExecEvent::ExecutionFailed { execution_id, error: "on its way".into(), at_unix: 0 }, None).unwrap();
+        tokio::time::sleep(HOUR - RUN_CAP_MARGIN + std::time::Duration::from_secs(1)).await;
+        assert!(!worker.clients.writer.settled(), "the record is held at the gate");
+        assert!(!worker.stopping.is_cancelled(), "records on their way: no stop yet");
+
+        gate.through.add_permits(1_000);
+        for _ in 0..500 {
+            if worker.stopping.is_cancelled() {
+                break;
+            }
+            // The writer runs on its own runtime, in real time.
+            tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(10))).await.unwrap();
+        }
+        assert!(worker.stopping.is_cancelled(), "the records went out: it stops then");
+        assert!(waiting.flag.is_cancelled());
+        drop((waiting, quiet, journal));
+    }
+
+    /// A line the broker keeps for good never stops the worker.
+    #[tokio::test(start_paused = true)]
+    async fn a_line_kept_for_good_never_stops_the_worker() {
+        let (worker, line) = watching_its_line();
+        line.cut.send_replace(None);
+        let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
+        let quiet = worker.holds.of(uuid::Uuid::from_u128(1));
+        quiet.quiet(holding());
+        tokio::time::sleep(HOUR * 24).await;
+        assert!(!worker.stopping.is_cancelled());
+        drop((waiting, quiet));
+    }
+
     /// A delivery of a run whose drive here is still leaving claims it
     /// once that drive left.
     #[tokio::test]
     async fn a_claim_waits_for_the_runs_last_drive_here_to_leave() {
-        let cancels = Cancels::new();
+        let cancels = Cancels::new(Box::new(|| {}));
         let execution_id = weft_core::new_execution_id();
         let leaving = cancels.claim(execution_id).expect("a fresh run");
         let mut claiming = tokio::spawn({

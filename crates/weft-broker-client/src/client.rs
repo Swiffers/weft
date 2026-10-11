@@ -46,8 +46,8 @@ impl HttpCore {
         Self::parse_success(answer, path)
     }
 
-    /// A call the broker holds open for up to `hold` (never more than
-    /// `MAX_HOLD`, which it enforces). The hold starts once the call is
+    /// A call the broker holds open for up to `hold`, however long that is:
+    /// a line has no idle timeout. The hold starts once the call is
     /// written, which may take up to the usual wait to send, so the line
     /// waits that, the hold and [`HOLD_GRACE`], and never gives up before
     /// the broker's own hold ends.
@@ -58,7 +58,7 @@ impl HttpCore {
         hold: Duration,
     ) -> Result<Res> {
         let to_send = DEFAULT_CALL_WAIT.to_send;
-        let wait = CallWait { to_send, to_answer: to_send + hold + HOLD_GRACE };
+        let wait = CallWait { to_send, to_answer: to_send.saturating_add(hold).saturating_add(HOLD_GRACE) };
         let answer = self.post_raw(path, body, wait).await?;
         Self::parse_success(answer, path)
     }
@@ -171,24 +171,11 @@ impl<T> WriteOutcome<T> {
     }
 }
 
-/// Wait up to `wait` in holds the broker grants (each at most
-/// `MAX_HOLD`, which it enforces), asking again after a hold that ended
-/// without the answer `done` looks for. Hands back the last answer. A
-/// `hold` that waits out an unavailable broker ([`read_until_answered`])
-/// stretches past `wait` by as long as the broker stays down.
-async fn held<T, F, Fut>(wait: Duration, mut hold: F, done: impl Fn(&T) -> bool) -> Result<T>
-where
-    F: FnMut(Duration) -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let deadline = tokio::time::Instant::now() + wait;
-    loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let answer = hold(left.min(weft_task_store::pg_signal::MAX_HOLD)).await?;
-        if done(&answer) || left <= weft_task_store::pg_signal::MAX_HOLD {
-            return Ok(answer);
-        }
-    }
+/// `wait` as a held call's `wait_ms`, in milliseconds. A wait too long to
+/// count in them is sent as the most they hold, which the broker reads as
+/// waiting for good (`weft_core::deadline::after`).
+fn wait_ms(wait: Duration) -> u64 {
+    u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Whether the broker answered that the call did nothing at all
@@ -367,17 +354,9 @@ impl TaskStoreClient for BrokerTaskStoreClient {
     }
 
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
-        held(
-            timeout,
-            |hold| async move {
-                let req = TaskWaitTerminalRequest { task_id, wait_ms: hold.as_millis() as u64 };
-                let resp: TaskWaitTerminalResponse =
-                    self.http.post_held("/v1/task/wait_terminal", &req, hold).await?;
-                Ok(resp.into_outcome())
-            },
-            |outcome| outcome.status.is_terminal(),
-        )
-        .await
+        let req = TaskWaitTerminalRequest { task_id, wait_ms: wait_ms(timeout) };
+        let resp: TaskWaitTerminalResponse = self.http.post_held("/v1/task/wait_terminal", &req, timeout).await?;
+        Ok(resp.into_outcome())
     }
 }
 
@@ -683,19 +662,19 @@ impl BrokerRunClient {
     }
 
     /// The answers waiting for `execution_id`'s waits, but the waits in
-    /// `taken`, held up to `wait` until one is there (`RunAnswersRequest`).
-    pub async fn answers(&self, execution_id: ExecutionId, taken: &[String], wait: Duration) -> Result<Vec<RunAnswer>> {
+    /// `taken`, read once (`RunAnswersRequest`).
+    pub async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> Result<Vec<RunAnswer>> {
         let path = "/v1/run/answers";
-        held(
-            wait,
-            |hold| async move {
-                let req = RunAnswersRequest { execution_id, wait_ms: hold.as_millis() as u64, taken: taken.to_vec() };
-                let resp: RunAnswersResponse = read_until_answered(path, || self.http.post_held(path, &req, hold)).await?;
-                Ok(resp.answers)
-            },
-            |answers| !answers.is_empty(),
-        )
-        .await
+        let req = RunAnswersRequest { execution_id, taken: taken.to_vec() };
+        let resp: RunAnswersResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
+        Ok(resp.answers)
+    }
+
+    /// What the broker pushes about the runs this worker drives: an answer
+    /// handed to one (`crate::line::PARKED_FIRE_CHANNEL`), and when the line
+    /// may have missed some (see [`BrokerLink::subscribe`]).
+    pub fn told(&self) -> weft_task_store::pg_signal::Subscription {
+        self.http.link.subscribe()
     }
 
     /// The cancels waiting for the runs this worker drives (`RunCancelsRequest`).
@@ -870,21 +849,12 @@ impl BrokerSupervisorClient {
         busy_commands: &[i64],
         wait: Duration,
     ) -> Result<SupervisorClaim> {
-        held(
-            wait,
-            |hold| {
-                let req = SupervisorClaimCommandRequest {
-                    claimer_replica: claimer_replica.to_string(),
-                    busy_commands: busy_commands.to_vec(),
-                    wait_ms: hold.as_millis() as u64,
-                };
-                async move {
-                    self.http.post_held("/v1/supervisor/claim_command", &req, hold).await
-                }
-            },
-            |claim| !matches!(claim, SupervisorClaim::Nothing),
-        )
-        .await
+        let req = SupervisorClaimCommandRequest {
+            claimer_replica: claimer_replica.to_string(),
+            busy_commands: busy_commands.to_vec(),
+            wait_ms: wait_ms(wait),
+        };
+        self.http.post_held("/v1/supervisor/claim_command", &req, wait).await
     }
 
     pub async fn event_record(
@@ -1197,19 +1167,8 @@ impl BrokerInfraStateClient {
         command_id: i64,
         wait: Duration,
     ) -> Result<InfraWaitApplyResponse> {
-        held(
-            wait,
-            |hold| {
-                let req = InfraWaitApplyRequest {
-                    project_id,
-                    command_id,
-                    wait_ms: hold.as_millis() as u64,
-                };
-                async move { self.http.post_held("/v1/infra/wait_apply", &req, hold).await }
-            },
-            |resp: &InfraWaitApplyResponse| resp.completed,
-        )
-        .await
+        let req = InfraWaitApplyRequest { project_id, command_id, wait_ms: wait_ms(wait) };
+        self.http.post_held("/v1/infra/wait_apply", &req, wait).await
     }
 }
 

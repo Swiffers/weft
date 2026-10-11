@@ -3,7 +3,22 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
-## Unreleased
+## 2026-10-11 (0.2.267)
+
+**On Google Cloud, a run waiting on a person lets the database sleep.**
+
+A run that cannot pause (a route still answering its caller, a trigger with
+`recorded: false`, a live stream between steps) keeps its question in its
+worker while it waits. Until now that kept the database awake for the whole
+wait. Now nothing touches the database until the answer or a cancel arrives:
+the answer reaches the worker through a news topic weft creates in your
+Google project. Upgrade as usual (merge upstream into your fork and run the
+install workflow again): it creates the topic and the rights that go with it.
+
+A worker on Google Cloud can keep one connection to weft for at most an
+hour. If every run on it is still waiting at that point, the worker stops:
+runs that can pause carry on elsewhere, and a run that cannot pause ends,
+saying which limit ended it. To wait longer, make the run one that can pause.
 
 **Five instance nodes lost "Instance" from their names.**
 

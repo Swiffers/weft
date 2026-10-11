@@ -326,13 +326,23 @@ they finish. A call the broker holds until something happens (new journal
 rows) costs nothing while it waits, so a worker takes one seat at the broker
 however many calls its runs hold open, and a call whose caller stops waiting
 is dropped at the broker too. The broker also pushes down the same connection
-the changes a worker keeps a copy of (see [the worker](#the-worker)), and the
-cancel of a run the worker drives. A connection with nothing to do for a
-minute closes, and opens again on the next call, so an idle process holds
-nothing open at the broker, except a worker. A worker driving runs keeps its
-connection open, to hear their cancels, and an idle one reports to the broker
-every second (that it is alive, and how many runs it drives), so its
-connection opens again within a second of closing. When the connection breaks, it comes back by
+the changes a worker keeps a copy of (see [the worker](#the-worker)), and,
+for a run the worker drives, its cancel and every answer handed to it. A
+connection with nothing to do for a minute closes, and opens again on the
+next call, so an idle process holds nothing open at the broker, except a
+worker. A worker driving runs keeps its connection open, to hear their
+cancels and answers, and an idle one reports to the broker every second
+(that it is alive, and how many runs it drives), so its connection opens
+again within a second of closing. On Google Cloud a connection is cut after
+an hour, the most Cloud Run lets one request last, and the broker says so
+when it opens. A busy worker lets it be cut and opens another, like any
+broken connection. A worker whose runs all only wait never does, since
+opening one makes it read again, which would wake the database: once its
+connection is within a minute of the cut and its runs only wait, it stops
+the way it does when Cloud Run stops it. The runs that can pause are
+handed back for a fresh worker to carry on, the others end with a message
+naming the limit, and the worker exits, so the next request starts a new
+one. When the connection breaks, it comes back by
 itself: a call not yet sent goes out on the new one if it is back within the
 call's wait. Past that, or when a sent call got no answer, two kinds of call
 are made again because doing so is safe: a batch of records (a batch that
@@ -378,9 +388,31 @@ A lost fast run is not marked cancelled the moment its worker dies: the
 dispatcher notices and ends it. Every worker reports that it is alive through
 the broker once a second, and counts as gone 15 seconds after its last report.
 The dispatcher ends a run once its worker has been gone for another 15
-seconds, and it checks every 15 seconds, so a fast run ends 30 to 45 seconds
-after its worker last reported. Its journal holds what reached the database
+seconds, and it looks for that at most once every 15 seconds, so a fast run
+ends 30 to 45 seconds after its worker last reported. Its journal holds what reached the database
 before the worker died.
+
+A worker whose runs are all only waiting on something outside them (a
+person's answer, while the run cannot pause) stops reporting, so the
+database is not woken every second for a wait that can last hours. Its last
+report says it is alive until the first of those waits would give up (its
+`holdSecs` running out), plus 15 seconds, and it reports again as soon as
+one of its runs moves (that first wait giving up included) or a new run
+comes, saying again how long it is alive for. The answer or the cancel that ends
+the wait is written by the dispatcher, which also tells the broker copy
+holding the worker's connection, without going through the database (on
+Google Cloud, over Pub/Sub). That broker copy stays up for the length of the
+wait, and pushes the answer or the cancel down the worker's connection, and
+only then does the worker read it. Nothing else reads while a run waits: the
+worker read its answers once as the run started waiting, and the broker
+reads only for the calls a worker makes. So the database sleeps for as long
+as the run waits, and wakes for the answer, the cancel, or the run's end,
+or when the connection breaks, after which the worker reads once to catch
+up. On Google Cloud such a wait lasts at most until the worker stops before
+its connection is cut, within the hour (see [the
+broker](#the-broker-and-who-may-talk-to-what)). If the worker dies during the wait, its
+runs are ended (or carried on, if durable) 30 to 45 seconds after that
+first wait would have given up.
 
 In that same check, a durable run whose worker died is queued again, and the
 dispatcher hands it to another worker at once, which carries it on from its

@@ -291,6 +291,7 @@
             cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
             exchange: None,
             hand_back: None,
+            hold: None,
         };
         let catalog = catalog(vec![("Trig", Box::new(Answer)), ("Step", Box::new(Pass))]);
         let drove = crate::execution_driver::run_one_execution_observed(catalog, &clients, drive, "instance-test", "tenant-test")
@@ -398,6 +399,7 @@
             cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
             exchange: Some(crate::execution_driver::Exchange { conn: conn.clone(), live: Some(conn.clone()), sink }),
             hand_back: None,
+            hold: None,
         };
         let drove = tokio::time::timeout(
             std::time::Duration::from_secs(30),

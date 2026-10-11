@@ -24,7 +24,6 @@ use axum::routing::post;
 use axum::Router;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{Alarm, CoreRole, Wake};
-use weft_task_store::pg_signal::{Busy, PgSignalWatch};
 
 /// A role's own tick, for a role that scales to zero: drain its loops,
 /// then set its next wake, if any loop wants one. `run` takes the loops
@@ -79,47 +78,6 @@ async fn tick(State(t): State<Tick>, axum::extract::RawQuery(query): axum::extra
             tracing::error!(target: "weft_runtime::server", role = %t.role, error = %format!("{e:#}"), "could not set the next tick");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("the next tick could not be set: {e:#}")).into_response()
         }
-    }
-}
-
-/// Keep `watch` listening while a request is answered, to the end of its
-/// answer's body: a stream of events is listened for until it closes. A
-/// process that scales to zero lets its watch go quiet only between
-/// requests (`weft_task_store::pg_signal::Listening::WhileBusy`), and
-/// every request it answers may write, so a quiet watch listens again
-/// before the request goes on.
-pub async fn keep_listening(
-    State(watch): State<Arc<PgSignalWatch>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let busy = watch.busy().await;
-    next.run(request).await.map(|body| axum::body::Body::new(Held { body, _busy: busy }))
-}
-
-/// An answer's body, holding its process busy until it ends.
-struct Held {
-    body: axum::body::Body,
-    _busy: Busy,
-}
-
-impl http_body::Body for Held {
-    type Data = axum::body::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::pin::Pin::new(&mut self.body).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.body.size_hint()
     }
 }
 

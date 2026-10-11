@@ -9,7 +9,8 @@
 //!   verified against Google's keys (`identity`), the object store on
 //!   Cloud Storage (`storage`), frontends on Cloud Run (`frontends`), the
 //!   door in front of the install's domains on a load balancer
-//!   (`domains`), the holders on a worker pool (`holders`). `api` is the one REST
+//!   (`domains`), the holders on a worker pool (`holders`), what happened
+//!   to a run told across copies on Pub/Sub (`news`). `api` is the one REST
 //!   client they share, `names` what they call things, `accounts` the
 //!   project's own service account.
 
@@ -36,6 +37,8 @@ pub mod infra_host;
 #[cfg(feature = "control")]
 pub mod names;
 #[cfg(feature = "control")]
+pub mod news;
+#[cfg(feature = "control")]
 pub mod runner;
 #[cfg(feature = "control")]
 pub mod storage;
@@ -44,6 +47,6 @@ pub use metadata::{identity_from_env, MetadataTokens};
 #[cfg(feature = "control")]
 pub use {
     alarm::CloudTasksAlarm, api::Google, domains::LoadBalancerDomains, frontends::CloudRunFrontends, holders::WorkerPoolHolders,
-    identity::GoogleIdentity, images::CloudBuildImages, infra_host::ComputeInfraHost, runner::CloudRunRunner,
+    identity::GoogleIdentity, images::CloudBuildImages, infra_host::ComputeInfraHost, news::PubSubNews, runner::{CloudRunRunner, REQUEST_CAP},
     storage::GcsObjectStore,
 };

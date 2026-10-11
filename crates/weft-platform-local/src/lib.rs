@@ -9,6 +9,7 @@
 //! - `images`: `docker build`, into the daemon's own store.
 //! - `alarm`: wakes kept in Postgres, delivered by the runtime.
 //! - `identity`: identities the install signs with its own key.
+//! - `news`: nothing to carry, the database being listened to for good.
 
 pub mod alarm;
 pub mod docker;
@@ -18,6 +19,7 @@ pub mod holders;
 pub mod identity;
 pub mod images;
 pub mod infra_host;
+pub mod news;
 pub mod runner;
 
 pub use alarm::{Deliver, HttpDeliver, LocalAlarm, NotTaken};
@@ -28,4 +30,5 @@ pub use holders::OneProcessHolds;
 pub use identity::LocalIdentity;
 pub use images::{bound_build_cache, DockerImageBuilder};
 pub use infra_host::{AgentBroker, AgentIdentity, DiskBacking, GpuAccess, LocalInfraHost, LocalInfraHostConfig, Publish};
+pub use news::DatabaseNews;
 pub use runner::{LocalRunner, LocalRunnerConfig};

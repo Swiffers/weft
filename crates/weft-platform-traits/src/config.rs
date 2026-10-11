@@ -147,6 +147,9 @@ pub struct GcpPlatform {
     /// The Cloud Tasks queue wakes go through.
     #[serde(rename = "tasksQueue")]
     pub tasks_queue: String,
+    /// The Pub/Sub topic news goes through (`crate::news`).
+    #[serde(rename = "newsTopic")]
+    pub news_topic: String,
     /// The service account weft's own roles run as.
     #[serde(rename = "coreServiceAccount")]
     pub core_service_account: String,
@@ -569,6 +572,7 @@ pub(crate) mod tests {
             build_bucket: "b".into(),
             builder_service_account: "builder@p".into(),
             tasks_queue: "q".into(),
+            news_topic: "weft-news".into(),
             core_service_account: "core@p".into(),
             holder_pool: "projects/p/locations/r/workerPools/weft-holder".into(),
             dispatcher_service: "weft-role-dispatcher".into(),

@@ -10,7 +10,10 @@ repository.workspace = true
 # Postgres via `#[sqlx::test]` + $DATABASE_URL. OFF by default so
 # `cargo test --workspace` is green on any machine without Postgres; CI runs
 # `cargo test -p weft-task-store --features db-tests` with a Postgres up.
-db-tests = ["dep:chrono"]
+db-tests = ["dep:chrono", "serve"]
+# The middleware that keeps a process's watch listening while it answers
+# a request (`pg_signal::keep_listening`), for the processes that serve.
+serve = ["dep:axum", "dep:http-body"]
 
 [dependencies]
 # Only for stamping a generated migration's file name with the date it was
@@ -18,6 +21,8 @@ db-tests = ["dep:chrono"]
 # production builds never link it.
 chrono = { workspace = true, optional = true }
 anyhow = { workspace = true }
+axum = { workspace = true, optional = true }
+http-body = { version = "1", optional = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -29,8 +34,12 @@ tokio-util = { version = "0.7" }
 tracing = { workspace = true }
 uuid = { workspace = true }
 weft-core = { workspace = true }
+# What the outbox tells news through (`announce::tell_news_through`).
+weft-platform-traits = { workspace = true }
 
 [dev-dependencies]
+# Driving `pg_signal::keep_listening` in the database tests (`oneshot`).
+tower = { workspace = true, features = ["util"] }
 # `test-util` enables tokio's paused virtual clock (start_paused +
 # advance) so the timing tests run deterministically without real
 # sleeps.

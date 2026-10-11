@@ -117,19 +117,20 @@ impl PostgresJournal {
     }
 }
 
-/// Answer the wait `token` with `value`, on the caller's transaction:
+/// Answer the wait `token` with `answer`, on the caller's transaction:
 /// the wait's signal goes (a wait is answered once), and the answer
 /// reaches its run. A run nobody drives (parked, queued) gets it in its
 /// record, `SuspensionResolved` at `last_seq + 1`, and is queued for a
 /// worker to carry on; a run a worker drives is written by that worker
 /// alone, so the answer is handed to it
-/// (`weft_task_store::parked_fires::hand_answer_in`). The run's row is
-/// locked before the signal is touched, the order every writer of a run
-/// takes them in. The caller pokes the outbox once it commits.
+/// (`weft_task_store::parked_fires::hand_answer_in`, which also makes the
+/// news its worker hears it by). The run's row is locked before the signal
+/// is touched, the order every writer of a run takes them in. The caller
+/// pokes the outbox once it commits.
 pub(crate) async fn answer_in(
     tx: &mut sqlx::PgConnection,
     token: &str,
-    value: &serde_json::Value,
+    answer: &weft_core::primitive::WaitAnswer,
     from: AnswerFrom,
 ) -> anyhow::Result<crate::journal::Answered> {
     use crate::journal::Answered;
@@ -171,15 +172,10 @@ pub(crate) async fn answer_in(
     let consumed = row_to_signal(row)?;
     let Some(locked) = locked.filter(|locked| locked.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
     if locked.owner.is_some() {
-        weft_task_store::parked_fires::hand_answer_in(&mut *tx, token, execution_id, value).await?;
+        weft_task_store::parked_fires::hand_answer_in(&mut *tx, token, execution_id, answer).await?;
         return Ok(Answered::Reached { consumed });
     }
-    let resolved = ExecEvent::SuspensionResolved {
-        execution_id,
-        token: token.to_string(),
-        value: value.clone(),
-        at_unix: crate::lease::now_unix() as u64,
-    };
+    let resolved = ExecEvent::wait_answered(execution_id, token.to_string(), answer.clone(), crate::lease::now_unix() as u64);
     match weft_journal::record::append_locked_in(&mut *tx, execution_id, &locked, std::slice::from_ref(&resolved), weft_journal::record::DISPATCHER, Then::Queued).await? {
         Appended::At(_) => Ok(Answered::Reached { consumed }),
         other => anyhow::bail!("run {execution_id} was locked with no owner, yet its answer was not written: {other:?}"),
@@ -932,9 +928,14 @@ impl Journal for PostgresJournal {
                     .bind(sqlx::types::Json(cause))
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("SELECT pg_notify($1, $2)")
+                // Announced, and the install's news for the copy holding
+                // the line of the run's worker (`weft_task_store::announce`).
+                // SYNC: 'cancel' <-> weft_task_store::announce::kind_named
+                sqlx::query("SELECT pg_notify($1, $2), weft_tell($3, $4, 'cancel')")
                     .bind(weft_task_store::runs::CANCEL_CHANNEL)
-                    .bind(weft_task_store::runs::cancel_payload(locked.project_id, execution_id))
+                    .bind(weft_task_store::runs::run_payload(locked.project_id, execution_id))
+                    .bind(locked.project_id)
+                    .bind(execution_id)
                     .execute(&mut *tx)
                     .await?;
                 write.requested = true;
@@ -946,6 +947,9 @@ impl Journal for PostgresJournal {
         }
         tx.commit().await?;
         weft_task_store::announce::committed(&self.pool);
+        if write.requested {
+            weft_task_store::announce::news_written(&self.pool);
+        }
         Ok(write)
     }
 
@@ -990,11 +994,16 @@ impl Journal for PostgresJournal {
         Ok(lost)
     }
 
-    async fn answer(&self, token: &str, value: &serde_json::Value) -> anyhow::Result<crate::journal::Answered> {
+    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<crate::journal::Answered> {
         let mut tx = self.pool.begin().await?;
-        let answered = answer_in(&mut tx, token, value, AnswerFrom::Sender).await?;
+        let answered = answer_in(&mut tx, token, answer, AnswerFrom::Sender).await?;
         tx.commit().await?;
         weft_task_store::announce::committed(&self.pool);
+        // An answer that reached its run may have been handed to the
+        // worker driving it, which left news for that worker.
+        if matches!(answered, crate::journal::Answered::Reached { .. }) {
+            weft_task_store::announce::news_written(&self.pool);
+        }
         Ok(answered)
     }
 

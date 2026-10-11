@@ -63,7 +63,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<Option<crate::tasks::TaskOutcome>>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = weft_core::deadline::after(tokio::time::Instant::now(), timeout);
     // Subscribed before the first read, so a finish between the read and
     // the wait is still heard.
     let mut signals = signals.subscribe();

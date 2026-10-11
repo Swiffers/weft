@@ -191,13 +191,28 @@ moment something is due (a schedule, a retry, a hibernation ending), and a
 program's infrastructure that runs fine keeps nothing awake: each machine
 says so itself when its state changes.
 
+A run that waits on a person while it cannot pause (a route whose caller is
+still on the line, an unrecorded run) keeps its worker and one copy of the
+broker up for as long as it waits, which is cheap, and leaves your database
+asleep for all of it. The answer or the cancel that ends the wait reaches
+the broker over Pub/Sub, not through the database, and is pushed to the
+worker on its connection. The database wakes when the answer or the cancel
+arrives, or the run ends. If you want a wait longer than an hour, make the
+run one that can pause: Cloud Run cuts a request after an hour, so when a
+worker's runs are all only waiting and its connection is a minute from that
+cut, the worker ends them with a message naming the limit, and stops. A
+caller that reaches that worker in the few seconds it takes to stop is told
+to try again. Cloud Run may send the retry to the same stopping worker for
+those few seconds, which turns it away again; once the worker is gone, the
+retry reaches a fresh one.
+
 | Piece | What it is |
 |---|---|
 | Cloud Run | weft's dispatcher, broker, listener and supervisor, a service each, and your programs' workers, one service per program. Each scales on its own load, and to zero between calls. A service at zero starts again when it is called: by the part of weft that just wrote work for it, by a Cloud Tasks wake, or by a call from outside (your CLI, a route, a provider's webhook) |
 | The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs one holder per 200 such triggers and none when there are none |
 | Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
-| Pub/Sub | a topic carrying Compute Engine's record of an infrastructure machine stopping or failing to the supervisor |
+| Pub/Sub | a topic carrying Compute Engine's record of an infrastructure machine stopping or failing to the supervisor, and one weft announces on when a run a worker drives gets an answer or is cancelled, so word of it travels between weft's copies without your database |
 | Cloud Tasks | every timer, schedule and poll your programs set, and the wakes weft schedules for itself to check on its own pending work |
 | Compute Engine | one machine per infrastructure unit your programs start (a database, a GPU model) |
 | A storage bucket | weft's files, reached as weft's own service account: no key is made for it, so an organization that forbids service-account keys runs weft as is |
@@ -504,7 +519,17 @@ which limit. If the
 program runs on several copies of its worker, each copy counts calls itself
 and hears the others' counts once a second, so a per-minute limit can let
 through about one second's worth of extra calls, and `callsAtOnce` is shared
-out between the copies that are up.
+out between the copies that are up. A copy with nothing to do stops listening
+so the install can sleep. When a call wakes it, that call is decided at once on
+what the copy heard before it went quiet, and so is every call until the copy
+hears back from weft's broker: under a second normally, a few seconds when the
+broker was asleep too and has to start. During that window the copy counts
+itself as the only copy, so if several copies wake at the same moment, each
+can let in up to the full `callsAtOnce`. The per-minute limits barely move:
+they can only overshoot by the calls that reach the copy in those few
+seconds. We chose this on purpose: the other way would make the first call
+after every pause wait for the broker, and on a sleeping install that means
+waiting for it to start.
 
 ## When something goes wrong
 

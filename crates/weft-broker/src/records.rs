@@ -7,7 +7,6 @@
 //! in the write itself, and a birth must name the worker's project.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -103,28 +102,17 @@ async fn run_claim(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): 
 }
 
 /// `POST /v1/run/answers`: see [`RunAnswersRequest`]. Only the worker
-/// driving the run takes its answers; the hold wakes when an answer is
-/// parked for the run's project.
+/// driving the run takes its answers, read once: the worker asks when its
+/// run starts waiting, and again when the line tells it one was handed to
+/// the run (`weft_broker_client::line::PARKED_FIRE_CHANNEL`).
 async fn run_answers(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RunAnswersRequest>) -> Resp<RunAnswersResponse> {
-    let (_, project, _) = worker(&caller)?;
+    worker(&caller)?;
     crate::handlers::require_worker_drives(&state, &caller, req.execution_id).await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(req.wait_ms).min(weft_task_store::pg_signal::MAX_HOLD);
-    let project = project.to_string();
-    // Subscribed before the first read, so an answer parked between an
-    // empty read and the wait still ends the wait.
-    let mut heard = state.signals.subscribe();
-    loop {
-        let mut answers = weft_task_store::parked_fires::answers_for(&state.pool, req.execution_id)
-            .await
-            .map_err(|e| unavailable_or_internal(e.context("read a run's answers")))?;
-        answers.retain(|(token, _)| !req.taken.contains(token));
-        let parked = |channel: &str, payload: &str| channel == weft_task_store::parked_fires::PARKED_FIRE_CHANNEL && payload == project;
-        if !answers.is_empty()
-            || !heard.woken_before(deadline, parked).await.map_err(|e| unavailable_or_internal(e.context("wait for a run's answers")))?
-        {
-            return Ok(Json(RunAnswersResponse { answers: answers.into_iter().map(|(token, value)| RunAnswer { token, value }).collect() }));
-        }
-    }
+    let mut answers = weft_task_store::parked_fires::answers_for(&state.pool, req.execution_id)
+        .await
+        .map_err(|e| unavailable_or_internal(e.context("read a run's answers")))?;
+    answers.retain(|(token, _)| !req.taken.contains(token));
+    Ok(Json(RunAnswersResponse { answers: answers.into_iter().map(|(token, answer)| RunAnswer { token, answer }).collect() }))
 }
 
 /// `POST /v1/run/give_up`: see [`RunGiveUpRequest`]. Its ending is a

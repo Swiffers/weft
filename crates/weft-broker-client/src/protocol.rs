@@ -13,11 +13,6 @@ use weft_core::access::wire::PublishedConnection;
 use weft_core::ExecutionId;
 use weft_task_store::tasks::{NewTask, TaskOutcome, TaskStatus};
 
-/// The longest the broker holds any request open (every `wait_ms`
-/// field is capped at it). A client that wants to wait longer asks
-/// again.
-pub use weft_task_store::pg_signal::MAX_HOLD;
-
 // The wire-enum helper is weft-core's (`weft_core::wire_enum!`), so an
 // enum can live beside the messages that carry it in any crate.
 use weft_core::wire_enum;
@@ -163,14 +158,14 @@ pub struct RunClaimResponse {
 }
 
 /// `POST /v1/run/answers`: the answers waiting for the waits of a run the
-/// calling worker drives, held open up to `wait_ms` (capped at
-/// [`MAX_HOLD`]) until one is there. Only the worker driving a run writes
-/// its record, so an answer to a run being driven waits for its worker to
-/// take it (`weft_task_store::parked_fires::answers_for`).
+/// calling worker drives, read once (none when none waits). Only the worker
+/// driving a run writes its record, so an answer to a run being driven
+/// waits for its worker to take it
+/// (`weft_task_store::parked_fires::answers_for`), and the worker is told
+/// when one is handed to it (`crate::line::PARKED_FIRE_CHANNEL`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunAnswersRequest {
     pub execution_id: ExecutionId,
-    pub wait_ms: u64,
     /// The waits whose answers the worker already took. An answer stays
     /// waiting until the run's record holds it, which an unrecorded run's
     /// never does, so these are left out rather than handed again.
@@ -182,11 +177,12 @@ pub struct RunAnswersResponse {
     pub answers: Vec<RunAnswer>,
 }
 
-/// One answer waiting for a run: the wait it resolves, and the value.
+/// One answer waiting for a run: the wait it resolves, and the answer (a
+/// value, or a person's skip).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunAnswer {
     pub token: String,
-    pub value: Value,
+    pub answer: weft_core::primitive::WaitAnswer,
 }
 
 /// `POST /v1/run/cancels`: the cancels waiting for the runs the calling
@@ -280,9 +276,8 @@ pub struct TaskEnqueueDedupResponse {
     pub inserted: bool,
 }
 
-/// A task's outcome, held open up to `wait_ms` (the broker caps it at
-/// `pg_signal::MAX_HOLD`) until it is terminal; the answer is its state
-/// either way.
+/// A task's outcome, held open up to `wait_ms` until it is terminal; the
+/// answer is its state either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskWaitTerminalRequest {
     pub task_id: Uuid,
@@ -779,7 +774,7 @@ pub struct SupervisorClaimCommandRequest {
     /// be handed again (they stay uncompleted until they end).
     pub busy_commands: Vec<i64>,
     /// How long to hold for a command to be issued when none is
-    /// waiting (the broker caps it at `pg_signal::MAX_HOLD`).
+    /// waiting.
     pub wait_ms: u64,
 }
 
@@ -1381,8 +1376,8 @@ pub struct InfraEnqueueApplyResponse {
 pub struct InfraWaitApplyRequest {
     pub project_id: Uuid,
     pub command_id: i64,
-    /// How long to hold for the command to complete (the broker caps it
-    /// at `pg_signal::MAX_HOLD`); the answer is its state either way.
+    /// How long to hold for the command to complete; the answer is its
+    /// state either way.
     pub wait_ms: u64,
 }
 
@@ -2218,10 +2213,12 @@ pub enum LetGo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorLetGo {}
 
-/// `POST /v1/door/tick`: once a second, a worker says it is alive (its
-/// `worker_lease`) and how many runs it drives per trigger, states what it
-/// counted at its door this minute, and hears what the project's other
-/// copies counted.
+/// `POST /v1/door/tick`: once a second while it has work under way, a
+/// worker says it is alive (its `worker_lease`) and how many runs it
+/// drives per trigger, states what it counted at its door this minute, and
+/// hears what the project's other copies counted. With nothing under way
+/// it sends none, and its lease lapses; with only runs that wait, its last
+/// tick vouches for it until the earliest of those waits gives up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorTickRequest {
     /// The image it runs (the program's binary hash): a drain of the runs
@@ -2240,6 +2237,11 @@ pub struct DoorTickRequest {
     /// The route tokens whose counts it reads back.
     #[serde(default)]
     pub tokens: Vec<String>,
+    /// Until when (unix seconds) the lease holds without another tick: set
+    /// by the last tick before a worker whose runs only wait stops ticking
+    /// (`weft_task_store::worker_door::lease_until`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vouch_until: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -44,33 +44,35 @@ pub async fn in_flight<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: w
 // SYNC: RUN_QUEUED_CHANNEL <-> weft_journal::record::notify_queued_in
 pub const RUN_QUEUED_CHANNEL: &str = "weft_run_queued";
 
-/// The channel a cancel of a running run is announced on, with
-/// `<project id> <execution id>` ([`cancel_payload`]), in the same
-/// transaction that sets the run's `cancel_requested`: the broker pushes it
-/// down the lines of the project's workers, and the one driving the run
-/// fires its flag. A worker that may have missed one (its line came back,
-/// it just claimed a run) reads `cancel_requested` of the runs it drives.
+/// The channel a cancel of a running run is announced on, with its run
+/// ([`run_payload`]), in the same transaction that sets the run's
+/// `cancel_requested`: the broker pushes it down the lines of the project's
+/// workers, and the one driving the run fires its flag. A worker that may
+/// have missed one (its line came back, it just claimed a run) reads
+/// `cancel_requested` of the runs it drives.
 // SYNC: CANCEL_CHANNEL <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-broker/src/line.rs (audience)
 pub const CANCEL_CHANNEL: &str = "weft_cancel";
 
-/// A [`CANCEL_CHANNEL`] payload.
-pub fn cancel_payload(project_id: uuid::Uuid, execution_id: weft_core::ExecutionId) -> String {
+/// How an announcement names a run: `<project id> <execution id>`.
+// SYNC: run_payload <-> parked_fire_notify in crates/weft-task-store/src/parked_fires.rs (GROUP)
+pub fn run_payload(project_id: uuid::Uuid, execution_id: weft_core::ExecutionId) -> String {
     format!("{project_id} {execution_id}")
 }
 
-/// The project and execution a [`CANCEL_CHANNEL`] payload names.
-pub fn parse_cancel_payload(payload: &str) -> Option<(uuid::Uuid, weft_core::ExecutionId)> {
+/// The project and execution a [`run_payload`] names.
+pub fn parse_run_payload(payload: &str) -> Option<(uuid::Uuid, weft_core::ExecutionId)> {
     let (project, execution) = payload.split_once(' ')?;
     Some((project.parse().ok()?, execution.parse().ok()?))
 }
 
 #[cfg(test)]
 mod tests {
-    /// A cancel's payload reads back as the project and run it named.
+    /// A run named in an announcement reads back as the project and run.
     #[test]
-    fn a_cancel_payload_reads_back() {
+    fn a_run_payload_reads_back() {
         let (project, run) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
-        assert_eq!(super::parse_cancel_payload(&super::cancel_payload(project, run)), Some((project, run)));
-        assert_eq!(super::parse_cancel_payload("not a cancel"), None);
+        assert_eq!(super::parse_run_payload(&super::run_payload(project, run)), Some((project, run)));
+        assert_eq!(super::parse_run_payload("not a run"), None);
+        assert_eq!(super::parse_run_payload(&project.to_string()), None, "a project alone names no run");
     }
 }

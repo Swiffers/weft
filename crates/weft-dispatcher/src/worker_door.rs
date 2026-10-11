@@ -36,7 +36,7 @@ pub async fn sweep(pool: &PgPool, now: i64) -> Result<()> {
 
 /// How far past its lease a worker's runs are left alone before they are
 /// read as lost: a worker that missed a few ticks under load is not gone.
-fn lost_margin_secs() -> i64 {
+pub(crate) fn lost_margin_secs() -> i64 {
     weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS)
 }
 
@@ -49,7 +49,10 @@ const LOST_BATCH: i64 = 500;
 /// ends (`crate::journal::Journal::let_go_of_lost`). Each run is taken
 /// under its own row lock, so a batch its old owner sends meanwhile and
 /// this sweep never write the run at once, and the epoch this raises
-/// refuses whichever of that owner's batches comes after.
+/// refuses whichever of that owner's batches comes after. A worker whose
+/// runs only wait vouched for itself until their waits give up
+/// (`weft_task_store::worker_door::lease_until`), so its lease, and its
+/// runs, hold until then.
 pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) -> Result<()> {
     let lapsed_before = now - lost_margin_secs();
     let lost: Vec<(weft_core::ExecutionId, String)> = sqlx::query_as(

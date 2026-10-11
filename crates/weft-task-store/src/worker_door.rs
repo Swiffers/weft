@@ -1,15 +1,33 @@
 //! Which worker processes are alive (`worker_lease`), the image each runs,
 //! what each drives right now per trigger (`worker_lease.in_flight`), and what each counted
 //! at its door this minute (`door_count`), all written once a second by
-//! every worker through the broker (`/v1/door/tick`). A worker's live
-//! lease is half of what says a run is being worked on
-//! ([`crate::in_flight_sql!`]), and what it drives is what a drain waits
-//! for.
+//! every worker that has work under way, through the broker
+//! (`/v1/door/tick`). A worker with nothing under way stops ticking after
+//! one last tick that says so, and its lease lapses: it owns no run then,
+//! and it ticks again before it takes one. A worker whose runs only wait on
+//! something outside them stops ticking too, after a last tick that vouches
+//! for it until the earliest of those waits gives up ([`lease_until`]), so
+//! its lease holds that long. A worker's live lease is half of what says a
+//! run is being worked on ([`crate::in_flight_sql!`]), and what it drives
+//! is what a drain waits for.
 
 /// How long a worker's lease (`worker_lease`) holds without a tick, at
 /// this install's pace: a few missed ticks, so a busy second never reads
 /// as a dead worker. A run its lapsed lease owned is lost.
 pub const WORKER_LEASE_SECS: i64 = 15;
+
+/// Until when (unix seconds) a tick at `now` keeps a worker's lease: one
+/// lease length (`lease_secs`, [`WORKER_LEASE_SECS`] at this install's
+/// pace), or, for the last tick of a worker whose runs only wait on
+/// something outside them, until `vouch_until` (the earliest moment one of
+/// those waits gives up, and a lease length). A vouch is held to the
+/// longest a wait can hold (`weft_core::run_settings::MAX_HOLD_SECS`), and
+/// one shorter than a lease length changes nothing.
+pub fn lease_until(now: i64, lease_secs: i64, vouch_until: Option<i64>) -> i64 {
+    let renewed = now.saturating_add(lease_secs);
+    let longest = renewed.saturating_add(i64::from(weft_core::run_settings::MAX_HOLD_SECS));
+    vouch_until.map_or(renewed, |vouch| vouch.clamp(renewed, longest))
+}
 
 /// The one rule for a worker being alive: its lease (`worker_lease` under
 /// the alias `$lease`) is ahead of the database's clock. Every reader
@@ -95,3 +113,19 @@ concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
     ],
     seed: &[],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tick keeps the lease one length; a vouch keeps it until then, held
+    /// to the longest a wait can hold, and never shorter than a tick.
+    #[test]
+    fn a_vouch_keeps_the_lease_until_then_within_the_longest_hold() {
+        let longest = i64::from(weft_core::run_settings::MAX_HOLD_SECS);
+        assert_eq!(lease_until(1_000, 15, None), 1_015);
+        assert_eq!(lease_until(1_000, 15, Some(5_000)), 5_000);
+        assert_eq!(lease_until(1_000, 15, Some(1_001)), 1_015, "a vouch shorter than a lease changes nothing");
+        assert_eq!(lease_until(1_000, 15, Some(i64::MAX)), 1_015 + longest, "held to the longest hold");
+    }
+}

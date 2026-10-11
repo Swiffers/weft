@@ -193,3 +193,74 @@ async fn an_announcement_goes_out_once_its_write_commits(pool: PgPool) {
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM weft_announcement").fetch_one(&pool).await.unwrap();
     assert_eq!(left, 0, "the outbox is empty once sent");
 }
+
+/// What a process hears another way (the install's news) reaches its
+/// waiters while its watch is quiet and the database asleep, without the
+/// watch listening again.
+#[sqlx::test]
+async fn what_is_told_another_way_reaches_waiters_while_the_watch_is_quiet(pool: PgPool) {
+    setup(&pool).await;
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(
+        &pool.connect_options(),
+        support::CHANNELS,
+        weft_task_store::pg_signal::Listening::WhileBusy,
+    )
+    .await
+    .unwrap();
+    let mut heard = watch.subscribe();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    cut_the_listener(&pool).await;
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    let told = watch.also_told();
+    assert!(told.signal(TASK_READY_CHANNEL, "x").unwrap());
+    assert!(told.recheck());
+    let next = tokio::time::timeout(Duration::from_secs(5), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Signal { channel: TASK_READY_CHANNEL, payload: "x".into() });
+    let next = tokio::time::timeout(Duration::from_secs(5), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Recheck);
+    assert!(!heard.listening(), "the watch stayed quiet");
+}
+
+/// A request holds its process's watch busy while it is answered, unless
+/// its handler let go of it: a call that then waits for hours holds
+/// nothing that would keep the database awake.
+#[sqlx::test]
+async fn a_request_that_let_go_of_its_listening_holds_the_watch_no_longer(pool: PgPool) {
+    use std::sync::Arc;
+    use axum::extract::Extension;
+    use axum::routing::get;
+    use tower::ServiceExt as _;
+    use weft_task_store::pg_signal::{keep_listening, PgSignalWatch, RequestListening};
+    setup(&pool).await;
+    let watch = PgSignalWatch::start(&pool.connect_options(), support::CHANNELS, weft_task_store::pg_signal::Listening::WhileBusy).await.unwrap();
+    let (waiting, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+    let handler = |lets_go: bool| {
+        let (waiting, release) = (waiting.clone(), release.clone());
+        move |Extension(listening): Extension<RequestListening>| {
+            let (waiting, release) = (waiting.clone(), release.clone());
+            async move {
+                if lets_go {
+                    listening.let_go();
+                }
+                waiting.notify_one();
+                release.notified().await;
+                "done"
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/holds", get(handler(false)))
+        .route("/lets-go", get(handler(true)))
+        .layer(axum::middleware::from_fn_with_state(watch.clone(), keep_listening));
+    for (path, holds) in [("/holds", true), ("/lets-go", false)] {
+        let request = axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap();
+        let call = tokio::spawn(app.clone().oneshot(request));
+        waiting.notified().await;
+        let now = tokio::time::Instant::now();
+        assert_eq!(watch.worked_since(now), holds, "{path}");
+        release.notify_one();
+        let answer = call.await.unwrap().unwrap();
+        axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();
+    }
+}

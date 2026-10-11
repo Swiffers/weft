@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 weft-core = { workspace = true }
 weft-journal = { workspace = true }
-weft-task-store = { workspace = true }
+weft-task-store = { workspace = true, features = ["serve"] }
 weft-access-store = { workspace = true }
 weft-providers = { workspace = true }
 weft-broker-client = { path = "../weft-broker-client", features = ["line-server"] }

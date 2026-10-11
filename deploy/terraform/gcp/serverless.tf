@@ -33,6 +33,7 @@ locals {
       buildBucket              = google_storage_bucket.builds.name
       builderServiceAccount    = google_service_account.builder.email
       tasksQueue               = google_cloud_tasks_queue.wakes.name
+      newsTopic                = google_pubsub_topic.news.name
       coreServiceAccount       = google_service_account.core.email
       holderPool               = "projects/${var.project_id}/locations/${var.region}/workerPools/${local.holder_pool}"
       dispatcherService        = "${var.name}-role-dispatcher"
@@ -147,7 +148,10 @@ resource "google_cloud_run_v2_service" "role" {
 
   template {
     service_account = google_service_account.core.email
-    # A wake or an internal call may run as long as its work does.
+    # A wake or an internal call may run as long as its work does. The
+    # broker tells each line this limit, and a worker whose runs only wait
+    # stops before it.
+    # SYNC: timeout <-> crates/weft-platform-gcp/src/runner.rs (REQUEST_CAP)
     timeout = "3600s"
 
     scaling {

@@ -27,6 +27,7 @@ pub mod runtime_store;
 pub mod scope;
 pub mod held_signals;
 pub mod line;
+pub mod news;
 pub mod notices;
 pub mod records;
 pub mod state;

@@ -201,6 +201,10 @@ pub(crate) struct RunDrive<'a> {
     /// How the run is asked to let go of this worker. `None` for a run
     /// nobody asks that of.
     pub(crate) hand_back: Option<&'a HandBack>,
+    /// How the run says it only waits on something outside it, so its
+    /// worker may stop ticking (`crate::run_holds`). `None` for a run no
+    /// worker's tick looks at.
+    pub(crate) hold: Option<crate::run_holds::RunHold>,
 }
 
 /// Run one execution to a terminal state or a pause. `replica` stamps
@@ -242,7 +246,7 @@ pub(crate) async fn run_one_execution_observed(
     replica: &str,
     tenant_id: &str,
 ) -> anyhow::Result<Drove> {
-    let RunDrive { execution_id, journal, program, starts_from, cancellation, exchange, hand_back } = run;
+    let RunDrive { execution_id, journal, program, starts_from, cancellation, exchange, hand_back, hold } = run;
     // The run's spend still being worked out, which goes on its record
     // before its ending (`crate::metering`).
     let record = RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() };
@@ -284,6 +288,7 @@ pub(crate) async fn run_one_execution_observed(
         waits,
         bus_coordinator.clone(),
         hand_back,
+        hold.as_ref(),
     )))
     .await
     {
@@ -299,9 +304,14 @@ pub(crate) async fn run_one_execution_observed(
     bus_coordinator.shutdown().await;
     drop(bus_coordinator);
     // Its spend: a charge still open is a call that spent and whose
-    // amount no response stated, booked as the unknown it is.
-    clients.open_charges.flush_execution_id(execution_id, "the run ended before the job was read back");
-    record.costs.wait_zero().await;
+    // amount no response stated, booked as the unknown it is, and every
+    // figure still being worked out lands before the ending. A call whose
+    // answer is still being read holds this wait, and the metering tap
+    // bounds it: it cuts an answer silent for its limit, or any answer once
+    // the run is cancelled (`crate::metering::ANSWER_SILENCE_LIMIT`).
+    clients.open_charges
+        .close_execution_id(execution_id, &record.costs, "the run ended before the job was read back")
+        .await;
     // Its caller's last words. A durable run's whole answer that waits
     // for its record leaves once the ending is on it too: one write holds
     // both.
@@ -512,7 +522,7 @@ async fn take_answers(
     let at_unix = now_unix();
     let resolved: Vec<ExecEvent> = answers
         .into_iter()
-        .map(|answer| ExecEvent::SuspensionResolved { execution_id, token: answer.token, value: answer.value, at_unix })
+        .map(|answer| ExecEvent::wait_answered(execution_id, answer.token, answer.answer, at_unix))
         .collect();
     JournalClient::record_events(journal, &resolved, Some(replica)).await?;
     journal.flush().await?;
@@ -578,6 +588,7 @@ async fn drive_execution_id(
     waits: Arc<crate::wait_tracker::WaitTracker>,
     bus_coordinator: Arc<crate::context::BusCoordinator>,
     hand_back: Option<&HandBack>,
+    hold: Option<&crate::run_holds::RunHold>,
 ) -> anyhow::Result<Drove> {
     let project_arc = program.project.clone();
     let project = &*project_arc;
@@ -678,6 +689,7 @@ async fn drive_execution_id(
         settings,
         &mut fold,
         hand_back,
+        hold,
     )
     .await?;
 
@@ -1290,6 +1302,8 @@ async fn drive(
     fold: &mut RunFold,
     // See `run_one_execution`.
     hand_back: Option<&HandBack>,
+    // See `RunDrive::hold`.
+    hold: Option<&crate::run_holds::RunHold>,
 ) -> anyhow::Result<ExecutionOutcome> {
     let project: &ProjectDefinition = &program.project;
     let program_idx = &program.index;
@@ -1351,16 +1365,20 @@ async fn drive(
     // The answers the run waits for while this worker keeps it: a wait
     // held in a node's call (`crate::held_waits`), and a suspended step
     // while a bus keeps the worker (drive() never returns while a bus is
-    // open, so without this its answer would never reach it). The ask is
-    // one held read (it ends when an answer comes, or the hold runs out),
-    // kept across turns of the loop: a chatty bus turns the loop many
-    // times a second, and an ask started afresh on every turn would ask
-    // the broker as often. `taken` is every wait whose answer this drive
-    // took, which the broker leaves out.
+    // open, so without this its answer would never reach it). The ask
+    // ([`answers_once_told`]) reads once as the run starts waiting and
+    // again only when the line says an answer was handed to it, kept
+    // across turns of the loop: a chatty bus turns the loop many times a
+    // second, and an ask started afresh on every turn would read as often.
+    // `taken` is every wait whose answer this drive took, which the broker
+    // leaves out.
     let mut taken: Vec<String> = Vec::new();
     // When the run went quiet: every running step waiting, and one of
     // those waits ended only from outside (see the stuck-check below).
     let mut quiet_since: Option<std::time::Instant> = None;
+    // When the run's hold gives up (unix seconds), while it is quiet
+    // (`crate::run_holds`): set once as it goes quiet.
+    let mut quiet_until: Option<i64> = None;
     let mut resume_wait: Option<futures::future::BoxFuture<'_, anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>>> = None;
     loop {
         // Poison checkpoint: a journal write failed somewhere since
@@ -1522,7 +1540,7 @@ async fn drive(
                 .held()
                 .early_for(&suspended_tokens(executions))
                 .into_iter()
-                .map(|(token, value)| weft_broker_client::protocol::RunAnswer { token, value })
+                .map(|(token, answer)| weft_broker_client::protocol::RunAnswer { token, answer })
                 .collect();
             resume_answered(
                 drive_journal, fold, execution_id, replica, early, executions, pulses, kicked, &mut awaited_sequences,
@@ -2435,6 +2453,9 @@ async fn drive(
                     Err(weft_core::error::WeftError::Suspended { token }) => {
                         NodeTaskOutcome::Waiting(token)
                     }
+                    Err(weft_core::error::WeftError::WaitSkipped(_)) => {
+                        NodeTaskOutcome::Skipped(weft_core::exec::skip::SkipReason::WaitSkipped)
+                    }
                     Err(e) => NodeTaskOutcome::Failed {
                         message: runner_for_bake.with_infra_hint(format!("{e}")),
                         catchable: weft_core::context::catchable_message(&e),
@@ -2666,20 +2687,23 @@ async fn drive(
         // otherwise, so the common path never asks.
         if waits.held().pending() || waiting_count(executions) > 0 {
             if resume_wait.is_none() {
-                let (runs, taken) = (clients.runs.clone(), taken.clone());
-                resume_wait = Some(Box::pin(async move {
-                    runs.answers(execution_id, &taken, weft_task_store::pg_signal::MAX_HOLD).await
-                }));
+                resume_wait = Some(Box::pin(answers_once_told(clients.runs.clone(), execution_id, taken.clone())));
             }
         } else {
             resume_wait = None;
         }
         // The hold runs out `holdSecs` after the run went quiet.
-        let hold = std::time::Duration::from_secs(settings.hold_secs().into());
+        let hold_for = std::time::Duration::from_secs(settings.hold_secs().into());
         let quiet_for = quiet_since.map(|since| clients.clock.now().saturating_duration_since(since));
+        // While quiet, its worker may stop ticking, vouching for itself
+        // until the run's hold gives up.
+        quiet_until = quiet_for.map(|quiet_for| quiet_until.unwrap_or_else(|| hold_ends_unix(crate::now_unix(), hold_for.saturating_sub(quiet_for))));
+        if let Some(hold) = hold {
+            hold.quiet(quiet_until.map(|until| crate::run_holds::Quiet { until, can_pause: unsuspendable(caller, bus_coordinator, settings).is_none() }));
+        }
         let held_out = async {
             match quiet_for {
-                Some(quiet_for) => clients.clock.sleep(hold.saturating_sub(quiet_for)).await,
+                Some(quiet_for) => clients.clock.sleep(hold_for.saturating_sub(quiet_for)).await,
                 None => std::future::pending().await,
             }
         };
@@ -2727,9 +2751,8 @@ async fn drive(
                 // resumes it in place (`resume_answered`). Any other answer
                 // is a held wait's: it goes to the node's call holding it,
                 // which records it, or is kept for the step that holds or
-                // suspends on it next (`HeldWaits::answer`). An empty
-                // answer is the broker's hold running out: nothing moved,
-                // and the next turn asks again.
+                // suspends on it next (`HeldWaits::answer`). The ask answers
+                // only once it found some, so something moved.
                 resume_wait = None;
                 let answers = answers?;
                 moved = !answers.is_empty();
@@ -2742,7 +2765,7 @@ async fn drive(
                 let suspended_on = suspended_tokens(executions);
                 let (suspended, held): (Vec<_>, Vec<_>) = answers.into_iter().partition(|answer| suspended_on.contains(answer.token.as_str()));
                 for answer in held {
-                    waits.held().answer(&answer.token, answer.value);
+                    waits.held().answer(&answer.token, answer.answer);
                 }
                 resume_answered(
                     drive_journal, fold, execution_id, replica, suspended, executions, pulses, kicked, &mut awaited_sequences,
@@ -2843,7 +2866,56 @@ async fn drive(
         if moved {
             quiet_since = None;
         }
+        // Moved, or its hold gave up: quiet no longer, before it goes on.
+        if quiet_since.is_none() && quiet_until.take().is_some() {
+            if let Some(hold) = hold {
+                hold.quiet(None);
+            }
+        }
     }
+}
+
+/// The answers waiting for run `execution_id`'s waits but the ones
+/// `taken`, once there are some: read now (the run starts waiting, or just
+/// took an answer), and again each time the line says one was handed to
+/// this run, or may have missed some. Nothing else reads: a run that waits a
+/// day leaves the database asleep all that time.
+async fn answers_once_told(
+    runs: Arc<dyn crate::context::RunClient>,
+    execution_id: ExecutionId,
+    taken: Vec<String>,
+) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+    // Subscribed before the first read, so an answer handed between an
+    // empty read and the wait still wakes it.
+    let mut told = runs.told();
+    loop {
+        let answers = runs.answers(execution_id, &taken).await?;
+        if !answers.is_empty() {
+            return Ok(answers);
+        }
+        loop {
+            match told.next().await? {
+                weft_task_store::pg_signal::Heard::Signal { channel, payload }
+                    if channel == weft_task_store::parked_fires::PARKED_FIRE_CHANNEL
+                        && weft_task_store::runs::parse_run_payload(&payload).is_some_and(|(_, run)| run == execution_id) =>
+                {
+                    break
+                }
+                weft_task_store::pg_signal::Heard::Recheck => break,
+                // Another run's news, the line lost (a recheck follows once
+                // it is back), the broker hearing again after a quiet spell:
+                // nothing missed here.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// When the hold of a run that went quiet gives up (unix seconds), `now`
+/// being the moment and `left` what is left of it, rounded up.
+fn hold_ends_unix(now: u64, left: std::time::Duration) -> i64 {
+    let secs = now.saturating_add(left.as_secs()).saturating_add(u64::from(left.subsec_nanos() > 0));
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 /// Every running step waits on another and nothing outside will end it:
@@ -3718,7 +3790,7 @@ async fn handle_node_skip(
     journal: &dyn JournalClient,
     replica: &str,
 ) {
-    mark_skipped(executions, node_id, execution_id, frames);
+    mark_skipped(executions, node_id, execution_id, frames, reason);
     // A node inside a gated scope carries NO closures: every member of
     // that scope gets its own `ScopeSkipped` row from the scope's
     // sweep (nested scopes included), and the scope's outward closures
@@ -3842,10 +3914,12 @@ async fn cancel_cleanup(
     dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
 ) {
     // An in-flight node's future is aborted immediately; it needs no window
-    // to wrap up first. A paid call's cost is measured by the metering tap
-    // BELOW the node's future, which finalizes on drop and resolves the
-    // figure detached (tracked by the process's pending-cost records), so an
-    // aborted node body never loses money bookkeeping.
+    // to wrap up first. A paid call's answer may be read on a task of a
+    // client library's own, which this abort does not reach: the metering
+    // tap watches the run's cancel flag, already tripped, and cuts such a
+    // call itself, booking it and releasing the run's ending
+    // (`crate::metering`). A call whose answer lives in the node's future
+    // is booked by the tap's drop.
     // 1. Stop every body.
     bodies.shutdown().await;
     // 2. Drain the task channel in one FIFO pass (see the doc above).
@@ -5031,6 +5105,24 @@ async fn apply_one_task_msg(
                 )
                 .await;
             }
+            NodeTaskOutcome::Skipped(reason) => {
+                retire_consumer_streams(project, &loc, task_execution_id, pulses, journal, replica, stream_rt)
+                    .await;
+                // Same stale-terminal guard as the Completed arm.
+                if firing_already_terminal(executions, &loc.node_id, task_execution_id, &loc.frames) {
+                    return;
+                }
+                // A body that ended skipped closes what it never emitted
+                // on, as a completed one does; the NodeSkipped row is the
+                // fact the fold sweeps the same ports from.
+                mark_skipped(executions, &loc.node_id, task_execution_id, &loc.frames, &reason);
+                let mentioned = mentioned_ports(executions, &loc.node_id, task_execution_id, &loc.frames);
+                build_unmentioned_closures(
+                    &loc.node_id, &mentioned, task_execution_id, &loc.frames,
+                    project, program_idx, pulses, executions, reason.inherited_failure(),
+                );
+                ship_node_skipped(journal, replica, task_execution_id, &loc.node_id, &loc.frames, &reason).await;
+            }
             NodeTaskOutcome::Waiting(token) => {
                 mark_waiting(executions, &loc.node_id, task_execution_id, &loc.frames, &token);
                 ship_node_suspended(journal, replica, task_execution_id, &loc.node_id, &loc.frames, &token)
@@ -5083,7 +5175,7 @@ async fn drain_task_msgs_for_cancel(
                 .await;
             }
             TaskMsg::Terminal { loc, execution_id: task_execution_id, outcome } => match outcome {
-                NodeTaskOutcome::Completed { .. } | NodeTaskOutcome::Failed { .. } => {
+                NodeTaskOutcome::Completed { .. } | NodeTaskOutcome::Failed { .. } | NodeTaskOutcome::Skipped(_) => {
                     tracing::debug!(
                         target: "weft_engine::execution_driver",
                         execution_id = %task_execution_id, node = %loc.node_id, frames = ?loc.frames,
@@ -5230,15 +5322,19 @@ fn mark_skipped(
     node_id: &str,
     execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
+    reason: &weft_core::exec::skip::SkipReason,
 ) {
     if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::Skipped;
         e.completed_at = Some(now_unix());
-        // A skip is the firing's whole outcome: the body never ran, so
-        // a port's refusal found at readiness is not a fact about it.
-        // The `NodeSkipped` row carries no error, and the fold reads
-        // none; the live record says the same.
+        // A skip is the firing's whole outcome (decided before the body
+        // ran, or the body's wait skipped by a person), so a port's
+        // refusal found at readiness is not a fact about it. The
+        // `NodeSkipped` row carries no error and the reason, and the fold
+        // reads them so; the live record says the same.
         e.error = None;
+        e.skip_reason = Some(reason.clone());
+        e.callback_id = None;
     }
 }
 

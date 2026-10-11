@@ -45,6 +45,7 @@ resource "google_project_service" "apis" {
     "iamcredentials.googleapis.com",
     # carrying infra machine events to the supervisor (machines.tf)
     "logging.googleapis.com",
+    # and those, and what happens to a run, across weft's copies (news.tf)
     "pubsub.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",

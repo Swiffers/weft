@@ -180,6 +180,21 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         _ => None,
     };
 
+    // What happened to a run, told across copies: a write leaves it in the
+    // outbox, which this process's flusher tells once it is given the
+    // news (`weft_task_store::announce`), and the broker, which holds the
+    // line of the run's worker, hears it (`weft_broker::news`). Every
+    // process that writes tells it, so news a dead one left goes out with
+    // the next write of any.
+    let news = match &pool {
+        Some((_, pool)) if writes => {
+            let news = platform::news(&config, &parts)?;
+            weft_task_store::announce::tell_news_through(pool, news.clone());
+            Some(news)
+        }
+        _ => None,
+    };
+
     let mut internal = Router::new();
     let mut public = Router::new();
     let mut outside: Option<Router> = None;
@@ -212,9 +227,12 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 public_base_url: config.public_url.clone(),
                 internet_url: config.internet_url.clone(),
                 object_store_public_internet: config.object_store.public_internet(),
+                line_max_age: platform::line_max_age(&config, serverless),
             },
         )
         .await?;
+        let heard = news.as_ref().expect("the broker's process hears news").listen();
+        weft_dispatcher::app::spawn_supervised("news", weft_broker::news::pass_on(heard, state.signals.also_told()));
         loops.push((CoreRole::Broker, Loops::Drain(weft_broker::drain_loops(state.clone()))));
         internal = mount(internal, CoreRole::Broker, weft_broker::router(state));
     }
@@ -456,7 +474,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
             let mut app = public.merge(internal);
             if let Some(signals) = &signals {
-                app = app.layer(axum::middleware::from_fn_with_state(signals.clone(), server::keep_listening));
+                app = app.layer(axum::middleware::from_fn_with_state(signals.clone(), weft_task_store::pg_signal::keep_listening));
                 for t in first_passes {
                     let signals = signals.clone();
                     tokio::spawn(async move {
@@ -515,6 +533,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     // with the process either way.
     if let Some(waker) = waker_at_exit {
         waker.settle(role_waker::RING_GRACE).await;
+    }
+    if let Some(news) = news {
+        if let Err(e) = news.close().await {
+            tracing::warn!(target: "weft_runtime", error = %format!("{e:#}"), "could not let go of this process's news; the platform drops it on its own later");
+        }
     }
     served?
 }

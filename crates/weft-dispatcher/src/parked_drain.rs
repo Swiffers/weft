@@ -204,25 +204,31 @@ async fn hand_answer(
     head: &Head,
     routing: &crate::api::signal::FireGateInfo,
 ) -> anyhow::Result<bool> {
-    let consumed = match routing.standing().arrival(crate::lease::now_unix()) {
+    // The wait's signal gone, and whether the answer reached its run (and
+    // may have left news for the worker driving it).
+    let (consumed, reached) = match routing.standing().arrival(crate::lease::now_unix()) {
         // Still parked: it waits on, and nothing behind it can go first.
         weft_core::arrival::Arrival::Wait => return Ok(false),
         weft_core::arrival::Arrival::Refused => {
             tracing::info!(target: "weft_dispatcher::parked_drain", token = %head.token, "a queued answer dropped: its trigger takes no work any more");
             weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
-            None
+            (None, false)
         }
-        weft_core::arrival::Arrival::Live => match crate::journal::postgres::answer_in(&mut tx, &head.token, &head.waiting.payload, crate::journal::postgres::AnswerFrom::Queue).await? {
+        weft_core::arrival::Arrival::Live => match crate::journal::postgres::answer_in(&mut tx, &head.token, &head.waiting.answer(), crate::journal::postgres::AnswerFrom::Queue).await? {
             // The wait's signal went, and its queue with it.
-            crate::journal::Answered::Reached { consumed } | crate::journal::Answered::RunEnded { consumed } => Some(consumed),
+            crate::journal::Answered::Reached { consumed } => (Some(consumed), true),
+            crate::journal::Answered::RunEnded { consumed } => (Some(consumed), false),
             crate::journal::Answered::Gone => {
                 weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
-                None
+                (None, false)
             }
         },
     };
     tx.commit().await?;
     weft_task_store::announce::committed(&state.pg_pool);
+    if reached {
+        weft_task_store::announce::news_written(&state.pg_pool);
+    }
     if let Some(consumed) = consumed {
         state.listener.unregister_many(&[consumed]).await;
     }

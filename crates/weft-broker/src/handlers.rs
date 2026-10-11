@@ -161,7 +161,7 @@ pub async fn execution_stop_tagged(
         tenant_id: execution_id_scope.tenant,
         payload: serde_json::to_value(&payload).map_err(internal)?,
     };
-    state.tasks.enqueue_dedup(task).await.map_err(internal)?;
+    weft_task_store::tasks::enqueue(&state.pool, task).await.map_err(internal)?;
     Ok(Json(ExecutionStopTaggedResponse { stops_asker }))
 }
 
@@ -173,10 +173,11 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
-/// How long a held request may actually be held: what the process asked
-/// for, never more than `MAX_HOLD` (a process that wants longer asks again).
-fn held(wait_ms: u64) -> Duration {
-    Duration::from_millis(wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
+/// When a held call's wait of `wait_ms` ends: as long as the caller asks
+/// (it is held on a line, which has no idle timeout), and forever for a
+/// wait past what the clock holds.
+pub(crate) fn held_until(wait_ms: u64) -> tokio::time::Instant {
+    weft_core::deadline::after(tokio::time::Instant::now(), Duration::from_millis(wait_ms))
 }
 
 // ---------- Tasks ----------
@@ -427,7 +428,7 @@ pub async fn task_wait_terminal(
     require_task_owned_by(&state, &caller, req.task_id).await?;
     let outcome = state
         .tasks
-        .wait_for_terminal(req.task_id, held(req.wait_ms))
+        .wait_for_terminal(req.task_id, Duration::from_millis(req.wait_ms))
         .await
         .map_err(internal)?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
@@ -1162,7 +1163,7 @@ pub async fn supervisor_claim_command(
     // own ticks): the answer then says so, and the process takes ownership
     // at once instead of on its next tick. Only after a wake, so a
     // supervisor woken by a command it cannot take yet does not spin.
-    let deadline = tokio::time::Instant::now() + held(req.wait_ms);
+    let deadline = held_until(req.wait_ms);
     let mut heard = state.signals.subscribe();
     let mut woken_once = false;
     loop {
@@ -1686,7 +1687,7 @@ pub async fn infra_wait_apply(
     }
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let deadline = tokio::time::Instant::now() + held(req.wait_ms);
+    let deadline = held_until(req.wait_ms);
     let mut heard = state.signals.subscribe();
     loop {
         let answer = apply_command_state(&state, &req).await?;
@@ -2293,7 +2294,7 @@ pub(crate) fn unavailable_or_internal(e: anyhow::Error) -> (StatusCode, String) 
         tracing::warn!(target: "weft_broker", "no connection to the database could be had: {e:#}");
         return (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.into());
     }
-    if causes().any(database_unreachable) {
+    if causes().any(weft_task_store::db::unreachable) {
         tracing::warn!(target: "weft_broker", "could not reach the database: {e:#}");
         return (StatusCode::SERVICE_UNAVAILABLE, "the database connection dropped, or the database is unavailable; ask again".into());
     }
@@ -2304,23 +2305,6 @@ pub(crate) fn unavailable_or_internal(e: anyhow::Error) -> (StatusCode, String) 
 /// call, so not one of its statements ran.
 fn no_connection(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
-}
-
-/// Whether a database error means the server could not be reached or
-/// is restarting, rather than that the statement itself failed: no
-/// connection to be had, a connection that broke, or the server
-/// refusing because it is shutting down or starting up (SQLSTATE class
-/// 08, and 57P01 to 57P03).
-fn database_unreachable(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) | sqlx::Error::Protocol(_) => {
-            true
-        }
-        sqlx::Error::Database(db) => db
-            .code()
-            .is_some_and(|code| code.starts_with("08") || matches!(&*code, "57P01" | "57P02" | "57P03")),
-        _ => false,
-    }
 }
 
 #[cfg(test)]

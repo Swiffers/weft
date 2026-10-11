@@ -163,6 +163,31 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
     }
 }
 
+/// How this process tells the install's other copies what happened to a
+/// run, and hears it (`weft_platform_traits::news`): on a machine, nothing
+/// (its one process listens to the database for good); on Google Cloud, the
+/// install's Pub/Sub topic.
+pub fn news(config: &InstallConfig, parts: &Parts) -> anyhow::Result<Arc<dyn weft_platform_traits::News>> {
+    Ok(match &config.platform {
+        PlatformConfig::Local(_) => Arc::new(weft_platform_local::DatabaseNews::default()),
+        PlatformConfig::Gcp(gcp) => {
+            let google = parts.google.clone().context("a process on Google Cloud holds its Google client")?;
+            Arc::new(weft_platform_gcp::PubSubNews::new(google, gcp))
+        }
+    })
+}
+
+/// How long this process's platform lets one request live before cutting
+/// it, which is how long a line to it lasts: a role placed serverless on
+/// Google Cloud is a Cloud Run service; anything else keeps a request for
+/// good.
+pub fn line_max_age(config: &InstallConfig, serverless: bool) -> Option<Duration> {
+    match (&config.platform, serverless) {
+        (PlatformConfig::Gcp(_), true) => Some(weft_platform_gcp::REQUEST_CAP),
+        _ => None,
+    }
+}
+
 /// The object store the install config names. A Cloud Storage bucket is
 /// reached through the platform's own Google client, so only on GCP.
 pub async fn object_store(settings: &ObjectStoreSettings, parts: &Parts) -> anyhow::Result<weft_platform_traits::SharedObjectStore> {

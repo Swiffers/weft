@@ -107,6 +107,10 @@ impl Google {
         self.send(self.http.post(url).json(body)).await.with_context(|| format!("POST {url}"))
     }
 
+    pub async fn put(&self, url: &str, body: &Value) -> anyhow::Result<Value> {
+        self.send(self.http.put(url).json(body)).await.with_context(|| format!("PUT {url}"))
+    }
+
     pub async fn patch(&self, url: &str, body: &Value) -> anyhow::Result<Value> {
         self.send(self.http.patch(url).json(body)).await.with_context(|| format!("PATCH {url}"))
     }

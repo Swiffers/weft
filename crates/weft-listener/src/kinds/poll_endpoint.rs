@@ -2,7 +2,10 @@
 //! every `interval_secs`, and fires the response body (JSON if it
 //! parses, else a JSON string), or, in delta mode, one fire per new item
 //! past the cursor kept on the signal row. Nothing runs between polls:
-//! each wake polls once and sets the next.
+//! each wake polls once and sets the next, carrying the row along
+//! (`WakeBody::row`), so a poll that found nothing new touches no
+//! database, and the row is written only when the cursor moves or the
+//! polls start failing, fail long enough to say so loudly, or work again.
 //!
 //! As an entry trigger every fire starts a fresh execution. As a parked
 //! run's wait (`await_signal`, a node waiting for an outside job to
@@ -24,7 +27,7 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woken};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woke, Woken};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct PollEndpointHandler;
@@ -98,18 +101,21 @@ impl KindHandler for PollEndpointHandler {
         Ok(Some(next_grid_point(now_ms, poll.interval_secs)))
     }
 
-    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Value>> {
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Woke>> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
-            .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
+            .map_err(|e| super::for_good(anyhow::anyhow!("malformed poll_endpoint spec: {e}")))?;
         // Registration refuses this (`check_resume`); a row that holds it
         // anyway was written past that check and is refused here too.
-        anyhow::ensure!(
-            !(woken.is_resume && poll.delta.is_some()),
-            "a run waiting on a poll_endpoint cannot use delta mode"
-        );
-        // A poll whose write lost still answers its own state: of two copies
-        // that polled at one state either answer stands (see `store`).
-        poll_once(&poll, &spec.access, woken.state, woken.seq, woken.is_resume, &ctx).await.map(Some)
+        if woken.is_resume && poll.delta.is_some() {
+            return Err(super::for_good(anyhow::anyhow!("a run waiting on a poll_endpoint cannot use delta mode")));
+        }
+        poll_once(&poll, &spec.access, woken.state, woken.seq, woken.is_resume, &ctx).await
+    }
+
+    /// A poll's state rides from one wake to the next, and most polls
+    /// change nothing worth writing.
+    fn wakes_from_body(&self) -> bool {
+        true
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -164,7 +170,8 @@ struct PollState {
     /// which on a queue-draining feed means "discard everything queued".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delta: Option<Value>,
-    /// Polls in a row that failed, across every copy that ran one.
+    /// Polls in a row that failed, as the wakes carry it; the row has the
+    /// count as of the last change worth writing (`worth_writing`).
     #[serde(default, skip_serializing_if = "is_zero")]
     consecutive_failures: u32,
     /// Why the last of them failed. Absent once a poll went through.
@@ -193,34 +200,58 @@ impl PollState {
         serde_json::to_value(self).expect("a poll state always serializes")
     }
 
-    /// What the node's display says about the polls.
+    /// What the node's display says about the polls, from the row, which
+    /// is written as they start failing, as the streak reaches
+    /// [`POLL_FAILURE_ESCALATION`], and as they work again.
     fn status_line(&self) -> String {
         match (&self.last_failure, self.consecutive_failures) {
-            (Some(why), n) if n > 0 => format!("{why} (failed {n} in a row)"),
+            (Some(why), n) if n >= POLL_FAILURE_ESCALATION => format!("{why} (failed {n} or more in a row)"),
+            (Some(why), n) if n > 0 => format!("{why} (failing)"),
             _ if self.resumed => "answered".to_string(),
             _ => "polling".to_string(),
         }
     }
 }
 
+/// Whether going from `before` to `next` is worth writing to the row: the
+/// cursor or the wait moved, or the polls went from working to failing,
+/// to the streak worth an error ([`POLL_FAILURE_ESCALATION`]), or back. A
+/// failure more in a streak is not: the running count rides with the
+/// wakes.
+fn worth_writing(before: &PollState, next: &PollState) -> bool {
+    let at = |s: &PollState| (s.consecutive_failures > 0, s.consecutive_failures >= POLL_FAILURE_ESCALATION);
+    (&before.delta, before.first_poll_at_ms, before.resumed) != (&next.delta, next.first_poll_at_ms, next.resumed) || at(before) != at(next)
+}
+
+/// What [`store`] did.
+enum Stored {
+    /// Written: the version the poll stands at.
+    At(i64),
+    /// Another copy moved it first; its write and its next poll stand.
+    Lost,
+    /// The write could not be made (logged), so whether the row moved is
+    /// unknown: the next poll reads the row instead of carrying the
+    /// state, and starts from whatever the row says (the older state,
+    /// which re-offers items rather than lose them, when the write never
+    /// landed).
+    Unknown,
+}
+
 /// Move the poll's state from `seq` to `next`, as a claim: of two copies
 /// that polled at the same state, one write lands and the other's is
-/// dropped (they read the same feed, so either answer stands). A write
-/// that could not be made is logged: the next poll starts from the older
-/// state, which only re-offers items, never loses them.
-async fn store(ctx: &SpawnCtx, seq: i64, next: &PollState) {
+/// dropped (they read the same feed, so either answer stands), and only
+/// the one that landed goes on.
+async fn store(ctx: &SpawnCtx, seq: i64, next: &PollState) -> Stored {
     match ctx.fire.claim_kind_state(next.to_value(), seq).await {
-        Ok(true) => {}
-        Ok(false) => tracing::debug!(
-            target: "weft_listener::poll_endpoint",
-            token = %ctx.fire.token(),
-            "another copy moved this poll's state first; its write stands"
-        ),
-        Err(e) => warn!(
-            target: "weft_listener::poll_endpoint",
-            token = %ctx.fire.token(), error = %format!("{e:#}"),
-            "poll state write failed"
-        ),
+        Ok(true) => Stored::At(seq + 1),
+        Ok(false) => {
+            tracing::debug!(target: "weft_listener::poll_endpoint", token = %ctx.fire.token(), "another copy moved this poll's state first; its write and its next poll stand");
+            Stored::Lost
+        }
+        Err(e) => {
+            warn!(target: "weft_listener::poll_endpoint", token = %ctx.fire.token(), error = %format!("{e:#}"), "poll state write failed; the next poll reads the row");
+            Stored::Unknown
+        }
     }
 }
 
@@ -240,12 +271,12 @@ async fn poll_once(
     seq: i64,
     is_resume: bool,
     ctx: &SpawnCtx,
-) -> Result<Value> {
+) -> Result<Option<Woke>> {
     let url = poll.url.as_str();
-    let before = PollState::read(&kind_state)?;
+    let before = PollState::read(&kind_state).map_err(super::for_good)?;
     if before.resumed {
         // A wake that was already set when the answer went out.
-        return Ok(kind_state);
+        return Ok(Some(Woke { state: kind_state, seq: Some(seq) }));
     }
     let state = before.delta.clone();
     let failed = |what: &str, detail: String| {
@@ -268,11 +299,16 @@ async fn poll_once(
         }
     };
     let next = 'poll: {
-        // Signed-in polls resolve the connection PER POLL: the credential
-        // is refreshed store-side and never frozen. No connection = a
-        // plain client.
+        // Signed-in polls keep the connection's credential between polls
+        // (`crate::reach`) and fetch it again when the endpoint refuses
+        // it. No connection = a plain client.
+        // A connection the broker says is gone or needs a reconnect stays
+        // so: the poll gives up until it is registered again. Any other
+        // failure to resolve it is a failed poll, counted like the
+        // endpoint's own.
         let client = match crate::listener_access::client_for(access, ctx).await {
-            Ok(c) => c,
+            Ok((c, _)) => c,
+            Err(e) if crate::listener_access::answered_for_good(&e) => return Err(super::for_good(e)),
             Err(e) => break 'poll failed("connection resolve failed", format!("{e:#}")),
         };
         let url = match crate::infra_address::for_listener(url, ctx).await {
@@ -301,8 +337,17 @@ async fn poll_once(
         };
         let resp = match request.send().await {
             Ok(r) if r.status().is_success() => r,
-            Ok(r) => break 'poll failed("non-success poll", r.status().to_string()),
-            Err(e) => break 'poll failed("poll request failed", e.to_string()),
+            Ok(r) => {
+                let status = r.status();
+                if access.is_some() && crate::listener_access::is_refusal(r).await {
+                    crate::listener_access::refused(ctx);
+                }
+                break 'poll failed("non-success poll", status.to_string());
+            }
+            Err(e) => {
+                crate::infra_address::unreached(poll.url.as_str(), ctx);
+                break 'poll failed("poll request failed", e.to_string());
+            }
         };
         let body = match resp.text().await {
             Ok(b) => b,
@@ -316,6 +361,9 @@ async fn poll_once(
             let answer = super::event_source::coerce_text_payload(body);
             let carried = weft_core::signal::poll_endpoint::carried(&answer, &poll.carry);
             let outcome = ctx.fire.fire_judged(&answer, carried, "poll_endpoint").await;
+            if outcome == crate::event_context::FireOutcome::UnknownSignal {
+                return Ok(gone(ctx));
+            }
             let resumed = is_resume && outcome == crate::event_context::FireOutcome::Fired;
             break 'poll PollState { resumed, ..PollState::default() };
         };
@@ -352,12 +400,10 @@ async fn poll_once(
             let mut advanced = state.clone();
             for (payload, state_after) in fires {
                 match ctx.fire.fire(payload, "poll_endpoint").await {
-                    // Not delivered (a transient failure, or a token the
-                    // broker does not know): hold the cursor so the item
-                    // is re-offered.
-                    crate::event_context::FireOutcome::EnqueueFailed
-                    | crate::event_context::FireOutcome::UnknownSignal
-                    | crate::event_context::FireOutcome::NotHeld => break,
+                    crate::event_context::FireOutcome::UnknownSignal => return Ok(gone(ctx)),
+                    // Not delivered (a transient failure): hold the cursor
+                    // so the item is re-offered.
+                    crate::event_context::FireOutcome::EnqueueFailed | crate::event_context::FireOutcome::NotHeld => break,
                     crate::event_context::FireOutcome::Fired | crate::event_context::FireOutcome::Filtered => {
                         advanced = Some(state_after);
                     }
@@ -367,10 +413,22 @@ async fn poll_once(
         };
         PollState { delta: advanced, ..PollState::default() }
     };
-    if next != before {
-        store(ctx, seq, &next).await;
-    }
-    Ok(next.to_value())
+    let seq = match worth_writing(&before, &next) {
+        true => match store(ctx, seq, &next).await {
+            Stored::At(seq) => Some(seq),
+            Stored::Lost => return Ok(None),
+            Stored::Unknown => None,
+        },
+        false => Some(seq),
+    };
+    Ok(Some(Woke { state: next.to_value(), seq }))
+}
+
+/// The broker knows the signal no more (it went, or no longer listens):
+/// it polls no more, whatever wakes it carried.
+fn gone(ctx: &SpawnCtx) -> Option<Woke> {
+    tracing::info!(target: "weft_listener::poll_endpoint", token = %ctx.fire.token(), "the signal is gone; it polls no more");
+    None
 }
 
 /// Consecutive failed polls before the per-poll warning escalates to

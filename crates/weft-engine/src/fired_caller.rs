@@ -162,7 +162,12 @@ impl CallerConnection for FiredCaller {
         self.record(head, final_chunk, true)
     }
 
-    async fn receive(&self, _cursor: &AtomicU64) -> Result<InboundMessage, CallerError> {
+    async fn receive(
+        &self,
+        _cursor: &AtomicU64,
+        _liveness: &std::sync::Weak<dyn weft_core::liveness::WaitLiveness>,
+        _node: &Option<weft_core::liveness::FiringLocation>,
+    ) -> Result<InboundMessage, CallerError> {
         Err(CallerError::WrongProtocol { protocol: "http" })
     }
 
@@ -170,6 +175,8 @@ impl CallerConnection for FiredCaller {
         &self,
         _msg: OutboundChunk,
         _cursor: &AtomicU64,
+        _liveness: &std::sync::Weak<dyn weft_core::liveness::WaitLiveness>,
+        _node: &Option<weft_core::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError> {
         Err(CallerError::WrongProtocol { protocol: "http" })
     }
@@ -345,7 +352,7 @@ mod tests {
         let caller = caller(&rows);
         let cursor = AtomicU64::new(0);
         assert!(matches!(
-            caller.receive(&cursor).await,
+            caller.receive(&cursor, &weft_core::liveness::no_liveness(), &None).await,
             Err(CallerError::WrongProtocol { .. })
         ));
     }

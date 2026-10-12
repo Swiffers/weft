@@ -11,8 +11,12 @@
 //! channel with the same payload, so nothing downstream knows the
 //! difference; the database telling it too only costs a look.
 
+use std::sync::Arc;
+
 use weft_platform_traits::{Listening, NewsHeard, NewsKind, RunNews};
 use weft_task_store::pg_signal::AlsoTold;
+
+use crate::line::LineFanout;
 
 /// The channels news comes in on, for the watch that hears it.
 pub const NEWS_CHANNELS: &[&str] = &[weft_task_store::parked_fires::PARKED_FIRE_CHANNEL, weft_task_store::runs::CANCEL_CHANNEL];
@@ -29,10 +33,13 @@ fn as_announced(news: RunNews) -> (&'static str, String) {
 }
 
 /// Tell `told` everything `listening` hears, for the life of the process:
-/// news as its announcement, news missed as a recheck. Returns only when
-/// either side stopped, which leaves the broker's waiters deaf to news, so
-/// it is run supervised.
-pub async fn pass_on(mut listening: Listening, told: AlsoTold) {
+/// news as its announcement. News missed makes the open `lines` look
+/// again, and only them: the lines are the only ones here waiting on news,
+/// and a loop or a role rung for it would wake the database for nothing
+/// (a subscription reports some missed each time it is made, at every
+/// start of a broker copy). Returns only when either side stopped, which
+/// leaves the broker's waiters deaf to news, so it is run supervised.
+pub async fn pass_on(mut listening: Listening, told: AlsoTold, lines: Arc<LineFanout>) {
     loop {
         let heard = match listening.next().await {
             Ok(heard) => heard,
@@ -52,7 +59,10 @@ pub async fn pass_on(mut listening: Listening, told: AlsoTold) {
                     }
                 }
             }
-            NewsHeard::MissedSome => told.recheck(),
+            NewsHeard::MissedSome => {
+                lines.recheck_lines();
+                true
+            }
         };
         if !passed {
             tracing::error!(target: "weft_broker::news", "the broker's signal watch stopped; news has nowhere to go");
@@ -73,7 +83,6 @@ mod tests {
     use weft_task_store::pg_signal::{Heard, Subscription};
 
     use super::*;
-    use crate::line::LineFanout;
 
     fn news(kind: NewsKind) -> RunNews {
         RunNews { project: uuid::Uuid::from_u128(1), execution: uuid::Uuid::from_u128(2), kind }
@@ -92,7 +101,8 @@ mod tests {
 
     // News reaches the broker's waiters as the database's announcement
     // would, and an answer and a cancel reach the line of the run's
-    // project; news missed is a recheck.
+    // project; news missed makes the open lines look again, and rings
+    // nothing else.
     weft_core::stress_test! {
         name: news_reaches_the_waiters_and_the_runs_line,
         runs: 10,
@@ -104,7 +114,7 @@ mod tests {
             let fanout = LineFanout::start(Subscription::with_listening(tx.subscribe(), Arc::new(AtomicBool::new(false))), None);
             let (line, mut on_line) = mpsc::channel(8);
             let _following = fanout.follow("t", &uuid::Uuid::from_u128(1).to_string(), line);
-            tokio::spawn(pass_on(fake.listen(), AlsoTold::over(&tx, NEWS_CHANNELS)));
+            tokio::spawn(pass_on(fake.listen(), AlsoTold::over(&tx, NEWS_CHANNELS), fanout.clone()));
             // Told once the passing-on listens.
             while fake.heard.receiver_count() < 1 {
                 tokio::task::yield_now().await;
@@ -121,11 +131,16 @@ mod tests {
             let told = tokio::time::timeout(Duration::from_secs(10), on_line.recv()).await.unwrap().unwrap();
             assert_eq!(told, Notice::Signal { channel: channel.into(), payload }, "the run's line hears its cancel");
 
-            fake.heard.send(NewsHeard::MissedSome).unwrap();
             assert_eq!(next(&mut waiter).await, Heard::Signal { channel, payload: as_announced(news(NewsKind::Cancel)).1.into() });
-            assert_eq!(next(&mut waiter).await, Heard::Recheck, "news missed: every waiter looks again");
+
+            fake.heard.send(NewsHeard::MissedSome).unwrap();
             let told = tokio::time::timeout(Duration::from_secs(10), on_line.recv()).await.unwrap().unwrap();
-            assert_eq!(told, Notice::Recheck { listening: false }, "and every line, though the database's listener is quiet");
+            assert_eq!(told, Notice::Recheck { listening: false }, "news missed: every line looks again, though the database's listener is quiet");
+            // The waiters (the role waker among them) hear nothing of it:
+            // the next thing they hear is the next news.
+            fake.heard.send(NewsHeard::News(news(NewsKind::Answer))).unwrap();
+            let (channel, payload) = as_announced(news(NewsKind::Answer));
+            assert_eq!(next(&mut waiter).await, Heard::Signal { channel, payload: payload.into() }, "no role is rung for news missed");
         }
     }
 }

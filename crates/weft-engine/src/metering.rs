@@ -50,6 +50,19 @@
 //! run's ending never waits on a provider that stays connected and silent.
 //! A call the run's cancel catches before its answer even started is let
 //! go the same way.
+//!
+//! A call whose amount only a later response states (a job started now,
+//! read back later: [`RouteClass::Reports`]) opens a charge, held in this
+//! process ([`OpenCharges`]) and written on the run's record
+//! (`ChargeOpened`). The read can come after the run paused, on another
+//! worker: a run that pauses lets go of its charges without booking them,
+//! and the drive that picks it up holds again every charge its record
+//! leaves open (`weft_journal::ChargeBook`), so that read prices it on
+//! the node that spent. A run that ends for good books every charge it
+//! still holds as unknown. A run that ends with no drive (cancelled while
+//! nobody drives it, given up because its worker could not write its
+//! record) has its open charges booked unknown by whoever writes that
+//! ending, off its record (`weft_journal::unpriced_charges_closed`).
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -101,10 +114,11 @@ impl PendingCostRecords {
     /// Every resolve is internally bounded (the follow-up client has a
     /// request timeout, the ledger poll a fixed budget). An OPEN charge
     /// holds a token until its run closes it
-    /// (`OpenCharges::close_execution_id`, which a run ending calls, and
-    /// which waits here); a report being read holds one of its own until the
-    /// read returns (bounded the same way); and each figure being written
-    /// holds one until it is on record.
+    /// (`OpenCharges::close_execution_id`, which a run ending or pausing
+    /// calls, and which waits here); a report being read holds one of its
+    /// own until the read returns (bounded the same way); and each figure,
+    /// and each charge's opening, being written holds one until it is
+    /// handed to the record.
     pub async fn wait_zero(&self) {
         self.inner.wait_zero().await;
     }
@@ -161,6 +175,25 @@ struct OpenCharge {
     /// The billable call's own pending token, carried on until the charge
     /// is booked, so its run's ending waits for it.
     held: weft_core::in_flight::InFlightToken,
+    /// Resolves once the charge's `ChargeOpened` is handed to the run's
+    /// record. The cost that closes the charge waits for it, so the
+    /// record never holds a close before its opening.
+    on_record: OnRecord,
+}
+
+/// See [`OpenCharge::on_record`].
+type OnRecord = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+
+/// What a run that lets go of its charges does with each one still open.
+#[derive(Clone, Debug)]
+pub enum Closing {
+    /// The run ended for good: the charge is booked as unknown, naming
+    /// why.
+    Unknown(String),
+    /// The run pauses: the charge stays open on its record, where the
+    /// drive that picks the run up reopens it (`OpenCharges::reopen`), and
+    /// this process lets go of it without booking anything.
+    Release,
 }
 
 /// One owner per charge, with reports queued in arrival order. A closing
@@ -176,20 +209,20 @@ pub struct OpenCharges {
 #[derive(Default)]
 struct Book {
     by_id: std::collections::HashMap<ChargeKey, ChargeState>,
-    /// Runs being ended (`OpenCharges::close_execution_id`). A response
-    /// body can finish after its run's charges were closed (a client
-    /// library reading the stream on a task of its own), and a charge it
-    /// opened then would hold the run's token with nothing left to close
-    /// it, so the ending would wait forever. Such a charge is booked as
-    /// unknown at once instead.
-    ending: std::collections::HashSet<ExecutionId>,
+    /// Runs being ended or paused (`OpenCharges::close_execution_id`),
+    /// with what their close does. A response body can finish after its
+    /// run's charges were closed (a client library reading the stream on a
+    /// task of its own), and a charge it opened then would hold the run's
+    /// token with nothing left to close it, so the ending would wait
+    /// forever. Such a charge is closed at once instead, the same way.
+    ending: std::collections::HashMap<ExecutionId, Closing>,
 }
 
 struct ChargeState {
     charge: OpenCharge,
     reports: std::collections::VecDeque<ChargeReport>,
     processing: bool,
-    closing: Option<String>,
+    closing: Option<Closing>,
 }
 
 struct ChargeReport {
@@ -214,16 +247,59 @@ impl OpenCharges {
 
     pub fn count(&self) -> usize { self.book().by_id.len() }
 
-    fn open(&self, service: &'static str, id: String, mut charge: OpenCharge) {
+    /// Hold a charge a billable call just opened, under the id its
+    /// provider gave it, and write its opening on the run's record
+    /// (`ChargeOpened`), so a drive that picks the run up after a pause
+    /// can hold it again ([`Self::reopen`]). `held` is the call's pending
+    /// token.
+    fn open(
+        &self,
+        service: &'static str,
+        id: String,
+        scratch: serde_json::Value,
+        held: weft_core::in_flight::InFlightToken,
+        sink: Arc<CostSink>,
+    ) {
+        let on_record = sink.write_opening(&id, &scratch);
+        self.insert(service, id, OpenCharge { token: 0, scratch, sink, held, on_record });
+    }
+
+    /// Hold again a charge the run's record says is still open
+    /// (`weft_journal::ChargeBook`): opened in an earlier drive of the run,
+    /// on this worker or another, and let go when that drive paused or
+    /// died. Its opening is on record already. The meter is found by the
+    /// service the record names; a service with no meter here cannot read
+    /// its report, so the charge is booked as unknown at once, saying so.
+    pub(crate) fn reopen(&self, id: String, scratch: serde_json::Value, sink: Arc<CostSink>) {
+        let held = sink.pending.hold();
+        let on_record = futures::future::ready(()).boxed().shared();
+        let charge = OpenCharge { token: 0, scratch, sink, held, on_record };
+        match weft_providers::meter_for(&charge.sink.service) {
+            Some(meter) => self.insert(meter.service(), id, charge),
+            None => {
+                tracing::error!(target: "weft_engine::metering",
+                    execution_id = %charge.sink.execution_id, service = %charge.sink.service, charge = %id,
+                    "the run's record holds a charge for a service this worker has no meter for; booking it as unknown");
+                let why = format!("this worker has no meter for '{}' to read the job back with", charge.sink.service);
+                book_open_charge(&id, charge, &why);
+            }
+        }
+    }
+
+    fn insert(&self, service: &'static str, id: String, mut charge: OpenCharge) {
         let id = ChargeKey { service, id };
         charge.token = self.next_token.fetch_add(1, Ordering::SeqCst);
         let replaced = {
             let mut book = self.book();
-            if book.ending.contains(&charge.sink.execution_id) {
+            if let Some(closing) = book.ending.get(&charge.sink.execution_id).cloned() {
                 drop(book);
-                tracing::warn!(target: "weft_engine::metering", charge = %id,
-                    "a call opened a charge after its run began ending; booking it as unknown");
-                book_open_charge(charge, "the call's response finished after its run began ending");
+                tracing::warn!(target: "weft_engine::metering", charge = %id, ?closing,
+                    "a call opened a charge after its run began letting go of its charges; closing it the same way");
+                let closing = match closing {
+                    Closing::Unknown(_) => Closing::Unknown("the call's response finished after its run began ending".into()),
+                    Closing::Release => Closing::Release,
+                };
+                close_charge(&id, charge, &closing);
                 return;
             }
             book.by_id.insert(id.clone(), ChargeState {
@@ -234,7 +310,7 @@ impl OpenCharges {
             tracing::error!(target: "weft_engine::metering", charge = %id, unread = replaced.reports.len(),
                 "two billable calls claimed the same charge id; booking the displaced call as unknown \
                  (any report queued for it goes unread; one being read right now still lands)");
-            book_open_charge(replaced.charge, "displaced by a second call claiming the same id");
+            book_open_charge(&id.id, replaced.charge, "displaced by a second call claiming the same id");
         }
     }
 
@@ -294,7 +370,7 @@ impl OpenCharges {
                         } else { None }
                     };
                     if let Some(held) = held {
-                        book_open_charge(held.charge, "no runtime was available to read the received report");
+                        book_open_charge(&id.id, held.charge, "no runtime was available to read the received report");
                     }
                 }
             }
@@ -312,15 +388,15 @@ impl OpenCharges {
                     Some(report) => Ok((report, state.charge.scratch.clone(), state.charge.sink.clone())),
                     None => {
                         state.processing = false;
-                        let why = state.closing.clone();
-                        Err(why.map(|why| (charges.remove(&id).expect("owned charge").charge, why)))
+                        let closing = state.closing.clone();
+                        Err(closing.map(|closing| (charges.remove(&id).expect("owned charge").charge, closing)))
                     }
                 }
             };
             let (report, mut scratch, sink) = match next {
                 Ok(next) => next,
                 Err(held) => {
-                    if let Some((charge, why)) = held { book_open_charge(charge, &why); }
+                    if let Some((charge, closing)) = held { close_charge(&id, charge, &closing); }
                     return;
                 }
             };
@@ -375,18 +451,18 @@ impl OpenCharges {
             };
             if let Some((charge, result, unread)) = completed {
                 match result {
-                    Ok(Some(cost)) => charge.sink.book_resolved(charge.held, cost),
+                    Ok(Some(cost)) => book_charge(&id.id, charge, cost),
                     Err(_) => {
                         tracing::error!(target: "weft_engine::metering", charge = %id,
                             "the meter panicked while reading a cost report");
-                        book_open_charge(charge, "the meter panicked while reading a cost report");
+                        book_open_charge(&id.id, charge, "the meter panicked while reading a cost report");
                     }
                     Ok(None) => {
                         // `completed` is only `Some` for a priced or panicked
                         // read; never panic on the money path regardless.
                         tracing::error!(target: "weft_engine::metering", charge = %id,
                             "an incomplete report closed a charge; booking it as unknown");
-                        book_open_charge(charge, "an incomplete report closed the charge");
+                        book_open_charge(&id.id, charge, "an incomplete report closed the charge");
                     }
                 }
                 if unread > 0 {
@@ -405,32 +481,33 @@ impl OpenCharges {
         }
     }
 
-    pub fn flush(&self, why: &str) { self.close_where(|_| true, why); }
+    pub fn flush(&self, why: &str) { self.close_where(|_| true, &Closing::Unknown(why.to_string())); }
 
-    /// End a run's spend: book every charge it still holds as unknown, then
-    /// wait until each of its figures is on record. Until that wait returns,
+    /// Let go of a run's spend as its drive ends: close every charge it
+    /// still holds as `closing` says, then wait until each of its figures
+    /// (and each charge's opening) is on record. Until that wait returns,
     /// a charge the run opens late (a body that finished after this began)
-    /// is booked as unknown at once rather than held. Once it returns no
+    /// is closed the same way at once rather than held. Once it returns no
     /// call of the run is left to open one, so the mark is dropped, and a
     /// run that paused can open charges again when it resumes.
-    pub async fn close_execution_id(&self, execution_id: ExecutionId, pending: &PendingCostRecords, why: &str) {
+    pub async fn close_execution_id(&self, execution_id: ExecutionId, pending: &PendingCostRecords, closing: Closing) {
         struct Ending<'a>(&'a OpenCharges, ExecutionId);
         impl Drop for Ending<'_> {
             fn drop(&mut self) { self.0.book().ending.remove(&self.1); }
         }
-        self.book().ending.insert(execution_id);
+        self.book().ending.insert(execution_id, closing.clone());
         let _ending = Ending(self, execution_id);
-        self.close_where(|charge| charge.sink.execution_id == execution_id, why);
+        self.close_where(|charge| charge.sink.execution_id == execution_id, &closing);
         pending.wait_zero().await;
     }
 
-    /// Book every matching charge as unknown and drop it. A charge whose
-    /// report is being read right now is not booked yet: the read may
-    /// still price it, so it is marked to close when the read returns
+    /// Close every matching charge as `closing` says and drop it. A charge
+    /// whose report is being read right now is not closed yet: the read
+    /// may still price it, so it is marked to close when the read returns
     /// (`drain_reports`). Until then it holds its pending token, and a
     /// wait on `PendingCostRecords::wait_zero` (process shutdown) waits for
     /// that read, which is bounded by the follow-up client's timeout.
-    fn close_where(&self, matches: impl Fn(&OpenCharge) -> bool, why: &str) {
+    fn close_where(&self, matches: impl Fn(&OpenCharge) -> bool, closing: &Closing) {
         let held = {
             let mut book = self.book();
             let charges = &mut book.by_id;
@@ -438,36 +515,50 @@ impl OpenCharges {
                 if !matches(&state.charge) { return None; }
                 if state.processing {
                     tracing::info!(target: "weft_engine::metering", charge = %id,
-                        "closing while its report is being read; it is booked when that read returns");
-                    state.closing = Some(why.to_string());
+                        "closing while its report is being read; it is closed when that read returns");
+                    state.closing = Some(closing.clone());
                     None
                 } else { Some(id.clone()) }
             }).collect();
-            ids.into_iter().map(|id| charges.remove(&id).expect("selected charge").charge).collect::<Vec<_>>()
+            ids.into_iter().map(|id| {
+                let charge = charges.remove(&id).expect("selected charge").charge;
+                (id, charge)
+            }).collect::<Vec<_>>()
         };
-        for charge in held { book_open_charge(charge, why); }
+        for (id, charge) in held { close_charge(&id, charge, closing); }
     }
 }
 
-/// Book one open charge as unknown: the spend happened, nothing ever
-/// stated its amount.
-fn book_open_charge(charge: OpenCharge, why: &str) {
-    // `scratch` is meter-owned and a meter may replace it wholesale, so
-    // it is not guaranteed to be an object. Indexing a non-object
-    // `Value` panics, and this is reached from a destructor that can
-    // run during an unwind, where a panic aborts the process. Keep whatever
-    // the meter left, under a key, rather than trusting its shape.
-    let mut metadata = match charge.scratch {
-        serde_json::Value::Object(_) => charge.scratch,
-        other => serde_json::json!({ "meterState": other }),
-    };
-    metadata["resolution"] = serde_json::json!(format!(
-        "the call spent, and no response ever stated what it cost ({why})"
-    ));
-    let model = metadata["model"].as_str().map(str::to_string);
+/// Close one open charge as `closing` says: book it as unknown, or let go
+/// of it, its opening left on the run's record for the drive that picks
+/// the run up.
+fn close_charge(id: &ChargeKey, charge: OpenCharge, closing: &Closing) {
+    match closing {
+        Closing::Unknown(why) => book_open_charge(&id.id, charge, why),
+        Closing::Release => {
+            tracing::debug!(target: "weft_engine::metering", charge = %id,
+                "the run pauses; its charge stays open on its record");
+        }
+    }
+}
+
+/// Book the figure that prices charge `id`, closing it on the run's
+/// record: once its opening is there, so the close never lands first.
+fn book_charge(id: &str, charge: OpenCharge, cost: MeasuredCost) {
+    let OpenCharge { sink, held, on_record, .. } = charge;
     // The charge's token moves into the booking, so the count cannot pass
     // through zero while the figure is still to be written down.
-    charge.sink.book_resolved(charge.held, MeasuredCost { amount_usd: None, model, metadata });
+    sink.book_closing(held, Some(id.to_string()), async move {
+        on_record.await;
+        cost
+    });
+}
+
+/// Book open charge `id` as unknown: the spend happened, nothing ever
+/// stated its amount.
+fn book_open_charge(id: &str, mut charge: OpenCharge, why: &str) {
+    let (model, metadata) = weft_journal::unpriced_cost(std::mem::take(&mut charge.scratch), why);
+    book_charge(id, charge, MeasuredCost { amount_usd: None, model, metadata });
 }
 
 // ---------- The cost sink (where a measured figure lands) ----------
@@ -513,11 +604,22 @@ impl CostSink {
         held: weft_core::in_flight::InFlightToken,
         cost: impl std::future::Future<Output = MeasuredCost> + Send + 'static,
     ) {
+        self.book_closing(held, None, cost);
+    }
+
+    /// [`Self::book`], for a figure that closes `charge`, the id of a
+    /// charge the run's record holds open (`ExecEvent::ChargeOpened`).
+    fn book_closing(
+        self: Arc<Self>,
+        held: weft_core::in_flight::InFlightToken,
+        charge: Option<String>,
+        cost: impl std::future::Future<Output = MeasuredCost> + Send + 'static,
+    ) {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     let cost = cost.await;
-                    self.record(cost).await;
+                    self.record(cost, charge).await;
                     drop(held);
                 });
             }
@@ -549,7 +651,7 @@ impl CostSink {
     /// an unrecorded run leaves a note of itself for it
     /// (`weft_journal::unrecorded`). A figure that cannot be written is
     /// said LOUDLY: the money trail is incomplete and says so.
-    async fn record(&self, cost: MeasuredCost) {
+    async fn record(&self, cost: MeasuredCost, charge: Option<String>) {
         let event = weft_journal::ExecEvent::CostReported {
             execution_id: self.execution_id,
             node_id: self.node_id.clone(),
@@ -561,6 +663,7 @@ impl CostSink {
             billed: false,
             origin: self.origin.clone(),
             metadata: cost.metadata,
+            charge,
             at_unix: crate::now_unix(),
         };
         let written = match self.journal.record_event(&event, Some(&self.replica)).await {
@@ -571,10 +674,55 @@ impl CostSink {
             tracing::error!(
                 target: "weft_engine::metering",
                 execution_id = %self.execution_id,
-                "COST RECORD LOST for node {} ({}): {e:#}",
+                "COST RECORD LOST for node {} ({}), unless it closes a charge on record, which the run's ending books as unknown: {e:#}",
                 self.node_id, self.service,
             );
         }
+    }
+
+    /// Hand the opening of charge `id` to the run's record
+    /// (`ExecEvent::ChargeOpened`), detached like a figure and holding a
+    /// pending token until it is handed, so a run that pauses right after
+    /// leaves with it on record. Only a call that opens a charge writes
+    /// one. It goes through the run's handle with no write of its own: a
+    /// paused run's record is written whole before it lets go, and an
+    /// unrecorded run never pauses, so its note keeps none. The returned
+    /// future resolves once it is handed (see [`OpenCharge::on_record`]).
+    fn write_opening(self: &Arc<Self>, id: &str, scratch: &serde_json::Value) -> OnRecord {
+        let event = weft_journal::ExecEvent::ChargeOpened {
+            execution_id: self.execution_id,
+            node_id: self.node_id.clone(),
+            frames: self.frames.clone(),
+            service: self.service.clone(),
+            charge: id.to_string(),
+            scratch: scratch.clone(),
+            origin: self.origin.clone(),
+            at_unix: crate::now_unix(),
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                target: "weft_engine::metering",
+                execution_id = %self.execution_id,
+                "CHARGE OPENING LOST for node {} ({}, charge {id}): the async runtime was already torn \
+                 down, so a drive that picks the run up cannot price it",
+                self.node_id, self.service,
+            );
+            return futures::future::ready(()).boxed().shared();
+        };
+        let sink = self.clone();
+        let held = self.pending.hold();
+        let written = handle.spawn(async move {
+            if let Err(e) = sink.journal.record_event(&event, Some(&sink.replica)).await {
+                tracing::error!(
+                    target: "weft_engine::metering",
+                    execution_id = %sink.execution_id,
+                    "CHARGE OPENING LOST for node {} ({}): {e:#}",
+                    sink.node_id, sink.service,
+                );
+            }
+            drop(held);
+        });
+        written.map(|_| ()).boxed().shared()
     }
 }
 
@@ -981,7 +1129,7 @@ impl Finalizer {
             if let Some(cut) = cut {
                 scratch["cut"] = serde_json::json!(cut);
             }
-            open_charges.open(meter.service(), id, OpenCharge { token: 0, scratch, sink, held });
+            open_charges.open(meter.service(), id, scratch, held, sink);
             return;
         }
 
@@ -1274,6 +1422,8 @@ pub(crate) mod tests {
         pub billed: bool,
         pub origin: weft_core::CredentialOwner,
         pub metadata: serde_json::Value,
+        /// The charge the figure closes, if it closes one.
+        pub charge: Option<String>,
     }
 
     /// A meter for a provider living at the test server: chat/completions
@@ -1474,8 +1624,8 @@ pub(crate) mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|event| match event {
-                weft_journal::ExecEvent::CostReported { node_id, service, model, amount_usd, billed, origin, metadata, .. } => Booked {
+            .filter_map(|event| match event {
+                weft_journal::ExecEvent::CostReported { node_id, service, model, amount_usd, billed, origin, metadata, charge, .. } => Some(Booked {
                     node_id: node_id.clone(),
                     service: service.clone(),
                     model: model.clone(),
@@ -1483,8 +1633,10 @@ pub(crate) mod tests {
                     billed: *billed,
                     origin: origin.clone(),
                     metadata: metadata.clone(),
-                },
-                other => panic!("a sink writes costs only: {other:?}"),
+                    charge: charge.clone(),
+                }),
+                weft_journal::ExecEvent::ChargeOpened { .. } => None,
+                other => panic!("a sink writes costs and charge openings only: {other:?}"),
             })
             .collect()
     }
@@ -1924,7 +2076,7 @@ pub(crate) mod tests {
         let started = tokio::time::Instant::now();
         let library = tokio::spawn(read_to_end(tap));
 
-        charges.close_execution_id(uuid::Uuid::nil(), &pending, "the run ended").await;
+        charges.close_execution_id(uuid::Uuid::nil(), &pending, Closing::Unknown("the run ended".into())).await;
         assert!(started.elapsed() >= ANSWER_SILENCE_LIMIT, "cut once the silence limit passed, not before");
         assert_eq!(library.await.unwrap(), Err(Cut::Silent.to_string()), "the reader is told why");
         let payloads = recorded_payloads(&tasks);
@@ -1946,7 +2098,7 @@ pub(crate) mod tests {
 
         let started = tokio::time::Instant::now();
         cancellation.cancel_because(weft_core::exec::CancelCause::User);
-        charges.close_execution_id(uuid::Uuid::nil(), &pending, "the run was cancelled").await;
+        charges.close_execution_id(uuid::Uuid::nil(), &pending, Closing::Unknown("the run was cancelled".into())).await;
         assert!(started.elapsed() < ANSWER_SILENCE_LIMIT, "cut by the cancel, not by the silence limit");
         assert_eq!(library.await.unwrap(), Err(Cut::Cancelled.to_string()));
         let payloads = recorded_payloads(&tasks);
@@ -2343,6 +2495,9 @@ mod open_charge_tests {
     }
 
     static QUEUED: QueuedMeter = QueuedMeter;
+    // Registered, so a drive that reopens a charge finds the meter by the
+    // service its record names (`OpenCharges::reopen`).
+    weft_providers::register_meter!(QUEUED);
 
     fn sink(tasks: Arc<RecordedCosts>, pending: Arc<PendingCostRecords>) -> Arc<CostSink> {
         Arc::new(CostSink {
@@ -2408,7 +2563,7 @@ mod open_charge_tests {
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
 
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink);
         assert_eq!(charges.count(), 1, "the charge is held between spend and figure");
         assert!(recorded_payloads(&tasks).is_empty(), "nothing is booked yet");
 
@@ -2428,6 +2583,130 @@ mod open_charge_tests {
         assert_eq!(booked[0].model.as_deref(), Some("m1"));
     }
 
+    /// The sink a drive builds for a charge its run's record leaves open:
+    /// the node, iteration, service and key the opening named.
+    fn reopened_sink(
+        tasks: Arc<RecordedCosts>,
+        pending: Arc<PendingCostRecords>,
+        open_charges: Arc<OpenCharges>,
+        execution_id: weft_core::ExecutionId,
+        charge: &weft_journal::OpenedCharge,
+    ) -> Arc<CostSink> {
+        Arc::new(CostSink {
+            journal: tasks,
+            writer: test_writer(),
+            replica: "w2".into(),
+            pending,
+            open_charges,
+            execution_id,
+            node_id: charge.node_id.clone(),
+            frames: charge.frames.clone(),
+            service: charge.service.clone(),
+            origin: charge.origin.clone(),
+            cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
+        })
+    }
+
+    /// The bug this pins: a job started before the run paused, read back
+    /// after it resumed on another worker. The pause books nothing; the
+    /// next drive holds the charge again from the run's record, and the
+    /// read prices it, once, against the node that started the job,
+    /// closing it on the record.
+    #[tokio::test]
+    async fn a_charge_opened_before_a_pause_is_priced_by_the_drive_that_picks_the_run_up() {
+        let record = Arc::new(RecordedCosts::default());
+        let execution_id = weft_core::ExecutionId::new_v4();
+
+        // The first drive, on one worker: the job starts, the run pauses.
+        let first_charges = OpenCharges::new();
+        let first_pending = PendingCostRecords::new();
+        let first = sink_on(record.clone(), first_pending.clone(), first_charges.clone(), execution_id);
+        first_charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, first.pending.hold(), first);
+        first_charges.close_execution_id(execution_id, &first_pending, Closing::Release).await;
+        assert_eq!(first_charges.count(), 0, "the pausing worker holds nothing of the run");
+        assert!(recorded_payloads(&record).is_empty(), "a pause books nothing");
+
+        // The next drive, on another worker: what the record leaves open.
+        let rows = record.events.lock().unwrap().clone();
+        let open: Vec<_> = weft_journal::ChargeBook::of_record(&rows).into_open().collect();
+        assert_eq!(open.len(), 1, "{rows:?}");
+        let second_charges = OpenCharges::new();
+        let second_pending = PendingCostRecords::new();
+        for charge in open {
+            let sink = reopened_sink(record.clone(), second_pending.clone(), second_charges.clone(), execution_id, &charge);
+            second_charges.reopen(charge.charge, charge.scratch, sink);
+        }
+        assert_eq!(second_charges.count(), 1, "the charge is held again");
+
+        second_charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
+            interrupted: false, status: 200, data: serde_json::json!({ "units": 3.0 }),
+        }, &lane()).await;
+        second_charges.close_execution_id(execution_id, &second_pending, Closing::Unknown("the run ended".into())).await;
+
+        let booked = recorded_payloads(&record);
+        assert_eq!(booked.len(), 1, "exactly one figure on the trail");
+        assert_eq!(booked[0].amount_usd, Some(6.0));
+        assert_eq!(booked[0].node_id, "node-x");
+        assert_eq!(booked[0].model.as_deref(), Some("m1"), "the meter state the opening carried");
+        assert_eq!(booked[0].charge.as_deref(), Some("req-1"));
+        let rows = record.events.lock().unwrap().clone();
+        assert_eq!(weft_journal::ChargeBook::of_record(&rows).into_open().count(), 0, "the record closed it");
+    }
+
+    /// A body that finishes after its run began pausing opens its charge
+    /// too late for the release to see it: it is let go the same way, with
+    /// its opening on record and nothing booked, and the pause completes.
+    #[tokio::test]
+    async fn a_charge_opened_after_its_run_began_pausing_stays_open_on_record() {
+        let record = Arc::new(RecordedCosts::default());
+        let charges = OpenCharges::new();
+        let pending = PendingCostRecords::new();
+        let execution_id = weft_core::ExecutionId::new_v4();
+        let sink = sink_on(record.clone(), pending.clone(), charges.clone(), execution_id);
+        let held = sink.pending.hold();
+
+        let pausing = charges.close_execution_id(execution_id, &pending, Closing::Release);
+        tokio::pin!(pausing);
+        assert!(futures::poll!(&mut pausing).is_pending(), "the pause waits on the call still in flight");
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, held, sink);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pausing)
+            .await
+            .expect("a charge opened during the pause must not hold it open");
+
+        assert_eq!(charges.count(), 0);
+        assert!(recorded_payloads(&record).is_empty(), "a pause books nothing");
+        let rows = record.events.lock().unwrap().clone();
+        assert_eq!(weft_journal::ChargeBook::of_record(&rows).into_open().count(), 1, "its opening is on record");
+    }
+
+    /// A record naming a service this worker has no meter for cannot be
+    /// read back here: the charge is booked as unknown at once, saying
+    /// why, never dropped.
+    #[tokio::test]
+    async fn a_reopened_charge_with_no_meter_is_booked_as_unknown() {
+        let record = Arc::new(RecordedCosts::default());
+        let charges = OpenCharges::new();
+        let pending = PendingCostRecords::new();
+        let charge = weft_journal::OpenedCharge {
+            node_id: "dub".into(),
+            frames: LoopFrames::default(),
+            service: "gone".into(),
+            charge: "job-9".into(),
+            scratch: serde_json::json!({}),
+            origin: weft_core::CredentialOwner::Author,
+        };
+        let sink = reopened_sink(record.clone(), pending.clone(), charges.clone(), weft_core::ExecutionId::new_v4(), &charge);
+        charges.reopen(charge.charge, charge.scratch, sink);
+        pending.wait_zero().await;
+
+        assert_eq!(charges.count(), 0);
+        let booked = recorded_payloads(&record);
+        assert_eq!(booked.len(), 1);
+        assert_eq!(booked[0].amount_usd, None);
+        assert_eq!((booked[0].node_id.as_str(), booked[0].charge.as_deref()), ("dub", Some("job-9")));
+        assert!(booked[0].metadata["resolution"].as_str().unwrap().contains("no meter for 'gone'"), "{:?}", booked[0].metadata);
+    }
+
     /// A report that does not finish the picture leaves the charge open,
     /// so a provider that answers across several reads is not booked off
     /// the first one.
@@ -2437,7 +2716,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink);
 
         // No `units`: the job is still running.
         let pending_report = ObservedCall {
@@ -2464,7 +2743,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let execution_id = uuid::Uuid::new_v4();
         let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink);
 
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"status": "IN_PROGRESS"}),
@@ -2472,7 +2751,7 @@ mod open_charge_tests {
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
         }, &lane()));
-        charges.close_execution_id(execution_id, &pending, "the execution ended before the job was read back").await;
+        charges.close_execution_id(execution_id, &pending, Closing::Unknown("the execution ended before the job was read back".into())).await;
 
         assert_eq!(charges.count(), 0);
         let booked = recorded_payloads(&tasks);
@@ -2496,7 +2775,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let execution_id = weft_core::ExecutionId::new_v4();
         let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink: sink.clone() });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink.clone());
         // The fake meter yields once inside `fold_report`; the displacing
         // open lands in that window.
         let read = charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
@@ -2504,9 +2783,9 @@ mod open_charge_tests {
         }, &lane());
         // Let the spawned read reach the meter's own await before displacing.
         tokio::task::yield_now().await;
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink);
         read.await;
-        charges.close_execution_id(execution_id, &pending, "the execution ended").await;
+        charges.close_execution_id(execution_id, &pending, Closing::Unknown("the execution ended".into())).await;
         assert_eq!(charges.count(), 0);
         let mut amounts: Vec<Option<f64>> = recorded_payloads(&tasks).iter().map(|record| record.amount_usd).collect();
         amounts.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -2530,12 +2809,12 @@ mod open_charge_tests {
         // The call went out: its token is taken, its body still streaming.
         let held = sink.pending.hold();
 
-        let ending = charges.close_execution_id(execution_id, &pending, "the run ended before the job was read back");
+        let ending = charges.close_execution_id(execution_id, &pending, Closing::Unknown("the run ended before the job was read back".into()));
         tokio::pin!(ending);
         assert!(futures::poll!(&mut ending).is_pending(), "the ending waits on the call still in flight");
 
         // The body finishes now, and its meter opens a charge.
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held, sink });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, held, sink);
         tokio::time::timeout(std::time::Duration::from_secs(5), ending)
             .await
             .expect("a charge opened after the close must not hold the ending open");
@@ -2563,12 +2842,12 @@ mod open_charge_tests {
             let opener = {
                 let charges = charges.clone();
                 tokio::spawn(async move {
-                    charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held, sink });
+                    charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, held, sink);
                 })
             };
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                charges.close_execution_id(execution_id, &pending, "the run ended"),
+                charges.close_execution_id(execution_id, &pending, Closing::Unknown("the run ended".into())),
             )
             .await
             .expect("the ending completes whichever side won");
@@ -2590,8 +2869,8 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let execution_id = weft_core::ExecutionId::new_v4();
         let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
-        charges.close_execution_id(execution_id, &pending, "the execution ended before the job was read back").await;
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink);
+        charges.close_execution_id(execution_id, &pending, Closing::Unknown("the execution ended before the job was read back".into())).await;
         charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
         }, &lane()).await;
@@ -2610,15 +2889,15 @@ mod open_charge_tests {
         let mine_pending = PendingCostRecords::new();
         let execution_id = uuid::Uuid::new_v4();
         let mine = sink_on(tasks.clone(), mine_pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: mine.pending.hold(), sink: mine });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, mine.pending.hold(), mine);
 
         // Another execution on the same process, still going. Its own
         // pending tracker, so waiting for this execution's records does
         // not wait on a charge that is meant to stay open.
         let other = sink_on(tasks.clone(), PendingCostRecords::new(), charges.clone(), uuid::Uuid::new_v4());
-        charges.open(QUEUED.service(), "req-2".into(), OpenCharge { token: 0, scratch: submitted("req-2").data, held: other.pending.hold(), sink: other });
+        charges.open(QUEUED.service(), "req-2".into(), submitted("req-2").data, other.pending.hold(), other);
 
-        charges.close_execution_id(execution_id, &mine_pending, "the execution ended before the job was read back").await;
+        charges.close_execution_id(execution_id, &mine_pending, Closing::Unknown("the execution ended before the job was read back".into())).await;
 
         assert_eq!(charges.count(), 1, "the other execution's charge is untouched");
         let booked = recorded_payloads(&tasks);
@@ -2641,14 +2920,14 @@ mod open_charge_tests {
         let execution_id = uuid::Uuid::new_v4();
 
         let first = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open("queued", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, held: first.pending.hold(), sink: first });
+        charges.open("queued", "job-1".into(), submitted("job-1").data, first.pending.hold(), first);
         let second = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open("otherprov", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, held: second.pending.hold(), sink: second });
+        charges.open("otherprov", "job-1".into(), submitted("job-1").data, second.pending.hold(), second);
 
         assert_eq!(charges.count(), 2, "neither displaced the other");
         assert!(recorded_payloads(&tasks).is_empty(), "nothing was booked as displaced");
 
-        charges.close_execution_id(execution_id, &pending, "the execution ended").await;
+        charges.close_execution_id(execution_id, &pending, Closing::Unknown("the execution ended".into())).await;
         assert_eq!(recorded_payloads(&tasks).len(), 2, "both spends are written down");
     }
 
@@ -2660,7 +2939,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
+        charges.open(QUEUED.service(), "req-1".into(), submitted("req-1").data, sink.pending.hold(), sink);
 
         charges.flush("the replica shut down");
         pending.wait_zero().await;

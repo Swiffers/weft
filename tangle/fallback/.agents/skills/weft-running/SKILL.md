@@ -84,6 +84,19 @@ one wait that used to hide here was `activate` sitting behind a worker
 from an older build; it no longer waits by default (see `--running-policy`
 under the command map), and `weft status` reports an activation still in
 flight, which `weft cancel-activate` ends before you run the verb again.
+Its triggers then come out parked, keeping their work, if events or runs
+were waiting on them, and wiped if not; weft does the same by itself to an
+activation whose command died while no setup run of it was going, about a
+minute after it stopped answering. A resync whose step keeps failing after
+taking its triggers down stops with them off, says why, and refuses builds
+until it is settled. If it stopped on infra its triggers read that was not
+running, or on an activation still landing, it goes on by itself once that
+infra runs or that activation has landed. Otherwise `weft resync --resume` picks it up where it stopped (a
+plain `weft resync` is refused meanwhile), and `weft cancel-activate` with
+no `--trigger` or `--instance` gives it up, leaves those triggers off and
+prints which (with either flag it is refused while the resync holds the
+project, because the resync covers every owner's triggers). If the weft process
+doing a resync dies, the next one carries it on where it was.
 You raise a number only once you can say what is taking the extra time,
 and a run that is longer than its shape says is something you report.
 
@@ -183,7 +196,7 @@ status` and the graph print back.
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
 | `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect`; `--instance <id>` does the same for one instance of the program on a node whose connection is `@instance_filled`, the way its settings page would |
 | `weft instance-values --instance <id> [--set node.field=value]... [--clear node.field]...` | what the program asks that instance to fill and what was given; with `--set` / `--clear`, changes it in one go (its live triggers reading a changed value are set up again). Through an instance token it mints and revokes |
-| `weft rm [--journal] [--local] [--all] --yes` | unregister the project, terminate [infra], reclaim data. `--journal` also drops its run history, `--local` its build artifacts, `--all` implies every flag. Asks first; pass `--yes`, and only after the user confirmed |
+| `weft rm [--journal] [--local] [--all] --yes` | unregister the project, terminate [infra], reclaim data. `--journal` also drops its run history, `--local` its build artifacts, `--all` implies every flag. Asks first; pass `--yes`, and only after the user confirmed. If it fails partway, the project stays marked as being removed until `weft rm` runs again in the project folder, which is the only way to finish it: the editor shows ``the project is being removed; run `weft rm` again to finish removing it`` as a banner and offers no button, that one included. Until then no new run starts and `weft ps` lists it that way. `weft status` still answers, with that line as a `WARNING:` above what is left of the project; run, activate, resync, the infra commands and every build refuse with it |
 | `weft clean --yes` | journal and image cleanup, per subject, and naming a subject takes all of it: an execution id takes that one run, `--project <id>` takes a whole project's history (removing a project leaves its runs behind, so this is how you erase them), no subject takes everything older than `--keep-days` (30 by default), `--all` takes the lot. A version the deletion left bare (no runs, nothing under it, no checkpoint name, not head) goes with the runs; a named checkpoint never does. `--images` and `--build-cache` touch no journal rows. Deleting runs asks first; pass `--yes`, and only after the user confirmed |
 
 How a run picks which nodes execute is in the `weft-language` skill. A
@@ -268,11 +281,15 @@ on an active project, the [infra] verbs that deactivate on the way):
   runs waiting on the triggers end cancelled; new work is refused. You pass
   it only when nothing is in flight (`weft executions` shows no suspended
   run of the project) or the user said to drop the waiting work.
-- `park`: nothing is dropped. A call from outside, an answer to a waiting
-  run, and every fire a trigger makes by itself (a schedule's tick, a
-  message on a connection it holds) wait, and run once the triggers are
-  back, on the version they come back with; someone calling a route is kept
-  on the line until then. The questions stay listed for the people who
+- `park`: nothing is dropped. An answer to a waiting run, a form someone
+  sends, an event a service delivers to a webhook, and every fire a trigger makes by itself (a
+  schedule's tick, a message on a connection it holds) wait, and run once the triggers are back, on the version they come
+  back with. Someone calling a route is never kept on the line: they get
+  `503` at once, with `Retry-After: 5` and the body `This service is
+  unavailable right now; try again in a moment.`, so tell whoever writes a
+  frontend or client for the program to retry a `503` that carries
+  `Retry-After`, and never one without it. The questions
+  stay listed for the people who
   answer them. Your pick when the user is editing and people are
   mid-conversation. A schedule parked for two hours has two hours of ticks
   waiting when it comes back.
@@ -302,6 +319,19 @@ when the program is one people are using and the work in flight has to
 survive. The [infra] verbs never pick for you: when a trigger reads the
 [infra], they stop and name `--mode` and `--grace`, and you run them again
 with one.
+
+**Turning parked or hibernated triggers back on.** `weft resync`, the
+[infra] verbs and an `ActivateTriggers` node bring them back by themselves
+and carry the kept work over: the events that waited run, and the runs
+waiting on a person keep waiting. Only `weft activate` (and the editor's
+Activate button) asks what to do with that work, and since you run it
+with no terminal, it stops and names `--reactivate-choice`. That choice is the user's, never yours: tell
+them what was kept (how many events wait, how many runs wait on a person),
+ask which of the three they want, and pass it. `execute_parked_keep_suspended`
+runs the events that waited and keeps the waiting runs waiting (what resync
+does). `keep_suspended_only` drops the events that waited, including answers
+people sent to waiting runs, and the waiting runs keep waiting. `wipe_all`
+drops everything and cancels the runs those triggers started.
 
 ## The infra verbs
 

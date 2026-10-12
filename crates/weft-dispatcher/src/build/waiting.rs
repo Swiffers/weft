@@ -30,7 +30,7 @@ use anyhow::{anyhow, Context, Result};
 use sqlx::PgPool;
 use weft_core::builds::{BuiltProgram, ImageBuild, VersionBuildState, VersionBuildStatus};
 
-use crate::project_store::{ProjectStoreOps, StoredProjectSummary};
+use crate::project_store::{ProjectStoreOps, ProjectTransition, StoredProjectSummary};
 use crate::state::DispatcherState;
 
 /// The state a version waits in, as the column spells it.
@@ -81,7 +81,7 @@ pub const ONE_WAITING_PER_PROJECT: &str =
 
 /// The SQL condition "the project bound at `project` has a waiting
 /// version": what holds its build transition once no request drives it
-/// (`crate::project_store::build_held`).
+/// (`crate::project_store::transition_held`).
 pub(crate) fn has_waiting_version(project: &str) -> String {
     format!("EXISTS (SELECT 1 FROM version_build v WHERE v.project_id = {project} AND v.state = '{WAITING}')")
 }
@@ -267,6 +267,26 @@ async fn let_go_of(hold: super::prune::ImageHold, project: uuid::Uuid, why: &str
     }
 }
 
+/// A registration refused because a resync holds the project ([`settle`]):
+/// what the build's caller is told, as a 409.
+#[derive(Debug)]
+pub struct ResyncHolds;
+
+impl std::fmt::Display for ResyncHolds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this build was not registered: {}", ProjectTransition::Resyncing.refusal().unwrap_or_default())
+    }
+}
+
+impl std::error::Error for ResyncHolds {}
+
+impl ResyncHolds {
+    /// Whether `e` is (or wraps) this refusal.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.chain().any(|cause| cause.downcast_ref::<ResyncHolds>().is_some())
+    }
+}
+
 /// What a registration settles, read and written in the registration's
 /// own transaction (`ProjectStoreOps::register_with_hashes`). Either way it
 /// lands only over an older ask than the one the project runs.
@@ -288,11 +308,19 @@ pub enum Settles<'a> {
 /// longer waits, or its project was removed, which ends it.
 pub(crate) async fn settle(conn: &mut sqlx::PgConnection, project: uuid::Uuid, settles: &Settles<'_>, now: i64) -> Result<bool> {
     lock_versions(conn, project).await?;
-    let running: Option<i64> = sqlx::query_scalar("SELECT registered_ask FROM project WHERE id = $1")
+    // Every registration passes here, under the project row's lock, which
+    // a resync takes to begin (`ProjectStoreOps::try_begin_resyncing`): no
+    // version registers while a resync holds the project, whose triggers
+    // it brings back on the build it named.
+    let row: Option<(i64, String)> = sqlx::query_as("SELECT registered_ask, transition FROM project WHERE id = $1 FOR UPDATE")
         .bind(project)
         .fetch_optional(&mut *conn)
         .await
         .context("read the ask the project runs")?;
+    if row.as_ref().is_some_and(|(_, transition)| transition == ProjectTransition::Resyncing.as_str()) {
+        return Err(ResyncHolds.into());
+    }
+    let running = row.map(|(ask, _)| ask);
     let registers = match settles {
         Settles::Waiting { version, answer } => {
             let row: Option<(String, i64)> =
@@ -377,22 +405,29 @@ pub async fn register_version(
         Registrar::Request { hold } => (Some(hold), None),
         Registrar::Loop { version: waiting } => (None, Some(waiting)),
     };
-    let registered = registered_in_store(projects, project, tenant, version, settles_by).await;
+    let mut registered = registered_in_store(projects, project, tenant, version, settles_by).await;
     // Let go only now: a prune deciding about one of these images under
     // its lock sees either this claim or the committed reference
     // (`ledger::begin_reclaim`), never neither.
     if let Some(hold) = hold {
         if let Err(released) = hold.release().await {
-            match &registered {
-                Ok(_) => tracing::error!(
+            if registered.is_ok() {
+                tracing::error!(
                     target: "weft_dispatcher::build",
                     project_id = %project,
                     error = %format!("{released:#}"),
                     "letting go of the build's claim on its images failed after the version registered; the claim \
                      lapses within 60 seconds"
-                ),
-                Err(e) => return Err(anyhow!("{e:#}\n(and letting go of the build's claim on its images failed too: {released:#})")),
+                );
             }
+            // A registration that failed keeps its own error (a
+            // `ResyncHolds` still answers 409), the release's failure
+            // added as context.
+            registered = registered.map_err(|e| {
+                e.context(format!(
+                    "letting go of the build's claim on its images failed too ({released:#}); the claim lapses within 60 seconds"
+                ))
+            });
         }
     }
     let Some((summary, answer)) = registered? else { return Ok(None) };
@@ -488,6 +523,8 @@ pub async fn announce(state: &DispatcherState, summary: &StoredProjectSummary) {
         );
     }
     state.builder.prunes.request(state, Some(summary.id));
+    // A queued event a failing hand-over stopped may run on this version.
+    crate::parked_drain::retry_stopped(state, summary.id).await;
     state
         .events
         .publish(crate::events::DispatcherEvent::ProjectRegistered {

@@ -32,7 +32,7 @@ impl ProjectStatus {
         self.0.get("status").and_then(Value::as_str).unwrap_or("")
     }
 
-    /// The build transition marker (`none` / `building` / `cancelling_build`).
+    /// The transition marker (`none` / `building` / `cancelling_build` / `resyncing`).
     pub fn transition(&self) -> &str {
         self.0.get("transition").and_then(Value::as_str).unwrap_or("")
     }

@@ -2,8 +2,9 @@
 //! `PollEndpoint`, `SocketListen`). All three hold or poll an external
 //! source and fire a fresh execution per event; what differs is HOW they
 //! read (held SSE stream vs periodic poll vs bidirectional socket). The
-//! payload coercion and the reconnect-backoff ladder are identical, so
-//! they live here once and the three handlers call in.
+//! payload coercion, the reconnect-backoff ladder and what a reconnecting
+//! connection says are identical, so they live here once and the
+//! handlers call in.
 
 use serde_json::Value;
 use tokio::time::{sleep, Duration};
@@ -54,6 +55,40 @@ impl Backoff {
 impl Default for Backoff {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// What a connection that drops and comes back says about itself, said
+/// only when it changes: `connecting` as it first comes up, `connected`,
+/// and once when it drops, `reconnecting since <time>: <first error>`,
+/// however many attempts follow. A holder writes each change to the row
+/// another process shows it from, so an attempt says nothing new.
+pub struct Said {
+    report: super::ServingReport,
+    down: bool,
+}
+
+impl Said {
+    pub fn new(report: super::ServingReport) -> Self {
+        report("connecting".to_string());
+        Self { report, down: false }
+    }
+
+    /// Up again, saying how (`connected`).
+    pub fn up(&mut self, how: &str) {
+        self.down = false;
+        (self.report)(how.to_string());
+    }
+
+    pub fn down(&mut self, why: impl std::fmt::Display) {
+        if !std::mem::replace(&mut self.down, true) {
+            (self.report)(format!("reconnecting since {}: {why}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+        }
+    }
+
+    /// For good: nothing follows.
+    pub fn stopped(&self, why: impl std::fmt::Display) {
+        (self.report)(format!("stopped: {why}"));
     }
 }
 

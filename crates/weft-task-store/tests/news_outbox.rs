@@ -1,8 +1,9 @@
 //! Layer-3 tests for the install's news going out through the outbox,
 //! against a REAL Postgres: news a write left is told in one call per
-//! batch, taken out only once told, kept in memory and told again (without
-//! reading the database) while it cannot be, and never holds up the
-//! database's own announcements.
+//! batch, taken out only once told, told again from memory a few times
+//! while it cannot be, then marked refused and written down, never
+//! travelling with or holding up the news after it, and never holds up
+//! the database's own announcements.
 //!
 //! Gated behind `db-tests` like the rest of this crate's database tests;
 //! `scripts/run-db-tests.sh weft-task-store` runs them.
@@ -18,18 +19,31 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use weft_platform_traits::{Listening, News, NewsHeard, NewsKind, RunNews};
 
-use support::setup;
+/// The crate's schema, and where a refusal of the news is written down
+/// (with the run columns every write of a failure reads).
+async fn setup(pool: &PgPool) {
+    support::setup(pool).await;
+    weft_task_store::apply_groups(pool, &[&weft_task_store::unanswered::GROUP]).await.expect("unanswered schema");
+    weft_task_store::unanswered::judged_run_columns(pool).await.expect("the run columns");
+}
 
-/// Refuses the first `fails` calls, then records each batch announced.
+/// Refuses the first `fails` calls, and every batch carrying the run
+/// `refuses` while it is set; records each batch announced.
 struct Flaky {
     fails: AtomicUsize,
+    refuses: Mutex<Option<uuid::Uuid>>,
     told: Mutex<Vec<Vec<RunNews>>>,
     heard: tokio::sync::broadcast::Sender<NewsHeard>,
 }
 
 impl Flaky {
     fn failing(fails: usize) -> Arc<Self> {
-        Arc::new(Self { fails: AtomicUsize::new(fails), told: Mutex::default(), heard: tokio::sync::broadcast::channel(1).0 })
+        Arc::new(Self {
+            fails: AtomicUsize::new(fails),
+            refuses: Mutex::default(),
+            told: Mutex::default(),
+            heard: tokio::sync::broadcast::channel(1).0,
+        })
     }
 
     fn told(&self) -> Vec<Vec<RunNews>> {
@@ -43,6 +57,10 @@ impl News for Flaky {
         if self.fails.load(Ordering::SeqCst) > 0 {
             self.fails.fetch_sub(1, Ordering::SeqCst);
             anyhow::bail!("the bus is away");
+        }
+        let refused = *self.refuses.lock().unwrap();
+        if news.iter().any(|piece| Some(piece.execution) == refused) {
+            anyhow::bail!("the bus will not take this");
         }
         self.told.lock().unwrap().push(news.to_vec());
         Ok(())
@@ -143,4 +161,104 @@ async fn a_bus_that_refuses_holds_up_no_announcement(pool: PgPool) {
         "the announcement went out while the news waits"
     );
     assert_eq!(waiting(&pool).await, 1, "the news still waits");
+}
+
+async fn refusal_written(pool: &PgPool) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM unanswered_call WHERE callee = 'news:')").fetch_one(pool).await.unwrap()
+}
+
+async fn refused(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM weft_news WHERE refused_at IS NOT NULL").fetch_one(pool).await.unwrap()
+}
+
+/// A batch the bus keeps refusing is tried a few times, then marked
+/// refused with the refusal written down, and the news after it goes out.
+/// News written later goes out alone and before any refused news is tried
+/// again; the refused news is then tried one piece per call, so the one
+/// piece the bus will never take refuses only itself, and once it goes
+/// out the refusal written down is cleared.
+#[sqlx::test]
+async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: PgPool) {
+    setup(&pool).await;
+    let mut first = Vec::new();
+    for execution in 2..=101 {
+        first.push(tell(&pool, execution).await);
+    }
+    let after = tell(&pool, 102).await;
+    let bus = Flaky::failing(0);
+    let poison = first[0];
+    *bus.refuses.lock().unwrap() = Some(poison.execution);
+    weft_task_store::announce::tell_news_through(&pool, bus.clone());
+    until("the news after the refused batch told", async || bus.told() == vec![vec![after]]).await;
+    until("the refusal written down", async || refusal_written(&pool).await).await;
+    assert_eq!((waiting(&pool).await, refused(&pool).await), (100, 100), "the refused batch waits, marked refused");
+
+    let later = tell(&pool, 103).await;
+    weft_task_store::announce::news_written(&pool);
+    until("everything but the piece the bus will never take told", async || {
+        weft_task_store::announce::news_written(&pool);
+        waiting(&pool).await == 1
+    })
+    .await;
+    let told = bus.told();
+    assert_eq!(told[..2], [vec![after], vec![later]], "new news went out alone, before the refused news was tried");
+    assert!(told[2..].iter().all(|call| call.len() == 1), "refused news is tried one piece per call");
+    let mut retold: Vec<RunNews> = told[2..].iter().map(|call| call[0]).collect();
+    retold.sort_by_key(|piece| piece.execution);
+    assert_eq!(retold, first[1..], "every refused piece but the one the bus will never take went out");
+    assert!(refusal_written(&pool).await, "a refused piece is still waiting");
+
+    *bus.refuses.lock().unwrap() = None;
+    weft_task_store::announce::news_written(&pool);
+    until("the last refused piece told once news was next written", async || waiting(&pool).await == 0).await;
+    assert_eq!(bus.told().last(), Some(&vec![poison]));
+    until("the refusal cleared once no refused news is left", async || !refusal_written(&pool).await).await;
+}
+
+/// A look on an install whose bus never refused anything reads the new
+/// news and nothing more: the refused path, and its install-wide lock, is
+/// taken only once a refusal exists.
+#[sqlx::test]
+async fn a_look_with_nothing_refused_never_takes_the_refused_path(pool: PgPool) {
+    setup(&pool).await;
+    // Count the calls to the refused path instead of making them.
+    sqlx::raw_sql(
+        "CREATE TABLE refused_looks (n INT); \
+         CREATE OR REPLACE FUNCTION weft_news_refused(p_limit BIGINT, p_skip BIGINT[], p_callee TEXT) \
+             RETURNS TABLE (seq BIGINT, project_id UUID, execution_id UUID, kind TEXT) AS $$ \
+             BEGIN INSERT INTO refused_looks VALUES (1); RETURN; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let refused_looks = async || -> i64 { sqlx::query_scalar("SELECT COUNT(*) FROM refused_looks").fetch_one(&pool).await.unwrap() };
+    let first = tell(&pool, 2).await;
+    let bus = Flaky::failing(0);
+    weft_task_store::announce::tell_news_through(&pool, bus.clone());
+    until("the first news told", async || waiting(&pool).await == 0).await;
+    // Looks run one after another, so once the second is told the first
+    // look has ended.
+    let second = tell(&pool, 3).await;
+    weft_task_store::announce::news_written(&pool);
+    until("the second news told", async || waiting(&pool).await == 0).await;
+    assert_eq!(bus.told(), vec![vec![first], vec![second]]);
+    assert_eq!(refused_looks().await, 0, "nothing refused: no look took the refused path");
+
+    weft_task_store::unanswered::failed(&pool, weft_task_store::unanswered::Callee::News, None, "the bus is away").await.unwrap().log();
+    weft_task_store::announce::news_written(&pool);
+    until("a refusal written down sends the next look down the refused path", async || refused_looks().await > 0).await;
+}
+
+/// A refusal written down while no refused news is left (another process
+/// told it meanwhile) is cleared by the next look, even one that finds no
+/// news at all.
+#[sqlx::test]
+async fn an_empty_look_clears_a_refusal_no_news_is_left_for(pool: PgPool) {
+    setup(&pool).await;
+    weft_task_store::unanswered::failed(&pool, weft_task_store::unanswered::Callee::News, None, "the bus is away").await.unwrap().log();
+    assert!(refusal_written(&pool).await);
+    let bus = Flaky::failing(0);
+    weft_task_store::announce::tell_news_through(&pool, bus.clone());
+    until("the refusal cleared", async || !refusal_written(&pool).await).await;
+    assert!(bus.told().is_empty());
 }

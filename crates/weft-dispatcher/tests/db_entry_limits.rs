@@ -92,3 +92,20 @@ async fn the_runs_a_trigger_started_are_reported_for_two_minutes(pool: PgPool) {
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(runs["tick"], (7, 1));
 }
+
+/// The minutes that no longer count go with the next refused token, so the
+/// counts are kept small by the writes that fill them and no timer looks.
+#[sqlx::test]
+async fn a_refused_token_prunes_the_minutes_that_no_longer_count(pool: PgPool) {
+    setup(&pool).await;
+    let edge = edge(Some(3));
+    let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    entry_limits::note_invalid_token(&pool, &edge, addr, 120).await.unwrap();
+    entry_limits::note_invalid_token(&pool, &edge, addr, 180).await.unwrap();
+    entry_limits::note_invalid_token(&pool, &edge, addr, 300).await.unwrap();
+    let minutes: Vec<i64> = sqlx::query_scalar("SELECT window_start FROM entry_rate ORDER BY window_start").fetch_all(&pool).await.unwrap();
+    assert_eq!(minutes, vec![300], "the minutes before the last two went");
+    entry_limits::note_invalid_token(&pool, &edge, addr, 360).await.unwrap();
+    let minutes: Vec<i64> = sqlx::query_scalar("SELECT window_start FROM entry_rate ORDER BY window_start").fetch_all(&pool).await.unwrap();
+    assert_eq!(minutes, vec![300, 360], "the minute before stays");
+}

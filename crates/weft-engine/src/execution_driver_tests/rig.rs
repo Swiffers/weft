@@ -45,7 +45,7 @@
         }
     }
 
-    pub(super) fn catalog(
+    pub(crate) fn catalog(
         nodes: Vec<(&'static str, Box<dyn weft_core::Node>)>,
     ) -> Arc<dyn weft_core::NodeCatalog> {
         // `Box::leak` is DELIBERATE: the catalog contract wants
@@ -187,8 +187,12 @@
                 return Ok(weft_task_store::tasks::DedupOutcome::Inserted(id));
             }
             assert_eq!(t.kind, weft_task_store::TaskKind::RegisterSignal.as_str(), "await tests only register and withdraw waits");
-            // Deterministic token derived from the task id.
-            let token = format!("tok-{id}");
+            // The token derives from the wait's identity, as the
+            // dispatcher's resume token does (`task_kinds::register_signal`):
+            // two registrations of one (execution, node, frames, call
+            // index) get the same token.
+            let identity = ["execution_id", "node_id", "frames", "is_resume", "call_index"].map(|field| t.payload[field].to_string());
+            let token = format!("tok-{}", uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity.join("/").as_bytes()));
             self.tokens.lock().unwrap().insert(id, token.clone());
             *self.last_token.lock().unwrap() = Some(token);
             Ok(weft_task_store::tasks::DedupOutcome::Inserted(id))
@@ -213,12 +217,15 @@
         }
     }
     /// The broker's side of the runs a rig drives: the answers a test
-    /// gives, handed to whoever reads next, each one told on the run's line
-    /// (as the broker pushes it); every read counted; the runs let go of.
+    /// gives, handed to whoever reads next, each one told to the run (as
+    /// its worker's line watch passes it on); every read counted; the runs
+    /// let go of.
     pub(crate) struct Answers {
         waiting: StdMutex<Vec<weft_broker_client::protocol::RunAnswer>>,
-        /// The run's line, as the broker pushes onto it.
-        pub(crate) line: tokio::sync::broadcast::Sender<weft_task_store::pg_signal::Heard>,
+        /// What the run is told, as its worker tells it: the clients' `told`.
+        pub(crate) told: tokio::sync::broadcast::Sender<crate::context::RunTold>,
+        /// The run that reads, as its first read names it.
+        run: StdMutex<Option<ExecutionId>>,
         /// How many times the answers were read.
         pub(crate) reads: std::sync::atomic::AtomicUsize,
         pub(crate) let_go: StdMutex<Vec<(ExecutionId, weft_broker_client::protocol::LetGo)>>,
@@ -227,7 +234,8 @@
         fn default() -> Self {
             Self {
                 waiting: StdMutex::default(),
-                line: tokio::sync::broadcast::channel(64).0,
+                told: crate::context::run_told(),
+                run: StdMutex::default(),
                 reads: std::sync::atomic::AtomicUsize::new(0),
                 let_go: StdMutex::default(),
             }
@@ -235,14 +243,20 @@
     }
     impl Answers {
         /// An answer to the wait `token`, as the install hands one to the
-        /// run's worker: kept for it, and told on its line (a recheck stands
-        /// for the run's own notice, which needs the run's id).
+        /// run's worker: kept for it, and told to the run that reads.
         pub(crate) fn answer(&self, token: impl Into<String>, value: Value) {
+            self.keep(token, value);
+            let run = self.run.lock().unwrap().expect("the run read its answers once as it started waiting");
+            let _ = self.told.send(crate::context::RunTold::Answered(run));
+        }
+
+        /// An answer to the wait `token`, kept for the run's next read and
+        /// told to nobody: the news of it travels on the line.
+        pub(crate) fn keep(&self, token: impl Into<String>, value: Value) {
             self.waiting.lock().unwrap().push(weft_broker_client::protocol::RunAnswer {
                 token: token.into(),
                 answer: weft_core::primitive::WaitAnswer::Given { value },
             });
-            let _ = self.line.send(weft_task_store::pg_signal::Heard::Recheck);
         }
 
         pub(crate) fn reads(&self) -> usize {
@@ -258,15 +272,13 @@
             self.let_go.lock().unwrap().push((execution_id, why));
             Ok(())
         }
-        async fn answers(&self, _execution_id: ExecutionId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+        async fn answers(&self, execution_id: ExecutionId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.run.lock().unwrap() = Some(execution_id);
             Ok(std::mem::take(&mut *self.waiting.lock().unwrap()))
         }
-        fn told(&self) -> weft_task_store::pg_signal::Subscription {
-            self.line.subscribe().into()
-        }
-        async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
-            Ok(Vec::new())
+        async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse> {
+            unreachable!("a rig has no line watch")
         }
     }
     pub(super) struct NoopInfra;
@@ -403,7 +415,7 @@
     /// THE property this engine rests on: the rows the run wrote,
     /// folded over the program, rebuild the tables the worker held.
     /// Compares the pulses (id, status, closure and its error, frames,
-    /// port, value) per node, the records (frames, ordinal, status,
+    /// port, value) per node, the records (frames, status,
     /// error, suspension token, port warnings, absorbed pulses) per
     /// node in order, the loop instances (config, source, cap, gather
     /// ports, launched, fired, terminated, carries, gathers, outer
@@ -423,10 +435,10 @@
         /// error, frames, port, value (as its JSON text, so the row
         /// orders totally).
         type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
-        /// One record as compared: node, frames, ordinal, status,
-        /// error, suspension token, absorbed pulses.
+        /// One record as compared: node, frames, status, error,
+        /// suspension token, absorbed pulses.
         type RecordRow =
-            (String, Vec<u32>, usize, NodeExecutionStatus, Option<String>, Option<String>, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
+            (String, Vec<u32>, NodeExecutionStatus, Option<String>, Option<String>, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
         /// One gather port as compared: per iteration index, the write
         /// (a value as JSON text, or the closed slot).
         type GatherRow = (String, Vec<(u32, String)>);
@@ -507,7 +519,6 @@
                         (
                             node.clone(),
                             r.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
-                            r.ordinal,
                             r.status.clone(),
                             r.error.clone(),
                             r.callback_id.clone(),
@@ -654,9 +665,11 @@
     /// [`clients`], their writer batching as `settings` say, its lanes on
     /// the process's own io runtime as a worker's are.
     pub(crate) fn clients_writing(journal: Arc<MemJournal>, settings: crate::journal_writer::WriterSettings) -> EngineClients {
+        let answers = Arc::new(Answers::default());
         EngineClients {
             writer: crate::journal_writer::WorkerJournal::start(journal, settings, &crate::context::io_runtime().expect("the io runtime starts")),
-            runs: Arc::new(Answers::default()),
+            told: answers.told.clone(),
+            runs: answers,
             tasks: Arc::new(NoopTasks),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
@@ -710,16 +723,23 @@
     /// A caller's exchange for a test's fake caller, its record kept
     /// nowhere.
     pub(crate) fn exchange(conn: Arc<dyn weft_core::caller::CallerConnection>) -> crate::execution_driver::Exchange {
-        struct Unkept;
-        impl crate::caller_conn::CallerJournalSink for Unkept {
-            fn connected(&self, _: ExecutionId, _: u64, _: weft_core::signal::Protocol) {}
-            fn inbound(&self, _: ExecutionId, _: u64, _: &weft_core::caller::InboundMessage) {}
-            fn outbound(&self, _: ExecutionId, _: u64, _: &weft_core::caller::OutboundChunk, _: bool) {}
-            fn errored(&self, _: ExecutionId, _: u64, _: &str) {}
-            fn disconnected(&self, _: ExecutionId, _: u64, _: &str) {}
-            fn close(&self) {}
-        }
         crate::execution_driver::Exchange { conn, live: None, sink: Arc::new(Unkept) }
+    }
+
+    /// A real caller's exchange, its conversation kept nowhere.
+    pub(crate) fn live_exchange(conn: Arc<crate::caller_conn::LiveCallerConnection>) -> crate::execution_driver::Exchange {
+        crate::execution_driver::Exchange { conn: conn.clone(), live: Some(conn), sink: Arc::new(Unkept) }
+    }
+
+    /// A caller's exchange kept nowhere.
+    pub(crate) struct Unkept;
+    impl crate::caller_conn::CallerJournalSink for Unkept {
+        fn connected(&self, _: ExecutionId, _: u64, _: weft_core::signal::Protocol) {}
+        fn inbound(&self, _: ExecutionId, _: u64, _: &weft_core::caller::InboundMessage) {}
+        fn outbound(&self, _: ExecutionId, _: u64, _: &weft_core::caller::OutboundChunk, _: bool) {}
+        fn errored(&self, _: ExecutionId, _: u64, _: &str) {}
+        fn disconnected(&self, _: ExecutionId, _: u64, _: &str) {}
+        fn close(&self) {}
     }
 
     /// Drive `execution_id` from `first` through `journal`, the way a worker
@@ -765,7 +785,7 @@
         });
         let program = Arc::new(crate::plan::ProgramTables::new(project, selection));
         let starts_from = crate::execution_driver::StartsFrom::Record(first);
-        let hold = Some(holds.of(execution_id));
+        let hold = Some(holds.of(execution_id, None));
         let run = RunDrive { execution_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back, hold };
         tokio::time::timeout(
             std::time::Duration::from_secs(60),

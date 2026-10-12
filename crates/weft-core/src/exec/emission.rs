@@ -1,17 +1,20 @@
 //! Pulse emissions and their identity.
 //!
 //! Every act that puts pulses on wires is an EMISSION with an id: a
-//! node body's `pulse_downstream` (the id is minted fresh and written
-//! to the journal on the `PortEmitted` row), a firing's termination
-//! sweep, a group boundary forwarding, a loop launching an iteration
-//! or emitting outward (those ids are DERIVED from what the journal
-//! already records: the execution, the node or group, the frames, the
-//! ordinal of the firing). A pulse's id is then derived from its
-//! emission id and the wire it lands on. So the live engine and the
-//! journal fold, given the same rows and the same program, put the
-//! same pulses with the same ids in the same table, and any row that
-//! names a pulse by id (a stream take, a loop's item launch) resolves
-//! identically on both sides. That is what makes replay exact.
+//! node body's `pulse_downstream` or `close_port` (written to the
+//! journal on the `PortEmitted` / `PortClosed` row), a firing's
+//! termination sweep, a group boundary forwarding, a loop launching
+//! an iteration or emitting outward. Every one of those ids is DERIVED
+//! from where the act happens (the node or group, the frames, and for
+//! a stream item or an iteration its number), never minted at random:
+//! one execution fires a node once per frames, so the place names the
+//! act. A pulse's id is then derived from its emission id and the wire
+//! it lands on. So the live engine and the journal fold, given the
+//! same rows and the same program, put the same pulses with the same
+//! ids in the same table, any row that names a pulse by id (a stream
+//! take, a loop's item launch) resolves identically on both sides, and
+//! a body replayed after a pause that emits a port again produces the
+//! very pulse already on the wire, which the table keeps once.
 
 use uuid::Uuid;
 
@@ -54,25 +57,40 @@ pub fn pulse_id(
     )
 }
 
-/// The emission of a firing's TERMINATION sweep (the closures on every
-/// output port it never mentioned). `ordinal` is the firing's rank
-/// among the records at the same (node, frames): a node fired twice at
-/// one location closes its ports twice, and the two sweeps must not
-/// collide.
+/// The emission of a node body's values and closes on its ordinary
+/// output ports, and of what the engine puts on them for the firing (a
+/// caught failure on `error`, a baked value): one id per firing. Each
+/// such port goes out at most once per firing, and the pulse id carries
+/// the port, so one id serves every one of them, and a replay of the
+/// body after a pause that emits a port again lands on the pulse
+/// already there.
 ///
-/// None of the derived emissions below folds the run's execution in: a
-/// pulse table is one run's, so the location and the ordinal already
-/// name the act, and a seeded run folds rows it inherited from another
-/// run into ITS table (`weft_journal::seed`), where an id that changed
-/// with the execution would no longer match the pulse ids those rows name.
-pub fn terminal_sweep_emission(node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
-    derived(&TERMINAL_SWEEP, &[node_id, &frames_key(frames), &ordinal.to_string()])
+/// None of the derived emissions here folds the run's execution in: a
+/// pulse table is one run's, so the location already names the act,
+/// and a seeded run folds rows it inherited from another run into ITS
+/// table (`weft_journal::seed`), where an id that changed with the
+/// execution would no longer match the pulse ids those rows name.
+pub fn body_emission(node_id: &str, frames: &LoopFrames) -> Uuid {
+    derived(&BODY, &[node_id, &frames_key(frames)])
+}
+
+/// The emission of the `item`th body emission that yields on a stream
+/// (`Generator[T]`) output, counted from 0 per firing: every item is
+/// its own pulse on the same wire, so each needs its own id.
+pub fn stream_emission(node_id: &str, frames: &LoopFrames, item: u64) -> Uuid {
+    derived(&STREAM_ITEM, &[node_id, &frames_key(frames), &item.to_string()])
+}
+
+/// The emission of a firing's TERMINATION sweep (the closures on every
+/// output port it never mentioned).
+pub fn terminal_sweep_emission(node_id: &str, frames: &LoopFrames) -> Uuid {
+    derived(&TERMINAL_SWEEP, &[node_id, &frames_key(frames)])
 }
 
 /// The emission of a group boundary firing (a `Passthrough` forwarding
 /// its inputs, or the closures a gated scope owes the outside).
-pub fn boundary_emission(node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
-    derived(&BOUNDARY, &[node_id, &frames_key(frames), &ordinal.to_string()])
+pub fn boundary_emission(node_id: &str, frames: &LoopFrames) -> Uuid {
+    derived(&BOUNDARY, &[node_id, &frames_key(frames)])
 }
 
 /// The emission of a loop launching iteration `index` (the body's
@@ -110,6 +128,12 @@ const ITERATION_LAUNCH: Uuid = Uuid::from_bytes([
 const LOOP_TERMINATION: Uuid = Uuid::from_bytes([
     0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x04,
 ]);
+const BODY: Uuid = Uuid::from_bytes([
+    0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x05,
+]);
+const STREAM_ITEM: Uuid = Uuid::from_bytes([
+    0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x06,
+]);
 
 #[cfg(test)]
 mod tests {
@@ -136,11 +160,15 @@ mod tests {
     fn derived_emissions_separate_by_every_part_and_by_kind() {
         let root: LoopFrames = Vec::new();
         let inner: LoopFrames = vec![Frame::Loop { index: 2 }];
-        let sweep = terminal_sweep_emission("n", &root, 0);
-        assert_eq!(sweep, terminal_sweep_emission("n", &root, 0));
-        assert_ne!(sweep, terminal_sweep_emission("n", &root, 1), "a second firing sweeps apart");
-        assert_ne!(sweep, terminal_sweep_emission("n", &inner, 0));
-        assert_ne!(sweep, boundary_emission("n", &root, 0), "same parts, different act");
+        let sweep = terminal_sweep_emission("n", &root);
+        assert_eq!(sweep, terminal_sweep_emission("n", &root));
+        assert_ne!(sweep, terminal_sweep_emission("n", &inner));
+        assert_ne!(sweep, boundary_emission("n", &root), "same parts, different act");
+        assert_ne!(sweep, body_emission("n", &root), "same parts, different act");
+        assert_eq!(body_emission("n", &inner), body_emission("n", &inner), "a replayed body emits the same act");
+        assert_ne!(body_emission("n", &root), body_emission("n", &inner));
+        assert_ne!(stream_emission("n", &root, 0), stream_emission("n", &root, 1), "each stream item is its own act");
+        assert_ne!(stream_emission("n", &root, 0), body_emission("n", &root));
         assert_ne!(
             iteration_launch_emission("g", &root, 0),
             iteration_launch_emission("g", &root, 1)

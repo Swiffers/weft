@@ -116,9 +116,18 @@ pub trait ProjectStoreOps: Send + Sync {
     /// list-everything endpoint needs the tenant pushed into the store.
     async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>>;
     async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>>;
-    /// Returns `Ok(true)` iff a row was removed. `Ok(false)` = no
-    /// such row (caller decides whether to 404). `Err` = DB failure.
-    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+    /// Mark the project as being removed, `weft rm`'s first write: no run
+    /// of it is born from then on. `false` when there is no such row.
+    async fn mark_removing(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+    /// Remove the project and everything kept under it, in one
+    /// transaction: its runs with everything of theirs, its recorded
+    /// programs and version tree, its trigger setups and bakes, its
+    /// signals, its tasks, its infra rows and infra lease, its instances'
+    /// access. Answers the signals it removed, for
+    /// the listener to let go of once this committed; `Ok(None)` = no such
+    /// row (caller decides whether to 404). `Err` = DB failure, and
+    /// nothing was removed.
+    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>>;
 
     /// Read the stored binary hash. `Ok(None)` if never set
@@ -144,33 +153,6 @@ pub trait ProjectStoreOps: Send + Sync {
         hash: &str,
     ) -> anyhow::Result<Option<String>>;
 
-    /// Forget every program version recorded for a REMOVED project
-    /// except the ones named. What a project removal and the last
-    /// `weft clean` after it call with the versions the surviving runs
-    /// were started against, so a deleted project leaves behind exactly
-    /// what keeps its past runs readable and nothing else. Answers how
-    /// many versions it dropped.
-    ///
-    /// Refuses on a project that still exists: while it is registered
-    /// its own running version is in play and the caller cannot know
-    /// what is safe to drop.
-    async fn retire_unused_definitions(
-        &self,
-        id: uuid::Uuid,
-        still_in_use: &[String],
-    ) -> anyhow::Result<u64>;
-
-    /// Every project id that still has recorded programs while the
-    /// project itself is gone.
-    ///
-    /// What the reaper sweeps. Retiring on removal is best-effort (the
-    /// removal has already happened and must not fail over unread rows),
-    /// and once the project row is gone no request can ever reach those
-    /// rows again: `weft rm` refuses a project it cannot find, and with no
-    /// runs left `weft clean` has nothing to be called on either. This is
-    /// what keeps a single failed retirement from being junk forever.
-    async fn projects_with_orphan_definitions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
-
     /// Read the stored infra hash. Same Result contract as
     /// `running_binary_hash`.
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
@@ -186,7 +168,7 @@ pub trait ProjectStoreOps: Send + Sync {
     /// no such project.
     async fn next_build_ask(&self, id: uuid::Uuid) -> anyhow::Result<i64>;
 
-    /// Read the project's verb-transition marker (the build axis,
+    /// Read the project's verb-transition marker (a build or a resync,
     /// orthogonal to `status`). `Ok(None)` = no such project.
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>>;
 
@@ -194,7 +176,9 @@ pub trait ProjectStoreOps: Send + Sync {
     /// flips `transition` to building IFF no request is starting builds
     /// for the project right now (the transition is none, or building held
     /// only by its waiting version or by a request gone: its heartbeat is
-    /// older than `stale_before`) AND the trigger lifecycle is not mid-flip
+    /// older than `stale_before`), no resync is under way (its plan holds
+    /// the transition until its task brought its triggers back or a
+    /// person gave it up) AND the trigger lifecycle is not mid-flip
     /// (activating / deactivating). Stamps the transition heartbeat. Taking
     /// over from a request gone ends, in the same transaction, the starts
     /// it left waiting to be made on the builder
@@ -207,6 +191,80 @@ pub trait ProjectStoreOps: Send + Sync {
     /// (409).
     async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool>;
 
+    /// Single-flight entry into the `resyncing` transition: flips
+    /// `transition` to resyncing and writes down `plan` IFF the project's
+    /// transition is at rest, the build it registered is the one `plan`
+    /// names (a build registering meanwhile moved it) AND the trigger
+    /// lifecycle is not mid-flip (activating / deactivating: a manual
+    /// activate that passed its own checks first must not run under the
+    /// resync), and in the same transaction enqueues `task`, the resync's
+    /// durable driver under `plan.driver` (`crate::task_kinds::resync`).
+    /// The plan holds the transition until the task brought every trigger
+    /// back ([`Self::end_resync`]), or a person gave it up
+    /// ([`Self::give_up_resync`]). Answers the task's id; `Ok(None)` =
+    /// lost: a build or another resync is under way, the build moved, or a
+    /// trigger is mid-flip.
+    async fn try_begin_resyncing(
+        &self,
+        id: uuid::Uuid,
+        plan: &crate::task_kinds::resync::ResyncPlan,
+        task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<Option<uuid::Uuid>>;
+
+    /// The resync the project holds under way (`project.resync` while its
+    /// transition is `resyncing`), and whether a task of its drive runs
+    /// now (pending or claimed); `None` with none.
+    async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>>;
+
+    /// The project's resync as its drive `driver` reads it: the plan, and
+    /// whether it is still under way (`false`: that drive ended it, and the
+    /// plan is what it ended with). `None` when the project holds no plan
+    /// of that drive (a person gave it up, or took it up again under
+    /// another).
+    async fn drive(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<Option<(crate::task_kinds::resync::ResyncPlan, bool)>>;
+
+    /// Write `plan` over the project's resync under way, the one writer
+    /// being the task of its drive (`plan.driver`). `Ok(false)` when that
+    /// drive holds none any more.
+    async fn write_resync(&self, id: uuid::Uuid, plan: &crate::task_kinds::resync::ResyncPlan) -> anyhow::Result<bool>;
+
+    /// Take the project's resync under way up again, in one transaction:
+    /// one that stopped under a new drive, its stop forgotten and a task
+    /// of `tenant` enqueued for it (the stopped drive's task, still ending,
+    /// writes nothing more); one going on, or whose task died without a
+    /// stop, with the task of its drive, enqueued unless one runs. Answers
+    /// the task that drives it; `Ok(None)` when the project holds no
+    /// resync under way.
+    async fn resume_resync(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<Option<uuid::Uuid>>;
+
+    /// The resyncs that stopped, with their plans: what
+    /// `crate::task_kinds::resync::retry_stopped` reads.
+    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, crate::task_kinds::resync::ResyncPlan)>>;
+
+    /// End the project's resync, its task under `driver` having brought
+    /// every trigger back: the transition lands at rest in the same
+    /// statement, and the plan stays as that drive's record (a run of its
+    /// task again answers from it). `false` when that drive holds none.
+    async fn end_resync(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<bool>;
+
+    /// Give the project's resync under way up (a person's cancel), in one
+    /// transaction: the triggers it took down and has not brought back are
+    /// read off the activation rows (`crate::task_kinds::resync::left_down`)
+    /// and written into its plan with the moment
+    /// (`crate::task_kinds::resync::GivenUp`), and the transition lands at
+    /// rest, so its task writes, takes down and turns on nothing more. The
+    /// plan stays on the row as the given-up drive's record, which `weft
+    /// status` shows ([`Self::given_up_resync`]) until the next resync
+    /// begins. Answers the plan as given up; `None` when no resync is
+    /// under way.
+    async fn give_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncPlan>>;
+
+    /// What the project's last resync left down, when a person gave it up
+    /// ([`Self::give_up_resync`]), less the triggers activated or taken
+    /// down since (`crate::activation_store`); `None` when it was not
+    /// given up, or the project never resynced.
+    async fn given_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::GivenUp>>;
+
     /// Request cancellation of the in-flight build: `transition` building
     /// (or cancelling_build already, so a cancel asked twice is the same
     /// cancel) → cancelling_build. From then on an image claim and a
@@ -218,25 +276,27 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
 
     /// The request that entered the build transition is done with it
-    /// (answered, or failed): from here the transition rests on the
-    /// project's waiting version alone, so [`Self::settle_building`] may
-    /// clear it as soon as none waits. Stamps the heartbeat to zero, which
-    /// no live driver ever leaves it at.
-    async fn release_build_driver(&self, id: uuid::Uuid) -> anyhow::Result<()>;
+    /// (answered, or failed): from here it rests on the project's waiting
+    /// version alone, so
+    /// [`Self::settle_transition`] may clear it as soon as nothing else
+    /// holds it. Stamps the heartbeat to zero, which no live driver ever
+    /// leaves it at.
+    async fn release_driver(&self, id: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Land at rest (`transition` → none) every project in a build
-    /// transition that nothing holds any more ([`build_held`]: no request
-    /// drives it and no version of it waits). `project` narrows it to one.
-    /// Answers the projects it landed, for the caller to announce. Called
-    /// by the build loop, by a request letting go, by a registration, by a
-    /// cancel, and by the stuck-transition reaper, so one definition of
-    /// "building" holds everywhere.
-    async fn settle_building(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>>;
+    /// Land at rest (`transition` → none) every project in a transition
+    /// that nothing holds any more ([`transition_held`]: for a build, no
+    /// request drives it and no version of it waits; for a resync, its
+    /// plan is forgotten). `project` narrows it to one. Answers the
+    /// projects it landed, for the caller to announce. Called by the build
+    /// loop, by a request letting go, by a registration, by a cancel, by a
+    /// resync's task at its end, and by the
+    /// `lapses` loop, so one definition of "held" holds everywhere.
+    async fn settle_transition(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>>;
 
-    /// Bump the transition heartbeat of a build transition still driven
-    /// (never one released). Called on an interval by the process DRIVING
-    /// it (a build request starting its builds) so the
-    /// stuck-transition reaper only repairs transitions whose driver
+    /// Bump the heartbeat of a transition still driven (never one
+    /// released). Called on an interval by the process DRIVING it (a
+    /// build request starting its builds) so the
+    /// `lapses` loop only repairs transitions whose driver
     /// actually died.
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()>;
 
@@ -244,7 +304,9 @@ pub trait ProjectStoreOps: Send + Sync {
     /// not exist).
     async fn worker_overrides(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_platform_traits::WorkerOverrides>>;
 
-    /// Replace the project's own worker levers.
+    /// Replace the project's own worker levers; the project's queued runs
+    /// start their tries again, the ones waiting to be tried taken at once
+    /// (`crate::delivery`).
     async fn set_worker_overrides(&self, id: uuid::Uuid, overrides: &weft_platform_traits::WorkerOverrides) -> anyhow::Result<()>;
 
     /// Whether the project declares infrastructure. `Ok(Some(has_infra))`
@@ -262,7 +324,7 @@ pub trait ProjectStoreOps: Send + Sync {
     // weft-broker-client.
 }
 
-/// The verb-transition marker on the project row: the BUILD axis,
+/// The verb-transition marker on the project row (a build or a resync),
 /// orthogonal to the trigger lifecycle (`status`). weft-core's, since the
 /// status answer carries it.
 pub use weft_core::projects::ProjectTransition;
@@ -287,11 +349,30 @@ pub(crate) fn build_driven(p: &str, stale_before: &str) -> String {
     format!("({p}.transition IN ('building', 'cancelling_build') AND {p}.transition_heartbeat_unix >= {stale_before})")
 }
 
-/// The SQL condition "something holds the project row `p` in its build
-/// transition": a request drives it ([`build_driven`]), or a version of it
-/// waits on its builds (`crate::build::waiting`). What a settle reads.
-pub(crate) fn build_held(p: &str, stale_before: &str) -> String {
-    format!("({} OR {})", build_driven(p, stale_before), crate::build::waiting::has_waiting_version(&format!("{p}.id")))
+/// The SQL condition "something holds the project row `p` in its
+/// transition": for a build, the request that entered it still beats (the
+/// starter of its builds) or a version of it waits on its builds
+/// (`crate::build::waiting`); for a resync, its plan is written down
+/// (`project.resync`), until its task brought every trigger back or a
+/// person stopped it (`crate::task_kinds::resync`). What a settle reads.
+pub(crate) fn transition_held(p: &str, stale_before: &str) -> String {
+    format!(
+        "(({p}.transition = 'resyncing' AND {p}.resync IS NOT NULL) \
+          OR ({p}.transition IN ('building', 'cancelling_build') AND ({p}.transition_heartbeat_unix >= {stale_before} OR NOT {})))",
+        held_by_driver_alone(p)
+    )
+}
+
+/// The SQL condition "the project row `p` is in a transition only the
+/// request driving it holds": a build no version of which waits. Once
+/// that request's heartbeat is stale nothing holds it
+/// ([`transition_held`]), and the `lapses` loop looks when the earliest of
+/// these could (`crate::lapses::earliest_lapse`).
+pub(crate) fn held_by_driver_alone(p: &str) -> String {
+    format!(
+        "({p}.transition IN ('building', 'cancelling_build') AND NOT {})",
+        crate::build::waiting::has_waiting_version(&format!("{p}.id"))
+    )
 }
 
 /// Cloneable handle to whatever the dispatcher uses as project
@@ -323,6 +404,45 @@ pub struct StoredProjectSummary {
     pub id: uuid::Uuid,
     pub name: String,
     pub description: String,
+    /// `weft rm` marked it and has not finished removing it
+    /// ([`ProjectStoreOps::mark_removing`]).
+    pub removing: bool,
+}
+
+impl StoredProjectSummary {
+    /// The project, unless `weft rm` marked it: then the refusal a verb on
+    /// it answers.
+    pub fn unless_removing(self) -> Result<Self, (axum::http::StatusCode, String)> {
+        if self.removing {
+            return Err(ProjectRemoving::refusal());
+        }
+        Ok(self)
+    }
+}
+
+/// A write refused because `weft rm` marked the project and has not
+/// finished removing it: what the caller is told, as a 409.
+#[derive(Debug)]
+pub struct ProjectRemoving;
+
+impl std::fmt::Display for ProjectRemoving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(weft_core::projects::PROJECT_BEING_REMOVED)
+    }
+}
+
+impl std::error::Error for ProjectRemoving {}
+
+impl ProjectRemoving {
+    /// Whether `e` is (or wraps) this refusal.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.chain().any(|cause| cause.downcast_ref::<ProjectRemoving>().is_some())
+    }
+
+    /// The answer a verb on a project being removed gets.
+    pub fn refusal() -> (axum::http::StatusCode, String) {
+        (axum::http::StatusCode::CONFLICT, Self.to_string())
+    }
 }
 
 impl PostgresProjectStore {
@@ -398,21 +518,31 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- default. NULL = use default. Schema per
                 -- weft_infra_supervisor::protocol::HealthProtocols.
                 health_protocols_json JSONB,
-                -- Verb-transition marker, orthogonal to `status` (the
-                -- BUILD axis): 'none' | 'building' | 'cancelling_build'.
+                -- Verb-transition marker, orthogonal to `status`:
+                -- 'none' | 'building' | 'cancelling_build' | 'resyncing'.
                 -- Written only by its own single-flight methods
-                -- (try_begin_building / request_cancel_build /
-                -- settle_building), never by lifecycle writes, so a
-                -- deactivate can't stomp an in-flight build marker. Held
-                -- by the request starting the builds, then by the
-                -- project's waiting version until it ends.
+                -- (try_begin_building / try_begin_resyncing /
+                -- request_cancel_build / settle_transition), never by
+                -- lifecycle writes, so a deactivate can't stomp an
+                -- in-flight marker. A build's is held by the request
+                -- starting the builds, then by the project's waiting
+                -- version until it ends; a resync's by its plan (`resync`).
                 transition TEXT NOT NULL DEFAULT 'none',
-                -- Heartbeat for the build transition
-                -- (transition='building'/'cancelling_build'): the request
-                -- starting the builds bumps this on an interval and zeroes
-                -- it when it lets go; once it is stale, only a waiting
-                -- version holds the transition (settle_building).
+                -- Heartbeat for a build transition: the request starting
+                -- its builds bumps this on an interval and zeroes it when it
+                -- lets go; once it is stale, only a waiting version holds
+                -- it (settle_transition).
                 transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0,
+                -- The project's resync (`crate::task_kinds::resync::ResyncPlan`):
+                -- the drive under way, whose triggers it takes down and
+                -- brings back, with the person's take-down choice and the
+                -- build it brings live, the owners it already brought
+                -- back, and why it stopped when it did. Under way while
+                -- `transition` is 'resyncing'; once its task ended it, or a
+                -- person gave it up (`given_up`: when, and the triggers it
+                -- left down, which `weft status` shows), kept as that
+                -- drive's record until the next resync.
+                resync JSONB,
                 -- The version tree's HEAD (`crate::versions`): the version
                 -- the next checkpoint or run parents on, the run the next
                 -- `--seed` inherits from (NULL when head is a bare
@@ -440,7 +570,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- The ask whose version the project runs: a registration
                 -- lands only over an older ask
                 -- (`crate::build::waiting::settle`).
-                registered_ask BIGINT NOT NULL DEFAULT 0
+                registered_ask BIGINT NOT NULL DEFAULT 0,
+                -- `weft rm` started on it (`mark_removing`, its first
+                -- write): no run of it is born from then on (the run
+                -- births check it in the statement that inserts the run,
+                -- `weft_record_batch` and `weft_journal::record::insert_queued_in`),
+                -- so the take-down that follows reaches every run it has.
+                removing BOOLEAN NOT NULL DEFAULT FALSE
             )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_api_port ON project(api_port) WHERE api_port IS NOT NULL",
@@ -503,8 +639,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         //
         // NO boot-time status touch-up here. Recovery of a project
         // interrupted mid-transition (a process died while activating /
-        // building / deactivating) is the stuck-transition reaper's
-        // job (`reaper::sweep_stuck_transitions`): per-project,
+        // building / deactivating) is the `lapses` loop's
+        // job (`crate::lapses`): per-project,
         // heartbeat-gated, and status-guarded, so it never wipes
         // another process's live state. A constructor-time bulk downgrade
         // would run in EVERY replica on EVERY boot and reset live
@@ -521,15 +657,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_json TEXT NOT NULL,
             recorded_at_unix BIGINT NOT NULL,
             PRIMARY KEY (project_id, definition_hash)
-            -- Deliberately NO foreign key to `project`. An execution's
-            -- journal outlives the project it ran (that is the point of
-            -- a journal), and a run without the program it ran against
-            -- cannot be read back: the rows are there and every input
-            -- and output is underivable, so the graph paints an empty
-            -- run and the reader goes hunting for a bug in the viewer.
-            -- The history is therefore kept as long as anything points
-            -- at it, and `retire_unused_definitions` drops the versions
-            -- no surviving run needs once the project itself is gone.
+            -- No foreign key to `project`: the project's removal erases
+            -- its runs first and drops these in its own transaction
+            -- (`ProjectStoreOps::remove`), so no run is ever left without
+            -- the program it ran against.
         )"#,
     ],
     seed: &[],
@@ -651,7 +782,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         // `tenant_id`, seizing another tenant's project. When the tenants
         // differ the UPDATE matches no row and (because the id already exists,
         // so the INSERT is suppressed) the statement returns NO row; we detect
-        // that and fail loudly as a cross-tenant collision.
+        // that and fail loudly as a cross-tenant collision. A project `weft
+        // rm` marked is not registered over either (`ProjectRemoving`).
         let registered: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO project \
                 (id, name, description, status, project_json, updated_at, \
@@ -663,7 +795,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                 project_json = EXCLUDED.project_json, \
                 updated_at = EXCLUDED.updated_at, \
                 has_infra = EXCLUDED.has_infra \
-             WHERE project.tenant_id = EXCLUDED.tenant_id \
+             WHERE project.tenant_id = EXCLUDED.tenant_id AND NOT project.removing \
              RETURNING id",
         )
         .bind(id)
@@ -675,12 +807,14 @@ impl ProjectStoreOps for PostgresProjectStore {
         .bind(has_infra)
         .fetch_optional(&mut *tx)
         .await?;
-        registered.ok_or_else(|| {
-            anyhow::anyhow!(
-                "project {id} already exists under a different tenant; \
-                 register refused (cross-tenant id collision)"
-            )
-        })?;
+        if registered.is_none() {
+            let removing: Option<bool> =
+                sqlx::query_scalar("SELECT removing FROM project WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?;
+            if removing == Some(true) {
+                return Err(ProjectRemoving.into());
+            }
+            anyhow::bail!("project {id} already exists under a different tenant; register refused (cross-tenant id collision)");
+        }
         if let Some(hash) = definition_hash {
             // History row FIRST (idempotent on (project_id, hash)),
             // then pointer advance. Inside the transaction the FK
@@ -727,8 +861,13 @@ impl ProjectStoreOps for PostgresProjectStore {
                 .bind(id).bind(source.map(serde_json::to_value).transpose()?)
                 .execute(&mut *tx).await?;
         }
+        if binary_hash.is_some() {
+            // A new image of the project: its queued runs whose workers
+            // could not be reached or kept answering busy are tried again.
+            crate::delivery::retry_stopped(&mut tx, id).await?;
+        }
         tx.commit().await?;
-        Ok(Some(StoredProjectSummary { id, name, description }))
+        Ok(Some(StoredProjectSummary { id, name, description, removing: false }))
     }
 
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
@@ -784,34 +923,59 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>> {
-        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, name, description FROM project WHERE tenant_id = $1 ORDER BY name",
+        let rows: Vec<(uuid::Uuid, String, String, bool)> = sqlx::query_as(
+            "SELECT id, name, description, removing FROM project WHERE tenant_id = $1 ORDER BY name",
         )
         .bind(tenant)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, description)| StoredProjectSummary { id, name, description })
+            .map(|(id, name, description, removing)| StoredProjectSummary { id, name, description, removing })
             .collect())
     }
 
     async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>> {
-        let row: Option<(uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, name, description FROM project WHERE id = $1",
+        let row: Option<(uuid::Uuid, String, String, bool)> = sqlx::query_as(
+            "SELECT id, name, description, removing FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, name, description)| StoredProjectSummary { id, name, description }))
+        Ok(row.map(|(id, name, description, removing)| StoredProjectSummary { id, name, description, removing }))
     }
 
-    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+    async fn mark_removing(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let marked = sqlx::query("UPDATE project SET removing = TRUE WHERE id = $1").bind(id).execute(&self.pool).await?;
+        Ok(marked.rows_affected() > 0)
+    }
+
+    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query("DELETE FROM project WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+        // Its runs, every event and every recorded value, so the space
+        // comes back: what a person keeps of a removed project is their
+        // files on disk. Under the project row's removal, in its
+        // transaction: no run was born since the project was marked
+        // removing, and none is born after this commits
+        // (`weft_record_batch`, `weft_journal::record::insert_queued_in`
+        // refuse both), so none outlives the project.
+        let (erased, mut signals) = crate::journal::postgres::erase_project_runs(&mut tx, id).await?;
+        tracing::info!(target: "weft_dispatcher::project", project_id = %id, executions = erased, "erasing the project's runs");
+        // What the project's runs needed and its triggers ran on: nothing
+        // reads them any more. Work queued for it goes too, a task being
+        // run included (its claimant finds its claim gone and stands down).
+        signals.extend(crate::journal::postgres::remove_project_signals(&mut *tx, id).await?);
+        sqlx::query("DELETE FROM task WHERE project_id = $1").bind(id).execute(&mut *tx).await?;
+        weft_task_store::unanswered::forget_project(&mut *tx, id).await?;
+        sqlx::query("DELETE FROM project_definition WHERE project_id = $1").bind(id).execute(&mut *tx).await?;
+        crate::infra_owner::release_project(&mut tx, id).await?;
         sqlx::query("DELETE FROM trigger_setup WHERE project_id = $1")
             .bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1")
@@ -821,6 +985,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         // that no longer existed, and the same id registered again
         // inherited a tree it never made.
         sqlx::query("DELETE FROM project_version WHERE project_id = $1")
+            .bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM version_runs WHERE project_id = $1")
             .bind(id).execute(&mut *tx).await?;
         // The infra rows go in the same transaction, AFTER the project
         // row: the broker's command and event inserts lock the project
@@ -836,7 +1002,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         weft_access_store::forget_project_access(&mut tx, id).await?;
         crate::journal::postgres::revoke_project_instance_tokens(&mut *tx, id).await?;
         tx.commit().await?;
-        Ok(res.rows_affected() > 0)
+        Ok(Some(signals))
     }
 
 
@@ -874,37 +1040,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(j,)| j))
-    }
-
-    async fn projects_with_orphan_definitions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
-        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT DISTINCT pd.project_id FROM project_definition pd \
-             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = pd.project_id)",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
-    }
-
-    async fn retire_unused_definitions(
-        &self,
-        id: uuid::Uuid,
-        still_in_use: &[String],
-    ) -> anyhow::Result<u64> {
-        // The guard is part of the same statement as the delete, so a
-        // project registered again in between cannot have its history
-        // dropped by a removal that was already under way.
-        let done = sqlx::query(
-            "DELETE FROM project_definition \
-             WHERE project_id = $1 \
-               AND NOT (definition_hash = ANY($2)) \
-               AND NOT EXISTS (SELECT 1 FROM project WHERE id = $1)",
-        )
-        .bind(id)
-        .bind(still_in_use)
-        .execute(&self.pool)
-        .await?;
-        Ok(done.rows_affected())
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -950,14 +1085,16 @@ impl ProjectStoreOps for PostgresProjectStore {
     async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool> {
         let now = crate::lease::now_unix();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query(
+        let res = sqlx::query(&format!(
             "UPDATE project \
              SET transition = 'building', transition_heartbeat_unix = $1 \
              WHERE id = $2 \
-               AND (transition = 'none' OR (transition = 'building' AND transition_heartbeat_unix < $3)) \
+               AND (transition = 'none' OR (transition = 'building' AND transition_heartbeat_unix < $3) \
+                    OR (transition = 'resyncing' AND NOT {})) \
                AND NOT EXISTS (SELECT 1 FROM trigger_activation a \
                                WHERE a.project_id = $2 AND a.status IN ('activating', 'deactivating'))",
-        )
+            transition_held("project", "$3")
+        ))
         .bind(now)
         .bind(id)
         .bind(stale_before)
@@ -971,6 +1108,160 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(true)
     }
 
+    async fn try_begin_resyncing(
+        &self,
+        id: uuid::Uuid,
+        plan: &crate::task_kinds::resync::ResyncPlan,
+        task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        // The named build checked as `crate::api::project::require_registered_build`
+        // checks it, under the row lock every registration takes
+        // (`crate::build::waiting::settle`), so no build lands between the
+        // check and the resync holding the project.
+        let entered = sqlx::query(
+            "UPDATE project SET transition = 'resyncing', transition_heartbeat_unix = 0, resync = $2 \
+             WHERE id = $1 AND transition = 'none' \
+               AND ($3::text IS NULL OR running_binary_hash = $3) \
+               AND ($4::text IS NULL OR running_definition_hash = $4) \
+               AND ($5::text IS NULL OR running_infra_hash = $5) \
+               AND NOT EXISTS (SELECT 1 FROM trigger_activation a \
+                               WHERE a.project_id = $1 AND a.status IN ('activating', 'deactivating'))",
+        )
+        .bind(id)
+        .bind(sqlx::types::Json(plan))
+        .bind(&plan.build.binary_hash)
+        .bind(&plan.build.definition_hash)
+        .bind(&plan.build.infra_hash)
+        .execute(&mut *tx)
+        .await?;
+        if entered.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let task = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?.id();
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        Ok(Some(task))
+    }
+
+    async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>> {
+        let row: Option<(sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>, bool)> = sqlx::query_as(
+            "SELECT p.resync, EXISTS (SELECT 1 FROM task t WHERE t.tenant_id = p.tenant_id AND t.kind = $2 \
+                                      AND t.dedup_key = p.resync->>'driver' AND t.status IN ('pending', 'claimed')) \
+             FROM project p WHERE p.id = $1 AND p.transition = 'resyncing' AND p.resync IS NOT NULL",
+        )
+        .bind(id)
+        .bind(crate::task_kinds::resync::RESYNC_KIND)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(plan, driven)| crate::task_kinds::resync::ResyncState { plan: plan.0, driven }))
+    }
+
+    async fn drive(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<Option<(crate::task_kinds::resync::ResyncPlan, bool)>> {
+        let row: Option<(sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>, bool)> = sqlx::query_as(
+            "SELECT resync, transition = 'resyncing' FROM project \
+             WHERE id = $1 AND resync->>'driver' = $2 AND NOT resync ? 'given_up'",
+        )
+        .bind(id)
+        .bind(driver.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(plan, under_way)| (plan.0, under_way)))
+    }
+
+    async fn write_resync(&self, id: uuid::Uuid, plan: &crate::task_kinds::resync::ResyncPlan) -> anyhow::Result<bool> {
+        let written = sqlx::query(
+            "UPDATE project SET resync = $2 WHERE id = $1 AND transition = 'resyncing' AND resync->>'driver' = $3",
+        )
+        .bind(id)
+        .bind(sqlx::types::Json(plan))
+        .bind(plan.driver.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(written.rows_affected() > 0)
+    }
+
+    async fn resume_resync(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<Option<uuid::Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        let held: Option<sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>> = sqlx::query_scalar(
+            "SELECT resync FROM project WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(sqlx::types::Json(mut plan)) = held else { return Ok(None) };
+        if plan.stopped.is_some() {
+            plan.driver = uuid::Uuid::now_v7();
+            plan.stopped = None;
+            sqlx::query("UPDATE project SET resync = $2 WHERE id = $1")
+                .bind(id)
+                .bind(sqlx::types::Json(&plan))
+                .execute(&mut *tx)
+                .await?;
+        }
+        let task = crate::task_kinds::resync::task(tenant, id, plan.driver);
+        let task = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?.id();
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        Ok(Some(task))
+    }
+
+    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, crate::task_kinds::resync::ResyncPlan)>> {
+        let rows: Vec<(uuid::Uuid, sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>)> =
+            sqlx::query_as("SELECT id, resync FROM project WHERE transition = 'resyncing' AND resync ? 'stopped'")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id, plan)| (id, plan.0)).collect())
+    }
+
+    async fn end_resync(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<bool> {
+        let ended = sqlx::query(
+            "UPDATE project SET transition = 'none', transition_heartbeat_unix = 0 \
+             WHERE id = $1 AND transition = 'resyncing' AND resync->>'driver' = $2",
+        )
+        .bind(id)
+        .bind(driver.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(ended.rows_affected() > 0)
+    }
+
+    async fn give_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncPlan>> {
+        let mut tx = self.pool.begin().await?;
+        // Held first: its drive's take-downs and claims lock this row too,
+        // so the rows read below hold every one it made. A trigger whose
+        // activation it started is still landing counts as down: the
+        // person's cancel ends that activation.
+        let held: Option<sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>> = sqlx::query_scalar(
+            "SELECT resync FROM project WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(sqlx::types::Json(mut plan)) = held else { return Ok(None) };
+        let rows = crate::activation_store::list_in(&mut tx, id).await?;
+        plan.given_up = Some(crate::task_kinds::resync::GivenUp {
+            at_unix: crate::lease::now_unix(),
+            left_down: crate::task_kinds::resync::left_down(&plan, &rows),
+        });
+        sqlx::query("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, resync = $2 WHERE id = $1")
+            .bind(id)
+            .bind(sqlx::types::Json(&plan))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(plan))
+    }
+
+    async fn given_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::GivenUp>> {
+        let given: Option<sqlx::types::Json<crate::task_kinds::resync::GivenUp>> =
+            sqlx::query_scalar("SELECT resync->'given_up' FROM project WHERE id = $1 AND resync ? 'given_up'")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(given.map(|given| given.0))
+    }
+
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let res = sqlx::query(
             "UPDATE project SET transition = 'cancelling_build' \
@@ -982,27 +1273,22 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn release_build_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE project SET transition_heartbeat_unix = 0 \
-             WHERE id = $1 AND transition IN ('building', 'cancelling_build')",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+    async fn release_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE project SET transition_heartbeat_unix = 0 WHERE id = $1 AND transition <> 'none'")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    async fn settle_building(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
-        // NOTE (compiler-invisible status set): this WHERE names the
-        // build transition's states by string, like the CAS methods above.
+    async fn settle_transition(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
         Ok(sqlx::query_scalar(&format!(
             "UPDATE project p SET transition = 'none' \
-             WHERE p.transition IN ('building', 'cancelling_build') \
+             WHERE p.transition <> 'none' \
                AND NOT {} \
                AND ($2::UUID IS NULL OR p.id = $2) \
              RETURNING p.id",
-            build_held("p", "$1")
+            transition_held("p", "$1")
         ))
         .bind(stale_before)
         .bind(project)
@@ -1011,13 +1297,13 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        // A released heartbeat (0, `release_build_driver`) stays released:
-        // the beat's task is stopped without waiting for it, so a bump
-        // already on its way may land after the release, and must not make
-        // the project driven again.
+        // A released heartbeat (0, `release_driver`) stays released: the
+        // beat's task is stopped without waiting for it, so a bump already
+        // on its way may land after the release, and must not make the
+        // project driven again.
         sqlx::query(
             "UPDATE project SET transition_heartbeat_unix = $1 \
-             WHERE id = $2 AND transition IN ('building', 'cancelling_build') AND transition_heartbeat_unix > 0",
+             WHERE id = $2 AND transition <> 'none' AND transition_heartbeat_unix > 0",
         )
         .bind(crate::lease::now_unix())
         .bind(id)
@@ -1065,12 +1351,30 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn set_worker_overrides(&self, id: uuid::Uuid, overrides: &weft_platform_traits::WorkerOverrides) -> anyhow::Result<()> {
-        let done = sqlx::query("UPDATE project SET worker_settings_json = $2 WHERE id = $1")
-            .bind(id)
-            .bind(serde_json::to_value(overrides)?)
-            .execute(&self.pool)
-            .await?;
-        anyhow::ensure!(done.rows_affected() == 1, "no project {id}");
+        // The project's queued runs start their tries again on the new
+        // levers: the change is what a person does about workers that
+        // refused them, could not be reached or kept answering busy. One
+        // waiting to be tried
+        // again is taken at once; one out with a delivery right now is
+        // left to it. The delivery hears the change
+        // (`crate::held::WORKER_SETTINGS_CHANNEL`). What `weft status`
+        // showed of the project's workers goes with the tries it was about:
+        // a queued run they fail again writes it afresh.
+        let mut tx = self.pool.begin().await?;
+        let changed: i64 = sqlx::query_scalar(
+            "WITH changed AS (UPDATE project SET worker_settings_json = $2 WHERE id = $1 RETURNING id), \
+                  retried AS (UPDATE run SET refusals = 0, unreached = 0, busy_since = NULL, waited_on_workers = FALSE, waits = FALSE, \
+                                  delivered_until = CASE WHEN waits THEN NULL ELSE delivered_until END \
+                              WHERE project_id IN (SELECT id FROM changed) AND state = 'queued') \
+             SELECT count(*) FROM changed",
+        )
+        .bind(id)
+        .bind(serde_json::to_value(overrides)?)
+        .fetch_one(&mut *tx)
+        .await?;
+        anyhow::ensure!(changed == 1, "no project {id}");
+        weft_task_store::unanswered::answered(&mut *tx, weft_task_store::unanswered::Callee::Workers(id)).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -1104,8 +1408,13 @@ pub struct FakeProjectStore {
     /// columns. Missing entry = (None, 0), matching the column
     /// defaults on a fresh row.
     transitions: RwLock<HashMap<uuid::Uuid, (ProjectTransition, i64)>>,
+    /// Mirror of `resync`; missing = NULL. The fake holds no task queue
+    /// (it lives in Postgres), so a resync here is driven by nobody.
+    resyncs: RwLock<HashMap<uuid::Uuid, crate::task_kinds::resync::ResyncPlan>>,
     /// Mirror of `build_asks`.
     build_asks: RwLock<HashMap<uuid::Uuid, i64>>,
+    /// Mirror of `project.removing`: the projects marked.
+    removing: RwLock<std::collections::HashSet<uuid::Uuid>>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -1125,7 +1434,9 @@ impl FakeProjectStore {
             has_infra: RwLock::new(HashMap::new()),
             worker_overrides: RwLock::new(HashMap::new()),
             transitions: RwLock::new(HashMap::new()),
+            resyncs: RwLock::new(HashMap::new()),
             build_asks: RwLock::new(HashMap::new()),
+            removing: RwLock::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -1170,6 +1481,9 @@ impl ProjectStoreOps for FakeProjectStore {
                      register refused (cross-tenant id collision)"
                 );
             }
+        }
+        if self.removing.read().await.contains(&id) {
+            return Err(ProjectRemoving.into());
         }
         // Compute before `project` is moved into `inner`. Re-derived on
         // every register so a re-register that adds/drops infra updates
@@ -1224,6 +1538,7 @@ impl ProjectStoreOps for FakeProjectStore {
             id,
             name: name_owned,
             description: description_owned,
+            removing: false,
         }))
     }
 
@@ -1261,6 +1576,7 @@ impl ProjectStoreOps for FakeProjectStore {
     async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>> {
         let tenants = self.tenants.read().await;
         let descriptions = self.descriptions.read().await;
+        let removing = self.removing.read().await;
         Ok(self
             .inner
             .read()
@@ -1271,12 +1587,14 @@ impl ProjectStoreOps for FakeProjectStore {
                 id: *id,
                 name: name.clone(),
                 description: descriptions.get(id).cloned().unwrap_or_default(),
+                removing: removing.contains(id),
             })
             .collect())
     }
 
     async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>> {
         let descriptions = self.descriptions.read().await;
+        let removing = self.removing.read().await.contains(&id);
         Ok(self
             .inner
             .read()
@@ -1286,23 +1604,29 @@ impl ProjectStoreOps for FakeProjectStore {
                 id,
                 name: name.clone(),
                 description: descriptions.get(&id).cloned().unwrap_or_default(),
+                removing,
             }))
     }
 
-    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        // Mirror Postgres FK CASCADE: removing a project clears every
-        // per-id side-map (binary/definition/infra hashes,
-        // tenants, has_infra, transitions). Without this the
+    async fn mark_removing(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        // The fake bears no runs (they live in the journal); the mark
+        // holds back registrations and activations, as the row's does.
+        if !self.inner.read().await.contains_key(&id) {
+            return Ok(false);
+        }
+        self.removing.write().await.insert(id);
+        Ok(true)
+    }
+
+    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+        // Mirror the Postgres removal: removing a project clears every
+        // per-id side-map (binary/definition/infra hashes, recorded
+        // programs, tenants, has_infra, transitions). Without this the
         // fake diverges from production: a test that re-registers under
         // the same id, or asserts cleanup, would see ghost state
-        // Postgres does not have.
-        //
-        // `definition_versions` is the exception, exactly as in
-        // Postgres: the recorded programs have NO foreign key to the
-        // project, because the journal outlives it and a run cannot be
-        // read back without the program it ran.
-        // `retire_unused_definitions` is what drops them.
+        // Postgres does not have. It keeps no signals.
         let was_present = self.inner.write().await.remove(&id).is_some();
+        self.definition_versions.write().await.retain(|(project, _), _| *project != id);
         self.sources.write().await.remove(&id);
         self.binary_hashes.write().await.remove(&id);
         self.definition_hashes.write().await.remove(&id);
@@ -1311,8 +1635,10 @@ impl ProjectStoreOps for FakeProjectStore {
         self.has_infra.write().await.remove(&id);
         self.worker_overrides.write().await.remove(&id);
         self.transitions.write().await.remove(&id);
+        self.resyncs.write().await.remove(&id);
         self.build_asks.write().await.remove(&id);
-        Ok(was_present)
+        self.removing.write().await.remove(&id);
+        Ok(was_present.then(Vec::new))
     }
 
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>> {
@@ -1344,30 +1670,6 @@ impl ProjectStoreOps for FakeProjectStore {
             .await
             .get(&(id, hash.to_string()))
             .cloned())
-    }
-
-    async fn projects_with_orphan_definitions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
-        let live = self.inner.read().await;
-        let versions = self.definition_versions.read().await;
-        let mut ids: Vec<uuid::Uuid> =
-            versions.keys().map(|(id, _)| *id).filter(|id| !live.contains_key(id)).collect();
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
-    }
-
-    async fn retire_unused_definitions(
-        &self,
-        id: uuid::Uuid,
-        still_in_use: &[String],
-    ) -> anyhow::Result<u64> {
-        if self.inner.read().await.contains_key(&id) {
-            return Ok(0);
-        }
-        let mut versions = self.definition_versions.write().await;
-        let before = versions.len();
-        versions.retain(|(p, hash), _| *p != id || still_in_use.contains(hash));
-        Ok((before - versions.len()) as u64)
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -1413,12 +1715,122 @@ impl ProjectStoreOps for FakeProjectStore {
             return Ok(false);
         }
         let entry = transitions.entry(id).or_insert((ProjectTransition::None, 0));
-        let at_rest = entry.0 == ProjectTransition::None || (entry.0 == ProjectTransition::Building && entry.1 < stale_before);
+        // A resync holds it while its plan is written down.
+        let resync_over = entry.0 == ProjectTransition::Resyncing && !self.resyncs.read().await.contains_key(&id);
+        let at_rest = entry.0 == ProjectTransition::None
+            || (entry.0 == ProjectTransition::Building && entry.1 < stale_before)
+            || resync_over;
         if !at_rest {
             return Ok(false);
         }
         *entry = (ProjectTransition::Building, crate::lease::now_unix());
         Ok(true)
+    }
+
+    async fn try_begin_resyncing(
+        &self,
+        id: uuid::Uuid,
+        plan: &crate::task_kinds::resync::ResyncPlan,
+        _task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        // As `try_begin_building`, the fake guards the transition alone,
+        // and enqueues nothing (the task queue lives in Postgres).
+        let mut transitions = self.transitions.write().await;
+        if !self.inner.read().await.contains_key(&id) {
+            return Ok(None);
+        }
+        let entry = transitions.entry(id).or_insert((ProjectTransition::None, 0));
+        if entry.0 != ProjectTransition::None {
+            return Ok(None);
+        }
+        *entry = (ProjectTransition::Resyncing, 0);
+        self.resyncs.write().await.insert(id, plan.clone());
+        Ok(Some(uuid::Uuid::now_v7()))
+    }
+
+    async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>> {
+        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
+            return Ok(None);
+        }
+        Ok(self
+            .resyncs
+            .read()
+            .await
+            .get(&id)
+            .map(|plan| crate::task_kinds::resync::ResyncState { plan: plan.clone(), driven: false }))
+    }
+
+    async fn drive(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<Option<(crate::task_kinds::resync::ResyncPlan, bool)>> {
+        let under_way = self.transition(id).await? == Some(ProjectTransition::Resyncing);
+        Ok(self
+            .resyncs
+            .read()
+            .await
+            .get(&id)
+            .filter(|plan| plan.driver == driver && plan.given_up.is_none())
+            .map(|plan| (plan.clone(), under_way)))
+    }
+
+    async fn write_resync(&self, id: uuid::Uuid, plan: &crate::task_kinds::resync::ResyncPlan) -> anyhow::Result<bool> {
+        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
+            return Ok(false);
+        }
+        Ok(self.resyncs.write().await.get_mut(&id).filter(|held| held.driver == plan.driver).map(|held| *held = plan.clone()).is_some())
+    }
+
+    async fn resume_resync(&self, id: uuid::Uuid, _tenant: &str) -> anyhow::Result<Option<uuid::Uuid>> {
+        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
+            return Ok(None);
+        }
+        Ok(self.resyncs.write().await.get_mut(&id).map(|plan| {
+            if plan.stopped.take().is_some() {
+                plan.driver = uuid::Uuid::now_v7();
+            }
+            uuid::Uuid::now_v7()
+        }))
+    }
+
+    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, crate::task_kinds::resync::ResyncPlan)>> {
+        let transitions = self.transitions.read().await;
+        Ok(self
+            .resyncs
+            .read()
+            .await
+            .iter()
+            .filter(|(id, plan)| plan.stopped.is_some() && transitions.get(id).map(|t| t.0) == Some(ProjectTransition::Resyncing))
+            .map(|(id, plan)| (*id, plan.clone()))
+            .collect())
+    }
+
+    async fn end_resync(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<bool> {
+        if self.drive(id, driver).await?.is_none_or(|(_, under_way)| !under_way) {
+            return Ok(false);
+        }
+        self.transitions.write().await.insert(id, (ProjectTransition::None, 0));
+        Ok(true)
+    }
+
+    /// The fake holds no activation rows: every trigger the plan took down
+    /// counts as left down.
+    async fn give_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncPlan>> {
+        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
+            return Ok(None);
+        }
+        let given = self.resyncs.write().await.get_mut(&id).map(|plan| {
+            plan.given_up = Some(crate::task_kinds::resync::GivenUp {
+                at_unix: crate::lease::now_unix(),
+                left_down: crate::task_kinds::resync::left_down(plan, &[]),
+            });
+            plan.clone()
+        });
+        if given.is_some() {
+            self.transitions.write().await.insert(id, (ProjectTransition::None, 0));
+        }
+        Ok(given)
+    }
+
+    async fn given_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::GivenUp>> {
+        Ok(self.resyncs.read().await.get(&id).and_then(|plan| plan.given_up.clone()))
     }
 
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
@@ -1432,21 +1844,28 @@ impl ProjectStoreOps for FakeProjectStore {
         }
     }
 
-    async fn release_build_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+    async fn release_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
         if let Some(entry) = self.transitions.write().await.get_mut(&id) {
-            if entry.0.is_building() {
+            if entry.0 != ProjectTransition::None {
                 entry.1 = 0;
             }
         }
         Ok(())
     }
 
-    async fn settle_building(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
+    async fn settle_transition(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
         // The fake project store sees no version builds (they live in
-        // Postgres), so a transition nothing drives is at rest.
+        // Postgres), so a build nothing drives is at rest, and a resync
+        // once its plan is forgotten.
         let mut settled = Vec::new();
+        let resyncs = self.resyncs.read().await;
         for (id, entry) in self.transitions.write().await.iter_mut() {
-            if entry.0.is_building() && entry.1 < stale_before && project.is_none_or(|p| p == *id) {
+            let stays = match entry.0 {
+                ProjectTransition::None => true,
+                ProjectTransition::Resyncing => resyncs.contains_key(id),
+                ProjectTransition::Building | ProjectTransition::CancellingBuild => entry.1 >= stale_before,
+            };
+            if !stays && project.is_none_or(|p| p == *id) {
                 entry.0 = ProjectTransition::None;
                 settled.push(*id);
             }
@@ -1455,9 +1874,9 @@ impl ProjectStoreOps for FakeProjectStore {
     }
 
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        // As the real store: only a build transition still driven.
+        // As the real store: only a transition still driven.
         if let Some(entry) = self.transitions.write().await.get_mut(&id) {
-            if entry.0.is_building() && entry.1 > 0 {
+            if entry.0 != ProjectTransition::None && entry.1 > 0 {
                 entry.1 = crate::lease::now_unix();
             }
         }

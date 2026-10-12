@@ -40,21 +40,27 @@ pub async fn apply_core_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         .context("apply core schema groups")
 }
 
-/// Every schema group the dispatcher owns, in dependency order, journal
-/// first. One list answers "what is the dispatcher's schema": the boot
+/// Every schema group the dispatcher owns, in dependency order: each group
+/// after the ones whose tables its DDL names (the groups the journal's
+/// triggers sit on come before it). One list answers "what is the dispatcher's schema": the boot
 /// applies it whole, the migration generator writes its origins from it,
 /// and the agreement test builds from it.
 pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // What the writes a run makes announce, sent in batches: every
     // trigger on a run's path writes to it.
     &weft_task_store::announce::GROUP,
-    &crate::journal::postgres::GROUP,
+    // Before the journal: a trigger of the journal's on `access_grant`
+    // marks the signals acting as a connection that changed.
+    &weft_access_store::GROUP,
     // Which worker processes are alive, and what their doors counted.
+    // Before the journal: a trigger of the journal's on `worker_lease`
+    // wakes the delivery when a worker of a project whose runs could not
+    // reach one comes alive.
     &weft_task_store::worker_door::GROUP,
+    &crate::journal::postgres::GROUP,
     // The exclusive infra ownership leases.
     &crate::infra_owner::GROUP,
     &weft_task_store::tasks::GROUP,
-    &weft_access_store::GROUP,
     &crate::infra_node::GROUP,
     &crate::infra_event::GROUP,
     &crate::infra_lifecycle_command::GROUP,
@@ -143,6 +149,9 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     weft_task_store::runs::RUN_QUEUED_CHANNEL,
     weft_journal::RUN_LOG_CHANNEL,
     weft_journal::RUN_ENDED_CHANNEL,
+    weft_journal::RETENTION_CHANNEL,
+    weft_task_store::worker_door::LEASE_ALIVE_CHANNEL,
+    crate::delivery::WORKERS_BACK_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
     crate::events::NOTIFY_CHANNEL,
@@ -150,6 +159,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::reaper::STORAGE_SWEEP_CHANNEL,
     crate::display_feeds::LOOK_NOW_CHANNEL,
     crate::holders::HELD_SIGNALS_CHANNEL,
+    crate::holders::ACCESS_REMADE_CHANNEL,
     crate::domains::DOMAINS_CHANNEL,
     crate::held::ROUTES_CHANNEL,
     crate::held::WORKER_SETTINGS_CHANNEL,
@@ -177,8 +187,12 @@ pub struct DispatcherSettings<'a> {
     pub frontends: Arc<dyn weft_platform_traits::FrontendHosting>,
     pub domains: Arc<dyn weft_platform_traits::DomainHosting>,
     pub holder_pool: Arc<dyn weft_platform_traits::HolderPool>,
+    /// See `DispatcherState::holder_news`.
+    pub holder_news: Arc<dyn weft_platform_traits::HolderNews>,
     /// The dispatcher's identity for its calls to the other roles.
     pub tokens: Arc<dyn weft_platform_traits::IdentityTokens>,
+    /// See `DispatcherState::booking`.
+    pub booking: Option<weft_task_store::drain::Booking>,
 }
 
 /// Build the dispatcher state.
@@ -196,7 +210,9 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         frontends,
         domains,
         holder_pool,
+        holder_news,
         tokens,
+        booking,
     } = settings;
     for channel in DISPATCHER_CHANNELS {
         signals.require(channel)?;
@@ -246,7 +262,9 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         domains,
         holder_pool,
         holder_settings: config.holders,
+        holder_news,
         worker_defaults: config.worker_settings(),
+        alert_after_secs: whole_secs_up(config.alert_delay()),
         builder,
         install_info: install_info(config),
         projects,
@@ -274,7 +292,15 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
             }
             weft_platform_traits::config::PlatformConfig::Gcp(_) => None,
         },
+        booking,
     })
+}
+
+/// `delay` in whole seconds, rounded up: a delay scaled under a test pace
+/// to a fraction of a second still waits a second, and only no delay at
+/// all (`alert_after_minutes = 0`, at the first failure) reads 0.
+fn whole_secs_up(delay: std::time::Duration) -> i64 {
+    i64::try_from(delay.as_millis().div_ceil(1000)).unwrap_or(i64::MAX)
 }
 
 /// What the install tells about itself (`GET /install`), from its config.
@@ -314,31 +340,33 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
             crate::task_kinds::run_node_test::RUN_NODE_TEST_KIND,
             Arc::new(crate::task_kinds::RunNodeTestExecutor),
         )
+        .register_str(crate::task_kinds::resync::RESYNC_KIND, Arc::new(crate::task_kinds::ResyncExecutor))
 }
 
 /// The dispatcher's background loops: its task picker, the delivery of
 /// queued runs to workers, the lifecycle claimer, what runs' endings leave
-/// to do, the drains, the search index, retention and the reapers. The runtime runs them where the dispatcher is placed (see
+/// to do, the drains, the look at lapsed holds, retention and the reapers. The runtime runs them where the dispatcher is placed (see
 /// `weft_task_store::drain`).
 pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::TaskRegistry) -> anyhow::Result<Vec<DrainLoop>> {
     let picker_store = Arc::new(
         weft_task_store::PostgresTaskStoreClient::new(state.pg_pool.clone(), state.signals.clone())
             .context("the dispatcher's signal watch listens on every task channel")?,
     );
-    // The picker, the delivery and the claimer also rescue a claim whose
-    // holder died, which nothing announces: they look again while
-    // anything is in motion.
-    let in_motion = |l| crate::reaper::while_in_motion(state, l);
+    // The picker, the delivery and the claimer also rescue a claim of
+    // their own whose holder died, which nothing announces: each looks
+    // again when its earliest claim lapses. Every other hold that lapses
+    // unannounced is the `lapses` loop's.
     let mut loops = vec![
-        in_motion(weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone())),
-        in_motion(crate::delivery::drain_loop(state.clone())),
-        in_motion(crate::lifecycle_claimer::drain_loop(state.clone())),
+        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone()),
+        crate::delivery::drain_loop(state.clone()),
+        crate::lifecycle_claimer::drain_loop(state.clone()),
+        crate::lapses::drain_loop(state.clone()),
         crate::run_ends::drain_loop(state.clone()),
         crate::drain::drain_loop(state.clone()),
-        crate::search_index::drain_loop(state.clone(), crate::search_index::rate_from_env()?),
         crate::retention::drain_loop(state.clone()),
         crate::build::follow::drain_loop(state),
         crate::holders::drain_loop(state),
+        crate::holders::access_loop(state),
         crate::domains::drain_loop(state),
     ];
     loops.extend(crate::reaper::drain_loops(state));
@@ -370,13 +398,16 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("dispatcher_picker", weft_task_store::executor::DISPATCHER_READY),
         ("delivery", crate::delivery::WAKE_ON),
         ("lifecycle_claimer", crate::lifecycle_claimer::WAKE_ON),
+        (crate::lapses::LAPSES, crate::lapses::WAKE_ON),
         ("run_ends", crate::run_ends::WAKE_ON),
         ("drains", crate::drain::WAKE_ON),
+        ("retention", crate::retention::WAKE_ON),
         ("parked_fires", crate::reaper::ON_PARKED_FIRE),
         ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
         ("hibernations", crate::reaper::ON_HIBERNATION),
-        ("infra_returns", crate::reaper::ON_INFRA_STATUS),
+        ("infra_returns", crate::reaper::ON_INFRA_RETURNS),
         ("holders", crate::holders::ON_HELD_SIGNALS),
+        (crate::holders::HOLDER_ACCESS, crate::holders::ON_ACCESS),
         ("domains_door", crate::domains::ON_DOMAINS),
         ("image_builds", crate::build::follow::WAKE_ON),
     ]
@@ -389,22 +420,33 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
 pub fn spawn_relays(state: &DispatcherState) {
     spawn_supervised("live_view", crate::live_view::run(state.clone()));
     spawn_supervised("infra_event_bridge", crate::infra_event_bridge::run(state.clone()));
-    // Builds and removals ask for a reclaim of the images nothing uses,
-    // but one a container still ran from, or one a process died before
-    // reclaiming, would wait for the next build. So the reclaim also runs
-    // at every start and on a timer.
-    let images = state.clone();
-    spawn_supervised("image_reclaim", async move {
-        loop {
-            images.builder.prunes.request(&images, None);
-            tokio::time::sleep(IMAGE_RECLAIM_EVERY).await;
-        }
-    });
+    // Builds and removals ask for a reclaim of the images nothing uses. On
+    // a machine an image a container still ran from cannot go
+    // (`ImageDeleted::InUse`), so an infra copy changing (stopped,
+    // replaced) asks again there.
+    if state.project_ports.is_some() {
+        spawn_supervised("image_reclaim", reclaim_after_infra_changes(state.clone()));
+    }
 }
 
-/// How often the dispatcher reclaims the images nothing uses
-/// (`crate::build::prune::AfterBuildPrunes`) without a build asking.
-const IMAGE_RECLAIM_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+/// Ask for a reclaim of the images nothing uses each time an infra copy
+/// changes (`crate::held::INFRA_STATUS_CHANNEL`). Returns only when the
+/// signal watch stops, which crashes the process through its supervisor.
+async fn reclaim_after_infra_changes(state: DispatcherState) {
+    let mut heard = state.signals.subscribe();
+    loop {
+        match heard.next().await {
+            Ok(weft_task_store::pg_signal::Heard::Signal { channel, .. }) if channel == crate::held::INFRA_STATUS_CHANNEL => {
+                state.builder.prunes.request(&state, None);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(target: "weft_dispatcher::build", error = %e, "reclaiming images after infra changes stopped");
+                return;
+            }
+        }
+    }
+}
 
 /// Spawn a background task under supervision: one that is only ever
 /// meant to run for the process's whole life, so the wrapped future NEVER
@@ -421,6 +463,9 @@ where
     tokio::spawn(async move {
         let joined = tokio::spawn(fut).await;
         match joined {
+            // The tokio runtime is shutting down (the process is ending
+            // already, e.g. on a failed start): nothing died.
+            Err(e) if e.is_cancelled() => return,
             Ok(()) => tracing::error!(
                 target: "weft_dispatcher",
                 loop_name = name,
@@ -478,5 +523,19 @@ pub fn cors_for(auth: AuthMode) -> tower_http::cors::CorsLayer {
     match auth {
         AuthMode::Local => crate::api::permissive_cors(),
         AuthMode::OperatorKeys => tower_http::cors::CorsLayer::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    /// The alert delay in whole seconds never rounds a delay down to none.
+    #[test]
+    fn a_delay_rounds_up_to_whole_seconds() {
+        assert_eq!(super::whole_secs_up(Duration::ZERO), 0, "no delay: at the first failure");
+        assert_eq!(super::whole_secs_up(Duration::from_millis(300)), 1);
+        assert_eq!(super::whole_secs_up(Duration::from_secs(60)), 60);
+        assert_eq!(super::whole_secs_up(Duration::from_millis(60_001)), 61);
     }
 }

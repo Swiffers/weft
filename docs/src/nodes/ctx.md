@@ -14,8 +14,12 @@ on something you detected yourself with `node_bail!`.
 signs the request and records what it cost. `ctx.http()` is for everything
 else. A `reqwest` client you built yourself skips both.
 
-**`ctx.await_signal` is refused once your node has emitted anything**, because
-a resume replays the body from the top and would emit again. It is also refused
+**If you want to send something on before a long wait, send it, then wait.**
+A resume replays the body from the top, and a port this firing already sent on
+keeps its first value: the replayed emit does nothing, the way a finished
+`ctx.run` hands back its recorded value. Streams are the exception. Once you
+yielded on or closed a `Generator` output, `ctx.await_signal` is refused,
+because those items went out live and cannot be sent again. It is also refused
 on a node with a `Generator` input, because a stream cannot be replayed.
 
 **`ctx.run` keys on call order, not on the name you gave it.** The name is for
@@ -87,7 +91,10 @@ honestly.
 | `is_output_wired("port")` | Whether anything downstream reads that output in this run | never |
 
 An ordinary port emits at most once per firing. Whatever you never mention is
-closed for you when the body returns. A `Generator[T]` port emits as often as
+closed for you when the body returns. A task you spawned with a clone of `ctx`
+can emit only while the body is running: an emit from it after the body
+returned, or after it paused on `ctx.await_signal`, fails with an error naming
+the node and the port. A `Generator[T]` port emits as often as
 you like until you close it.
 
 `NodeOutput` is the payload you hand those calls:
@@ -105,7 +112,7 @@ you like until you close it.
 
 | Call | What it does | It fails when |
 |---|---|---|
-| `await_signal(kind).await` | Parks this firing until the signal fires, releasing the worker. Returns the payload | The body already emitted, or the node has a stream input, or the body's call order changed between replays |
+| `await_signal(kind).await` | Parks this firing until the signal fires, releasing the worker. Returns the payload | The body already yielded on or closed a stream output, or the node has a stream input, or the body's call order changed between replays |
 | `register_signal(kind).await` | Sets up a trigger that starts a new run on every fire. Called during setup | Called twice for one node in one setup |
 | `run("name", closure).await` | Runs the closure and writes down its result, or gives back what was written down last time | The closure itself fails |
 

@@ -77,8 +77,53 @@ pub(crate) enum Outbound {
     Terminate(Option<OutboundChunk>, Option<CloseReason>),
     /// An error to surface to the caller per the error mode (a real
     /// error status before anything went out, an in-band chunk after,
-    /// a close frame on a socket), then close.
-    Error(String),
+    /// a close frame on a socket), then close; `ending` says which.
+    Error { message: String, ending: Ending },
+}
+
+/// How an exchange ends when the program did not answer it, as its caller
+/// hears it: the status before the first byte, the `"status"` of the error
+/// written in-band after it, and a socket's close code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// The program failed, got stuck, or ended without answering: `500`.
+    ProgramFailed,
+    /// A time limit ran out (the run's cap, the session's cap, the line's
+    /// limit, a wait held as long as it may): `504`.
+    TimeLimit,
+    /// Weft or a person stopped the run, or it carries on elsewhere without
+    /// this caller (parked, handed back): `503`, with no `Retry-After`,
+    /// since a retry may start a second run beside the one that goes on.
+    Stopped,
+}
+
+impl Ending {
+    /// The HTTP status a caller hears.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::ProgramFailed => 500,
+            Self::TimeLimit => 504,
+            Self::Stopped => 503,
+        }
+    }
+
+    /// The close code a socket's caller hears: `1011` (internal error) for
+    /// a failure and a limit, `1013` (try again later) for a stop.
+    fn close_code(self) -> u16 {
+        match self {
+            Self::ProgramFailed | Self::TimeLimit => 1011,
+            Self::Stopped => 1013,
+        }
+    }
+
+    /// How a run cancelled for `cause` ends for its caller.
+    pub fn of_cancel(cause: &weft_core::exec::CancelCause) -> Self {
+        use weft_core::exec::CancelCause;
+        match cause {
+            CancelCause::Limit { .. } => Self::TimeLimit,
+            CancelCause::User | CancelCause::Execution { .. } | CancelCause::CallerGone | CancelCause::Runtime { .. } => Self::Stopped,
+        }
+    }
 }
 
 /// Single-consumer bounded outbound queue: many nodes push, one socket
@@ -247,7 +292,9 @@ pub struct LiveCallerConnection {
     /// this log, so a node that subscribes slightly after the first frame
     /// still sees it (no lost-message race that a raw broadcast has). This
     /// is the same offset-cursor model the bus uses. `None` for HTTP.
-    inbound: Option<InboundLog>,
+    inbound: Option<Arc<InboundLog>>,
+    /// When its session cap ends (unix seconds), `None` without one.
+    session_ends: Option<i64>,
     /// What the caller sent to open the exchange, as the dispatcher
     /// matched and gated it (both protocols).
     handshake: Arc<LiveRequest>,
@@ -290,20 +337,18 @@ pub struct LiveCallerConnection {
 /// are gone for cursors (cursors never read the DB, matching the bus). The
 /// caller's journal sink persists each inbound for durability/replay
 /// independently of this window.
-#[derive(Clone)]
+///
+/// A reader waits through the shared wait protocol
+/// (`weft_core::liveness::wait_on`), the log being its source: its
+/// generation moves on each message and on the close, so a run whose steps
+/// all wait on the caller reads as waiting on the outside, never stuck
+/// (`crate::execution_driver`).
 pub(crate) struct InboundLog {
-    inner: Arc<Mutex<InboundInner>>,
-    notify: Arc<tokio::sync::Notify>,
-    /// Set true when the socket closes; a reader caught up past the end of
-    /// a closed log gets a disconnect rather than blocking forever.
-    closed: Arc<AtomicBool>,
-}
-
-/// The three outcomes of reading at an absolute offset (see `read_at`).
-enum InboundRead {
-    Got(InboundMessage),
-    OutOfWindow { oldest_resident: u64 },
-    NotYet,
+    inner: Mutex<InboundInner>,
+    notify: tokio::sync::Notify,
+    /// Fast mirror of `InboundInner::generation` for the lock-free observe
+    /// path.
+    generation: AtomicU64,
 }
 
 struct InboundInner {
@@ -317,58 +362,78 @@ struct InboundInner {
     next_offset: u64,
     /// Max retained messages. The oldest are evicted past this.
     window: usize,
+    /// Set when the socket closes; a reader caught up past the end of a
+    /// closed log gets a disconnect rather than waiting forever.
+    closed: bool,
+    /// Moves on every message and on the close (see the type's doc).
+    generation: u64,
 }
 
 impl InboundLog {
-    fn new(window: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(InboundInner {
+    fn new(window: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(InboundInner {
                 msgs: std::collections::VecDeque::new(),
                 base_offset: 0,
                 next_offset: 0,
                 window: window.max(1),
-            })),
-            notify: Arc::new(tokio::sync::Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
-        }
+                closed: false,
+                generation: 0,
+            }),
+            notify: tokio::sync::Notify::new(),
+            generation: AtomicU64::new(0),
+        })
     }
     /// Append an inbound message, evict past the window, wake parked readers.
-    fn push(&self, msg: InboundMessage) {
-        {
-            let mut g = self.inner.lock().expect("inbound log poisoned");
+    pub(crate) fn push(&self, msg: InboundMessage) {
+        self.changed(|g| {
             g.msgs.push_back(msg);
             g.next_offset += 1;
             while g.msgs.len() > g.window {
                 g.msgs.pop_front();
                 g.base_offset += 1;
             }
-        }
-        self.notify.notify_waiters();
+        });
     }
     /// Mark the inbound side closed and wake readers so they unblock.
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.changed(|g| g.closed = true);
+    }
+    /// Apply `change` and move the generation on, under the lock, then wake
+    /// the readers.
+    fn changed(&self, change: impl FnOnce(&mut InboundInner)) {
+        {
+            let mut g = self.inner.lock().expect("inbound log poisoned");
+            change(&mut g);
+            g.generation += 1;
+            self.generation.store(g.generation, Ordering::Release);
+        }
         self.notify.notify_waiters();
     }
-    /// Read at absolute `offset`. Offsets are absolute over the whole
-    /// connection lifetime (never relative to the moving window), so a
-    /// stored cursor offset means the same message forever. Three outcomes,
-    /// no silent clamping:
-    ///   - `Got(msg)`: the message at `offset` is resident.
-    ///   - `OutOfWindow { oldest_resident }`: `offset` fell behind the
-    ///     window (evicted; cursors never read the DB). The node decides
-    ///     what to do; `oldest_resident` is absolute, valid to re-seed with.
-    ///   - `NotYet`: `offset` is at/past the current end; wait for arrival.
-    fn read_at(&self, offset: u64) -> InboundRead {
+    /// The message at `cursor`, advancing it, the way a read resolves: a
+    /// message, the cursor behind the window (moved to its floor), or the
+    /// caller gone; `None` while the next message has not come.
+    ///
+    /// Offsets are absolute over the whole connection lifetime (never
+    /// relative to the moving window), so a stored cursor means the same
+    /// message forever.
+    fn take_at(&self, cursor: &AtomicU64) -> Option<Result<InboundMessage, CallerError>> {
+        let want = cursor.load(Ordering::SeqCst);
         let g = self.inner.lock().expect("inbound log poisoned");
-        if offset < g.base_offset {
-            return InboundRead::OutOfWindow { oldest_resident: g.base_offset };
+        // Fell behind the window: the typed outcome (no silent
+        // substitution), the cursor MOVED to the next retained message so
+        // the next read resumes there, identical to the bus's `FellBehind`.
+        // The log is dense, so that message IS the floor.
+        if want < g.base_offset {
+            cursor.store(g.base_offset, Ordering::SeqCst);
+            return Some(Err(CallerError::FellBehind { oldest_resident: g.base_offset }));
         }
-        if offset >= g.next_offset {
-            return InboundRead::NotYet;
+        if want >= g.next_offset {
+            return g.closed.then_some(Err(CallerError::Disconnected));
         }
-        let idx = (offset - g.base_offset) as usize;
-        InboundRead::Got(g.msgs.get(idx).cloned().expect("resident offset present"))
+        let message = g.msgs.get((want - g.base_offset) as usize).cloned().expect("resident offset present");
+        cursor.store(want + 1, Ordering::SeqCst);
+        Some(Ok(message))
     }
     fn now_offset(&self) -> u64 {
         self.inner.lock().expect("inbound log poisoned").next_offset
@@ -382,6 +447,21 @@ impl InboundLog {
     }
 }
 
+impl weft_core::liveness::WaitSource for InboundLog {
+    fn gen_now(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    fn settled_gen(&self) -> u64 {
+        self.inner.lock().expect("inbound log poisoned").generation
+    }
+    fn wake_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+}
+
 struct ConnInner {
     terminated: bool,
     /// Something was queued toward the wire: the head is committed, a
@@ -392,7 +472,7 @@ struct ConnInner {
 /// Why an exchange whose run parked ends here: the run outlives its
 /// caller (`outlivesCaller`), so its worker leaves while it waits and
 /// whatever it says once resumed goes nowhere. Said to the caller (an
-/// error before the first byte, in-band after it, a `1011` close on a
+/// error before the first byte, in-band after it, a `1013` close on a
 /// socket) and recorded on the exchange.
 pub const PARKED: &str = "the run is waiting on a signal and carries on without this caller \
      (its route outlives its caller): no answer will come on this request";
@@ -413,6 +493,19 @@ impl ConnInner {
 }
 
 impl LiveCallerConnection {
+    /// Whether, with the caller still connected, a step of the run whose
+    /// waits `waits` holds waits on the caller's next message: the outside
+    /// can move the run, so it is not stuck.
+    pub(crate) fn waited_on(&self, waits: &crate::wait_tracker::WaitTracker) -> bool {
+        self.is_connected() && self.inbound.as_ref().is_some_and(|log| waits.waits_on(&(log.clone() as Arc<dyn weft_core::liveness::WaitSource>)))
+    }
+
+    /// When the caller's session cap ends (unix seconds), `None` without
+    /// one.
+    pub(crate) fn session_ends(&self) -> Option<i64> {
+        self.session_ends
+    }
+
     /// The sink the exchange is recorded through, for the run to close
     /// once it is over.
     pub fn journal(&self) -> Arc<dyn CallerJournalSink> {
@@ -447,7 +540,10 @@ impl LiveCallerConnection {
         let Some(answer) = held.take() else { return };
         match committed {
             Ok(()) => self.outbound.push_terminal(answer),
-            Err(why) => self.outbound.push_terminal(Outbound::Error(format!("the answer is not on the run's record, so it was not sent: {why}"))),
+            Err(why) => self.outbound.push_terminal(Outbound::Error {
+                message: format!("the answer is not on the run's record, so it was not sent: {why}"),
+                ending: Ending::Stopped,
+            }),
         }
     }
 
@@ -504,14 +600,15 @@ impl LiveCallerConnection {
     /// silently dropped socket. A program that already answered keeps its
     /// answer: the error is recorded and never pushed after it, whether
     /// that answer already left or still waits for the run's record.
-    pub async fn surface_error(&self, message: &str) {
+    /// `ending` is how the caller hears which kind of end it was.
+    pub async fn surface_error(&self, message: &str, ending: Ending) {
         self.record.errored(message);
         // Tolerant streams: the chosen mode says swallow it.
         if self.config.error_mode == weft_core::signal::ErrorMode::DropChunk {
             return;
         }
         if self.take_end(|_| ()).is_some() {
-            self.outbound.push_terminal(Outbound::Error(message.to_string()));
+            self.outbound.push_terminal(Outbound::Error { message: message.to_string(), ending });
         }
     }
 
@@ -531,7 +628,7 @@ impl LiveCallerConnection {
         if silent_http {
             let message = weft_core::caller::NO_ANSWER;
             self.record.errored(message);
-            self.outbound.push_terminal(Outbound::Error(message.to_string()));
+            self.outbound.push_terminal(Outbound::Error { message: message.to_string(), ending: Ending::ProgramFailed });
         } else {
             self.outbound.push_terminal(Outbound::Terminate(None, None));
         }
@@ -540,14 +637,15 @@ impl LiveCallerConnection {
     /// The run carries on without this caller (it parked on a wait,
     /// [`PARKED`], or was handed back, [`HANDED_BACK`]): it has NOT ended,
     /// so this never says it did. Whatever the exchange was doing, it
-    /// stops here with `why`. A program that already terminated the
-    /// exchange is left alone.
+    /// stops here with `why`, as a stop ([`Ending::Stopped`]): asking again
+    /// would start a second run beside the one that goes on. A program that
+    /// already terminated the exchange is left alone.
     pub async fn run_carries_on(&self, why: &str) {
         if self.take_end(|_| ()).is_none() {
             return;
         }
         self.record.errored(why);
-        self.outbound.push_terminal(Outbound::Error(why.to_string()));
+        self.outbound.push_terminal(Outbound::Error { message: why.to_string(), ending: Ending::Stopped });
     }
 
     /// Claim the exchange's end once: `None` when it was already
@@ -732,17 +830,21 @@ impl CallerConnection for LiveCallerConnection {
     async fn receive(
         &self,
         cursor: &std::sync::atomic::AtomicU64,
+        liveness: &std::sync::Weak<dyn weft_core::liveness::WaitLiveness>,
+        node: &Option<weft_core::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError> {
         let log = self.inbound.as_ref().ok_or(CallerError::WrongProtocol {
             protocol: self.config.protocol.as_wire_str(),
         })?;
-        recv_from_log(log, cursor).await
+        recv_from_log(log, cursor, liveness, node).await
     }
 
     async fn request(
         &self,
         msg: OutboundChunk,
         cursor: &std::sync::atomic::AtomicU64,
+        liveness: &std::sync::Weak<dyn weft_core::liveness::WaitLiveness>,
+        node: &Option<weft_core::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError> {
         // No subscribe race: the cursor reads from a stored log, so a reply
         // landing between send and read is still at/after the cursor.
@@ -750,7 +852,7 @@ impl CallerConnection for LiveCallerConnection {
         let log = self.inbound.as_ref().ok_or(CallerError::WrongProtocol {
             protocol: self.config.protocol.as_wire_str(),
         })?;
-        recv_from_log(log, cursor).await
+        recv_from_log(log, cursor, liveness, node).await
     }
 
     fn http_request(&self) -> Result<Arc<HttpRequestParts>, CallerError> {
@@ -783,11 +885,10 @@ impl CallerConnection for LiveCallerConnection {
     }
 }
 
-/// Read the message at `cursor` from the stored inbound log, waiting on
-/// the log's notify until one arrives. Advances `cursor` by one on success.
-/// A closed log with the cursor caught up is a disconnect (caller gone).
-/// Arm the notify BEFORE the catch-up check so a message landing in the gap
-/// still wakes us (no lost wakeup).
+/// Read the message at `cursor` from the stored inbound log, waiting until
+/// one arrives as `node`'s wait on the run's `liveness`
+/// (`weft_core::liveness::wait_on`). Advances `cursor` by one on success. A
+/// closed log with the cursor caught up is a disconnect (caller gone).
 ///
 /// The wait is UNBOUNDED on purpose: a node parking for the next caller
 /// message can legitimately wait minutes or hours (a chat user thinking),
@@ -795,39 +896,13 @@ impl CallerConnection for LiveCallerConnection {
 /// end this wait are a message arriving, the caller disconnecting, or the
 /// session-cap firing (which closes the log -> a disconnect here).
 async fn recv_from_log(
-    log: &InboundLog,
+    log: &Arc<InboundLog>,
     cursor: &std::sync::atomic::AtomicU64,
+    liveness: &std::sync::Weak<dyn weft_core::liveness::WaitLiveness>,
+    node: &Option<weft_core::liveness::FiringLocation>,
 ) -> Result<InboundMessage, CallerError> {
-    loop {
-        let notified = log.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let want = cursor.load(Ordering::SeqCst);
-        match log.read_at(want) {
-            // Got it: advance the cursor past the absolute offset read.
-            InboundRead::Got(m) => {
-                cursor.store(want + 1, Ordering::SeqCst);
-                return Ok(m);
-            }
-            // Fell behind the window: surface the typed outcome (no silent
-            // substitution) and MOVE the cursor to the next retained message
-            // so the next `receive()` resumes there, identical to the bus's
-            // `FellBehind`. The caller's inbound log is dense (no membership
-            // entries), so the next retained message AT/AFTER a below-floor
-            // cursor IS the floor: `resumed_at == oldest_resident`. Both
-            // absolute, stable as the window slides.
-            InboundRead::OutOfWindow { oldest_resident } => {
-                cursor.store(oldest_resident, Ordering::SeqCst);
-                return Err(CallerError::FellBehind { oldest_resident });
-            }
-            // Not yet arrived: fall through to wait on the notify.
-            InboundRead::NotYet => {}
-        }
-        if log.closed.load(Ordering::SeqCst) {
-            return Err(CallerError::Disconnected);
-        }
-        notified.await;
-    }
+    let source = log.clone() as Arc<dyn weft_core::liveness::WaitSource>;
+    weft_core::liveness::wait_on(liveness, node, &source, || log.take_at(cursor)).await
 }
 
 /// One write to the caller, raced against the exchange ending under it:
@@ -1001,9 +1076,11 @@ pub(crate) fn new_connection(
 ) -> (
     Arc<LiveCallerConnection>,
     Arc<OutboundQueue>,
-    Option<InboundLog>,
+    Option<Arc<InboundLog>>,
 ) {
     let outbound = OutboundQueue::new(OUTBOUND_BUFFER);
+    // The session cap runs from the caller's arrival, which is now.
+    let session_ends = (config.max_session_secs != 0).then(|| crate::now_unix().saturating_add(config.max_session_secs) as i64);
     let inbound = match config.protocol {
         Protocol::Websocket => Some(InboundLog::new(config.inbound_window)),
         Protocol::Http => None,
@@ -1017,6 +1094,7 @@ pub(crate) fn new_connection(
         config,
         outbound: outbound.clone(),
         inbound: inbound.clone(),
+        session_ends,
         handshake,
         http_request,
         record: CallerRecord::new(execution_id, journal.clone()),
@@ -1155,11 +1233,16 @@ impl ExchangeEnd {
         }
     }
 
-    /// Whether the CALLER ended the exchange (a hang-up, a close frame,
-    /// a dead socket, a missed heartbeat, a message the connection
-    /// refused, the session cap). Everything else is the program's own
-    /// end, after which the run finishes on its own.
-    fn caller_initiated(self) -> bool {
+    /// What a run tied to its caller is cancelled with when the exchange
+    /// ends this way, `None` when it is the program's own end, after which
+    /// the run finishes on its own. The caller ending it (a hang-up, a
+    /// close frame, a dead socket, a missed heartbeat, a message the
+    /// connection refused) is [`CancelCause::CallerGone`]; the session cap
+    /// is the time limit the caller was answered with, naming the cap
+    /// ([`crate::worker::Limit::SessionCap`]).
+    ///
+    /// [`CancelCause::CallerGone`]: weft_core::exec::CancelCause::CallerGone
+    fn cancels_tied_run(self, config: &CallerRuntimeConfig, execution_id: ExecutionId) -> Option<weft_core::exec::CancelCause> {
         match self {
             Self::CallerHungUp
             | Self::CallerHungUpOnSend
@@ -1169,13 +1252,15 @@ impl ExchangeEnd {
             | Self::CallerMissedHeartbeat
             | Self::SocketNeverOpened
             | Self::InboundTooLarge
-            | Self::InboundDecodeFailed
-            | Self::SessionCapExceeded => true,
+            | Self::InboundDecodeFailed => Some(weft_core::exec::CancelCause::CallerGone),
+            Self::SessionCapExceeded => Some(
+                crate::worker::Limit::SessionCap { cap: std::time::Duration::from_secs(config.max_session_secs) }.cause(execution_id),
+            ),
             Self::ResponseComplete
             | Self::ResponseErrored
             | Self::OutboundQueueClosed
             | Self::SessionClosedByProgram
-            | Self::SessionErroredByProgram => false,
+            | Self::SessionErroredByProgram => None,
         }
     }
 }
@@ -1205,16 +1290,19 @@ pub trait LiveStarter: Send + Sync {
     async fn bear(&self, admitted: Box<crate::door::Admitted>) -> Result<Born, Response>;
 }
 
-/// The caller of `conn` is gone (their side ended the exchange, for
-/// `end`): the exchange stops, a run tied to its caller is cancelled, and
-/// the connection says the caller left. The cancel lands before the caller
+/// The exchange of `conn` ended, for `end`: the exchange stops, a run tied
+/// to its caller is cancelled with the cause `end` names
+/// ([`ExchangeEnd::cancels_tied_run`]), and the connection says the caller
+/// left. The cancel lands before the caller
 /// reads as gone, so whatever wakes on the caller leaving
 /// (`weft_engine::worker`'s move off a worker no call holds open) finds the
 /// run already cancelled.
 fn exchange_ended(conn: &LiveCallerConnection, outbound: &OutboundQueue, canceller: &dyn ExecutionCanceller, execution_id: ExecutionId, end: ExchangeEnd) {
     outbound.close();
-    if end.caller_initiated() && matches!(resolve_disconnect(conn.config.outlives_caller), DisconnectAction::CancelExecution) {
-        canceller.cancel(execution_id, weft_core::exec::CancelCause::CallerGone);
+    if matches!(resolve_disconnect(conn.config.outlives_caller), DisconnectAction::CancelExecution) {
+        if let Some(cause) = end.cancels_tied_run(&conn.config, execution_id) {
+            canceller.cancel(execution_id, cause);
+        }
     }
     conn.mark_disconnected(end.as_str());
 }
@@ -1673,7 +1761,7 @@ async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft
                 let end = ExchangeEnd::SessionCapExceeded;
                 exchange_ended(&here.conn, &outbound, here.canceller.as_ref(), here.execution_id, end);
                 here.carry_on();
-                return build_response(&error_head(), axum::body::Body::from(format!("no response from the program: {}", end.as_str())));
+                return build_response(&error_head(Ending::TimeLimit), axum::body::Body::from(format!("no response from the program: {}", end.as_str())));
             }
             Waited::Item(Some(Outbound::Head(head))) => explicit = Some(head),
             Waited::Item(decisive) => break decisive,
@@ -1702,14 +1790,14 @@ async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft
         }
         // Before the first byte the status line is still ours to set: a
         // real error status, the message as the body.
-        Some(Outbound::Error(message)) => {
+        Some(Outbound::Error { message, ending }) => {
             conn.mark_disconnected(ExchangeEnd::ResponseErrored.as_str());
-            build_response(&error_head(), axum::body::Body::from(message))
+            build_response(&error_head(ending), axum::body::Body::from(message))
         }
         Some(Outbound::Head(_)) => unreachable!("a head is held above, never decisive"),
         None => {
             conn.mark_disconnected(ExchangeEnd::OutboundQueueClosed.as_str());
-            build_response(&error_head(), axum::body::Body::from(format!("no response from the program: {}", ExchangeEnd::OutboundQueueClosed.as_str())))
+            build_response(&error_head(Ending::ProgramFailed), axum::body::Body::from(format!("no response from the program: {}", ExchangeEnd::OutboundQueueClosed.as_str())))
         }
     };
     here.carry_on();
@@ -1738,10 +1826,10 @@ fn committed_head(explicit: Option<ResponseHead>, first: Option<&OutboundChunk>)
     }
 }
 
-/// A `500` with a text body: the program failed (or ended silent) before
-/// the first byte, so the status line can still say so.
-fn error_head() -> ResponseHead {
-    ResponseHead::new(500).with_content_type_for(&OutboundChunk::Text(String::new()))
+/// The head of an exchange that ends before its first byte without the
+/// program's answer: the status `ending` says, with a text body.
+fn error_head(ending: Ending) -> ResponseHead {
+    ResponseHead::new(ending.status()).with_content_type_for(&OutboundChunk::Text(String::new()))
 }
 
 /// What feeds a streamed answer's body.
@@ -1817,8 +1905,8 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                         }
                         // The status is committed, so the error goes
                         // in-band, then the stream closes.
-                        Some(Outbound::Error(message)) => {
-                            let sent = async { tx.send(Ok(head.in_band_error(&message))).await.is_ok() };
+                        Some(Outbound::Error { message, ending }) => {
+                            let sent = async { tx.send(Ok(head.in_band_error(&message, ending.status()))).await.is_ok() };
                             if let Err(end) = write_or_end(sent, tx.closed(), &mut session).await {
                                 break 'feed end;
                             }
@@ -1850,9 +1938,15 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                 }
             }
         };
+        // The status is committed, so the cap is told in-band, as a time
+        // limit. Only if the body has room: a full body is a caller that
+        // has not read what came before it, and would never read this.
+        if end == ExchangeEnd::SessionCapExceeded {
+            let _ = tx.try_send(Ok(head.in_band_error(end.as_str(), Ending::TimeLimit.status())));
+        }
         // The exchange ended: stop producers (a blocked send now errors);
-        // a tied run is cancelled only when the CALLER ended it, and a run
-        // that answered finishes on its own.
+        // a tied run is cancelled when the caller ended it (or its session
+        // cap did), and a run that answered finishes on its own.
         exchange_ended(&conn, &outbound, canceller.as_ref(), execution_id, end);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -1881,7 +1975,7 @@ fn build_response(head: &ResponseHead, body: axum::body::Body) -> Response {
 struct SocketPump {
     conn: Arc<LiveCallerConnection>,
     outbound: Arc<OutboundQueue>,
-    inbound: InboundLog,
+    inbound: Arc<InboundLog>,
     config: CallerRuntimeConfig,
     heartbeat_secs: u64,
     clock: Arc<dyn weft_platform_traits::Clock>,
@@ -1981,11 +2075,11 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                     }
                     break ExchangeEnd::SessionClosedByProgram;
                 }
-                Some(Outbound::Error(msg)) => {
+                Some(Outbound::Error { message, ending }) => {
                     let sent = async {
                         socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                            code: 1011, // internal error
-                            reason: msg.into(),
+                            code: ending.close_code(),
+                            reason: message.into(),
                         }))).await.is_ok()
                     };
                     // The program ended it: a close the caller no longer
@@ -2019,6 +2113,14 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
     // closed leaves the run to finish.
     inbound.close();
     exchange_ended(&conn, &outbound, canceller.as_ref(), execution_id, reason);
+    // The cap is told as a time limit. A caller that no longer reads holds
+    // this write only until the socket's caller-silence bound aborts the
+    // connection, and then has nobody left to tell.
+    if reason == ExchangeEnd::SessionCapExceeded {
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame { code: Ending::TimeLimit.close_code(), reason: reason.as_str().into() })))
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -2037,10 +2139,10 @@ mod tests {
             Some(ResponseHead::new(200).with_header("content-type", "application/x-ndjson").with_keepalive("\n")),
             Some(&OutboundChunk::Text("{\"a\":1}\n".into())),
         );
-        assert_eq!(ndjson.in_band_error("boom"), b"\n{\"error\":\"boom\"}\n");
+        assert_eq!(ndjson.in_band_error("boom", 500), b"\n{\"error\":\"boom\",\"status\":500}\n");
         assert_eq!(ndjson.keepalive.as_deref(), Some("\n"), "the filler comes off the committed head");
         let text = committed_head(None, Some(&OutboundChunk::Text("partial".into())));
-        assert_eq!(text.in_band_error("boom"), b"\n[error] boom");
+        assert_eq!(text.in_band_error("boom", 500), b"\n[error] boom");
         assert_eq!(committed_head(None, None).status, 204, "no body and no head is a 204");
     }
 
@@ -2440,10 +2542,21 @@ mod tests {
     #[derive(Default)]
     struct RecordingCanceller {
         cancelled: Mutex<Vec<ExecutionId>>,
+        causes: Mutex<Vec<weft_core::exec::CancelCause>>,
     }
     impl ExecutionCanceller for RecordingCanceller {
-        fn cancel(&self, execution_id: ExecutionId, _cause: weft_core::exec::CancelCause) {
+        fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause) {
             self.cancelled.lock().unwrap().push(execution_id);
+            self.causes.lock().unwrap().push(cause);
+        }
+    }
+    impl RecordingCanceller {
+        /// The run was ended as the session cap, naming the cap.
+        fn ended_at_the_session_cap(&self) {
+            match self.causes.lock().unwrap().as_slice() {
+                [weft_core::exec::CancelCause::Limit { detail }] => assert!(detail.contains("maxSessionSecs"), "{detail}"),
+                other => panic!("ended with {other:?}"),
+            }
         }
     }
 
@@ -2797,10 +2910,14 @@ mod tests {
         assert!(canceller.cancelled.lock().unwrap().is_empty(), "the program ended the exchange; the run finishes on its own");
     }
 
-    /// The words are the fact: which ends are the caller's, and which
-    /// the program's.
+    /// The words are the fact: the caller's ends cancel a tied run as the
+    /// caller gone, the session cap as the time limit it answered the
+    /// caller with, and the program's own ends cancel nothing.
     #[test]
-    fn only_a_callers_end_cancels_a_tied_run() {
+    fn each_end_cancels_a_tied_run_with_its_own_cause() {
+        use weft_core::exec::CancelCause;
+        let cfg = CallerRuntimeConfig { max_session_secs: 900, ..http_cfg() };
+        let id = ExecutionId::nil();
         for end in [
             ExchangeEnd::CallerHungUp,
             ExchangeEnd::CallerHungUpOnSend,
@@ -2808,11 +2925,15 @@ mod tests {
             ExchangeEnd::SocketTransportError,
             ExchangeEnd::SocketEnded,
             ExchangeEnd::CallerMissedHeartbeat,
+            ExchangeEnd::SocketNeverOpened,
             ExchangeEnd::InboundTooLarge,
             ExchangeEnd::InboundDecodeFailed,
-            ExchangeEnd::SessionCapExceeded,
         ] {
-            assert!(end.caller_initiated(), "{}", end.as_str());
+            assert_eq!(end.cancels_tied_run(&cfg, id), Some(CancelCause::CallerGone), "{}", end.as_str());
+        }
+        match ExchangeEnd::SessionCapExceeded.cancels_tied_run(&cfg, id) {
+            Some(CancelCause::Limit { detail }) => assert!(detail.contains("900 second") && detail.contains("maxSessionSecs"), "{detail}"),
+            other => panic!("the session cap ended the run with {other:?}"),
         }
         for end in [
             ExchangeEnd::ResponseComplete,
@@ -2821,7 +2942,7 @@ mod tests {
             ExchangeEnd::SessionClosedByProgram,
             ExchangeEnd::SessionErroredByProgram,
         ] {
-            assert!(!end.caller_initiated(), "{}", end.as_str());
+            assert_eq!(end.cancels_tied_run(&cfg, id), None, "{}", end.as_str());
         }
     }
 
@@ -2839,12 +2960,64 @@ mod tests {
     #[tokio::test]
     async fn an_error_before_the_first_byte_is_a_real_500() {
         let (status, headers, body) = exchange("{}", |conn| async move {
-            conn.surface_error("the node blew up").await;
+            conn.surface_error("the node blew up", Ending::ProgramFailed).await;
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(header(&headers, "content-type"), Some("text/plain; charset=utf-8"));
         assert_eq!(body, "the node blew up");
+    }
+
+    /// Each kind of end is its own status before the first byte: a time
+    /// limit `504`, a stop `503`, neither telling the caller to retry
+    /// (`Retry-After`), since the run may carry on.
+    #[tokio::test]
+    async fn a_limit_answers_504_and_a_stop_503_with_no_retry_after() {
+        for (ending, expected) in [(Ending::TimeLimit, StatusCode::GATEWAY_TIMEOUT), (Ending::Stopped, StatusCode::SERVICE_UNAVAILABLE)] {
+            let (status, headers, body) = exchange("{}", move |conn| async move {
+                conn.surface_error("ended", ending).await;
+            })
+            .await;
+            assert_eq!(status, expected, "{ending:?}");
+            assert_eq!(header(&headers, "retry-after"), None, "{ending:?}");
+            assert_eq!(body, "ended");
+        }
+    }
+
+    /// Once an answer streams its status line is out: the kind rides the
+    /// error written in-band, as its `"status"`.
+    #[tokio::test]
+    async fn an_end_after_the_first_byte_says_its_status_in_band() {
+        let (status, _headers, body) = exchange("{}", |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            let head = ResponseHead::new(200).with_header("content-type", "application/x-ndjson");
+            http.write_with(head, OutboundChunk::Text("{\"a\":1}\n".into())).await.unwrap();
+            conn.surface_error("the run reached its cap", Ending::TimeLimit).await;
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK, "the status line was out already");
+        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last, serde_json::json!({ "error": "the run reached its cap", "status": 504 }));
+    }
+
+    /// How each cancel reaches a caller: a limit is a time limit, anything
+    /// else a stop; and the close code a socket hears for each kind.
+    #[test]
+    fn a_cancel_ends_for_its_caller_by_its_cause() {
+        use weft_core::exec::CancelCause;
+        assert_eq!(Ending::of_cancel(&CancelCause::Limit { detail: "cap".into() }), Ending::TimeLimit);
+        for cause in [
+            CancelCause::User,
+            CancelCause::Execution { by: ExecutionId::nil(), tag: "t".into() },
+            CancelCause::Runtime { detail: "the drain's deadline".into() },
+            CancelCause::CallerGone,
+        ] {
+            assert_eq!(Ending::of_cancel(&cause), Ending::Stopped, "{cause:?}");
+        }
+        assert_eq!(
+            [Ending::ProgramFailed, Ending::TimeLimit, Ending::Stopped].map(|e| (e.status(), e.close_code())),
+            [(500, 1011), (504, 1011), (503, 1013)]
+        );
     }
 
     #[tokio::test]
@@ -2859,15 +3032,19 @@ mod tests {
     }
 
     /// A run that parked has not ended: its caller hears that it
-    /// carries on without them, never that it ended unanswered.
+    /// carries on without them, as a stop (`503`), never that it ended
+    /// unanswered, and is not told to retry. A run handed back the same.
     #[tokio::test]
     async fn a_run_that_parks_says_so_and_never_claims_it_ended() {
-        let (status, _headers, body) = exchange("{}", |conn| async move {
-            conn.run_carries_on(PARKED).await;
-        })
-        .await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body, PARKED);
+        for why in [PARKED, HANDED_BACK] {
+            let (status, headers, body) = exchange("{}", move |conn| async move {
+                conn.run_carries_on(why).await;
+            })
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(header(&headers, "retry-after"), None, "a retry would start a second run");
+            assert_eq!(body, why);
+        }
     }
 
     #[tokio::test]
@@ -2953,10 +3130,10 @@ mod tests {
     }
 
     /// A program that never answers holds its caller only up to the
-    /// session cap: the cap answers a loud `500` saying so, and the run,
-    /// tied to its caller, is cancelled.
+    /// session cap: the cap answers a `504` saying so, and the run, tied
+    /// to its caller, is cancelled as that time limit, naming the cap.
     #[tokio::test]
-    async fn a_silent_end_answers_500_with_the_reason() {
+    async fn a_silent_end_answers_504_with_the_reason() {
         let cfg = CallerRuntimeConfig { max_session_secs: 1, ..http_cfg() };
         // Nobody talks; the session cap (1s on the fake clock, which
         // returns at once) ends the exchange with the head held.
@@ -2965,9 +3142,78 @@ mod tests {
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert!(body.contains("session cap exceeded"), "got: {body}");
         assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        canceller.ended_at_the_session_cap();
+    }
+
+    /// A stream under way when the session cap runs out ends with the cap
+    /// written in-band as a time limit, and the run, tied to its caller,
+    /// is cancelled as that time limit, naming the cap.
+    #[tokio::test(start_paused = true)]
+    async fn the_session_cap_after_the_first_byte_is_a_time_limit_in_band() {
+        let cfg = CallerRuntimeConfig { max_session_secs: 5, ..http_cfg() };
+        let (here, _, canceller) = run_here(cfg, LiveRequest::default(), "{}", |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+            let head = ResponseHead::new(200).with_header("content-type", "application/x-ndjson");
+            http.write_with(head, OutboundChunk::Text("{\"a\":1}\n".into())).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let execution_id = here.execution_id;
+        let response = answer_http(here, 0, weft_platform_traits::SystemClock::new()).await;
+        assert_eq!(response.status(), StatusCode::OK, "the status line was out already");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last, serde_json::json!({ "error": "session cap exceeded", "status": 504 }));
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        canceller.ended_at_the_session_cap();
+    }
+
+    /// A socket open when the session cap runs out is closed as a time
+    /// limit, saying why, and the run, tied to its caller, is cancelled as
+    /// that time limit, naming the cap.
+    #[tokio::test]
+    async fn the_session_cap_closes_a_socket_as_a_time_limit() {
+        use futures::StreamExt as _;
+        let cfg = CallerRuntimeConfig { max_session_secs: 1, ..ws_cfg() };
+        let execution_id = ExecutionId::new_v4();
+        let (conn, outbound, inbound) =
+            new_connection(cfg.clone(), execution_id, Arc::new(LiveRequest::default()), None, Arc::new(RecordingSink::default()));
+        let canceller = Arc::new(RecordingCanceller::default());
+        let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: canceller.clone(), execution_id, armed: true };
+        let pump = SocketPump {
+            conn,
+            outbound,
+            inbound: inbound.expect("a websocket connection has an inbound log"),
+            config: cfg,
+            heartbeat_secs: 0,
+            clock: weft_platform_traits::SystemClock::new(),
+            canceller: canceller.clone(),
+            execution_id,
+        };
+        let opened = Arc::new(Mutex::new(Some((pump, unopened))));
+        let app = Router::new().route(
+            "/",
+            axum::routing::get(move |ws: WebSocketUpgrade| async move {
+                let (pump, unopened) = opened.lock().unwrap().take().expect("one socket");
+                ws.on_upgrade(move |socket| pump_ws(socket, pump, unopened))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/")).await.unwrap();
+        let close = loop {
+            if let tokio_tungstenite::tungstenite::Message::Close(frame) = socket.next().await.expect("a close frame").unwrap() {
+                break frame.expect("a close code");
+            }
+        };
+        assert_eq!(u16::from(close.code), Ending::TimeLimit.close_code());
+        assert_eq!(&*close.reason, "session cap exceeded");
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        canceller.ended_at_the_session_cap();
     }
 
     #[tokio::test]

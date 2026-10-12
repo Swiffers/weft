@@ -38,6 +38,48 @@ pub enum TakeDownTarget {
     WholeProject,
 }
 
+/// Who asks for a take-down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeDownAsker {
+    /// A person, a lifecycle command or one of the dispatcher's loops.
+    Outside,
+    /// A program's run: never among the runs the take-down reaches.
+    Run(ExecutionId),
+    /// A resync taking down the triggers it brings back, under its drive
+    /// (`crate::task_kinds::resync::ResyncPlan::driver`): it goes through
+    /// only while that drive holds the project.
+    Resync(uuid::Uuid),
+}
+
+impl TakeDownAsker {
+    /// The run that asked, if one did.
+    pub fn run(self) -> Option<ExecutionId> {
+        match self {
+            TakeDownAsker::Run(run) => Some(run),
+            TakeDownAsker::Outside | TakeDownAsker::Resync(_) => None,
+        }
+    }
+
+    /// The resync drive that asked, if one did.
+    fn resync(self) -> Option<uuid::Uuid> {
+        match self {
+            TakeDownAsker::Resync(driver) => Some(driver),
+            TakeDownAsker::Outside | TakeDownAsker::Run(_) => None,
+        }
+    }
+}
+
+/// How a take-down ended, when nothing refused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakenDown {
+    Done,
+    /// The project does not exist.
+    ProjectGone,
+    /// It was a resync's ([`TakeDownAsker::Resync`]), and that drive no
+    /// longer holds the project: nothing was taken down.
+    ResyncGone,
+}
+
 /// What a take-down needs to know about one live run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFacts {
@@ -122,8 +164,7 @@ pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -
         .collect()
 }
 
-/// Take `target` down under `spec`. Returns false when the project does
-/// not exist.
+/// Take `target` down under `spec`, as `asker` asked.
 ///
 /// In order, so the gate is right from the first moment and nothing is
 /// left half done: refuse a target that is mid-activation (cancel that
@@ -141,12 +182,13 @@ pub async fn take_down(
     target: &TakeDownTarget,
     spec: &DeactivateSpec,
     went_down_with: Option<DownWith>,
-    asked_by: Option<ExecutionId>,
-) -> Result<bool, (StatusCode, String)> {
+    asker: TakeDownAsker,
+) -> Result<TakenDown, (StatusCode, String)> {
     spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
+    let asked_by = asker.run();
     let Some(transition) = state.projects.transition(project_id).await.map_err(|e| internal("transition", e))? else {
-        return Ok(false);
+        return Ok(TakenDown::ProjectGone);
     };
     if transition.is_building() {
         return Err((
@@ -195,12 +237,13 @@ pub async fn take_down(
     };
     let unlisten = match state
         .activations
-        .set_lifecycle_guarded(project_id, &keys, &landing, signals)
+        .set_lifecycle_guarded(project_id, &keys, &landing, signals, asker.resync())
         .await
         .map_err(|e| internal("set lifecycle", e))?
     {
         LifecycleWrite::Applied { unlisten } => unlisten,
-        LifecycleWrite::NotFound => return Ok(false),
+        LifecycleWrite::NotFound => return Ok(TakenDown::ProjectGone),
+        LifecycleWrite::ResyncGone => return Ok(TakenDown::ResyncGone),
         LifecycleWrite::Rejected { blocker } => {
             return Err((StatusCode::CONFLICT, format!("cannot deactivate: {blocker}; cancel it first")));
         }
@@ -240,7 +283,7 @@ pub async fn take_down(
                 .map_err(|e| internal("finish drain", e))?;
         }
     }
-    Ok(true)
+    Ok(TakenDown::Done)
 }
 
 #[cfg(test)]

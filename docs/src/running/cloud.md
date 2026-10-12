@@ -186,18 +186,24 @@ is: delete it from its own provider if you no longer want it.
 ### What you get
 
 While nobody is using the install and no trigger keeps a connection open,
-none of weft runs and your database sleeps. weft books a wake only for a
-moment something is due (a schedule, a retry, a hibernation ending), and a
-program's infrastructure that runs fine keeps nothing awake: each machine
-says so itself when its state changes.
+none of weft runs. Your database wakes only when something happens: a run
+doing work, a timer or schedule coming due, a poll that finds something new,
+something arriving from outside (a call to a route, a webhook, an event on a
+connection a trigger holds), something weft itself has due (a hibernation
+ending, a subscription to renew), or an editor or `weft follow` watching the
+install (more on the editor below). A poll that finds nothing new wakes weft's
+listener and leaves the database asleep. A program's infrastructure that
+runs fine keeps nothing awake: each machine says so itself when its state
+changes.
 
-A run that waits on a person while it cannot pause (a route whose caller is
-still on the line, an unrecorded run) keeps its worker and one copy of the
-broker up for as long as it waits, which is cheap, and leaves your database
-asleep for all of it. The answer or the cancel that ends the wait reaches
+If a run cannot pause (its caller is still on the line, or it is
+unrecorded) and it waits, on a person's answer or on its caller's next
+message over a socket, it keeps its worker and one copy of the broker up for
+as long as it waits, which is cheap, and leaves your database asleep for all
+of it. The answer or the cancel that ends the wait reaches
 the broker over Pub/Sub, not through the database, and is pushed to the
-worker on its connection. The database wakes when the answer or the cancel
-arrives, or the run ends. If you want a wait longer than an hour, make the
+worker on its connection. The database wakes when the answer, the cancel
+or the caller's next message arrives, or the run ends. If you want a wait longer than an hour, make the
 run one that can pause: Cloud Run cuts a request after an hour, so when a
 worker's runs are all only waiting and its connection is a minute from that
 cut, the worker ends them with a message naming the limit, and stops. A
@@ -212,8 +218,8 @@ retry reaches a fresh one.
 | The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs one holder per 200 such triggers and none when there are none |
 | Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
-| Pub/Sub | a topic carrying Compute Engine's record of an infrastructure machine stopping or failing to the supervisor, and one weft announces on when a run a worker drives gets an answer or is cancelled, so word of it travels between weft's copies without your database |
-| Cloud Tasks | every timer, schedule and poll your programs set, and the wakes weft schedules for itself to check on its own pending work |
+| Pub/Sub | three topics, which let weft's parts tell each other things without going through your database: `weft-machine-events` carries Compute Engine's record of an infrastructure machine stopping or failing to the supervisor, `weft-news` is where weft announces that a run a worker drives got an answer or was cancelled, and `weft-holders` tells the holders that the triggers they should hold changed, or that one of your connections was reconnected, rotated or removed, so they drop the credentials they kept for it (a token refresh is not announced here) |
+| Cloud Tasks | two queues. `weft-wakes` delivers every timer, schedule and poll your programs set, each subscription renewal, and each holder's check; if the install does not answer one, it keeps retrying, at most five minutes apart. For a trigger's wake, the listener gives the trigger up after `wake_attempts` failed deliveries it answered (20, about an hour; a delivery that never reached it uses none) and says why on its node. `weft resync` brings it back. `weft-ticks` delivers the wakes weft sets for itself (a background job's next look) and gives one up after ten minutes |
 | Compute Engine | one machine per infrastructure unit your programs start (a database, a GPU model) |
 | A storage bucket | weft's files, reached as weft's own service account: no key is made for it, so an organization that forbids service-account keys runs weft as is |
 | Artifact Registry | two image repositories: one for the runtime, workers and infra nodes, which only the install writes, and one for frontends |
@@ -225,13 +231,14 @@ its events (a provider's webhook) calls the install. If you want to
 know when an event subscription takes a push instead of holding a
 connection, go and read
 [how a trigger picks its road](../connections/events.md#the-two-roads).
-You pay for a holder while it runs. A running holder also checks in with weft
-every 10 seconds, so weft's broker and your database never get to sleep
-while such a trigger is on. If a
-holder crashes, its triggers hear nothing for up to about 40 seconds: its
-claims run out 30 seconds after it last renewed them, and another holder, or
-its restarted copy, takes them at its next look. A
-holder that is stopped normally hands its triggers over at once.
+You pay for a holder while it runs, but it wakes your database only when it
+calls weft: when it starts, when an event arrives on one of its connections,
+when a connection drops or comes back (once per drop, however many reconnect
+attempts follow), and when the `weft-holders` topic tells it something
+changed. If a holder crashes, weft frees its triggers within three
+minutes for another holder, or its restarted copy, to take (for how it
+notices, go and read [the listener](architecture.md#the-listener)). A holder that is
+stopped normally hands its triggers over at once.
 
 If you have VS Code pointed at the install, the editor keeps a live
 connection open to it, and the install and your database stay awake while
@@ -241,8 +248,47 @@ Switching the editor back to your local install closes it at once.
 
 If you want to change one of the install's defaults (how many triggers a
 holder takes, a holder's CPU and memory, how many builds run at once, how
-many bad tokens a minute one address may present), edit it in
+many bad tokens a minute one address may present, how many times a trigger's
+failing wake is delivered before it is given up), edit it in
 `deploy/terraform/gcp/variables.tf` in your fork and run the workflow again.
+
+If weft's own work keeps failing, like waking one of its services, handing
+a run to your project's workers, or acting on your infrastructure, the
+install sends an email. A run of your program that fails sends no email.
+`weft status --on prod` lists these failures under `waiting on weft:`. You
+get an email about one of them in two cases. If weft has given up retrying,
+you get the email at once. If weft is still retrying, you get it on the
+first failed try after the failure has been going on for 5 minutes
+(`alert_after_minutes` changes that, see below). weft asks Google to email you once per
+problem, and once more each time it clears and then comes back. Google also
+sends at most one of these emails every 5 minutes for the whole install, a
+limit separate from the wait above, so a problem that comes up soon after
+an email may get no email of its own. It still shows in `weft status`. If
+you run weft on your own machine, there is no email: `weft status`, without
+`--on prod`, is where these failures show.
+
+When an email arrives, run `weft status --on prod` in each of your
+projects' folders:
+a problem with the install as a whole, like waking one of its services,
+shows in all of them, and a problem with one project, like weft failing to
+hand a run to its workers or to act on its infrastructure, shows only in
+that project's status.
+
+The emails go to a person with the Owner role on your Google Cloud project,
+usually the account you made the project with. Only a person granted Owner
+on the project itself counts: groups, service accounts, and an Owner role
+inherited from a folder or organization are skipped. If several people hold
+Owner directly, the emails go to the one whose address comes first in
+alphabetical order. If you want them sent somewhere else, add a repository
+secret named `WEFT_ALERT_EMAIL` holding that address (a secret, so a public
+fork's run logs never show it). The alert that sends these
+emails is on by default and costs about $0.35 a month on Google's bill. If
+you want it off, set `alerts_enabled` to `false` in
+`deploy/terraform/gcp/variables.tf`. If you want weft to wait a different
+number of minutes before emailing about a failure it is still retrying,
+change `alert_after_minutes` in the same file (set it to 0 to be emailed at
+the first failure). Each of these changes takes effect the next time you run
+the install workflow.
 
 weft generates the rest of its secrets itself: the key your saved
 connections are encrypted with, the key live callers' tickets are signed
@@ -546,17 +592,18 @@ waiting for it to start.
   sees it.
 - **`weft domain list` says the door in front of your domains refuses to
   follow them**: Google refused to change the load balancer, and the
-  message says why. weft tries again on its own, waiting longer each time,
-  up to six hours. Once you have fixed the cause, any `weft domain add` or
-  `weft domain rm` tries again at once.
+  message says why. weft tries again on its own twice, five and then ten
+  minutes later, and after the third refusal it stops and leaves the
+  message in `weft domain list`. Once you have fixed the cause, any `weft
+  domain add` or `weft domain rm` tries again at once.
 - **weft does not start, and its log says the database session "cannot
   LISTEN"**: `WEFT_DATABASE_URL` goes through a pooler. Add a direct address
   of the same database as the `WEFT_DATABASE_LISTEN_URL` secret ([a
   database](#a-database)) and run the install workflow again.
 - **A trigger that keeps a connection open shows "waiting for a holder to
-  take it" on its node**: a running holder with room takes it within about 10 seconds; otherwise weft
-  is starting one. If it stays
-  that way, the holders' logs say why.
+  take it" on its node**: a running holder with room takes it as soon as
+  weft tells the holders the trigger is there; otherwise weft is starting
+  one. If it stays that way, the holders' logs say why.
 - **A run on prod is refused with "has no ... connection picked on this
   install"**: the step was connected on your machine, not on prod. Run the
   `weft connect --node <step>` it names, with `--on prod`.
@@ -568,6 +615,13 @@ waiting for it to start.
   not the one its frontend was added with (`weft frontend ls --on prod` shows
   it, spelled as GitHub spells it, `owner/name`). Remove the frontend and add
   it again with the right `--repo`, then run `weft target export` again.
+- **The install workflow stops in "create the cloud" with "no email to send
+  the alerts to was found"**: `WEFT_ALERT_EMAIL` is not set, and no person
+  holds the Owner role directly on your Google Cloud project, the only kind
+  of owner the workflow emails. If you want the alerts, add a repository
+  secret named `WEFT_ALERT_EMAIL` holding the address that should get them; if you
+  don't, set `alerts_enabled` to `false` in
+  `deploy/terraform/gcp/variables.tf`. Then run the workflow again.
 - **The install workflow stops in "create the cloud"**: Terraform's output
   in that step names the resource it could not make and why. If it names a quota (Compute Engine addresses or CPUs, say), raise
   it in the Google Cloud console and run the workflow again.

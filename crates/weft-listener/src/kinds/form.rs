@@ -163,6 +163,7 @@ mod tests {
                 auth_config: Value::Null,
             },
             serving: Default::default(),
+            gave_up: None,
         }
     }
 

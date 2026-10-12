@@ -105,6 +105,9 @@ pub struct EngineClients {
     /// What the process's line to the broker pushes, which is how a worker
     /// hears that a run it drives is asked to stop.
     pub line: Arc<dyn WorkerLine>,
+    /// What the line says about the answers of the runs a worker drives,
+    /// as its line watch passes it on to their drives (`crate::worker`).
+    pub told: tokio::sync::broadcast::Sender<RunTold>,
     /// What the worker's door asks the broker (`crate::door`).
     pub door_broker: Arc<dyn crate::door::DoorBroker>,
     /// What the worker holds for its runs to share (`weft_core::shared`).
@@ -142,9 +145,16 @@ pub trait WorkerLine: Send + Sync {
     fn subscribe(&self) -> weft_task_store::pg_signal::Subscription;
     fn stay_open(&self) -> Box<dyn Send + Sync>;
     fn cut_at(&self) -> tokio::sync::watch::Receiver<Option<weft_broker_client::line::Cut>>;
+    /// Replace the open line, missing nothing and telling nobody to look
+    /// again (`weft_broker_client::BrokerLink::replace`).
+    fn replace(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>>;
 }
 
 impl WorkerLine for weft_broker_client::BrokerLink {
+    fn replace(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(weft_broker_client::BrokerLink::replace(self))
+    }
+
     fn subscribe(&self) -> weft_task_store::pg_signal::Subscription {
         weft_broker_client::BrokerLink::subscribe(self)
     }
@@ -166,17 +176,38 @@ pub(crate) struct TestLine {
     /// How many holds are taken right now.
     pub held: Arc<std::sync::atomic::AtomicUsize>,
     pub cut: tokio::sync::watch::Sender<Option<weft_broker_client::line::Cut>>,
+    /// How many times the line was replaced, each a new line opened now
+    /// and cut as the last one was; none while `refuses` is set.
+    pub replaced: std::sync::atomic::AtomicUsize,
+    pub refuses: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 impl TestLine {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self { pushed: tokio::sync::broadcast::channel(64).0, held: Arc::default(), cut: tokio::sync::watch::channel(None).0 })
+        Arc::new(Self {
+            pushed: tokio::sync::broadcast::channel(64).0,
+            held: Arc::default(),
+            cut: tokio::sync::watch::channel(None).0,
+            replaced: Default::default(),
+            refuses: Default::default(),
+        })
     }
 }
 
 #[cfg(test)]
 impl WorkerLine for TestLine {
+    fn replace(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        use std::sync::atomic::Ordering;
+        Box::pin(async move {
+            anyhow::ensure!(!self.refuses.load(Ordering::SeqCst), "the broker is away");
+            let cut = (*self.cut.borrow()).expect("a line with a cut is replaced");
+            self.replaced.fetch_add(1, Ordering::SeqCst);
+            self.cut.send_replace(Some(weft_broker_client::line::Cut { opened: tokio::time::Instant::now(), ..cut }));
+            Ok(())
+        })
+    }
+
     fn subscribe(&self) -> weft_task_store::pg_signal::Subscription {
         self.pushed.subscribe().into()
     }
@@ -237,6 +268,7 @@ impl EngineClients {
             steering: crate::record_first::RecordFirst::new(steering, writer.clone()),
             open_charges: crate::metering::OpenCharges::new(),
             line: Arc::new(link.clone()),
+            told: run_told(),
             door_broker: crate::door::HeldDoorBroker::new(
                 weft_broker_client::BrokerDoorClient::new(link.clone()),
                 Arc::new(link.clone()),
@@ -268,6 +300,23 @@ pub(crate) fn io_runtime() -> anyhow::Result<tokio::runtime::Handle> {
     Ok(io.insert(handle).clone())
 }
 
+/// What a worker's line says about the answers of the runs it drives, as
+/// each waiting run hears it.
+#[derive(Debug, Clone)]
+pub enum RunTold {
+    /// An answer was handed to this run: it reads its own.
+    Answered(ExecutionId),
+    /// The line may have missed some, and the one read for every run the
+    /// worker drives found these answers: each run takes its own.
+    Rechecked(Arc<Vec<weft_broker_client::protocol::RunAnswerOf>>),
+}
+
+/// A channel for [`RunTold`], sized like the line's own notices: a run
+/// that falls behind it reads its answers again.
+pub fn run_told() -> tokio::sync::broadcast::Sender<RunTold> {
+    tokio::sync::broadcast::channel(1024).0
+}
+
 /// The runs a worker drives, as the broker holds them
 /// (`weft_broker_client::BrokerRunClient`); a trait so tests drive a
 /// worker against a fake.
@@ -282,12 +331,9 @@ pub trait RunClient: Send + Sync {
     /// The answers waiting for `execution_id`'s waits, but the waits in
     /// `taken`, read once.
     async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>;
-    /// What the broker pushes about the runs this worker drives: an answer
-    /// handed to one (`weft_broker_client::line::PARKED_FIRE_CHANNEL`,
-    /// naming the run), and a recheck when the line may have missed some.
-    fn told(&self) -> weft_task_store::pg_signal::Subscription;
-    /// The cancels waiting for the runs this worker drives.
-    async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>>;
+    /// The cancels and the answers waiting for every run this worker
+    /// drives, in one read.
+    async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse>;
 }
 
 #[async_trait]
@@ -301,11 +347,8 @@ impl RunClient for weft_broker_client::BrokerRunClient {
     async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
         weft_broker_client::BrokerRunClient::answers(self, execution_id, taken).await
     }
-    fn told(&self) -> weft_task_store::pg_signal::Subscription {
-        weft_broker_client::BrokerRunClient::told(self)
-    }
-    async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
-        weft_broker_client::BrokerRunClient::cancels(self).await
+    async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse> {
+        weft_broker_client::BrokerRunClient::rechecked(self).await
     }
 }
 
@@ -1312,6 +1355,10 @@ fn membership_event(execution_id: ExecutionId, bus_id: &str, entry: &BusEntry) -
 pub struct EmitMsg {
     /// The emitting firing's identity.
     pub loc: FiringLocation,
+    /// The emission's id, derived from its place
+    /// (`weft_core::exec::emission`): the pulse ids and the journal
+    /// rows carry it.
+    pub id: uuid::Uuid,
     pub kind: EmitKind,
     /// `Some` when this emission asked to wait for delivery
     /// (`yield_downstream`): the producer's task is parked on
@@ -1369,8 +1416,10 @@ pub enum NodeTaskOutcome {
     /// The step failed. `message` is what the run's failure reads;
     /// `catchable` is what the step's `error` output carries if the
     /// failure is caught (`weft_core::context::catchable_message`),
-    /// `None` for a failure that never is.
-    Failed { message: String, catchable: Option<String> },
+    /// `None` for a failure that never is. `gave_up_wait`: the step
+    /// failed on a wait it gave up (`WeftError::WaitGaveUp`), a time
+    /// limit its run's caller hears as one.
+    Failed { message: String, catchable: Option<String>, gave_up_wait: bool },
     /// The step ended skipped, for `reason`: what it waited on was
     /// skipped by a person (`WeftError::WaitSkipped`). Every output it
     /// did not emit closes, as for any skip.
@@ -1422,15 +1471,32 @@ pub async fn record_from_replica(journal: &dyn JournalClient, event: ExecEvent, 
     }
 }
 
+/// What a firing sent before it paused, per output port: the value it
+/// emitted there, or `None` for a port it closed.
+pub type SentBeforePause = HashMap<String, Option<Arc<Value>>>;
+
 /// What one firing has done to its output ports, under ONE lock (see
-/// the `port_claims` field doc): the ports it mentioned (emitted or
-/// closed) and the generator ports it explicitly ENDED (`close_port`,
-/// the early end-of-stream verb; a yield after the end is a
-/// node-author bug and errors loud).
+/// the `port_claims` field doc).
 #[derive(Default)]
 struct PortClaims {
+    /// The ports this run of the body mentioned (emitted or closed).
     mentioned: HashSet<String>,
+    /// The generator ports it explicitly ENDED (`close_port`, the early
+    /// end-of-stream verb; a yield after the end is a node-author bug
+    /// and errors loud).
     ended_streams: HashSet<String>,
+    /// What the firing sent before it paused: the ports its record
+    /// mentions (`NodeExecution::mentioned_ports`), each with the value
+    /// the run's fold holds for it (`None` for a close). The body
+    /// replays from the top on resume, and its emission on one of these
+    /// again sends nothing, the first value standing.
+    sent_before_pause: SentBeforePause,
+    /// How many emissions yielded on a stream output so far: the
+    /// number of the next one's id (`stream_emission`).
+    stream_items: u64,
+    /// The body returned (it ended, or paused on a wait): the firing
+    /// owns nothing done through this handle from here on.
+    body_returned: bool,
 }
 
 pub struct RunnerHandle {
@@ -1439,6 +1505,9 @@ pub struct RunnerHandle {
     /// How the run is kept (its `ExecutionStarted`'s settings): whether it
     /// can pause, and how long a wait it cannot pause on holds.
     settings: weft_core::run_settings::RunSettings,
+    /// The run runs no program (a node test's): no worker could pick it
+    /// back up, so it never pauses and every wait holds in its call.
+    without_program: bool,
     /// Whether this node exists once per instance: its infra is then the
     /// run instance's own copy, never the shared one.
     per_instance: Option<weft_core::instance::PerInstance>,
@@ -1508,11 +1577,18 @@ pub struct RunnerHandle {
     /// `&self` of the trait method; calls are serialized by the
     /// node body (single Future polling).
     awaited_sequence: Mutex<std::collections::VecDeque<weft_core::primitive::AwaitedEntry>>,
-    /// 0-based ordinal of the NEXT `await_signal` call within this
-    /// (node, frames) execution. Increments on every call. Combined
-    /// with the per-(node, frames) sequence above, it determines
-    /// whether the call replays or registers fresh.
-    next_call_index: AtomicU32,
+    /// 0-based ordinal of the NEXT `await_signal` or `ctx.run` call
+    /// within this (node, frames) execution. Increments on every call.
+    /// Combined with the per-(node, frames) sequence above, it
+    /// determines whether the call replays or registers fresh, and it
+    /// is the last part of a wait's identity (execution, node, frames,
+    /// call index), so two calls that share the rest must never share
+    /// it. A firing starts its own at 0, because one execution fires a
+    /// node once per frames; a live node test, which fires its node
+    /// once per `rig.run` under one execution and one node id, hands
+    /// every handle it mints the same one
+    /// ([`Self::with_call_numbering`]).
+    next_call_index: Arc<AtomicU32>,
     /// 0-based ordinal of the NEXT log line within this (node, frames):
     /// its place among its firing's lines (`ExecEvent::LogLine::seq`).
     /// Separate counter from `next_call_index` so log lines don't shift
@@ -1535,11 +1611,12 @@ pub struct RunnerHandle {
     /// a node-author bug (each port can be emitted AT MOST ONCE per
     /// firing) and errors loud. Multiple `pulse_downstream` calls on
     /// DISJOINT ports are fine: that's the "release early then
-    /// finalize" pattern (bus marker out, then `done` at the end).
-    /// `Generator[T]` ports are EXEMPT from the once-only claim (each
-    /// emission is one item of the stream) but still recorded here, so
-    /// the no-emission-before-a-durable-suspend guard covers yields
-    /// too. The once-only rule is not weakened by the exemption: it
+    /// finalize" pattern (bus marker out, then `done` at the end), and
+    /// it holds across a pause: a port sent before it replays as a
+    /// no-op. `Generator[T]` ports are EXEMPT from the once-only claim
+    /// (each emission is one item of the stream) but still recorded
+    /// here, so the no-wait-after-a-stream-started guard sees yields.
+    /// The once-only rule is not weakened by the exemption: it
     /// exists because a second pulse at one `(execution_id, frames)` key has
     /// no identity a waiting consumer could reconcile, and a generator
     /// consumer never reconciles: it fires once and pulls items in
@@ -1644,6 +1721,7 @@ impl RunnerHandle {
             project_id,
             execution_id,
             settings: weft_core::run_settings::RunSettings::default(),
+            without_program: false,
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
@@ -1662,7 +1740,7 @@ impl RunnerHandle {
             tenant_id,
             cancellation,
             awaited_sequence: Mutex::new(std::collections::VecDeque::new()),
-            next_call_index: AtomicU32::new(0),
+            next_call_index: Arc::new(AtomicU32::new(0)),
             next_side_effect_index: AtomicU32::new(0),
             entry_register_count: AtomicU32::new(0),
             emit_tx: None,
@@ -1783,6 +1861,25 @@ impl RunnerHandle {
         self
     }
 
+    /// The run this firing belongs to runs no program (a node test's).
+    #[cfg(any(test, feature = "node-tests"))]
+    pub fn without_program(mut self) -> Self {
+        self.without_program = true;
+        self
+    }
+
+    /// Number this handle's `await_signal` and `ctx.run` calls on
+    /// `numbering`, shared with the other handles of a live node test
+    /// (see `next_call_index`): each `rig.run` is a firing of the same
+    /// node under the same execution, so a second run's first wait
+    /// carries on from the first run's numbering instead of taking its
+    /// identity, and with it its answer.
+    #[cfg(feature = "node-tests")]
+    pub fn with_call_numbering(mut self, numbering: Arc<AtomicU32>) -> Self {
+        self.next_call_index = numbering;
+        self
+    }
+
     /// Whether this node exists once per instance (from its definition).
     pub fn with_per_instance(mut self, per_instance: Option<weft_core::instance::PerInstance>) -> Self {
         self.per_instance = per_instance;
@@ -1815,9 +1912,17 @@ impl RunnerHandle {
         self
     }
 
-    /// What the body emitted on its baked outputs this firing.
+    /// What the firing emitted on its baked outputs: in this run of the
+    /// body, and before it paused (the value downstream received, which
+    /// a replay never sends again).
     pub fn baked_emitted(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
-        self.baked_emitted.lock().expect("baked emissions poisoned").clone()
+        let mut baked = self.baked_emitted.lock().expect("baked emissions poisoned").clone();
+        for (port, value) in &self.lock_port_claims().sent_before_pause {
+            if let Some(value) = value.as_deref().filter(|_| self.baked_outputs.contains(port)) {
+                baked.insert(port.clone(), value.clone());
+            }
+        }
+        baked
     }
 
     /// `failure`, and when the firing used a connection an infra node's
@@ -1878,6 +1983,35 @@ impl RunnerHandle {
         self
     }
 
+    /// What the firing being resumed sent or closed before it paused:
+    /// the replayed body's emissions on those ports send nothing, and
+    /// the values stand for them (an infra setup bakes them).
+    pub fn with_sent_before_pause(self, sent: SentBeforePause) -> Self {
+        self.lock_port_claims().sent_before_pause = sent;
+        self
+    }
+
+    /// The body returned (ended or paused): from here on an emission, a
+    /// wait or a step through this handle (from a task the body spawned
+    /// with a clone of its ctx) is refused, because the firing it would
+    /// belong to is no longer running. Taken under the claims lock every
+    /// emission sends under, so an emission is either on the channel
+    /// before the firing's terminal or refused.
+    pub fn end_body(&self) {
+        self.lock_port_claims().body_returned = true;
+    }
+
+    /// The refusal for anything done through this handle after its body
+    /// returned (see [`Self::end_body`]).
+    fn outlived(&self, what: &str) -> WeftError {
+        WeftError::NodeExecution(format!(
+            "node '{}' {what} after its body returned or paused on a wait; a firing owns only \
+             what is done while its body runs, so a task spawned with a clone of ctx has to \
+             finish before the body returns or waits",
+            self.place
+        ))
+    }
+
     /// Reject any port name the node didn't declare in its metadata.
     /// Runs BEFORE the one-emission-per-port gate so a typo'd port is
     /// surfaced as the actual bug (undeclared) rather than as a misleading
@@ -1917,8 +2051,7 @@ impl RunnerHandle {
     /// in `ports` collides, NONE is recorded, so the caller sees a
     /// clean "this attempt failed" instead of a partial mention that
     /// would poison later legitimate emissions.
-    fn mention_or_err(&self, ports: &[String]) -> WeftResult<()> {
-        let mut claims = self.lock_port_claims();
+    fn claim(&self, claims: &mut PortClaims, ports: &[String]) -> WeftResult<()> {
         for port_name in ports {
             if claims.ended_streams.contains(port_name) {
                 return Err(WeftError::NodeExecution(format!(
@@ -1943,6 +2076,71 @@ impl RunnerHandle {
         Ok(())
     }
 
+    /// Claim what `kind` touches and send it to the loop driver, in ONE
+    /// hold of the claims lock: refused once the body returned (see
+    /// [`Self::end_body`]); a port the firing sent before it paused is
+    /// claimed for this run of the body and sends nothing (a replay);
+    /// the rest goes out under the id its place derives. Answers whether
+    /// anything was sent.
+    fn claim_and_send(&self, kind: EmitKind, delivery: Option<Arc<DeliveryGate>>) -> WeftResult<bool> {
+        let mut claims = self.lock_port_claims();
+        let kind = match kind {
+            EmitKind::Values(mut output) => {
+                let ports: Vec<String> = output.outputs.keys().cloned().collect();
+                if claims.body_returned {
+                    return Err(self.outlived(&format!("emitted on '{}'", ports.join("', '"))));
+                }
+                self.claim(&mut claims, &ports)?;
+                output.outputs.retain(|port, _| !claims.sent_before_pause.contains_key(port));
+                if output.outputs.is_empty() {
+                    return Ok(false);
+                }
+                if !self.baked_outputs.is_empty() {
+                    let mut baked = self.baked_emitted.lock().expect("baked emissions poisoned");
+                    for (port, value) in output.outputs.iter().filter(|(port, _)| self.baked_outputs.contains(*port)) {
+                        baked.insert(port.clone(), value.clone());
+                    }
+                }
+                EmitKind::Values(output)
+            }
+            EmitKind::Close { port } => {
+                if claims.body_returned {
+                    return Err(self.outlived(&format!("closed '{port}'")));
+                }
+                if self.is_generator_output(&port) {
+                    if !claims.ended_streams.insert(port.clone()) {
+                        return Err(WeftError::NodeExecution(format!(
+                            "node '{}' closed stream port '{}' twice; a stream ends once.",
+                            self.place, port
+                        )));
+                    }
+                    // Also recorded as a mention, so the no-wait-after-a-
+                    // stream-started guard sees the explicit end too.
+                    claims.mentioned.insert(port.clone());
+                } else {
+                    self.claim(&mut claims, std::slice::from_ref(&port))?;
+                }
+                if claims.sent_before_pause.contains_key(&port) {
+                    return Ok(false);
+                }
+                EmitKind::Close { port }
+            }
+        };
+        // One id per firing for its ordinary ports, one per item for a
+        // yield: what the fold re-derives from the row, and what a replay
+        // that sent a port again would land on.
+        let id = match &kind {
+            EmitKind::Values(output) if output.outputs.keys().any(|port| self.is_generator_output(port)) => {
+                let item = claims.stream_items;
+                claims.stream_items += 1;
+                weft_core::exec::emission::stream_emission(&self.node_id, &self.node_frames, item)
+            }
+            _ => weft_core::exec::emission::body_emission(&self.node_id, &self.node_frames),
+        };
+        self.send_emission(id, kind, delivery)?;
+        Ok(true)
+    }
+
     fn lock_port_claims(&self) -> std::sync::MutexGuard<'_, PortClaims> {
         self.port_claims
             .lock()
@@ -1960,6 +2158,9 @@ impl RunnerHandle {
 
     /// Why the run cannot pause right now, if it cannot.
     fn unsuspendable(&self) -> Option<crate::held_waits::Unsuspendable> {
+        if self.without_program {
+            return Some(crate::held_waits::Unsuspendable::NoProgram);
+        }
         crate::held_waits::unsuspendable(self.caller_connection.as_ref(), &self.bus_coordinator, self.settings)
     }
 
@@ -2045,6 +2246,7 @@ impl RunnerHandle {
     /// closed (loop dropped while the node task was still running).
     fn send_emission(
         &self,
+        id: uuid::Uuid,
         kind: EmitKind,
         delivery: Option<Arc<DeliveryGate>>,
     ) -> WeftResult<()> {
@@ -2063,6 +2265,7 @@ impl RunnerHandle {
             .clone();
         tx.send(TaskMsg::Emission(EmitMsg {
             loc: self.firing_location(),
+            id,
             kind,
             delivery,
             stream_caps,
@@ -2171,6 +2374,7 @@ pub async fn ship_node_failed(
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     error: &str,
+    gave_up_wait: bool,
 ) {
     record_from_replica(
         journal,
@@ -2179,6 +2383,7 @@ pub async fn ship_node_failed(
             node_id: node_id.to_string(),
             frames: frames.clone(),
             error: error.to_string(),
+            gave_up_wait,
             at_unix: now_unix(),
         },
         replica,
@@ -2288,16 +2493,20 @@ impl ContextHandle for RunnerHandle {
     /// times in a row; each call is replay-instant on resume.
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
         // A durable suspension replays the whole node body on resume.
-        // Emitting (`pulse_downstream`) before a durable await is
-        // unsound: the replay would re-run the body and re-emit the
-        // already-sent pulses (the journal doesn't memoize emissions
-        // the way it memoizes awaits/run), duplicating downstream
-        // work. A node that holds a live bus must NOT durably suspend
-        // anyway: it stays warm and uses bus.recv() instead.
-        if !self.lock_port_claims().mentioned.is_empty() {
-            return Err(WeftError::NodeExecution(
-                weft_core::context::emitted_then_await_signal_error(&self.place),
-            ));
+        // An ordinary port sent before the wait replays as a no-op (the
+        // firing's record remembers it, see `sent_before_pause`), but a
+        // stream's items went out live, one pulse each, so a wait after
+        // a yield or a stream's close is refused.
+        {
+            let claims = self.lock_port_claims();
+            if claims.body_returned {
+                return Err(self.outlived("waited"));
+            }
+            if claims.mentioned.iter().chain(claims.sent_before_pause.keys()).any(|port| self.is_generator_output(port)) {
+                return Err(WeftError::NodeExecution(
+                    weft_core::context::streamed_then_await_signal_error(&self.place),
+                ));
+            }
         }
         // A stream CONSUMER cannot durably suspend either: the resume
         // replays the body from the top, and the items its earlier
@@ -2375,6 +2584,9 @@ impl ContextHandle for RunnerHandle {
     /// body and fails loudly; an exhausted sequence is the fresh path,
     /// `None`, so the wrapper invokes the closure.
     async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
+        if self.lock_port_claims().body_returned {
+            return Err(self.outlived(&format!("ran step '{name}'")));
+        }
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
         let replayed = weft_core::primitive::replay_run(&mut self.lock_awaited_sequence(), name, call_index)?;
         Ok((call_index, replayed))
@@ -3200,17 +3412,10 @@ impl ContextHandle for RunnerHandle {
         }
 
         // The call is now known to proceed: claim every touched port
-        // (the one-emission-per-port rule).
-        self.mention_or_err(&ports)?;
-        if !self.baked_outputs.is_empty() {
-            let mut baked = self.baked_emitted.lock().expect("baked emissions poisoned");
-            for (port, value) in kept.outputs.iter().filter(|(port, _)| self.baked_outputs.contains(*port)) {
-                baked.insert(port.clone(), value.clone());
-            }
-        }
+        // (the one-emission-per-port rule) and send.
         if !wait_delivered {
             if !kept.outputs.is_empty() {
-                self.send_emission(EmitKind::Values(kept), None)?;
+                self.claim_and_send(EmitKind::Values(kept), None)?;
             }
             return Ok(());
         }
@@ -3226,7 +3431,11 @@ impl ContextHandle for RunnerHandle {
             )));
         }
         let gate = DeliveryGate::new();
-        self.send_emission(EmitKind::Values(kept), Some(gate.clone()))?;
+        // Everything it carries was sent before a pause (a replay): its
+        // delivery is that earlier emission's, already behind the body.
+        if !self.claim_and_send(EmitKind::Values(kept), Some(gate.clone()))? {
+            return Ok(());
+        }
         let liveness = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
         gate.wait_delivered(&liveness, self.firing_location()).await
     }
@@ -3268,25 +3477,7 @@ impl ContextHandle for RunnerHandle {
     async fn close_port(&self, port: &str) -> WeftResult<()> {
         let port = port.to_string();
         self.check_declared_outputs(std::slice::from_ref(&port))?;
-        if self.is_generator_output(&port) {
-            // One lock for the end-and-mention record (the same
-            // `port_claims` lock every emission check takes), so the
-            // claim is atomic and cannot order-invert against
-            // `mention_or_err`.
-            let mut claims = self.lock_port_claims();
-            if !claims.ended_streams.insert(port.clone()) {
-                return Err(WeftError::NodeExecution(format!(
-                    "node '{}' closed stream port '{}' twice; a stream ends once.",
-                    self.place, port
-                )));
-            }
-            // Also recorded as a mention so the no-emission-before-a-
-            // durable-suspend guard covers the explicit end too.
-            claims.mentioned.insert(port.clone());
-        } else {
-            self.mention_or_err(std::slice::from_ref(&port))?;
-        }
-        self.send_emission(EmitKind::Close { port }, None)
+        self.claim_and_send(EmitKind::Close { port }, None).map(|_| ())
     }
 
     fn create_bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)> {
@@ -3315,6 +3506,10 @@ impl ContextHandle for RunnerHandle {
 
     fn caller_connection(&self) -> Option<Arc<dyn weft_core::caller::CallerConnection>> {
         self.caller_connection.clone()
+    }
+
+    fn waits_here(&self) -> Option<(std::sync::Weak<dyn WaitLiveness>, FiringLocation)> {
+        Some((Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>, self.firing_location()))
     }
 }
 
@@ -3945,6 +4140,7 @@ mod replay_tests {
             uuid::Uuid::from_u128(0x108),
             execution_id,
             "OpensConnection".into(),
+            None,
         )
         .await
         .expect("the test's run is born");

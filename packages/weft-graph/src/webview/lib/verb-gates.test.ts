@@ -6,15 +6,17 @@
 // one that counts.
 
 import { describe, it, expect } from 'vitest';
-import { isVerbOffered, sourceInfraReady, transitional, type VerbInputs } from './verb-gates';
+import { isVerbOffered, resyncStopped, sourceInfraReady, transitional, type VerbInputs } from './verb-gates';
 
 function inputs(over: Partial<VerbInputs> = {}): VerbInputs {
 	return {
+		removing: false,
 		available: [],
 		hasInfra: false,
 		hasTriggers: false,
 		infraRollup: 'none',
 		status: 'registered',
+		transition: 'none',
 		infraBusy: false,
 		...over,
 	};
@@ -57,6 +59,22 @@ describe('a project in the middle of something', () => {
 		expect(isVerbOffered('cancel_activate', i)).toBe(true);
 	});
 
+	it('offers only what the table names while it resyncs', () => {
+		// Under way: the triggers read active, and a starter verb would only 409.
+		const going = inputs({ available: [], transition: 'resyncing', status: 'inactive', hasInfra: true, hasTriggers: true });
+		expect(transitional(going)).toBe(true);
+		expect(resyncStopped(going)).toBe(false);
+		expect(isVerbOffered('activate', going)).toBe(false);
+		expect(isVerbOffered('infra_start', going)).toBe(false);
+		// Stopped with triggers down: taken up again, or given up.
+		const stopped = inputs({ ...going, available: ['resync', 'cancel_activate'] });
+		expect(resyncStopped(stopped)).toBe(true);
+		expect(isVerbOffered('resync', stopped)).toBe(true);
+		expect(isVerbOffered('cancel_activate', stopped)).toBe(true);
+		expect(isVerbOffered('activate', stopped)).toBe(false);
+		expect(isVerbOffered('run', stopped)).toBe(false);
+	});
+
 	it('offers no starter verb while it drains', () => {
 		const i = inputs({ available: ['cancel_running'], status: 'deactivating', hasTriggers: true });
 		expect(isVerbOffered('run', i)).toBe(false);
@@ -79,6 +97,15 @@ describe('a project in the middle of something', () => {
 			expect(transitional(i)).toBe(true);
 			expect(isVerbOffered('infra_start', i)).toBe(false);
 		}
+	});
+});
+
+describe('a project `weft rm` stopped partway through removing', () => {
+	it('offers no verb at all, the starter ones included', () => {
+		const i = inputs({ removing: true, hasInfra: true, hasTriggers: true, infraRollup: 'stopped' });
+		expect(isVerbOffered('run', i)).toBe(false);
+		expect(isVerbOffered('activate', i)).toBe(false);
+		expect(isVerbOffered('infra_start', i)).toBe(false);
 	});
 });
 

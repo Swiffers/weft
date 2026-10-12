@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsAlign",
   "label": "Align Transcript",
-  "description": "Line up a known transcript with its audio: each word gets its start and end time in seconds (for subtitles, karaoke, or editing by word).",
+  "description": "Line up a known transcript with its audio: each word and each character gets its start and end time in seconds, in a JSON file (for subtitles, karaoke, or editing by word).",
   "tags": [
     "ai",
     "audio",
@@ -28,19 +28,19 @@
       "type": "String",
       "widget": { "kind": "textarea" },
       "required": true,
-      "description": "The text actually spoken in the recording."
+      "description": "The text actually spoken in the recording, in any format. ElevenLabs does not tell speakers apart."
     }
   ],
   "outputs": [
     {
-      "name": "words",
-      "type": "List[JsonDict]",
-      "description": "Each word: text, start, end (seconds)."
+      "name": "alignment",
+      "type": "Blob",
+      "description": "A JSON file holding the timings: `words`, each word of the transcript with its `start` and `end` in seconds and its `loss` (ElevenLabs's average alignment loss over the word's characters); `characters`, each character with its `start` and `end` in seconds; and `loss`, the same number as the `loss` output. It is a file because the timings of a long recording are more than a wire can carry."
     },
     {
       "name": "loss",
       "type": "Number",
-      "description": "How well the transcript matched the audio (lower is better)."
+      "description": "ElevenLabs's average alignment loss over every character of the transcript."
     }
   ],
   "features": {

@@ -38,6 +38,8 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+# Paused time for the waits a holder and a down signal sleep through.
+tokio = { workspace = true, features = ["full", "test-util"] }
 # The provider_events contract tests hold a real in-process websocket
 # gateway + fake broker; the stress harness needs weft-core's
 # test-support macro + futures' catch_unwind.

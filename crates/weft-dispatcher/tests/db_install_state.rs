@@ -185,14 +185,15 @@ async fn a_refused_add_of_a_stored_domain_keeps_it(pool: PgPool) {
 
 /// The loop that keeps the door on the stored domains asks the platform
 /// nothing while the door serves exactly them, retries a refusal later
-/// each time while recording why, and clears the refusal once accepted.
+/// each time while recording why, stops at the third refusal in a row,
+/// and clears the refusal once accepted.
 #[sqlx::test]
 async fn the_door_follows_the_stored_domains_and_backs_off_a_refusal(pool: PgPool) {
     use weft_dispatcher::domains::{add, door_state, settle};
     use weft_task_store::drain::DrainStep;
     project(&pool).await;
     add(&pool, &Domain { name: "a.example.com".into(), serves: DomainServes::Install }, 1).await.unwrap();
-    let door = ScriptedDoor::new(&[false, true, true, false]);
+    let door = ScriptedDoor::new(&[false, true, true, true, false]);
     assert_eq!(settle(&pool, &door).await.unwrap(), DrainStep::Done);
     assert_eq!(settle(&pool, &door).await.unwrap(), DrainStep::Done, "nothing new: the platform is not asked");
     assert_eq!(door.asked().len(), 1);
@@ -205,7 +206,11 @@ async fn the_door_follows_the_stored_domains_and_backs_off_a_refusal(pool: PgPoo
     assert_eq!(refused.refusals, 2);
     assert!(refused.refused.is_some_and(|why| why.contains("refused")), "the reason is kept for `weft domain list`");
     assert_eq!(refused.served.map(|(names, _)| names), Some(vec!["a.example.com".to_string()]), "what the door last accepted stays");
+    assert_eq!(settle(&pool, &door).await.unwrap(), DrainStep::Done, "the third refusal in a row stops the tries");
+    assert_eq!(door_state(&pool).await.unwrap().refusals, 3);
 
+    // `weft domain add` of a stored domain, or a change of the domains,
+    // tries again.
     assert_eq!(settle(&pool, &door).await.unwrap(), DrainStep::Done);
     let accepted = door_state(&pool).await.unwrap();
     assert_eq!((accepted.refused, accepted.refusals), (None, 0));

@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::exec::emission::{boundary_emission, PulseEmission};
 use crate::exec::execution::{
-    next_firing_ordinal, NodeExecution, NodeExecutionStatus, NodeExecutionTable,
+    NodeExecution, NodeExecutionStatus, NodeExecutionTable,
 };
 use crate::exec::postprocess::{
     close_failed_then_unmentioned_downstream, close_unmentioned_downstream, emit_port_closure,
@@ -360,7 +360,7 @@ pub fn fire_ready_passthroughs(
             return fired;
         }
         // Deterministic order, so the live engine and the fold create
-        // records (and their ordinals) in the same sequence.
+        // records in the same sequence.
         ready.sort_by(|(a, ga), (b, gb)| a.id.cmp(&b.id).then(frames_key(&ga.frames).cmp(&frames_key(&gb.frames))));
         for (def, group) in ready {
             fired.push(dispatch_passthrough(
@@ -421,8 +421,7 @@ fn dispatch_passthrough(
         };
     }
 
-    let ordinal = next_firing_ordinal(executions, &node_id, execution_id, &frames);
-    let emission_id = boundary_emission(&node_id, &frames, ordinal);
+    let emission_id = boundary_emission(&node_id, &frames);
     let record_id = Uuid::new_v4();
     executions.entry(node_id.clone()).or_default().push(NodeExecution {
         id: record_id,
@@ -431,8 +430,8 @@ fn dispatch_passthrough(
         node_id: node_id.clone(),
         status: NodeExecutionStatus::Running,
         pulses_absorbed: absorbed.clone(),
-        ordinal,
         error: group.error.clone(),
+        gave_up_wait: false,
         callback_id: None,
         started_at: now,
         completed_at: None,
@@ -463,21 +462,11 @@ fn dispatch_passthrough(
         NodeExecutionStatus::Skipped
     } else if let Some(err) = &group.error {
         // A pre-dispatch failure (a port refused its value): nothing
-        // was forwarded, so every output closes.
+        // was forwarded.
         let failure = Failure::at(project, &node_id, &frames, err.as_str());
-        sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, program_idx, pulses, &mut emissions, &failure);
-        // And the scope never starts, which the INSIDE has to be told
-        // as well. Closing only the In boundary's own outputs left
-        // every scope root (a member no wire feeds) never started,
-        // never skipped and never closed, so anything the Out boundary
-        // fed from that branch waited for a value that was never
-        // coming and the run ended Stuck. This is the same teardown the
-        // gated-off path does; only the reason differs.
-        if let Some(group_id) = &in_scope {
-            emissions.extend(tear_down_scope(
-                project, program_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
-            ));
-        }
+        emissions.extend(fail_boundary(
+            &node_id, in_scope.as_deref(), emission_id, execution_id, &frames, project, program_idx, pulses, kicked, &failure,
+        ));
         NodeExecutionStatus::Failed
     } else {
         // The scope's gate is consumed here, never forwarded: the In
@@ -522,19 +511,14 @@ fn dispatch_passthrough(
             }
             Err(e) => {
                 // A forward that failed on the way out (a wire's path
-                // cannot read the value, a single-shot port emitted
-                // twice): the same failure as a refused port, so the
-                // same aftermath. The scope never starts and has to be
-                // told, or its roots wait for ever and the run ends
-                // Stuck (the pre-dispatch branch above says why).
+                // cannot read the value): the same failure as a refused
+                // port, so the same aftermath.
                 let err = e.to_string();
                 let failure = Failure::at(project, &node_id, &frames, err.as_str());
-                sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, program_idx, pulses, &mut emissions, &failure);
-                if let Some(group_id) = &in_scope {
-                    emissions.extend(tear_down_scope(
-                        project, program_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
-                    ));
-                }
+                emissions.extend(fail_boundary(
+                    &node_id, in_scope.as_deref(), emission_id, execution_id, &frames, project, program_idx, pulses, kicked,
+                    &failure,
+                ));
                 error = Some(err);
                 NodeExecutionStatus::Failed
             }
@@ -575,21 +559,39 @@ fn dispatch_passthrough(
     }
 }
 
-/// Close every output of a boundary that forwarded nothing.
+/// The aftermath of a boundary that failed and forwarded nothing.
+///
+/// An In boundary's outputs lead into its scope, and the scope never
+/// starts: the teardown a gated-off scope gets (`tear_down_scope`)
+/// tells every member, each kicked into one skip, and closes the
+/// scope's outward surface with the failure. Nothing more goes inside:
+/// a closure on the In boundary's own outputs as well told the members
+/// twice, and a member fed both by the In boundary and by another
+/// member (which, skipped by its scope, sends nothing) was left with
+/// that closure pending for ever, so the run could never end.
+///
+/// Any other boundary (an Out) closes every output with the failure.
 #[allow(clippy::too_many_arguments)]
-fn sweep_all_outputs(
+fn fail_boundary(
     node_id: &str,
+    in_scope: Option<&str>,
     emission_id: Uuid,
     execution_id: ExecutionId,
     frames: &LoopFrames,
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
-    emissions: &mut Vec<PulseEmission>,
+    kicked: &mut HashMap<FiringLocation, KickedNode>,
     failure: &Failure,
-) {
+) -> Vec<PulseEmission> {
+    if let Some(group_id) = in_scope {
+        return tear_down_scope(
+            project, program_idx, pulses, kicked, emission_id, execution_id, group_id, frames, None, Some(failure),
+        );
+    }
+    let mut emissions = Vec::new();
     if let Err(e) = close_unmentioned_downstream(
-        node_id, &HashSet::new(), emission_id, execution_id, frames, project, pulses, program_idx, emissions,
+        node_id, &HashSet::new(), emission_id, execution_id, frames, project, pulses, program_idx, &mut emissions,
         Some(failure), &HashSet::new(),
     ) {
         tracing::error!(
@@ -600,6 +602,7 @@ fn sweep_all_outputs(
              neither fire nor skip"
         );
     }
+    emissions
 }
 
 /// A scope whose In boundary skipped with `reason` (a group's
@@ -812,20 +815,11 @@ pub fn kick_scope(
     skipped_by: Option<&str>,
 ) {
     for root in roots {
-        // First writer wins, and nothing ever removes a kick.
-        //
-        // That means a location kicked once cannot be kicked again, so a
-        // scope that fires TWICE at one location (a group fed twice at
-        // the same frames) does not re-kick the body roots it kicked the
-        // first time. That is a real limitation of this table, it
-        // predates the teardown below, and it is NOT worked around here:
-        // an earlier attempt keyed "this kick is spent" off the
-        // `dispatched` flag, which the engine sets when it schedules and
-        // the fold sets when it applies `NodeStarted`. Those are
-        // different moments, so live and replay disagreed about whether
-        // a slot was spent, and a replacement also wiped a firing
-        // trigger's wake payload and port snapshot. Both are worse than
-        // the limitation. See the note in `tear_down_scope`.
+        // First writer wins, and nothing ever removes a kick: a scope
+        // fires once per location, so its roots there are kicked once.
+        // A second write at a kicked location only marks it skipped
+        // (`skipped_by`) and keeps the rest (a firing trigger's wake
+        // payload and port snapshot).
         kicked
             .entry(FiringLocation::new(root.clone(), frames.clone()))
             .and_modify(|kick| {
@@ -1296,8 +1290,8 @@ mod tests {
         assert_eq!(scope_permission(&project, &program_idx, member, &frames, &executions), ScopePermission::Pending, "the body has not started");
         executions.entry("B__in".into()).or_default().push(NodeExecution {
             id: Uuid::new_v4(), received: Default::default(), skip_reason: None, node_id: "B__in".into(),
-            status: NodeExecutionStatus::Completed, pulses_absorbed: vec![], ordinal: 0, error: None,
-            callback_id: None, started_at: 0, completed_at: Some(1), cost_usd: 0.0, logs: vec![],
+            status: NodeExecutionStatus::Completed, pulses_absorbed: vec![], error: None,
+            gave_up_wait: false, callback_id: None, started_at: 0, completed_at: Some(1), cost_usd: 0.0, logs: vec![],
             mentioned_ports: Default::default(), closed_output_ports: Default::default(),
             execution_id: Uuid::nil(), frames: vec![outer, call], inherited_from: None,
         });
@@ -1341,42 +1335,18 @@ mod tests {
     }
 
 
-    /// A group fed twice at one location fires twice: the second
-    /// firing's record has the next ordinal and its pulses new ids.
-    #[test]
-    fn a_second_firing_at_one_location_gets_the_next_ordinal_and_new_ids() {
-        let project = grouped_project();
-        let program_idx = ProgramIndex::build(&project);
-        let mut pulses = PulseTable::default();
-        let mut executions = NodeExecutionTable::default();
-        let mut kicked = HashMap::new();
-        emit_src(&project, &program_idx, &mut pulses, true);
-        fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
-        let first: Vec<Uuid> = pulses["inner"].iter().map(|p| p.id).collect();
-        // `inner` takes the first delivery, then `src` fires again.
-        for p in pulses.get_mut("inner").unwrap().iter_mut() {
-            p.absorb();
-        }
-        emit_src(&project, &program_idx, &mut pulses, true);
-        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
-        assert_eq!(fired.len(), 1);
-        let records = &executions["g__in"];
-        assert_eq!(records.iter().map(|e| e.ordinal).collect::<Vec<_>>(), vec![0, 1]);
-        let second: Vec<Uuid> = pending(&pulses, "inner").iter().map(|p| p.id).collect();
-        assert_eq!(second.len(), 1);
-        assert!(!first.contains(&second[0]), "a second firing's pulse is a new pulse");
-    }
-
     /// A value a boundary's port refuses fails the boundary before it
-    /// forwards: every output closes, the record is Failed with the
-    /// reason, and the scope is torn down.
+    /// forwards: the record is Failed with the reason, and the scope is
+    /// torn down.
     ///
     /// Torn down, not merely left alone: the scope never starts, so its
-    /// outward ports close and every member is told. Leaving the inside
-    /// untouched stranded every member no closure reaches, and anything
-    /// the Out boundary fed from that branch waited forever.
+    /// outward ports close and every member is told, once, by a kick
+    /// into a skip. Leaving the inside untouched stranded every member,
+    /// and anything the Out boundary fed from that branch waited
+    /// forever; a closure on the boundary's own outputs as well told a
+    /// wire-fed member twice and stranded it when it had a second input.
     #[test]
-    fn a_refused_value_fails_the_boundary_and_closes_every_output() {
+    fn a_refused_value_fails_the_boundary_and_tears_down_its_scope() {
         let project = grouped_project();
         let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
@@ -1392,9 +1362,7 @@ mod tests {
         assert_eq!(*status, NodeExecutionStatus::Failed);
         assert!(error.as_deref().is_some_and(|e| e.contains("'x'")), "{error:?}");
         assert!(output.is_none());
-        let inner = pending(&pulses, "inner");
-        assert_eq!(inner.len(), 1);
-        assert!(inner[0].closed, "the refused port closes downstream");
+        assert!(pending(&pulses, "inner").is_empty(), "nothing goes inside a scope that never starts");
         // Every member, the same as a scope that was gated off: a
         // scope-skip emits no closures, so a member nobody kicks is a
         // member nothing will ever settle. `lonely` (no wire into it)
@@ -1405,13 +1373,16 @@ mod tests {
                 "a failed scope tells {member} instead of stranding it: {kicked:?}"
             );
         }
+        let outward = pending(&pulses, "sink");
+        assert_eq!(outward.len(), 1);
+        assert!(outward[0].closed && outward[0].failure.is_some(), "the scope's outside hears the failure: {:?}", outward[0]);
         assert_eq!(executions["g__in"][0].error, *error);
     }
 
     /// The same aftermath when the boundary fails on the way OUT: a wire
     /// leaving it reads a key off the value that is not there. Nothing
-    /// was forwarded, every output closes with the error, and the scope
-    /// is told, so its members are never stranded.
+    /// was forwarded, and the scope is told, so its members are never
+    /// stranded.
     #[test]
     fn a_boundary_that_cannot_forward_fails_and_tells_its_scope() {
         let mut project = grouped_project();
@@ -1430,9 +1401,10 @@ mod tests {
         assert_eq!(*status, NodeExecutionStatus::Failed);
         assert!(error.as_deref().is_some_and(|e| e.contains("cannot read")), "{error:?}");
         assert!(output.is_none());
-        let inner = pending(&pulses, "inner");
-        assert_eq!(inner.len(), 1);
-        assert!(inner[0].closed && inner[0].failure.is_some(), "closed with the failure: {:?}", inner[0]);
+        assert!(pending(&pulses, "inner").is_empty(), "nothing goes inside a scope that never starts");
+        let outward = pending(&pulses, "sink");
+        assert_eq!(outward.len(), 1);
+        assert!(outward[0].closed && outward[0].failure.is_some(), "closed with the failure: {:?}", outward[0]);
         for member in ["lonely", "inner"] {
             assert!(kicked.keys().any(|loc| loc.node_id == member), "the failed forward tells {member}: {kicked:?}");
         }

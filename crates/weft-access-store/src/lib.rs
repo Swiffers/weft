@@ -26,7 +26,7 @@ pub use crypt::{open_json, open_str, seal_json, seal_str};
 pub use flows::{
     begin_oauth, begin_picker, own_connection_gate, change_instance_values, complete_oauth, connection_handle, connect_direct, delete_grant,
     delete_published_grants, finish_picker, forget_instance_grants, forget_project_access, list_grants, load_picker,
-    instance_connection_counts, instance_value_counts, instance_values, publish_grant, published_connection, sweep_expired_connects,
+    instance_connection_counts, instance_value_counts, instance_values, publish_grant, published_connection,
     ConnectionValue, InstanceValueWrite,
     take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
     PublishAccess, write_pushed_values,
@@ -97,6 +97,24 @@ pub(crate) async fn read_answer(resp: reqwest::Response, shown: &str) -> anyhow:
         .text()
         .await
         .map_err(|e| AccessError::Unreached(format!("the answer from {shown} did not arrive: {}", e.without_url())))?)
+}
+
+/// The store's error for a provider's refusal of `kind` (read off its
+/// answer with [`RefusalKind::of_answer`]): one saying it could not answer
+/// now (busy, slow or down) is [`AccessError::Unreached`], tried again,
+/// never a reconnect; any other is what `refused` makes of it, since only
+/// the caller knows whether the credential or the request was refused.
+///
+/// [`RefusalKind::of_answer`]: weft_core::access::client::RefusalKind::of_answer
+pub(crate) fn refusal(
+    kind: weft_core::access::client::RefusalKind,
+    why: String,
+    refused: impl FnOnce(String) -> AccessError,
+) -> AccessError {
+    match kind {
+        weft_core::access::client::RefusalKind::Temporary => AccessError::Unreached(why),
+        weft_core::access::client::RefusalKind::Auth | weft_core::access::client::RefusalKind::Other => refused(why),
+    }
 }
 
 /// [`read_answer`] as JSON: an empty or unparsable one is `Null` (the
@@ -214,6 +232,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            -- How many times the connection was made again over this row
+            -- (a reconnect or a rotate, `flows.rs`): what tells a signal
+            -- acting as it that its credentials changed. A token refresh,
+            -- a scope widened or a label renamed leaves it as it is.
+            reconnects BIGINT NOT NULL DEFAULT 0,
             CONSTRAINT access_grant_instance_has_project
                 CHECK (instance_id IS NULL OR project_id IS NOT NULL)
         );

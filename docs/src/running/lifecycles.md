@@ -82,6 +82,44 @@ trigger that looks live and is dead.
 Project status moves `registered` → `activating` → `active` →
 `deactivating` → `inactive`.
 
+If you cancel an activate with `weft cancel-activate` and its triggers kept
+work from before (events waiting on them, or runs of theirs waiting), they end
+up parked with that work, which waits for their next activate. Otherwise they
+are wiped. If the weft process carrying out an activate dies at a point where
+no setup run of it is going, weft ends the activate the same way by itself,
+about a minute later.
+
+A resync takes down only the triggers that were on when it began, and brings
+back exactly those. It writes down that plan before it takes any trigger
+down, and carries it out in the background, so it goes on whatever happens
+to your request or to the weft process doing it: if that process dies, the
+next one to take the work up carries on where it was. The request only
+follows it and answers when it ends. Until it ends, it holds the project: no
+other activation of its triggers starts, a build you start is refused with
+`cannot build now`, and a build that was already compiling finishes but is
+not registered (`this build was not registered: the project is
+resyncing; ...`).
+
+If a step fails, the resync tries again 5 seconds later, then 20 seconds
+after that. At its third failure in one go, whichever steps failed, it
+stops with the triggers it has not brought back still down, and says why: in the answer to `weft resync`, under
+`waiting on weft:` in `weft status`, and as "Resync stopped" on the editor's
+action bar. If it stopped because the infra those triggers read was not
+running, or because an activation of them was still landing, it goes on by
+itself once that infra runs or that activation has landed. Otherwise, once
+you have fixed the cause, `weft resync --resume` (or the bar's Resync
+button) takes it up again where it stopped, with the mode and the build it
+began with. A plain `weft resync` is refused while a resync holds the
+project. If you would rather give it up, `weft cancel-activate` with no
+`--trigger` or `--instance` (or the bar's Give up button) ends it and prints
+the triggers it had not brought back yet. Those stay down until you run
+`weft activate`. Meanwhile `weft status` lists the ones still down under
+`waiting on weft:`, for example `a given-up resync left these triggers down:
+the program's triggers (feed, door)`, and the line goes once they are on
+again or the next resync begins.
+The resync covers every trigger of every owner, so while it holds the
+project, `weft cancel-activate --trigger` or `--instance` is refused.
+
 ### One trigger at a time
 
 Each trigger is turned on separately, so `weft activate --trigger inbound`
@@ -157,8 +195,19 @@ nothing new is sent to that worker, and once its last execution lands the
 worker finishes writing down what it owes (a metered call's cost) and leaves on
 its own, which takes a second or two; the cap covers both.
 
-Reactivating a project that kept state asks you again: drain the parked work
-and keep the suspensions, keep the suspensions only, or wipe everything.
+If you switch parked or hibernated triggers back on with `weft activate`, it
+asks what to do with the work they kept: run the events that arrived meanwhile
+(answers people sent to waiting runs included) and keep the waiting runs
+waiting, drop those events but keep the runs waiting, or drop everything and
+cancel the runs those triggers started (`--reactivate-choice
+execute_parked_keep_suspended`, `keep_suspended_only` or `wipe_all`; with no
+terminal or with `--json` you have to pass one). `weft activate` and the editor's Activate button are the only two that ask.
+Everything else that turns these triggers back on carries the kept work over
+without asking: the events run and the waiting runs keep waiting. That
+covers a resync, an infra upgrade, triggers coming back once their infra
+runs again, an `ActivateTriggers` node, connections being picked on the
+install, and the deploy workflow `weft ci add` writes (it passes
+`--reactivate-choice execute_parked_keep_suspended`).
 
 ### Infra has to be up first
 
@@ -186,7 +235,7 @@ Infrastructure that only a run touches does not hold activation back.
 | `waiting_for_input` | Parked on a person or a service. No worker is up and nothing is being spent |
 | `completed` | Finished |
 | `failed` | A step failed (a wait the run held past its `holdSecs` and its node did not handle counts as one), or the run could get no further |
-| `cancelled` | You or another run stopped it; its live caller hung up; it was a fast run and its worker went away; its worker was stopped while it could not pause (`recorded: false`, a caller still on the line with `outlivesCaller` off, or a bus between its nodes open); it reached the hour a cloud install allows one stretch of a run; or the runtime stopped it (a newer build replaced its image) |
+| `cancelled` | You or another run stopped it; its live caller hung up; it was a fast run and its worker went away; its worker was stopped while it could not pause (`recorded: false`, a caller still on the line with `outlivesCaller` off, or a bus between its nodes open); it reached the hour a cloud install allows one stretch of a run; its caller's session reached the route's or socket's `maxSessionSecs`; or the runtime stopped it (a newer build replaced its image, or a queued run was refused three times, which names who said the last no: `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>`, or `its project's worker settings kept it from any worker 3 times: <error>`) |
 
 `weft executions --status running` lists both the ones working and the ones
 waiting, and the status column tells them apart.

@@ -10,15 +10,20 @@
 //!     verbs: apply / stop / terminate) serializes via the EXCLUSIVE
 //!     `infra_owner` lease (`owns_project_predicate`): a supervisor runs
 //!     a project's command, and writes its `infra_node` state, only
-//!     while it owns the project. The supervisor uses NO per-command
-//!     claim lease (it would be redundant with exclusive ownership and
-//!     its 300s expiry would wrongly let a sibling re-run a long command
-//!     mid-flight). This is the supervisor's single-actor authority.
+//!     while it owns the project. This is the supervisor's single-actor
+//!     authority. Its claim also writes `claimed_by_replica` on the row,
+//!     with no expiry of its own: it says the command is under way (so a
+//!     cancel flags it instead of completing it, and a second pass skips
+//!     it), and it holds only while the claimer holds the project's lease
+//!     (`supervisor_claimable`), so a command whose runner died goes to
+//!     the next owner with the lease, never on a clock that could hand a
+//!     long command to a sibling mid-flight.
 //!
 //! The claim SQL is not 100% shared: each caller's RETURNING column list
 //! and its serialization predicate differ. The CLAIM_LEASE_TTL constant
 //! and `claimable_predicate` belong to the dispatcher path;
-//! `owns_project_predicate` belongs to the supervisor path.
+//! `owns_project_predicate` and `supervisor_claimable` belong to the
+//! supervisor path.
 
 use std::time::Duration;
 
@@ -97,7 +102,8 @@ pub fn claimable_predicate() -> String {
 ///
 /// Unlike the dispatcher's `claimed_by_replica` claim lease (which serializes
 /// the dispatcher's own verbs and is the right tool there), the
-/// supervisor needs no per-command claim lease at all: `infra_owner` is
+/// supervisor needs no per-command claim lease of its own (its claim
+/// mark holds only as long as this lease, `supervisor_claimable`): `infra_owner` is
 /// exclusive (one process per project) and continuously renewed on each
 /// ownership tick, and the owner runs one project's commands in order,
 /// so two supervisors can never change one project's infrastructure. The
@@ -117,6 +123,25 @@ pub fn claimable_predicate() -> String {
 // SYNC: supervisor replica (the infra_owner lease key compared here) <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.replica), crates/weft-infra-supervisor/src/lib.rs (SupervisorState.replica)
 pub fn owns_project_predicate(replica_param: &str, project_col: &str) -> String {
     live_lease_exists(Some(replica_param), project_col)
+}
+
+/// SQL condition that is true iff the supervisor command aliased
+/// `command_alias` is one the supervisor bound at `replica_param` may
+/// take: nobody claimed it; it claimed it itself and does not run it any
+/// more (not among the ids bound at `busy_param`: its run stopped when
+/// ownership moved, and the lease came back); or whoever claimed it no
+/// longer holds the project's lease (it died, or lost the project
+/// mid-command), whose work the new owner runs again from the start.
+/// A dispatcher's claim on a take-down it drained counts as the last
+/// case: a dispatcher holds no project's lease.
+pub fn supervisor_claimable(command_alias: &str, replica_param: &str, busy_param: &str) -> String {
+    format!(
+        "({c}.claimed_by_replica IS NULL \
+          OR ({c}.claimed_by_replica = {replica_param} AND NOT {c}.id = ANY({busy_param})) \
+          OR NOT {held})",
+        c = command_alias,
+        held = owns_project_predicate(&format!("{command_alias}.claimed_by_replica"), &format!("{command_alias}.project_id")),
+    )
 }
 
 /// SQL `EXISTS (...)` fragment that is true iff a LIVE `infra_owner`
@@ -270,15 +295,18 @@ pub fn commands_overlap(a: &str, b: &str) -> String {
     )
 }
 
-/// The channel an `infra_lifecycle_command` row notifies on, from the
-/// `infra_command_notify` trigger in the dispatcher's
-/// `infra_lifecycle_command::GROUP`: once when the command is issued,
-/// and once when it completes. The claimers wake on the first, and
-/// whoever waits on a command's outcome wakes on the second. The broker
-/// also announces here when a machine running a project's infra says
-/// how it stands changed (`look:<project_id>`), which wakes a supervisor
-/// that scales to zero to look at it.
-pub const INFRA_COMMAND_CHANNEL: &str = "weft_infra_command";
+/// The channel an `infra_lifecycle_command` row notifies on, and the
+/// payload asking the supervisor for a look: kept beside the code that
+/// asks (`weft_task_store::infra_command::ask_for_look`). The claimers
+/// wake on a command issued, whoever waits on a command's outcome on its
+/// completion.
+pub use weft_task_store::infra_command::{look_payload, INFRA_COMMAND_CHANNEL};
+
+/// The loop the broker books a supervisor's next pass under
+/// (`role_loop_due`, role `supervisor`), as it answers the supervisor's
+/// ownership sync. A supervisor that scales to zero runs one whole pass
+/// whatever a wake names.
+pub const SUPERVISOR_PASS_LOOP: &str = "pass";
 
 /// What an [`INFRA_COMMAND_CHANNEL`] notification says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,19 +318,27 @@ pub enum InfraCommandSignal<'a> {
     /// Something running this project's infra changed how it stands, so
     /// its health is looked at now (`look:<project_id>`).
     Look { project_id: &'a str },
+    /// A person asked to cancel this command (`cancel:<id>`), sent when
+    /// its `cancel_requested` flag is set. It wakes no claimer: only
+    /// whoever is running that command reacts to it.
+    Cancel { id: i64 },
 }
 
 impl<'a> InfraCommandSignal<'a> {
     /// Read a notification's payload; `None` for one this build does
     /// not know, which concerns nobody here.
     // SYNC: the payload shapes <-> the `infra_command_notify` function in
-    //       crates/weft-dispatcher/src/infra_lifecycle_command.rs (GROUP)
+    //       crates/weft-dispatcher/src/infra_lifecycle_command.rs (GROUP),
+    //       and weft_task_store::infra_command::look_payload
     pub fn parse(payload: &'a str) -> Option<Self> {
         if let Some(project_id) = payload.strip_prefix("issued:") {
             return Some(Self::Issued { project_id });
         }
         if let Some(project_id) = payload.strip_prefix("look:") {
             return Some(Self::Look { project_id });
+        }
+        if let Some(id) = payload.strip_prefix("cancel:") {
+            return id.parse().ok().map(|id| Self::Cancel { id });
         }
         payload.strip_prefix("done:")?.parse().ok().map(|id| Self::Done { id })
     }
@@ -327,10 +363,6 @@ pub const LOOK_WAKE: weft_task_store::drain::WakeOn = weft_task_store::drain::Wa
     concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Look { .. })),
 };
 
-/// The [`INFRA_COMMAND_CHANNEL`] payload asking for a look at `project`.
-pub fn look_payload(project: uuid::Uuid) -> String {
-    format!("look:{project}")
-}
 
 #[cfg(test)]
 mod verb_tests {
@@ -366,6 +398,17 @@ mod signal_tests {
             Some(InfraCommandSignal::Issued { project_id: "00000000-0000-0000-0000-000000000001" }),
         );
         assert_eq!(InfraCommandSignal::parse("done:42"), Some(InfraCommandSignal::Done { id: 42 }));
+    }
+
+    /// A cancel reads back, and wakes no claimer: only the held claim
+    /// running that command reacts to it.
+    #[test]
+    fn a_cancel_reads_back_and_wakes_no_claimer() {
+        assert_eq!(InfraCommandSignal::parse("cancel:7"), Some(InfraCommandSignal::Cancel { id: 7 }));
+        assert_eq!(InfraCommandSignal::parse("cancel:x"), None);
+        assert!(!(super::ISSUED_WAKE.concerns)("cancel:7"));
+        assert!(!(super::LOOK_WAKE.concerns)("cancel:7"));
+        assert!((super::ISSUED_WAKE.concerns)("issued:00000000-0000-0000-0000-000000000001"));
     }
 
     #[test]

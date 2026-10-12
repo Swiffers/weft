@@ -24,14 +24,13 @@ pub const PING_AFTER_IDLE: Duration = Duration::from_secs(5);
 const REACH_FOR: Duration = Duration::from_secs(60);
 
 /// How many connections the broker writes workers' batches of records on
-/// (its record pool): as many batches go at once per broker, and the
-/// search index waits while one broker has that many going, which is its
-/// pool full.
+/// (its record pool): as many batches go at once per broker.
 pub const RECORD_POOL_CONNECTIONS: u32 = 8;
 
 /// The name a broker's record pool connections carry
 /// (`application_name`), ahead of the broker's replica: one name per
-/// broker, so its batches are counted apart from other brokers'.
+/// broker, so its batches are told apart from other brokers' in the
+/// database's own view of its sessions.
 pub const RECORD_POOL_APPLICATION: &str = "weft-records";
 
 /// Whether a database error means the database could not be reached or

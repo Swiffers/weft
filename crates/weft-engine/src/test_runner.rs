@@ -43,6 +43,7 @@ enum Args {
     },
     /// Serve `POST /_weft/test` (one test per request, live included)
     /// and `GET /_weft/tests` as the install's test runner, until stopped.
+    // SYNC: Args::Serve <-> crates/weft-compiler/src/build.rs (test_server_dockerfile)
     Serve {
         #[arg(long, env = "WEFT_BROKER_URL")]
         broker_url: String,
@@ -53,6 +54,11 @@ enum Args {
         project_id: uuid::Uuid,
         #[arg(long, env = "PORT", default_value = "8080")]
         port: u16,
+        /// The platform's cap on one request, when it has one: a live
+        /// test runs inside one, and stops itself before it.
+        // SYNC: WEFT_RUN_CAP_SECS <-> crates/weft-compiler/src/codegen.rs (write_main_rs Args::run_cap_secs), crates/weft-platform-gcp/src/runner.rs (container)
+        #[arg(long, env = "WEFT_RUN_CAP_SECS")]
+        run_cap_secs: Option<u64>,
     },
     /// Run every basic/fake test in the registry.
     RunAll {
@@ -177,7 +183,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
             }
         }
 
-        Args::Serve { broker_url, tenant_id, project_id, port } => {
+        Args::Serve { broker_url, tenant_id, project_id, port, run_cap_secs } => {
             let identity = match crate::worker::identity_from_env() {
                 Ok(i) => i,
                 Err(e) => {
@@ -192,7 +198,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let live = LiveEnv { broker_url, tenant_id, project_id, identity };
+            let live = LiveEnv { broker_url, tenant_id, project_id, identity, run_cap: run_cap_secs.map(std::time::Duration::from_secs) };
             match serve(catalog, live, door, port).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -330,6 +336,8 @@ struct LiveEnv {
     tenant_id: String,
     project_id: uuid::Uuid,
     identity: std::sync::Arc<dyn weft_platform_traits::IdentityTokens>,
+    /// The platform's cap on one request (`Args::Serve::run_cap_secs`).
+    run_cap: Option<std::time::Duration>,
 }
 
 /// Run one test. `Err` is a request that could not run at all (no such
@@ -374,6 +382,7 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
                 env.project_id,
                 live.execution_id,
                 format!("node-test:{node}::{}", declared.name),
+                env.run_cap,
             )
             .await?;
             let rig = runner.rig(&live.connection, service, live.fixtures);

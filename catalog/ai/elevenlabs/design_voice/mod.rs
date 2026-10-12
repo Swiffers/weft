@@ -1,23 +1,28 @@
 //! ElevenLabsDesignVoice: generate voice PREVIEWS from a text
-//! description. Each preview carries its audio and a generated voice
-//! id; nothing lands on the account until Create Voice mints the
-//! preferred one into a durable voice.
+//! description (and, on eleven_ttv_v3, a reference recording). Each
+//! preview carries its audio and a generated voice id; nothing lands on
+//! the account until Create Voice mints the preferred one into a
+//! durable voice.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use base64::Engine as _;
+use serde_json::json;
 
-use weft::access::client::post_json;
-use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::storage::{FileHandle, StorageScope};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
 
-use super::elevenlabs::API;
+use super::flows::set_some;
+use super::voice_previews::{emit_previews, line_refusal, preview_request};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsDesignVoiceNode;
 
 #[cfg(feature = "node-tests")]
 mod tests;
+
+/// The one model ElevenLabs lets take reference audio (and so the
+/// prompt strength that weighs it against the description).
+const REFERENCE_MODEL: &str = "eleven_ttv_v3";
 
 #[async_trait]
 impl Node for ElevenLabsDesignVoiceNode {
@@ -30,64 +35,66 @@ impl Node for ElevenLabsDesignVoiceNode {
         let account: Access = ctx.inputs.get("account")?;
         let description: String = ctx.inputs.get("description")?;
         let model: String = ctx.inputs.get("model")?;
+        let output_format: String = ctx.inputs.get("outputFormat")?;
         let text: Option<String> = ctx.inputs.opt::<String>("text")?.filter(|t| !t.trim().is_empty());
+        let reference: Option<FileHandle> = ctx.inputs.opt("referenceAudio")?;
+        let prompt_strength: Option<f64> = ctx.inputs.opt("promptStrength")?;
+        let enhance: bool = ctx.inputs.get("shouldEnhance")?;
 
-        let mut body = json!({ "voice_description": description, "model_id": model });
-        match &text {
-            Some(t) => body["text"] = json!(t),
-            None => body["auto_generate_text"] = json!(true),
+        if let Some(refusal) =
+            refusal(&description, text.as_deref(), &model, reference.is_some(), prompt_strength.is_some())
+        {
+            return Err(WeftError::Input(refusal));
         }
-
-        let http = ctx.client(&account).await?;
-        let answer = post_json(
-            &http,
-            &format!("{API}/text-to-voice/design"),
-            &body,
-            "elevenlabs: design the voice",
-        )
-        .await?;
-
-        // Each preview's audio arrives base64; a data: URL in the
-        // typed value lets `internalize` store it and hand the slot
-        // back as a normal stored file.
-        let previews: Vec<Value> = answer["previews"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|p| {
-                // A preview without its audio or its voice id is no
-                // preview: emitting it would hand on an empty clip, or
-                // one Create Voice cannot mint.
-                let voice_id = p["generated_voice_id"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-                    .node_err("elevenlabs answered a preview with no generated_voice_id")?;
-                let b64 = p["audio_base_64"]
-                    .as_str()
-                    .filter(|a| !a.is_empty())
-                    .node_err("elevenlabs answered a preview with no audio_base_64")?;
-                let mime = p["media_type"]
-                    .as_str()
-                    .node_err("elevenlabs answered a preview with no media_type")?;
-                Ok(json!({
-                    "voiceId": voice_id,
-                    "audio": format!("data:{mime};base64,{b64}"),
-                    "durationSecs": p["duration_secs"],
-                    "language": p["language"],
-                }))
-            })
-            .collect::<WeftResult<_>>()?;
-        if previews.is_empty() {
-            weft::node_bail!("elevenlabs answered no previews for this description");
+        // The fields both preview routes take, then the ones only
+        // designing takes.
+        let mut body = preview_request(&ctx, &description, text.as_deref())?;
+        body["model_id"] = json!(model);
+        set_some(&mut body, "quality", ctx.inputs.opt::<f64>("quality")?);
+        if enhance {
+            body["should_enhance"] = json!(true);
         }
-
-        let ty = ctx.output_type("previews")?;
-        let stored = ctx
-            .storage(StorageScope::Execution)
-            // The preview clips are the run's product: keep them past
-            // the run (default 30-day access-bumped TTL).
-            .internalize(&json!(previews), &ty, Some(KeepTtl::Default))
-            .await?;
-        ctx.pulse_downstream(NodeOutput::new().set("previews", stored)).await
+        if let Some(file) = &reference {
+            let (_, bytes) = ctx.storage(StorageScope::Execution).get_bytes(file).await?;
+            body["reference_audio_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+        emit_previews(&ctx, &account, "design", &body, &output_format, "design the voice on ElevenLabs").await
     }
+}
+
+/// What ElevenLabs's voice design route would refuse, said before
+/// anything is paid for (the compiler refuses the same when it is
+/// written; this is the floor for wired values), or `None` when the
+/// request is fine. Lengths count characters, as ElevenLabs does.
+fn refusal(
+    description: &str,
+    text: Option<&str>,
+    model: &str,
+    reference: bool,
+    prompt_strength: bool,
+) -> Option<String> {
+    let described = description.chars().count();
+    if !(20..=1000).contains(&described) {
+        return Some(format!(
+            "`description` is {described} characters, and ElevenLabs takes 20 to 1000: {}",
+            if described < 20 { "describe the voice in more detail" } else { "shorten it" }
+        ));
+    }
+    if let Some(refusal) = line_refusal(text) {
+        return Some(refusal);
+    }
+    if reference && model != REFERENCE_MODEL {
+        return Some(format!(
+            "ElevenLabs takes `referenceAudio` only on {REFERENCE_MODEL}, and `model` is {model}: set `model` to \
+             {REFERENCE_MODEL}, or leave `referenceAudio` empty"
+        ));
+    }
+    if prompt_strength && !reference {
+        return Some(
+            "`promptStrength` weighs the description against `referenceAudio`, and no `referenceAudio` is given: \
+             wire one in, or leave `promptStrength` empty"
+                .into(),
+        );
+    }
+    None
 }

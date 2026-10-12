@@ -35,8 +35,8 @@
             node_id: node_id.into(),
             status: NodeExecutionStatus::Failed,
             pulses_absorbed: Vec::new(),
-            ordinal: 0,
             error: Some(error.into()),
+            gave_up_wait: false,
             callback_id: None,
             started_at: 1,
             completed_at: Some(2),
@@ -60,7 +60,7 @@
             "storage denied",
         ));
         assert_eq!(
-            first_failure(&project, &executions).as_deref(),
+            first_failed(&executions).map(|record| failure_of(&project, record)).as_deref(),
             Some("cards.answer: storage denied")
         );
     }

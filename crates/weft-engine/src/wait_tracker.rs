@@ -141,6 +141,12 @@ impl WaitTracker {
         self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether a node is inside a wait on `source` right now.
+    pub fn waits_on(&self, source: &Arc<dyn WaitSource>) -> bool {
+        let source = Arc::as_ptr(source).cast::<()>();
+        self.lock_nodes().values().any(|node| node.waits.values().any(|wait| wait.source.as_ptr().cast::<()>() == source))
+    }
+
     /// True when EVERY one of the `in_flight` live node tasks (the
     /// driver's identity set of spawned firings) is a node execution
     /// PARKED at its true `notified.await` point (not mid-evaluation)
@@ -188,8 +194,9 @@ impl WaitTracker {
     /// therefore pairs this proof with its own "task channel is empty"
     /// check, in that order, before acting on it (see the stuck-check
     /// in `execution_driver`). Neither half alone is a proof.
-    pub fn deadlock_provable(&self, in_flight: &HashSet<FiringLocation>) -> bool {
-        if in_flight.is_empty() {
+    pub fn deadlock_provable<'a>(&self, in_flight: impl IntoIterator<Item = &'a FiringLocation>) -> bool {
+        let mut in_flight = in_flight.into_iter().peekable();
+        if in_flight.peek().is_none() {
             return false;
         }
         // Phase 1: under ONE map lock, require every in-flight firing

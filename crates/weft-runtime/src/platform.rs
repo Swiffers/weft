@@ -163,6 +163,16 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
     }
 }
 
+/// Where this process writes the line weft logs when its own work is stuck
+/// (`weft_platform_traits::ALERT_TARGET`): on Google Cloud, when the
+/// install alerts, the line its alert policy matches; nowhere otherwise.
+pub fn alert_lines(config: &InstallConfig) -> Option<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>> {
+    match (&config.platform, config.alert_after()) {
+        (PlatformConfig::Gcp(_), Some(_)) => Some(Box::new(weft_platform_gcp::alert_line::layer())),
+        (PlatformConfig::Gcp(_), None) | (PlatformConfig::Local(_), _) => None,
+    }
+}
+
 /// How this process tells the install's other copies what happened to a
 /// run, and hears it (`weft_platform_traits::news`): on a machine, nothing
 /// (its one process listens to the database for good); on Google Cloud, the
@@ -177,6 +187,38 @@ pub fn news(config: &InstallConfig, parts: &Parts) -> anyhow::Result<Arc<dyn wef
     })
 }
 
+/// What the holders hear (the held set changed, a connection was made
+/// again or removed), told by the dispatcher: on a local install, relayed
+/// from the one process's own database watch; on Google Cloud, the
+/// holders' topic.
+pub fn holder_news(
+    config: &InstallConfig,
+    parts: &Parts,
+    signals: Option<&Arc<weft_task_store::pg_signal::PgSignalWatch>>,
+) -> anyhow::Result<Arc<dyn weft_platform_traits::HolderNews>> {
+    Ok(match &config.platform {
+        PlatformConfig::Local(_) => Arc::new(weft_platform_local::DatabaseHolderNews::new(
+            signals.context("a local install's process listens to its database")?.clone(),
+            weft_dispatcher::holders::HELD_SIGNALS_CHANNEL,
+            weft_dispatcher::holders::ACCESS_REMADE_CHANNEL,
+        )),
+        PlatformConfig::Gcp(gcp) => {
+            let google = parts.google.clone().context("a process on Google Cloud holds its Google client")?;
+            Arc::new(weft_platform_gcp::PubSubHolderNews::new(google, gcp))
+        }
+    })
+}
+
+/// How a dead holder is noticed: a check it keeps pushing ahead through the
+/// alarm on Google Cloud; nothing on a local install, whose one process
+/// holds under a name it takes back at its restart.
+pub fn holder_liveness(config: &InstallConfig, parts: &Parts) -> Arc<dyn weft_platform_traits::HolderLiveness> {
+    match &config.platform {
+        PlatformConfig::Local(_) => Arc::new(weft_platform_local::OneProcessHolds),
+        PlatformConfig::Gcp(_) => Arc::new(weft_platform_traits::AlarmLiveness::new(parts.alarm.clone())),
+    }
+}
+
 /// How long this process's platform lets one request live before cutting
 /// it, which is how long a line to it lasts: a role placed serverless on
 /// Google Cloud is a Cloud Run service; anything else keeps a request for
@@ -185,6 +227,42 @@ pub fn line_max_age(config: &InstallConfig, serverless: bool) -> Option<Duration
     match (&config.platform, serverless) {
         (PlatformConfig::Gcp(_), true) => Some(weft_platform_gcp::REQUEST_CAP),
         _ => None,
+    }
+}
+
+/// How the platform bounds a role placed serverless, as its passes and
+/// its stopping need to know.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerlessLimits {
+    /// How long one tick's pass drains before it answers
+    /// (`weft_task_store::drain::drain_due`'s `slice`): well inside the
+    /// platform's cut of a request, so a loop that always has more never
+    /// holds the tick open until it is cut.
+    pub tick_slice: Duration,
+    /// How long a stopping process waits for its rings still out
+    /// (`crate::role_waker::RoleWaker::settle`): inside the time the
+    /// platform gives a stopping process, with room to log what was not
+    /// delivered.
+    pub ring_grace: Duration,
+}
+
+/// On Google Cloud a role placed serverless is a Cloud Run service: it cuts
+/// a request at `weft_platform_gcp::REQUEST_CAP` (an hour), and gives a
+/// stopping instance `weft_platform_gcp::STOP_GRACE` after SIGTERM, of
+/// which the rings take all but 2 seconds.
+const GCP_SERVERLESS: ServerlessLimits = ServerlessLimits {
+    tick_slice: Duration::from_secs(60),
+    ring_grace: Duration::from_secs(weft_platform_gcp::STOP_GRACE.as_secs() - 2),
+};
+const _: () = assert!(GCP_SERVERLESS.tick_slice.as_secs() < weft_platform_gcp::REQUEST_CAP.as_secs());
+
+/// The bounds of a role placed serverless on this install's platform;
+/// `None` on a platform that places no role so (a local install runs every
+/// role in its one process).
+pub fn serverless_limits(config: &InstallConfig) -> Option<ServerlessLimits> {
+    match &config.platform {
+        PlatformConfig::Gcp(_) => Some(GCP_SERVERLESS),
+        PlatformConfig::Local(_) => None,
     }
 }
 

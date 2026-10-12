@@ -76,6 +76,16 @@ pub struct UnitRuntime {
     /// Resolved at apply: `Unit.health.recovery_after_seconds` or the
     /// supervisor's global default.
     pub recovery_after_seconds: u32,
+    /// Since when (unix seconds) a `running` unit has been seen not ready:
+    /// it turns `flaky` once that is `flaky_after_seconds` old. `None`
+    /// while it is ready, or once it is declared flaky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_ready_since_unix: Option<i64>,
+    /// Since when (unix seconds) a `flaky` unit has been seen ready again:
+    /// it recovers once that is `recovery_after_seconds` old. `None`
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_since_unix: Option<i64>,
     /// The image refs this unit's containers actually run after the
     /// apply that stamped this entry (`Image::Upstream` literals and
     /// resolved `Image::Local` tags alike). A FROZEN unit (left up
@@ -119,8 +129,18 @@ pub const NOT_DONE: &str = "the broker could not get a connection to its databas
 /// body the bytes `weft_journal::frame` encodes (not JSON), answered with
 /// `weft_journal::frame::BatchAnswer`. Worker-only: every run of the batch
 /// is fenced on the calling replica.
-// SYNC: JOURNAL_RECORD_PATH <-> crates/weft-broker/src/lib.rs (routes)
+// SYNC: JOURNAL_RECORD_PATH <-> crates/weft-broker/src/records.rs (routes)
 pub const JOURNAL_RECORD_PATH: &str = "/v1/journal/record";
+
+/// The header a worker sends its batches with to say it reads every fate
+/// of this release (`weft_journal::record::Fate`), [`BATCH_FATES`]. A
+/// worker of the previous release sends none, and is answered only with
+/// the fates it reads (`weft_broker::records::previous_release_answer`);
+/// a broker of the previous release ignores it, and answers with the
+/// fates it has, which this release reads too. The release after this
+/// one drops it.
+pub const BATCH_FATES_HEADER: &str = "x-weft-batch-fates";
+pub const BATCH_FATES: &str = "project_removing";
 
 /// The most one batch body may weigh. A lane closes a batch at a mebibyte;
 /// a run's next row alone may weigh more (one emission, one value per
@@ -185,15 +205,26 @@ pub struct RunAnswer {
     pub answer: weft_core::primitive::WaitAnswer,
 }
 
-/// `POST /v1/run/cancels`: the cancels waiting for the runs the calling
-/// worker drives (`run.cancel_requested`): what a worker reads when it may
-/// have missed one announced on its line (the line came back).
+/// `POST /v1/run/rechecked`: what a worker reads once its line may have
+/// missed some (it opened again after a break, or fell behind): the
+/// cancels waiting for every run it drives and the answers handed to them,
+/// in one read for all of them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RunCancelsRequest {}
+pub struct RunRecheckedRequest {}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunCancelsResponse {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunRecheckedResponse {
     pub cancels: Vec<RunCancel>,
+    /// Every answer handed to one of its runs, oldest first.
+    pub answers: Vec<RunAnswerOf>,
+}
+
+/// An answer handed to the run `execution_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAnswerOf {
+    pub execution_id: ExecutionId,
+    pub token: String,
+    pub answer: weft_core::primitive::WaitAnswer,
 }
 
 /// `POST /v1/run/give_up`: end a run the calling worker drives but whose
@@ -619,7 +650,86 @@ pub struct SupervisorSyncOwnershipRequest {
     /// project's copies only under the project's lease
     /// ([`SupervisorGoneCopiesRequest`]). A lease on a project with no
     /// infra that the host no longer holds is not renewed and lapses.
-    pub held_projects: Vec<Uuid>,
+    /// Every sync of a replica carries its host's latest listing that went
+    /// through, less the projects whose every copy this replica deleted
+    /// since (a pass's sweep), so whether a project is ownable never
+    /// depends on which sync this is. A sync that carries one clears the
+    /// failed passes' retries and failures of every project no lease
+    /// covers and nothing makes ownable any more. `None` when none did (a
+    /// pass of a supervisor that scales to zero whose listing failed): a
+    /// project only the listing could make ownable is not claimed then,
+    /// and its failed pass's retry stays booked ([`Self::all_failed`]
+    /// counts it).
+    pub held_projects: Option<Vec<Uuid>>,
+    /// Projects this replica's health look went through since its last
+    /// sync, whatever the look came to. A failed pass's retry over one of
+    /// them, while this replica still holds its lease, is taken: the look
+    /// was the retry (a look that failed again sets the next one through
+    /// `failed`). One that is not also `failed` (and with no `all_failed`)
+    /// went through clean, which ends its failures in a row.
+    #[serde(default)]
+    pub looked: Vec<Uuid>,
+    /// Projects this replica looked at, and ran the commands of, with
+    /// nothing given up: what was written down as given up on them is
+    /// cleared.
+    #[serde(default)]
+    pub settled: Vec<Uuid>,
+    /// Projects a pass of this replica could not get through (a health
+    /// look, a sweep of gone copies, a command's ending that could not be
+    /// written), each with why. Each is written down for `weft status`
+    /// and counted (`infra_health_look.failures`): a later pass tries it
+    /// again after [`supervisor_retry_after`], until one goes through or
+    /// it gives up. Only a project whose lease this replica holds, or a
+    /// removed one (no row): what the host still holds of those is counted
+    /// the same way and written down as one install-wide failure, cleared
+    /// once a sync's listing (`held_projects`) holds none of them.
+    #[serde(default)]
+    pub failed: Vec<ProjectTrouble>,
+    /// Projects a health protocol of this replica gave up on: written down
+    /// for `weft status` until a pass reports them settled, and tried again
+    /// only when something real happens (a machine's word, a person's
+    /// command or look), never on a clock. Only a project whose lease this
+    /// replica holds.
+    #[serde(default)]
+    pub gave_up: Vec<ProjectTrouble>,
+    /// A step of this replica's pass that covers every project failed
+    /// (listing what its host holds, reading what it owns), with why: a
+    /// failure of the pass over each project whose lease this replica
+    /// holds, counted and written down like one in `failed` (once per
+    /// project, with its own error when it has one too). With no listing
+    /// (`held_projects` is `None`), also over each project whose failed
+    /// pass's retry is due, that no lease covers, and that only the
+    /// listing could make ownable: that pass was its retry.
+    #[serde(default)]
+    pub all_failed: Option<String>,
+    /// A pass of a supervisor that scales to zero ends: give every lease
+    /// back instead of renewing and claiming.
+    #[serde(default)]
+    pub ending: bool,
+}
+
+/// A project a supervisor's pass could not get through, and why
+/// ([`SupervisorSyncOwnershipRequest::failed`] and `gave_up`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectTrouble {
+    pub project_id: Uuid,
+    pub error: String,
+}
+
+/// How many tries in a row the supervisor makes at one thing before it
+/// gives up until something real happens: a health protocol's action, a
+/// pass over a project ([`SupervisorSyncOwnershipRequest::failed`]), and
+/// the runs of one infra command that never ended (its `runs`, counted by
+/// the broker's claim).
+pub const SUPERVISOR_GIVE_UP_AFTER: u32 = 3;
+
+/// How long after its `failures`th failure in a row the supervisor tries
+/// again (5 s, then 10 s), or `None` once it gives up
+/// ([`SUPERVISOR_GIVE_UP_AFTER`]).
+pub fn supervisor_retry_after(failures: u32) -> Option<std::time::Duration> {
+    const BASE_SECS: u64 = 5;
+    (failures < SUPERVISOR_GIVE_UP_AFTER)
+        .then(|| std::time::Duration::from_secs(BASE_SECS << failures.saturating_sub(1)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -657,17 +767,12 @@ pub struct SupervisorSyncOwnershipResponse {
     /// on one of them while nobody held it woke none of this replica's
     /// claims, so it asks again at once when this is not empty.
     pub claimed: Vec<Uuid>,
-    /// Whether a project this replica owns gives it something to do now
-    /// that nothing will announce (`lifecycle_command::supervisor_work`: a
-    /// command waiting): it looks again soon while this is true.
-    pub owns_work: bool,
-    /// In how many seconds (on the database's clock, 0 when already) the
-    /// soonest lease this replica does not hold lapses, over the projects
-    /// that give their owner something to do; a project of those nobody
-    /// holds counts as lapsed. A replica looks again then: the sibling
-    /// holding it may be gone, and only a lapsed lease is taken over.
-    /// `None` when there is no such project.
-    pub others_lapse_in_secs: Option<i64>,
+    /// When a supervisor next has something to look at that nothing
+    /// announces (unix seconds, database clock): a unit's health window
+    /// ending, a health protocol's retry, a command waiting on a project no
+    /// lease covers, a lease another replica holds lapsing. The broker
+    /// books the supervisor's next pass then; `None` when there is none.
+    pub next_due_unix: Option<i64>,
 }
 
 /// Pure read of the projects a supervisor process currently owns (no claim,
@@ -761,7 +866,43 @@ pub struct SupervisorHealthProtocolsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorHealthProtocolsResponse {
     pub protocols: Option<serde_json::Value>,
+    /// What each of the project's health protocols did, kept across the
+    /// supervisor's processes.
+    #[serde(default)]
+    pub state: Vec<HealthProtocolState>,
 }
+
+/// What one health protocol of a project did, kept across the
+/// supervisor's processes (an `infra_health_protocol` row).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthProtocolState {
+    pub protocol: String,
+    /// The copies its action acted on since it was last armed (empty for
+    /// an action on no copy); `None`: it has not fired.
+    pub acted: Option<std::collections::BTreeSet<InfraCopy>>,
+    /// Failed attempts in a row since its last success.
+    pub consecutive_failures: u32,
+    /// Not before (unix seconds) does it try again after a failure.
+    pub next_retry_at_unix: Option<i64>,
+    /// When it gave up (unix seconds): it tries again once the units it
+    /// saw then (`gave_up_seen`) change, a person's infra command touches
+    /// the project, or every unit is healthy.
+    pub gave_up_at_unix: Option<i64>,
+    pub gave_up_seen: Option<serde_json::Value>,
+    pub last_error: Option<String>,
+}
+
+/// Replace a project's [`HealthProtocolState`]s (a protocol not listed
+/// has none left), for the supervisor holding its lease (410 otherwise).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetHealthStateRequest {
+    pub replica: String,
+    pub project_id: Uuid,
+    pub protocols: Vec<HealthProtocolState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetHealthStateResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorClaimCommandRequest {
@@ -770,9 +911,14 @@ pub struct SupervisorClaimCommandRequest {
     /// `infra_owner` exclusive lease), so two supervisors never change
     /// the same project's infrastructure.
     pub claimer_replica: String,
-    /// The commands this process is running right now, which it must not
-    /// be handed again (they stay uncompleted until they end).
+    /// The commands this process runs, or finished and still has to write
+    /// the end of: never handed to it again. A command it claimed before
+    /// and does not list is handed to it again (its run stopped when
+    /// ownership moved and came back).
     pub busy_commands: Vec<i64>,
+    /// Busy commands whose cancel this process already heard.
+    #[serde(default)]
+    pub cancelling: Vec<i64>,
     /// How long to hold for a command to be issued when none is
     /// waiting.
     pub wait_ms: u64,
@@ -790,6 +936,8 @@ pub enum SupervisorClaim {
     UnownedWork,
     /// Nothing was issued for this process for the whole hold.
     Nothing,
+    /// A person asked to cancel these busy commands (none of `cancelling`).
+    Cancel { commands: Vec<i64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,6 +961,9 @@ pub struct SupervisorCommandRow {
     /// "take it all down so I can update it" override.
     #[serde(default)]
     pub force: bool,
+    /// A person asked to cancel it before it was handed out.
+    #[serde(default)]
+    pub cancel_requested: bool,
 }
 
 impl SupervisorCommandRow {
@@ -1059,6 +1210,13 @@ pub struct SupervisorSetStatusRequest {
     /// could enforce, but today it stores as-given).
     pub failure_stage: Option<FailureStage>,
     pub failure_message: Option<String>,
+    /// With `unit`: the unit's window, written with its status (the
+    /// health loop's look sets them; a command's per-unit stamp clears
+    /// them). Ignored without `unit`.
+    #[serde(default)]
+    pub not_ready_since_unix: Option<i64>,
+    #[serde(default)]
+    pub ready_since_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1538,19 +1696,6 @@ pub struct SupervisorCommandCompleteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCompleteResponse {}
 
-/// Poll target for an executing supervisor: has the user requested
-/// cancellation of this claimed command? Checked between platform calls
-/// and inside readiness/drain waits so a cancel interrupts promptly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorCommandCancelRequestedRequest {
-    pub command_id: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorCommandCancelRequestedResponse {
-    pub cancel_requested: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorTriggerDepsRequest {
     pub project_id: Uuid,
@@ -1813,6 +1958,18 @@ pub struct SignalRowWire {
     /// For a held signal: what its holder says the connection is doing,
     /// while a holder holds it; `None` while none does.
     pub serving: Option<HeldServing>,
+    /// The registration this row is (the `signal.generation` column): a
+    /// number every registration upsert and restore of the token moves
+    /// to one never used before, so a wake names the registration it was
+    /// set for and a stale one is told apart from the current one.
+    #[serde(default)]
+    pub generation: i64,
+    /// Why the listener or its holder gave up on this signal for good
+    /// (`signal.held_failed`), shown on its node until a registration
+    /// again (or an account reconnect, which registers again) clears it.
+    /// `None` while it is not given up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_failed: Option<String>,
 }
 
 /// What a holder says one held connection is doing, for its node's
@@ -1834,19 +1991,11 @@ pub enum HeldTransport {
     Unservable { reason: String },
 }
 
-/// How long a holder's claim on a signal lasts unless it renews it: three
-/// of its looks (`weft_listener::hold`), so one slow look never drops a
-/// connection it still holds, and one that died hands its signals on
-/// within this. 30 seconds in real time, at this install's pace.
-pub fn hold_lease_secs() -> i64 {
-    weft_core::time_scale::scaled_secs(30)
-}
-
-/// One look of a holder (`signal/hold`): renew the claims on what it
-/// holds, report what each connection is doing, take more when it has
-/// room. Of the signals that need a holder, only those no live holder
-/// claims are taken, so holders share them and take over from one that
-/// went.
+/// One look of a holder (`signal/hold`): say what each connection it
+/// holds is doing when that changed, learn which of them are still its
+/// own, and take more when it has room. A claim lasts until its holder
+/// lets it go or the holder's liveness check releases it (`/held/check`);
+/// holders share the signals by taking only the ones no holder claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalHoldRequest {
     /// The holder; the call must come from this replica.
@@ -1894,9 +2043,8 @@ pub struct SignalSetHoldsRequest {
     pub holds: bool,
 }
 
-/// Give up every claim `replica` holds (a holder stopping): another
-/// holder takes them at its next look instead of waiting for the claims
-/// to lapse.
+/// Give up every claim `replica` holds (a holder stopping), so another
+/// holder takes them at once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalLetGoRequest {
     pub replica: String,
@@ -1948,6 +2096,32 @@ pub struct ListenerInfraAddressRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerInfraAddress {
     pub authority: String,
+    /// Whether the address is one of the project's infra endpoints
+    /// (translated for weft's roles). An infra endpoint's address can
+    /// move (a local unit made again on another port), so the listener
+    /// asks again after a connect to it fails; any other address is
+    /// the one given, for good. An older broker that does not say is
+    /// read as an infra endpoint, which is always correct, only slower.
+    #[serde(default = "is_infra_unsaid")]
+    pub is_infra: bool,
+}
+
+fn is_infra_unsaid() -> bool {
+    true
+}
+
+/// Give up on a signal for good (`signal/give_up`): it could not come up
+/// after its retries, or its wake can never be handled (a spec or state
+/// nothing can read, a kind no listener knows). Written once with why,
+/// fenced on the registration it gave up on (`generation`), so a newer
+/// registration of the token is never marked; a held one is also let go
+/// (only by the holder whose claim it is, the caller's replica). A row
+/// already given up, or registered again since, is left as it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalGiveUpRequest {
+    pub token: String,
+    pub generation: i64,
+    pub reason: String,
 }
 
 /// What serving a subscription needs: the connection's resolved auth
@@ -2234,14 +2408,17 @@ pub struct DoorTickRequest {
     /// This copy's counts this minute, each its total so far.
     #[serde(default)]
     pub counts: Vec<DoorCount>,
-    /// The route tokens whose counts it reads back.
-    #[serde(default)]
-    pub tokens: Vec<String>,
     /// Until when (unix seconds) the lease holds without another tick: set
     /// by the last tick before a worker whose runs only wait stops ticking
     /// (`weft_task_store::worker_door::lease_until`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vouch_until: Option<i64>,
+    /// Set on the first tick of a worker told to stop while its last tick
+    /// vouched for it: its lease now ends before that vouch, and the broker
+    /// rings the dispatcher's look at lapsed leases (`lapses`), which was
+    /// booked for the vouch and nothing else would bring forward.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shortens: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2407,11 +2584,50 @@ mod supervisor_protocol_tests {
         assert_eq!(resp.definition_hash, "abc123");
     }
 
+    /// The supervisor tries again after 5 s, then 10 s, and gives up at
+    /// the third failure in a row.
+    #[test]
+    fn the_supervisor_tries_twice_more_then_gives_up() {
+        use std::time::Duration;
+        assert_eq!(supervisor_retry_after(1), Some(Duration::from_secs(5)));
+        assert_eq!(supervisor_retry_after(2), Some(Duration::from_secs(10)));
+        assert_eq!(supervisor_retry_after(SUPERVISOR_GIVE_UP_AFTER), None);
+        assert_eq!(supervisor_retry_after(40), None);
+    }
+
     #[test]
     fn sync_ownership_round_trip() {
-        let req = SupervisorSyncOwnershipRequest { replica: "sup-1".into(), held_projects: vec![] };
+        let req = SupervisorSyncOwnershipRequest {
+            replica: "sup-1".into(),
+            held_projects: None,
+            looked: vec![Uuid::from_u128(0xa1)],
+            settled: vec![],
+            failed: vec![ProjectTrouble { project_id: Uuid::from_u128(0xa1), error: "no host".into() }],
+            gave_up: vec![],
+            all_failed: Some("the host did not list".into()),
+            ending: true,
+        };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "replica": "sup-1", "held_projects": [] }));
+        assert_eq!(
+            v,
+            json!({
+                "replica": "sup-1",
+                "held_projects": null,
+                "looked": ["00000000-0000-0000-0000-0000000000a1"],
+                "settled": [],
+                "failed": [{ "project_id": "00000000-0000-0000-0000-0000000000a1", "error": "no host" }],
+                "gave_up": [],
+                "all_failed": "the host did not list",
+                "ending": true,
+            })
+        );
+        let listed: SupervisorSyncOwnershipRequest = serde_json::from_value(json!({
+            "replica": "sup-1",
+            "held_projects": ["00000000-0000-0000-0000-0000000000a1"],
+        }))
+        .unwrap();
+        assert_eq!(listed.held_projects, Some(vec![Uuid::from_u128(0xa1)]));
+        assert_eq!(listed.all_failed, None);
         let resp: SupervisorSyncOwnershipResponse = serde_json::from_value(json!({
             "owned": [
                 {
@@ -2422,16 +2638,14 @@ mod supervisor_protocol_tests {
                 }
             ],
             "claimed": ["00000000-0000-0000-0000-0000000000a1"],
-            "owns_work": true,
-            "others_lapse_in_secs": 12,
+            "next_due_unix": 12,
         }))
         .unwrap();
         assert_eq!(resp.owned.len(), 1);
         assert_eq!(resp.owned[0].project_id.to_string(), "00000000-0000-0000-0000-0000000000a1");
         assert_eq!(resp.owned[0].status, ProjectStatus::Active);
         assert_eq!(resp.claimed, vec![resp.owned[0].project_id]);
-        assert!(resp.owns_work);
-        assert_eq!(resp.others_lapse_in_secs, Some(12));
+        assert_eq!(resp.next_due_unix, Some(12));
     }
 
     #[test]
@@ -2439,6 +2653,7 @@ mod supervisor_protocol_tests {
         let req = SupervisorClaimCommandRequest {
             claimer_replica: "sup-1".into(),
             busy_commands: vec![7],
+            cancelling: vec![],
             wait_ms: 25_000,
         };
         assert_eq!(
@@ -2446,6 +2661,7 @@ mod supervisor_protocol_tests {
             json!({
                 "claimer_replica": "sup-1",
                 "busy_commands": [7],
+                "cancelling": [],
                 "wait_ms": 25_000,
             })
         );
@@ -2457,8 +2673,9 @@ mod supervisor_protocol_tests {
             verb: InfraLifecycleVerb::Apply,
             spec_json: None,
             force: false,
+            cancel_requested: false,
         };
-        for claim in [SupervisorClaim::Command(command), SupervisorClaim::UnownedWork, SupervisorClaim::Nothing] {
+        for claim in [SupervisorClaim::Command(command), SupervisorClaim::UnownedWork, SupervisorClaim::Nothing, SupervisorClaim::Cancel { commands: vec![7] }] {
             let back: SupervisorClaim =
                 serde_json::from_value(serde_json::to_value(&claim).unwrap()).unwrap();
             assert_eq!(format!("{back:?}"), format!("{claim:?}"));
@@ -2853,6 +3070,7 @@ mod supervisor_protocol_tests {
             verb: InfraLifecycleVerb::Terminate,
             spec_json: None,
             force: false,
+            cancel_requested: false,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["node_id"], "n");
@@ -2871,6 +3089,7 @@ mod supervisor_protocol_tests {
             verb: InfraLifecycleVerb::Terminate,
             spec_json: Some(spec_json),
             force: false,
+            cancel_requested: false,
         };
         let wipe = row(json!({ "disks": "delete_all" })).terminate_work().unwrap();
         assert_eq!(wipe.disks, weft_core::infra::TerminateDisks::DeleteAll);
@@ -2928,6 +3147,8 @@ mod supervisor_protocol_tests {
             status: InfraNodeStatus::Running,
             failure_stage: None,
             failure_message: None,
+            not_ready_since_unix: None,
+            ready_since_unix: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         let back: SupervisorSetStatusRequest = serde_json::from_value(v).unwrap();
@@ -2947,6 +3168,8 @@ mod supervisor_protocol_tests {
             status: InfraNodeStatus::Stopping,
             failure_stage: None,
             failure_message: None,
+            not_ready_since_unix: None,
+            ready_since_unix: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         let back: SupervisorSetStatusRequest = serde_json::from_value(v).unwrap();
@@ -3019,6 +3242,8 @@ mod supervisor_protocol_tests {
             kind_state: Value::Null,
             holds: false,
             serving: None,
+            generation: 0,
+            held_failed: None,
         }
     }
 
@@ -3186,6 +3411,7 @@ mod supervisor_protocol_tests {
                 .into_iter()
                 .collect(),
             provider_account: Some("T1".into()),
+            expires_at_unix: None,
         };
         let v = serde_json::to_value(&src).unwrap();
         assert_eq!(v["values"], json!({ "token": "xoxb-1" }));

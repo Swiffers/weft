@@ -18,7 +18,7 @@
       "requiresScopes": [
         "voice_lab"
       ],
-      "description": "Your own ElevenLabs account (the minted voice lives in it; the shared credential cannot serve this)."
+      "description": "Your own ElevenLabs account (the minted voice lives in it; the shared credential cannot serve this). ElevenLabs offers instant cloning on its Starter plan and above."
     },
     {
       "name": "name",
@@ -30,7 +30,7 @@
       "name": "samples",
       "type": "List[Audio]",
       "required": true,
-      "description": "Sample recordings of the voice (a minute of clean speech works well)."
+      "description": "Recordings of the voice to clone. ElevenLabs says a few minutes of audio is enough for an instant clone."
     },
     {
       "name": "description",
@@ -43,7 +43,12 @@
       "type": "Boolean",
       "default": false,
       "label": "Remove background noise",
-      "description": "Clean the samples before cloning."
+      "description": "Turn on to clean the samples with ElevenLabs's audio isolation model before cloning. If the samples have no background noise, ElevenLabs warns it can make the quality worse."
+    },
+    {
+      "name": "labels",
+      "type": "Dict[String, String]",
+      "description": "Labels to store with the voice, each a name and a value. ElevenLabs names language, accent, gender and age as keys, like `{ \"language\": \"en\", \"accent\": \"en-US\" }`."
     }
   ],
   "outputs": [
@@ -51,6 +56,11 @@
       "name": "voiceId",
       "type": "String",
       "description": "The minted voice's id: what the speak nodes take."
+    },
+    {
+      "name": "requiresVerification",
+      "type": "Boolean",
+      "description": "Whether ElevenLabs says the new voice requires verification."
     }
   ],
   "features": {

@@ -243,6 +243,14 @@ is armed, so Ctrl+C at a prompt leaks nothing.
 a test names the real thing it needs: a channel it may post in, an account it
 may read. Read them with `rig.fixture("NAME")`.
 
+If your node waits on a signal (`ctx.await_signal`), a live test waits for the
+real answer, held in the node's call the way it is in
+[a run that cannot pause](durable-execution.md#when-the-run-cannot-pause). On your
+machine it waits as long as the job behind it takes. On a cloud install the
+whole test has the platform's limit on one request, counted from when the
+test started: on Google Cloud it is stopped 59 minutes in, and a wait still
+held fails saying so.
+
 ## What to write
 
 Ship a `fake` test for every node. If it talks to a provider, ship a `live` one

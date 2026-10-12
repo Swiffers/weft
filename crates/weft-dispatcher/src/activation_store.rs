@@ -54,12 +54,14 @@ pub struct Activation {
 /// that blocked it so the caller can say which.
 /// `Applied` hands back the signals the written activations govern, read
 /// or deleted in the write's own transaction ([`SignalsGoing`]), for the
-/// listener cleanup.
+/// listener cleanup. `ResyncGone`: the write was a resync's take-down,
+/// and that drive no longer holds the project.
 #[derive(Debug, Clone)]
 pub enum LifecycleWrite {
     Applied { unlisten: Vec<crate::journal::SignalRegistration> },
     Rejected { blocker: String },
     NotFound,
+    ResyncGone,
 }
 
 /// Which signal rows a guarded lifecycle write deletes in its own
@@ -103,8 +105,26 @@ impl ValuesStore<'_> {
     }
 }
 
+/// The SQL condition "the setup run of the activating row `a` has not
+/// ended": queued, waiting, or driven. While it goes, the activation's
+/// driver does not beat (`crate::transition::ActivationHeartbeat`): the run
+/// may wait days on a person, and is judged by its own worker's lease
+/// (`crate::lapses`) and its ending (`crate::run_ends`).
+pub(crate) const SETUP_RUN_GOES: &str =
+    "EXISTS (SELECT 1 FROM run setup WHERE setup.execution_id = a.activating_execution_id AND setup.state <> 'ended')";
+
+/// THE activations their driver holds by its heartbeat alone, as a SQL
+/// condition over a `trigger_activation` row aliased `a`: activating, with
+/// no setup run of theirs going ([`SETUP_RUN_GOES`]). One whose heartbeat
+/// went stale is stuck ([`ActivationStoreOps::list_stuck`]), and the
+/// `lapses` loop looks when the earliest of them could
+/// (`crate::lapses::earliest_lapse`).
+pub(crate) fn held_by_driver_alone() -> String {
+    format!("(a.status = 'activating' AND a.activating_execution_id IS NOT NULL AND NOT {SETUP_RUN_GOES})")
+}
+
 /// An activation whose driver died mid-activation (its heartbeat went
-/// stale): the reaper rolls it back.
+/// stale): the `lapses` loop rolls it back.
 #[derive(Debug, Clone)]
 pub struct StuckActivation {
     pub project_id: uuid::Uuid,
@@ -133,28 +153,48 @@ pub trait ActivationStoreOps: Send + Sync {
     /// With `expect`, the claim is also refused unless every one of
     /// `keys` exists and is still in that status: a re-arm that saw its
     /// triggers Active must not turn back on one a deactivate took down
-    /// since.
+    /// since. While a resync holds the project, the one claim that goes
+    /// through is the resync's own (`resync`, the drive bringing its
+    /// triggers back: `crate::task_kinds::resync`), and only while that
+    /// drive holds it: no other activation starts under a resync, and a
+    /// resync given up turns nothing on.
     async fn try_begin_activating(
         &self,
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
         execution_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
+        resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>>;
 
     /// End the activation `execution_id` names (every row it claimed) at `to`; an
     /// instance's row landing wiped goes instead ([`wipe_forgets`]). With
-    /// `remove_signals`, the signals those activations govern are deleted
-    /// in the same transaction and handed back for the listener cleanup;
-    /// with `values`, that change is stored in it too. `None`
+    /// `remove_entries`, those activations' entry rows are deleted in the
+    /// same transaction and handed back for the listener cleanup; the waits
+    /// of runs their triggers fired stay, since nothing here ends those
+    /// runs. With `values`, that change is stored in it too. `None`
     /// (and nothing stored) if `execution_id` no longer owns any row.
     async fn end_activating(
         &self,
         project_id: uuid::Uuid,
         execution_id: uuid::Uuid,
         to: &ActivationLifecycle,
-        remove_signals: bool,
+        remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
+    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
+
+    /// End the activation `execution_id` names that nobody will finish (a
+    /// person cancelled it, or its driver died). When its triggers kept work
+    /// (events waiting on them, runs of theirs waiting:
+    /// `crate::journal::postgres::activation_preservation`), they land
+    /// parked with every signal kept, so that work waits for their next
+    /// activation; otherwise they are wiped, their entry rows going. Decided
+    /// and written in one transaction under the activation's rows. `None`
+    /// when `execution_id` no longer owns any row.
+    async fn end_unfinished(
+        &self,
+        project_id: uuid::Uuid,
+        execution_id: uuid::Uuid,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
 
     /// Put the activations `execution_id` claimed back as they were before the
@@ -187,13 +227,18 @@ pub trait ActivationStoreOps: Send + Sync {
     /// any of them is activating (cancel the activation first) or while
     /// the project is building. Keys with no row are skipped: there is
     /// nothing listening to take down. `signals` names the signal rows
-    /// deleted in the same transaction.
+    /// deleted in the same transaction. With `resync`, the write is that
+    /// resync drive's take-down (`crate::task_kinds::resync`), and goes
+    /// through only while that drive holds the project, decided under the
+    /// same project row lock a person's give-up takes: a resync given up
+    /// takes nothing down after it.
     async fn set_lifecycle_guarded(
         &self,
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
         lifecycle: &ActivationLifecycle,
         signals: SignalsGoing,
+        resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<LifecycleWrite>;
 
     /// Compare-and-set one activation's status (the drain landing).
@@ -209,7 +254,9 @@ pub trait ActivationStoreOps: Send + Sync {
     /// process does this on an interval so the reaper only repairs dead ones.
     async fn bump_heartbeat(&self, execution_id: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Activations stuck in Activating whose heartbeat went stale.
+    /// Activations stuck in Activating: their heartbeat went stale, and no
+    /// setup run of theirs goes on ([`SETUP_RUN_GOES`]; its driver stops
+    /// beating while it does).
     async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>>;
 
     /// Every activation draining right now, with its project.
@@ -279,6 +326,79 @@ fn wipe_forgets(key: &ActivationKey, lifecycle: &ActivationLifecycle) -> bool {
 /// once that infra is up again.
 fn forgets_instance_rows(lifecycle: &ActivationLifecycle) -> bool {
     lifecycle.is_wiped() && lifecycle.went_down.map(|w| w.with) != Some(weft_broker_client::activation::DownWith::Infra)
+}
+
+/// Activation keys as `(trigger, instance)` rows give them.
+fn owned_keys(rows: Vec<(String, Option<String>)>) -> anyhow::Result<Vec<ActivationKey>> {
+    rows.into_iter()
+        .map(|(trigger, instance)| {
+            Ok(ActivationKey::new(trigger, Owner::from_instance(instance.map(InstanceId::new).transpose().map_err(anyhow::Error::msg)?)))
+        })
+        .collect()
+}
+
+/// [`ActivationStoreOps::end_activating`] on the caller's transaction.
+async fn end_activating_in(
+    tx: &mut sqlx::PgConnection,
+    project_id: uuid::Uuid,
+    execution_id: uuid::Uuid,
+    to: &ActivationLifecycle,
+    remove_entries: bool,
+    values: Option<&ValuesStore<'_>>,
+) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+    let owned = "project_id = $1 AND activating_execution_id = $2 AND status = 'activating'";
+    // An instance's rows landing wiped go ([`wipe_forgets`]); the rest
+    // move to `to`.
+    let mut ended: Vec<(String, Option<String>)> = if forgets_instance_rows(to) {
+        sqlx::query_as(&format!(
+            "DELETE FROM trigger_activation WHERE {owned} AND instance_id IS NOT NULL RETURNING trigger, instance_id"
+        ))
+        .bind(project_id)
+        .bind(execution_id)
+        .fetch_all(&mut *tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    let moved: Vec<(String, Option<String>)> = sqlx::query_as(
+        "UPDATE trigger_activation \
+         SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
+             fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, \
+             went_down_at_unix = $10, \
+             activating_execution_id = NULL, \
+             activation_program = CASE WHEN $1 = 'active' THEN activation_program ELSE NULL END, \
+             activation_version = CASE WHEN $1 = 'active' THEN activation_version ELSE NULL END, \
+             updated_at = $7 \
+         WHERE project_id = $8 AND activating_execution_id = $9 AND status = 'activating' \
+         RETURNING trigger, instance_id",
+    )
+    .bind(to.status.as_str())
+    .bind(to.accepting_fires)
+    .bind(to.fires_visible_to_consumers)
+    .bind(to.fires_deadline_unix)
+    .bind(to.went_down.map(|w| w.with.as_str()))
+    .bind(to.drain_deadline_unix)
+    .bind(crate::lease::now_unix())
+    .bind(project_id)
+    .bind(execution_id)
+    .bind(to.went_down.map(|w| w.at_unix))
+    .fetch_all(&mut *tx)
+    .await?;
+    ended.extend(moved);
+    if ended.is_empty() {
+        return Ok(None);
+    }
+    if let Some(values) = values {
+        values.store(&mut *tx, project_id).await?;
+    }
+    let removed = match remove_entries {
+        true => {
+            let keys = owned_keys(ended)?;
+            crate::journal::postgres::remove_activation_signals(&mut *tx, project_id, &keys, crate::journal::postgres::Governed::Entries).await?
+        }
+        false => Vec::new(),
+    };
+    Ok(Some(removed))
 }
 
 /// The same test as [`wipe_forgets`], over a `trigger_activation` row
@@ -481,6 +601,13 @@ pub enum ClaimRefused {
     Claimed,
     /// With `expect`: one of the keys is missing or not in that status.
     NotExpected,
+    /// A resync holds the project: only its own claim goes through.
+    Resyncing,
+    /// The claim was a resync's, and that drive no longer holds the
+    /// project (a person gave it up, or took it up again under another).
+    ResyncGone,
+    /// `weft rm` marked the project and has not finished removing it.
+    Removing,
 }
 
 /// Whether a claim of `keys` may go ahead over the rows it read
@@ -511,19 +638,75 @@ fn key_arrays(keys:&[ActivationKey]) -> (Vec<String>, Vec<String>) {
 
 const KEYS_JOIN: &str = "(a.trigger, COALESCE(a.instance_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[]))";
 
+/// The project row as a guarded activation write holds it, locked for the
+/// rest of the write's transaction: that lock orders the write with a
+/// build, a resync's drive and a person giving a resync up.
+struct HeldProject {
+    transition: String,
+    /// The drive of the resync under way (`project.resync`).
+    driver: Option<String>,
+    /// What a resync a person gave up left down, when its record is on
+    /// the row.
+    given_up: Option<crate::task_kinds::resync::GivenUp>,
+    /// `weft rm` marked the project (`project.removing`): the row's lock
+    /// orders this write with the mark, so nothing is turned on after it.
+    removing: bool,
+}
+
+/// [`HeldProject`] as its row reads.
+type HeldRow = (String, Option<String>, Option<sqlx::types::Json<crate::task_kinds::resync::GivenUp>>, bool);
+
+/// Lock and read the project row in the caller's transaction; `None`
+/// when there is no such project.
+async fn hold_project(tx: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<Option<HeldProject>> {
+    let row: Option<HeldRow> =
+        sqlx::query_as("SELECT transition, resync->>'driver', resync->'given_up', removing FROM project WHERE id = $1 FOR UPDATE")
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    Ok(row.map(|(transition, driver, given_up, removing)| HeldProject {
+        transition,
+        driver,
+        given_up: given_up.map(|g| g.0),
+        removing,
+    }))
+}
+
+impl HeldProject {
+    /// The write goes through for `keys`: someone activating or taking
+    /// them down decided about them, so a given-up resync's record stops
+    /// naming them (`crate::task_kinds::resync::GivenUp::forget`).
+    async fn decided(self, tx: &mut sqlx::PgConnection, project_id: uuid::Uuid, keys: &[ActivationKey]) -> anyhow::Result<()> {
+        let Some(mut given_up) = self.given_up else { return Ok(()) };
+        if given_up.forget(keys) {
+            sqlx::query("UPDATE project SET resync = jsonb_set(resync, '{given_up}', $2) WHERE id = $1")
+                .bind(project_id)
+                .bind(sqlx::types::Json(&given_up))
+                .execute(&mut *tx)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// [`ActivationStoreOps::list`] on the caller's connection.
+pub(crate) async fn list_in(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<Vec<Activation>> {
+    let rows: Vec<LifecycleRow> = sqlx::query_as(
+        "SELECT trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
+                fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_execution_id, \
+                activation_program, activation_version \
+         FROM trigger_activation WHERE project_id = $1 ORDER BY trigger, instance_id NULLS FIRST",
+    )
+    .bind(project_id)
+    .fetch_all(conn)
+    .await?;
+    rows.into_iter().map(row_to_activation).collect()
+}
+
 #[async_trait]
 impl ActivationStoreOps for PostgresActivationStore {
     async fn list(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<Activation>> {
-        let rows: Vec<LifecycleRow> = sqlx::query_as(
-            "SELECT trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
-                    fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_execution_id, \
-                    activation_program, activation_version \
-             FROM trigger_activation WHERE project_id = $1 ORDER BY trigger, instance_id NULLS FIRST",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(row_to_activation).collect()
+        list_in(&mut *self.pool.acquire().await?, project_id).await
     }
 
     async fn try_begin_activating(
@@ -532,21 +715,28 @@ impl ActivationStoreOps for PostgresActivationStore {
         keys: &[ActivationKey],
         execution_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
+        resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>> {
+        use crate::project_store::ProjectTransition;
         let now = crate::lease::now_unix();
         let (triggers, instances) = key_arrays(keys);
         let mut tx = self.pool.begin().await?;
-        // The project row serializes activations with the build
-        // transition: a build refuses while any activation is mid-flip,
-        // and an activation refuses while a build is in flight.
-        let transition: Option<(String,)> =
-            sqlx::query_as("SELECT transition FROM project WHERE id = $1 FOR UPDATE")
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        match transition {
-            Some((t,)) if t == "none" => {}
-            _ => return Ok(Err(ClaimRefused::Building)),
+        // The project row serializes activations with its transition: a
+        // build refuses while any activation is mid-flip, and an activation
+        // refuses while a build is in flight; under a resync, only the
+        // resync's own drive turns triggers on.
+        let Some(held) = hold_project(&mut tx, project_id).await? else { return Ok(Err(ClaimRefused::Building)) };
+        let transition = crate::project_store::project_transition_from_str(&held.transition)?;
+        let refused = match (transition, resync) {
+            _ if held.removing => Some(ClaimRefused::Removing),
+            (t, _) if t.is_building() => Some(ClaimRefused::Building),
+            (ProjectTransition::Resyncing, Some(own)) if held.driver.as_deref() == Some(own.to_string().as_str()) => None,
+            (_, Some(_)) => Some(ClaimRefused::ResyncGone),
+            (ProjectTransition::Resyncing, None) => Some(ClaimRefused::Resyncing),
+            _ => None,
+        };
+        if let Some(refused) = refused {
+            return Ok(Err(refused));
         }
         let before: Vec<LifecycleRow> = sqlx::query_as(&format!(
             "SELECT a.trigger, a.instance_id, a.status, a.accepting_fires, a.fires_visible_to_consumers, \
@@ -563,6 +753,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         if let Err(refused) = claimable(keys, &before, expect) {
             return Ok(Err(refused));
         }
+        held.decided(&mut tx, project_id, keys).await?;
         let activating = ActivationLifecycle::activating(execution_id);
         sqlx::query(
             "INSERT INTO trigger_activation \
@@ -604,69 +795,40 @@ impl ActivationStoreOps for PostgresActivationStore {
         project_id: uuid::Uuid,
         execution_id: uuid::Uuid,
         to: &ActivationLifecycle,
-        remove_signals: bool,
+        remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
-        let owned = "project_id = $1 AND activating_execution_id = $2 AND status = 'activating'";
-        // An instance's rows landing wiped go ([`wipe_forgets`]); the rest
-        // move to `to`.
-        let mut ended: Vec<(String, Option<String>)> = if forgets_instance_rows(to) {
-            sqlx::query_as(&format!(
-                "DELETE FROM trigger_activation WHERE {owned} AND instance_id IS NOT NULL RETURNING trigger, instance_id"
-            ))
-            .bind(project_id)
-            .bind(execution_id)
-            .fetch_all(&mut *tx)
-            .await?
-        } else {
-            Vec::new()
-        };
-        let moved: Vec<(String, Option<String>)> = sqlx::query_as(
-            "UPDATE trigger_activation \
-             SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
-                 fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, \
-                 went_down_at_unix = $10, \
-                 activating_execution_id = NULL, \
-                 activation_program = CASE WHEN $1 = 'active' THEN activation_program ELSE NULL END, \
-                 activation_version = CASE WHEN $1 = 'active' THEN activation_version ELSE NULL END, \
-                 updated_at = $7 \
-             WHERE project_id = $8 AND activating_execution_id = $9 AND status = 'activating' \
-             RETURNING trigger, instance_id",
+        let ended = end_activating_in(&mut tx, project_id, execution_id, to, remove_entries, values).await?;
+        tx.commit().await?;
+        Ok(ended)
+    }
+
+    async fn end_unfinished(
+        &self,
+        project_id: uuid::Uuid,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+        let mut tx = self.pool.begin().await?;
+        let owned: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT trigger, instance_id FROM trigger_activation \
+             WHERE project_id = $1 AND activating_execution_id = $2 AND status = 'activating' FOR UPDATE",
         )
-        .bind(to.status.as_str())
-        .bind(to.accepting_fires)
-        .bind(to.fires_visible_to_consumers)
-        .bind(to.fires_deadline_unix)
-        .bind(to.went_down.map(|w| w.with.as_str()))
-        .bind(to.drain_deadline_unix)
-        .bind(crate::lease::now_unix())
         .bind(project_id)
         .bind(execution_id)
-        .bind(to.went_down.map(|w| w.at_unix))
         .fetch_all(&mut *tx)
         .await?;
-        ended.extend(moved);
-        if ended.is_empty() {
-            tx.commit().await?;
+        if owned.is_empty() {
             return Ok(None);
         }
-        if let Some(values) = values {
-            values.store(&mut tx, project_id).await?;
-        }
-        let removed = if remove_signals {
-            let keys: Vec<ActivationKey> = ended
-                .into_iter()
-                .map(|(trigger, instance)| {
-                    Ok(ActivationKey::new(trigger, Owner::from_instance(instance.map(InstanceId::new).transpose().map_err(anyhow::Error::msg)?)))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            crate::journal::postgres::remove_activation_signals(&mut *tx, project_id, &keys).await?
-        } else {
-            Vec::new()
+        let keys = owned_keys(owned)?;
+        let kept = crate::journal::postgres::activation_preservation(&mut *tx, project_id, &keys).await?;
+        let ended = match kept.parked > 0 || kept.suspended > 0 {
+            true => end_activating_in(&mut tx, project_id, execution_id, &ActivationLifecycle::parked(), false, None).await?,
+            false => end_activating_in(&mut tx, project_id, execution_id, &ActivationLifecycle::wiped(), true, None).await?,
         };
         tx.commit().await?;
-        Ok(Some(removed))
+        Ok(ended)
     }
 
     async fn restore(
@@ -747,19 +909,24 @@ impl ActivationStoreOps for PostgresActivationStore {
         keys: &[ActivationKey],
         lifecycle: &ActivationLifecycle,
         signals: SignalsGoing,
+        resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<LifecycleWrite> {
+        use crate::project_store::ProjectTransition;
         let (triggers, instances) = key_arrays(keys);
         let mut tx = self.pool.begin().await?;
-        let transition: Option<(String,)> =
-            sqlx::query_as("SELECT transition FROM project WHERE id = $1 FOR UPDATE")
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((transition,)) = transition else {
+        let Some(held) = hold_project(&mut tx, project_id).await? else {
             return Ok(LifecycleWrite::NotFound);
         };
-        if transition != "none" {
-            return Ok(LifecycleWrite::Rejected { blocker: transition });
+        let parsed = crate::project_store::project_transition_from_str(&held.transition)?;
+        if parsed.is_building() {
+            return Ok(LifecycleWrite::Rejected { blocker: held.transition });
+        }
+        // A resync takes its own triggers down under its transition, only
+        // while its drive holds it.
+        if let Some(own) = resync {
+            if parsed != ProjectTransition::Resyncing || held.driver.as_deref() != Some(own.to_string().as_str()) {
+                return Ok(LifecycleWrite::ResyncGone);
+            }
         }
         let activating: Option<(String, Option<String>)> = sqlx::query_as(&format!(
             "SELECT a.trigger, a.instance_id FROM trigger_activation a \
@@ -774,6 +941,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             let whose = instance.map(|m| format!(" of instance '{m}'")).unwrap_or_default();
             return Ok(LifecycleWrite::Rejected { blocker: format!("activating (trigger '{trigger}'{whose})") });
         }
+        held.decided(&mut tx, project_id, keys).await?;
         let forgotten: Vec<&ActivationKey> = keys.iter().filter(|k| wipe_forgets(k, lifecycle)).collect();
         if !forgotten.is_empty() {
             let (triggers, instances) = key_arrays(&forgotten.into_iter().cloned().collect::<Vec<_>>());
@@ -813,7 +981,7 @@ impl ActivationStoreOps for PostgresActivationStore {
                 crate::journal::postgres::remove_project_signals_except(&mut *tx, project_id, except).await?
             }
             SignalsGoing::Activations => {
-                crate::journal::postgres::remove_activation_signals(&mut *tx, project_id, keys).await?
+                crate::journal::postgres::remove_activation_signals(&mut *tx, project_id, keys, crate::journal::postgres::Governed::Every).await?
             }
         };
         tx.commit().await?;
@@ -867,10 +1035,11 @@ impl ActivationStoreOps for PostgresActivationStore {
     }
 
     async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>> {
-        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
-            "SELECT DISTINCT project_id, activating_execution_id FROM trigger_activation \
-             WHERE status = 'activating' AND activating_execution_id IS NOT NULL AND heartbeat_unix < $1",
-        )
+        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT a.project_id, a.activating_execution_id FROM trigger_activation a \
+             WHERE {} AND a.heartbeat_unix < $1",
+            held_by_driver_alone()
+        ))
         .bind(stale_before)
         .fetch_all(&self.pool)
         .await?;
@@ -946,6 +1115,9 @@ impl ActivationStoreOps for FakeActivationStore {
         keys: &[ActivationKey],
         execution_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
+        // The project's transition lives in the project store, which this
+        // fake does not see: it guards the build axis alone.
+        _resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>> {
         if self.building.read().await.contains(&project_id) {
             return Ok(Err(ClaimRefused::Building));
@@ -977,7 +1149,7 @@ impl ActivationStoreOps for FakeActivationStore {
         project_id: uuid::Uuid,
         execution_id: uuid::Uuid,
         to: &ActivationLifecycle,
-        _remove_signals: bool,
+        _remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         if values.is_some() {
@@ -1001,6 +1173,15 @@ impl ActivationStoreOps for FakeActivationStore {
             true
         });
         Ok(ended.then(Vec::new))
+    }
+
+    async fn end_unfinished(
+        &self,
+        project_id: uuid::Uuid,
+        execution_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+        // The fake keeps no signals, so no trigger kept any work.
+        self.end_activating(project_id, execution_id, &ActivationLifecycle::wiped(), true, None).await
     }
 
     async fn restore(
@@ -1053,6 +1234,7 @@ impl ActivationStoreOps for FakeActivationStore {
         keys: &[ActivationKey],
         lifecycle: &ActivationLifecycle,
         _signals: SignalsGoing,
+        _resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<LifecycleWrite> {
         if self.building.read().await.contains(&project_id) {
             return Ok(LifecycleWrite::Rejected { blocker: "building".into() });
@@ -1149,7 +1331,7 @@ mod tests {
 
     async fn activate(store: &FakeActivationStore, project: uuid::Uuid, key: &ActivationKey) {
         let setup = uuid::Uuid::new_v4();
-        assert!(store.try_begin_activating(project, std::slice::from_ref(key), setup, None).await.unwrap().is_ok());
+        assert!(store.try_begin_activating(project, std::slice::from_ref(key), setup, None, None).await.unwrap().is_ok());
         store.end_activating(project, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     }
 
@@ -1167,20 +1349,20 @@ mod tests {
         for k in [&shared, &ada, &bob, &cyd] {
             activate(&store, project, k).await;
         }
-        store.set_lifecycle_guarded(project, &[shared.clone(), ada.clone()], &ActivationLifecycle::wiped(), SignalsGoing::Kept).await.unwrap();
+        store.set_lifecycle_guarded(project, &[shared.clone(), ada.clone()], &ActivationLifecycle::wiped(), SignalsGoing::Kept, None).await.unwrap();
         assert_eq!(owners(&store, project).await, vec![None, Some("bob".into()), Some("cyd".into())]);
 
         let draining = ActivationLifecycle::deactivating_to(ActivationLifecycle::wiped(), i64::MAX);
-        store.set_lifecycle_guarded(project, std::slice::from_ref(&bob), &draining, SignalsGoing::Kept).await.unwrap();
+        store.set_lifecycle_guarded(project, std::slice::from_ref(&bob), &draining, SignalsGoing::Kept, None).await.unwrap();
         assert_eq!(owners(&store, project).await.len(), 3, "the row stays while it drains");
         assert!(store.cas_status(project, &bob, ProjectStatus::Deactivating, ProjectStatus::Inactive).await.unwrap());
         assert!(!store.cas_status(project, &bob, ProjectStatus::Deactivating, ProjectStatus::Inactive).await.unwrap());
 
-        store.set_lifecycle_guarded(project, std::slice::from_ref(&cyd), &ActivationLifecycle::parked(), SignalsGoing::Kept).await.unwrap();
+        store.set_lifecycle_guarded(project, std::slice::from_ref(&cyd), &ActivationLifecycle::parked(), SignalsGoing::Kept, None).await.unwrap();
         assert_eq!(owners(&store, project).await, vec![None, Some("cyd".into())]);
 
         let setup = uuid::Uuid::new_v4();
-        let previous = store.try_begin_activating(project, std::slice::from_ref(&ada), setup, None).await.unwrap().expect("claimed");
+        let previous = store.try_begin_activating(project, std::slice::from_ref(&ada), setup, None, None).await.unwrap().expect("claimed");
         assert!(previous.is_empty(), "ada activates again as never activated");
 
         // That activation cancelled (or reaped) mid-way lands wiped, so
@@ -1188,7 +1370,7 @@ mod tests {
         store.end_activating(project, setup, &ActivationLifecycle::wiped(), true, None).await.unwrap().expect("owned");
         assert_eq!(owners(&store, project).await, vec![None, Some("cyd".into())]);
         let setup = uuid::Uuid::new_v4();
-        store.try_begin_activating(project, std::slice::from_ref(&shared), setup, None).await.unwrap().expect("claimed");
+        store.try_begin_activating(project, std::slice::from_ref(&shared), setup, None, None).await.unwrap().expect("claimed");
         store.end_activating(project, setup, &ActivationLifecycle::wiped(), true, None).await.unwrap().expect("owned");
         assert_eq!(owners(&store, project).await, vec![None, Some("cyd".into())]);
     }

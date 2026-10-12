@@ -1,0 +1,5 @@
+{
+  "types": {
+    "VoicePreview": "{ voiceId: String, audio: Audio, durationSecs?: Number, language?: String }"
+  }
+}

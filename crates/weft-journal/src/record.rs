@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use weft_core::exec::CancelCause;
 use weft_core::project::selection::{RecordedSelection, RunSelection};
+use weft_core::projects::PROJECT_BEING_REMOVED;
 use weft_core::run_settings::KeepFor;
 use weft_core::ExecutionId;
 
@@ -268,9 +269,12 @@ pub enum Fate {
     /// (two workers took one fire): it is theirs, and nothing of this one
     /// went in.
     BornElsewhere,
+    /// A run that started in this batch for a project `weft rm` is
+    /// removing ([`PROJECT_BEING_REMOVED`]): nothing of it went in.
+    ProjectRemoving,
     /// Its rows do not follow on from its record under this writer (it
-    /// lost the run to another worker, or the run ended or was let go):
-    /// nothing went in.
+    /// lost the run to another worker, or the run ended or was let go), or
+    /// it started for a project that has no row: nothing went in.
     Refused,
 }
 
@@ -280,6 +284,7 @@ impl Fate {
             "accepted" => Self::Accepted,
             "already_applied" => Self::AlreadyApplied,
             "born_elsewhere" => Self::BornElsewhere,
+            "project_removing" => Self::ProjectRemoving,
             "refused" => Self::Refused,
             other => anyhow::bail!("the record answered a run with '{other}', which weft does not read"),
         })
@@ -287,15 +292,28 @@ impl Fate {
 }
 
 /// One run's answer from [`record_batch`]: its fate, its project (`None`
-/// for a run the record does not hold), and whether it ended now with
-/// somebody to tell (it is watched, or holds signals to take down).
+/// for a run the record does not hold), whether it ended now with
+/// somebody to tell (it is watched, or holds signals to take down), and,
+/// when it ended now, until when it is kept (`None` for ever, or when it
+/// did not end now).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded {
     pub execution_id: ExecutionId,
     pub fate: Fate,
     pub project_id: Option<uuid::Uuid>,
     pub tell_end: bool,
+    pub keep_until: Option<i64>,
+    /// Born running now under a writer with no live lease: nothing has
+    /// woken the dispatcher's look at lapsed holds for that worker yet, so
+    /// whoever wrote it rings it, or the run would be stranded if the
+    /// worker died before its first tick.
+    pub unwatched: bool,
 }
+
+/// One run's answer as `weft_record_batch` gives it: its id, its fate,
+/// its project, whether it ended with somebody to tell, its erase time,
+/// whether it was born unwatched.
+type RecordedRow = (ExecutionId, String, Option<uuid::Uuid>, bool, Option<i64>, bool);
 
 /// Write one batch of a worker's writer lane (`crate::frame`): every run
 /// of it in one statement and one transaction, synced to disk when the
@@ -345,14 +363,16 @@ pub async fn record_batch(
         }
     }
     let rows: Vec<&[u8]> = batch.rows.clone();
-    let answered: Vec<(ExecutionId, String, Option<uuid::Uuid>, bool)> = sqlx::query_as(
-        "SELECT o_execution_id, o_fate, o_project_id, o_tell_end FROM weft_record_batch(\
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+    let now = unix_now();
+    let answered: Vec<RecordedRow> = sqlx::query_as(
+        "SELECT o_execution_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(writer)
     .bind(tenant)
     .bind(lane)
-    .bind(unix_now())
+    .bind(now)
+    .bind(delivered_until(now))
     .bind(head.durable)
     .bind(&ids)
     .bind(&epochs)
@@ -379,7 +399,9 @@ pub async fn record_batch(
     );
     answered
         .into_iter()
-        .map(|(execution_id, fate, project_id, tell_end)| Ok(Recorded { execution_id, fate: Fate::parse(&fate)?, project_id, tell_end }))
+        .map(|(execution_id, fate, project_id, tell_end, keep_until, unwatched)| {
+            Ok(Recorded { execution_id, fate: Fate::parse(&fate)?, project_id, tell_end, keep_until, unwatched })
+        })
         .collect()
 }
 
@@ -405,7 +427,8 @@ pub struct Queued<'a> {
 /// Start `queued` on the caller's transaction: its row (`queued`, no owner,
 /// never claimed), its record's first row and its selection, and the
 /// delivery woken. `false` when the run is already on record (a retried
-/// start, by its id): nothing is written then. A queued run is started by
+/// start, by its id): nothing is written then. Errs, writing nothing, when
+/// its project has no row or is being removed. A queued run is started by
 /// hand or sets triggers up, never fired by one, so it adds nothing to its
 /// version's trigger runs (those are counted as workers bear them).
 pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> anyhow::Result<bool> {
@@ -422,12 +445,16 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     // A queued run has not run: an ending in its start would leave a row
     // that waits for a worker over a record that says it ended.
     anyhow::ensure!(written.ended.is_none(), "run {execution_id} is started with its ending");
+    // Only for a project still there and not being removed: `weft rm`
+    // marks the project first and takes its runs down after, so a run
+    // started once the mark is in would outlive the take-down.
     let inserted = sqlx::query(
         "INSERT INTO run (execution_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
              fired_by, source_version, definition_hash, binary_hash, selection, seed_of, stale, spec, example, state, \
              epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'queued', \
-             0, 0, 0, $19, $20, $21, $22, $23) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'queued', \
+             0, 0, 0, $19, $20, $21, $22, $23 \
+         WHERE EXISTS (SELECT 1 FROM project WHERE id = $2 AND NOT removing) \
          ON CONFLICT (execution_id) DO NOTHING",
     )
     .bind(execution_id)
@@ -456,7 +483,16 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
-        return Ok(false);
+        let project = born.project_id;
+        let removing: Option<bool> = sqlx::query_scalar("SELECT removing FROM project WHERE id = $1")
+            .bind(project)
+            .fetch_optional(&mut *conn)
+            .await?;
+        return match removing {
+            Some(false) => Ok(false),
+            Some(true) => anyhow::bail!("run {execution_id} is not started for project {project}: {PROJECT_BEING_REMOVED}"),
+            None => anyhow::bail!("run {execution_id} is started for project {project}, which has no row: it was removed, or was never registered"),
+        };
     }
     sqlx::query("INSERT INTO run_log (execution_id, seq, events, writer, written_at) VALUES ($1, 0, $2, $3, $4)")
         .bind(execution_id)
@@ -527,6 +563,10 @@ pub struct Locked {
     pub epoch: i32,
     pub keep_for: Option<i64>,
     pub definition_hash: Option<String>,
+    /// Its workers failed its delivery since it was last claimed, which
+    /// only a queued run carries (`run.waited_on_workers`): read when it
+    /// leaves the queue, never for whether it still waits on them now.
+    pub waited_on_workers: bool,
 }
 
 /// Lock `execution_id`'s row on the caller's transaction (`FOR UPDATE`),
@@ -534,7 +574,7 @@ pub struct Locked {
 /// owner goes through.
 pub async fn lock_in(conn: &mut PgConnection, execution_id: ExecutionId) -> anyhow::Result<Option<Locked>> {
     Ok(sqlx::query_as(
-        "SELECT project_id, tenant_id, state, keeping, owner, last_seq, epoch, keep_for, definition_hash \
+        "SELECT project_id, tenant_id, state, keeping, owner, last_seq, epoch, keep_for, definition_hash, waited_on_workers \
          FROM run WHERE execution_id = $1 FOR UPDATE",
     )
     .bind(execution_id)
@@ -599,15 +639,17 @@ pub async fn append_locked_in(
         (None, Then::Stays) => locked.state.as_str(),
     };
     // Announced through the outbox (`weft_announce`), which its writer
-    // pokes once it commits: its new row for the live view, and its ending
-    // when somebody waits on it.
-    let tell_end: bool = sqlx::query_scalar(
+    // pokes once it commits: its new row for the live view, its ending
+    // when somebody waits on it, and, when it ends to be erased, to
+    // retention.
+    let (tell_end, erased_later): (bool, bool) = sqlx::query_as(
         "UPDATE run SET last_seq = $2, state = $3, cost_micro_usd = cost_micro_usd + $4, skipped = skipped + $5, \
              ended_at = $6, outcome = $7, error = $8, cancel_cause = $9, keep_until = $6 + keep_for, \
-             delivered_until = NULL, \
+             delivered_until = NULL, busy_since = CASE WHEN $6 IS NULL THEN busy_since END, \
+             waited_on_workers = waited_on_workers AND $6 IS NULL, \
              holds_signals = ($6 IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.execution_id = $1)) \
          WHERE execution_id = $1 \
-         RETURNING $6 IS NOT NULL AND (watch_end OR holds_signals)",
+         RETURNING $6 IS NOT NULL AND (watch_end OR holds_signals), $6 IS NOT NULL AND keep_for IS NOT NULL",
     )
     .bind(execution_id)
     .bind(if events.is_empty() { locked.last_seq } else { seq })
@@ -630,6 +672,10 @@ pub async fn append_locked_in(
         channels.push(crate::RUN_ENDED_CHANNEL);
         payloads.extend(crate::run_ended_payloads([&execution_id]));
     }
+    if erased_later {
+        channels.push(crate::RETENTION_CHANNEL);
+        payloads.push(String::new());
+    }
     if !channels.is_empty() {
         sqlx::query("SELECT weft_announce(c, p) FROM unnest($1::text[], $2::text[]) AS t(c, p)")
             .bind(&channels)
@@ -645,6 +691,13 @@ pub async fn append_locked_in(
             .bind(&written.resolved)
             .execute(&mut *conn)
             .await?;
+    }
+    if ended.is_some() && locked.waited_on_workers {
+        // A queued run its workers had failed (busy, refused, not reached)
+        // ended without reaching one: what `weft status` shows of them
+        // goes with it, as a claim's does, unless another queued run still
+        // waits on them.
+        weft_task_store::unanswered::delivery_waits_ended(&mut *conn, locked.project_id).await?;
     }
     if ended.is_some() {
         // An answer handed to the run that it never took has nobody left
@@ -704,9 +757,12 @@ pub enum GaveUp {
 }
 
 /// End `execution_id`, a run `owner` drives but whose record it can no
-/// longer write (a write of it failed): its owner is cleared and its
-/// ending, failed with `why`, is written after the last row that landed,
-/// on the caller's transaction. Refused when `owner` does not drive it.
+/// longer write (a write of it failed): its owner is cleared and, after
+/// the last row that landed, every charge its record leaves open is booked
+/// unknown (`crate::fold::unpriced_charges_closed`: the worker's own
+/// booking of them could not be written) and its ending, failed with
+/// `why`, is written, on the caller's transaction. Refused when `owner`
+/// does not drive it.
 pub async fn give_up_in(conn: &mut PgConnection, execution_id: ExecutionId, owner: &str, why: &str) -> anyhow::Result<GaveUp> {
     let Some(mut locked) = lock_in(conn, execution_id).await? else { return Ok(GaveUp::NotOwned) };
     if locked.state != "running" || locked.owner.as_deref() != Some(owner) {
@@ -714,8 +770,26 @@ pub async fn give_up_in(conn: &mut PgConnection, execution_id: ExecutionId, owne
     }
     sqlx::query("UPDATE run SET owner = NULL WHERE execution_id = $1").bind(execution_id).execute(&mut *conn).await?;
     locked.owner = None;
-    let ending = ExecEvent::ExecutionFailed { execution_id, error: why.to_string(), at_unix: unix_now() as u64 };
-    match append_locked_in(conn, execution_id, &locked, std::slice::from_ref(&ending), GAVE_UP, Then::Stays).await? {
+    let at_unix = unix_now() as u64;
+    // A record that does not read still ends: the run's ending is what
+    // matters most, and the charges it may leave open are said lost.
+    let mut writes = match read_record(&mut *conn, execution_id, None).await?.events(execution_id) {
+        Ok(record) => crate::fold::unpriced_charges_closed(
+            execution_id,
+            &record,
+            "the run's record could not be written, so it ended before the job was read back",
+            at_unix,
+        ),
+        Err(e) => {
+            tracing::error!(
+                target: "weft_journal::record", %execution_id, error = %e,
+                "a run given up has a record that does not read; any charge it left open stays off its cost trail"
+            );
+            Vec::new()
+        }
+    };
+    writes.push(ExecEvent::ExecutionFailed { execution_id, error: why.to_string(), at_unix });
+    match append_locked_in(conn, execution_id, &locked, &writes, GAVE_UP, Then::Stays).await? {
         Appended::At(seq) => Ok(GaveUp::Ended(seq)),
         other => anyhow::bail!("run {execution_id} was locked running with no owner, yet its ending was not written: {other:?}"),
     }
@@ -735,28 +809,59 @@ pub struct Claimed {
 }
 
 /// What a claim reads off the run row: its new epoch, its attempts, its
-/// program, and a cancel already asked for.
-type ClaimedRow = (i32, i32, Option<String>, Option<sqlx::types::Json<CancelCause>>);
+/// program, a cancel already asked for, and whether its workers failed it
+/// since its last claim (`run.waited_on_workers`).
+type ClaimedRow = (i32, i32, Option<String>, Option<sqlx::types::Json<CancelCause>>, bool);
+
+/// Until when a run claimed or born by a worker at `now` counts as
+/// delivered to that worker though its lease is not written yet
+/// (`run.delivered_until`): one lease length at this install's pace. The
+/// worker's first tick lands well within it, and the lost-run sweep leaves
+/// the run alone until then (`weft_task_store::run_held_until_sql!`).
+pub fn delivered_until(now: i64) -> i64 {
+    now + weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS)
+}
 
 /// Claim queued run `execution_id` of `project_id` for `owner`: it is
-/// running, owned by `owner` under a raised epoch, its delivery done.
-/// `None` when it is not queued (another worker claimed it, it ended, it
-/// is not this project's). A claim `owner` holds already is given again
+/// running, owned by `owner` under a raised epoch, and it counts as
+/// `owner`'s until [`delivered_until`] whatever its lease says; the tries
+/// its delivery counted (refusals, hand-offs with no answer, a stretch of
+/// busy answers) start again from none, and so does the mark that its
+/// workers failed it (`run.waited_on_workers`), so only a queued run ever
+/// carries them. A run carrying that mark reaching a worker ends what
+/// `weft status` shows of the project's workers, once no other queued run
+/// of the project waits on them
+/// (`weft_task_store::unanswered::delivery_waits_ended`): the mark, not
+/// the counts, since its tries starting again (a worker coming alive, a
+/// build registering) reset the counts while the failure they counted
+/// is still what `weft status` shows. `None` when it is not queued
+/// (another worker claimed it, it ended, it is not this project's). A claim `owner` holds already is given again
 /// under a new epoch: the answer of one that committed may have been lost
 /// on its way, and the worker never drives a run twice (it asks only for
 /// a run it is not driving), so nothing was written under the old epoch.
 pub async fn claim(conn: &mut PgConnection, execution_id: ExecutionId, project_id: uuid::Uuid, owner: &str) -> anyhow::Result<Option<Claimed>> {
+    // The row is locked first and its mark read off the version the lock
+    // waited for (a `busy` that committed meanwhile included), then
+    // cleared by the update, in one statement.
     let claimed: Option<ClaimedRow> = sqlx::query_as(
-        "UPDATE run SET state = 'running', owner = $3, epoch = epoch + 1, attempts = attempts + 1, delivered_until = NULL \
-         WHERE execution_id = $1 AND project_id = $2 AND (state = 'queued' OR (state = 'running' AND owner = $3)) \
-         RETURNING epoch, attempts, definition_hash, cancel_requested",
+        "WITH was AS (SELECT waited_on_workers FROM run \
+                      WHERE execution_id = $1 AND project_id = $2 AND (state = 'queued' OR (state = 'running' AND owner = $3)) \
+                      FOR UPDATE) \
+         UPDATE run SET state = 'running', owner = $3, epoch = epoch + 1, attempts = attempts + 1, delivered_until = $4, \
+             refusals = 0, unreached = 0, busy_since = NULL, waited_on_workers = FALSE \
+         FROM was WHERE run.execution_id = $1 \
+         RETURNING run.epoch, run.attempts, run.definition_hash, run.cancel_requested, was.waited_on_workers",
     )
     .bind(execution_id)
     .bind(project_id)
     .bind(owner)
+    .bind(delivered_until(unix_now()))
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((epoch, attempts, definition_hash, cancel_requested)) = claimed else { return Ok(None) };
+    let Some((epoch, attempts, definition_hash, cancel_requested, waited_on_workers)) = claimed else { return Ok(None) };
+    if waited_on_workers {
+        weft_task_store::unanswered::delivery_waits_ended(&mut *conn, project_id).await?;
+    }
     let definition_hash = definition_hash.ok_or_else(|| anyhow::anyhow!("run {execution_id} runs no program, so no worker can claim it"))?;
     let record = read_record(conn, execution_id, None).await?;
     Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0), record }))
@@ -860,6 +965,7 @@ mod tests {
             billed: false,
             origin: weft_core::CredentialOwner::Platform,
             metadata: serde_json::Value::Null,
+            charge: None,
             at_unix: 1,
         };
         let events = vec![

@@ -178,7 +178,7 @@ async fn store_then_rearm(
     let (moved, live) = loop {
         // Subscribed before looking, so a claim ending between the look
         // and the wait still wakes it.
-        let mut events = state.events.subscribe_project(project_id).await;
+        let mut heard = state.signals.subscribe();
         let mut tx = state.pg_pool.begin().await.map_err(|e| access_error(e.into()))?;
         let locked: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM project WHERE id = $1 FOR UPDATE")
             .bind(project_id)
@@ -200,7 +200,7 @@ async fn store_then_rearm(
         };
         if reading.iter().any(|a| a.lifecycle.status == ProjectStatus::Activating) {
             drop(tx);
-            wait_for_activations(&mut events).await;
+            wait_for_activations(&mut heard).await?;
             continue;
         }
         let moved = match &store {
@@ -226,7 +226,17 @@ async fn store_then_rearm(
                 .collect::<Vec<ActivationKey>>(),
         );
     };
-    Ok((moved, rearm(state, project_id, &live).await?))
+    let rearmed = rearm(state, project_id, &live).await;
+    // The events that waited on a pick go again on what is stored now,
+    // whichever trigger they wait in (a pick a run reads re-arms nothing):
+    // each waits again if what it lacks is still not picked.
+    crate::parked_drain::drain_waiting_on(state, weft_core::door_fire::UnclockedWait::Picks, Some(project_id)).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the pick is stored, but the events that waited on it could not be handed over ({e:#}); the next change of a pick hands them over"),
+        )
+    })?;
+    Ok((moved, rearmed?))
 }
 
 /// What an activation checks of the install's picks before any trigger
@@ -274,7 +284,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         // The picks are already stored: the setup reads them there.
         let rearm = crate::api::project::Rearm { overlay: None, store: None };
         loop {
-            let mut events = state.events.subscribe_project(project_id).await;
+            let mut heard = state.signals.subscribe();
             let request = weft_core::activation::ActivateRequest {
                 scope: weft_core::activation::ActivationScope { triggers: triggers.clone(), instance: owner.instance().cloned() },
                 ..Default::default()
@@ -285,11 +295,13 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
                     break;
                 }
                 Err(crate::api::project::ActivateError::Refused(ClaimRefused::Claimed)) => {
-                    wait_for_activations(&mut events).await;
+                    wait_for_activations(&mut heard).await?;
                 }
                 Err(crate::api::project::ActivateError::Refused(ClaimRefused::NotExpected)) => break,
                 Err(error @ (crate::api::project::ActivateError::Failed(..)
-                | crate::api::project::ActivateError::Refused(ClaimRefused::Building))) => {
+                | crate::api::project::ActivateError::Refused(
+                    ClaimRefused::Building | ClaimRefused::Resyncing | ClaimRefused::ResyncGone | ClaimRefused::Removing,
+                ))) => {
                     let (_, why) = <(StatusCode, String)>::from(error);
                     let whose = match owner.instance() {
                         Some(instance) => format!(" (instance {instance})"),

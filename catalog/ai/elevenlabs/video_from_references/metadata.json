@@ -1,0 +1,176 @@
+{
+  "type": "ElevenLabsVideoFromReferences",
+  "label": "Video From References",
+  "description": "Make a video from a prompt and material you give it, using the video models ElevenLabs serves (Google Veo 3.1, ByteDance Seedance). Give it images of what should appear in the video; on Veo, also images whose visual style to copy; on Seedance, clips to borrow motion from and sounds to use. For a video that opens or ends on a given image, use Generate Video: no model takes frames and references together. If you set something the model does not take, the call is refused before anything is charged. Needs your own ElevenLabs account on a Pro plan or above.",
+  "tags": [
+    "ai",
+    "video",
+    "generation",
+    "reference"
+  ],
+  "icon": "Film",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
+      "required": true,
+      "requiresScopes": [
+        "image_video"
+      ],
+      "description": "Your own ElevenLabs account: wire an ElevenLabsAccess node whose connection has \"Images and video\" ticked. weft's built-in connection cannot make images or videos, and each one is paid from this account's credits."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "widget": {
+        "kind": "textarea"
+      },
+      "required": true,
+      "description": "What happens in the video, and how the material you give it appears in it.",
+      "placeholder": "The mug from the photo turns slowly on a wooden table, soft morning light"
+    },
+    {
+      "name": "subjects",
+      "type": "Image | List[Image]",
+      "description": "Images of what appears in the video, like a person or a product. Up to 3 on Veo, counting `styles`. Up to 9 on Seedance 2.0, and no more than 12 files once clips and sounds are counted too. Up to 30 on Seedance 2.5."
+    },
+    {
+      "name": "styles",
+      "type": "Image | List[Image]",
+      "description": "Veo only: images whose visual style the video copies. Up to 3 images in all, counting `subjects`."
+    },
+    {
+      "name": "videos",
+      "type": "Video | List[Video]",
+      "description": "Seedance only: clips to take motion or subjects from. Seedance 2.0 takes up to 3, at most 15 seconds together; Seedance 2.5 up to 10, at most 30 seconds together."
+    },
+    {
+      "name": "audios",
+      "type": "Audio | List[Audio]",
+      "description": "Seedance only: audio to use, such as speech a subject lip-syncs to. Seedance 2.0 takes up to 3, at most 15 seconds together, and needs a subject or a clip with them; Seedance 2.5 takes up to 10, at most 30 seconds together, and can use them alone."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "default": "veo-3.1-fast-generate-001",
+      "label": "Model",
+      "description": "veo-3.1-fast-generate-001 (Veo 3.1 Fast) is the quick one, for previews and iteration; veo-3.1-generate-001 is the high-quality one. Seedance 2.5 takes the most material and makes the longest videos, up to 30 seconds; the fast and mini Seedance 2.0 models stop at 720p. The Seedance (ByteDance) models are refused with `model_access_denied` until ElevenLabs approves your workspace (ask ElevenLabs support for access), and are not offered in the United States.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "veo-3.1-fast-generate-001",
+          "veo-3.1-generate-001",
+          "bytedance-seedance-v2",
+          "bytedance-seedance-v2-fast",
+          "bytedance-seedance-v2-mini",
+          "bytedance-seedance-v2.5"
+        ]
+      }
+    },
+    {
+      "name": "durationSecs",
+      "type": "Number",
+      "label": "Duration (seconds)",
+      "description": "On Veo, leave it empty or set 8: it makes only 8-second videos from references. On Seedance, leave it empty for 5; Seedance 2.0 takes 4 to 15, Seedance 2.5 4 to 30.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 30,
+        "step": 1
+      }
+    },
+    {
+      "name": "aspectRatio",
+      "type": "String",
+      "label": "Aspect ratio",
+      "description": "Leave empty for 16:9. Veo takes only 16:9 and 9:16. `auto` (Seedance only) lets the model match the material you give it.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "auto",
+          "16:9",
+          "9:16",
+          "1:1",
+          "4:3",
+          "3:4",
+          "21:9"
+        ]
+      }
+    },
+    {
+      "name": "resolution",
+      "type": "String",
+      "label": "Resolution",
+      "description": "Leave empty for 720p. Veo takes 720p, 1080p and 4K; Seedance 2.0 takes 480p, 720p, 1080p and 4K, but its fast and mini models only 480p and 720p; Seedance 2.5 takes 480p, 720p and 1080p. 4K and 4k both work.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "480p",
+          "720p",
+          "1080p",
+          "4K"
+        ]
+      }
+    },
+    {
+      "name": "generateAudio",
+      "type": "Boolean",
+      "default": true,
+      "label": "Sound",
+      "description": "The model makes a soundtrack along with the picture. If you want a silent video, untick it."
+    },
+    {
+      "name": "negativePrompt",
+      "type": "String",
+      "label": "Negative prompt",
+      "description": "Veo only: what the video should avoid."
+    },
+    {
+      "name": "promptAsWritten",
+      "type": "Boolean",
+      "default": false,
+      "label": "Use prompt as written",
+      "description": "Veo only. Veo may rewrite your prompt to improve it; if you want it used exactly as you wrote it, tick this."
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "description": "Veo and Seedance 2.0 only. If you want to be able to make a similar video again, set any whole number here, then run again with that number and the same inputs. Leave empty for a new random seed each run.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 9007199254740992,
+        "step": 1
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "video",
+      "type": "Video",
+      "description": "The generated video, kept for 30 days after it was last read."
+    }
+  ],
+  "features": {
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "subjects",
+        "styles",
+        "videos",
+        "audios"
+      ]
+    ]
+  },
+  "display": {
+    "kind": "media",
+    "output": "video"
+  }
+}

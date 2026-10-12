@@ -128,6 +128,23 @@ pub struct RehydrateRequest {
 pub struct StartRequest {
     pub token: String,
     pub mode: StartMode,
+    /// The row this one replaced under the same token, when the write
+    /// that came before this start replaced one (a registration again, or
+    /// the put-back of the row a failed one replaced): its wakes are
+    /// cancelled before the new row's are set, so a wake set for the old
+    /// spec never goes off. `None` for a token's first row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<ReplacedSignal>,
+}
+
+/// What a start needs of the row it replaced to cancel the wakes that row
+/// set: the moments are computed from its spec and state, and named with
+/// its registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplacedSignal {
+    pub spec: SignalSpec,
+    pub kind_state: Value,
+    pub generation: i64,
 }
 
 /// What the row being started is, which decides how hard the kind may
@@ -206,6 +223,11 @@ pub struct UnregisterRequest {
     pub tenant_id: String,
     pub spec: SignalSpec,
     pub kind_state: Value,
+    /// The removed row's registration (`signal.generation`), which names
+    /// the wakes it had set, so they are cancelled with it. 0 from an
+    /// older dispatcher, whose wakes were named without one.
+    #[serde(default)]
+    pub generation: i64,
     /// The token comes back up right after (a registration replaced this
     /// row with one served the other way round): the answer waits for the
     /// teardown, which is keyed by the token, so it is over before anything

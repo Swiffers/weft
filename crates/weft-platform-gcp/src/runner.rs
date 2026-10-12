@@ -25,6 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use weft_platform_traits::config::GcpPlatform;
+use weft_platform_traits::runner::PlatformRefused;
 use weft_platform_traits::{Patience, Runner, WorkerEndpoint, WorkerSettings, WorkerStarting, WorkerTarget};
 
 use crate::api::{is_status, Google};
@@ -36,6 +37,10 @@ use crate::names;
 /// wait stops before its line reaches it (`weft_broker_client::line`).
 // SYNC: REQUEST_CAP <-> deploy/terraform/gcp/serverless.tf (google_cloud_run_v2_service.role timeout)
 pub const REQUEST_CAP: Duration = Duration::from_secs(3600);
+
+/// How long Cloud Run lets a stopping instance run after it sends
+/// SIGTERM, before it kills it. Cloud Run's own figure, not one weft sets.
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a bring-up waits for a deploy in flight to settle, and how
 /// often it looks. Cloud Run settles a revision in minutes; past this the
@@ -50,8 +55,40 @@ const SETTLE_POLL: Duration = Duration::from_secs(5);
 const CALLER_HOLD: Duration = Duration::from_secs(20);
 
 /// A bring-up's outcome as every caller sharing it reads it: the address,
-/// or the failure in words (an `anyhow::Error` cannot be shared).
-type Landed = Option<Result<String, String>>;
+/// or the failure ([`Fault`]).
+type Landed = Option<Result<String, Fault>>;
+
+/// A failed bring-up as every caller sharing it reads it (an
+/// `anyhow::Error` cannot be shared): the failure in words, and whether
+/// Google refused weft's call ([`REFUSING_STATUSES`]), which each caller
+/// hears as [`PlatformRefused`].
+#[derive(Debug, Clone)]
+struct Fault {
+    words: String,
+    refused: bool,
+}
+
+/// What Google answers when it refuses weft's call rather than failing to
+/// handle it: an invalid request, a call it would not authenticate,
+/// permission denied. A 429 is not one: Google answers it for a passing
+/// rate limit as much as for a quota, so it counts as no answer, whose
+/// tries stop and wait for something that can fix it instead of ending
+/// the run.
+const REFUSING_STATUSES: [u16; 3] = [400, 401, 403];
+
+impl Fault {
+    fn of(e: &anyhow::Error) -> Self {
+        Self { words: format!("{e:#}"), refused: REFUSING_STATUSES.iter().any(|status| is_status(e, *status)) }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        if self.refused {
+            anyhow::Error::new(PlatformRefused { why: self.words })
+        } else {
+            anyhow::anyhow!(self.words)
+        }
+    }
+}
 
 /// The bring-ups in flight in this process, one per service name
 /// and spec: however many deliveries and live callers want the same one,
@@ -90,11 +127,11 @@ impl Flights {
         let started = std::time::Instant::now();
         let landing = Landing { flights: self.clone(), key };
         tokio::spawn(async move {
-            let landed = bring_up.await.map_err(|e| format!("{e:#}"));
+            let landed = bring_up.await.map_err(|e| Fault::of(&e));
             let (name, took) = (&landing.key.0, started.elapsed());
             match &landed {
                 Ok(at) => tracing::info!(target: "weft_platform_gcp::runner", %name, ?took, %at, "the program's worker is up"),
-                Err(e) => tracing::warn!(target: "weft_platform_gcp::runner", %name, ?took, error = %e, "bringing up the program's worker failed"),
+                Err(e) => tracing::warn!(target: "weft_platform_gcp::runner", %name, ?took, error = %e.words, refused = e.refused, "bringing up the program's worker failed"),
             }
             // Out of the map before the outcome is sent, so a caller that
             // reads the outcome and asks again starts afresh.
@@ -110,7 +147,7 @@ impl Flights {
         let landed = async {
             match rx.wait_for(Option::is_some).await {
                 Ok(landed) => landed.clone().expect("waited for an outcome"),
-                Err(_) => Err(format!("the bring-up of {what} stopped without an outcome")),
+                Err(_) => Err(Fault { words: format!("the bring-up of {what} stopped without an outcome"), refused: false }),
             }
         };
         let landed = match patience {
@@ -119,7 +156,7 @@ impl Flights {
                 .await
                 .map_err(|_| anyhow::Error::new(WorkerStarting { what: what.to_string() }))?,
         };
-        landed.map_err(|e| anyhow::anyhow!(e))
+        landed.map_err(Fault::into_error)
     }
 }
 
@@ -365,7 +402,8 @@ impl CloudRunRunner {
     // SYNC: the worker's environment <-> crates/weft-compiler/src/codegen.rs (write_main_rs Args),
     //       crates/weft-platform-local/src/runner.rs (worker_env),
     //       crates/weft-core/src/caller_token.rs (ProjectSecret::from_env),
-    //       crates/weft-engine/src/worker.rs (identity_from_env)
+    //       crates/weft-engine/src/worker.rs (identity_from_env),
+    //       crates/weft-engine/src/test_runner.rs (Args::Serve run_cap_secs, the test server's WEFT_RUN_CAP_SECS)
     fn container(&self, target: &WorkerTarget) -> Value {
         let secret = self.secret_of(target.project);
         let mut env = vec![
@@ -484,7 +522,6 @@ impl CloudRunRunner {
     /// Past the memo, the work is one shared bring-up per service and tag
     /// ([`Flights`]).
     async fn ensure(&self, target: &WorkerTarget, patience: Patience) -> anyhow::Result<String> {
-        target.settings.validate().map_err(|e| anyhow::anyhow!("project {}: {e}", target.project))?;
         let key = (names::worker_service(target.project), Self::tag_of(target));
         if let Some(known) = self.known.lock().get(&key) {
             return Ok(known.address.clone());
@@ -790,7 +827,10 @@ mod tests {
             build_bucket: "acme-weft-builds".into(),
             builder_service_account: "weft-builder@acme.iam.gserviceaccount.com".into(),
             tasks_queue: "weft-wakes".into(),
+            wake_attempts: 20,
+            ticks_queue: "weft-ticks".into(),
             news_topic: "weft-news".into(),
+            holders_topic: "weft-holders".into(),
             core_service_account: "weft-core@acme.iam.gserviceaccount.com".into(),
             holder_pool: "projects/acme/locations/us-central1/workerPools/weft-holder".into(),
             dispatcher_service: "weft-role-dispatcher".into(),
@@ -800,6 +840,7 @@ mod tests {
             workload_identity_provider: "w".into(),
             infra_network_tag: "weft-infra".into(),
             build_machine: None,
+            alerts: true,
         }
     }
 
@@ -977,6 +1018,32 @@ mod tests {
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1, "the second caller joined the first bring-up");
         assert!(flights.inflight.lock().is_empty(), "a landed bring-up leaves the map");
         let failed = flights.join(key(), || async { anyhow::bail!("the revision crashed") });
-        assert_eq!(format!("{:#}", flights.wait(failed, Patience::ToTheEnd, "svc").await.unwrap_err()), "the revision crashed");
+        let crashed = flights.wait(failed, Patience::ToTheEnd, "svc").await.unwrap_err();
+        assert_eq!(format!("{crashed:#}"), "the revision crashed");
+        assert!(!PlatformRefused::is(&crashed), "a failure Google did not refuse is no refusal");
+    }
+
+    /// Google refusing weft's call, under whatever context the bring-up
+    /// added, reaches every caller sharing it as `PlatformRefused`; Google
+    /// failing to handle it (a 503) does not.
+    #[tokio::test]
+    async fn google_refusing_the_bring_up_reaches_its_callers_as_a_refusal() {
+        let flights = Arc::new(Flights::new(Duration::from_millis(20)));
+        let answered = |status: u16| {
+            let flights = flights.clone();
+            async move {
+                let rx = flights.join(("svc".to_string(), status.to_string()), move || async move {
+                    Err(anyhow::Error::new(crate::api::ApiError { status, body: "no".into() }).context("deploy svc's revision"))
+                });
+                flights.wait(rx, Patience::ToTheEnd, "svc").await.unwrap_err()
+            }
+        };
+        for status in REFUSING_STATUSES {
+            let refused = answered(status).await;
+            assert!(PlatformRefused::is(&refused), "{status}: {refused:#}");
+            assert!(format!("{refused:#}").contains(&format!("Google answered {status}")), "{refused:#}");
+        }
+        assert!(!PlatformRefused::is(&answered(503).await));
+        assert!(!PlatformRefused::is(&answered(429).await), "a rate limit is no answer, not a refusal");
     }
 }

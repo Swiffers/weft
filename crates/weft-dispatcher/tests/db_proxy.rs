@@ -55,7 +55,7 @@ async fn a_request_waiting_on_its_upstream_holds_the_watch_no_longer(pool: PgPoo
     request.extensions_mut().insert(ConnectInfo::<SocketAddr>("127.0.0.1:1".parse().unwrap()));
     let call = tokio::spawn(door.oneshot(request));
     tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("the upstream was reached");
-    assert!(!watch.worked_since(tokio::time::Instant::now()), "nothing holds the watch while the upstream answers");
+    assert!(!watch.holds(), "nothing holds the watch while the upstream answers");
     release.notify_one();
     let answer = call.await.unwrap().unwrap();
     assert_eq!(axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap(), "answered");

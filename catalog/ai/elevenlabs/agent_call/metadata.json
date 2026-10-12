@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsAgentCall",
   "label": "Agent: Place Call",
-  "description": "Place an outbound phone call with a configured ElevenLabs voice agent. The agent holds the conversation on its own; wire the conversation id into Agent: Get Conversation for the transcript.",
+  "description": "Place an outbound phone call with an ElevenLabs voice agent, from a Twilio, Exotel or SIP trunk number on the account. The agent holds the conversation on its own; wire the conversation id into Agent: Get Conversation for the transcript.",
   "tags": [
     "ai",
     "audio",
@@ -66,7 +66,7 @@
       },
       "label": "From number",
       "placeholder": "Pick an imported number, or paste its id",
-      "description": "The agent's imported phone number (Agents > Phone Numbers)."
+      "description": "The number the call comes from: one imported on the account (Agents > Phone Numbers), from Twilio, Exotel or a SIP trunk."
     },
     {
       "name": "toNumber",
@@ -79,19 +79,112 @@
     {
       "name": "dynamicVariables",
       "type": "JsonDict",
-      "description": "Values for the agent prompt's {{variables}}, e.g. { \"customer_name\": \"Ada\" }."
+      "description": "Values for the agent prompt's {{variables}} on this call, e.g. { \"customer_name\": \"Ada\" }."
+    },
+    {
+      "name": "firstMessage",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "label": "First message",
+      "description": "What the agent says first on this call, in place of its own first message. An empty text makes it wait for the other side to speak first. The agent must allow it: `agent.first_message` in Agent: Create's `allowOverrides`."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "description": "The system prompt for this call, in place of the agent's own. The agent must allow it: `agent.prompt.prompt` in Agent: Create's `allowOverrides`."
+    },
+    {
+      "name": "language",
+      "type": "String",
+      "placeholder": "en",
+      "description": "The language for this call as an ISO code, like `fr`, in place of the agent's own. The agent must allow it: `agent.language` in Agent: Create's `allowOverrides`."
+    },
+    {
+      "name": "voice",
+      "type": "String",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/voices",
+            "items": "voices",
+            "label": "name",
+            "value": "voice_id"
+          }
+        ]
+      },
+      "label": "Voice",
+      "placeholder": "Pick a voice, or paste a voice id",
+      "description": "The voice for this call, in place of the agent's own. The agent must allow it: `tts.voice_id` in Agent: Create's `allowOverrides`."
+    },
+    {
+      "name": "userId",
+      "type": "String",
+      "label": "User id",
+      "description": "Your own id for the person called, kept on the conversation so you can find their calls later."
+    },
+    {
+      "name": "branchId",
+      "type": "String",
+      "label": "Branch",
+      "description": "The id of the agent branch to use for this call."
+    },
+    {
+      "name": "environment",
+      "type": "String",
+      "description": "The environment whose variables this call uses. Leave empty for ElevenLabs's default, production."
+    },
+    {
+      "name": "clientData",
+      "type": "JsonDict",
+      "label": "More call settings",
+      "widget": { "kind": "code", "language": "json" },
+      "description": "Any other setting for this call, written as the JSON ElevenLabs takes in `conversation_initiation_client_data`: more changes in `conversation_config_override` (each one the agent must allow), `starting_workflow_node_id`, `procedure_ids`, `custom_llm_extra_body`. The inputs above go on top of it: objects merge key by key, and where both set the same key, the input wins."
+    },
+    {
+      "name": "ringingTimeoutSecs",
+      "type": "Number",
+      "label": "Ring for",
+      "widget": { "kind": "number", "min": 1, "max": 999, "step": 1 },
+      "description": "How many seconds to ring before giving up, from 1 to 999; the number's provider may cut it shorter. Leave empty for ElevenLabs's default, 60."
+    },
+    {
+      "name": "recordCall",
+      "type": "Boolean",
+      "default": false,
+      "label": "Record on Twilio",
+      "description": "Turn on to have Twilio record the call; the recording is stored in your Twilio account. Twilio numbers only."
+    },
+    {
+      "name": "answeringMachineDetection",
+      "type": "String",
+      "label": "Detect answering machines",
+      "widget": {
+        "kind": "select",
+        "options": ["enable", "detect_message_end"]
+      },
+      "description": "Twilio's own check for an answering machine. `enable` gives a verdict as soon as Twilio can tell a person from a machine; `detect_message_end` also waits for the greeting to finish, so it answers later. The verdict comes as ElevenLabs's `answering_machine_detection` webhook event, which has to be turned on in the workspace or agent webhook settings; it is not part of the conversation. Twilio bills for it separately. Twilio numbers only; leave empty for no check."
     }
   ],
   "outputs": [
     {
       "name": "conversationId",
       "type": "String",
-      "description": "The conversation's id: what Get Conversation takes."
+      "description": "The conversation's id: what Agent: Get Conversation takes."
     },
     {
       "name": "callSid",
       "type": "String",
-      "description": "The telephony call id (Twilio numbers)."
+      "description": "The call's id at Twilio or Exotel (its CallSid), on a call from one of their numbers."
+    },
+    {
+      "name": "sipCallId",
+      "type": "String",
+      "description": "The call's SIP id, on a call from a SIP trunk number."
     }
   ],
   "features": {

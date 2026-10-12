@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use weft_core::access::client::{authed_client, base_client, resolve_steps};
+use weft_core::access::client::{authed_client, base_client, resolve_steps, RefusalKind};
 use weft_core::access::spec::{
     lookup_path, Acquisition, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
     VerificationRung,
@@ -148,22 +148,14 @@ pub async fn list_grants(
         .collect()
 }
 
-/// Delete pending-connect and parked-result rows past the TTL. The TTL
-/// was only ever checked on read, so an abandoned consent and an
-/// unpolled result would otherwise live forever; the periodic sweep
-/// (mirroring the broker's expiry sweeps) is what actually reclaims
-/// them. Returns how many rows died, for the sweep's log line.
-pub async fn sweep_expired_connects(pool: &PgPool) -> anyhow::Result<u64> {
-    let cutoff = chrono::Utc::now() - CONNECT_TTL;
-    let mut swept = 0;
-    for table in ["access_connect", "access_connect_result", "access_picker"] {
-        swept += sqlx::query(&format!("DELETE FROM {table} WHERE created_at < $1"))
-            .bind(cutoff)
-            .execute(pool)
-            .await?
-            .rows_affected();
-    }
-    Ok(swept)
+/// The `WITH` clause that deletes `table`'s rows past their life (made
+/// before the bind `cutoff_param`, [`CONNECT_TTL`] ago) in the statement
+/// that adds one to it: an abandoned consent, picker or unpolled result
+/// goes when the next one of its kind is made, with no timer looking for
+/// it, and a read that finds one past its life deletes it. Named
+/// `pruned`, for a statement that adds clauses of its own after it.
+fn pruning(table: &str, cutoff_param: &str) -> String {
+    format!("WITH pruned AS (DELETE FROM {table} WHERE created_at < {cutoff_param})")
 }
 
 /// Forget one connection of `owner`'s. An instance forgets only its
@@ -737,11 +729,13 @@ pub async fn begin_picker(
     )
     .map_err(|why| AccessError::Invalid(why.into()))?;
     let state = uuid::Uuid::new_v4().simple().to_string();
-    sqlx::query(
-        "INSERT INTO access_picker
+    sqlx::query(&format!(
+        "{pruned}
+         INSERT INTO access_picker
              (state, tenant_id, access_id, service, script, code, mime_types, grants, project_id, instance_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-    )
+        pruned = pruning("access_picker", "$11"),
+    ))
     .bind(&state)
     .bind(tenant)
     .bind(req.access_id)
@@ -752,13 +746,14 @@ pub async fn begin_picker(
     .bind(serde_json::to_value(&req.grants)?)
     .bind(req.for_instance.as_ref().map(|m| m.project_id))
     .bind(req.for_instance.as_ref().map(|m| m.instance.as_str()))
+    .bind(chrono::Utc::now() - CONNECT_TTL)
     .execute(pool)
     .await?;
     Ok(state)
 }
 
 /// The picker page's read: NOT consumed (the page may reload), but
-/// dead past the TTL like a pending consent.
+/// dead past the TTL like a pending consent, and deleted when found so.
 pub async fn load_picker(pool: &PgPool, state: &str) -> anyhow::Result<PickerSession> {
     #[allow(clippy::type_complexity)]
     let row: Option<(String, uuid::Uuid, String, String, String, Value, chrono::DateTime<chrono::Utc>, Option<uuid::Uuid>, Option<String>)> =
@@ -777,6 +772,7 @@ pub async fn load_picker(pool: &PgPool, state: &str) -> anyhow::Result<PickerSes
         .into());
     };
     if chrono::Utc::now() - created_at > CONNECT_TTL {
+        sqlx::query("DELETE FROM access_picker WHERE state = $1").bind(state).execute(pool).await?;
         return Err(AccessError::Invalid(
             "this picker link expired; open the picker again from the editor".into(),
         )
@@ -809,24 +805,27 @@ pub async fn load_picker(pool: &PgPool, state: &str) -> anyhow::Result<PickerSes
 /// granted them by the pick itself), so the editor's shortfall check
 /// sees them; `permissions_verified` is untouched. One transaction, so
 /// a poll sees the session or its outcome, never neither (which it
-/// would read as gone).
+/// would read as gone). A session past its life widens nothing: it is
+/// as gone as a used one.
 pub async fn finish_picker(
     pool: &PgPool,
     state: &str,
     result_json: Value,
 ) -> anyhow::Result<()> {
+    let cutoff = chrono::Utc::now() - CONNECT_TTL;
     let mut tx = pool.begin().await?;
     #[allow(clippy::type_complexity)]
     let row: Option<(String, uuid::Uuid, Value, Option<uuid::Uuid>, Option<String>)> = sqlx::query_as(
-        "DELETE FROM access_picker WHERE state = $1
+        "DELETE FROM access_picker WHERE state = $1 AND created_at >= $2
          RETURNING tenant_id, access_id, grants, project_id, instance_id",
     )
     .bind(state)
+    .bind(cutoff)
     .fetch_optional(&mut *tx)
     .await?;
     let Some((tenant, access_id, grants, project_id, instance)) = row else {
         return Err(AccessError::Invalid(
-            "this picker link is unknown or was already used".into(),
+            "this picker link is unknown, already used, or expired; open the picker again from the editor".into(),
         )
         .into());
     };
@@ -856,14 +855,17 @@ pub async fn finish_picker(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query(
-        "INSERT INTO access_connect_result (state, tenant_id, result_json)
+    sqlx::query(&format!(
+        "{pruned}
+         INSERT INTO access_connect_result (state, tenant_id, result_json)
          VALUES ($1, $2, $3)
          ON CONFLICT (state) DO NOTHING",
-    )
+        pruned = pruning("access_connect_result", "$4"),
+    ))
     .bind(state)
     .bind(&tenant)
     .bind(result_json)
+    .bind(cutoff)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1020,12 +1022,14 @@ pub async fn begin_oauth(
         }
     }
 
-    sqlx::query(
-        "INSERT INTO access_connect
+    sqlx::query(&format!(
+        "{pruned}
+         INSERT INTO access_connect
            (state, tenant_id, service, registration_sealed, project_id, spec_json, scopes,
             pkce_verifier, door, upgrade_grant_id, redirect_uri, instance_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-    )
+        pruned = pruning("access_connect", "$13"),
+    ))
     .bind(&state)
     .bind(tenant)
     .bind(&spec.service)
@@ -1038,6 +1042,7 @@ pub async fn begin_oauth(
     .bind(req.upgrade_grant_id)
     .bind(redirect_uri)
     .bind(req.instance.as_ref().map(|m| m.as_str()))
+    .bind(chrono::Utc::now() - CONNECT_TTL)
     .execute(pool)
     .await?;
 
@@ -1113,6 +1118,16 @@ pub async fn take_connect_result(
     if live {
         return Ok(None);
     }
+    // Whatever is left under the state is past its life: it goes now.
+    sqlx::query(
+        "WITH a AS (DELETE FROM access_connect WHERE state = $1 AND tenant_id = $2),
+              b AS (DELETE FROM access_picker WHERE state = $1 AND tenant_id = $2)
+         DELETE FROM access_connect_result WHERE state = $1 AND tenant_id = $2",
+    )
+    .bind(state)
+    .bind(tenant)
+    .execute(pool)
+    .await?;
     Err(AccessError::Gone(
         "this sign-in is unknown, already finished, or expired; start it again".into(),
     )
@@ -1165,7 +1180,8 @@ async fn complete_oauth_inner(
         chrono::DateTime<chrono::Utc>,
         Option<String>,
     )> = sqlx::query_as(
-        "WITH claimed AS (
+        &format!(
+            "{pruned}, claimed AS (
              DELETE FROM access_connect WHERE state = $1
              RETURNING tenant_id, service, registration_sealed, project_id, spec_json, scopes,
                        pkce_verifier, door, upgrade_grant_id, redirect_uri, created_at, instance_id
@@ -1174,8 +1190,11 @@ async fn complete_oauth_inner(
              SELECT $1, tenant_id, 'null'::jsonb, now() FROM claimed
          )
          SELECT * FROM claimed",
+            pruned = pruning("access_connect_result", "$2"),
+        ),
     )
     .bind(state)
+    .bind(chrono::Utc::now() - CONNECT_TTL)
     .fetch_optional(pool)
     .await?;
     let Some((
@@ -1382,7 +1401,7 @@ async fn finish_connect(
                      permissions_verified = $6, identity = $7, label = $8, door = $9,
                      expires_at = $10, spec_json = $11, registration_sealed = $12,
                      client_id = $13, provider_account = $14, events_recipe_hash = $15,
-                     project_id = $16, updated_at = now()
+                     project_id = $16, reconnects = reconnects + 1, updated_at = now()
                  WHERE id = $1 AND tenant_id = $2 AND {}",
                 same_owner_sql("$17", "$18")
             ))
@@ -1504,6 +1523,12 @@ fn sign_in_spent(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// One request to a provider's token endpoint, answered as JSON. Not
+/// reached, cut off, or answered busy or down (408, 429, 5xx, or an
+/// error code saying so whatever the status, like Slack's `ratelimited`:
+/// [`RefusalKind::of_answer`]) is
+/// [`AccessError::Unreached`]; any other refusal is
+/// [`AccessError::Invalid`], which the caller names for what it is.
 pub(crate) async fn token_request(
     token_url: &str,
     params: &[(String, String)],
@@ -1522,27 +1547,27 @@ pub(crate) async fn token_request(
         .map_err(|e| AccessError::Unreached(format!("token endpoint unreachable: {}", e.without_url())))?;
     let status = resp.status();
     let body = crate::read_answer(resp, "the token endpoint").await?;
+    let parsed: Option<Value> = serde_json::from_str(&body).ok();
     if !status.is_success() {
-        return Err(AccessError::Invalid(format!(
-            "token endpoint answered {status}: {}",
-            head_of(&body)
-        ))
-        .into());
+        let answered = format!("token endpoint answered {status}: {}", head_of(&body));
+        let kind = RefusalKind::of_answer(status, parsed.as_ref().unwrap_or(&Value::Null));
+        return Err(crate::refusal(kind, answered, AccessError::Invalid).into());
     }
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|_| AccessError::Invalid(format!(
-            "token endpoint answered non-JSON: {}",
-            head_of(&body)
-        )))?;
-    if json.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err(AccessError::Invalid(format!(
-            "token endpoint refused: {}",
-            json.get("error").and_then(Value::as_str).unwrap_or("unknown error")
-        ))
+    let json = parsed.ok_or_else(|| AccessError::Invalid(format!(
+        "token endpoint answered non-JSON: {}",
+        head_of(&body)
+    )))?;
+    // A refusal answered 200: Slack's `ok: false`, or an OAuth `error`.
+    // Its code says whether the provider was only busy (Slack's
+    // `ratelimited`), which is tried again like a 429.
+    let refused = json.get("ok").and_then(Value::as_bool) == Some(false);
+    if let Some(code) = json.get("error").and_then(Value::as_str).or(refused.then_some("unknown error")) {
+        return Err(crate::refusal(
+            RefusalKind::of_answer(status, &json),
+            format!("token endpoint refused: {code}"),
+            AccessError::Invalid,
+        )
         .into());
-    }
-    if let Some(err) = json.get("error").and_then(Value::as_str) {
-        return Err(AccessError::Invalid(format!("token endpoint refused: {err}")).into());
     }
     Ok(json)
 }
@@ -1648,6 +1673,50 @@ fn head_of(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A token endpoint answering every request with `status` and `body`;
+    /// returns its URL.
+    async fn token_endpoint(status: u16, body: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || async move { (axum::http::StatusCode::from_u16(status).unwrap(), body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/token")
+    }
+
+    /// A token endpoint busy or down (408, 429, 5xx), or never reached,
+    /// refused nothing, so the request is answered as not reached and
+    /// tried again; any other refusal is of the request.
+    #[tokio::test]
+    async fn a_token_endpoint_busy_or_down_is_not_reached_and_a_refusal_is_invalid() {
+        for status in [408, 429, 500, 502, 503] {
+            let err = token_request(&token_endpoint(status, "busy").await, &[], None).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{status}: {err:#}");
+        }
+        for status in [400, 401, 403, 404] {
+            let err = token_request(&token_endpoint(status, r#"{"error":"invalid_grant"}"#).await, &[], None).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{status}: {err:#}");
+        }
+        // A refusal answered 200 is read by its code: busy is tried again,
+        // anything else is of the request.
+        for body in [r#"{"ok":false,"error":"ratelimited"}"#, r#"{"error":"temporarily_unavailable"}"#] {
+            let err = token_request(&token_endpoint(200, body).await, &[], None).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{body}: {err:#}");
+        }
+        for body in [r#"{"ok":false,"error":"invalid_auth"}"#, r#"{"ok":false}"#, r#"{"error":"invalid_grant"}"#] {
+            let err = token_request(&token_endpoint(200, body).await, &[], None).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{body}: {err:#}");
+        }
+        // Nothing listens on the port once its listener is dropped.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let err = token_request(&format!("http://{closed}/token"), &[], None).await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{err:#}");
+        let ok = token_request(&token_endpoint(200, r#"{"access_token":"t"}"#).await, &[], None).await.unwrap();
+        assert_eq!(ok["access_token"], "t");
+    }
 
     /// A chooser gets the raw token, so only the caller's own
     /// connection passes: never the runtime's, and never the author's

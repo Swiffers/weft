@@ -17,6 +17,8 @@
 //! - **terminate**: remove everything the copy runs and owns, keeping
 //!   the disks the spec listed; remove the `infra_node` row.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -69,7 +71,9 @@ fn resolve_units(
     use crate::health_engine::{FLAKY_AFTER, RECOVERY_AFTER};
     let mut out = std::collections::BTreeMap::new();
     for u in &spec.units {
-        let (unit_status, image_refs) = if reconciled.contains(&u.name) {
+        // A frozen unit also keeps the health window it is in; a
+        // reconciled one starts with none.
+        let (unit_status, image_refs, windows) = if reconciled.contains(&u.name) {
             let mut refs = infra::unit_image_refs(u, node_id, image_tags)?;
             if transitioning {
                 // The apply may not have replaced the unit's old copy
@@ -79,7 +83,7 @@ fn resolve_units(
                     refs.extend(p.image_refs.iter().cloned());
                 }
             }
-            (status, refs)
+            (status, refs, (None, None))
         } else {
             // Left up / frozen: keep its current status (Running or
             // Flaky) AND the refs its last apply recorded (they can be
@@ -94,7 +98,7 @@ fn resolve_units(
                     u.name
                 )
             })?;
-            (p.status, p.image_refs.clone())
+            (p.status, p.image_refs.clone(), (p.not_ready_since_unix, p.ready_since_unix))
         };
         out.insert(
             u.name.clone(),
@@ -104,6 +108,8 @@ fn resolve_units(
                 flaky_after_seconds: u.health.flaky_after_seconds.unwrap_or(FLAKY_AFTER.as_secs() as u32),
                 recovery_after_seconds: u.health.recovery_after_seconds.unwrap_or(RECOVERY_AFTER.as_secs() as u32),
                 image_refs,
+                not_ready_since_unix: windows.0,
+                ready_since_unix: windows.1,
             },
         );
     }
@@ -148,11 +154,6 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// legitimate warmup.
 const READINESS_BREADCRUMB_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How often the executing supervisor polls the command's
-/// `cancel_requested` flag while inside the readiness wait. Between
-/// discrete host steps the check is per-step.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
 /// Marker error: the command was HALTED because the user requested
 /// cancellation. `tick` maps it to a `cancelled` outcome (never a
 /// failure). Cancel = halt, not rollback: the host is not
@@ -173,14 +174,13 @@ impl std::fmt::Display for CancelledByUser {
 
 impl std::error::Error for CancelledByUser {}
 
-/// Bail with `CancelledByUser` if the command's cancel flag is set.
-/// `at` names the step for the outcome message.
-async fn check_cancel(
-    state: &SupervisorState,
-    command_id: i64,
-    at: &'static str,
-) -> Result<()> {
-    if state.broker.command_cancel_requested(command_id).await? {
+/// Bail with `CancelledByUser` if a person asked to cancel the command:
+/// `cancel` is raised when the claim hands it out flagged, or when the
+/// broker's held claim hears the cancel while it runs
+/// (`SupervisorClaim::Cancel`). `at` names the step for the outcome
+/// message.
+fn check_cancel(cancel: &AtomicBool, at: &'static str) -> Result<()> {
+    if cancel.load(Ordering::SeqCst) {
         return Err(anyhow::Error::new(CancelledByUser { at }));
     }
     Ok(())
@@ -207,12 +207,13 @@ const CLAIM_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// running here is stopped rather than left issuing host calls for a
 /// project that is no longer this supervisor's. When the broker answers that a
 /// command waits on a project nobody owns, the ownership loop is asked
-/// to tick now.
+/// to tick now. A person cancelling a running command ends the hold too
+/// (`SupervisorClaim::Cancel`): the command stops at its next step.
 pub async fn run_loop(
     state: SupervisorState,
-    changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+    mut changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
 ) -> Result<()> {
-    work(state, changes, Until::Forever).await
+    work(state, &mut changes, Until::Forever).await
 }
 
 /// One pass of [`run_loop`] for a supervisor that scales to zero: claim and
@@ -220,9 +221,11 @@ pub async fn run_loop(
 /// one that becomes claimable while any runs (issued meanwhile, or freed
 /// by one ending), and return once none is running and none is left to
 /// claim. A claim that fails with nothing running fails the pass.
+/// `changes` stays with the caller, so the renewal beside the pass keeps
+/// somewhere to send what it changed once the commands are done.
 pub async fn drain(
     state: SupervisorState,
-    changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+    changes: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
 ) -> Result<()> {
     work(state, changes, Until::Idle).await
 }
@@ -238,16 +241,22 @@ enum Until {
     Idle,
 }
 
+/// One command running here: its project, its id, how to stop it, and
+/// whether a person asked to cancel it.
+struct Busy {
+    project: Uuid,
+    command: i64,
+    task: tokio::task::AbortHandle,
+    cancel: Arc<AtomicBool>,
+}
+
 async fn work(
     state: SupervisorState,
-    mut changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+    changes: &mut tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
     until: Until,
 ) -> Result<()> {
     let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    // The command each running task runs (its project, its id), and how to
-    // stop it.
-    let mut busy: std::collections::HashMap<tokio::task::Id, (Uuid, i64, tokio::task::AbortHandle)> =
-        std::collections::HashMap::new();
+    let mut busy: std::collections::HashMap<tokio::task::Id, Busy> = std::collections::HashMap::new();
     loop {
         // While anything runs, the claim sleeps on the broker until a
         // command is issued, in a pass too: a command issued for another
@@ -257,40 +266,43 @@ async fn work(
             (Until::Idle, true) => Duration::ZERO,
             _ => CLAIM_HOLD,
         };
-        let busy_commands: Vec<i64> = busy.values().map(|(_, command, _)| *command).collect();
+        let busy_commands: Vec<i64> = busy.values().map(|b| b.command).collect();
+        let cancelling: Vec<i64> = busy.values().filter(|b| b.cancel.load(Ordering::SeqCst)).map(|b| b.command).collect();
         // Ownership first: a claim can only hand out a project this supervisor
         // took back AFTER the loss that is already queued here, so the
         // loss is applied before that claim spawns anything, and never
-        // stops the command the new claim started. Dropping a claim that
-        // lost the race is free: claiming marks nothing on the broker.
+        // stops the command the new claim started.
         tokio::select! {
             biased;
             change = changes.recv() => {
                 let change = change.ok_or_else(|| {
                     anyhow!("the ownership loop is gone; the lifecycle loop cannot follow what this supervisor owns")
                 })?;
-                busy.retain(|_, (project_id, _, task)| {
-                    if !change.lost.contains(project_id) {
+                busy.retain(|_, b| {
+                    if !change.lost.contains(&b.project) {
                         return true;
                     }
                     tracing::info!(
-                        %project_id,
+                        project_id = %b.project,
                         "this supervisor no longer owns the project; stopping its running command, the new owner runs it again"
                     );
-                    task.abort();
+                    b.task.abort();
                     false
                 });
             }
-            claimed = state.broker.claim_command(&state.replica, &busy_commands, hold) => match claimed {
+            claimed = state.broker.claim_command(&state.replica, &busy_commands, &cancelling, hold) => match claimed {
                 Ok(SupervisorClaim::Command(cmd)) => {
-                    let (project_id, command_id) = (cmd.project_id, cmd.id);
-                    let task_state = state.clone();
-                    let task = running.spawn(async move {
-                        if let Err(e) = run_command(&task_state, cmd).await {
-                            tracing::warn!(error = %e, "lifecycle command could not be recorded");
-                        }
-                    });
-                    busy.insert(task.id(), (project_id, command_id, task));
+                    let (project, command) = (cmd.project_id, cmd.id);
+                    let cancel = Arc::new(AtomicBool::new(cmd.cancel_requested));
+                    let (task_state, task_cancel) = (state.clone(), cancel.clone());
+                    let task = running.spawn(async move { run_command(&task_state, cmd, &task_cancel).await });
+                    busy.insert(task.id(), Busy { project, command, task, cancel });
+                }
+                Ok(SupervisorClaim::Cancel { commands }) => {
+                    for b in busy.values().filter(|b| commands.contains(&b.command)) {
+                        tracing::info!(command_id = b.command, "a person asked to cancel the command; it stops at its next step");
+                        b.cancel.store(true, Ordering::SeqCst);
+                    }
                 }
                 // A pass with nothing running is done: the project nobody
                 // owns is taken on by the ownership tick it asked for, and
@@ -306,9 +318,8 @@ async fn work(
                         return Ok(());
                     }
                 }
-                // A pass with nothing running fails, so the tick that ran it
-                // fails and is run again; one with commands running lets
-                // them finish and asks again.
+                // A pass with nothing running ends on it; one with commands
+                // running lets them finish and asks again.
                 Err(e) if until == Until::Idle && busy.is_empty() => return Err(e.context("claim a lifecycle command")),
                 Err(e) => {
                     tracing::warn!(error = %e, "lifecycle claim failed");
@@ -337,22 +348,24 @@ async fn work(
 /// Exposed for integration tests, which step the loop one command at a
 /// time with no wait; the real [`run_loop`] claims and runs side by side.
 pub async fn tick(state: &SupervisorState, wait: Duration) -> Result<bool> {
-    let SupervisorClaim::Command(cmd) = state
-        .broker
-        .claim_command(&state.replica, &[], wait)
-        .await?
-    else {
+    let SupervisorClaim::Command(cmd) = state.broker.claim_command(&state.replica, &[], &[], wait).await? else {
         return Ok(false);
     };
-    run_command(state, cmd).await?;
+    let cancel = AtomicBool::new(cmd.cancel_requested);
+    run_command(state, cmd, &cancel).await;
     Ok(true)
 }
 
-/// Run one claimed command and record how it ended.
-async fn run_command(
-    state: &SupervisorState,
-    cmd: weft_broker_client::protocol::SupervisorCommandRow,
-) -> Result<()> {
+/// Run one claimed command and record how it ended. A record the broker
+/// cannot take, even after waiting a little for it, leaves the command
+/// uncompleted in the database, which is the only place its state lives:
+/// whoever holds the project's lease next claims it and runs it again
+/// (this process at its next claim, or a sibling once the lease is given
+/// back or lapses), the way a command a displaced owner left is run, and
+/// the project is reported failed until a rerun's ending is written. The
+/// broker counts every claim, and gives up a command that never ends
+/// (`weft_broker::lifecycle_writes::claim_next`).
+async fn run_command(state: &SupervisorState, cmd: weft_broker_client::protocol::SupervisorCommandRow, cancel: &AtomicBool) {
     tracing::info!(
         command_id = cmd.id,
         project_id = %cmd.project_id,
@@ -363,7 +376,7 @@ async fn run_command(
     // Shared until the command is recorded, so the ownership loop's sweep
     // never deletes a copy this command is building (`ProjectLocks`).
     let _project = state.project_locks.share(cmd.project_id).await;
-    let result = execute(state, &cmd).await;
+    let result = execute(state, &cmd, cancel).await;
     // A user-honored cancel is its own outcome, never a failure.
     let cancelled = result
         .as_ref()
@@ -380,20 +393,32 @@ async fn run_command(
     // UNCOMPLETED on purpose, so the new owner re-runs and finishes it
     // (the user never re-acts). Either way, log + move on; neither is
     // a failure of this command's run.
-    match state
-        .broker
-        .command_complete(&state.replica, cmd.id, error.as_deref(), cancelled)
-        .await?
-    {
-        weft_broker_client::WriteOutcome::Applied(_) => {}
-        weft_broker_client::WriteOutcome::Displaced => tracing::info!(
+    let completed = crate::patiently(state, || {
+        state.broker.command_complete(&state.replica, cmd.id, error.as_deref(), cancelled)
+    })
+    .await;
+    // An ending this process could not write before is written now (or
+    // was already): the rerun clears that trouble.
+    let ended = crate::health::Step::End(cmd.id);
+    match completed {
+        Ok(weft_broker_client::WriteOutcome::Applied(_)) => state.health.lock().await.untroubled(cmd.project_id, ended),
+        Ok(weft_broker_client::WriteOutcome::Displaced) => tracing::info!(
             command_id = cmd.id,
             "command_complete displaced (project ownership moved); the command is left for the new owner"
         ),
-        weft_broker_client::WriteOutcome::Gone => tracing::info!(
-            command_id = cmd.id,
-            "command_complete: the command was already completed; no-op"
-        ),
+        Ok(weft_broker_client::WriteOutcome::Gone) => {
+            tracing::info!(command_id = cmd.id, "command_complete: the command was already completed; no-op");
+            state.health.lock().await.untroubled(cmd.project_id, ended);
+        }
+        Err(e) => {
+            let why = format!(
+                "its command {} ran, and how it ended could not be written, so it runs again (the broker gives a command up \
+                 once it was taken up {} times): {e:#}",
+                cmd.id,
+                weft_broker_client::protocol::SUPERVISOR_GIVE_UP_AFTER,
+            );
+            crate::failed(state, cmd.project_id, ended, &why).await;
+        }
     }
     if let Err(e) = result {
         if cancelled {
@@ -410,7 +435,6 @@ async fn run_command(
             );
         }
     }
-    Ok(())
 }
 
 /// Which copy a row of `project` names, as the host knows it.
@@ -477,6 +501,7 @@ async fn owned_project(
 async fn wait_for_readiness(
     state: &SupervisorState,
     command_id: i64,
+    cancel: &AtomicBool,
     project_id: Uuid,
     node_id: &str,
     instance: Option<&weft_core::instance::InstanceId>,
@@ -486,22 +511,18 @@ async fn wait_for_readiness(
     // A user apply is a user-controlled operation: a slow-warmup unit (a
     // model server pulling weights) can legitimately take a long time, so
     // this wait is NOT capped by a fixed hard-fail deadline. The user
-    // interrupts a unit that will never come up via cancel (polled at
-    // CANCEL_POLL_INTERVAL); a periodic breadcrumb makes a stuck readiness
+    // interrupts a unit that will never come up via cancel (read at every
+    // look); a periodic breadcrumb makes a stuck readiness
     // legible in the logs rather than a silent hang. Unlike the wait for
     // running work a stop does first (the dispatcher's, capped by the
     // person's deadline, `weft_dispatcher::drain`), there is nothing to
     // cancel instead of waiting: the unit either comes up or the user
     // stops it.
-    let mut next_cancel_check = state.clock.now();
     let mut next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
     // What the row says it waits on, rewritten only when it changes.
     let mut recorded = String::new();
     loop {
-        if state.clock.now() >= next_cancel_check {
-            check_cancel(state, command_id, "waiting for the units to be ready").await?;
-            next_cancel_check = state.clock.now() + CANCEL_POLL_INTERVAL;
-        }
+        check_cancel(cancel, "waiting for the units to be ready")?;
         let seen = state.host.observe(&node.tenant, node.project).await?;
         let mut waiting = Vec::new();
         for unit in units {
@@ -568,12 +589,13 @@ async fn record_waiting(
 async fn execute(
     state: &SupervisorState,
     cmd: &weft_broker_client::protocol::SupervisorCommandRow,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     use weft_broker_client::protocol::InfraLifecycleVerb;
     // Apply is the only verb that doesn't operate on existing
     // infra_node rows; it creates / updates one. Route early.
     if cmd.verb == InfraLifecycleVerb::Apply {
-        return execute_apply(state, cmd).await;
+        return execute_apply(state, cmd, cancel).await;
     }
     // What runs on these copies was settled before the command reached
     // a supervisor: cancelled by the dispatcher as it issued it, or waited
@@ -625,7 +647,7 @@ async fn execute(
                 // Interruptible between nodes: already-stopped units
                 // stay stopped (halt, not rollback); the rest keep their
                 // prior status.
-                check_cancel(state, cmd.id, "stopping infra nodes").await?;
+                check_cancel(cancel, "stopping infra nodes")?;
                 let copy = node_ref(&project, &n.node_id, &n.copy_id);
                 // A unit the host runs for this copy that the row's roster
                 // does not carry is an orphan: a unit dropped from the
@@ -661,7 +683,7 @@ async fn execute(
                         .broker
                         .set_status(
                             &state.replica,
-                            Some(cmd.id),
+                            cmd.id,
                             cmd.project_id,
                             &n.node_id,
                             n.instance.as_ref(),
@@ -690,7 +712,7 @@ async fn execute(
                         .broker
                         .set_status(
                             &state.replica,
-                            Some(cmd.id),
+                            cmd.id,
                             cmd.project_id,
                             &n.node_id,
                             n.instance.as_ref(),
@@ -769,12 +791,12 @@ async fn execute(
                 // ownership moved: the new owner re-runs the terminate. Gone
                 // means the row vanished under us (a project removal in
                 // flight): the removal below still runs.
-                check_cancel(state, cmd.id, "terminating infra nodes").await?;
+                check_cancel(cancel, "terminating infra nodes")?;
                 match state
                     .broker
                     .set_status(
                         &state.replica,
-                        Some(cmd.id),
+                        cmd.id,
                         cmd.project_id,
                         &n.node_id,
                         n.instance.as_ref(),
@@ -835,7 +857,7 @@ async fn execute(
                     .await?;
             }
             for copy in &rowless {
-                check_cancel(state, cmd.id, "deleting the disks of infra copies already down").await?;
+                check_cancel(cancel, "deleting the disks of infra copies already down")?;
                 state.host.terminate(copy, &[]).await?;
             }
         }
@@ -861,6 +883,7 @@ async fn execute(
 async fn execute_apply(
     state: &SupervisorState,
     cmd: &weft_broker_client::protocol::SupervisorCommandRow,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let node_id = cmd.node_id.as_deref().ok_or_else(|| anyhow!("apply command missing node_id"))?;
     // An apply builds exactly one copy: the shared one, or one
@@ -960,7 +983,7 @@ async fn execute_apply(
             .broker
             .set_status(
                 &state.replica,
-                Some(cmd.id),
+                cmd.id,
                 cmd.project_id,
                 node_id,
                 instance,
@@ -1041,16 +1064,16 @@ async fn execute_apply(
         // a half-applied node (the host is not transactional; the user
         // terminates or retries from there), while the command outcome is
         // recorded as `cancelled`, not failed.
-        check_cancel(state, cmd.id, "before removing units the spec dropped").await?;
+        check_cancel(cancel, "before removing units the spec dropped")?;
         // Units the prior roster carries and the spec no longer declares.
         for unit in prior_units.keys().filter(|u| resolved.unit(u).is_none()) {
             state.host.remove_unit(&copy, unit).await?;
         }
-        check_cancel(state, cmd.id, "before applying units").await?;
+        check_cancel(cancel, "before applying units")?;
         for unit in &reconcile {
             state.host.apply_unit(&resolved, unit).await?;
         }
-        wait_for_readiness(state, cmd.id, cmd.project_id, node_id, instance, &copy, &reconcile).await?;
+        wait_for_readiness(state, cmd.id, cancel, cmd.project_id, node_id, instance, &copy, &reconcile).await?;
         endpoint_addresses(state, &resolved).await
     }
     .await;
@@ -1067,7 +1090,7 @@ async fn execute_apply(
                 .broker
                 .set_status(
                     &state.replica,
-                    Some(cmd.id),
+                    cmd.id,
                     cmd.project_id,
                     node_id,
                     instance,
@@ -1211,6 +1234,8 @@ mod tests {
                 flaky_after_seconds: 1,
                 recovery_after_seconds: 1,
                 image_refs: refs.iter().map(|s| s.to_string()).collect(),
+                not_ready_since_unix: None,
+                ready_since_unix: None,
             }
         }
 

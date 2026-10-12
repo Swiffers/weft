@@ -235,8 +235,9 @@ pub fn default_protocols() -> HealthProtocols {
 
 /// One unit of one deployed copy, as this look saw it. Only units the
 /// host has reported are here (see [`HealthCondition`]), and only units
-/// expected to run now (running or flaky).
-#[derive(Debug, Clone, PartialEq)]
+/// expected to run now (running or flaky). Serialized as what a health
+/// protocol saw when it gave up (`HealthProtocolState::gave_up_seen`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnitView {
     pub node_id: String,
     /// Whose copy: `None` for the shared one.

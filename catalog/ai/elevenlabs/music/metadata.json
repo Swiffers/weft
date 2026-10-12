@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsMusic",
   "label": "Compose Music",
-  "description": "Generate a music track from a text prompt, in any style, with or without vocals. Emits the audio file.",
+  "description": "Generate a music track from a text prompt or from a composition plan laid out section by section, in any style, with or without vocals. Emits the audio file and the song's id.",
   "tags": [
     "ai",
     "audio",
@@ -20,9 +20,72 @@
       "name": "prompt",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "required": true,
-      "description": "What the track should sound like: style, mood, instruments, lyrics.",
+      "description": "What the track should sound like: style, mood, instruments, tempo. Up to 4,100 characters. Set this or `compositionPlan`, not both.",
       "placeholder": "A slow lo-fi hip hop beat with warm piano chords"
+    },
+    {
+      "name": "compositionPlan",
+      "type": "JsonDict",
+      "label": "Composition plan",
+      "widget": {
+        "kind": "code",
+        "language": "json"
+      },
+      "placeholder": "{ \"chunks\": [{ \"text\": \"[Verse 1]\", \"duration_ms\": 15000, \"positive_styles\": [\"lo-fi\", \"warm piano\"] }] }",
+      "description": "If you want to lay the song out section by section instead of describing it in one prompt, give ElevenLabs's composition plan here: `{ \"chunks\": [...] }`, up to 30 chunks adding up to between 3 seconds and 10 minutes. A chunk is either new music (a `text` holding a `[Section]` name and the lyrics lines, a `duration_ms` from 3,000 to 120,000, and `positive_styles` in English) or a slice of a stored song kept as it was (`song_id` and `range: { start_ms, end_ms }`), which is how you edit or extend a song made with `storeForInpainting` on. For every field, go and read ElevenLabs's guides Composition plans (https://elevenlabs.io/docs/eleven-api/guides/how-to/music/composition-plans) and Music inpainting (https://elevenlabs.io/docs/eleven-api/guides/how-to/music/inpainting). Set this or `prompt`, not both."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "default": "music_v2_5",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "music_v2_5",
+          "music_v2"
+        ]
+      },
+      "label": "Model",
+      "description": "music_v2_5 is ElevenLabs's most advanced music model, with better quality and prompt adherence than music_v2, which remains available."
+    },
+    {
+      "name": "outputFormat",
+      "type": "String",
+      "default": "auto",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "auto",
+          "mp3_48000_320",
+          "mp3_48000_240",
+          "mp3_48000_192",
+          "mp3_48000_128",
+          "mp3_44100_192",
+          "mp3_44100_128",
+          "mp3_44100_96",
+          "mp3_44100_64",
+          "mp3_44100_32",
+          "mp3_24000_48",
+          "mp3_22050_32",
+          "pcm_48000",
+          "pcm_44100",
+          "pcm_32000",
+          "pcm_24000",
+          "pcm_22050",
+          "pcm_16000",
+          "pcm_8000",
+          "ulaw_8000",
+          "alaw_8000",
+          "opus_48000_32",
+          "opus_48000_64",
+          "opus_48000_96",
+          "opus_48000_128",
+          "opus_48000_192"
+        ]
+      },
+      "label": "Output format",
+      "description": "Leave on auto to let ElevenLabs pick the best format for the model, which it says is mp3_48000_192 for its v2 models. Otherwise: mp3 for anything that plays a file, pcm, ulaw or alaw for telephony, opus_48000_* for a WhatsApp voice note (stored as Ogg Opus)."
     },
     {
       "name": "lengthSecs",
@@ -33,28 +96,106 @@
         "max": 600,
         "step": 1
       },
-      "description": "Track length in seconds (3 to 600). Absent = the model picks."
-    },
-    {
-      "name": "model",
-      "type": "String",
-      "default": "music_v1",
-      "widget": {
-        "kind": "select",
-        "free_text": true,
-        "options": [
-          "music_v1",
-          "music_v2"
-        ]
-      },
-      "label": "Model"
+      "description": "Track length in seconds, 3 to 600. Leave empty to let the model choose a length from the prompt. Only with a `prompt`: a `compositionPlan` takes its length from its chunks."
     },
     {
       "name": "forceInstrumental",
       "type": "Boolean",
       "default": false,
       "label": "Instrumental only",
-      "description": "Never generate vocals."
+      "description": "Turn on to be sure the track has no vocals; left off, the prompt decides. Only with a `prompt`."
+    },
+    {
+      "name": "lyrics",
+      "type": "String",
+      "label": "Lyrics",
+      "widget": { "kind": "textarea" },
+      "description": "If you want the song to sing your own words, write them here, up to 4,000 characters. Not with `forceInstrumental`, which makes sure nothing is sung. A `compositionPlan` carries its lyrics in each chunk's `text`."
+    },
+    {
+      "name": "generationMode",
+      "type": "String",
+      "label": "Mode",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "track",
+          "loop",
+          "ambience",
+          "video_to_music"
+        ]
+      },
+      "description": "A hint at what kind of piece the prompt is for. Leave empty for no hint. Only with a `prompt`."
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 2147483647,
+        "step": 1
+      },
+      "description": "If you want to be able to make a similar track again, set any whole number here, then run again with that number and the same settings. ElevenLabs says the result can still differ, and may change when it updates its system. Only with a `compositionPlan`: ElevenLabs takes no seed with a `prompt`."
+    },
+    {
+      "name": "finetune",
+      "type": "String",
+      "label": "Finetune",
+      "placeholder": "Pick a finetune, or paste its id",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/music/finetunes",
+            "items": "finetunes",
+            "label": "name",
+            "value": "id",
+            "where": { "status": "completed" },
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "next_cursor"
+            }
+          }
+        ]
+      },
+      "description": "If you want the music to carry a sound of its own, pick a finetune: a version of the music model trained on your tracks, a teammate's, or one of ElevenLabs's curated ones. The list shows the finetunes that have finished training."
+    },
+    {
+      "name": "finetuneStrength",
+      "type": "Number",
+      "label": "Finetune strength",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 2,
+        "step": 0.05
+      },
+      "description": "How strongly the `finetune` shapes the music, above 0 and up to 2. Lower leaves more room for the prompt; leave empty for full strength, 1. Needs a `finetune`."
+    },
+    {
+      "name": "usePhoneticNames",
+      "type": "Boolean",
+      "default": false,
+      "label": "Spell names phonetically",
+      "description": "If the prompt has proper names in it, turn this on and the lyrics spell them phonetically, so the model pronounces them better."
+    },
+    {
+      "name": "storeForInpainting",
+      "type": "Boolean",
+      "default": false,
+      "label": "Keep for editing",
+      "description": "Turn on to have ElevenLabs store the song, so a later `compositionPlan` can keep, regenerate or build on parts of it through its `songId`."
+    },
+    {
+      "name": "signWithC2pa",
+      "type": "Boolean",
+      "default": false,
+      "label": "Sign with C2PA",
+      "description": "Turn on to have ElevenLabs sign the song with C2PA. It works on mp3 only, so it needs an mp3 `outputFormat` or auto."
     }
   ],
   "outputs": [
@@ -74,10 +215,155 @@
     {
       "name": "sizeBytes",
       "type": "Number"
+    },
+    {
+      "name": "songId",
+      "type": "String",
+      "description": "The id ElevenLabs gave this song. With `storeForInpainting` on, put it in a later `compositionPlan` (a chunk's `song_id`) to keep, regenerate or build on parts of this song."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "prompt" },
+          { "kind": "input_satisfied", "port": "compositionPlan" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' sets both `prompt` and `compositionPlan`, and ElevenLabs composes from one of them: keep one.",
+        "port": "compositionPlan"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "seed" },
+          { "kind": "input_satisfied", "port": "prompt" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' sets a `seed` with a `prompt`, and ElevenLabs takes a seed only with a `compositionPlan`: compose from a plan, or leave `seed` empty.",
+        "port": "seed"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "lengthSecs" },
+          { "kind": "input_satisfied", "port": "compositionPlan" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' sets `lengthSecs` with a `compositionPlan`, which takes its length from its chunks: leave `lengthSecs` empty, or compose from a `prompt`.",
+        "port": "lengthSecs"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "forceInstrumental", "equals": true },
+          { "kind": "input_satisfied", "port": "compositionPlan" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' turns on `forceInstrumental` with a `compositionPlan`, and ElevenLabs takes it only with a `prompt`: turn it off, or compose from a `prompt`.",
+        "port": "forceInstrumental"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "generationMode" },
+          { "kind": "input_satisfied", "port": "compositionPlan" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' sets `generationMode` with a `compositionPlan`, and ElevenLabs takes it only with a `prompt`: leave `generationMode` empty, or compose from a `prompt`.",
+        "port": "generationMode"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "lyrics" },
+          { "kind": "config_equals", "field": "forceInstrumental", "equals": true }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' gives `lyrics` and turns on `forceInstrumental`, which makes sure nothing is sung: keep one of them.",
+        "port": "lyrics"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "finetuneStrength" },
+          { "kind": "not", "of": { "kind": "input_satisfied", "port": "finetune" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' sets `finetuneStrength` with no `finetune` for it to act on: pick a `finetune`, or leave `finetuneStrength` empty.",
+        "port": "finetuneStrength"
+      }
+    },
+    {
+      "when": {
+        "kind": "any",
+        "of": [
+          { "kind": "config_equals", "field": "finetuneStrength", "equals": 0 },
+          { "kind": "config_equals", "field": "finetuneStrength", "equals": 0.0 }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' sets `finetuneStrength` to 0, and ElevenLabs takes a strength above 0: raise it, or leave `finetune` empty to compose without one.",
+        "port": "finetuneStrength"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "signWithC2pa", "equals": true },
+          { "kind": "config_matches", "field": "outputFormat", "regex": "^(pcm|ulaw|alaw|opus)_" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' signs the song with C2PA, which ElevenLabs does on mp3 only: pick an mp3 `outputFormat` or auto, or turn `signWithC2pa` off.",
+        "port": "signWithC2pa"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "output_wired", "port": "songId" },
+          { "kind": "not", "of": { "kind": "config_equals", "field": "storeForInpainting", "equals": true } },
+          { "kind": "not", "of": { "kind": "input_wired", "port": "storeForInpainting" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsMusic '{id}' hands its `songId` on with `storeForInpainting` off, and a later `compositionPlan` can only build on a song ElevenLabs stored: turn `storeForInpainting` on if that is what the id is for.",
+        "severity": "warning",
+        "port": "storeForInpainting"
+      }
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "prompt",
+        "compositionPlan"
+      ]
+    ]
   },
   "display": {
     "kind": "media",

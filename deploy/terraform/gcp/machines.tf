@@ -16,9 +16,9 @@ resource "google_pubsub_topic" "machine_events" {
 # which costs its supervisor one look that finds nothing.
 # SYNC: the `wi-` prefix <-> crates/weft-core/src/infra/resolve.rs (NodeRef::resource_base)
 resource "google_logging_project_sink" "machine_events" {
-  name        = "${var.name}-machine-events"
-  destination = "pubsub.googleapis.com/${google_pubsub_topic.machine_events.id}"
-  filter      = <<-EOT
+  name                   = "${var.name}-machine-events"
+  destination            = "pubsub.googleapis.com/${google_pubsub_topic.machine_events.id}"
+  filter                 = <<-EOT
     resource.type="gce_instance"
     protoPayload.resourceName:"/instances/wi-"
     protoPayload.methodName=("compute.instances.preempted" OR "compute.instances.hostError" OR "compute.instances.guestTerminate" OR "compute.instances.automaticRestart" OR "v1.compute.instances.stop" OR "v1.compute.instances.suspend" OR "v1.compute.instances.delete" OR "v1.compute.instances.reset")
@@ -46,7 +46,7 @@ resource "google_pubsub_topic_iam_member" "machine_events_published_by_the_sink"
 }
 
 # Pub/Sub presents the core account's identity to the supervisor, as the
-# wakes queue does, which its own service agent may only do when allowed.
+# wake queues do, which its own service agent may only do when allowed.
 resource "google_service_account_iam_member" "pubsub_signs_as_core" {
   service_account_id = google_service_account.core.name
   role               = "roles/iam.serviceAccountTokenCreator"

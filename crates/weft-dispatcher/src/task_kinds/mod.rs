@@ -9,6 +9,7 @@
 pub mod fire_signal;
 pub mod program_call;
 pub mod register_signal;
+pub mod resync;
 pub mod run_node_test;
 pub mod stop_tagged;
 pub mod withdraw_signal;
@@ -19,6 +20,7 @@ pub mod withdraw_signal;
 pub use fire_signal::FireSignalExecutor;
 pub use program_call::ProgramCallExecutor;
 pub use register_signal::RegisterSignalExecutor;
+pub use resync::ResyncExecutor;
 pub use run_node_test::RunNodeTestExecutor;
 pub use stop_tagged::StopTaggedExecutor;
 pub use withdraw_signal::WithdrawSignalExecutor;

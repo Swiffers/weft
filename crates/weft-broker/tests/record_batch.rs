@@ -22,8 +22,19 @@ use weft_journal::ExecEvent;
 const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
 const TENANT: &str = "t1";
 
+/// The schema, and the project the runs are born in: a birth for a
+/// project that is not there is refused.
 async fn schema(pool: &PgPool) {
     weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    sqlx::query(
+        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at) \
+         VALUES ($1, 'p', $2, 'inactive', '{}', 0)",
+    )
+    .bind(PROJECT)
+    .bind(TENANT)
+    .execute(pool)
+    .await
+    .expect("project row");
 }
 
 fn birth(execution_id: weft_core::ExecutionId, keeping: Keeping) -> ExecEvent {
@@ -68,6 +79,7 @@ fn cost(execution_id: weft_core::ExecutionId) -> ExecEvent {
         billed: false,
         origin: weft_core::CredentialOwner::Platform,
         metadata: serde_json::Value::Null,
+        charge: None,
         at_unix: 2,
     }
 }
@@ -93,6 +105,11 @@ async fn send(pool: &PgPool, writer: &str, lane: &str, parts: &[Part]) -> Vec<Fa
 }
 
 async fn send_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts: &[Part]) -> Vec<Fate> {
+    answers_on(conn, writer, lane, parts).await.into_iter().map(|recorded| recorded.fate).collect()
+}
+
+/// Write `parts` as [`send_on`] does; each run's whole answer, in order.
+async fn answers_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts: &[Part]) -> Vec<weft_journal::record::Recorded> {
     let encoded: Vec<Vec<Vec<u8>>> =
         parts.iter().map(|part| part.rows.iter().map(|row| weft_journal::stored::encode(row)).collect()).collect();
     let head = BatchHead {
@@ -114,7 +131,44 @@ async fn send_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts:
         selections: Vec::new(),
     };
     let batch = Batch { head, rows: encoded.iter().flatten().map(Vec::as_slice).collect() };
-    record_batch(conn, writer, TENANT, lane, &batch).await.unwrap().into_iter().map(|recorded| recorded.fate).collect()
+    record_batch(conn, writer, TENANT, lane, &batch).await.unwrap()
+}
+
+/// A run born running under a writer whose lease was never written (it
+/// has not ticked yet) is answered unwatched, so the broker wakes the
+/// look at lapsed holds for it; one born under a live lease, or born
+/// ended, is not. A birth for a project that is not there is refused.
+#[sqlx::test]
+async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: PgPool) {
+    schema(&pool).await;
+    let (early, ended) = (weft_core::new_execution_id(), weft_core::new_execution_id());
+    let mut conn = pool.acquire().await.unwrap();
+    let answers = answers_on(
+        &mut conn,
+        "w1",
+        "w1:0",
+        &[part(early, 1, 0, vec![vec![birth(early, Keeping::Fast)]]), part(ended, 1, 0, vec![vec![birth(ended, Keeping::Fast), completed(ended)]])],
+    )
+    .await;
+    assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Accepted, true), (Fate::Accepted, false)]);
+
+    sqlx::query(
+        "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix) \
+         VALUES ('w2', $1, $2, EXTRACT(EPOCH FROM NOW())::BIGINT + 60)",
+    )
+    .bind(PROJECT)
+    .bind(TENANT)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let watched = weft_core::new_execution_id();
+    let answers = answers_on(&mut conn, "w2", "w2:0", &[part(watched, 1, 0, vec![vec![birth(watched, Keeping::Fast)]])]).await;
+    assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Accepted, false)]);
+
+    sqlx::query("DELETE FROM project").execute(&pool).await.unwrap();
+    let orphan = weft_core::new_execution_id();
+    let answers = answers_on(&mut conn, "w1", "w1:0", &[part(orphan, 1, 0, vec![vec![birth(orphan, Keeping::Fast)]])]).await;
+    assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Refused, false)]);
 }
 
 /// A run's row as the tests read it: state, owner, epoch, last row, cost.
@@ -274,4 +328,42 @@ async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: 
     let lost = tokio::time::timeout(Duration::from_secs(5), sweep).await.expect("no deadlock").unwrap();
     assert_eq!(lost, Lost::Requeued);
     assert_eq!(row(&pool, run).await, ("queued".into(), None, 2, 1, 0), "let go of from the batch's last row");
+}
+
+/// A run whose worker could not write its record, given up with a charge
+/// its record leaves open, ends with that charge booked unknown: one
+/// `CostReported` closing it, before the ending, in the same write.
+#[sqlx::test]
+async fn a_given_up_run_books_its_open_charge_unknown(pool: PgPool) {
+    schema(&pool).await;
+    let run = weft_core::new_execution_id();
+    let opened = ExecEvent::ChargeOpened {
+        execution_id: run,
+        node_id: "dub".into(),
+        frames: Vec::new(),
+        service: "jobs".into(),
+        charge: "job-1".into(),
+        scratch: serde_json::json!({ "model": "m" }),
+        origin: weft_core::CredentialOwner::Platform,
+        at_unix: 2,
+    };
+    assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Durable)], vec![opened]])]).await, [Fate::Accepted]);
+
+    let mut tx = pool.begin().await.unwrap();
+    let gave_up = weft_journal::record::give_up_in(&mut tx, run, "w1", "a write failed").await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(gave_up, weft_journal::record::GaveUp::Ended(2));
+
+    let mut conn = pool.acquire().await.unwrap();
+    let events = weft_journal::record::read_record(&mut conn, run, None).await.unwrap().events(run).unwrap();
+    let costs: Vec<&ExecEvent> = events.iter().filter(|event| matches!(event, ExecEvent::CostReported { .. })).collect();
+    assert_eq!(costs.len(), 1, "{events:?}");
+    assert!(
+        matches!(costs[0], ExecEvent::CostReported { node_id, service, charge: Some(charge), amount_usd: None, model: Some(model), .. }
+            if node_id == "dub" && service == "jobs" && charge == "job-1" && model == "m"),
+        "{:?}", costs[0]
+    );
+    assert!(matches!(&events[events.len() - 2..], [ExecEvent::CostReported { .. }, ExecEvent::ExecutionFailed { .. }]), "{events:?}");
+    assert_eq!(weft_journal::ChargeBook::of_record(&events).into_open().count(), 0, "the record holds no open charge");
+    assert_eq!(row(&pool, run).await.0, "ended");
 }

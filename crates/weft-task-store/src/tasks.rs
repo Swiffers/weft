@@ -1,13 +1,13 @@
 //! `task` table: the dispatcher's durable work queue. Producers (a worker
 //! through the broker, a listener, the dispatcher itself) `enqueue`; one
-//! dispatcher process claims a row via `claim_one` (FOR UPDATE SKIP
+//! dispatcher process claims a row via `claim_next` (FOR UPDATE SKIP
 //! LOCKED), runs the work, then `complete` or `fail`. Heartbeat extends the
 //! claim's lease so a slow op doesn't lose the row to the stale-recovery
 //! filter. A run is never a task: its own row (`run`) is its claim.
 //!
 //! Idempotency: every executor MUST be safe to re-run on partial
 //! success. A row can be run again after a process crash (the lease
-//! expires and `claim_one` rescues it) or after a surrender (the
+//! expires and `claim_next` rescues it) or after a surrender (the
 //! claimer could not renew its lease and `surrender`ed the row). Cluster
 //! ops should treat "already exists" as success; executors with a
 //! non-re-runnable side effect persist its outcome via
@@ -38,8 +38,10 @@ pub fn claim_heartbeat_interval() -> std::time::Duration {
     weft_core::time_scale::scaled(std::time::Duration::from_secs(15))
 }
 
-/// How long terminal-state rows linger before the sweeper deletes
-/// them. Long enough that producers polling for results see them.
+/// How long terminal-state rows linger before the picker, run dry,
+/// deletes them (`weft_prune_finished_tasks`, handed the cutoff by
+/// [`claim_next`]). Long enough that producers polling for results see
+/// them.
 pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 
 /// Where a task stands: weft-core's, since a client waiting on a task
@@ -47,7 +49,7 @@ pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 pub use weft_core::task::TaskStatus;
 
 /// A row from the `task` table. Producers fill `NewTask`; consumers
-/// receive `Task` from `claim_one`.
+/// receive `Task` from `claim_next`.
 ///
 /// Derives serde directly: this is also the wire shape used by
 /// `weft-broker-client::protocol`. A new field on this struct
@@ -139,7 +141,14 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             tenant_id TEXT NOT NULL,
             payload JSONB NOT NULL,
             claimed_by TEXT,
+            -- Until when the claim holds without a heartbeat. NULL on a
+            -- claim that rests on a run (`claim_rests_on`).
             claimed_until_unix BIGINT,
+            -- The run a claimed task waits on while it waits (an
+            -- activation's setup run, which may wait days on a person):
+            -- its claimant stops renewing, and the claim holds for as
+            -- long as that run goes (`weft_dispatcher::lapses`).
+            claim_rests_on UUID,
             attempts INTEGER NOT NULL DEFAULT 0,
             result JSONB,
             error TEXT,
@@ -175,6 +184,21 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
                 PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant || '|' || p_kind || '|' || p_dedup, 0));
             END;
             $$ LANGUAGE plpgsql"#,
+        // Delete up to 500 tasks that finished before `p_before` (unix
+        // seconds), skipping any row another transaction holds, and answer
+        // how many went: the picker's claim calls it in the statement that
+        // finds nothing left to claim ([`claim_next`], which hands it the
+        // cutoff from [`TERMINAL_RETENTION_SECS`]), so the table is pruned
+        // once per burst of work, never on a timer, never on an enqueue.
+        r#"CREATE OR REPLACE FUNCTION weft_prune_finished_tasks(p_before BIGINT) RETURNS INTEGER AS $$
+            WITH gone AS (
+                DELETE FROM task WHERE id IN (
+                    SELECT id FROM task
+                    WHERE status IN ('complete', 'failed') AND completed_at_unix < p_before
+                    LIMIT 500 FOR UPDATE SKIP LOCKED)
+                RETURNING 1)
+            SELECT count(*)::INTEGER FROM gone
+            $$ LANGUAGE sql"#,
         // THE dedup'd enqueue ([`enqueue_dedup_in`]): the task already
         // live under `(tenant, kind, dedup_key)`, or the new one. A
         // transaction-scoped lock on that triple serializes two producers
@@ -293,46 +317,112 @@ pub async fn enqueue_dedup_in(conn: &mut sqlx::PgConnection, spec: NewTask) -> R
     Ok(if inserted { DedupOutcome::Inserted(id) } else { DedupOutcome::AlreadyLive(id) })
 }
 
+/// What [`claim_next`] found.
+#[derive(Debug)]
+pub enum Claim {
+    /// A task, now claimed.
+    Task(Task),
+    /// Nothing claimable, and when the earliest claim a claimant renews
+    /// lapses (unix seconds), which a later claim then rescues; `None`
+    /// with no such claim (a resting claim has no lapse here).
+    Dry { next_lapse: Option<i64> },
+}
+
 /// Atomically claim one task for `replica` (the claiming dispatcher
 /// process). Picks oldest pending first; also rescues claims whose lease
 /// expired (the claimant died mid-work).
 ///
 /// One statement: the pick locks its row (`FOR UPDATE SKIP LOCKED`, so
 /// sibling claimants skip it rather than queue behind it) and the claim
-/// updates it, with no round trip between.
-pub async fn claim_one(pool: &PgPool, replica: &str) -> Result<Option<Task>> {
+/// updates it, with no round trip between. When nothing is claimable, the
+/// same statement, only in that case, reads the earliest lapse of the
+/// claims out (a picker run dry knows when to look again) and prunes the
+/// finished tasks past their retention (`weft_prune_finished_tasks`).
+pub async fn claim_next(pool: &PgPool, replica: &str) -> Result<Claim> {
     let now = unix_now();
+    // The lapse and the prune are evaluated only when the CASE reaches
+    // them: never when a task was claimed. The prune deletes finished rows
+    // only, which the pick never touches.
     let row = sqlx::query(
-        r#"UPDATE task
-           SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1
-           WHERE id = (SELECT id FROM task
-                       WHERE status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2)
-                       ORDER BY created_at_unix ASC
-                       FOR UPDATE SKIP LOCKED
-                       LIMIT 1)
-           RETURNING id, kind, status, project_id, execution_id, tenant_id, attempts, payload"#,
+        r#"WITH picked AS (
+               UPDATE task
+               SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1
+               WHERE id = (SELECT id FROM task
+                           WHERE status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2)
+                           ORDER BY created_at_unix ASC
+                           FOR UPDATE SKIP LOCKED
+                           LIMIT 1)
+               RETURNING id, kind, status, project_id, execution_id, tenant_id, attempts, payload)
+           SELECT p.*,
+                  CASE WHEN p.id IS NULL
+                       THEN (SELECT MIN(claimed_until_unix) FROM task WHERE status = 'claimed') END AS next_lapse,
+                  CASE WHEN p.id IS NULL THEN weft_prune_finished_tasks($4) END AS pruned
+           FROM (SELECT 1) AS one LEFT JOIN picked p ON TRUE"#,
     )
     .bind(replica)
     .bind(now)
     .bind(now + claim_duration_secs())
-    .fetch_optional(pool)
+    .bind(now - TERMINAL_RETENTION_SECS)
+    .fetch_one(pool)
     .await?;
-    row.map(row_to_task).transpose()
+    if row.try_get::<Option<Uuid>, _>("id")?.is_none() {
+        let pruned: Option<i32> = row.try_get("pruned")?;
+        if let Some(pruned) = pruned.filter(|pruned| *pruned > 0) {
+            tracing::info!(target: "weft_task_store::tasks", pruned, "pruned finished tasks past their retention");
+        }
+        return Ok(Claim::Dry { next_lapse: row.try_get("next_lapse")? });
+    }
+    Ok(Claim::Task(row_to_task(row)?))
 }
 
 /// Renew the claim's lease. Returns false if the row no longer
 /// belongs to us (lease lost, manually transitioned, deleted).
-/// The caller should abandon work and let the next claim recover.
+/// The caller should abandon work and let the next claim recover. A
+/// claim resting on a run ([`rest_claim`]) stays resting.
 pub async fn heartbeat(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
     let claim_until = unix_now() + claim_duration_secs();
     let rows = sqlx::query(
         r#"UPDATE task
-           SET claimed_until_unix = $1
+           SET claimed_until_unix = CASE WHEN claim_rests_on IS NULL THEN $1 END
            WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
     )
     .bind(claim_until)
     .bind(task_id)
     .bind(replica)
+    .execute(pool)
+    .await?;
+    Ok(rows.rows_affected() > 0)
+}
+
+/// Let the claim rest on `run`, a run the task waits on that may wait for
+/// days: its claimant stops renewing it, and no claim rescues it
+/// (`claimed_until_unix` is empty). Whoever watches that run hands the
+/// task back once it ended and nobody resumed the claim
+/// (`weft_dispatcher::lapses`). False when the row is no longer ours.
+pub async fn rest_claim(pool: &PgPool, task_id: Uuid, replica: &str, run: weft_core::ExecutionId) -> Result<bool> {
+    let rows = sqlx::query(
+        r#"UPDATE task SET claimed_until_unix = NULL, claim_rests_on = $3
+           WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
+    )
+    .bind(task_id)
+    .bind(replica)
+    .bind(run)
+    .execute(pool)
+    .await?;
+    Ok(rows.rows_affected() > 0)
+}
+
+/// Take a resting claim ([`rest_claim`]) back to a lease renewed by its
+/// claimant. False when the row is no longer ours (it was handed back
+/// meanwhile).
+pub async fn resume_claim(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
+    let rows = sqlx::query(
+        r#"UPDATE task SET claimed_until_unix = $3, claim_rests_on = NULL
+           WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
+    )
+    .bind(task_id)
+    .bind(replica)
+    .bind(unix_now() + claim_duration_secs())
     .execute(pool)
     .await?;
     Ok(rows.rows_affected() > 0)
@@ -392,7 +482,7 @@ pub async fn store_result_partial(
 
 /// The row's recorded result, or `None` when the row is gone or holds
 /// none. Reads whatever `store_result_partial` or `complete` wrote;
-/// the row outlives claims (only the terminal-retention sweep deletes
+/// the row outlives claims (only pruning deletes
 /// it), so a re-claim reads a prior claim's recorded outcome here.
 pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>> {
     let row: Option<(Option<Value>,)> =
@@ -538,21 +628,6 @@ fn row_to_outcome(row: sqlx::postgres::PgRow) -> Result<TaskOutcome> {
     let status_str: String = row.try_get("status")?;
     let status = TaskStatus::parse(&status_str).ok_or_else(|| anyhow::anyhow!("bad status {status_str}"))?;
     Ok(TaskOutcome { status, result: row.try_get("result")?, error: row.try_get("error")? })
-}
-
-/// Sweep terminal-state rows older than the retention window.
-pub async fn sweep_terminal(pool: &PgPool) -> Result<u64> {
-    let cutoff = unix_now() - TERMINAL_RETENTION_SECS;
-    let rows = sqlx::query(
-        r#"DELETE FROM task
-           WHERE status IN ('complete', 'failed')
-             AND completed_at_unix IS NOT NULL
-             AND completed_at_unix < $1"#,
-    )
-    .bind(cutoff)
-    .execute(pool)
-    .await?;
-    Ok(rows.rows_affected())
 }
 
 /// Decode a `task` row. Every column propagates its decode error

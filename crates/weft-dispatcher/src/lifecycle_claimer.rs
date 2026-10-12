@@ -22,8 +22,8 @@
 //! Wake mechanism: every command row announces itself on
 //! `INFRA_COMMAND_CHANNEL` (`issued:<project>`) from its own trigger when
 //! it commits, whoever wrote it. The claim loop wakes on each and drains
-//! everything pending; a long safety tick catches a lost notification
-//! and a dead claimer's lapsed lease, which nothing announces.
+//! everything pending, then looks again when the earliest of its claims
+//! could lapse, since nothing announces a claimer that died.
 
 use anyhow::Result;
 use sqlx::PgPool;
@@ -37,15 +37,35 @@ use crate::state::DispatcherState;
 pub(crate) static WAKE_ON: &[WakeOn] = &[ISSUED_WAKE];
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new("lifecycle_claimer", WAKE_ON, SAFETY_POLL_INTERVAL, move || {
+    DrainLoop::new("lifecycle_claimer", "start the lifecycle commands waiting for it", WAKE_ON, SAFETY_POLL_INTERVAL, move || {
         let state = state.clone();
         async move {
-            match claim_and_run_one(&state).await? {
-                true => Ok(DrainStep::More),
-                false => Ok(DrainStep::Done),
+            if claim_and_run_one(&state).await? {
+                return Ok(DrainStep::More);
             }
+            // A claim whose claimer died is taken over once its lease
+            // runs out, which nothing announces.
+            let now = crate::lease::now_unix();
+            Ok(match earliest_claim_lapse(&state.pg_pool).await? {
+                Some(at) => DrainStep::RetryIn(std::time::Duration::from_secs((at + 1 - now).max(1).unsigned_abs())),
+                None => DrainStep::Done,
+            })
         }
     })
+}
+
+/// When the earliest claim this loop makes runs out (unix seconds, on the
+/// database's clock like the claim): what [`claim_one`] then takes over.
+async fn earliest_claim_lapse(pool: &PgPool) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT MIN(claimed_at_unix) + {ttl} FROM infra_lifecycle_command \
+         WHERE claimed_by_replica IS NOT NULL AND completed_at_unix IS NULL \
+           AND (verb IN ({verbs}) OR drain_by_unix IS NOT NULL)",
+        ttl = weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs(),
+        verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
+    ))
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Three terminal outcomes a dispatcher-claimed verb can produce.
@@ -134,16 +154,15 @@ async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
     }
 }
 
-/// How often a command's drain looks whether the person cancelled it.
-const DRAIN_CANCEL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// The wait a stop or terminate does before its supervisor takes it: the
 /// running work its copies reach, through the one drain, cancelled at its
 /// deadline (sparing the run that asked). Once over, the command is handed
 /// on: its drain cleared and its claim let go, which announces it to the
-/// supervisors. A cancel of the command ends it here, cancelled. A
-/// database failure lets the claim go with the drain still to do, for the
-/// next pass.
+/// supervisors. A cancel of the command ends it here, cancelled. The drain
+/// keeps the claim alive at each look it takes ([`CommandClaim`]), so a
+/// wait on runs that only wait touches the database when it looks, not
+/// on a clock of its own. A database failure lets the claim go with the
+/// drain still to do, for the next pass.
 async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand, drain: crate::infra_lifecycle_command::DrainFirst) {
     let replica = state.replica.as_str();
     let scope = crate::drain::DrainScope {
@@ -153,31 +172,14 @@ async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand, dra
     };
     let left = u64::try_from(drain.by_unix - crate::lease::now_unix()).unwrap_or(0);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(left);
-    let cancelled = async {
-        loop {
-            tokio::time::sleep(DRAIN_CANCEL_POLL).await;
-            match crate::infra_lifecycle_command::cancel_requested(&state.pg_pool, row.id).await {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(e) => tracing::warn!(
-                    target: "weft_dispatcher::lifecycle_claimer",
-                    command_id = row.id, error = %format!("{e:#}"),
-                    "could not read whether this command was cancelled; looking again"
-                ),
-            }
-        }
-    };
+    let claim = CommandClaim { id: row.id, replica };
     let ended = tokio::select! {
-        drained = crate::drain::drain(state, &scope, Some(deadline), crate::infra_lifecycle_command::RunningPolicy::Wait) => drained,
-        () = cancelled => {
+        drained = crate::drain::drain(state, &scope, Some(deadline), crate::infra_lifecycle_command::RunningPolicy::Wait, Some(&claim)) => drained,
+        () = cancelled(state, row.id) => {
             let outcome = RunOutcome::Cancelled("cancelled while waiting for the running work".into());
             if let Err(e) = complete(&state.pg_pool, row.id, replica, &outcome).await {
                 tracing::error!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "could not record a cancelled command; its claim lapses and the next pass looks again");
             }
-            return;
-        }
-        () = hold_claim(&state.pg_pool, row.id, replica) => {
-            tracing::warn!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, "the claim on this command's drain was taken over by another replica; it answers for it now");
             return;
         }
     };
@@ -196,6 +198,62 @@ async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand, dra
     };
     if let Err(e) = handed {
         tracing::warn!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "the wait before this take-down failed; it is looked at again once its claim lapses");
+    }
+}
+
+/// Until command `id` is cancelled: its flag is read now, then again each
+/// time a cancel of it is announced (`InfraCommandSignal::Cancel`) or the
+/// watch may have missed one. Never returns when the flag cannot be read
+/// or the watch stops (both logged): the command runs on.
+async fn cancelled(state: &DispatcherState, id: i64) {
+    use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
+    // Subscribed before the read, so a cancel between the two is heard.
+    let mut heard = state.signals.subscribe();
+    loop {
+        match crate::infra_lifecycle_command::cancel_requested(&state.pg_pool, id).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                target: "weft_dispatcher::lifecycle_claimer",
+                command_id = id, error = %format!("{e:#}"),
+                "could not read whether this command was cancelled; read again at the next cancel"
+            ),
+        }
+        let woken = heard
+            .woken(|channel, payload| channel == INFRA_COMMAND_CHANNEL && InfraCommandSignal::parse(payload) == Some(InfraCommandSignal::Cancel { id }))
+            .await;
+        if let Err(e) = woken {
+            tracing::error!(target: "weft_dispatcher::lifecycle_claimer", command_id = id, error = %format!("{e:#}"), "no cancel of this command can be heard any more");
+            return std::future::pending().await;
+        }
+    }
+}
+
+/// A dispatcher's claim on a command whose drain keeps it alive
+/// (`crate::drain::drain`): renewed at each look the drain takes, to last
+/// past its next one.
+pub struct CommandClaim<'a> {
+    pub id: i64,
+    pub replica: &'a str,
+}
+
+impl CommandClaim<'_> {
+    /// Keep the claim until at least `until_unix` (the claim lapses
+    /// `CLAIM_LEASE_TTL` after `claimed_at_unix`, which is set that far
+    /// ahead when the drain's next look is further than one lease away).
+    /// `false` when it is no longer this process's.
+    pub async fn keep_until(&self, pool: &PgPool, until_unix: i64) -> Result<bool> {
+        let renewed = sqlx::query(
+            "UPDATE infra_lifecycle_command SET claimed_at_unix = GREATEST(EXTRACT(EPOCH FROM NOW())::BIGINT, $3 - $4) \
+             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+        )
+        .bind(self.id)
+        .bind(self.replica)
+        .bind(until_unix)
+        .bind(i64::try_from(weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs()).unwrap_or(i64::MAX))
+        .execute(pool)
+        .await?;
+        Ok(renewed.rows_affected() == 1)
     }
 }
 
@@ -443,18 +501,18 @@ async fn run_deactivate(
         // Nothing listening is reached: nothing to park.
         return Ok(RunOutcome::Succeeded);
     }
-    let existed = crate::take_down::take_down(
+    let taken = crate::take_down::take_down(
         state,
         project_id,
         &crate::take_down::TakeDownTarget::Activations(targets),
         &take_down.spec,
         // The health loop's own park: its auto-recover may bring it back.
         Some(crate::take_down::DownWith::Health),
-        None,
+        crate::take_down::TakeDownAsker::Outside,
     )
     .await
     .map_err(|(_, m)| anyhow::anyhow!("deactivate: {m}"))?;
-    if !existed {
+    if taken == crate::take_down::TakenDown::ProjectGone {
         // The project row was removed between the supervisor
         // enqueueing this command and the dispatcher claiming it.
         // Not a failure: surface as Cancelled so `wait_for_command`

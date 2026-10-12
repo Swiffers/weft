@@ -407,12 +407,15 @@ enum Cmd {
     /// Activate a project. Without a project id, discovers the cwd
     /// project, compiles + registers it first, then activates.
     ///
-    /// `--reactivate-choice` is forwarded to the dispatcher when the
-    /// project is in hibernate/park: one of
-    /// `execute_parked_keep_suspended`, `keep_suspended_only`,
-    /// `wipe_all`. Without it the human-terminal prompt fires;
-    /// `--json` mode requires it explicitly when there is preserved
-    /// state.
+    /// `--reactivate-choice` says what happens to the work the triggers
+    /// kept while they were parked or hibernated:
+    /// `execute_parked_keep_suspended` runs the events that arrived
+    /// meanwhile (answers people sent to waiting runs included) and keeps
+    /// the waiting runs waiting; `keep_suspended_only` drops those events,
+    /// the answers people sent among them, and keeps the waiting runs
+    /// waiting; `wipe_all` drops everything and cancels the runs those
+    /// triggers started. Without it a terminal is asked; `--json` mode
+    /// requires it when the triggers kept work.
     ///
     /// A worker built from an older image than the one being
     /// activated is replaced: `--running-policy cancel` (the default)
@@ -503,6 +506,12 @@ enum Cmd {
         opts: TriggerDeactivationOpts,
         #[command(flatten)]
         scope: ScopeOpts,
+        /// Take up again the resync this project holds (one that stopped
+        /// with triggers down), where it stopped, with the choice and the
+        /// build it began with: nothing is built, nothing is asked, and no
+        /// new resync starts. Takes no other flag.
+        #[arg(long)]
+        resume: bool,
     },
     /// List every project registered with the dispatcher.
     Ps,
@@ -1242,6 +1251,11 @@ enum InfraAction {
         #[arg(long, value_name = "id")]
         instance: Option<weft_core::instance::InstanceId>,
     },
+    /// Ask the supervisor to look at this project's infra again: its units'
+    /// health, its waiting commands and what gone copies left behind. A
+    /// health protocol that gave up tries again. `weft status` shows what
+    /// it finds.
+    Look,
     /// Print what the project's infra containers wrote: every unit of
     /// every infra node, or one node's. Each block is headed by the node
     /// (and whose copy), the unit and the container that wrote it.
@@ -1601,6 +1615,7 @@ impl InfraAction {
                 (commands::infra::InfraAction::Upgrade, opts_from(opts, instance))
             }
             InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
+            InfraAction::Look => (commands::infra::InfraAction::Look, Default::default()),
             InfraAction::ListDoors => {
                 (commands::infra::InfraAction::ListDoors, Default::default())
             }
@@ -1877,8 +1892,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::CancelRunning { project, scope } => {
             commands::cancel_running::run(ctx, project, scope.into()).await
         }
-        Cmd::Resync { opts, scope } => {
+        Cmd::Resync { opts, scope, resume: false } => {
             commands::resync::run(ctx, scope.into(), opts.into()).await
+        }
+        Cmd::Resync { opts, scope, resume: true } => {
+            let scope: weft_core::activation::ActivationScope = scope.into();
+            let opts: commands::deactivate::TriggerChoiceFlags = opts.into();
+            if scope != weft_core::activation::ActivationScope::default()
+                || opts.mode.is_some()
+                || opts.grace.is_some()
+                || opts.running_policy.is_some()
+                || opts.drain_timeout.is_some()
+            {
+                anyhow::bail!(
+                    "--resume takes the resync up with the triggers, choice and build it began with; leave out every other flag"
+                );
+            }
+            commands::resync::resume(ctx).await
         }
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project, journal, local, all, force, yes } => {

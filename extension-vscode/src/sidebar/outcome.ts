@@ -27,6 +27,8 @@ export function describeOutcome(
           return `cancelled  ·  stopped by run ${cancelCause.by.slice(0, 8)} (tag ${cancelCause.tag})`;
         case 'runtime':
           return `cancelled  ·  ${cancelCause.detail}`;
+        case 'limit':
+          return `cancelled  ·  time limit: ${cancelCause.detail}`;
         default:
           return 'cancelled';
       }

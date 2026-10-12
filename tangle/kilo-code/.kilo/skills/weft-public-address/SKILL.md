@@ -11,14 +11,17 @@ internet. Polling triggers (Telegram, email, sheets, RSS, cron) and
 everything local work without one.
 
 **The error, verbatim.** When a project with a dial-in trigger is
-activated on a weft the internet cannot reach, activation refuses with:
+activated on a weft the internet cannot reach, activation refuses with
+this, and a trigger already on stops with it when it next has to make its
+subscription again:
 
 > this trigger needs '<service>' to deliver events TO your weft, which
 > requires your weft to be reachable from the internet, and it is not. If
 > you accept making its public trigger surface reachable, rerun
-> `./setup.sh --public-url` and re-activate; or use a connection that
-> supports dialing out (your own provider app), where the service offers
-> one.
+> `./setup.sh --public-url`, then `weft activate` (or `weft resync`, when
+> the trigger is already on); or use a connection that supports dialing
+> out (your own provider app), where the service offers one. See
+> https://weavemindai.github.io/weft/connections/events.html
 
 If you see that, or a user pastes it, this is the cause and nothing else.
 It is not a broken credential, a wrong path, or a bad subscription. Say so
@@ -40,7 +43,8 @@ thing the tool told them. Steps:
    `ask`-first moves.
 3. Run `./setup.sh --public-url`, then `weft daemon status` to read back
    the hostname it minted.
-4. Re-activate the project. If the same error comes back, the transport
+4. Run `weft activate`, or `weft resync` if the trigger is already on
+   (`weft activate` refuses a trigger that is on). If the same error comes back, the transport
    was never the problem; go and read the trigger's own metadata for
    which transports its connection actually supports.
 

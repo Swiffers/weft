@@ -41,7 +41,12 @@ import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation, TriggerC
 import { LOCAL_INSTALL } from '../../packages/weft-graph/src/protocol';
 import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint } from './localInstall';
 import { isTriggerChoiceRefusal, triggerChoiceIntent } from './triggerChoice';
-import { emptyActionAvailability, parseRunning, parseStatusPayload } from '../../packages/weft-graph/src/status';
+import {
+  emptyActionAvailability,
+  parseRunning,
+  parseStatusPayload,
+  PROJECT_BEING_REMOVED,
+} from '../../packages/weft-graph/src/status';
 import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -621,7 +626,9 @@ export function activate(context: vscode.ExtensionContext) {
     // The install the graph showed at the click, bound like the project.
     const on = onArgs(installOf(projectId));
     const verbTag = verbTagFor(verb, args);
-    const gated = PREFLIGHT_VERBS.has(verb);
+    // A resync taken up again (`--resume`) ships nothing: it brings back
+    // the build it began with.
+    const gated = PREFLIGHT_VERBS.has(verb) && !args.includes('--resume');
     // The click registered: show the pre-CLI window (save flush + the
     // pre-flight check) on the bar instead of an idle bar that jumps,
     // with a working Stop (the abort handle) for its whole duration.
@@ -826,23 +833,23 @@ export function activate(context: vscode.ExtensionContext) {
     const choice = await vscode.window.showQuickPick(
       [
         {
-          label: 'Execute parked + keep suspensions',
-          description: `${parked} parked, ${suspended} suspended`,
+          label: 'Run what was kept, keep the waiting runs',
+          description: `runs ${parked} kept event(s), answers people sent included; ${suspended} run(s) keep waiting on a person`,
           value: 'execute_parked_keep_suspended',
         },
         {
-          label: 'Keep suspensions only',
-          description: `drops ${parked} parked, keeps ${suspended} suspended`,
+          label: 'Drop the kept events, keep the waiting runs',
+          description: `drops ${parked} kept event(s), answers people sent included; ${suspended} run(s) keep waiting on a person`,
           value: 'keep_suspended_only',
         },
         {
           label: 'Wipe all',
-          description: 'drops everything preserved, fresh start',
+          description: 'drops everything kept and cancels the runs these triggers started: a fresh start',
           value: 'wipe_all',
         },
       ],
       {
-        title: `Reactivating ${project.label}: preserved state to handle`,
+        title: `Reactivating ${project.label}: work kept while the triggers were off`,
         placeHolder: 'Pick a reactivate choice',
         ignoreFocusOut: true,
       },
@@ -1064,9 +1071,26 @@ export function activate(context: vscode.ExtensionContext) {
         snapshot: parseStatusPayload(json),
         running: parseRunning(json),
       };
-      // A status banner lasts exactly as long as the status cannot be
-      // read: the next good read takes it down, and only its own.
-      actionBar.clearErrorIfVerb(projectId, 'status');
+      // A project `weft rm` stopped partway through removing is said
+      // above the bar for as long as it stays so, and the bar offers no
+      // verb (`removing` in the snapshot). Otherwise a status banner
+      // lasts exactly as long as the status cannot be read: the next
+      // good read takes it down, and only its own.
+      if (result.snapshot.removing) {
+        actionBar.setError(projectId, 'status', 'This project is being removed, so nothing here can run.', {
+          what: 'Reading the project status',
+          stage: 'dispatch',
+          diagnostics: [
+            {
+              severity: 'error',
+              message: PROJECT_BEING_REMOVED,
+              hint: 'Run `weft rm` again in a terminal in the project folder to finish removing it.',
+            },
+          ],
+        });
+      } else {
+        actionBar.clearErrorIfVerb(projectId, 'status');
+      }
       return result;
     } catch (err) {
       // The daemon answered with something this editor cannot read: a

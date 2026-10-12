@@ -248,6 +248,10 @@ fn rig(run_id: &str, broker_base: String) -> Rig {
         ),
         Arc::new(weft_platform_traits::FakeAlarm::new()),
         doors.clone(),
+        weft_listener::HolderPlatform {
+            news: Arc::new(weft_platform_traits::FakeHolderNews::default()),
+            liveness: Arc::new(weft_platform_traits::OneProcessHolds),
+        },
     );
     Rig { doors, state }
 }

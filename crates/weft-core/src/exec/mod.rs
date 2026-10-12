@@ -22,7 +22,7 @@ pub use cancel::CancelCause;
 pub use completion::check_completion;
 pub use emission::PulseEmission;
 pub use execution::{
-    latest_firing, latest_firing_mut, next_firing_ordinal, NodeExecution, NodeExecutionStatus,
+    firing_at, firing_at_mut, NodeExecution, NodeExecutionStatus,
     NodeExecutionTable,
 };
 pub use postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag};

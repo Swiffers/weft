@@ -62,14 +62,15 @@ install that copy is billed all the time. On a cloud install one stretch of a ru
 A trigger that holds a connection open (a stream or a socket it listens to,
 an event subscription that dials out) runs on a holder, which weft starts
 only while such a trigger is on and which is billed while it runs. Its node
-shows "waiting for a holder to take it" until one has. While a holder runs,
-it checks in through weft every 10 seconds, which also keeps weft's broker
-and the database up. Infrastructure that runs fine keeps nothing awake: its
-machine reports only when its state changes. Everything else (a route, a
-form, a timer, a poll, a provider that pushes its events) needs nothing
-running between events. If the install's database is on a plan that sleeps
-and has limited hours, tell the user before you deploy such a trigger that it
-keeps the database awake around the clock.
+shows "waiting for a holder to take it" until one has. A holder does not
+keep the database awake: it hears about changes over Pub/Sub and keeps a
+Cloud Tasks check pushed ahead of itself, and neither touches the database.
+The database wakes when an event arrives on that connection, when the
+connection drops or comes back, and when a holder starts or is told the
+triggers changed. Infrastructure that runs fine keeps
+nothing awake: its machine reports only when its state changes. Everything
+else (a route, a form, a timer, a poll, a provider that pushes its events)
+needs nothing running between events.
 
 While the user's VS Code editor is pointed at the cloud install, it keeps a
 live connection to it, which keeps the install and its database awake. After

@@ -215,8 +215,7 @@ pub struct ActivateRequest {
 /// What an activate points the project at: the hashes of the version
 /// that built (absent when activating by id, which keeps the recorded
 /// ones) and the answer to "what about the state a hibernated or parked
-/// project kept". The half of an activate a resync carries verbatim; the
-/// running-work half it takes from its own picker.
+/// project kept".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivationTarget {
     #[serde(flatten)]
@@ -284,7 +283,7 @@ pub struct ActivateResponse {
 }
 
 /// One address a listener answers on, for the trigger at `node_id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationUrl {
     pub node_id: String,
     pub url: String,
@@ -296,6 +295,24 @@ pub struct ActivationUrl {
 pub struct ResyncResponse {
     pub urls: Vec<ActivationUrl>,
     pub resynced: Vec<Owner>,
+}
+
+/// One owner's triggers, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerTriggers {
+    pub owner: Owner,
+    pub triggers: Vec<String>,
+}
+
+/// What `POST /projects/{id}/cancel-activate` answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelActivateResponse {
+    /// Set when the cancel gave up a resync (under way, or stopped): the
+    /// triggers it had taken down and not brought back, which stay down
+    /// until `weft activate` turns them on. Empty when it had brought
+    /// every one back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resync_given_up: Option<Vec<OwnerTriggers>>,
 }
 
 #[cfg(test)]

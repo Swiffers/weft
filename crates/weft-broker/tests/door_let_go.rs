@@ -151,3 +151,56 @@ async fn an_answer_handed_to_a_run_that_parks_reaches_its_record(pool: PgPool) {
     );
     assert!(weft_task_store::parked_fires::answers_for(&pool, execution_id).await.unwrap().is_empty(), "taken once");
 }
+
+/// After its line may have missed some, a worker reads the cancels and the
+/// answers of every run it drives in one call: its own runs only, answers
+/// oldest first.
+#[sqlx::test]
+async fn one_recheck_reads_the_cancels_and_answers_of_every_run_a_worker_drives(pool: PgPool) {
+    schema(&pool).await;
+    let cancelled = driven_by(&pool, "w1").await;
+    let answered = driven_by(&pool, "w1").await;
+    let elsewhere = driven_by(&pool, "w2").await;
+    sqlx::query("UPDATE run SET cancel_requested = $2 WHERE execution_id = $1")
+        .bind(cancelled)
+        .bind(sqlx::types::Json(weft_core::exec::CancelCause::User))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    for (token, run) in [("first", answered), ("second", answered), ("theirs", elsewhere)] {
+        let answer = weft_core::primitive::WaitAnswer::Given { value: serde_json::json!(token) };
+        weft_task_store::parked_fires::hand_answer_in(&mut tx, token, run, &answer).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let rechecked = weft_broker::records::rechecked(&pool, "w1", PROJECT).await.unwrap();
+    assert_eq!(rechecked.cancels.len(), 1);
+    assert_eq!((rechecked.cancels[0].execution_id, &rechecked.cancels[0].cause), (cancelled, &weft_core::exec::CancelCause::User));
+    let answers: Vec<_> = rechecked.answers.iter().map(|a| (a.execution_id, a.token.as_str())).collect();
+    assert_eq!(answers, vec![(answered, "first"), (answered, "second")], "its own, oldest first; nothing of w2's");
+}
+
+/// A worker of the previous release, once its line came back, reads the
+/// cancels of the runs it drives from `/v1/run/cancels`: its own runs only,
+/// in the shape that release reads (`{"cancels": [...]}`, nothing else).
+#[sqlx::test]
+async fn a_previous_release_worker_still_reads_its_cancels(pool: PgPool) {
+    schema(&pool).await;
+    let cancelled = driven_by(&pool, "w1").await;
+    driven_by(&pool, "w1").await;
+    let elsewhere = driven_by(&pool, "w2").await;
+    for run in [cancelled, elsewhere] {
+        sqlx::query("UPDATE run SET cancel_requested = $2 WHERE execution_id = $1")
+            .bind(run)
+            .bind(sqlx::types::Json(weft_core::exec::CancelCause::User))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let cancels = weft_broker::records::previous_release_cancels(&pool, "w1", PROJECT).await.unwrap();
+    let wire = serde_json::to_value(&cancels).unwrap();
+    let expected = vec![weft_broker_client::protocol::RunCancel { execution_id: cancelled, cause: weft_core::exec::CancelCause::User }];
+    assert_eq!(wire, serde_json::json!({ "cancels": serde_json::to_value(&expected).unwrap() }));
+}

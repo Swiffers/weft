@@ -425,7 +425,7 @@ async fn download_url(
     let store = &state.runtime_store;
     let parsed = wall(&caller, &key)?;
     let (meta, url) = store
-        .download_url(&parsed, PresignAudience::Internal, q.ttl_secs)
+        .download_url(&parsed, PresignAudience::Internal, q.ttl_secs, false)
         .await
         .map_err(map_err)?;
     Ok(Json(DownloadUrlResponse { meta, url }))
@@ -543,7 +543,7 @@ async fn presign(
         Some(url) => url,
         None => {
             store
-                .download_url(&parsed, PresignAudience::Internal, req.ttl_secs)
+                .download_url(&parsed, PresignAudience::Internal, req.ttl_secs, true)
                 .await
                 .map_err(map_err)?
                 .1

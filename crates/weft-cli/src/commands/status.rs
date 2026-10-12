@@ -127,15 +127,25 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     println!("project: {} ({project_id})", data.name);
+    // Half taken down: what follows is what is left.
+    if data.removing {
+        println!("  WARNING: {}", weft_core::projects::PROJECT_BEING_REMOVED);
+    }
     println!("  registration: {}", data.status);
     match &data.address {
         Some(weft_core::projects::ProjectAddress::Serving { url }) => println!("  address: {url} (its routes, at the root)"),
         Some(weft_core::projects::ProjectAddress::Unavailable { why }) => println!("  address: unavailable: {why}"),
         None => {}
     }
-    // The build-transition axis: only worth a line while in flight.
-    if data.transition != ProjectTransition::None {
-        println!("  build: {} (cancel with `{}`)", data.transition, ctx.weft("cancel-build"));
+    // The transition axis: only worth a line while in flight.
+    match data.transition {
+        ProjectTransition::None => {}
+        ProjectTransition::Resyncing => println!(
+            "  resync: under way (`{}` ends its wait on running work, `{}` stops it as the triggers come back)",
+            ctx.weft("cancel-running"),
+            ctx.weft("cancel-activate")
+        ),
+        building => println!("  build: {building} (cancel with `{}`)", ctx.weft("cancel-build")),
     }
     for build in &data.builds {
         match &build.log_url {
@@ -196,11 +206,20 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 Some(instance) => println!("    {trigger} (instance {instance}): {mode}{version}"),
                 None => println!("    {trigger}: {mode}{version}"),
             }
-            // Fires parked until the instance is given a value they
-            // need: its next change of values routes them again.
+            // Fires waiting on something no clock brings: what they wait
+            // on hands them over again.
             if let Some(waiting) = &entry.waiting {
-                let counted = if waiting.fires == 1 { "1 fire waits".to_string() } else { format!("{} fires wait", waiting.fires) };
-                println!("      {counted} until the instance's values change: {}", waiting.reason);
+                use weft_core::door_fire::UnclockedWait;
+                let (fires, wait) = if waiting.fires == 1 { ("1 fire".to_string(), "waits") } else { (format!("{} fires", waiting.fires), "wait") };
+                let until = match waiting.on {
+                    UnclockedWait::Instance => format!("{wait} until the instance's values change"),
+                    UnclockedWait::Infra => format!("{wait} until the infra the runs read is running again"),
+                    UnclockedWait::Picks => format!("{wait} until the install picks the connections the runs need"),
+                    UnclockedWait::Failure => "stopped after failing to start a run, and holds the trigger's queue; `weft activate`, a new \
+                                               build or a change of the worker settings tries again"
+                        .to_string(),
+                };
+                println!("      {fires} {until}: {}", waiting.reason);
             }
         }
     }

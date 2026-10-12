@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::Layer as _;
 
 #[derive(Debug, Parser)]
 #[command(name = "weft-runtime", version)]
@@ -48,27 +51,34 @@ enum AgentCommand {
 async fn main() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
     let args = Args::parse();
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        "weft_runtime=info,weft_dispatcher=info,weft_broker=info,weft_listener=info,weft_infra_supervisor=info,weft_platform_local=info,weft_platform_gcp=info".into()
-    });
-    match &args.command {
+    let config = match &args.command {
+        Command::Serve { config, .. } => Some(weft_platform_traits::InstallConfig::load(config)?),
+        Command::UnitAgent { .. } => None,
+    };
+    // Every weft crate at info. The alert line is the platform's to write
+    // (`platform::alert_lines`), never the ordinary log's.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "weft=info".into())
+        .add_directive(format!("{}=off", weft_platform_traits::ALERT_TARGET).parse()?);
+    let lines = match &args.command {
         // A local install's runtime keeps its own log, bounded; anywhere
         // else the platform collects stdout.
         Command::Serve { log: Some(path), .. } => {
             let file = weft_runtime::log_file::LogFile::open(path, weft_runtime::log_file::MAX_BYTES)?;
-            tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(file).init();
+            tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file).boxed()
         }
         // Colours only on a terminal: a platform's log collector (Cloud
         // Run's) keeps the escape codes as text.
-        _ => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
-            .init(),
-    }
+        _ => tracing_subscriber::fmt::layer().with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())).boxed(),
+    };
+    tracing_subscriber::registry()
+        .with(config.as_ref().and_then(weft_runtime::platform::alert_lines))
+        .with(lines.with_filter(filter))
+        .init();
     match args.command {
-        Command::Serve { config, role, .. } => {
+        Command::Serve { role, .. } => {
             weft_core::time_scale::announce();
-            let config = weft_platform_traits::InstallConfig::load(&config)?;
+            let config = config.expect("the config of `serve` is read above");
             let role = role.as_deref().map(weft_platform_traits::CoreRole::parse).transpose().map_err(anyhow::Error::msg)?;
             weft_runtime::serve(config, role).await
         }

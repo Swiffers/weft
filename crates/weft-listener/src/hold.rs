@@ -5,37 +5,58 @@
 //! one process, or a holder, one of the copies of this code weft runs in
 //! a pool as many as the held signals need (none when there are none). A
 //! holder claims each signal it holds through the broker, in its own
-//! name, and renews the claim at every look. Holders share the signals by
-//! taking only the ones no live holder claims, and when one dies its
-//! claims lapse and another takes them over. A signal whose row is
+//! name, and the claim lasts until it lets go. Holders share the signals
+//! by taking only the ones no holder claims. A signal whose row is
 //! rewritten (a registration again) loses its claim, so its holder stops
 //! the old connection and the new one comes up as the row now reads.
+//!
+//! Nothing here runs on a timer. A holder looks (one broker call: say
+//! what each connection is doing when that changed, learn which are
+//! still its own, take what is free) when it starts, when it is told the
+//! held signals changed or may have missed it
+//! (`weft_platform_traits::HolderNews`), and when one of its connections
+//! changes what it says. A holder that dies is noticed by its dead man's
+//! switch (`weft_platform_traits::HolderLiveness`): it keeps one check
+//! scheduled ahead of now and pushes it further before it comes due; one
+//! that goes off frees what the holder claimed.
 //!
 //! A signal that ended (its row is gone, or its activation parked) stops
 //! along with what it arranged outside (a provider subscription). One
 //! that only changed hands stops here and nothing more: what it arranged
 //! outside is keyed by its token, and is the next connection's now.
-//!
-//! Each look also carries what every connection says it is doing, so the
-//! node's display, which the listener renders in another process, shows
-//! it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use weft_broker_client::protocol::{HeldNow, HeldServing, HeldTransport, SignalHoldRequest, SignalLetGoRequest, SignalRowWire};
 use weft_core::signal::listener_protocol::StartMode;
+use weft_platform_traits::{HeldCheck, HolderHeard, HolderLiveness, HolderNote};
 
 use crate::registry::{ServingState, Transport};
 use crate::ListenerState;
 
-/// How often a holder looks: renews its claims, says what its connections
-/// are doing, and takes the signals waiting for a holder. A third of a
-/// claim's life (`weft_broker_client::protocol::hold_lease_secs`), at this
-/// install's pace.
-fn look_every() -> Duration {
-    weft_core::time_scale::scaled(Duration::from_secs(10))
+/// How far ahead of now a holder's check is set.
+fn check_ahead() -> Duration {
+    weft_core::time_scale::scaled(Duration::from_secs(180))
 }
+
+/// How often a holder pushes its check further ahead.
+fn push_every() -> Duration {
+    weft_core::time_scale::scaled(Duration::from_secs(60))
+}
+
+/// How long before its check goes off a holder that could not push it
+/// further lets go of everything instead.
+fn fence_margin() -> Duration {
+    weft_core::time_scale::scaled(Duration::from_secs(30))
+}
+
+/// The pauses before a look that failed is tried again. After the last, a
+/// holder in a pool ends (the platform starts another, which looks as it
+/// starts); an install's one process looks at its next news, which its
+/// own database sends as it comes back.
+const LOOK_RETRIES: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(20)];
 
 /// One process's holding: one look at a time, the most signals it holds,
 /// and what it last said about each connection, so a look only carries
@@ -48,31 +69,163 @@ pub struct Holding {
     /// `None`; a holder in a pool serves no routes, so nothing takes on its
     /// behalf before its loop has set its room.
     room: std::sync::OnceLock<Option<u32>>,
+    /// Told when a connection changes what it says
+    /// (`crate::kinds::serving_sink`), so the holder says it.
+    pub(crate) changed: Arc<tokio::sync::Notify>,
 }
 
-/// Hold until `stop` resolves: a look now, then one every
-/// [`look_every`], then every claim given up ([`let_go`]). `room` is the
-/// most signals this process holds (`None` for every one there is). A
-/// look that fails is logged; the next one tries again, and the claims it
-/// could not renew lapse to another holder meanwhile. `stop` is heard
-/// only between looks, so a look the broker is answering is never cut
-/// off with claims it took and nothing here knowing of them.
+/// Hold until `stop` resolves, then give every claim up ([`let_go`]).
+/// `room` is the most signals this process holds (`None` for every one
+/// there is). A holder in a pool sets its first check before anything is
+/// taken, and gives everything up and ends when it cannot keep its check
+/// ahead ([`keep_checked`]) or its looks keep failing ([`LOOK_RETRIES`]):
+/// the platform starts another. `stop` is heard only between looks, so a
+/// look the broker is answering is never cut off with claims it took and
+/// nothing here knowing of them.
 pub async fn run(state: ListenerState, room: Option<u32>, stop: impl std::future::Future<Output = ()>) {
     if state.holding.room.set(room).is_err() {
         tracing::error!(target: "weft_listener::hold", "a second hold loop started in this process; it ends at once");
         return;
     }
     tokio::pin!(stop);
-    loop {
-        if let Err(e) = look(&state, &[], StartMode::Restore).await {
-            tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder's look failed; looking again shortly");
-        }
+    let mut heard = state.holders.news.listen();
+    let liveness = state.holders.liveness.clone();
+    let pooled = liveness.pooled();
+    let mut check = None;
+    if pooled {
         tokio::select! {
-            () = tokio::time::sleep(look_every()) => {}
+            (first, pushed_at) = first_check(liveness.as_ref(), &state.config.replica) => check = Some((parking_lot::Mutex::new(first), pushed_at)),
+            () = &mut stop => return,
+        }
+    }
+    let fenced = async {
+        match &check {
+            Some((check, pushed_at)) => keep_checked(liveness.as_ref(), check, *pushed_at).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(fenced);
+    let mut owed = Some(0);
+    loop {
+        if let Some(tries) = owed {
+            owed = match look(&state, &[], StartMode::Restore).await {
+                Ok(()) => None,
+                Err(e) if tries < LOOK_RETRIES.len() => {
+                    tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder's look failed; trying again");
+                    Some(tries + 1)
+                }
+                Err(e) if pooled => {
+                    tracing::error!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder's looks keep failing; it lets go of everything and ends, and the copy started in its place looks again");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder's looks keep failing; it looks again at the next news");
+                    None
+                }
+            };
+        }
+        let retry = async {
+            match owed {
+                Some(tries) => tokio::time::sleep(LOOK_RETRIES[tries - 1]).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = retry => {}
+            news = heard.next() => match news {
+                Ok(HolderHeard::Note(HolderNote::HeldSetChanged)) => owed = owed.or(Some(0)),
+                Ok(HolderHeard::Note(HolderNote::AccessChanged)) => state.reach.access_changed(),
+                Ok(HolderHeard::MissedSome) => {
+                    state.reach.access_changed();
+                    owed = owed.or(Some(0));
+                }
+                Err(e) => {
+                    tracing::error!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder hears no news any more; it lets go of everything");
+                    break;
+                }
+            },
+            () = state.holding.changed.notified() => {
+                if let Err(e) = say(&state).await {
+                    tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder could not say what its connections are doing; it looks again to say it");
+                    owed = owed.or(Some(0));
+                }
+            }
+            () = &mut fenced => {
+                tracing::error!(target: "weft_listener::hold", "a holder could not keep its check ahead; it lets go of everything and ends");
+                break;
+            }
             () = &mut stop => break,
         }
     }
-    let_go(&state).await;
+    let_go(&state, check.as_ref().map(|(c, _)| c.lock().clone())).await;
+}
+
+/// This holder's first check, pushed until it is set, each try
+/// [`check_ahead`] of when it starts, and when the try that set it
+/// started.
+async fn first_check(liveness: &dyn HolderLiveness, replica: &str) -> (HeldCheck, tokio::time::Instant) {
+    loop {
+        let pushing_at = tokio::time::Instant::now();
+        let check = HeldCheck { replica: replica.to_string(), generation: 1, due_at_ms: in_ms(check_ahead()) };
+        match liveness.push(&check).await {
+            Ok(()) => return (check, pushing_at),
+            Err(e) => {
+                tracing::error!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder could not set its first check; it holds nothing until it can");
+                tokio::time::sleep(weft_core::time_scale::scaled(Duration::from_secs(5))).await;
+            }
+        }
+    }
+}
+
+/// Keep the holder's check ahead of now: every [`push_every`], set a new
+/// one [`check_ahead`] of now, then withdraw the old. Each is tried again
+/// until [`fence_margin`] before the old one goes off, counted from when
+/// it was pushed (`pushed_at`, the first one's included). Answers only
+/// when no new check could be set by then: the old one goes off and frees
+/// what the holder claims, so it must let go first. A new check set and
+/// an old one left is no harm: it goes off and frees the claims of a
+/// holder that is alive, which takes them back on the news that follows.
+pub async fn keep_checked(liveness: &dyn HolderLiveness, current: &parking_lot::Mutex<HeldCheck>, mut pushed_at: tokio::time::Instant) {
+    loop {
+        tokio::time::sleep(push_every()).await;
+        let old = current.lock().clone();
+        let until = pushed_at + check_ahead().saturating_sub(fence_margin());
+        let pushing_at = tokio::time::Instant::now();
+        let new = HeldCheck { generation: old.generation + 1, due_at_ms: in_ms(check_ahead()), ..old.clone() };
+        if !until_done(until, || liveness.push(&new)).await {
+            return;
+        }
+        *current.lock() = new;
+        pushed_at = pushing_at;
+        if !until_done(until, || liveness.withdraw(&old)).await {
+            tracing::warn!(target: "weft_listener::hold", generation = old.generation, "a holder's old check could not be withdrawn; it goes off, and the holder takes its signals back");
+        }
+    }
+}
+
+/// Try `call` until it works, a few seconds apart, or `until` passes.
+async fn until_done<F: std::future::Future<Output = anyhow::Result<()>>>(until: tokio::time::Instant, mut call: impl FnMut() -> F) -> bool {
+    loop {
+        match call().await {
+            Ok(()) => return true,
+            Err(e) if tokio::time::Instant::now() < until => {
+                tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder's check could not be moved; trying again");
+                tokio::time::sleep_until((tokio::time::Instant::now() + weft_core::time_scale::scaled(Duration::from_secs(5))).min(until)).await;
+            }
+            Err(e) => {
+                tracing::error!(target: "weft_listener::hold", error = %format!("{e:#}"), "a holder's check could not be moved in time");
+                return false;
+            }
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn in_ms(ahead: Duration) -> i64 {
+    now_ms() + i64::try_from(ahead.as_millis()).unwrap_or(i64::MAX / 2)
 }
 
 /// Take `tokens` now and bring each up in `mode`, within this process's
@@ -85,20 +238,43 @@ pub async fn take_now(state: &ListenerState, tokens: &[String], mode: StartMode)
     look(state, tokens, mode).await
 }
 
-/// One look: renew what this process holds, stop what it no longer holds,
-/// bring up what it took (the `want` ones in `mode`, the others as a
-/// restore).
-async fn look(state: &ListenerState, want: &[String], mode: StartMode) -> anyhow::Result<()> {
-    let mut said = state.holding.said.lock().await;
-    let room = state.holding.room.get().copied().flatten();
-    let holding: Vec<HeldNow> = renewed(held_here(state), want)
-        .into_iter()
+/// What the connections held here say now that they did not say last,
+/// as a look carries it.
+fn holding(state: &ListenerState, want: &[String], said: &mut HashMap<String, HeldServing>) -> Vec<HeldNow> {
+    let held = renewed(held_here(state), want);
+    said.retain(|token, _| held.contains(token));
+    held.into_iter()
         .map(|token| {
             let now = serving_of(state, &token);
             let serving = (said.get(&token) != Some(&now)).then_some(now);
             HeldNow { token, serving }
         })
-        .collect();
+        .collect()
+}
+
+/// Say what changed, when something did: a look that takes nothing.
+async fn say(state: &ListenerState) -> anyhow::Result<()> {
+    let changed = holding(state, &[], &mut state.holding.said.lock().await.clone());
+    if changed.iter().all(|h| h.serving.is_none()) {
+        return Ok(());
+    }
+    look(state, &[], StartMode::Restore).await
+}
+
+/// One look: say what changed, stop what this process no longer holds,
+/// bring up what it took (the `want` ones in `mode`, the others as a
+/// restore).
+async fn look(state: &ListenerState, want: &[String], mode: StartMode) -> anyhow::Result<()> {
+    let mut said = state.holding.said.lock().await;
+    // A give-up written now lets go of its claim, so the look below no
+    // longer holds it; one that still fails stays held, and says so.
+    for (token, gave_up) in state.registry.unrecorded() {
+        if let Err(e) = state.fire_sink.give_up(&token, gave_up.generation, &gave_up.reason).await {
+            tracing::warn!(target: "weft_listener::hold", %token, error = %format!("{e:#}"), "a give-up still could not be recorded; the next look tries again");
+        }
+    }
+    let room = state.holding.room.get().copied().flatten();
+    let holding = holding(state, want, &mut said);
     let answer = state
         .signals
         .hold(&SignalHoldRequest { replica: state.config.replica.clone(), holding: holding.clone(), room, want: want.to_vec() })
@@ -146,25 +322,35 @@ async fn bring_up(state: &ListenerState, row: SignalRowWire, mode: StartMode) ->
 }
 
 /// Give up every claim this process holds (it is stopping), so another
-/// holder takes them at its next look rather than after they lapse. Each
-/// connection stops here first, so no signal is ever connected from two
-/// holders at once; what it arranged outside stays, for the next holder.
-/// The broker lets go of every claim under this process's name, including
-/// any a look took that never came up here.
-async fn let_go(state: &ListenerState) {
+/// holder takes them at once. Each connection stops here first, so no
+/// signal is ever connected from two holders at once; what it arranged
+/// outside stays, for the next holder. The broker lets go of every claim
+/// under this process's name, including any a look took that never came
+/// up here. Once it has, the holder's `check` is withdrawn; a claim the
+/// broker could not let go of is left to the check.
+async fn let_go(state: &ListenerState, check: Option<HeldCheck>) {
     for token in held_here(state) {
         crate::kinds::stop_here(state, &token);
     }
     if let Err(e) = state.signals.let_go(&SignalLetGoRequest { replica: state.config.replica.clone() }).await {
-        tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "could not give up this holder's claims; they lapse to another holder instead");
+        tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "could not give up this holder's claims; its check frees them when it goes off");
+        return;
+    }
+    if let Some(check) = check {
+        if let Err(e) = state.holders.liveness.withdraw(&check).await {
+            tracing::warn!(target: "weft_listener::hold", error = %format!("{e:#}"), "could not withdraw this holder's check; it goes off and finds nothing to free");
+        }
     }
 }
 
-/// Every signal this process holds now: the connections up, and the ones
-/// down and retrying.
+/// Every connection this process holds now: the ones up, the ones down
+/// and retrying, and the ones given up on whose give-up is still to be
+/// written. A signal down here that holds no connection is no holder's
+/// claim: its own retry brings it back.
 fn held_here(state: &ListenerState) -> Vec<String> {
     let mut tokens: Vec<String> = state.registry.list().into_iter().map(|(token, _)| token).collect();
-    tokens.extend(state.registry.down_tokens());
+    tokens.extend(state.registry.down_connections());
+    tokens.extend(state.registry.unrecorded().into_iter().map(|(token, _)| token));
     tokens
 }
 
@@ -180,6 +366,9 @@ fn renewed(mut held: Vec<String>, want: &[String]) -> Vec<String> {
 
 /// What one held signal says it is doing now.
 fn serving_of(state: &ListenerState, token: &str) -> HeldServing {
+    if let Some(gave_up) = state.registry.unrecorded_of(token) {
+        return HeldServing { status: format!("given up on: {}", gave_up.reason), transport: None };
+    }
     if let Some(reason) = state.registry.down_reason(token) {
         return HeldServing { status: format!("down, retrying: {reason}"), transport: None };
     }
@@ -220,6 +409,37 @@ pub fn from_wire(said: Option<&HeldServing>) -> ServingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_platform_traits::{AlarmLiveness, FakeAlarm};
+
+    /// A holder whose pushes work keeps one check ahead and withdraws
+    /// each old one, and never lets go. Once its alarm refuses, it lets go
+    /// within the last few seconds before the fence margin of the check
+    /// last set, counted on the one clock the holder keeps.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_cannot_push_its_check_lets_go_before_the_old_one_goes_off() {
+        let alarm = Arc::new(FakeAlarm::new());
+        let liveness = AlarmLiveness::new(alarm.clone());
+        let started = tokio::time::Instant::now();
+        let current = parking_lot::Mutex::new(HeldCheck { replica: "h".into(), generation: 1, due_at_ms: in_ms(check_ahead()) });
+        let pushing = tokio::time::timeout(push_every() * 3 + Duration::from_secs(1), keep_checked(&liveness, &current, started)).await;
+        assert!(pushing.is_err(), "a holder whose pushes work never lets go");
+        assert_eq!(current.lock().generation, 4);
+        assert_eq!(alarm.wakes().len(), 3, "each new check set");
+        assert_eq!(alarm.cancelled().len(), 3, "each old check withdrawn");
+        assert_eq!(alarm.pending().len(), 1, "one check ahead at a time");
+
+        // Pick up from the third push, as the loop left it.
+        let last_pushed_at = started + push_every() * 3;
+        alarm.fail_sets(true);
+        let set = alarm.wakes().len();
+        keep_checked(&liveness, &current, last_pushed_at).await;
+        let fence = last_pushed_at + check_ahead() - fence_margin();
+        let let_go_at = tokio::time::Instant::now();
+        assert!(let_go_at <= fence, "let go {:?} past the fence", let_go_at - fence);
+        assert!(fence - let_go_at <= Duration::from_secs(5), "let go {:?} before the fence, while pushing still had time", fence - let_go_at);
+        assert_eq!(alarm.wakes().len(), set, "nothing more was set");
+        assert_eq!(current.lock().generation, 4, "the check that goes off is the last one set");
+    }
 
     #[test]
     fn a_serving_state_says_the_same_on_both_sides() {

@@ -90,7 +90,7 @@ node and the wrong value.
    not a source bug: you pick a stored connection yourself (`weft connect
    --node <id> --grant <grant>`) or send the user to the node's Connect
    button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died mid-step: weft does not run a step again once its start is on
-   record, because the step may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that step by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <execution-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole execution again.
+   record, because the step may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that step by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <execution-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole execution again. A run that cannot pause and held a wait for the trigger's whole `holdSecs` fails too, with the waiting node saying it gave up; a caller still on the line was answered `504`. A queued run (a `weft run`, a resume) that ended with `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>` or `its project's worker settings kept it from any worker 3 times: <error>` never got going. The `<error>` says why, and item 8 says whether the workers are still out of reach.
 3. **A value is wrong, not failed.** Work upstream from the output: open the
    run, look at the top-level groups, find the first whose output is already
    wrong, descend, repeat. When you hold the concrete failing case, iterate
@@ -109,7 +109,7 @@ node and the wrong value.
    carrying that tag: look at **that** run, and if no sibling was supposed
    to stop this one, the bug is in whichever node tagged and stopped it
    (`weft executions` shows each run's tags, so you
-   see which runs shared it). `Caller disconnected` means the live caller this run was answering dropped its connection. `the worker running this run went away; a fast run lives in its worker's memory, so it is not run again` means a fast run lost its worker (a crash, a machine gone): check what it did outside, then start it again (let the trigger fire again, or fire it by hand: `weft bake`, then `weft run --fire <trigger>=<payload>`, with the `payload` on the trigger's `node_kicked` line in `weft events <execution-id>`), and if the trigger's runs have to carry on after a worker dies, set `durable: true` on it. A durable run whose worker stops or dies is never cancelled: another worker picks it up from its record, and only the step that was running fails (item 2). `the run had to leave the copy of the program running it (...), and it cannot be suspended: <why>` means its worker was stopping and this run could not move to another one; the `<why>` names the reason: its trigger has `recorded: false`, its route does not have `outlivesCaller`, or a bus between its nodes was open. Check what it did outside, then start it again the same way as a fast run that lost its worker. Anything else is the runtime's own reason, printed as words.
+   see which runs shared it). `Caller disconnected` means the live caller this run was answering went away: it hung up, closed its socket (or never opened it), missed its heartbeat, or sent a message the connection refused. `the worker running this run went away; a fast run lives in its worker's memory, so it is not run again` means a fast run lost its worker (a crash, a machine gone): check what it did outside, then start it again (let the trigger fire again, or fire it by hand: `weft bake`, then `weft run --fire <trigger>=<payload>`, with the `payload` on the trigger's `node_kicked` line in `weft events <execution-id>`), and if the trigger's runs have to carry on after a worker dies, set `durable: true` on it. A durable run whose worker stops or dies is never cancelled: another worker picks it up from its record, and only the step that was running fails (item 2). `the run had to leave the copy of the program running it (...), and it cannot be suspended: <why>` means its worker was stopping and this run could not move to another one; the `<why>` names the reason: its trigger has `recorded: false`, its route does not have `outlivesCaller`, or a bus between its nodes was open. Check what it did outside, then start it again the same way as a fast run that lost its worker. A run cut by a platform limit on a cloud install (its hour, or its worker's connection to weft about to be cut while every run on it only waited) carries the cause kind `limit` (`{"kind": "limit", "detail": "..."}` in `--json`, `(a time limit: <detail>)` in `weft tree`). A caller still connected was answered `504`, and the detail names the way out (a pause, a reconnect). A run whose caller's session reached the route's or socket's `maxSessionSecs` is a time limit too, on any install: `execution <id> stopped when its caller's session reached the <n> second limit its trigger sets (maxSessionSecs), and the caller was told it was a time limit (a 504, or close code 1011 on a socket). A session meant to last longer raises maxSessionSecs, or sets it to 0 for no limit`. `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>` and `its project's worker settings kept it from any worker 3 times: <error>` mean a queued run (a `weft run`, a resume) was answered no three times, 5 s and then 20 s apart, the reason names who said the last no, and `<error>` is that answer: fix what it names, then start the run again (item 8 has what counts as a refusal). Anything else is the runtime's own reason, printed as words.
 6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
    bug (a wire the compiler could not catch). The `execution_failed` line
    names every firing left holding a pulse and the wired ports it never
@@ -118,7 +118,155 @@ node and the wrong value.
 7. **Nothing ran.** Nothing reached the branch: check that the trigger that
    should have fired is activated, then walk from it down to the first
    `_should_flow` or required input that closed.
-8. **Too much is running.** The one failure nobody reports, because nothing
+8. **The trigger fired, or you ran it, and no run starts (or the [infra]
+   does not move).** `weft status` says what holds it. Under `triggers:`, a
+   trigger whose fires are queued shows one line:
+   - `2 fires wait until the infra the runs read is running again: <reason>`
+     (or `until the instance's values change`, or `until the install picks
+     the connections the runs need`): they go on by themselves once that
+     happens, so the fix is whatever the `<reason>` names.
+   - `1 fire stopped after failing to start a run, and holds the trigger's
+     queue; ...`: handing it to a worker failed three times (tried again
+     5 s later, then 20 s after that), and every fire behind it waits in order. Fix the
+     `<reason>`, then run `weft activate` (a new build or a change of the
+     worker settings also tries again).
+
+   A fire waiting for room (a limit reached) or for its trigger gets no
+   line here. If it waits for room, it tries again by itself, waiting longer
+   each time, up to 5 minutes. If it waits for its parked trigger, it is
+   handed over when the trigger is activated again.
+
+   Under `waiting on weft:`, each row is one of weft's own calls that keeps
+   failing, as `<what> (failing for <span>, last tried <span> ago; <then>):
+   <error>`, and it stays until the thing is resolved. The rows about
+   weft's roles and jobs, the bucket and news rows, and the row about
+   removed projects are install-wide, so every
+   project shows them.
+   - `weft's supervisor, which starts and stops infra, cannot be reached`
+     (or the dispatcher, or another role): weft tries again on the next
+     change that needs it. As with [the daemon] in item 11, you report the
+     row to the user and restart nothing.
+   - `this project's workers, which runs are handed to, cannot be reached
+     or cannot take them`, followed by `a queued run refused 3 times
+     ends, and one its workers could not be reached for 3 times waits
+     until a worker of the project comes up or a build of it registers;
+     one they keep answering busy (which spends no try) is tried again
+     after a pause that grows to a minute, for as long as they do; changing
+     the project's worker settings (more memory, for a worker that stays
+     busy) tries every queued run afresh`. Only an answer that says no is a refusal: from
+     the worker, any error but its busy `503`; from Cloud Run answering in
+     its place, a `4xx` other than `404`, `408` or `429`; from Google Cloud
+     asked to create the worker, a `400`, `401` or `403`, whose words end
+     up in the `<error>`; from weft itself, worker settings that together
+     are a shape no platform could run. A `404`, `408`, `429` or `5xx` from
+     Cloud Run, and a `429`, `5xx` or timeout from Google Cloud, are no
+     answer.
+     A queued run (a `weft run`, a resume) that is refused is tried again
+     5 s later, then 20 s after that, and the third refusal ends it
+     cancelled with a reason naming who said the last no: `its worker
+     refused it 3 times: <error>`, `the platform refused weft's calls for
+     it 3 times: <error>`, or `its project's worker settings kept it from
+     any worker 3 times: <error>`. A worker answering busy makes the run
+     wait without spending a try, for as long as the workers answer busy,
+     each wait as long as it has been turned away so far (at least 5 s, at
+     most a minute). Once that lasts longer than the install's alert delay
+     (`alert_after_minutes`, 5 minutes by default), this row shows, its
+     error reading ``this project's worker has answered busy for <time>
+     (memory full); raise its memory (`weft workers set --memory
+     <size>`)``, and a Google Cloud install emails an alert. A call that
+     got no answer at all is tried again 5 s and then 20 s later too, but
+     after a third with no answer the run is not ended: it waits, queued,
+     until a worker of its project comes alive or a build of the project
+     registers, and then its tries start over. A worker still starting is
+     not a failure at all. Changing the project's worker settings (`weft
+     workers set ...`) hands every run still queued to the workers again at
+     once, its tries forgotten.
+     The row goes once none of the project's queued runs still waits on its
+     workers (answered busy, refused, or not reached) and a run of the
+     project has since left the queue: the last one that waited (it reached
+     a worker, ended, or was cancelled), or one started after the failure.
+     A change of the project's worker settings takes it away too.
+   - `weft's <role> could not <job>` (say, `hand queued runs to workers`),
+     followed by `weft tried a few times and stopped; it tries again on the
+     next change that concerns it`: this row appears only on a cloud
+     install. A pass of one of weft's background jobs failed, was tried
+     again 1 s, 5 s and 20 s later, and failed every time, so it stopped
+     and wrote its error here; Google Cloud's queue does not keep calling
+     it. The job runs again on the next change that concerns it, and the
+     row stays until a pass goes through. Report the row to the user as
+     printed.
+   - `weft's supervisor could not get through this project's infra`: the
+     error says what the supervisor could not do (look at the project's
+     health, delete what the host still holds for copies that are gone, or
+     write down how a command ended). An error starting `could not list
+     what the host holds to delete what its gone copies left` or `could not
+     read what it owns to look at its health` means the whole pass failed,
+     and every project the supervisor holds counts a failed pass. On the
+     user's own machine the error ends `(tried again at the supervisor's
+     next look)`, and the supervisor never gives up. On a cloud install the
+     error ends with how many passes failed in a row and when it tries
+     again (5 s after the first failure, 10 s after the second), or, at the
+     third, ``(failed 3 times in a row, so the supervisor stopped trying;
+     `weft infra look` tries again)``. A pass that goes through starts the
+     count again from zero. A health
+     protocol (what the supervisor does about an unhealthy unit, like
+     restarting it or taking down the triggers that read it) that failed 3
+     times shows in this row too, as `its health protocol '<name>' failed 3
+     times: <error>`. Fix the [infra], then run `weft infra look`: it starts
+     a fresh round of three tries, and every health protocol that gave up
+     tries again. The row clears once a pass over the project goes through.
+   - `weft's supervisor could not delete what the infra host still holds
+     of removed projects (their disks included)`: the error names each
+     removed project, what went wrong and what happens next: on the user's
+     own machine `(tried again at the supervisor's next look)`; on a cloud
+     install it is tried again 5 s, then 10 s later, and the third failure
+     ends `(failed 3 times in a row, so the supervisor stopped trying; its
+     next pass tries again)`. From then on every pass of the supervisor
+     tries again, and `weft infra look` in any project starts one. The row
+     clears once the host holds nothing of any removed project.
+   - `weft's supervisor gave up infra commands of this project it could
+     never finish`: a command (a start, a stop, an upgrade) was taken up 3
+     times and never ended, because its run or the write of how it ended
+     kept failing. The error names the command and ends `so it gave the
+     command up; issue it again`. Fix the cause, then issue the command
+     again; the row clears once a later infra command of the project ends.
+   - `weft could not repair work of this project whose holder went away`:
+     weft tries again twice within half a minute, then whenever it next
+     looks at lapsed work, and the error says what fixes it by hand.
+   - `the listener still serves triggers of this project whose hibernation
+     ended, and what they pick up is refused`: the error names each node
+     and why it was kept. weft tells the listener to let go of them again at
+     the next change of a trigger.
+   - `a resync of this project stopped with triggers it took down still
+     down; builds wait for it`: the resync failed three times in one go
+     (it tried again 5 s, then 20 s later), and the error is the last failure. Builds are
+     refused with `cannot build now` until it is settled, and one already
+     compiling is not registered. If it stopped on infra those triggers
+     read that was not running, or on an activation still landing, it goes
+     on by itself once that infra runs or that activation has landed. Otherwise, once the cause is fixed,
+     `weft resync --resume` takes it up again where it stopped (a plain
+     `weft resync` is refused while it is held); `weft cancel-activate`
+     on its own gives it up, leaves those triggers down for a `weft
+     activate` later, and prints which ones, while `weft cancel-activate
+     --trigger` or `--instance` is refused as long as the resync holds the
+     project, because the resync covers every trigger of every owner. The editor's action bar shows the same as
+     "Resync stopped", with Resync and Give up.
+   - `a given-up resync left these triggers down: <whose triggers>
+     (<names>)`: a resync was given up with `weft cancel-activate`, which
+     printed the same triggers, and these are the ones still not on. `weft
+     activate` turns them on, and the row clears once they are on again or
+     the next resync begins.
+   - `weft's broker could not remove stored files from the bucket`: the
+     error counts the files and names up to five, which hold their tenant's
+     quota until removed. They are tried again at the expiry loop's next
+     pass, a wipe of their files, or the tenant's next upload.
+   - `weft could not tell the install's news (a cancel or an answer
+     reaching a run a worker drives); those runs hear of it late`: weft
+     tried a few times, then marked that news refused. New news always
+     goes out first and alone, so it is never stuck behind it. When news is
+     next written, or a weft process starts, the refused news is tried
+     again one piece at a time, and the row clears once none is left.
+9. **Too much is running.** The one failure nobody reports, because nothing
    errors: runs accumulate and the only symptom is a list that keeps
    growing. Every live connection is its own run for as long as the caller
    holds it, so a page anyone can open, or a client that reconnects by
@@ -128,14 +276,41 @@ node and the wrong value.
    again: the count comes back down, or you have found a leak. Several runs
    of one trigger that never end is a finding you report, with the count and
    how long they have stood.
-9. **A timer or a wake that never arrived.** A wake the receiver refuses
+10. **A timer or a wake that never arrived.** A wake the receiver refuses
    for good is dropped once, with one error in `weft daemon logs` naming it,
-   the status and the answer (on a local install: any `4xx` except `408`
-   and `429`; the listener answers a wake it cannot read `200` with
-   `dropped` and logs it). A failure that may pass (a `5xx`, `408`, `429`,
-   no answer) is sent again later, waiting longer each time. So a wait that
-   never woke is read in `weft daemon logs`.
-10. **[the daemon] unreachable** (connection refused, an editor button that
+   the status and the answer (on a local install: a `400`, `413`, `415`
+   or `422`; the listener answers a wake it cannot read `200` with
+   `dropped` and logs it). Any other failure (another `4xx`, a `5xx`, no
+   answer) is sent again later, waiting longer each time. So a wait that
+   never woke is read in `weft daemon logs`. A trigger's own timer,
+   schedule, poll or subscription renewal whose wake keeps failing is
+   given 20 failed deliveries that reached the listener (`wake_attempts`
+   on a cloud install). A delivery that got no answer because the listener
+   was down, or a 5xx from it or from something in front of it, is not
+   counted. On the
+   user's own machine the 20 take about an hour when the listener answered
+   every one, and up to about 95 minutes when an outage had already
+   stretched the wait between tries to its longest, 5 minutes. After the
+   20th the trigger is given up and stops being woken, and its node shows
+   `its wake failed each of the 20 times the listener handled it, the last
+   with: <error>`, or, when the wake did its work and only setting the next
+   wake failed, `its wake was handled, but the wake after it could not be
+   set on the last of the 20 times the listener handled it, so nothing
+   wakes it again: <error>`. One whose connection only a person can fix
+   (it is gone, needs reconnecting, or lacks a permission: the broker
+   answers 400, 404, 409 or 410) is given up at once. A trigger that keeps
+   a connection open (a socket, a stream, an SSE subscription, a service's
+   events) retries by itself while its live panel shows `reconnecting since
+   <time>: <error>`, and stops on a failure only a person can fix (those
+   same answers, a credential refused right after it was fetched, a setup
+   error that fails the same way every time): its live panel shows
+   `stopped: <why>`, and the reason stays on its node. A service that is
+   busy or limiting calls is still retried. Either kind comes back once it
+   is registered again: when its connection was the trouble, reconnecting
+   that connection does it for every trigger that uses it; for anything
+   else, a setup error say, fix it and run `weft resync`. `weft activate`
+   does not bring it back: to it, the trigger is still on.
+11. **[the daemon] unreachable** (connection refused, an editor button that
    does nothing). You read, never restart: `weft daemon status` and `weft
    daemon logs --tail 50` say what [the daemon] is doing. Then you tell the
    user the symptom (the exact refusal, and what you were running) and stop;

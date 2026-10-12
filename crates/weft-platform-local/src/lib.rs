@@ -22,11 +22,11 @@ pub mod infra_host;
 pub mod news;
 pub mod runner;
 
-pub use alarm::{Deliver, HttpDeliver, LocalAlarm, NotTaken};
+pub use alarm::{Deliver, EarlierDeliveries, HttpDeliver, LocalAlarm, NotTaken};
 pub use docker::{Docker, DockerCli};
 pub use domains::NoDomains;
 pub use frontends::NoFrontendHosting;
-pub use holders::OneProcessHolds;
+pub use holders::{DatabaseHolderNews, OneProcessHolds};
 pub use identity::LocalIdentity;
 pub use images::{bound_build_cache, DockerImageBuilder};
 pub use infra_host::{AgentBroker, AgentIdentity, DiskBacking, GpuAccess, LocalInfraHost, LocalInfraHostConfig, Publish};

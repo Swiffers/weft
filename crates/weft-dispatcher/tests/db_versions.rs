@@ -112,20 +112,6 @@ async fn identical_code_is_one_version(pool: PgPool) {
     assert_eq!(versions.version(project, &rows[0].id).await.unwrap().unwrap().label.as_deref(), Some("renamed"));
 }
 
-/// The program definitions a project's runs need are read off their rows,
-/// whatever their record holds.
-#[sqlx::test]
-async fn the_definitions_in_use_are_read_off_the_runs(pool: PgPool) {
-    let (journal, projects, versions) = setup(&pool).await;
-    let project = Uuid::new_v4();
-    seed_project(&projects, project).await;
-    assert!(journal.definition_hashes_in_use(project).await.unwrap().is_empty());
-    let v = version(project, &manifest(&[("main.weft", "aaa")]), None, None, 1);
-    versions.upsert_version(&v).await.unwrap();
-    start_run(&journal, project, &v.id, None, None, 1).await;
-    assert_eq!(journal.definition_hashes_in_use(project).await.unwrap(), vec!["def-1"]);
-}
-
 /// A run started by hand lists under its version with what it was asked
 /// (its spec, its seed, the places it ran again), in the order it was
 /// started, and carries the saved example it is set to. A run nobody
@@ -176,7 +162,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     let activations = PostgresActivationStore::new(pool.clone());
     let keys = [ActivationKey::new("door", Owner::Shared)];
     let setup_execution_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(project, &keys, setup_execution_id, None).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(project, &keys, setup_execution_id, None, None).await.unwrap().is_ok());
     assert!(activations.record_activation_source(project, setup_execution_id, &activated, "v1").await.unwrap());
     activations.end_activating(project, setup_execution_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None).await.unwrap();
@@ -190,7 +176,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
         .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(execution_id), activated_versions: vec![] }, Some("v2"), None)
         .await
         .unwrap();
-    activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::wiped(), SignalsGoing::Kept).await.unwrap();
+    activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::wiped(), SignalsGoing::Kept, None).await.unwrap();
     assert_eq!(activations.list(project).await.unwrap()[0].program, None);
     let head = versions.head(project).await.unwrap();
     assert_eq!((head.head_version.as_deref(), head.head_run, head.activated_versions), (Some("v2"), None, vec![]));
@@ -256,7 +242,7 @@ async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
     assert!(versions.run(r2).await.unwrap().is_none());
     assert!(versions.run(r1).await.unwrap().is_some());
     assert_eq!(versions.versions(project).await.unwrap().len(), 1);
-    assert!(projects.remove(project).await.unwrap());
+    assert!(projects.remove(project).await.unwrap().is_some());
     assert!(versions.versions(project).await.unwrap().is_empty(), "removing the project drops its tree");
     assert!(versions.run(r1).await.unwrap().is_none(), "and the tree's runs with it");
 }

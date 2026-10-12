@@ -862,7 +862,7 @@ export interface Failure {
 
 /// Why an execution was cancelled: a person, a sibling run's
 /// `ctx.stop_tagged` (naming the run and the tag), the live caller
-/// dropping, or the runtime itself. Rides the `execution_cancelled`
+/// dropping, the runtime itself, or a time limit running out. Rides the `execution_cancelled`
 /// event beside its text `reason`; absent only on a journal row written
 /// before the field existed.
 // SYNC: CancelCause <-> crates/weft-core/src/exec/cancel.rs CancelCause
@@ -870,7 +870,8 @@ export type CancelCause =
   | { kind: 'user' }
   | { kind: 'execution'; by: string; tag: string }
   | { kind: 'caller_gone' }
-  | { kind: 'runtime'; detail: string };
+  | { kind: 'runtime'; detail: string }
+  | { kind: 'limit'; detail: string };
 
 /// The port every node carries, deciding whether it runs at all.
 // SYNC: SHOULD_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
@@ -1052,10 +1053,12 @@ export interface ActivationEntry {
   status: LifecycleStatus;
   // SYNC: mode <-> crates/weft-core/src/activation.rs ActivationMode
   mode: ActivationMode;
-  /// An instance's fires parked until the instance has a value they need:
-  /// how many, and why (the refusal naming the field).
+  /// Fires waiting in the trigger's queue on something no clock brings
+  /// (a value the instance has not given, infra, the install's picks, or a
+  /// hand-over that kept failing): how many, on what, and why.
   // SYNC: waiting <-> crates/weft-core/src/program.rs WaitingFires
-  waiting?: { fires: number; reason: string };
+  // SYNC: on <-> crates/weft-core/src/door_fire.rs UnclockedWait
+  waiting?: { fires: number; on: 'instance' | 'infra' | 'picks' | 'failure'; reason: string };
   /// The version of the source its fires run, once its setup finished.
   version?: string;
 }
@@ -1374,11 +1377,12 @@ export type NodeFeedState =
 /// (debounced 500ms), on file-change debounce, and on the Refresh
 /// button. Drives both the action bar (state + drift) AND graph
 /// decorations (per-node infra status).
-/// The BUILD-transition axis on the project row, orthogonal to
-/// `projectStatus`. While not 'none', the only offered action is
-/// cancel_build (the master transitional rule).
+/// The single-flight transition on the project row, orthogonal to
+/// `projectStatus`. While a build is in flight, the only offered action
+/// is cancel_build (the master transitional rule); while a resync is, only
+/// the cancel of the trigger step it is at.
 // SYNC: ProjectTransition <-> crates/weft-core/src/projects.rs ProjectTransition, packages/weft-graph/src/status.ts VALID_TRANSITIONS
-export type ProjectTransition = 'none' | 'building' | 'cancelling_build';
+export type ProjectTransition = 'none' | 'building' | 'cancelling_build' | 'resyncing';
 
 /// Trigger-deactivation spec the shared picker produces and the verbs
 /// that take triggers down consume (deactivate; infra stop/terminate/
@@ -1409,6 +1413,9 @@ export const DEFAULT_DRAIN_TIMEOUT_SECS = 60;
 
 // SYNC: ActionAvailability <-> crates/weft-core/src/projects.rs ProjectStatusResponse
 export interface ActionAvailability {
+  /// `weft rm` marked the project and has not finished removing it: no
+  /// verb is offered, the starter ones included.
+  removing: boolean;
   /// Verbs the dispatcher will currently accept.
   availableActions: ActionVerb[];
   /// Drift bits. Lit independently; each resolved by its own verb.
@@ -1429,9 +1436,11 @@ export interface ActionAvailability {
   /// "Cancel running / Resume" while deactivating).
   // SYNC: projectStatus <-> crates/weft-core/src/projects.rs ProjectStatus
   projectStatus: LifecycleStatus | 'unknown';
-  /// The build-transition axis. 'building'/'cancelling_build' render
+  /// The transition axis. 'building'/'cancelling_build' render
   /// the unified transitional pattern (the launching button shows
-  /// "Building... (cancel)") and gate every other verb.
+  /// "Building... (cancel)") and gate every other verb; 'resyncing'
+  /// leaves the triggers' own state on show, with what `availableActions`
+  /// still offers.
   transition: ProjectTransition;
   /// Live infra rows exist whose node the current source no longer
   /// declares (the user deleted the node while it was deployed).
@@ -1688,6 +1697,8 @@ export interface ActionErrorDiagnostic {
 }
 
 export type BackendSnapshot = {
+  /// See `ActionAvailability.removing`.
+  removing: boolean;
   /// Verbs the dispatcher will currently accept. Inherited from
   /// the most recent status fetch; stale-but-known is preferable
   /// to blank during overlays so disabled-state derivation works.
@@ -2161,7 +2172,11 @@ export type WebviewMessage =
   /// User clicked Resync. Deactivate + reactivate against the current
   /// source. `spec` is the shared picker's choice of how triggers come
   /// down, exactly like Deactivate.
-  | { kind: 'resyncProject'; spec?: DeactivationSpec }
+  | { kind: 'resyncProject'; spec: DeactivationSpec }
+  /// User clicked Resync on a resync that stopped with triggers down: take
+  /// that one up again where it stopped (`weft resync --resume`), with the
+  /// choice and the build it began with. Never starts a new resync.
+  | { kind: 'resumeResync' }
   /// User clicked Upgrade Infra. atomic infra stop + image
   /// rebuild + start. `deactivation` follows the same shared-picker
   /// contract as infraStop.

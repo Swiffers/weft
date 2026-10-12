@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsDub",
   "label": "Dub Audio",
-  "description": "Dub a recording into another language: translated and re-voiced to match the original speakers. Runs as long as the dub takes and emits the dubbed audio file.",
+  "description": "Dub a recording into another language: ElevenLabs translates it and re-voices it to match the original speakers. Runs as long as the dub takes and emits the dubbed audio (FLAC), even from a video.",
   "tags": [
     "ai",
     "audio",
@@ -13,59 +13,95 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
     {
       "name": "file",
       "type": "File",
-      "required": true,
-      "description": "The audio or video to dub."
+      "description": "The audio or video to dub, up to 3 GiB. Give this or `sourceUrl`, not both."
+    },
+    {
+      "name": "sourceUrl",
+      "type": "String",
+      "label": "Source link",
+      "placeholder": "https://",
+      "description": "If the recording is already online, give its public link here instead of `file`: ElevenLabs downloads it itself, so it never passes through weft. The same 3 GiB limit applies. Give this or `file`, not both."
     },
     {
       "name": "targetLang",
       "type": "String",
       "required": true,
       "label": "Target language",
-      "placeholder": "fr",
-      "description": "ISO language code to dub into (fr, es, de, ...)."
+      "placeholder": "es",
+      "description": "The language to dub into, as a code like `es` or `fr`, or a regional variant ElevenLabs supports, like `fr-CA` or `es-MX`."
     },
     {
       "name": "sourceLang",
       "type": "String",
       "label": "Source language",
-      "description": "ISO code of the spoken language. Absent = auto-detect."
+      "description": "The spoken language, as a code like `en`. Leave empty for ElevenLabs to detect it."
     },
     {
-      "name": "numSpeakers",
+      "name": "model",
+      "type": "String",
+      "default": "dubbing_v1",
+      "label": "Model",
+      "description": "dubbing_v1, the default, costs $0.50 a minute and dubs into 29 languages. If you want ElevenLabs's newer model, which it describes as \"end-to-end dubbing that preserves voice and emotion\", or one of the 92 languages it dubs into, pick dubbing_v2, at $2.20 a minute.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "dubbing_v1",
+          "dubbing_v2"
+        ]
+      }
+    },
+    {
+      "name": "keyterms",
+      "type": "List[String]",
+      "description": "Names and terms to get right in the transcription and the translation, like product or brand names. Up to 1,000, each at most 50 characters and 5 words, with none of the characters `<>{}[]\\`."
+    },
+    {
+      "name": "cloningStrength",
       "type": "Number",
       "widget": {
         "kind": "number",
         "min": 0,
-        "max": 20,
+        "max": 10,
         "step": 1
       },
-      "description": "How many speakers the recording has. Absent or 0 = auto-detect."
+      "description": "dubbing_v2 only. If you want the dubbed voices to copy the original speakers more or less closely, set 0 to 10; leave empty for ElevenLabs's default, 7. With it set, the node has to add your language after creating the project, so a language ElevenLabs does not dub is refused only after the project has cost one language's dub; left empty, such a language is refused before anything is charged. It cannot be combined with a `transcript` that carries translations."
     },
     {
-      "name": "dropBackgroundAudio",
-      "type": "Boolean",
-      "default": false,
-      "label": "Drop background audio",
-      "description": "Keep only the dubbed voices, discarding music and effects."
+      "name": "transcript",
+      "type": "JsonDict",
+      "widget": {
+        "kind": "code",
+        "language": "json"
+      },
+      "description": "Enterprise only. If you already have a transcript and want ElevenLabs to use it instead of transcribing the recording, give it here as a `{ \"segments\": [...] }` document of at most 20,000 segments and 4 MiB; for what goes in each segment, go and read ElevenLabs's guide Bring your own transcript (https://elevenlabs.io/docs/eleven-api/guides/how-to/dubbing/bring-your-own-transcript). It needs `sourceLang`. If one segment carries a `translation`, every segment must, and the dub uses those translations instead of machine translation; translations cannot be combined with `cloningStrength`."
+    },
+    {
+      "name": "reference",
+      "type": "String",
+      "description": "If you keep the project and want to recognize it on your side, put up to 500 characters here: ElevenLabs stores them on the project and gives them back unchanged. It does not change the dub. It needs `projectId` wired, since otherwise the node deletes the project."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "Audio",
-      "description": "The dubbed audio."
+      "description": "The dubbed audio (FLAC), kept for 30 days after it was last read."
     },
     {
-      "name": "dubbingId",
+      "name": "projectId",
       "type": "String",
-      "description": "The dub project's id on the account (re-download other languages, or delete it)."
+      "description": "The dub's project, on the ElevenLabs account whose key the node used. If it is your own account and you want to keep the project (to edit the dub or add languages to it in ElevenLabs), wire this. When nothing reads it, the node deletes the project once the dub is stored."
     },
     {
       "name": "filename",
@@ -81,8 +117,117 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "file",
+        "sourceUrl"
+      ]
+    ]
   },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "cloningStrength"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "model",
+              "equals": "dubbing_v2"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "model"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDub '{id}' sets `cloningStrength`, which ElevenLabs offers only on dubbing_v2: set `model` to dubbing_v2, or leave `cloningStrength` empty.",
+        "level": "structural",
+        "severity": "error",
+        "port": "cloningStrength"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "transcript"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "sourceLang"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDub '{id}' gives a `transcript` with no `sourceLang`, and ElevenLabs needs to be told which language a transcript is in: set `sourceLang`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "sourceLang"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "reference"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "output_wired",
+              "port": "projectId"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDub '{id}' sets a `reference` on a project it deletes once the dub is stored, because nothing reads `projectId`: wire `projectId` to keep the project, or leave `reference` empty.",
+        "level": "structural",
+        "severity": "error",
+        "port": "reference"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "file"
+          },
+          {
+            "kind": "input_satisfied",
+            "port": "sourceUrl"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDub '{id}' gives both `file` and `sourceUrl`, and the dub takes its recording from one: keep one of them.",
+        "level": "structural",
+        "severity": "error",
+        "port": "sourceUrl"
+      }
+    }
+  ],
   "display": {
     "kind": "media",
     "output": "file"

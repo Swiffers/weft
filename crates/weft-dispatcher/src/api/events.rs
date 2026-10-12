@@ -170,12 +170,16 @@ mod tests {
     /// for.
     #[tokio::test(start_paused = true)]
     async fn a_display_stream_sends_the_current_display_then_changes() {
-        use crate::display_feeds::{DisplayFeeds, DisplayKey, DisplayReader, DisplaySource, NodeFeed, LOOK_EVERY};
+        use crate::display_feeds::{DisplayAt, DisplayFeeds, DisplayKey, DisplayReader, DisplaySource, NodeFeed, LOOK_EVERY};
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Flip(AtomicUsize);
         #[async_trait::async_trait]
         impl DisplayReader for Flip {
-            async fn read(&self, _key: &DisplayKey) -> NodeFeed {
+            async fn find(&self, _key: &DisplayKey) -> Result<DisplayAt, String> {
+                Ok(DisplayAt::Nowhere)
+            }
+
+            async fn read(&self, _key: &DisplayKey, _at: &DisplayAt) -> NodeFeed {
                 if self.0.fetch_add(1, Ordering::SeqCst) < 3 { NodeFeed::Absent } else { NodeFeed::Ok { items: vec![] } }
             }
         }

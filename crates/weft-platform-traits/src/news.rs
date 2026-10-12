@@ -64,24 +64,37 @@ pub trait News: Send + Sync {
 /// told it missed some.
 pub const LISTEN_CAPACITY: usize = 1024;
 
-/// One listener's view of the news.
-pub struct Listening {
-    heard: broadcast::Receiver<NewsHeard>,
+/// What a listener can be told when it may have missed some of what it
+/// listens to: falling behind is that, too.
+pub trait MayMiss: Clone {
+    fn missed_some() -> Self;
 }
 
-impl From<broadcast::Receiver<NewsHeard>> for Listening {
-    fn from(heard: broadcast::Receiver<NewsHeard>) -> Self {
+impl MayMiss for NewsHeard {
+    fn missed_some() -> Self {
+        NewsHeard::MissedSome
+    }
+}
+
+/// One listener's view of what it listens to: the run news, or what
+/// holders are told (`crate::holders::HolderHeard`).
+pub struct Listening<H = NewsHeard> {
+    heard: broadcast::Receiver<H>,
+}
+
+impl<H> From<broadcast::Receiver<H>> for Listening<H> {
+    fn from(heard: broadcast::Receiver<H>) -> Self {
         Self { heard }
     }
 }
 
-impl Listening {
+impl<H: MayMiss> Listening<H> {
     /// The next thing heard. Falling behind is missing some; the news
     /// stopping is an error, since nothing would be heard again.
-    pub async fn next(&mut self) -> anyhow::Result<NewsHeard> {
+    pub async fn next(&mut self) -> anyhow::Result<H> {
         match self.heard.recv().await {
             Ok(heard) => Ok(heard),
-            Err(broadcast::error::RecvError::Lagged(_)) => Ok(NewsHeard::MissedSome),
+            Err(broadcast::error::RecvError::Lagged(_)) => Ok(H::missed_some()),
             Err(broadcast::error::RecvError::Closed) => anyhow::bail!("the install's news stopped"),
         }
     }

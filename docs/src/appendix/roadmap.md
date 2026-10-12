@@ -12,7 +12,8 @@ stays alive. Die-and-resume stays the default, and the language makes the cost
 visible, because holding keeps a worker up for the whole wait.
 
 **Suspendable live channels.** A bus is pinned to one worker, both ends have to
-stay alive, and `await_signal` is forbidden while it is open. The plan is to
+stay alive, and the run cannot pause while it is open: an `await_signal` there
+waits in place on the same worker. The plan is to
 journal enough channel state that a fresh worker resumes both ends mid-stream.
 That needs a replay story for a partially-consumed stream, which items were
 delivered and which pulls answered, so it comes after the rest of the durable

@@ -132,6 +132,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         let url = secret("WEFT_DATABASE_URL")?;
         let pool = weft_task_store::db::connect(&url, WORK_POOL.0, WORK_POOL.1).await.context("connect to the database")?;
         weft_dispatcher::app::apply_core_schema(&pool).await?;
+        weft_task_store::unanswered::alert_after(&pool, config.alert_after())
+            .await
+            .context("write down whether the install alerts on its stuck failures")?;
         Some((url, pool))
     } else {
         None
@@ -141,7 +144,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let waker = match writes {
         true => {
             let (_, pool) = pool.as_ref().expect("a process that writes holds the database");
-            role_waker::RoleWaker::new(&config, &hosted, &addresses, parts.tokens.clone(), pool.clone())?.map(Arc::new)
+            role_waker::RoleWaker::new(&config, &addresses, parts.tokens.clone(), parts.alarm.clone(), pool.clone())?.map(Arc::new)
         }
         false => None,
     };
@@ -195,6 +198,13 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         _ => None,
     };
 
+    // What the holders hear: built once per process that holds, or that
+    // tells them (the dispatcher, after the held set or access changed).
+    let holder_news = match runs(CoreRole::Listener) || runs(CoreRole::Holder) || runs(CoreRole::Dispatcher) {
+        true => Some(platform::holder_news(&config, &parts, signals.as_ref())?),
+        false => None,
+    };
+
     let mut internal = Router::new();
     let mut public = Router::new();
     let mut outside: Option<Router> = None;
@@ -228,12 +238,21 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 internet_url: config.internet_url.clone(),
                 object_store_public_internet: config.object_store.public_internet(),
                 line_max_age: platform::line_max_age(&config, serverless),
+                dispatcher_alarm: (config.roles.of(CoreRole::Dispatcher) == Placement::Serverless).then(|| parts.alarm.clone()),
+                // The broker books the supervisor's next pass when it
+                // answers its ownership sync, on a supervisor that scales
+                // to zero.
+                supervisor_booking: (config.roles.of(CoreRole::Supervisor) == Placement::Serverless)
+                    .then(|| weft_task_store::drain::Booking::new(pool.clone(), CoreRole::Supervisor, parts.alarm.clone())),
             },
         )
         .await?;
         let heard = news.as_ref().expect("the broker's process hears news").listen();
-        weft_dispatcher::app::spawn_supervised("news", weft_broker::news::pass_on(heard, state.signals.also_told()));
-        loops.push((CoreRole::Broker, Loops::Drain(weft_broker::drain_loops(state.clone()))));
+        weft_dispatcher::app::spawn_supervised("news", weft_broker::news::pass_on(heard, state.signals.also_told(), state.lines.clone()));
+        loops.push((CoreRole::Broker, Loops::Drain(weft_broker::drain_loops(state.clone())?)));
+        // The holders' liveness check: called by the alarm with weft's
+        // own account only.
+        internal = mount(internal, CoreRole::Broker, guard_for(CoreRole::Broker).guard(weft_broker::held_check_route(state.clone())));
         internal = mount(internal, CoreRole::Broker, weft_broker::router(state));
     }
 
@@ -253,7 +272,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 frontends: parts.frontends.clone(),
                 domains: parts.domains.clone(),
                 holder_pool: parts.holder_pool.clone(),
+                holder_news: holder_news.clone().expect("the dispatcher's process tells the holders"),
                 tokens: parts.tokens.clone(),
+                // Scaled to zero, the dispatcher's loops book each other's
+                // looks; on a machine each looks on its own.
+                booking: serverless.then(|| weft_task_store::drain::Booking::new(pool.clone(), CoreRole::Dispatcher, parts.alarm.clone())),
             },
             weft_dispatcher::app::Defaults::for_auth(config.auth),
         )
@@ -292,6 +315,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     // process they are one state, so the listener answers for the
     // connections this same process holds.
     if runs(CoreRole::Listener) || runs(CoreRole::Holder) {
+        let news = holder_news.clone().expect("a process that holds hears the holders' news");
         // A local install's one process holds under a name that survives
         // its restart, so a new process takes its old claims back at once
         // instead of waiting for them to lapse. A cloud's holders are
@@ -315,6 +339,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             // An entry's event goes straight to its project's worker, with
             // the project's worker key.
             weft_listener::fire_sink::HttpWorkerDoors::new(install_secret()?),
+            weft_listener::HolderPlatform { news, liveness: platform::holder_liveness(&config, &parts) },
         );
         if runs(CoreRole::Listener) {
             if only.is_none() {
@@ -359,12 +384,24 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     // A role that scales to zero also runs one pass as its process starts,
     // for what came due while no process of it was up.
     let mut first_passes: Vec<server::Tick> = Vec::new();
+    let limits = if serverless {
+        Some(platform::serverless_limits(&config).context("this install's platform places no role serverless")?)
+    } else {
+        None
+    };
     for (role, l) in loops {
-        if serverless {
-            let run: Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Option<Duration>> + Send + Sync> = match l {
+        if let Some(limits) = limits {
+            let run: Arc<
+                dyn Fn(weft_task_store::drain::TickBody) -> futures::future::BoxFuture<'static, Result<(), weft_task_store::drain::PassFailed>> + Send + Sync,
+            > = match l {
                 // When each loop is due lives in the database, shared by
                 // every instance of the role, since a tick may land on any.
                 Loops::Drain(loops) => {
+                    // Scaled to zero, a loop nothing rings and nothing books
+                    // would never run again: refused here, at every boot.
+                    weft_task_store::drain::check_woken(role, &loops)?;
+                    let (_, pool) = pool.as_ref().expect("a process with drain loops holds the database");
+                    let booking = weft_task_store::drain::Booking::new(pool.clone(), role, parts.alarm.clone());
                     // A process that hears the database itself (a role that
                     // writes, so it is up with CPU of its own whenever an
                     // instance of it is) also runs its loops for as long as
@@ -372,11 +409,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     // process does: a task written for it is picked up the
                     // moment it is announced, never after a ring's trip
                     // through the platform, which waits behind the tick
-                    // already running. Their safety looks run only while the
-                    // process has work, so one left idle queries nothing. The
-                    // tick still starts the role when it is at zero, and runs
-                    // what is due; both claim the same rows, so whichever
-                    // reaches a task first runs it.
+                    // already running. They keep no timer: the tick rung
+                    // for the same write books every look. The tick still
+                    // starts the role when it is at zero, and runs what is
+                    // due; both claim the same rows, so whichever reaches a
+                    // task first runs it.
                     if let Some(signals) = &signals {
                         for l in loops.iter().cloned() {
                             let subscription = signals.subscribe();
@@ -385,30 +422,29 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                         }
                     }
                     let loops = Arc::new(loops);
-                    let (_, pool) = pool.as_ref().expect("a process with drain loops holds the database");
-                    let pool = pool.clone();
-                    Arc::new(move |woken| {
-                        let (loops, pool) = (loops.clone(), pool.clone());
-                        Box::pin(async move { weft_task_store::drain::drain_due(&pool, role.as_str(), &loops, &woken).await })
+                    // Each pass holds the process's watch while its loops
+                    // drain: they write what other roles wait on, and a
+                    // write made while the watch is quiet would be
+                    // announced to nobody.
+                    let listen = signals.clone();
+                    Arc::new(move |call| {
+                        let (loops, booking, listen) = (loops.clone(), booking.clone(), listen.clone());
+                        Box::pin(async move {
+                            weft_task_store::drain::drain_due(&booking, &loops, &call, limits.tick_slice, listen.as_deref()).await
+                        })
                     })
                 }
-                // The supervisor's one pass covers everything it does, and
-                // answers when it next has something to look at; with
-                // nothing anywhere, a command being issued wakes it.
-                Loops::Supervisor(state) => Arc::new(move |_woken| {
+                // The supervisor's one pass covers everything it does; its
+                // next look is booked by the broker it reports to.
+                Loops::Supervisor(state) => Arc::new(move |_call| {
                     let state = state.clone();
                     Box::pin(async move {
-                        match weft_infra_supervisor::tick(&state).await {
-                            Ok(next) => next,
-                            Err(e) => {
-                                tracing::warn!(target: "weft_runtime", error = %format!("{e:#}"), "a supervisor tick failed; the next one retries");
-                                Some(state.health_interval)
-                            }
-                        }
+                        weft_infra_supervisor::tick(&state).await;
+                        Ok(())
                     })
                 }),
             };
-            let t = server::Tick { role, run, alarm: parts.alarm.clone() };
+            let t = server::Tick { role, run, alarm: parts.alarm.clone(), pool: pool.as_ref().map(|(_, pool)| pool.clone()) };
             if writes {
                 first_passes.push(t.clone());
             }
@@ -472,18 +508,20 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         _ if serverless => {
             let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
             let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-            let mut app = public.merge(internal);
-            if let Some(signals) = &signals {
-                app = app.layer(axum::middleware::from_fn_with_state(signals.clone(), weft_task_store::pg_signal::keep_listening));
-                for t in first_passes {
-                    let signals = signals.clone();
-                    tokio::spawn(async move {
-                        let _looking = signals.looking().await;
-                        if let Err(e) = t.pass(Vec::new()).await {
-                            tracing::warn!(target: "weft_runtime", role = %t.role, error = %format!("{e:#}"), "the first pass could not set the next wake; the next pass sets it");
-                        }
-                    });
-                }
+            // Each role's routes hold the process's watch around the calls
+            // that may write (`weft_task_store::pg_signal::keep_listening`),
+            // a tick's pass while its loops drain; probes, a worker's line, and the
+            // proxy to a frontend hold nothing.
+            let app = public.merge(internal);
+            for t in first_passes {
+                tokio::spawn(async move {
+                    if let Err(e) = t.pass(weft_task_store::drain::TickBody::default()).await {
+                        tracing::error!(
+                            target: "weft_runtime", role = %t.role, error = %format!("{e:#}"),
+                            "the first pass failed; what it left runs at its loops' next wake or ring"
+                        );
+                    }
+                });
             }
             let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
             tracing::info!(target: "weft_runtime", role = ?only, %addr, "serving");
@@ -532,11 +570,16 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     // or the task serving them ended; a ring still out would otherwise go
     // with the process either way.
     if let Some(waker) = waker_at_exit {
-        waker.settle(role_waker::RING_GRACE).await;
+        waker.settle().await;
     }
     if let Some(news) = news {
         if let Err(e) = news.close().await {
             tracing::warn!(target: "weft_runtime", error = %format!("{e:#}"), "could not let go of this process's news; the platform drops it on its own later");
+        }
+    }
+    if let Some(news) = holder_news {
+        if let Err(e) = news.close().await {
+            tracing::warn!(target: "weft_runtime", error = %format!("{e:#}"), "could not let go of the holders' news; the platform drops it on its own later");
         }
     }
     served?

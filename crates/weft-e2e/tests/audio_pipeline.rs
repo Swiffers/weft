@@ -42,13 +42,16 @@ async fn assert_transcribed(
     settled.completed()?;
 
     // The transcript came through the whole pipe: audio bus -> realtime
-    // session -> text bus -> full-text port. The exact words are the
+    // session -> text bus -> the transcript file. The exact words are the
     // model's business; a real transcription of 25s of speech is not a
     // few characters.
-    let text = settled
+    let file = settled
         .input_of("out")
-        .and_then(|i| i.get("data").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_default();
+        .and_then(|i| i.get("data").cloned())
+        .ok_or_else(|| anyhow::anyhow!("the transcript Debug never received a value"))?;
+    let file = weft_core::storage::StoredFile::from_value(&file)?;
+    let transcript: Value = serde_json::from_slice(&weft_e2e::storage::download(project.dispatcher(), &file.key).await?)?;
+    let text = transcript["text"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(
         text.split_whitespace().count() >= 20,
         "transcript looks empty or truncated: {text:?}"

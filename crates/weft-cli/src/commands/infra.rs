@@ -40,6 +40,8 @@ pub enum InfraAction {
     /// between platform calls; unclaimed ones cancel outright; the
     /// provisioning execution is interrupted). HALT, not rollback.
     Cancel,
+    /// Ask the supervisor to look at the infra again.
+    Look,
     /// Per-node verbs. `node` is the node's PLACE as a person spells it
     /// (`one.db`), checked and written canonical by `place_named`
     /// before the daemon sees it.
@@ -76,6 +78,9 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     if matches!(action, InfraAction::Status) {
         return infra_status(&ctx).await;
     }
+    if matches!(action, InfraAction::Look) {
+        return infra_look(&ctx).await;
+    }
     if let InfraAction::Logs { node, tail, follow } = action {
         let node = match node {
             Some(node) => Some(place_named(&ctx, &node).await?),
@@ -107,7 +112,7 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
         InfraAction::Cancel => ActionVerb::InfraCancel,
         InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
         InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
-        InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
+        InfraAction::Status | InfraAction::ListDoors | InfraAction::Look | InfraAction::Logs { .. } => unreachable!(),
     };
     let ctx_inner = ctx.clone();
     ctx.with_progress(verb, |progress| async move {
@@ -137,7 +142,7 @@ async fn run_inner(
         InfraAction::Cancel => "infra cancel issued",
         InfraAction::NodeStop { .. } => "infra node stopped",
         InfraAction::NodeTerminate { .. } => "infra node terminated",
-        InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
+        InfraAction::Status | InfraAction::ListDoors | InfraAction::Look | InfraAction::Logs { .. } => unreachable!(),
     };
     match action {
         // Plain Start: just bring DOWN units up (apply skips up units).
@@ -162,7 +167,7 @@ async fn run_inner(
             let place = place_named(ctx, &node).await?;
             infra_node_verb(ctx, progress, &place, "terminate", false, &opts).await?
         }
-        InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
+        InfraAction::Status | InfraAction::ListDoors | InfraAction::Look | InfraAction::Logs { .. } => unreachable!(),
     }
     progress.complete(summary);
     Ok(())
@@ -181,6 +186,16 @@ async fn infra_cancel(ctx: &Ctx, progress: &Progress, instance: Option<&weft_cor
     progress.dispatcher_call_start(&path);
     client.post_empty(&path).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id }));
+    Ok(())
+}
+
+async fn infra_look(ctx: &Ctx) -> Result<()> {
+    let (client, project_id, _name) = super::resolve_project(ctx)?;
+    client.post_empty(&format!("/projects/{project_id}/infra/look")).await?;
+    if ctx.json_out(&serde_json::json!({ "project_id": project_id }))? {
+        return Ok(());
+    }
+    println!("Asked the supervisor to look at the infra again; `{}` shows what it finds.", super::weft_on(ctx.on(), "status"));
     Ok(())
 }
 

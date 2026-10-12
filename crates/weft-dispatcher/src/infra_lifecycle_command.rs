@@ -43,7 +43,7 @@ pub use weft_broker_client::protocol::{InfraLifecycleVerb, RunningPolicy};
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "infra_lifecycle_command",
-    tables: &["infra_lifecycle_command"],
+    tables: &["infra_lifecycle_command", "infra_health_protocol", "infra_health_look"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_lifecycle_command (
             id                BIGSERIAL PRIMARY KEY,
@@ -55,6 +55,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             issued_by_replica     TEXT NOT NULL,
             issued_at_unix    BIGINT NOT NULL,
             claimed_by_replica    TEXT,
+            -- A dispatcher's claim lapses `CLAIM_LEASE_TTL` after this. A
+            -- drain whose next look is further away sets it ahead, so the
+            -- claim lasts until then
+            -- (`crate::lifecycle_claimer::CommandClaim`).
             claimed_at_unix   BIGINT,
             completed_at_unix BIGINT,
             -- 'succeeded' | 'failed' | 'cancelled' | NULL.
@@ -76,8 +80,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- can update it" override. Default false.
             force             BOOLEAN NOT NULL DEFAULT FALSE,
             -- The user requested cancellation of this command while it
-            -- was CLAIMED (in flight). The executing supervisor polls
-            -- this between calls to the platform and halts (leaving
+            -- was CLAIMED (in flight), announced as it is set
+            -- (`cancel:<id>`). Whoever runs it halts (leaving
             -- per-node partial state visible; no platform applies a
             -- whole project transactionally).
             -- Pending unclaimed rows are cancelled outright (outcome =
@@ -100,18 +104,26 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- every copy there is (every_copy TRUE; the project going).
             -- An apply always names exactly one copy.
             instance_id         TEXT,
-            every_copy        BOOLEAN NOT NULL DEFAULT FALSE
+            every_copy        BOOLEAN NOT NULL DEFAULT FALSE,
+            -- How many times a supervisor claimed it to run. A command that
+            -- is claimed again and again never ended (its run or the write
+            -- of its ending keeps failing, or its supervisor keeps dying
+            -- on it), so the claim gives it up once this reaches
+            -- `SUPERVISOR_GIVE_UP_AFTER` (`weft_broker::lifecycle_writes::claim_next`).
+            runs              INT NOT NULL DEFAULT 0
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
               ON infra_lifecycle_command(tenant_id)
               WHERE completed_at_unix IS NULL"#,
         // Claim path for supervisor-owned verbs (apply / stop /
-        // terminate). The supervisor `claim_command` SELECT scans
-        // uncompleted rows of these verbs ordered by id and gates each
-        // on a live `infra_owner` lease (its single-actor authority); it
-        // does NOT use the `claimed_by_replica` lease (that is the
-        // dispatcher's mechanism). This partial index keyed on id covers
-        // that scan and skips dispatcher-owned + completed rows.
+        // terminate). The supervisor's claim scans uncompleted rows of
+        // these verbs ordered by id and gates each on a live
+        // `infra_owner` lease (its single-actor authority); its claim
+        // marks `claimed_by_replica`, which holds only while the claimer
+        // holds the project's lease
+        // (`weft_broker_client::lifecycle_command::supervisor_claimable`).
+        // This partial index keyed on id covers that scan and skips
+        // dispatcher-owned + completed rows.
         concat!(
             r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_supervisor_claim
               ON infra_lifecycle_command(id)
@@ -139,6 +151,50 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
               ON infra_lifecycle_command(project_id, node_id, instance_id) NULLS NOT DISTINCT
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
+        r#"CREATE TABLE IF NOT EXISTS infra_health_protocol (
+            -- What one health protocol of a project did, kept across the
+            -- supervisor's processes
+            -- (weft_broker_client::protocol::HealthProtocolState).
+            project_id           UUID NOT NULL,
+            protocol             TEXT NOT NULL,
+            -- The copies its action acted on since it was last armed (a
+            -- JSON array of {node_id, instance}); NULL: it has not fired.
+            acted_json           JSONB,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            -- When its failed action is tried again (unix seconds).
+            next_retry_at_unix   BIGINT,
+            -- When it gave up (unix seconds), shown in `weft status`; it is
+            -- armed again when the units it saw then change, a command
+            -- touches the project, or every unit is healthy.
+            gave_up_at_unix      BIGINT,
+            -- The units the health loop saw when it gave up.
+            gave_up_seen         JSONB,
+            last_error           TEXT,
+            PRIMARY KEY (project_id, protocol)
+        )"#,
+        // The broker's look for the supervisor's next due retry.
+        r#"CREATE INDEX IF NOT EXISTS idx_infra_health_protocol_retry
+              ON infra_health_protocol(next_retry_at_unix)
+              WHERE gave_up_at_unix IS NULL AND next_retry_at_unix IS NOT NULL"#,
+        r#"CREATE TABLE IF NOT EXISTS infra_health_look (
+            -- How the supervisor's passes over one project stand, kept
+            -- across its processes (weft_broker::lifecycle_writes::sync_ownership).
+            project_id      UUID PRIMARY KEY,
+            -- When a person last asked for a look (`weft infra look`, unix
+            -- seconds): a health protocol that gave up at or before it is
+            -- armed again.
+            asked_at_unix   BIGINT,
+            -- Passes over the project that failed in a row since one went
+            -- through (weft_broker_client::protocol::supervisor_retry_after).
+            failures        INTEGER NOT NULL DEFAULT 0,
+            -- When a pass tries the project again (unix seconds); NULL:
+            -- nothing failed, a pass took the retry, or it gave up.
+            retry_at_unix   BIGINT
+        )"#,
+        // The broker's look for the supervisor's next due retry.
+        r#"CREATE INDEX IF NOT EXISTS idx_infra_health_look_retry
+              ON infra_health_look(retry_at_unix)
+              WHERE retry_at_unix IS NOT NULL"#,
         // Announce a command when it is issued or its drain is over (its
         // claimers wake) and when it completes (whoever waits on its
         // outcome wakes), from a trigger so no writer (the dispatcher's
@@ -171,6 +227,22 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             FOR EACH ROW
             WHEN (NEW.completed_at_unix IS NOT NULL AND OLD.completed_at_unix IS NULL)
             EXECUTE FUNCTION infra_command_notify()"#,
+        // Announce a person's cancel of a command (`cancel:<id>`), so
+        // whoever runs it (a drain waiting on running work, a supervisor)
+        // stops at once instead of reading the flag on a clock.
+        // SYNC: the payload <-> weft_broker_client::lifecycle_command::InfraCommandSignal::Cancel
+        r#"CREATE OR REPLACE FUNCTION infra_command_cancel_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_infra_command', 'cancel:' || NEW.id::text);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS infra_command_notify_on_cancel ON infra_lifecycle_command"#,
+        r#"CREATE TRIGGER infra_command_notify_on_cancel
+            AFTER UPDATE OF cancel_requested ON infra_lifecycle_command
+            FOR EACH ROW
+            WHEN (NEW.cancel_requested AND NOT OLD.cancel_requested)
+            EXECUTE FUNCTION infra_command_cancel_notify()"#,
     ],
     seed: &[],
 };
@@ -601,8 +673,10 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
 /// its start): the shared copies' (`instance` `None`, which also reaches
 /// a command for every copy, since that one takes the shared copies
 /// down too) or one instance's. Flags CLAIMED rows (`cancel_requested =
-/// TRUE`; the executing supervisor polls the flag between install
-/// calls and halts) and completes still-UNCLAIMED rows outright with
+/// TRUE`; the executing supervisor hears it through the `cancel:<id>`
+/// notice the flag's trigger sends and halts at its next step; the
+/// supervisor's claim marks `claimed_by_replica` like the dispatcher's
+/// does) and completes still-UNCLAIMED rows outright with
 /// outcome `cancelled` (nothing has touched the install for them yet).
 /// Flag first, then complete: a row claimed between the two statements
 /// has its flag already set, so no window exists where a command
@@ -654,9 +728,31 @@ pub async fn request_cancel_owner(
     Ok(flagged)
 }
 
+/// A person asks the supervisor to look at `project_id`'s infra again:
+/// the time is kept on the project's `infra_health_look`, which arms
+/// again every health protocol that gave up at or before it
+/// (`weft_broker::lifecycle_writes::health_state`), the supervisor's
+/// passes over the project start a fresh round of tries (no failure
+/// counted, no retry booked: the look is the next pass), and the ask is
+/// announced as that commits
+/// (`weft_task_store::infra_command::ask_for_look`).
+pub async fn person_asks_for_look(pool: &PgPool, project_id: uuid::Uuid) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO infra_health_look (project_id, asked_at_unix) VALUES ($1, EXTRACT(EPOCH FROM NOW())::BIGINT) \
+         ON CONFLICT (project_id) DO UPDATE SET asked_at_unix = EXCLUDED.asked_at_unix, failures = 0, retry_at_unix = NULL",
+    )
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?;
+    weft_task_store::infra_command::ask_for_look(&mut *tx, project_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Whether a claimed command's cancellation was requested. Read by the
-/// broker's supervisor endpoint so the executing supervisor can poll
-/// mid-command.
+/// dispatcher's own commands (an upgrade between its stop and its start)
+/// at their steps.
 pub async fn cancel_requested(pool: &PgPool, command_id: i64) -> Result<bool> {
     let row: Option<(bool,)> = sqlx::query_as(
         "SELECT cancel_requested FROM infra_lifecycle_command WHERE id = $1",
@@ -674,10 +770,14 @@ pub async fn remove_project<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     project_id: uuid::Uuid,
 ) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM infra_lifecycle_command WHERE project_id = $1")
-        .bind(project_id)
-        .execute(executor)
-        .await?;
+    let res = sqlx::query(
+        "WITH health AS (DELETE FROM infra_health_protocol WHERE project_id = $1), \
+              look AS (DELETE FROM infra_health_look WHERE project_id = $1) \
+         DELETE FROM infra_lifecycle_command WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .execute(executor)
+    .await?;
     Ok(res.rows_affected())
 }
 
@@ -712,6 +812,7 @@ mod tests {
                 verb: take_down.verb(),
                 spec_json,
                 force,
+                cancel_requested: false,
             };
             (row.force, row.terminate_work())
         };

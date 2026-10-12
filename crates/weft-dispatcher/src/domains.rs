@@ -297,28 +297,28 @@ pub async fn unserve(pool: &PgPool, hosting: &dyn DomainHosting, stored: &[Domai
     Ok(())
 }
 
-/// The longest wait between two tries at a door the platform keeps
-/// refusing.
-const LONGEST_DOOR_RETRY: Duration = Duration::from_secs(6 * 3600);
+/// How many refusals in a row the platform's door gets before the loop
+/// stops trying: a refusal that keeps coming needs a person, and
+/// `weft domain add` of a stored domain tries again.
+const DOOR_TRIES: i32 = 3;
 
 /// How soon the door is put on the stored domains again after the
-/// platform refused once; each refusal in a row doubles it, up to
-/// [`LONGEST_DOOR_RETRY`], so a refusal that needs a person does not keep
-/// the install awake.
+/// platform refused `refusals` times in a row: five minutes, doubling.
 fn door_retry(refusals: i32) -> Duration {
     let first = weft_core::time_scale::scaled(Duration::from_secs(300));
-    let doublings = u32::try_from(refusals.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
-    first.saturating_mul(1 << doublings).min(LONGEST_DOOR_RETRY)
+    let doublings = u32::try_from(refusals.saturating_sub(1).clamp(0, DOOR_TRIES)).unwrap_or(0);
+    first.saturating_mul(1 << doublings)
 }
 
-/// Put the platform's door on what is stored, when the rows change and
-/// now and then, one change to the domains at a time install-wide (the
-/// lock `weft domain add` and `rm` take). Asks the platform nothing when
-/// the door already serves exactly what is stored. A refusal is logged,
-/// recorded for `weft domain list`, and retried, later each time.
+/// Put the platform's door on what is stored, when the rows change, one
+/// change to the domains at a time install-wide (the lock `weft domain
+/// add` and `rm` take). Asks the platform nothing when the door already
+/// serves exactly what is stored. A refusal is logged, recorded for `weft
+/// domain list`, and retried a little later, until [`DOOR_TRIES`] refusals
+/// in a row.
 pub fn drain_loop(state: &DispatcherState) -> DrainLoop {
     let state = state.clone();
-    DrainLoop::new("domains_door", ON_DOMAINS, door_retry(1), move || {
+    DrainLoop::new("domains_door", "set up the door in front of the install's domains", ON_DOMAINS, door_retry(1), move || {
         let state = state.clone();
         async move {
             let key = crate::lease::advisory_key(crate::lease::DOMAINS_DOMAIN, "install");
@@ -355,7 +355,17 @@ pub async fn settle(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<DrainS
         }
         Err(refused) => {
             record_refused(pool, &format!("{refused:#}")).await?;
-            let retry = door_retry(door.refusals + 1);
+            let refusals = door.refusals + 1;
+            if refusals >= DOOR_TRIES {
+                tracing::error!(
+                    target: "weft_dispatcher::domains",
+                    error = %format!("{refused:#}"), refusals,
+                    "the platform's door keeps refusing to follow the stored domains; `weft domain list` shows why, and \
+                     `weft domain add` of a stored domain tries again"
+                );
+                return Ok(DrainStep::Done);
+            }
+            let retry = door_retry(refusals);
             tracing::warn!(
                 target: "weft_dispatcher::domains",
                 error = %format!("{refused:#}"), retry_in_secs = retry.as_secs(),

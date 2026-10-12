@@ -18,6 +18,16 @@ pub async fn signals(pool: &PgPool) -> Arc<PgSignalWatch> {
     PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.expect("start the signal watch")
 }
 
+/// The task `replica` claims next (`tasks::claim_next`), `None` when
+/// nothing is claimable.
+#[allow(dead_code)]
+pub async fn claimed_task(pool: &PgPool, replica: &str) -> anyhow::Result<Option<tasks::Task>> {
+    Ok(match tasks::claim_next(pool, replica).await? {
+        tasks::Claim::Task(task) => Some(task),
+        tasks::Claim::Dry { .. } => None,
+    })
+}
+
 /// Apply the task and worker-process schema to a fresh test database.
 pub async fn setup(pool: &PgPool) {
     weft_task_store::apply_groups(pool, &[&weft_task_store::announce::GROUP, &weft_task_store::worker_door::GROUP, &tasks::GROUP])

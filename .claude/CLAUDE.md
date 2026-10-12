@@ -78,6 +78,10 @@ Blocking is the last resort, allowed only when the turn has nothing else in it a
 
 When a background command is still running and you genuinely have nothing left to do, you do not sit on it: check it is alive (read its output, look for progress) and say what it is doing. A command that has printed nothing for a long stretch is stuck, and a stuck command is a bug to investigate, not a wait to extend.
 
+Never a bare `sleep`, and never a single wait longer than 3 minutes: wait for the completion notice, and if you must look before it, one check capped at 3 minutes. Never a poll loop on a file to hear from another agent; it messages you, or you wait for its notice. (An orchestrator once spent hours in ten-minute poll loops waiting on its agents.)
+
+**Every brief you write for an agent carries this section's rule in its own words** (background the slow command, work while it runs, no sleep, no wait over 3 minutes), because an agent does not read this file on its own.
+
 ## Modes
 
 A [mode] is a cognitive pattern. You operate in one at a time. Each mode's full rules live in its own skill, not in this file. The set: `mode-collaborative`, `mode-red-team`, `mode-convergence`, `mode-babble`, `mode-code`, `mode-research`, `mode-debug`, `mode-writing`.

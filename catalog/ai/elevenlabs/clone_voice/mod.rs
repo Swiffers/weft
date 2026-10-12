@@ -3,7 +3,10 @@
 //! ACCOUNT ASSET: it outlives this execution and works in every speak
 //! node from then on.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
+use serde_json::json;
 
 use weft::access::client::{json_call, Multipart};
 use weft::node::NodeOutput;
@@ -31,6 +34,7 @@ impl Node for ElevenLabsCloneVoiceNode {
         let samples: Vec<FileHandle> = ctx.inputs.list("samples")?;
         let description: Option<String> = ctx.inputs.opt("description")?;
         let remove_noise: bool = ctx.inputs.get("removeBackgroundNoise")?;
+        let labels: Option<BTreeMap<String, String>> = ctx.inputs.opt("labels")?;
 
         if samples.is_empty() {
             return Err(weft::WeftError::Input(
@@ -50,6 +54,10 @@ impl Node for ElevenLabsCloneVoiceNode {
         if remove_noise {
             form = form.text("remove_background_noise", "true");
         }
+        // A form field carries text, so the labels go as their JSON.
+        if let Some(labels) = labels.filter(|l| !l.is_empty()) {
+            form = form.text("labels", &json!(labels).to_string());
+        }
         let (content_type, body) = form.build();
 
         let http = ctx.client(&account).await?;
@@ -57,12 +65,19 @@ impl Node for ElevenLabsCloneVoiceNode {
             http.post(format!("{API}/voices/add"))
                 .header("content-type", content_type)
                 .body(body),
-            "elevenlabs: clone the voice",
+            "clone the voice on ElevenLabs",
         )
         .await?;
         let voice_id = answer["voice_id"]
             .as_str()
-            .node_err("elevenlabs: the clone answered no voice_id")?;
-        ctx.pulse_downstream(NodeOutput::new().set("voiceId", voice_id)).await
+            .node_err("ElevenLabs cloned the voice but its answer has no voice_id")?;
+        // The voice exists on the account once ElevenLabs answers, so a
+        // flag it left out closes its port rather than failing a run
+        // whose rerun would mint a second voice.
+        let mut out = NodeOutput::new().set("voiceId", voice_id);
+        if let Some(verify) = answer["requires_verification"].as_bool() {
+            out = out.set("requiresVerification", verify);
+        }
+        ctx.pulse_downstream(out).await
     }
 }

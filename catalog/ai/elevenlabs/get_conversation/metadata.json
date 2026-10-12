@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsGetConversation",
   "label": "Agent: Get Conversation",
-  "description": "Read an agent conversation: waits for the call to finish (default), then emits the transcript, the summary, whether the call succeeded, and optionally the recording.",
+  "description": "Read an agent conversation: waits for the call to finish (default), then emits the transcript as a JSON file, the summary, whether the call succeeded, the data and criteria results, how long it lasted and what it cost, and optionally the whole conversation, its trace and the recording.",
   "tags": [
     "ai",
     "audio",
@@ -50,13 +50,8 @@
     },
     {
       "name": "transcript",
-      "type": "List[JsonDict]",
-      "description": "Each turn: role (agent/user) and message."
-    },
-    {
-      "name": "text",
-      "type": "String",
-      "description": "The whole transcript as role-prefixed lines."
+      "type": "Blob",
+      "description": "A JSON file holding the transcript: `turns`, each turn's `role` (`agent` or `user`) and `message`; and `text`, the whole transcript as one line per turn, starting with its role (`agent: Hello!`). It is a file because a long call's transcript is more than a wire can carry."
     },
     {
       "name": "summary",
@@ -64,14 +59,54 @@
       "description": "The analysis's transcript summary."
     },
     {
+      "name": "summaryTitle",
+      "type": "String",
+      "description": "A short title for the call, from the analysis."
+    },
+    {
       "name": "successful",
       "type": "String",
       "description": "The analysis's call outcome (success / failure / unknown)."
     },
     {
-      "name": "conversation",
+      "name": "successScore",
+      "type": "Number",
+      "description": "The analysis's overall success score for the call, when it gives one."
+    },
+    {
+      "name": "dataCollection",
       "type": "JsonDict",
-      "description": "The whole conversation object."
+      "description": "Each data collection item's id and the value ElevenLabs found for it in the conversation, once the analysis is done: the items Agent: Create's `dataCollection` set up."
+    },
+    {
+      "name": "evaluation",
+      "type": "JsonDict",
+      "description": "Each success criterion's id and its result (`success`, `failure` or `unknown`), once the analysis is done: the criteria Agent: Create's `evaluationCriteria` set up."
+    },
+    {
+      "name": "durationSecs",
+      "type": "Number",
+      "description": "How long the call lasted, in seconds."
+    },
+    {
+      "name": "terminationReason",
+      "type": "String",
+      "description": "Why the call ended, in ElevenLabs's words."
+    },
+    {
+      "name": "costUsd",
+      "type": "Number",
+      "description": "What the conversation cost in US dollars, as ElevenLabs reports it: the model's price plus ElevenLabs's own."
+    },
+    {
+      "name": "conversation",
+      "type": "Blob",
+      "description": "A JSON file holding the whole conversation object, exactly as ElevenLabs answers it. Stored only when something reads this port."
+    },
+    {
+      "name": "otlpTrace",
+      "type": "Blob",
+      "description": "A JSON file holding the conversation as an OpenTelemetry (OTLP) trace, with the structure of ElevenLabs's post-call webhook. ElevenLabs is only asked for it when something reads this port."
     },
     {
       "name": "audio",

@@ -20,6 +20,8 @@ import { EXECUTION_PHASES } from './protocol';
 /// fields the frontends consume; extra fields are ignored.
 // SYNC: RawStatusPayload <-> crates/weft-core/src/projects.rs ProjectStatusResponse
 export interface RawStatusPayload {
+  /** `weft rm` marked the project and has not finished removing it. */
+  removing?: boolean;
   status?: string;
   transition?: string;
   mode?: string;
@@ -57,6 +59,11 @@ export interface RawStatusPayload {
   };
 }
 
+/// What a person is told about a project `weft rm` marked and has not
+/// finished removing (`RawStatusPayload.removing`).
+// SYNC: PROJECT_BEING_REMOVED <-> crates/weft-core/src/projects.rs PROJECT_BEING_REMOVED
+export const PROJECT_BEING_REMOVED = 'the project is being removed; run `weft rm` again to finish removing it';
+
 // SYNC: infra_rollup values <-> crates/weft-core/src/projects.rs ProjectStatusResponse.infra_rollup
 const VALID_ROLLUPS = [
   'none',
@@ -79,7 +86,7 @@ const VALID_STATUSES = [
 ] as const;
 
 // SYNC: VALID_TRANSITIONS <-> crates/weft-core/src/projects.rs ProjectTransition, packages/weft-graph/src/protocol.ts ProjectTransition
-const VALID_TRANSITIONS: ProjectTransition[] = ['none', 'building', 'cancelling_build'];
+const VALID_TRANSITIONS: ProjectTransition[] = ['none', 'building', 'cancelling_build', 'resyncing'];
 
 /// Collapse a raw transition string to the enum, resting on 'none' for
 /// an unknown value (a version-skewed dispatcher shouldn't brick the
@@ -95,6 +102,7 @@ export function parseTransition(raw: unknown): ProjectTransition {
 /// faking a verb list when the status fetch 404s.
 export function emptyActionAvailability(): ActionAvailability {
   return {
+    removing: false,
     availableActions: [],
     binaryDrift: false,
     definitionDrift: false,
@@ -140,6 +148,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     ...(n.progress !== undefined ? { progress: progressOnLocalClock(n.progress, Date.now() / 1000) } : {}),
   }));
   return {
+    removing: !!raw.removing,
     availableActions: (Array.isArray(raw.available_actions)
       ? raw.available_actions
       : []) as ActionVerb[],
@@ -208,6 +217,7 @@ export function idleActionBarState(): ActionBarState {
 /// One derivation so the two shapes can't drift apart per host.
 export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapshot {
   return {
+    removing: snapshot.removing,
     available: snapshot.availableActions,
     status: snapshot.projectStatus,
     transition: snapshot.transition,

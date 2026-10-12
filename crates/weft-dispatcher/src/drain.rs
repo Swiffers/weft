@@ -64,18 +64,33 @@ pub enum Drained {
     Cancelled { left: i64 },
 }
 
-/// How often a waiting drain counts again: the workers state what they
-/// drive once a second.
-const COUNT_EVERY: Duration = Duration::from_secs(1);
-
 /// How often a drain still waiting says so in the log.
 const BREADCRUMB_EVERY: Duration = Duration::from_secs(30);
 
+/// What makes a drain count again: a run ended (every run it waits on,
+/// and every run in its scope waiting to resume, is marked watched,
+/// [`mark_watched`]), or an activation changing status (one landing
+/// elsewhere, or rolled back).
+pub(crate) static WAKE_ON: &[WakeOn] =
+    &[WakeOn::any(weft_journal::RUN_ENDED_CHANNEL), WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
+
 /// Wait for the work `scope` reaches, as `policy` says: `cancel` cancels
 /// what is going now; `wait` waits until nothing is going, or until
-/// `deadline` (none: for as long as it takes, logged every half minute),
-/// where it cancels what is left.
-pub async fn drain(state: &DispatcherState, scope: &DrainScope<'_>, deadline: Option<Instant>, policy: RunningPolicy) -> anyhow::Result<Drained> {
+/// `deadline` (none: for as long as it takes, logged every half minute
+/// with no query), where it cancels what is left. It counts again when a
+/// run it waits on ends ([`WAKE_ON`]), when the lease of a worker driving
+/// what it waits on could lapse ([`workers_look`]), and at the deadline;
+/// never on a timer of its own. A drain run under a command's `claim`
+/// renews it at each count to last past the next one, and counts again
+/// within a claim lease, so the claim never runs further ahead than one
+/// lease; it fails once the claim is no longer this process's.
+pub async fn drain(
+    state: &DispatcherState,
+    scope: &DrainScope<'_>,
+    deadline: Option<Instant>,
+    policy: RunningPolicy,
+    claim: Option<&crate::lifecycle_claimer::CommandClaim<'_>>,
+) -> anyhow::Result<Drained> {
     if policy == RunningPolicy::Cancel {
         let left = going(&state.pg_pool, scope).await?;
         cancel_left(state, scope, &CancelCause::User).await?;
@@ -83,6 +98,9 @@ pub async fn drain(state: &DispatcherState, scope: &DrainScope<'_>, deadline: Op
     }
     let started = Instant::now();
     let mut breadcrumb = started + BREADCRUMB_EVERY;
+    // Subscribed before the first count, so an ending between the count
+    // and the wait is heard.
+    let mut heard = state.signals.subscribe();
     loop {
         let left = going(&state.pg_pool, scope).await?;
         if left == 0 {
@@ -98,16 +116,43 @@ pub async fn drain(state: &DispatcherState, scope: &DrainScope<'_>, deadline: Op
             cancel_left(state, scope, &scope.reaching.cap_cause()).await?;
             return Ok(Drained::Cancelled { left });
         }
-        if now >= breadcrumb {
+        mark_watched(&state.pg_pool, scope).await?;
+        let look = workers_look(&state.pg_pool, scope)
+            .await?
+            .map(|at| now + Duration::from_secs((at + 1 - crate::lease::now_unix()).max(1).unsigned_abs()));
+        let mut count_at = [deadline, look].into_iter().flatten().min();
+        if let Some(claim) = claim {
+            // The claim is kept one claim lease at most: a dispatcher that
+            // dies mid-drain leaves a claim another takes over within a
+            // lease, whatever the drain was waiting for.
+            use weft_broker_client::lifecycle_command::{CLAIM_LEASE_TTL, CLAIM_RENEW_INTERVAL};
+            let renew_by = now + CLAIM_LEASE_TTL - CLAIM_RENEW_INTERVAL;
+            let next = count_at.map_or(renew_by, |count_at| count_at.min(renew_by));
+            count_at = Some(next);
+            let until = crate::lease::now_unix()
+                + i64::try_from(next.saturating_duration_since(now).as_secs() + CLAIM_RENEW_INTERVAL.as_secs()).unwrap_or(i64::MAX / 2);
+            anyhow::ensure!(
+                claim.keep_until(&state.pg_pool, until).await?,
+                "the claim on command {} was taken over by another replica, which answers for it now",
+                claim.id
+            );
+        }
+        loop {
+            let wake = count_at.map_or(breadcrumb, |count_at| count_at.min(breadcrumb));
+            if heard.woken_before(wake, |channel, payload| WAKE_ON.iter().any(|w| w.hears(channel, payload))).await? {
+                break;
+            }
+            if count_at.is_some_and(|count_at| Instant::now() >= count_at) {
+                break;
+            }
             tracing::info!(
                 target: "weft_dispatcher::drain",
                 project_id = %scope.project_id, ?scope.reaching, left,
-                waited_secs = now.duration_since(started).as_secs(),
+                waited_secs = Instant::now().duration_since(started).as_secs(),
                 "still waiting for running work to finish"
             );
-            breadcrumb = now + BREADCRUMB_EVERY;
+            breadcrumb += BREADCRUMB_EVERY;
         }
-        tokio::time::sleep(COUNT_EVERY).await;
     }
 }
 
@@ -140,99 +185,146 @@ pub(crate) async fn cancel_left(state: &DispatcherState, scope: &DrainScope<'_>,
     Ok(())
 }
 
-/// The keys as the two arrays the queries join on: triggers, and owners
-/// (`NULL` for the shared one).
-fn key_arrays(keys: &[ActivationKey]) -> (Vec<String>, Vec<Option<String>>) {
-    keys.iter().map(|key| (key.trigger.clone(), key.instance().map(|m| m.as_str().to_string()))).unzip()
+/// What `scope` reaches, as the queries below select it: the arguments
+/// their filters read from `$2` on.
+enum Binds<'a> {
+    None,
+    /// Triggers, and owners (`NULL` for the shared one).
+    Keys(Vec<String>, Vec<Option<String>>),
+    One(&'a str),
 }
+
+/// How the queries pick what `scope` reaches: among a live worker `l`'s
+/// counts `f(token, n)`, among runs `r`, and the arguments both read.
+struct Filter<'a> {
+    counted: &'static str,
+    runs: &'static str,
+    binds: Binds<'a>,
+}
+
+impl<'a> Reaching<'a> {
+    fn filter(&self) -> Filter<'a> {
+        match *self {
+            Reaching::Triggers(keys) => {
+                let (triggers, instances) = keys.iter().map(|key| (key.trigger.clone(), key.instance().map(|m| m.as_str().to_string()))).unzip();
+                Filter {
+                    counted: "f.token IN (SELECT s.token FROM signal s \
+                              JOIN unnest($2::text[], $3::text[]) AS k(trigger, instance) \
+                                ON s.activation_trigger = k.trigger AND s.instance_id IS NOT DISTINCT FROM k.instance \
+                              WHERE s.project_id = $1 AND NOT s.is_resume)",
+                    runs: "EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS k(trigger, instance) \
+                           WHERE r.fired_by = k.trigger AND r.instance_id IS NOT DISTINCT FROM k.instance)",
+                    binds: Binds::Keys(triggers, instances),
+                }
+            }
+            Reaching::Copies(Copies::Shared | Copies::Every) => Filter { counted: "TRUE", runs: "TRUE", binds: Binds::None },
+            Reaching::Copies(Copies::Instance(instance)) => Filter {
+                counted: "f.token IN (SELECT s.token FROM signal s WHERE s.project_id = $1 AND NOT s.is_resume AND s.instance_id = $2)",
+                runs: "r.instance_id = $2",
+                binds: Binds::One(instance.as_str()),
+            },
+            Reaching::OtherImages(keep) => Filter { counted: "l.binary_hash <> $2", runs: "r.binary_hash <> $2", binds: Binds::One(keep) },
+        }
+    }
+}
+
+/// `query` with `scope`'s project as `$1` and `filter`'s arguments after.
+fn bound<'q, O>(
+    query: sqlx::query::QueryScalar<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    scope: &DrainScope<'_>,
+    filter: &'q Filter<'_>,
+) -> sqlx::query::QueryScalar<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+    let query = query.bind(scope.project_id);
+    match &filter.binds {
+        Binds::None => query,
+        Binds::Keys(triggers, instances) => query.bind(triggers).bind(instances),
+        Binds::One(value) => query.bind(*value),
+    }
+}
+
+/// A run on record that is queued for a worker or being driven by one.
+const GOING: &str = concat!("(r.state = 'queued' OR ", weft_task_store::in_flight_sql!("r"), ")");
 
 /// What the project's live workers say they drive of what `scope` reaches.
 async fn driven_by_workers(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Result<i64> {
     const ALIVE: &str = weft_task_store::worker_alive!("l");
-    let sum = |filter: &str| {
-        format!(
-            "SELECT COALESCE(SUM(f.n::bigint), 0)::bigint FROM worker_lease l \
-             CROSS JOIN LATERAL jsonb_each_text(l.in_flight) AS f(token, n) \
-             WHERE l.project_id = $1 AND {ALIVE} AND {filter}"
-        )
-    };
-    let project_id = scope.project_id;
-    Ok(match scope.reaching {
-        Reaching::Triggers(keys) => {
-            let (triggers, instances) = key_arrays(keys);
-            sqlx::query_scalar(&sum(
-                "f.token IN (SELECT s.token FROM signal s \
-                 JOIN unnest($2::text[], $3::text[]) AS k(trigger, instance) \
-                   ON s.activation_trigger = k.trigger AND s.instance_id IS NOT DISTINCT FROM k.instance \
-                 WHERE s.project_id = $1 AND NOT s.is_resume)",
-            ))
-            .bind(project_id)
-            .bind(&triggers)
-            .bind(&instances)
-            .fetch_one(pool)
-            .await?
-        }
-        Reaching::Copies(Copies::Shared | Copies::Every) => sqlx::query_scalar(&sum("TRUE")).bind(project_id).fetch_one(pool).await?,
-        Reaching::Copies(Copies::Instance(instance)) => {
-            sqlx::query_scalar(&sum(
-                "f.token IN (SELECT s.token FROM signal s WHERE s.project_id = $1 AND NOT s.is_resume AND s.instance_id = $2)",
-            ))
-            .bind(project_id)
-            .bind(instance.as_str())
-            .fetch_one(pool)
-            .await?
-        }
-        Reaching::OtherImages(keep) => {
-            sqlx::query_scalar(&sum("l.binary_hash <> $2")).bind(project_id).bind(keep).fetch_one(pool).await?
-        }
-    })
+    let filter = scope.reaching.filter();
+    let sql = format!(
+        "SELECT COALESCE(SUM(f.n::bigint), 0)::bigint FROM worker_lease l \
+         CROSS JOIN LATERAL jsonb_each_text(l.in_flight) AS f(token, n) \
+         WHERE l.project_id = $1 AND {ALIVE} AND {}",
+        filter.counted
+    );
+    Ok(bound(sqlx::query_scalar(&sql), scope, &filter).fetch_one(pool).await?)
 }
 
 /// The runs on record `scope` reaches that are queued for a worker or
 /// being driven by one.
 async fn on_record(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Result<Vec<ExecutionId>> {
-    const GOING: &str = concat!("(r.state = 'queued' OR ", weft_task_store::in_flight_sql!("r"), ")");
-    let select = |filter: &str| format!("SELECT r.execution_id FROM run r WHERE r.project_id = $1 AND {GOING} AND {filter}");
-    let project_id = scope.project_id;
-    Ok(match scope.reaching {
-        Reaching::Triggers(keys) => {
-            let (triggers, instances) = key_arrays(keys);
-            sqlx::query_scalar(&select(
-                "EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS k(trigger, instance) \
-                 WHERE r.fired_by = k.trigger AND r.instance_id IS NOT DISTINCT FROM k.instance)",
-            ))
-            .bind(project_id)
-            .bind(&triggers)
-            .bind(&instances)
-            .fetch_all(pool)
-            .await?
-        }
-        Reaching::Copies(Copies::Shared | Copies::Every) => sqlx::query_scalar(&select("TRUE")).bind(project_id).fetch_all(pool).await?,
-        Reaching::Copies(Copies::Instance(instance)) => {
-            sqlx::query_scalar(&select("r.instance_id = $2")).bind(project_id).bind(instance.as_str()).fetch_all(pool).await?
-        }
-        Reaching::OtherImages(keep) => {
-            sqlx::query_scalar(&select("r.binary_hash <> $2")).bind(project_id).bind(keep).fetch_all(pool).await?
-        }
-    })
+    let filter = scope.reaching.filter();
+    let sql = format!("SELECT r.execution_id FROM run r WHERE r.project_id = $1 AND {GOING} AND {}", filter.runs);
+    Ok(bound(sqlx::query_scalar(&sql), scope, &filter).fetch_all(pool).await?)
 }
 
-/// A trigger's activation changing status: one starting to deactivate has
-/// a drain to land.
-pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
+/// Mark watched every run on record `scope` reaches that is going, or
+/// parked and so able to go again (`run.watch_end`): its ending then
+/// announces itself (`weft_journal::RUN_ENDED_CHANNEL`), so the drain
+/// counts again when it ends rather than on a timer, a parked run that
+/// resumed meanwhile included. Its going again needs no announcing: while
+/// it goes, the drain counts it and looks at its owner's hold
+/// ([`workers_look`]). Marked when a drain looks, never on a run's own
+/// path.
+pub async fn mark_watched(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Result<()> {
+    let filter = scope.reaching.filter();
+    let sql = format!(
+        "WITH marked AS (UPDATE run r SET watch_end = TRUE \
+             WHERE r.project_id = $1 AND NOT r.watch_end AND (r.state = 'parked' OR {GOING}) AND {} RETURNING 1) \
+         SELECT count(*) FROM marked",
+        filter.runs
+    );
+    let _marked: i64 = bound(sqlx::query_scalar(&sql), scope, &filter).fetch_one(pool).await?;
+    Ok(())
+}
+
+/// When what `scope` reaches could next stop counting as going without
+/// anything announcing it, in unix seconds: the earliest lease of a live
+/// worker counting some of it at its door (a busy worker renews it every
+/// second, one whose runs only wait vouched for itself until then, and a
+/// lapsed one counts for nothing), and the earliest moment a run of it on
+/// record stops being held by its owner (`weft_task_store::run_held_until_sql!`:
+/// its owner's lease, or the grace of a run just handed to a worker whose
+/// first tick has not landed). The drain counts again then.
+pub async fn workers_look(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Result<Option<i64>> {
+    const ALIVE: &str = weft_task_store::worker_alive!("l");
+    const HELD: &str = weft_task_store::run_held_until_sql!("r");
+    let filter = scope.reaching.filter();
+    let sql = format!(
+        "SELECT MIN(at) FROM ( \
+             SELECT MIN(l.leased_until_unix) AS at FROM worker_lease l \
+             WHERE l.project_id = $1 AND {ALIVE} \
+               AND EXISTS (SELECT 1 FROM jsonb_each_text(l.in_flight) AS f(token, n) WHERE f.n::bigint > 0 AND {counted}) \
+             UNION ALL \
+             SELECT MIN({HELD}) FROM run r \
+             WHERE r.project_id = $1 AND r.state = 'running' AND {HELD} >= EXTRACT(EPOCH FROM NOW())::BIGINT AND {runs} \
+         ) looks",
+        counted = filter.counted,
+        runs = filter.runs,
+    );
+    Ok(bound(sqlx::query_scalar(&sql), scope, &filter).fetch_one(pool).await?)
+}
 
 /// The take-downs that wait: every activation left `Deactivating` lands
 /// `Inactive` once nothing it waits on is going, and at its deadline what
-/// is left is cancelled first. Looks every second while any waits.
+/// is left is cancelled first. Counts again when a run it waits on ends
+/// ([`WAKE_ON`]), and at the earliest of every drain's deadline and the
+/// lapse of a worker lease it waits on.
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new("drains", WAKE_ON, weft_task_store::drain::SAFETY_POLL_INTERVAL, move || {
+    DrainLoop::new("drains", "take down what waits for its runs to end", WAKE_ON, weft_task_store::drain::SAFETY_POLL_INTERVAL, move || {
         let state = state.clone();
         async move {
             let deactivating = state.activations.list_deactivating().await?;
-            if deactivating.is_empty() {
-                return Ok(DrainStep::Done);
-            }
             let now = crate::lease::now_unix();
+            let mut next: Option<i64> = None;
             for (project_id, key) in deactivating {
                 let deadline = state
                     .activations
@@ -251,9 +343,17 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
                     );
                     cancel_left(&state, &scope, &scope.reaching.cap_cause()).await?;
                 }
-                land_if_drained(&state, project_id, &key).await?;
+                if land_if_drained(&state, project_id, &key).await? {
+                    continue;
+                }
+                mark_watched(&state.pg_pool, &scope).await?;
+                let look = workers_look(&state.pg_pool, &scope).await?.map(|at| at + 1);
+                next = [next, deadline.filter(|deadline| *deadline > now), look].into_iter().flatten().min();
             }
-            Ok(DrainStep::RetryIn(COUNT_EVERY))
+            Ok(match next {
+                Some(at) => DrainStep::RetryIn(Duration::from_secs((at - now).max(1).unsigned_abs())),
+                None => DrainStep::Done,
+            })
         }
     })
 }
@@ -262,8 +362,9 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
 /// nothing it waits on is going. Idempotent: a stale view loses the
 /// compare-and-set and the next look checks again, and an activate that
 /// flipped it back to `Active` meanwhile wins it, so the deactivation
-/// rolls back cleanly.
-pub(crate) async fn land_if_drained(state: &DispatcherState, project_id: uuid::Uuid, key: &ActivationKey) -> anyhow::Result<()> {
+/// rolls back cleanly. Answers whether it waits no more: it landed, or
+/// was not draining.
+pub(crate) async fn land_if_drained(state: &DispatcherState, project_id: uuid::Uuid, key: &ActivationKey) -> anyhow::Result<bool> {
     use crate::activation_store::ProjectStatus;
     let draining = state
         .activations
@@ -272,11 +373,11 @@ pub(crate) async fn land_if_drained(state: &DispatcherState, project_id: uuid::U
         .iter()
         .any(|a| &a.key == key && a.lifecycle.status == ProjectStatus::Deactivating);
     if !draining {
-        return Ok(());
+        return Ok(true);
     }
     let scope = DrainScope { project_id, reaching: Reaching::Triggers(std::slice::from_ref(key)), except: None };
     if going(&state.pg_pool, &scope).await? > 0 {
-        return Ok(());
+        return Ok(false);
     }
     if state.activations.cas_status(project_id, key, ProjectStatus::Deactivating, ProjectStatus::Inactive).await? {
         tracing::info!(target: "weft_dispatcher::drain", %project_id, trigger = %key, "drain finished: deactivating -> inactive");
@@ -286,5 +387,5 @@ pub(crate) async fn land_if_drained(state: &DispatcherState, project_id: uuid::U
         // project taking any: its front goes.
         crate::front::let_go_if_idle(state, project_id).await?;
     }
-    Ok(())
+    Ok(true)
 }

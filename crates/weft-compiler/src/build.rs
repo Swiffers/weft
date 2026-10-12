@@ -386,7 +386,7 @@ pub fn build_test_artifact(
     if let Some(parent) = dockerfile_path.parent() {
         std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
     }
-    std::fs::write(&dockerfile_path, &dockerfile_summary.body).map_err(CompileError::Io)?;
+    std::fs::write(&dockerfile_path, test_server_dockerfile(&dockerfile_summary.body)).map_err(CompileError::Io)?;
 
     let stage_weft = dockerfile_summary.builder_base.is_none();
     let build_context = stage_build_context(
@@ -407,6 +407,17 @@ pub fn build_test_artifact(
     let content_hash = node_test_content_hash(project, catalog, package_name)?;
 
     Ok(StagedImageBuild { build_context, content_hash })
+}
+
+/// The node-test image's Dockerfile: the worker recipe, started as the
+/// install's test server. A platform starts every image it runs with no
+/// arguments (a worker serves as it is), and the test binary's other
+/// subcommands are for running it by hand, so the image names `serve`
+/// itself.
+// SYNC: the test server's start command <-> crates/weft-engine/src/test_runner.rs (Args::Serve)
+fn test_server_dockerfile(worker_recipe: &str) -> String {
+    let newline = if worker_recipe.ends_with('\n') { "" } else { "\n" };
+    format!("{worker_recipe}{newline}CMD [\"serve\"]\n")
 }
 
 /// The content hash naming a package's node-test build. One function
@@ -1121,6 +1132,17 @@ pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
 #[cfg(test)]
 mod tests {
     use super::sanitize_crate_name;
+
+    /// A platform starts the node-test image with no arguments, so the
+    /// image itself must start the test server, after the worker recipe
+    /// whether or not that ends its last line.
+    #[test]
+    fn the_node_test_image_starts_its_test_server() {
+        let recipe = "FROM x\nENTRYPOINT [\"/usr/local/bin/worker\"]";
+        let expected = "FROM x\nENTRYPOINT [\"/usr/local/bin/worker\"]\nCMD [\"serve\"]\n";
+        assert_eq!(super::test_server_dockerfile(recipe), expected);
+        assert_eq!(super::test_server_dockerfile(&format!("{recipe}\n")), expected);
+    }
 
     /// The builder base compiles the STOCK WORKER: the staged context
     /// carries a package crate per stdlib package (so their rlibs, and the

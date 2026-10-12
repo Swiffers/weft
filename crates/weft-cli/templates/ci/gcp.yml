@@ -101,16 +101,21 @@ jobs:
           echo "$WEFT_REPO_ROOT/target/release" >> "$GITHUB_PATH"
 
       # A program that is off is switched on; one whose triggers are on is
-      # brought up to date. `--mode park` holds the calls that arrive while
-      # its triggers come down and back up, and runs them once they are
-      # back; change it to `hibernate` or `wipe` if that suits this program.
+      # brought up to date. `--mode park` keeps what arrives while its
+      # triggers come down and back up (webhook calls, answers, the
+      # triggers' own fires) and runs it once they are back; a caller on a
+      # live route is answered 503 meanwhile, told to retry in 5 seconds.
+      # Change it to `hibernate` or `wipe` if that suits this program.
+      # Switching on a program whose triggers were parked runs what they
+      # kept and leaves its runs waiting on a person waiting, as a resync
+      # does.
       - name: deploy the program
         run: |
           status=$(weft status --on ${{ vars.WEFT_TARGET }} --json | jq -r '.status // "registered"')
           if [ "$status" = "active" ]; then
             weft resync --on ${{ vars.WEFT_TARGET }} --mode park
           else
-            weft activate --on ${{ vars.WEFT_TARGET }}
+            weft activate --on ${{ vars.WEFT_TARGET }} --reactivate-choice execute_parked_keep_suspended
           fi
 
       # Everything below is the frontend's, and runs only when the install

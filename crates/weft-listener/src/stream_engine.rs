@@ -7,8 +7,9 @@
 //! all; every byte that goes out was declared in the spec.
 //!
 //! The caller supplies the same two closures as the socket engine:
-//! `prepare` runs at the start of every connect cycle (values are
-//! resolved freshly, so a rotated password heals on reconnect), and
+//! `prepare` runs at the start of every connect cycle (values come from
+//! the connection as this process keeps it, fetched again once the
+//! connection changed, so a rotated password heals on reconnect), and
 //! `on_event` receives each fired unit's payload.
 
 use std::time::Instant;
@@ -22,7 +23,7 @@ use tracing::{info, warn};
 
 use weft_core::signal::Framing;
 
-use crate::kinds::event_source::Backoff;
+use crate::kinds::event_source::{Backoff, Said};
 use crate::kinds::ServingReport;
 
 pub use crate::socket_engine::PrepareError;
@@ -70,30 +71,29 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Pipe for T {}
 
 /// Run the engine until aborted (or a fatal prepare error). `target`
 /// names the driving kind in every log line. `report` is where the
-/// node's display reads what the engine is doing: every turn of the
-/// connect loop reports there (see `socket_engine`).
+/// node's display reads what the engine is doing, said when it changes
+/// (see `socket_engine`).
 pub fn spawn(
     mut prepare: Prepare,
     mut on_event: OnEvent,
     target: &'static str,
     report: ServingReport,
 ) -> JoinHandle<()> {
-    let set_status = move |status: String| report(status);
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
+        let mut said = Said::new(report);
         loop {
-            set_status("connecting".to_string());
             let plan = match prepare().await {
                 Ok(p) => p,
                 Err(PrepareError::Transient(e)) => {
                     warn!(target: "weft_listener::stream_engine", kind = target, error = %format!("{e:#}"), "connect preparation failed; retrying");
-                    set_status(format!("connect preparation failed; retrying: {e:#}"));
+                    said.down(format!("connect preparation failed: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(PrepareError::Fatal(e)) => {
-                    warn!(target: "weft_listener::stream_engine", kind = target, error = %format!("{e:#}"), "connect preparation is misconfigured; giving up on this pipe");
-                    set_status(format!("misconfigured, not retrying: {e:#}"));
+                    warn!(target: "weft_listener::stream_engine", kind = target, error = %format!("{e:#}"), "connect preparation fails the same every time; giving up on this pipe");
+                    said.stopped(format!("{e:#}"));
                     return;
                 }
             };
@@ -101,12 +101,12 @@ pub fn spawn(
             let mut pipe = match dial(&plan).await {
                 Ok(p) => {
                     info!(target: "weft_listener::stream_engine", kind = target, address = %plan.address, "pipe connected");
-                    set_status("connected".to_string());
+                    said.up("connected");
                     p
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::stream_engine", kind = target, address = %plan.address, error = %format!("{e:#}"), "connect failed; retrying");
-                    set_status(format!("connect failed; retrying: {e:#}"));
+                    said.down(format!("connect failed: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -116,7 +116,7 @@ pub fn spawn(
             // `run_cycle` returns only when the pipe dropped or
             // misbehaved, and says which; the loop dials again.
             let why = run_cycle(&plan, &mut pipe, &mut on_event, target).await;
-            set_status(format!("{why}; reconnecting"));
+            said.down(why);
 
             backoff.reset_if_healthy(connected_at.elapsed());
             backoff.wait_then_climb().await;

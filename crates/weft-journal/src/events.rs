@@ -199,13 +199,17 @@ pub enum ExecEvent {
 
     /// The firing failed with `error`. Ports already emitted keep their
     /// values; every other output closes, a generator output's closure
-    /// carrying the error as a FAILED stream end.
+    /// carrying the error as a FAILED stream end. `gave_up_wait`: it
+    /// failed on a wait it gave up at a time limit
+    /// (`NodeExecution::gave_up_wait`).
     NodeFailed {
         #[serde(skip)]
         execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         error: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        gave_up_wait: bool,
         at_unix: u64,
     },
 
@@ -507,6 +511,31 @@ pub enum ExecEvent {
         /// answer).
         origin: weft_core::CredentialOwner,
         metadata: Value,
+        /// The charge this figure closes (`ChargeOpened`), by the id its
+        /// provider gave it; `None` for a call priced on its own response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charge: Option<String>,
+        at_unix: u64,
+    },
+
+    /// A metered call spent money whose amount only a later response
+    /// states (a job started now, read back later). The figure is booked
+    /// by the `CostReported` naming this charge; until one does, the
+    /// charge is open (`crate::fold::ChargeBook`), and a drive that picks
+    /// the run up again holds it open so its later read prices it.
+    ChargeOpened {
+        #[serde(skip)]
+        execution_id: ExecutionId,
+        node_id: String,
+        frames: LoopFrames,
+        service: String,
+        /// The id the provider gave the charge (a job id).
+        charge: String,
+        /// The meter's own state for the charge, as it stood when the
+        /// call opened it.
+        scratch: Value,
+        /// Whose key the call spent, as on `CostReported`.
+        origin: weft_core::CredentialOwner,
         at_unix: u64,
     },
 
@@ -764,6 +793,7 @@ macro_rules! execution_id_of {
             | Self::SuspensionSkipped { execution_id, .. }
             | Self::RunOutput { execution_id, .. }
             | Self::CostReported { execution_id, .. }
+            | Self::ChargeOpened { execution_id, .. }
             | Self::LogLine { execution_id, .. }
             | Self::FileEdited { execution_id, .. }
             | Self::ExecutionTagged { execution_id, .. }
@@ -844,6 +874,7 @@ impl ExecEvent {
             | Self::SuspensionSkipped { at_unix, .. }
             | Self::RunOutput { at_unix, .. }
             | Self::CostReported { at_unix, .. }
+            | Self::ChargeOpened { at_unix, .. }
             | Self::LogLine { at_unix, .. }
             | Self::FileEdited { at_unix, .. }
             | Self::ExecutionTagged { at_unix, .. }
@@ -887,6 +918,7 @@ impl ExecEvent {
             Self::SuspensionSkipped { .. } => "suspension_skipped",
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
+            Self::ChargeOpened { .. } => "charge_opened",
             Self::LogLine { .. } => "log_line",
             Self::FileEdited { .. } => "file_edited",
             Self::ExecutionTagged { .. } => "execution_tagged",
@@ -960,13 +992,17 @@ impl ExecEvent {
             Self::RunOutput { node_id, frames: at, name, value, .. } => {
                 node_id.len() + frames(at) + name.len() + value_bytes(value)
             }
-            Self::CostReported { node_id, frames: at, cost_id, service, model, metadata, .. } => {
+            Self::CostReported { node_id, frames: at, cost_id, service, model, metadata, charge, .. } => {
                 node_id.len()
                     + frames(at)
                     + cost_id.len()
                     + service.len()
                     + model.as_ref().map_or(0, String::len)
                     + value_bytes(metadata)
+                    + charge.as_ref().map_or(0, String::len)
+            }
+            Self::ChargeOpened { node_id, frames: at, service, charge, scratch, .. } => {
+                node_id.len() + frames(at) + service.len() + charge.len() + value_bytes(scratch)
             }
             Self::LogLine { node_id, frames: at, level, message, .. } => node_id.len() + frames(at) + level.len() + message.len(),
             Self::ExecutionTagged { tags, .. } => texts(tags),
@@ -1082,7 +1118,7 @@ mod wire_tests {
         let rows = vec![
             ExecEvent::NodeStarted { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
             ExecEvent::NodeCompleted { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
-            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), error: "e".into(), at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), error: "e".into(), gave_up_wait: false, at_unix: 1 },
             ExecEvent::NodeSkipped {
                 execution_id: execution_id(),
                 node_id: "n".into(),
@@ -1233,7 +1269,7 @@ mod wire_tests {
             ExecEvent::NodeKicked { execution_id: execution_id(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
             ExecEvent::NodeStarted { execution_id: execution_id(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
             ExecEvent::NodeCompleted { execution_id: execution_id(), node_id: "n".into(), frames: vec![], at_unix: 1 },
-            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], error: "boom".into(), gave_up_wait: false, at_unix: 1 },
             ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None }, at_unix: 1 },
             ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: Some(weft_core::pulse::Failure { node: "auth.query".into(), error: "down".into() }) }, at_unix: 1 },
             ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::WatchedNodeFailed { failure: weft_core::pulse::Failure { node: "q".into(), error: "down".into() } }, at_unix: 1 },
@@ -1266,6 +1302,31 @@ mod wire_tests {
                 billed: true,
                 origin: weft_core::CredentialOwner::Author,
                 metadata: json!({}),
+                charge: None,
+                at_unix: 1,
+            },
+            ExecEvent::CostReported {
+                execution_id: execution_id(),
+                node_id: "n".into(),
+                frames: vec![],
+                cost_id: "c2".into(),
+                service: "jobs".into(),
+                model: None,
+                amount_usd: None,
+                billed: false,
+                origin: weft_core::CredentialOwner::Author,
+                metadata: json!({ "resolution": "unknown" }),
+                charge: Some("job-1".into()),
+                at_unix: 2,
+            },
+            ExecEvent::ChargeOpened {
+                execution_id: execution_id(),
+                node_id: "n".into(),
+                frames: vec![weft_core::frames::Frame::Loop { index: 1 }],
+                service: "jobs".into(),
+                charge: "job-1".into(),
+                scratch: json!({ "route": "dub", "model": "m" }),
+                origin: weft_core::CredentialOwner::Author,
                 at_unix: 1,
             },
             ExecEvent::LogLine { execution_id: execution_id(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "hi".into(), at_unix_ms: None, seq: None, at_unix: 1 },
@@ -1364,7 +1425,7 @@ mod wire_tests {
         let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 36, "a variant has no row above: {kinds:?}");
+        assert_eq!(kinds.len(), 37, "a variant has no row above: {kinds:?}");
         for row in rows {
             let kind = row.kind_str();
             let json = weft_core::project::selection::RecordedSelection::resolving(std::slice::from_ref(&selection), || round_trip(row));
@@ -1399,5 +1460,44 @@ mod wire_tests {
         });
         old_skip.as_object_mut().unwrap().remove("reason");
         assert!(serde_json::from_value::<ExecEvent>(old_skip).is_err(), "a skip without its reason is refused");
+    }
+
+    /// A cost priced on its own response spells no charge, so an ordinary
+    /// call's row is what it always was; one that closes a charge names
+    /// it, and the charge's opening keeps every field it carries.
+    #[test]
+    fn a_cost_names_the_charge_it_closes_only_when_it_closes_one() {
+        let cost = |charge: Option<&str>| ExecEvent::CostReported {
+            execution_id: execution_id(),
+            node_id: "n".into(),
+            frames: vec![],
+            cost_id: "c".into(),
+            service: "jobs".into(),
+            model: None,
+            amount_usd: Some(1.5),
+            billed: false,
+            origin: weft_core::CredentialOwner::Author,
+            metadata: json!({}),
+            charge: charge.map(str::to_string),
+            at_unix: 1,
+        };
+        assert!(round_trip(cost(None)).get("charge").is_none(), "an ordinary call's row spells no charge");
+        assert_eq!(round_trip(cost(Some("job-1")))["charge"], json!("job-1"));
+        let opened = round_trip(ExecEvent::ChargeOpened {
+            execution_id: execution_id(),
+            node_id: "dub".into(),
+            frames: vec![weft_core::frames::Frame::Loop { index: 3 }],
+            service: "jobs".into(),
+            charge: "job-1".into(),
+            scratch: json!({ "route": "dubbing", "seconds": 12 }),
+            origin: weft_core::CredentialOwner::Author,
+            at_unix: 1,
+        });
+        assert_eq!(opened["kind"], json!("charge_opened"));
+        assert_eq!(opened["charge"], json!("job-1"));
+        assert_eq!(opened["scratch"], json!({ "route": "dubbing", "seconds": 12 }));
+        let mut without = opened.clone();
+        without.as_object_mut().unwrap().remove("scratch");
+        assert!(serde_json::from_value::<ExecEvent>(without).is_err(), "an opening without its meter state is refused");
     }
 }

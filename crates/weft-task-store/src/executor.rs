@@ -101,9 +101,11 @@ pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn::a
 
 /// The dispatcher's picker as a drain loop: each pass claims one task and
 /// runs it on a task of its own (under the concurrency cap), until none
-/// is claimable. Woken by a task becoming claimable; the safety look also
-/// rescues a task whose claim lapsed (its claimant died), which nothing
-/// announces.
+/// is claimable. Woken by a task becoming claimable. Run dry, it looks
+/// again when the earliest claim it may have to rescue lapses (its
+/// claimant died, which nothing announces), which the claim that found
+/// nothing read too, or sleeps until a task is announced when no claim is
+/// out.
 pub fn dispatcher_picker_loop<Ctx>(
     store: Arc<crate::traits::PostgresTaskStoreClient>,
     ctx: Ctx,
@@ -114,21 +116,27 @@ where
     Ctx: Send + Sync + Clone + 'static,
 {
     let slots = Arc::new(tokio::sync::Semaphore::new(DISPATCHER_PICKER_CONCURRENCY));
-    crate::drain::DrainLoop::new("dispatcher_picker", DISPATCHER_READY, crate::drain::SAFETY_POLL_INTERVAL, move || {
+    crate::drain::DrainLoop::new("dispatcher_picker", "pick up the tasks waiting for it", DISPATCHER_READY, crate::drain::SAFETY_POLL_INTERVAL, move || {
         let (store, ctx, registry, replica, slots) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone());
         async move {
             // At capacity: wait for a running task to finish before claiming
             // another.
             let slot = slots.acquire_owned().await.expect("the picker's semaphore is never closed");
             match store.claim_dispatcher_task(&replica).await? {
-                Some(task) => {
+                crate::tasks::Claim::Task(task) => {
                     tokio::spawn(async move {
                         let _slot = slot;
                         run_dispatcher_task(store.pool().clone(), ctx, registry, replica, task).await;
                     });
                     Ok(crate::drain::DrainStep::More)
                 }
-                None => Ok(crate::drain::DrainStep::Done),
+                crate::tasks::Claim::Dry { next_lapse } => Ok(match next_lapse {
+                    // Rescued once it is past, so a second after it.
+                    Some(lapse) => crate::drain::DrainStep::RetryIn(std::time::Duration::from_secs(
+                        (lapse + 1 - crate::tasks::unix_now()).max(1).unsigned_abs(),
+                    )),
+                    None => crate::drain::DrainStep::Done,
+                }),
             }
         }
     })
@@ -163,14 +171,16 @@ async fn run_dispatcher_task<Ctx>(
     let task_id = task.id;
     let kind = task.kind.clone();
     let lease = LeaseSignal::new();
-    let heartbeat = spawn_claim_heartbeat(
-        pool.clone(),
+    let claim = TaskClaim {
+        pool: pool.clone(),
         task_id,
-        replica.clone(),
-        lease.clone(),
-    );
+        replica: replica.clone(),
+        resting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        lease: lease.clone(),
+    };
+    let heartbeat = spawn_claim_heartbeat(claim.clone());
     let outcome = run_with_lease_guard(
-        executor.execute(&ctx, &task),
+        CLAIM.scope(claim, executor.execute(&ctx, &task)),
         lease,
         task_id,
         &kind,
@@ -178,6 +188,55 @@ async fn run_dispatcher_task<Ctx>(
     .await;
     drop(heartbeat);
     finalize_task(&pool, task_id, &replica, &kind, outcome).await;
+}
+
+tokio::task_local! {
+    /// The claim of the task the executor running on this task works for.
+    static CLAIM: TaskClaim;
+}
+
+/// The claim of a task being run, as its executor reaches it
+/// ([`current_claim`]): the work may wait on a run that waits for days (an
+/// activation's setup run waiting on a person), and renewing the claim
+/// every few seconds meanwhile would keep the database awake for nothing.
+/// So the claim can rest on that run ([`TaskClaim::rest_on`]) and be
+/// taken back once it ends ([`TaskClaim::resume`]).
+#[derive(Clone)]
+pub struct TaskClaim {
+    pool: PgPool,
+    task_id: uuid::Uuid,
+    replica: String,
+    /// The heartbeat leaves the claim alone while it rests.
+    resting: Arc<std::sync::atomic::AtomicBool>,
+    lease: LeaseSignal,
+}
+
+/// The claim of the task whose executor calls this, when one does.
+pub fn current_claim() -> Option<TaskClaim> {
+    CLAIM.try_with(Clone::clone).ok()
+}
+
+impl TaskClaim {
+    /// Rest the claim on `run` (`crate::tasks::rest_claim`): no more
+    /// renewals until [`Self::resume`].
+    pub async fn rest_on(&self, run: weft_core::ExecutionId) -> Result<()> {
+        self.resting.store(true, std::sync::atomic::Ordering::Release);
+        if !crate::tasks::rest_claim(&self.pool, self.task_id, &self.replica, run).await? {
+            self.lease.lost(LeaseLoss::Stolen);
+        }
+        Ok(())
+    }
+
+    /// Renew the claim again (`crate::tasks::resume_claim`). A claim
+    /// handed back while it rested is another claimant's now: the work
+    /// stops.
+    pub async fn resume(&self) -> Result<()> {
+        if !crate::tasks::resume_claim(&self.pool, self.task_id, &self.replica).await? {
+            self.lease.lost(LeaseLoss::Stolen);
+        }
+        self.resting.store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
 }
 
 /// Why the heartbeat task told the executor to stop. Typed so the
@@ -397,13 +456,10 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 ///     parallel execution of the same row. `LeaseLoss::Unrenewable`,
 ///     the finalizer requeues the row.
 /// A stalled executor is NOT an exit: the heartbeat keeps renewing,
-/// the executor keeps running, no leak.
-fn spawn_claim_heartbeat(
-    pool: PgPool,
-    task_id: uuid::Uuid,
-    replica: String,
-    lease: LeaseSignal,
-) -> Heartbeat {
+/// the executor keeps running, no leak. A claim resting on a run
+/// ([`TaskClaim::rest_on`]) is not renewed, and touches nothing.
+fn spawn_claim_heartbeat(claim: TaskClaim) -> Heartbeat {
+    let TaskClaim { pool, task_id, replica, resting, lease } = claim;
     let interval = claim_heartbeat_interval();
     let max_consecutive_errors =
         (claim_duration_secs() as f64 / interval.as_secs_f64()) as u32 + 1;
@@ -411,6 +467,9 @@ fn spawn_claim_heartbeat(
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
+            if resting.load(std::sync::atomic::Ordering::Acquire) {
+                continue;
+            }
             match crate::tasks::heartbeat(&pool, task_id, &replica).await {
                 Ok(true) => {
                     consecutive_errors = 0;

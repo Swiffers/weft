@@ -245,11 +245,14 @@ impl ResponseHead {
     /// The bytes that tell a reader of this body the program failed,
     /// once the status line is already out: in the body's own framing,
     /// so a reader parsing it gets the error as an item it can read.
-    /// JSON lines get one line `{"error": "..."}`, server-sent events an
-    /// `error` event, anything else a text line `[error] ...`. Each
-    /// starts on a fresh line, since the last item may not have ended
-    /// one (a blank line is skipped by a JSON-lines or SSE reader).
-    pub fn in_band_error(&self, message: &str) -> Vec<u8> {
+    /// JSON lines get one line `{"error": "...", "status": 504}`, the
+    /// status being the one the answer would have had, had it not started
+    /// (`500` the program failed, `504` a time limit, `503` stopped);
+    /// server-sent events an `error` event, anything else a text line
+    /// `[error] ...`. Each starts on a fresh line, since the last item may
+    /// not have ended one (a blank line is skipped by a JSON-lines or SSE
+    /// reader).
+    pub fn in_band_error(&self, message: &str, status: u16) -> Vec<u8> {
         const JSON_LINES: &[&str] = &[
             "application/x-ndjson",
             "application/ndjson",
@@ -261,7 +264,7 @@ impl ResponseHead {
         let essence = self.content_type_essence();
         match essence.as_deref() {
             Some(ct) if JSON_LINES.contains(&ct) => {
-                format!("\n{}\n", serde_json::json!({ "error": message })).into_bytes()
+                format!("\n{}\n", serde_json::json!({ "error": message, "status": status })).into_bytes()
             }
             Some("text/event-stream") => {
                 let mut out = String::from("\nevent: error\n");
@@ -643,10 +646,15 @@ pub trait CallerConnection: Send + Sync {
     /// waiting for the caller's next message, and Weft never times out a
     /// user-controlled wait. It ends only on a message, a disconnect
     /// (`Disconnected`), or the session cap firing (which disconnects).
+    /// The wait is `node`'s, registered with the run's `liveness` like any
+    /// in-process wait ([`crate::liveness::wait_on`]): a run whose steps all
+    /// wait on their caller is waiting on the outside, never stuck.
     /// `Err(WrongProtocol)` on HTTP.
     async fn receive(
         &self,
         cursor: &std::sync::atomic::AtomicU64,
+        liveness: &std::sync::Weak<dyn crate::liveness::WaitLiveness>,
+        node: &Option<crate::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError>;
 
     /// WebSocket only: send a message, then read the next inbound at
@@ -654,12 +662,14 @@ pub trait CallerConnection: Send + Sync {
     /// is no strict send/reply correlation: "the reply" is simply the next
     /// message this reader observes after the send. A node needing strict
     /// correlation sends, then filters `receive` for the matching message
-    /// itself. The read is UNBOUNDED, like `receive`. `Err(WrongProtocol)`
-    /// on HTTP.
+    /// itself. The read is UNBOUNDED, and `node`'s wait, like `receive`.
+    /// `Err(WrongProtocol)` on HTTP.
     async fn request(
         &self,
         msg: OutboundChunk,
         cursor: &std::sync::atomic::AtomicU64,
+        liveness: &std::sync::Weak<dyn crate::liveness::WaitLiveness>,
+        node: &Option<crate::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError>;
 
     /// HTTP only: the inbound request (the handshake plus the body
@@ -730,8 +740,19 @@ impl CallerHandle {
                 CallerHandle::Websocket(WsCaller {
                     conn,
                     cursor: Arc::new(std::sync::atomic::AtomicU64::new(start)),
+                    waiter: Waiter { liveness: crate::liveness::no_liveness(), node: None },
                 })
             }
+        }
+    }
+
+    /// The handle whose reads are `node`'s waits, registered with the
+    /// run's `liveness` (see [`CallerConnection::receive`]). Internal:
+    /// `ExecutionContext::caller()` hands each firing its own.
+    pub fn waited_by(self, liveness: std::sync::Weak<dyn crate::liveness::WaitLiveness>, node: crate::liveness::FiringLocation) -> Self {
+        match self {
+            CallerHandle::Websocket(ws) => CallerHandle::Websocket(WsCaller { waiter: Waiter { liveness, node: Some(node) }, ..ws }),
+            http => http,
         }
     }
 
@@ -845,6 +866,16 @@ impl HttpCaller {
 pub struct WsCaller {
     conn: Arc<dyn CallerConnection>,
     cursor: Arc<std::sync::atomic::AtomicU64>,
+    waiter: Waiter,
+}
+
+/// Whose wait a read of the caller's next message is (see
+/// [`CallerConnection::receive`]): the run's liveness hook and the reading
+/// firing, nobody's outside a run.
+#[derive(Clone)]
+struct Waiter {
+    liveness: std::sync::Weak<dyn crate::liveness::WaitLiveness>,
+    node: Option<crate::liveness::FiringLocation>,
 }
 
 impl WsCaller {
@@ -873,7 +904,7 @@ impl WsCaller {
     /// (the cursor fell behind the retained window; resumable). Inbound is
     /// broadcast: every reader sees every message.
     pub async fn receive(&self) -> Result<InboundMessage, CallerError> {
-        self.conn.receive(&self.cursor).await
+        self.conn.receive(&self.cursor, &self.waiter.liveness, &self.waiter.node).await
     }
 
     /// Send a message, then read the next inbound from this handle's cursor
@@ -881,7 +912,7 @@ impl WsCaller {
     /// correlated (inbound is broadcast); see the
     /// `CallerConnection::request` contract.
     pub async fn request(&self, msg: OutboundChunk) -> Result<InboundMessage, CallerError> {
-        self.conn.request(msg, &self.cursor).await
+        self.conn.request(msg, &self.cursor, &self.waiter.liveness, &self.waiter.node).await
     }
 
     /// Read the next inbound message, collapsing the genuinely TERMINAL
@@ -899,7 +930,7 @@ impl WsCaller {
     /// match `CallerError::FellBehind` itself; `recv_next` is the
     /// fail-fast-on-anything-unexpected convenience for the common case.
     pub async fn recv_next(&self) -> WeftResult<Option<InboundMessage>> {
-        recv_next_from(self.conn.receive(&self.cursor).await)
+        recv_next_from(self.receive().await)
     }
 
     /// Close the session with a normal-closure frame (`1000`, no
@@ -933,7 +964,7 @@ impl WsCaller {
     /// cursor reads the broadcast stream independently (its own position),
     /// so two cursors both see every message from where each started.
     pub fn cursor(&self) -> CallerCursor {
-        CallerCursor::new(self.conn.clone(), self.conn.inbound_now_offset())
+        self.cursor_at(self.conn.inbound_now_offset())
     }
 
     /// A cursor positioned at an explicit `offset`. The general primitive:
@@ -942,7 +973,7 @@ impl WsCaller {
     /// offset below the retained floor reads the earliest still-retained
     /// message (RAM-only: the window is the whole readable world).
     pub fn cursor_at(&self, offset: u64) -> CallerCursor {
-        CallerCursor::new(self.conn.clone(), offset)
+        CallerCursor { conn: self.conn.clone(), pos: Arc::new(std::sync::atomic::AtomicU64::new(offset)), waiter: self.waiter.clone() }
     }
 
     /// A cursor from the earliest inbound message STILL RETAINED in RAM
@@ -951,7 +982,7 @@ impl WsCaller {
     /// journaled connection the trimmed-out prefix lives in the DB but a
     /// cursor never reads it.
     pub fn cursor_from_start(&self) -> CallerCursor {
-        CallerCursor::new(self.conn.clone(), self.conn.inbound_retained_floor())
+        self.cursor_at(self.conn.inbound_retained_floor())
     }
 
     /// A forward cursor that ALSO replays the single most recent message
@@ -960,7 +991,7 @@ impl WsCaller {
     /// it is a plain forward cursor at now.
     pub fn cursor_including_last(&self) -> CallerCursor {
         let start = self.conn.last_inbound_offset().unwrap_or_else(|| self.conn.inbound_now_offset());
-        CallerCursor::new(self.conn.clone(), start)
+        self.cursor_at(start)
     }
 }
 
@@ -972,13 +1003,11 @@ impl WsCaller {
 pub struct CallerCursor {
     conn: Arc<dyn CallerConnection>,
     pos: Arc<std::sync::atomic::AtomicU64>,
+    /// Its handle's: a cursor waits as the firing that minted it.
+    waiter: Waiter,
 }
 
 impl CallerCursor {
-    fn new(conn: Arc<dyn CallerConnection>, start: u64) -> Self {
-        Self { conn, pos: Arc::new(std::sync::atomic::AtomicU64::new(start)) }
-    }
-
     /// Await the next inbound message at this cursor (UNBOUNDED, see
     /// [`WsCaller::receive`]), advancing the cursor on success. Returns the
     /// TYPED [`CallerError`] so a node can `match` every outcome (notably
@@ -986,20 +1015,20 @@ impl CallerCursor {
     /// behind the retained window). On `FellBehind` the cursor advances to the
     /// floor; call again to resume there, or stop.
     pub async fn receive(&self) -> Result<InboundMessage, CallerError> {
-        self.conn.receive(&self.pos).await
+        self.conn.receive(&self.pos, &self.waiter.liveness, &self.waiter.node).await
     }
 
     /// Send a message, then read the next inbound at this cursor (UNBOUNDED).
     /// Typed error (see [`Self::receive`]).
     pub async fn request(&self, msg: OutboundChunk) -> Result<InboundMessage, CallerError> {
-        self.conn.request(msg, &self.pos).await
+        self.conn.request(msg, &self.pos, &self.waiter.liveness, &self.waiter.node).await
     }
 
     /// Read the next inbound at this cursor, collapsing end-of-stream to
     /// `Ok(None)` so a node loops `while let Some(m) = cur.recv_next().await? {}`.
     /// See [`WsCaller::recv_next`].
     pub async fn recv_next(&self) -> WeftResult<Option<InboundMessage>> {
-        recv_next_from(self.conn.receive(&self.pos).await)
+        recv_next_from(self.receive().await)
     }
 
     /// This cursor's current position (next offset it will read).
@@ -1254,6 +1283,8 @@ impl CallerConnection for FakeCallerConnection {
     async fn receive(
         &self,
         cursor: &std::sync::atomic::AtomicU64,
+        _liveness: &std::sync::Weak<dyn crate::liveness::WaitLiveness>,
+        _node: &Option<crate::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError> {
         self.record(CallerCall::Receive);
         if self.config.protocol != Protocol::Websocket {
@@ -1282,6 +1313,8 @@ impl CallerConnection for FakeCallerConnection {
         &self,
         msg: OutboundChunk,
         cursor: &std::sync::atomic::AtomicU64,
+        _liveness: &std::sync::Weak<dyn crate::liveness::WaitLiveness>,
+        _node: &Option<crate::liveness::FiringLocation>,
     ) -> Result<InboundMessage, CallerError> {
         self.record(CallerCall::Request(msg));
         if self.config.protocol != Protocol::Websocket {
@@ -1382,21 +1415,21 @@ mod tests {
     #[test]
     fn in_band_error_speaks_the_body_framing() {
         let head = |ct: &str| ResponseHead::new(200).with_header("Content-Type", ct);
-        let line = head("application/x-ndjson; charset=utf-8").in_band_error("the model \"failed\"");
+        let line = head("application/x-ndjson; charset=utf-8").in_band_error("the model \"failed\"", 500);
         let text = String::from_utf8(line).unwrap();
         assert!(text.starts_with('\n') && text.ends_with('\n'), "{text:?}");
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(parsed, serde_json::json!({ "error": "the model \"failed\"" }));
+        assert_eq!(parsed, serde_json::json!({ "error": "the model \"failed\"", "status": 500 }));
         for ct in ["application/ndjson", "application/jsonl", "APPLICATION/X-JSONLINES"] {
-            let text = String::from_utf8(head(ct).in_band_error("boom")).unwrap();
-            assert_eq!(text, "\n{\"error\":\"boom\"}\n", "{ct}");
+            let text = String::from_utf8(head(ct).in_band_error("boom", 504)).unwrap();
+            assert_eq!(text, "\n{\"error\":\"boom\",\"status\":504}\n", "{ct}");
         }
         assert_eq!(
-            String::from_utf8(head("text/event-stream").in_band_error("a\nb")).unwrap(),
+            String::from_utf8(head("text/event-stream").in_band_error("a\nb", 503)).unwrap(),
             "\nevent: error\ndata: a\ndata: b\n\n",
         );
-        assert_eq!(head("text/plain; charset=utf-8").in_band_error("boom"), b"\n[error] boom");
-        assert_eq!(ResponseHead::new(200).in_band_error("boom"), b"\n[error] boom", "no content type is text");
+        assert_eq!(head("text/plain; charset=utf-8").in_band_error("boom", 500), b"\n[error] boom");
+        assert_eq!(ResponseHead::new(200).in_band_error("boom", 500), b"\n[error] boom", "no content type is text");
     }
 
     #[test]

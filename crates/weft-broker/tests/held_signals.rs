@@ -10,7 +10,9 @@
 
 use sqlx::PgPool;
 
-use weft_broker::held_signals::{hold, judge_held_fire, let_go, set_holds, signal_held, signals_held, still_held_by, write_kind_state, HeldFire};
+use weft_broker::held_signals::{
+    give_up, hold, judge_held_fire, release, set_holds, signal_held, signals_held, still_held_by, write_kind_state, HeldFire,
+};
 use weft_broker_client::protocol::{HeldNow, HeldServing, ProjectStatus};
 
 async fn schema(pool: &PgPool) {
@@ -189,39 +191,40 @@ async fn holders_take_disjoint_shares_within_their_room(pool: PgPool) {
     wipe(&pool, "wiped").await;
     signal(&pool, "form", ACTIVE, ProjectStatus::Active).await;
 
-    let one = hold(&pool, "h1", &[], Some(2), &[], 30).await.unwrap();
+    let one = hold(&pool, "h1", &[], Some(2), &[]).await.unwrap();
     assert_eq!(one.taken.len(), 2, "its room");
     assert!(one.taken.iter().all(|r| r.holds));
-    let two = hold(&pool, "h2", &[], Some(5), &[], 30).await.unwrap();
+    let two = hold(&pool, "h2", &[], Some(5), &[]).await.unwrap();
     let mut all = tokens(&one.taken);
     all.extend(tokens(&two.taken));
     all.sort();
     assert_eq!(all, vec!["a", "b", "c"], "every live held signal once, never the wiped one or the form");
-    assert!(hold(&pool, "h3", &[], None, &[], 30).await.unwrap().taken.is_empty(), "nothing left");
+    assert!(hold(&pool, "h3", &[], None, &[]).await.unwrap().taken.is_empty(), "nothing left");
 }
 
-/// A holder keeps what it claims while it renews, says what each
-/// connection does, loses what another claim took after its own lapsed,
-/// and gives up its claims when it stops.
+/// A holder keeps what it claims for as long as it lives, with no renewal,
+/// says what each connection does, loses it when its check goes off (it
+/// stopped pushing it: it died) to the next holder that looks, and gives
+/// up its claims when it stops.
 #[sqlx::test]
-async fn a_claim_lives_while_renewed_and_lapses_to_another_holder(pool: PgPool) {
+async fn a_claim_lives_until_let_go_or_the_check(pool: PgPool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
 
-    assert_eq!(tokens(&hold(&pool, "h1", &[], None, &[], 30).await.unwrap().taken), vec!["sse"]);
+    assert_eq!(tokens(&hold(&pool, "h1", &[], None, &[]).await.unwrap().taken), vec!["sse"]);
     let listening = HeldServing { status: "listening".into(), transport: None };
-    let renewed = hold(&pool, "h1", &[HeldNow { token: "sse".into(), serving: Some(listening.clone()) }], None, &[], 30).await.unwrap();
-    assert_eq!(renewed.kept, vec!["sse"]);
+    let kept = hold(&pool, "h1", &[HeldNow { token: "sse".into(), serving: Some(listening.clone()) }], None, &[]).await.unwrap();
+    assert_eq!(kept.kept, vec!["sse"]);
     assert_eq!(signal_held(&pool, "sse").await.unwrap().unwrap().serving, Some(listening), "the display reads what it said");
-    assert!(hold(&pool, "h2", &[], None, &[], 30).await.unwrap().taken.is_empty(), "a live claim is never taken");
+    assert!(hold(&pool, "h2", &[], None, &[]).await.unwrap().taken.is_empty(), "a claim is never taken while its holder holds it");
 
-    // h1 dies: its claim lapses, h2 takes it, and h1 coming back finds it
-    // is no longer its own.
-    sqlx::query("UPDATE signal SET held_until = 0 WHERE token = 'sse'").execute(&pool).await.unwrap();
-    assert!(signal_held(&pool, "sse").await.unwrap().unwrap().serving.is_none(), "a dead holder's word is not shown");
-    assert_eq!(tokens(&hold(&pool, "h2", &[], None, &[], 30).await.unwrap().taken), vec!["sse"]);
-    let lost = hold(&pool, "h1", &holding(&["sse"]), None, &[], 30).await.unwrap();
+    // h1 dies: its check frees the claim, h2 takes it, and h1 coming back
+    // finds it is no longer its own.
+    assert_eq!(release(&pool, "h1").await.unwrap(), 1, "the check frees what h1 held");
+    assert!(signal_held(&pool, "sse").await.unwrap().unwrap().serving.is_none(), "a freed claim's word is not shown");
+    assert_eq!(tokens(&hold(&pool, "h2", &[], None, &[]).await.unwrap().taken), vec!["sse"]);
+    let lost = hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap();
     assert!(lost.kept.is_empty() && lost.ended.is_empty(), "lost to another holder, not ended: {lost:?}");
     let fire = |held_by: Option<&str>| weft_task_store::kinds::FireSignalPayload {
         token: "sse".into(),
@@ -235,8 +238,8 @@ async fn a_claim_lives_while_renewed_and_lapses_to_another_holder(pool: PgPool) 
     assert_eq!(judge_held_fire(&pool, None, &fire(None)).await.unwrap(), HeldFire::Taken, "a fire no holder sends is not judged here");
 
     // h2 stops: the next holder takes it at once.
-    let_go(&pool, "h2").await.unwrap();
-    assert_eq!(tokens(&hold(&pool, "h3", &[], None, &[], 30).await.unwrap().taken), vec!["sse"]);
+    release(&pool, "h2").await.unwrap();
+    assert_eq!(tokens(&hold(&pool, "h3", &[], None, &[]).await.unwrap().taken), vec!["sse"]);
 }
 
 /// A row that stops holding (its kind decides otherwise now) lets its
@@ -246,11 +249,11 @@ async fn a_row_that_stops_holding_lets_its_holder_go(pool: PgPool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
-    hold(&pool, "h1", &[], None, &[], 30).await.unwrap();
-    assert!(hold(&pool, "h1", &holding(&["sse"]), None, &[], 30).await.unwrap().taken.is_empty(), "held, so not taken again");
+    hold(&pool, "h1", &[], None, &[]).await.unwrap();
+    assert!(hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap().taken.is_empty(), "held, so not taken again");
     set_holds(&pool, "sse", false).await.unwrap();
     assert!(!still_held_by(&pool, "sse", "h1").await.unwrap(), "a row served another way takes no held fire");
-    let after = hold(&pool, "h1", &holding(&["sse"]), None, &[], 30).await.unwrap();
+    let after = hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap();
     assert!(after.kept.is_empty() && after.ended.is_empty(), "the row lives on, served another way: {after:?}");
 }
 
@@ -264,11 +267,11 @@ async fn a_gone_or_wiped_row_has_ended(pool: PgPool) {
     for t in ["kept", "parked", "gone", "wiped"] {
         held_signal(&pool, t, ACTIVE, ProjectStatus::Active).await;
     }
-    hold(&pool, "h1", &[], None, &[], 30).await.unwrap();
+    hold(&pool, "h1", &[], None, &[]).await.unwrap();
     sqlx::query("DELETE FROM signal WHERE token = 'gone'").execute(&pool).await.unwrap();
     sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE trigger = 'parked'").execute(&pool).await.unwrap();
     wipe(&pool, "wiped").await;
-    let look = hold(&pool, "h1", &holding(&["kept", "parked", "gone", "wiped"]), None, &[], 30).await.unwrap();
+    let look = hold(&pool, "h1", &holding(&["kept", "parked", "gone", "wiped"]), None, &[]).await.unwrap();
     let mut kept = look.kept.clone();
     kept.sort();
     assert_eq!(kept, vec!["kept", "parked"]);
@@ -285,7 +288,96 @@ async fn a_holder_back_under_its_name_takes_its_claims_back(pool: PgPool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
-    hold(&pool, "local", &[], None, &[], 30).await.unwrap();
-    assert_eq!(tokens(&hold(&pool, "local", &[], None, &[], 30).await.unwrap().taken), vec!["sse"]);
-    assert!(hold(&pool, "other", &[], None, &[], 30).await.unwrap().taken.is_empty());
+    hold(&pool, "local", &[], None, &[]).await.unwrap();
+    assert_eq!(tokens(&hold(&pool, "local", &[], None, &[]).await.unwrap().taken), vec!["sse"]);
+    assert!(hold(&pool, "other", &[], None, &[]).await.unwrap().taken.is_empty());
+}
+
+/// A dead holder's check frees every claim it held, and each one freed is
+/// announced (`signal_held_on_release`), so the holders' pool is sized
+/// again and the other holders look.
+#[sqlx::test]
+async fn the_check_releases_a_dead_holders_rows_and_announces(pool: PgPool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    for t in ["a", "b"] {
+        held_signal(&pool, t, ACTIVE, ProjectStatus::Active).await;
+    }
+    assert_eq!(hold(&pool, "h1", &[], None, &[]).await.unwrap().taken.len(), 2);
+    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    heard.listen("weft_held_signals").await.unwrap();
+    assert_eq!(release(&pool, "h1").await.unwrap(), 2);
+    tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv()).await.expect("announced in time").unwrap();
+    assert_eq!(release(&pool, "h1").await.unwrap(), 0, "a second check frees nothing");
+}
+
+/// A row registered again under its holder (the registration lets its
+/// holder go) is taken back by that holder in the same look that finds it
+/// no longer kept, so the new registration is served at once.
+#[sqlx::test]
+async fn a_rewrite_under_a_holder_is_taken_back_in_the_same_look(pool: PgPool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
+    hold(&pool, "h1", &[], None, &[]).await.unwrap();
+    sqlx::query("UPDATE signal SET held_by = NULL, serving = NULL, generation = nextval('signal_generation_seq') WHERE token = 'sse'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let look = hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap();
+    assert!(look.kept.is_empty(), "the old registration is not kept: {look:?}");
+    assert_eq!(tokens(&look.taken), vec!["sse"], "and the new one is taken in the same look");
+}
+
+/// A signal given up on is shown with why, never taken, only for the
+/// registration it names, and a decision made again clears it.
+#[sqlx::test]
+async fn a_given_up_row_is_shown_and_never_taken(pool: PgPool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
+    let row = hold(&pool, "h1", &[], None, &[]).await.unwrap().taken.remove(0);
+    assert!(!give_up(&pool, "sse", row.generation, "why", Some("h2")).await.unwrap(), "only its holder gives a held one up");
+    assert!(!give_up(&pool, "sse", row.generation - 1, "why", Some("h1")).await.unwrap(), "an older registration is not this one");
+    assert!(give_up(&pool, "sse", row.generation, "why", Some("h1")).await.unwrap());
+    assert!(!still_held_by(&pool, "sse", "h1").await.unwrap(), "let go with it");
+    let shown = signal_held(&pool, "sse").await.unwrap().expect("still shown");
+    assert_eq!(shown.held_failed.as_deref(), Some("why"));
+    assert!(hold(&pool, "h2", &[], None, &[]).await.unwrap().taken.is_empty(), "never taken");
+    assert!(!give_up(&pool, "sse", row.generation, "again", Some("h1")).await.unwrap(), "given up once");
+    set_holds(&pool, "sse", true).await.unwrap();
+    assert!(signal_held(&pool, "sse").await.unwrap().unwrap().held_failed.is_none(), "deciding again clears it");
+    assert_eq!(tokens(&hold(&pool, "h2", &[], None, &[]).await.unwrap().taken), vec!["sse"]);
+}
+
+/// A caller with no replica (the listener) gives up a held signal only
+/// while no holder claims it.
+#[sqlx::test]
+async fn a_caller_with_no_replica_gives_up_only_an_unclaimed_held_row(pool: PgPool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    held_signal(&pool, "claimed", ACTIVE, ProjectStatus::Active).await;
+    let claimed = hold(&pool, "h1", &[], None, &[]).await.unwrap().taken.remove(0);
+    held_signal(&pool, "free", ACTIVE, ProjectStatus::Active).await;
+    let free: i64 = sqlx::query_scalar("SELECT generation FROM signal WHERE token = 'free'").fetch_one(&pool).await.unwrap();
+    assert!(!give_up(&pool, "claimed", claimed.generation, "why", None).await.unwrap(), "a claimed one is its holder's");
+    assert!(still_held_by(&pool, "claimed", "h1").await.unwrap());
+    assert!(give_up(&pool, "free", free, "why", None).await.unwrap(), "nobody claims this one");
+    assert_eq!(signal_held(&pool, "free").await.unwrap().unwrap().held_failed.as_deref(), Some("why"));
+}
+
+/// A look that says nothing new and finds nothing to take writes nothing.
+#[sqlx::test]
+async fn a_look_that_says_nothing_writes_nothing(pool: PgPool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
+    hold(&pool, "h1", &[], None, &[]).await.unwrap();
+    let version = || async {
+        sqlx::query_scalar::<_, String>("SELECT xmin::text FROM signal WHERE token = 'sse'").fetch_one(&pool).await.unwrap()
+    };
+    let before = version().await;
+    let look = hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap();
+    assert_eq!(look.kept, vec!["sse"]);
+    assert_eq!(version().await, before, "the row was not written");
 }

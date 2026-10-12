@@ -106,6 +106,13 @@ so the expired sign-in cannot be renewed
 A pasted credential that expired says so too, because there is nothing to
 refresh it with.
 
+If the provider is busy or down when weft refreshes (it answers 408, 429 or
+a 5xx, or does not answer at all), nothing is wrong with the connection, so
+it never asks you to reconnect: the step fails with the provider's own
+answer (`token endpoint answered 503 ...`, or `token endpoint unreachable:
+...`), and the refresh is tried again the next time the connection is
+opened.
+
 ## Where the secrets are
 
 Sealed with AES-256-GCM, under `CREDENTIAL_ENCRYPTION_KEY`, which is 32 bytes

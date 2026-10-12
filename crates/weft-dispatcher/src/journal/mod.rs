@@ -188,8 +188,9 @@ pub trait Journal: Send + Sync {
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<CancelWrite>;
 
-    /// Let go of `execution_id` when it is running and its owner's lease
-    /// ran out before `lapsed_before` (unix seconds): its owner is cleared
+    /// Let go of `execution_id` when it is running and its owner stopped
+    /// holding it (`weft_task_store::run_held_until_sql!`) before
+    /// `lapsed_before` (unix seconds): its owner is cleared
     /// and its epoch raised, so a late batch from the old owner is
     /// refused. A durable run is queued again, carried on from its record
     /// by the next worker that claims it; a fast run lived in its worker's
@@ -249,14 +250,6 @@ pub trait Journal: Send + Sync {
     /// apart is how they drift. `None` if the run is unknown.
     async fn execution_owner(&self, execution_id: ExecutionId) -> anyhow::Result<Option<ExecutionOwner>>;
 
-    /// Every program version the runs still on record were started
-    /// against, for one project. What a project removal (and the last
-    /// `weft clean` after it) reads to know which recorded programs are
-    /// still needed: the record outlives the project, so the programs its
-    /// runs point at have to as well, or the rows are there and
-    /// unreadable.
-    async fn definition_hashes_in_use(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>>;
-
     /// The LAST `limit` log lines of a run, oldest first: every event
     /// `LogEntry::from_event` projects (node log lines and the failures
     /// its record holds), in the order they were written
@@ -285,9 +278,6 @@ pub trait Journal: Send + Sync {
         &self,
         execution_id: ExecutionId,
     ) -> anyhow::Result<Option<ExecutionSummary>>;
-
-    /// Every run of `project_id` still on record.
-    async fn execution_ids_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<ExecutionId>>;
 
     /// The summaries of `execution_ids`, by id, in ONE read: what `weft
     /// tree` and the editor's version sidebar read a status per run started
@@ -429,34 +419,18 @@ pub trait Journal: Send + Sync {
     /// unregisters it there (`unregister_many`), the way a cancel does.
     async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// Delete all data of every run of a project, and say how many went.
-    /// Called by `weft rm`.
-    ///
-    /// Removing a project erases its history rather than orphaning it.
-    /// Keeping the runs sounded kind and was not: the project row that
-    /// named them is gone, so `weft rm` can never run again for them
-    /// and `weft clean` has no project to clean, which left rows nobody
-    /// could reach or free. What survives a removal is what the person
-    /// still has: their files on disk.
-    async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64>;
-
-    /// Every project id that still has runs while the project itself is
-    /// gone. What the reaper sweeps.
-    ///
-    /// The erase at removal is best-effort, because a project is
-    /// already gone by then and failing the answer would say the
-    /// removal did not happen when it did. Nothing else can reach those
-    /// rows afterwards (`weft rm` refuses a project it cannot find, and
-    /// `weft clean` needs a project), so without this one transient
-    /// failure would keep them for good.
-    async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
-
     /// Erase up to `limit` ended runs whose time to be kept ran out before
     /// `now` (unix seconds), oldest first, with everything of theirs (the
     /// same one list a `weft clean` erases). Answers how many, and the
     /// resume signals that went with them for the listener to let go of.
     /// A parked or queued run has no end, so it is never erased.
     async fn erase_expired(&self, now: i64, limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)>;
+
+    /// The earliest moment (unix seconds) a run [`Self::erase_expired`]
+    /// would erase runs out of its keep, `None` with none: the same runs,
+    /// so a run it must leave (a flagged one) never makes it look in a
+    /// loop.
+    async fn next_expiry(&self) -> anyhow::Result<Option<i64>>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -559,6 +533,11 @@ pub struct SignalRegistration {
     /// Whether the signal keeps a connection open between fires, as the
     /// listener's `/prepare` decided: a holder holds it.
     pub holds: bool,
+    /// Which registration the row is (the `signal.generation` column),
+    /// read back: every write of a registration moves it to a number never
+    /// used before, so the value a registration carries into a write is
+    /// never stored. The listener names a signal's wakes with it.
+    pub generation: i64,
 }
 
 /// What a [`Journal::signal_insert`] did.
@@ -1074,6 +1053,7 @@ mod log_entry_tests {
                 frames: Default::default(),
                 error: "boom".into(),
                 at_unix: 2,
+                gave_up_wait: false,
             },
             ExecEvent::NodeCancelled {
                 execution_id,
@@ -1160,6 +1140,7 @@ mod log_entry_tests {
             frames: Default::default(),
             error: "boom".into(),
             at_unix: 10,
+            gave_up_wait: false,
         };
         // Journal (drain) order: the failure first, then a's second
         // line, b's line, a's first line, and an old-style line of the

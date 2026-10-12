@@ -2069,14 +2069,13 @@ impl Capture {
         Ok(())
     }
 
-    /// Whether the body has touched (emitted or closed) any output
-    /// port yet, mirroring production's port-claims "mentioned" set
-    /// for the `await_signal` guard (a touch-then-durable-suspend
-    /// would touch again on replay).
-    fn has_mentioned_a_port(&self) -> bool {
-        !self.outputs.lock().unwrap().is_empty()
-            || !self.stream_outputs.lock().unwrap().is_empty()
-            || !self.closed_ports.lock().unwrap().is_empty()
+    /// Whether the body has yielded on or closed a stream output yet,
+    /// mirroring production's `await_signal` guard (a stream's items
+    /// went out live, so a pause after one cannot be replayed; an
+    /// ordinary port sent before a pause replays as a no-op).
+    fn has_touched_a_stream(&self) -> bool {
+        !self.stream_outputs.lock().unwrap().is_empty()
+            || self.closed_ports.lock().unwrap().iter().any(|port| self.declared[port].as_generator().is_some())
     }
 
     /// Same ARGUMENT validation production applies (a declared
@@ -2232,9 +2231,9 @@ impl ContextHandle for TestHandle {
         // Same refusals as the production handle, in production's
         // order: a green node test on a body an execution would refuse
         // is the costly divergence.
-        if self.capture.has_mentioned_a_port() {
+        if self.capture.has_touched_a_stream() {
             return Err(WeftError::NodeExecution(
-                crate::context::emitted_then_await_signal_error(NODE_UNDER_TEST_ID),
+                crate::context::streamed_then_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
         if self.has_generator_input {
@@ -3045,18 +3044,48 @@ pub struct LiveRig {
     fixtures: std::collections::BTreeMap<String, String>,
     /// Output ports the case wires downstream, as [`FakeRig::wire_output`].
     wired_outputs: Mutex<HashSet<String>>,
+    /// Created input ports the case declared, as [`FakeRig::input_type`].
+    input_types: Mutex<Vec<(String, WeftType)>>,
+    /// Output port types the case declared, as [`FakeRig::output_type`].
+    output_types: Mutex<HashMap<String, WeftType>>,
 }
 
 impl LiveRig {
     /// Composed by the runtime's test runner, never by test code.
     pub fn new(factory: LiveHandleFactory, access: Access, fixtures: std::collections::BTreeMap<String, String>) -> Self {
-        Self { factory, access, fixtures, wired_outputs: Mutex::new(HashSet::new()) }
+        Self {
+            factory,
+            access,
+            fixtures,
+            wired_outputs: Mutex::new(HashSet::new()),
+            input_types: Mutex::new(Vec::new()),
+            output_types: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Wire output `port` downstream for the runs that follow, as
     /// [`FakeRig::wire_output`] does on the fake tier.
     pub fn wire_output(&self, port: &str) {
         self.wired_outputs.lock().unwrap().insert(port.to_string());
+    }
+
+    /// Declare a created input port with its type for the runs that
+    /// follow, as [`FakeRig::input_type`] does on the fake tier: how a
+    /// live test drives a node whose inputs are ports the program
+    /// writes (`ExecPython(photo: Image)`).
+    pub fn input_type(&self, port: &str, ty: WeftType) {
+        let mut declared = self.input_types.lock().unwrap();
+        match declared.iter_mut().find(|(name, _)| name == port) {
+            Some(entry) => entry.1 = ty,
+            None => declared.push((port.to_string(), ty)),
+        }
+    }
+
+    /// Declare an output port's type for the runs that follow, as
+    /// [`FakeRig::output_type`] does on the fake tier: a created output
+    /// port, or the resolved type of a `MustOverride` one.
+    pub fn output_type(&self, port: &str, ty: WeftType) {
+        self.output_types.lock().unwrap().insert(port.to_string(), ty);
     }
 
     /// The connection marker for the test's declared service, to place
@@ -3122,6 +3151,24 @@ impl LiveRig {
             .await
     }
 
+    /// Read back the bytes of a REAL stored file a run emitted (a
+    /// stored-file value from `outcome.output(..)`), so a live test can
+    /// check what a node wrote, not only that it wrote something. The
+    /// live twin of [`FakeRig::stored_bytes`].
+    pub async fn stored_bytes(&self, file: &Value) -> WeftResult<bytes::Bytes> {
+        let key = crate::storage::StoredFile::from_value(file)?.key;
+        // A storage read emits nothing, so it declares no outputs.
+        let handle = (self.factory)(
+            HandleRole::Harness { node_type: "NodeTestStorageRead" },
+            HashMap::new(),
+            false,
+        )?;
+        let (_, stream) = handle.storage_get(&key, None).await?;
+        crate::storage::collect_stream(stream)
+            .await
+            .map_err(|e| WeftError::NodeExecution(format!("read the stored file {key}: {e}")))
+    }
+
     /// Open the test's declared-service grant through the PRODUCTION
     /// handle and hand back the [`OpenedConnection`], so a test can
     /// make its own signed provider calls (`conn.client()`) for setup
@@ -3169,9 +3216,10 @@ impl LiveRig {
     /// in a node test, so pulses are recorded, not routed).
     pub async fn run(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
         let manifest = node.manifest();
+        let custom = self.input_types.lock().unwrap().clone();
         // Keeps the run's generator feeds registered (see the fake
         // rig's `run` for why this binding must outlive the body).
-        let (bag, _feeds_alive) = match manifest_input_bag(manifest, &[], inputs) {
+        let (bag, _feeds_alive) = match manifest_input_bag(manifest, &custom, inputs) {
             Ok(pair) => pair,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
@@ -3187,7 +3235,10 @@ impl LiveRig {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
-        let outputs_by_name = declared_output_map(manifest, &config);
+        let mut outputs_by_name = declared_output_map(manifest, &config);
+        for (port, ty) in self.output_types.lock().unwrap().iter() {
+            outputs_by_name.insert(port.clone(), ty.clone());
+        }
         let inner = match (self.factory)(
             HandleRole::NodeUnderTest { node_type: &manifest.node_type },
             outputs_by_name.clone(),
@@ -3205,7 +3256,7 @@ impl LiveRig {
                 self.wired_outputs.lock().unwrap().clone(),
                 manifest.features.catch_errors,
             ),
-            declared_inputs: declared_input_map(manifest, &[]),
+            declared_inputs: declared_input_map(manifest, &custom),
         });
         let ctx = test_context(manifest, bag, None, handle.clone());
         let result = node.run(ctx).await;
@@ -3228,11 +3279,11 @@ struct CapturingHandle {
 impl ContextHandle for CapturingHandle {
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
         // Emissions are captured HERE, so the inner production
-        // handle's own emitted-then-suspend guard never sees them;
+        // handle's own streamed-then-suspend guard never sees them;
         // apply it at the capture layer where the truth lives.
-        if self.capture.has_mentioned_a_port() {
+        if self.capture.has_touched_a_stream() {
             return Err(WeftError::NodeExecution(
-                crate::context::emitted_then_await_signal_error(NODE_UNDER_TEST_ID),
+                crate::context::streamed_then_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
         self.inner.await_signal(spec).await
@@ -4283,8 +4334,9 @@ mod tests {
         );
     }
 
-    /// A body that emits then awaits is refused with the exact
-    /// production error (a durable suspension would re-emit on replay).
+    /// A body that emits on an ordinary port, waits, then emits more:
+    /// production replays the first emission as a no-op on resume, so
+    /// the rig lets it through and both values land.
     struct EmitThenAwaitNode;
     impl crate::node::NodeManifest for EmitThenAwaitNode {
         fn manifest(&self) -> &'static NodeMetadata {
@@ -4295,6 +4347,48 @@ mod tests {
     impl Node for EmitThenAwaitNode {
         async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
             ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await?;
+            let answer = ctx
+                .await_signal(crate::signal::timer::Timer {
+                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
+                })
+                .await?;
+            ctx.pulse_downstream(NodeOutput::new().set("reply", answer)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_emit_then_await_then_emit_lands_both_values() {
+        let rig = FakeRig::new();
+        rig.signal(json!({"answer": 42}));
+        let outcome = rig.run(&EmitThenAwaitNode, json!({})).await;
+        outcome.result.as_ref().expect("emit, wait, emit is allowed on ordinary ports");
+        assert_eq!(outcome.outputs["done"], json!(true));
+        assert_eq!(outcome.outputs["reply"], json!({"answer": 42}));
+    }
+
+    /// A body that yields on a stream then awaits is refused with the
+    /// exact production error: the stream's items went out live and a
+    /// replay could not tell which it already sent.
+    struct YieldThenAwaitNode;
+    impl crate::node::NodeManifest for YieldThenAwaitNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "RigStreamProducer",
+                    "label": "Rig stream producer",
+                    "description": "test-only stream producer",
+                    "inputs": [],
+                    "outputs": [{"name": "rows", "type": "Generator[Number]"}]
+                }))
+                .expect("stream producer manifest")
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for YieldThenAwaitNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            ctx.pulse_downstream(NodeOutput::new().set("rows", json!(1))).await?;
             ctx.await_signal(crate::signal::timer::Timer {
                 spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
             })
@@ -4304,17 +4398,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_emit_then_await_is_refused_like_production() {
+    async fn a_yield_then_await_is_refused_like_production() {
         let rig = FakeRig::new();
         rig.signal(json!({"answer": 42}));
         let err = rig
-            .run(&EmitThenAwaitNode, json!({}))
+            .run(&YieldThenAwaitNode, json!({}))
             .await
             .result
-            .expect_err("emit-then-durable-suspend would re-emit on replay")
+            .expect_err("a stream's items cannot be replayed")
             .to_string();
         assert!(
-            err.contains(&crate::context::emitted_then_await_signal_error(
+            err.contains(&crate::context::streamed_then_await_signal_error(
                 NODE_UNDER_TEST_ID
             )),
             "{err}"

@@ -1,14 +1,18 @@
-//! ElevenLabsTranscribe self-tests: the server-frame classifier (the
-//! node's pure decision core), plus one real realtime session. The
-//! socket session has no fake form yet, so the streaming path's free
-//! coverage is the mechanism e2es.
+//! ElevenLabsTranscribe self-tests: the server-frame classifier and the
+//! transcript it builds, with the file it stores (the node's pure
+//! decision core), the session URL with every setting under
+//! ElevenLabs's names, the audio formats a bus
+//! can declare, the refusals said before the session opens, plus one real
+//! realtime session. The socket session has no fake form yet, so the
+//! streaming path's free coverage is the mechanism e2es.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use weft::bus::{BusOptions, BusPayloadKind};
-use weft::{LiveRig, NodeTest, WeftResult};
+use weft::storage::StoredFile;
+use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
-use super::{classify_server_frame, ServerWord};
+use super::{audio_chunk, audio_format, classify_server_frame, ServerWord, Session, Transcript};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -20,27 +24,13 @@ pub fn tests() -> Vec<NodeTest> {
             assert!(matches!(word, ServerWord::Committed(t) if t == "hello there"));
             Ok(())
         }),
-        NodeTest::basic("timestamped_variants_classify_by_commitment", || {
-            // The committed one forwards; the final (still-revising
-            // family) one is ignored.
-            let committed = classify_server_frame(
-                r#"{"message_type": "committed_transcript_with_timestamps", "text": "so"}"#,
-            );
-            assert!(matches!(committed, ServerWord::Committed(t) if t == "so"));
-            let final_ts = classify_server_frame(
-                r#"{"message_type": "final_transcript_with_timestamps", "text": "so"}"#,
-            );
-            assert!(matches!(final_ts, ServerWord::Ignore));
-            Ok(())
-        }),
+        NodeTest::basic("a_timestamped_frame_carries_the_words_and_language_of_its_segment", timestamped),
+        NodeTest::basic("an_entities_frame_carries_them_under_weft_names", entities_frame),
+        NodeTest::basic("an_edited_frame_carries_the_rewrite_of_its_segment", edited_frame),
+        NodeTest::basic("a_final_frame_only_ever_reports_a_language", final_frames),
         NodeTest::basic("bookkeeping_frames_are_ignored", || {
-            for kind in [
-                "session_started",
-                "partial_transcript",
-                "final_transcript",
-                "committed_transcript_entities",
-            ] {
-                let word = classify_server_frame(&format!(r#"{{"message_type": "{kind}"}}"#));
+            for kind in ["session_started", "partial_transcript"] {
+                let word = classify_server_frame(&format!(r#"{{"message_type": "{kind}", "text": ""}}"#));
                 assert!(matches!(word, ServerWord::Ignore), "{kind} not ignored");
             }
             Ok(())
@@ -49,6 +39,11 @@ pub fn tests() -> Vec<NodeTest> {
             let word =
                 classify_server_frame(r#"{"message_type": "insufficient_audio_activity"}"#);
             assert!(matches!(word, ServerWord::NothingLeft));
+            Ok(())
+        }),
+        NodeTest::basic("a_warning_is_logged_and_the_session_goes_on", || {
+            let word = classify_server_frame(r#"{"message_type": "warning", "warning": "audio is clipping"}"#);
+            assert!(matches!(word, ServerWord::Warning(w) if w == "audio is clipping"));
             Ok(())
         }),
         NodeTest::basic("an_unparseable_body_refuses", || {
@@ -66,15 +61,271 @@ pub fn tests() -> Vec<NodeTest> {
             );
             Ok(())
         }),
+        NodeTest::basic("segments_join_and_annotations_find_their_segment_by_text", annotations),
+        NodeTest::basic("the_transcript_file_holds_what_the_session_asked_for", document),
+        NodeTest::basic("every_session_setting_rides_the_url_under_elevenlabs_names", every_setting),
+        NodeTest::basic("only_the_model_format_and_commit_ride_by_default", default_query),
+        NodeTest::basic("the_bus_metadata_picks_the_audio_format", formats),
+        NodeTest::basic("the_context_rides_the_chunk_it_is_given", chunks),
+        NodeTest::fake("settings_elevenlabs_would_refuse_are_refused_before_the_session_opens", refused),
     ]
+}
+
+fn timestamped() -> WeftResult<()> {
+    let word = classify_server_frame(
+        r#"{"message_type": "committed_transcript_with_timestamps", "text": "so", "language_code": "en",
+            "words": [{"text": "so", "start": 0.1, "end": 0.3, "type": "word", "logprob": -0.2}]}"#,
+    );
+    let ServerWord::Words { text, words, language } = word else { panic!("not read as a segment's words") };
+    assert_eq!(text, "so");
+    assert_eq!(words, vec![json!({ "text": "so", "start": 0.1, "end": 0.3, "type": "word", "logprob": -0.2 })]);
+    assert_eq!(language.as_deref(), Some("en"));
+    // Language detection alone may answer no words.
+    let word = classify_server_frame(
+        r#"{"message_type": "committed_transcript_with_timestamps", "text": "so", "words": null}"#,
+    );
+    assert!(matches!(word, ServerWord::Words { words, language: None, .. } if words.is_empty()));
+    Ok(())
+}
+
+fn entities_frame() -> WeftResult<()> {
+    let word = classify_server_frame(
+        r#"{"message_type": "committed_transcript_entities", "text": "call Jill",
+            "entities": [{"text": "Jill", "entity_type": "name", "start_char": 5, "end_char": 9}]}"#,
+    );
+    let ServerWord::Entities { text, entities } = word else { panic!("not read as entities") };
+    assert_eq!(text, "call Jill");
+    assert_eq!(entities, vec![json!({ "text": "Jill", "entityType": "name", "startChar": 5, "endChar": 9 })]);
+    let word = classify_server_frame(
+        r#"{"message_type": "committed_transcript_entities", "text": "call Jill", "entities": [{"text": "Jill"}]}"#,
+    );
+    assert!(matches!(word, ServerWord::Refused(why) if why.contains("entity_type")), "a malformed entity is loud");
+    Ok(())
+}
+
+fn edited_frame() -> WeftResult<()> {
+    let word = classify_server_frame(
+        r#"{"message_type": "edited_transcript", "text": "on the twelfth of July", "edited_text": "on 07-12"}"#,
+    );
+    assert!(matches!(word, ServerWord::Edited { text, edited } if text == "on the twelfth of July" && edited == "on 07-12"));
+    let word = classify_server_frame(r#"{"message_type": "edited_transcript", "text": "x"}"#);
+    assert!(matches!(word, ServerWord::Refused(why) if why.contains("edited_text")));
+    Ok(())
+}
+
+fn final_frames() -> WeftResult<()> {
+    for kind in ["final_transcript", "final_transcript_with_timestamps"] {
+        let word = classify_server_frame(&format!(r#"{{"message_type": "{kind}", "text": "so", "language_code": "fr"}}"#));
+        assert!(matches!(word, ServerWord::Language(l) if l == "fr"), "{kind} reports its language");
+        let word = classify_server_frame(&format!(r#"{{"message_type": "{kind}", "text": "so"}}"#));
+        assert!(matches!(word, ServerWord::Ignore), "{kind} never adds a segment twice");
+    }
+    Ok(())
+}
+
+fn annotations() -> WeftResult<()> {
+    let mut t = Transcript::default();
+    assert!(t.commit("yes"));
+    assert!(!t.commit(""), "an empty segment adds nothing");
+    assert!(t.commit("call Jill"));
+    assert!(t.commit("yes"));
+    assert_eq!(t.full_text(), "yes call Jill yes");
+
+    // Entities land positioned in the full transcript.
+    let jill = json!({ "text": "Jill", "entityType": "name", "startChar": 5, "endChar": 9 });
+    assert!(t.add_entities("call Jill", &[jill]));
+    assert_eq!(t.entities, vec![json!({ "text": "Jill", "entityType": "name", "startChar": 9, "endChar": 13 })]);
+    assert_eq!(&t.full_text()[9..13], "Jill");
+    assert!(!t.add_entities("call Jill", &[]), "a segment takes its entities once");
+    assert!(!t.add_entities("never said", &[]));
+
+    // Rewrites arrive out of order and find the earliest segment with
+    // their text still waiting for one.
+    assert!(t.add_edit("yes", "Yes."));
+    assert!(t.add_edit("yes", "Yes!"));
+    assert!(!t.add_edit("yes", "Yes?"), "two segments, two rewrites");
+    assert_eq!(t.edited_text(), "Yes. call Jill Yes!", "the unedited segment stays as spoken");
+    assert_eq!(t.unedited(), 1);
+    Ok(())
+}
+
+fn document() -> WeftResult<()> {
+    let mut t = Transcript::default();
+    assert!(t.commit("call Jill"));
+    assert!(t.commit("on the twelfth"));
+    assert_eq!(t.document(&session()), json!({ "text": "call Jill on the twelfth" }), "the text alone by default");
+
+    let jill = json!({ "text": "Jill", "entityType": "name", "startChar": 5, "endChar": 9 });
+    assert!(t.add_entities("call Jill", &[jill.clone()]));
+    let entities = Session { entity_detection: vec!["pii".into()], ..session() };
+    assert_eq!(t.document(&entities), json!({ "text": "call Jill on the twelfth", "entities": [jill] }));
+
+    assert!(t.add_edit("on the twelfth", "on the 12th"));
+    let rewrites = Session { transcript_edit: Some("Write dates as numbers.".into()), ..session() };
+    assert_eq!(
+        t.document(&rewrites),
+        json!({ "text": "call Jill on the twelfth", "editedText": "call Jill on the 12th" }),
+        "the text as spoken, and the rewrite with the segment that got none kept as spoken"
+    );
+    Ok(())
+}
+
+/// The node's defaults, as a run with nothing set reads them.
+fn session() -> Session {
+    Session {
+        model: "scribe_v2_realtime".into(),
+        commit_strategy: "vad".into(),
+        language: None,
+        secondary_languages: Vec::new(),
+        vad_silence_threshold_secs: None,
+        vad_threshold: None,
+        min_speech_duration_ms: None,
+        min_silence_duration_ms: None,
+        include_timestamps: false,
+        include_language_detection: false,
+        keyterms: Vec::new(),
+        no_verbatim: false,
+        entity_detection: Vec::new(),
+        transcript_edit: None,
+        filter_background_audio: false,
+        enable_logging: true,
+        previous_text: None,
+    }
+}
+
+fn default_query() -> WeftResult<()> {
+    assert_eq!(
+        session().query("pcm_16000"),
+        "model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=vad"
+    );
+    assert!(session().refusal().is_none());
+    Ok(())
+}
+
+fn every_setting() -> WeftResult<()> {
+    let s = Session {
+        commit_strategy: "turn_prediction".into(),
+        language: Some("en".into()),
+        secondary_languages: vec!["fr".into(), "de".into()],
+        vad_silence_threshold_secs: Some(0.8),
+        vad_threshold: Some(0.35),
+        min_speech_duration_ms: Some(120),
+        min_silence_duration_ms: Some(300),
+        include_timestamps: true,
+        include_language_detection: true,
+        keyterms: vec!["Weavemind".into(), "weft node".into()],
+        no_verbatim: true,
+        entity_detection: vec!["pii".into(), "email_address".into()],
+        enable_logging: false,
+        ..session()
+    };
+    assert!(s.refusal().is_none(), "{:?}", s.refusal());
+    assert_eq!(
+        s.query("ulaw_8000"),
+        "model_id=scribe_v2_realtime&audio_format=ulaw_8000&commit_strategy=turn_prediction&language_code=en\
+         &secondary_languages=fr&secondary_languages=de&vad_silence_threshold_secs=0.8&vad_threshold=0.35\
+         &min_speech_duration_ms=120&min_silence_duration_ms=300&include_timestamps=true\
+         &include_language_detection=true&no_verbatim=true&keyterms=Weavemind&keyterms=weft%20node\
+         &entity_detection=pii&entity_detection=email_address&enable_logging=false"
+    );
+    let rewrite = Session {
+        transcript_edit: Some("Write dates as YYYY-MM-DD & times as HH:MM".into()),
+        filter_background_audio: true,
+        ..session()
+    };
+    assert!(rewrite.refusal().is_none());
+    assert!(
+        rewrite.query("pcm_16000").ends_with(
+            "&filter_background_audio=true&transcript_edit=Write%20dates%20as%20YYYY-MM-DD%20%26%20times%20as%20HH%3AMM"
+        ),
+        "{}",
+        rewrite.query("pcm_16000")
+    );
+    Ok(())
+}
+
+fn formats() -> WeftResult<()> {
+    for rate in [8_000, 16_000, 22_050, 24_000, 44_100, 48_000] {
+        let (format, chunk_rate) = audio_format(&json!({ "sample_rate": rate, "encoding": "pcm_s16le" }))?;
+        assert_eq!((format, chunk_rate), (format!("pcm_{rate}"), rate));
+    }
+    assert_eq!(audio_format(&json!({ "sample_rate": 8000, "encoding": "ulaw" }))?, ("ulaw_8000".to_string(), 8000));
+    for (meta, says) in [
+        (json!({ "sample_rate": 11025, "encoding": "pcm_s16le" }), "11025 Hz"),
+        (json!({ "sample_rate": 16000, "encoding": "ulaw" }), "μ-law at 8000 Hz only"),
+        (json!({ "sample_rate": 16000, "encoding": "f32le" }), "\"f32le\""),
+        (json!({ "sample_rate": 16000 }), "no encoding"),
+        (json!({ "encoding": "pcm_s16le" }), "no sample_rate"),
+    ] {
+        let err = audio_format(&meta).expect_err("a format the endpoint does not take").to_string();
+        assert!(err.contains(says), "{meta}: {err}");
+    }
+    Ok(())
+}
+
+fn chunks() -> WeftResult<()> {
+    let first: Value = serde_json::from_str(&audio_chunk(b"\x01\x02", 16_000, Some("Agent: how can I help?"), false))
+        .expect("a chunk is JSON");
+    assert_eq!(
+        first,
+        json!({
+            "message_type": "input_audio_chunk",
+            "audio_base_64": "AQI=",
+            "commit": false,
+            "sample_rate": 16000,
+            "previous_text": "Agent: how can I help?",
+        })
+    );
+    let flush: Value = serde_json::from_str(&audio_chunk(&[], 8_000, None, true)).expect("a chunk is JSON");
+    assert_eq!(
+        flush,
+        json!({ "message_type": "input_audio_chunk", "audio_base_64": "", "commit": true, "sample_rate": 8000 })
+    );
+    Ok(())
+}
+
+/// A 16 kHz PCM bus with one frame, already closed: what the node reads
+/// its format from before it would open the session.
+fn audio_bus(rig: &FakeRig) -> WeftResult<Value> {
+    let (mut audio, marker) = rig.seed_bus(BusOptions {
+        payload: BusPayloadKind::Bytes,
+        meta: json!({ "sample_rate": 16_000, "encoding": "pcm_s16le" }),
+        ..BusOptions::default()
+    })?;
+    audio.register("mic").expect("a fresh bus accepts its first name");
+    audio.send_bytes("audio", vec![0u8; 320]).expect("an open bytes bus accepts a frame");
+    audio.close();
+    Ok(marker)
+}
+
+async fn refused(rig: FakeRig) -> WeftResult<()> {
+    for (extra, says) in [
+        (json!({ "commitStrategy": "manual", "vadThreshold": 0.5 }), "`commitStrategy` manual"),
+        (json!({ "commitStrategy": "manual", "minSilenceDurationMs": 200 }), "`commitStrategy` manual"),
+        (json!({ "filterBackgroundAudio": true, "includeTimestamps": true }), "does not combine `filterBackgroundAudio`"),
+        (json!({ "transcriptEdit": "Spell numbers out.", "entityDetection": ["pii"] }), "both `transcriptEdit` and `entityDetection`"),
+        (json!({ "transcriptEdit": "x".repeat(2001) }), "2001 characters"),
+        (json!({ "keyterms": vec!["term"; 51] }), "at most 50"),
+        (json!({ "keyterms": ["a".repeat(21)] }), "at most 20"),
+    ] {
+        let mut given = json!({ "account": rig.access("elevenlabs"), "audio": audio_bus(&rig)? });
+        for (k, v) in extra.as_object().expect("extra inputs are an object") {
+            given[k] = v.clone();
+        }
+        let err = rig.run(&super::ElevenLabsTranscribeNode, given).await.failure()?;
+        assert!(err.starts_with("input error"), "a mistake in the program is an input error: {extra}: {err}");
+        assert!(err.contains(says), "{extra}: {err}");
+    }
+    assert!(rig.requests().is_empty(), "no session opens, so nothing is paid for");
+    Ok(())
 }
 
 /// One real realtime session: two seconds of a generated 440 Hz tone
 /// on a live audio bus, transcribed for real. A tone carries no
 /// speech, so the assertion is the protocol round-trip itself (the
-/// session opens, drains the audio, and answers a String transcript),
-/// not any particular words; the audio never lands anywhere, so there
-/// is nothing to clean up.
+/// session opens, drains the audio, and the transcript lands as a JSON
+/// file), not any particular words; the audio never lands on the
+/// account, so there is nothing to clean up.
 async fn live_session(rig: LiveRig) -> WeftResult<()> {
     const RATE: usize = 16_000;
     let (mut audio, marker) = rig.bus(BusOptions {
@@ -106,9 +357,8 @@ async fn live_session(rig: LiveRig) -> WeftResult<()> {
         )
         .await
         .ok()?;
-    assert!(
-        outcome.output("text")?.is_string(),
-        "the session ends in a String transcript (a tone may transcribe to nothing)"
-    );
+    // A tone may transcribe to nothing, so the file's size says nothing.
+    let file = StoredFile::from_value(outcome.output("transcript")?)?;
+    assert_eq!((file.filename.as_str(), file.mime_type.as_str()), ("transcript.json", "application/json"));
     Ok(())
 }

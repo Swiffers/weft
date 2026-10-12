@@ -162,6 +162,7 @@ mod tests {
                 auth_config: Value::Null,
             },
             serving: Default::default(),
+            gave_up: None,
         };
         let out = handler().process_entry(&sig, Value::Null);
         assert!(matches!(out.target, ProcessTarget::Drop { .. }));

@@ -641,6 +641,12 @@ pub struct ResolvedEventSource {
     /// multi-install socket filters its frames by.
     #[serde(default)]
     pub provider_account: Option<String>,
+    /// When the credential in `auth`/`values` stops being good (unix
+    /// seconds, a refresh margin before its token expires), for a side
+    /// that keeps it between uses: it resolves again before then. `None`
+    /// for a credential that does not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
 }
 
 impl EventsSpec {

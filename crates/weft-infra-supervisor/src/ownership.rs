@@ -52,41 +52,75 @@ impl OwnershipChange {
     }
 }
 
-/// What one ownership tick found.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Synced {
-    /// What the tick changed for this supervisor, if anything.
-    pub change: Option<OwnershipChange>,
-    /// Whether it has something to look at now: a project it owns gives
-    /// it work, or the host listing or the gone-copy sweep left some.
-    pub owns_work: bool,
-    /// When the soonest lease it does not hold, over a project with
-    /// something to do, lapses (see `SupervisorSyncOwnershipResponse`).
-    pub others_lapse_in: Option<std::time::Duration>,
+/// What one supervisor process knows of its ownership between syncs.
+#[derive(Debug, Clone, Default)]
+pub struct Ownership {
+    /// What it owned after its last sync.
+    owned: HashSet<Uuid>,
+    /// The projects its host held at its latest listing that went
+    /// through, less the ones its sweep since deleted every copy of
+    /// ([`Ownership::emptied`]), `None` while none did. Every sync carries
+    /// them, the ones that do not list the host included, so a project
+    /// ownable only through its copies on the host stays ownable for the
+    /// whole of a pass: its lease is renewed while the pass sweeps it, and
+    /// its failed sweep's retry is booked as the pass ends. A removed
+    /// project's failure the broker wrote down is cleared at the first sync
+    /// that no longer carries it. A pass whose listing failed carries
+    /// `None`, which keeps such a project's retry booked.
+    held_projects: Option<Vec<Uuid>>,
 }
 
 /// Tick for as long as the process lives, handing every change to each work
 /// loop in `changes` (lifecycle and health).
 pub async fn run_loop(state: SupervisorState, changes: Vec<UnboundedSender<OwnershipChange>>) -> Result<()> {
-    follow(state, HashSet::new(), changes, true).await
+    follow(state, Ownership::default(), changes, false).await
 }
 
-/// Renew what a pass of a supervisor that scales to zero owns (`owned`,
-/// what its first tick found) for as long as the pass runs, ticking at the
-/// loop's interval and handing every change to `changes`. The pass drops
-/// it when its commands are done.
-pub async fn keep_renewing(state: SupervisorState, owned: HashSet<Uuid>, changes: Vec<UnboundedSender<OwnershipChange>>) -> Result<()> {
-    follow(state, owned, changes, false).await
+/// Renew what a pass of a supervisor that scales to zero owns
+/// (`ownership`, what its first tick found) for as long as the pass runs,
+/// at the loop's interval, handing every change to `changes`. It only
+/// renews and claims: the pass listed and swept the host once as it
+/// started. The pass drops it when its commands are done.
+pub async fn keep_renewing(state: SupervisorState, ownership: Ownership, changes: Vec<UnboundedSender<OwnershipChange>>) -> Result<()> {
+    follow(state, ownership, changes, true).await
 }
 
 /// Tick, and again at every interval (or when a work loop asks), from
-/// `owned`; the first tick at once when `tick_first`.
-async fn follow(state: SupervisorState, mut owned: HashSet<Uuid>, changes: Vec<UnboundedSender<OwnershipChange>>, tick_first: bool) -> Result<()> {
-    if !tick_first {
+/// `ownership`. In a pass (`in_pass`) the first tick waits for the
+/// interval and each one only renews and claims. Otherwise each tick also
+/// lists the host and sweeps its gone copies in a task of their own, so a
+/// sweep deleting disks for minutes never holds up the renewal; a tick
+/// that finds the last sweep still running sweeps nothing.
+async fn follow(state: SupervisorState, mut ownership: Ownership, changes: Vec<UnboundedSender<OwnershipChange>>, in_pass: bool) -> Result<()> {
+    if in_pass {
         wait_for_next_tick(&state).await;
     }
+    let mut sweeping: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        match tick(&state, &mut owned).await.map(|synced| synced.change) {
+        let ticked = match in_pass {
+            true => renew(&state, &mut ownership, Syncing::MidPass).await,
+            false => claim(&state, &mut ownership).await.map(|(change, held)| {
+                while sweeping.try_join_next().is_some() {}
+                match (held, sweeping.is_empty()) {
+                    (Ok(copies), true) => {
+                        let state = state.clone();
+                        // The next tick lists the host again, which shows
+                        // what this sweep deleted.
+                        sweeping.spawn(async move {
+                            sweep_gone_copies(&state, copies).await;
+                        });
+                    }
+                    (Ok(_), false) => tracing::debug!("the last sweep of gone copies still runs; this tick sweeps nothing"),
+                    // Every tick lists again, so nothing is written down.
+                    (Err(e), _) => tracing::error!(
+                        error = %format!("{e:#}"),
+                        "listing what the host holds failed; its gone copies are swept at the next tick"
+                    ),
+                }
+                change
+            }),
+        };
+        match ticked {
             Ok(Some(change)) => {
                 for loop_changes in &changes {
                     loop_changes
@@ -109,48 +143,123 @@ async fn wait_for_next_tick(state: &SupervisorState) {
     }
 }
 
-/// One ownership tick: list what the host holds, renew + claim (the
-/// held projects included), sweep the gone copies under the leases just
-/// renewed, update `owned` (what this supervisor owned after the previous
-/// tick) and hand back what changed, if anything, and when there is next
-/// something to look at. Exposed so integration tests can step it one
-/// tick at a time.
-pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<Synced> {
+/// One ownership tick, the sweep left to the caller: list what the host
+/// holds, renew + claim (the held projects included), update `ownership`
+/// (what this supervisor owned after the previous tick, and its host's
+/// latest listing), and hand back what changed, if anything, with the
+/// host's listing or why it failed, whose gone copies the caller sweeps
+/// ([`sweep_gone_copies`]) under the leases just renewed, while it keeps
+/// renewing them; a failed listing is the caller's to report. The sync
+/// also reports what this supervisor's looks came to since the last one
+/// (looked at, settled, failed, given up), and the broker books the next
+/// pass of a supervisor that scales to zero.
+pub(crate) async fn claim(state: &SupervisorState, ownership: &mut Ownership) -> Result<(Option<OwnershipChange>, Result<Vec<NodeRef>>)> {
     // A failed listing skips this tick's sweep but never the renewal:
-    // losing every lease over a host hiccup would hand the projects over.
-    let held = match state.host.copies().await {
-        Ok(copies) => Some(copies),
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "listing what the host holds failed; the next tick sweeps");
-            None
-        }
-    };
-    let mut held_projects: Vec<Uuid> = held.iter().flatten().map(|c| c.project).collect();
-    held_projects.sort_unstable();
-    held_projects.dedup();
-    let synced = state.broker.sync_ownership(&state.replica, &held_projects).await?;
+    // losing every lease over a host hiccup would hand the projects over,
+    // so the sync carries the latest listing that went through.
+    let held = state.host.copies().await;
+    if let Ok(copies) = &held {
+        let mut held_projects: Vec<Uuid> = copies.iter().map(|c| c.project).collect();
+        held_projects.sort_unstable();
+        held_projects.dedup();
+        ownership.held_projects = Some(held_projects);
+    }
+    let change = renew(state, ownership, Syncing::Claim).await?;
+    Ok((change, held))
+}
+
+/// Renew + claim (the host's latest listing included), update
+/// `ownership` and hand back what changed, if anything.
+async fn renew(state: &SupervisorState, ownership: &mut Ownership, syncing: Syncing) -> Result<Option<OwnershipChange>> {
+    let synced = sync(state, ownership.held_projects.as_deref(), syncing).await?;
     tracing::debug!(
         replica = %state.replica,
         owned = synced.owned.len(),
         claimed = synced.claimed.len(),
+        next_due_unix = ?synced.next_due_unix,
         "ownership synced (renewed + claimed a batch)"
     );
-    // A listing that failed, or a sweep that left gone copies behind,
-    // is looked at again soon: what it leaves may be billed.
-    let sweep_left = match held {
-        Some(copies) => sweep_gone_copies(state, copies).await,
-        None => true,
-    };
     let now: HashSet<Uuid> = synced.owned.iter().map(|p| p.project_id).collect();
-    let mut lost: Vec<Uuid> = owned.difference(&now).copied().collect();
+    let mut lost: Vec<Uuid> = ownership.owned.difference(&now).copied().collect();
     lost.sort_unstable();
-    *owned = now;
+    ownership.owned = now;
     let change = OwnershipChange { claimed: synced.claimed, lost };
-    Ok(Synced {
-        change: (!change.is_empty()).then_some(change),
-        owns_work: synced.owns_work || sweep_left,
-        others_lapse_in: synced.others_lapse_in_secs.map(|s| std::time::Duration::from_secs(u64::try_from(s).unwrap_or(0))),
-    })
+    Ok((!change.is_empty()).then_some(change))
+}
+
+/// End a pass of a supervisor that scales to zero: report what the pass
+/// looked at, settled and could not get through, and give every lease
+/// back, so a machine's next word about a project is looked at by
+/// whichever process it wakes. `held_projects` is the host's listing the
+/// pass started from ([`Ownership`]), `None` when it failed.
+pub async fn end(state: &SupervisorState, held_projects: Option<&[Uuid]>) -> Result<crate::Pass> {
+    let synced = sync(state, held_projects, Syncing::End).await?;
+    Ok(crate::Pass { settled: synced.settled })
+}
+
+impl Ownership {
+    /// The projects the host held at the latest listing that went
+    /// through, `None` while none did.
+    pub fn held_projects(&self) -> Option<&[Uuid]> {
+        self.held_projects.as_deref()
+    }
+
+    /// This process deleted every copy the listing held of `emptied`
+    /// ([`sweep_gone_copies`]): the host holds none of them any more.
+    pub fn emptied(&mut self, emptied: &[Uuid]) {
+        if let Some(held) = &mut self.held_projects {
+            held.retain(|p| !emptied.contains(p));
+        }
+    }
+}
+
+/// Which of a supervisor's syncs this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Syncing {
+    /// A tick that lists the host and claims: it reports what the looks
+    /// came to.
+    Claim,
+    /// A renewal in the middle of a pass: it reports nothing, and the
+    /// pass's end reports what the pass met.
+    MidPass,
+    /// A pass ending: it reports, and gives every lease back.
+    End,
+}
+
+/// What one sync reported settled, and what the broker answered.
+struct Synced {
+    settled: Vec<Uuid>,
+    owned: Vec<weft_broker_client::protocol::SupervisorProject>,
+    claimed: Vec<Uuid>,
+    next_due_unix: Option<i64>,
+}
+
+/// One `sync_ownership`, carrying what this process's looks came to since
+/// the last one (handed back if the sync fails, so the next one reports
+/// it).
+async fn sync(state: &SupervisorState, held_projects: Option<&[Uuid]>, syncing: Syncing) -> Result<Synced> {
+    let report = match syncing {
+        Syncing::MidPass => crate::health::Report::default(),
+        Syncing::Claim | Syncing::End => state.health.lock().await.take_report(),
+    };
+    let ending = syncing == Syncing::End;
+    let req = weft_broker_client::protocol::SupervisorSyncOwnershipRequest {
+        replica: state.replica.clone(),
+        held_projects: held_projects.map(<[Uuid]>::to_vec),
+        looked: report.looked.clone(),
+        settled: report.settled.clone(),
+        failed: report.failed(),
+        gave_up: report.gave_up(),
+        all_failed: report.all_failed(),
+        ending,
+    };
+    match crate::patiently(state, || state.broker.sync_ownership(&req)).await {
+        Ok(resp) => Ok(Synced { settled: report.settled, owned: resp.owned, claimed: resp.claimed, next_due_unix: resp.next_due_unix }),
+        Err(e) => {
+            state.health.lock().await.report_again(report);
+            Err(e)
+        }
+    }
 }
 
 /// Delete everything the host holds (`copies`, its listing) for a copy
@@ -191,46 +300,56 @@ pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<
 /// until it is registered again, which the per-copy check right before
 /// each deletion also catches, down to the same window.
 ///
-/// One project or copy failing is logged and the rest still go.
-/// Idempotent: a copy another supervisor deleted first is simply gone
-/// from the next listing.
-pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) -> bool {
+/// One project or copy failing does not stop the rest; a project whose
+/// sweep failed is reported failed (`crate::failed`), and a later pass
+/// sweeps it again. A removed project has no lease to fail under: the
+/// broker counts its failure as the install's (`Callee::GoneCopies`),
+/// clears it once a listing holds none of the project, and books its
+/// retry like a project's. Idempotent: a copy another supervisor deleted
+/// first is simply gone from the next listing.
+///
+/// Hands back the projects whose every listed copy it deleted: the host
+/// holds none of them any more, which the pass's last sync says
+/// ([`Ownership::emptied`]).
+pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) -> Vec<Uuid> {
     let mut by_project: BTreeMap<Uuid, Vec<NodeRef>> = BTreeMap::new();
     for copy in copies {
         by_project.entry(copy.project).or_default().push(copy);
     }
-    let mut left = false;
+    let mut emptied = Vec::new();
     for (project, copies) in by_project {
         let Some(_project) = state.project_locks.try_alone(project) else {
             tracing::debug!(project_id = %project, "a lifecycle command holds the project; its gone copies wait for the next tick");
-            left = true;
             continue;
         };
         match sweep_project(state, project, &copies).await {
-            Ok(project_left) => left |= project_left,
+            Ok(true) => emptied.push(project),
+            Ok(false) => {}
             Err(e) => {
-                tracing::warn!(project_id = %project, error = %format!("{e:#}"), "sweeping the project's gone copies failed; the next tick tries again");
-                left = true;
+                crate::failed(state, project, crate::health::Step::Sweep, &format!("could not delete what the host still holds for its gone copies: {e:#}"))
+                    .await;
             }
         }
     }
-    left
+    emptied
 }
 
 /// One project's sweep, under its lock: judge its copies, then delete
-/// each gone one after judging it again (the lease fence). Answers
-/// whether it left a gone copy standing (a delete that failed).
+/// each gone one after judging it again (the lease fence). Every gone
+/// copy is tried; the ones that could not be deleted fail it. True when
+/// it deleted every copy in `copies`.
 async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef]) -> Result<bool> {
-    let Some(gone) = state.broker.gone_copies(&state.replica, project, copies).await? else {
+    let Some(gone) = crate::patiently(state, || state.broker.gone_copies(&state.replica, project, copies)).await? else {
         tracing::debug!(project_id = %project, "another supervisor holds the project's lease; its copies are its to sweep");
         return Ok(false);
     };
-    let mut left = false;
+    let mut failed = Vec::new();
+    let mut deleted = 0;
     for copy in copies.iter().filter(|c| gone.contains(&c.copy_id)) {
-        match state.broker.gone_copies(&state.replica, project, std::slice::from_ref(copy)).await? {
+        match crate::patiently(state, || state.broker.gone_copies(&state.replica, project, std::slice::from_ref(copy))).await? {
             None => {
                 tracing::info!(project_id = %project, "the project's lease moved mid-sweep; leaving its copies to the new owner");
-                return Ok(left);
+                break;
             }
             Some(still) if still.is_empty() => continue,
             Some(_) => {}
@@ -241,16 +360,13 @@ async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef
             copy_id = %copy.copy_id,
             "the copy is gone for good; deleting what the host still holds for it, kept disks included"
         );
-        if let Err(e) = state.host.terminate(copy, &[]).await {
-            tracing::warn!(
-                project_id = %copy.project,
-                node = %copy.node,
-                copy_id = %copy.copy_id,
-                error = %format!("{e:#}"),
-                "deleting a gone copy failed; the next tick tries again"
-            );
-            left = true;
+        match state.host.terminate(copy, &[]).await {
+            Ok(()) => deleted += 1,
+            Err(e) => failed.push(format!("{}: {e:#}", copy.copy_id)),
         }
     }
-    Ok(left)
+    match failed.is_empty() {
+        true => Ok(deleted == copies.len()),
+        false => Err(anyhow!("{}", failed.join("; "))),
+    }
 }

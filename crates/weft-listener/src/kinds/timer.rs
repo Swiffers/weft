@@ -17,7 +17,7 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woken};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woke, Woken};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct TimerHandler;
@@ -136,18 +136,19 @@ impl KindHandler for TimerHandler {
     ///
     /// A wake aimed at an earlier moment than the row names (one already
     /// served) does nothing; its next wake is the one the row names.
-    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Value>> {
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Woke>> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
-            .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
-        let Some(due) = next_of(&woken.state) else { return Ok(Some(woken.state)) };
+            .map_err(|e| super::for_good(anyhow::anyhow!("malformed timer spec: {e}")))?;
+        let unchanged = Woke { state: woken.state.clone(), seq: Some(woken.seq) };
+        let Some(due) = next_of(&woken.state) else { return Ok(Some(unchanged)) };
         if due > woken.now_ms.max(woken.aimed_at_ms) {
-            return Ok(Some(woken.state));
+            return Ok(Some(unchanged));
         }
         // A cron's next is its next occurrence after both the moment it
         // just served and now, so a wake that came late does not fire
         // every occurrence it slept through. A one-shot has no next.
         let next = match &timer.spec {
-            TimerSpec::Cron { .. } => next_cron_after(&timer.spec, due.max(woken.now_ms))?,
+            TimerSpec::Cron { .. } => next_cron_after(&timer.spec, due.max(woken.now_ms)).map_err(super::for_good)?,
             TimerSpec::After { .. } | TimerSpec::At { .. } => None,
         };
         let after = state_at(next);
@@ -155,7 +156,7 @@ impl KindHandler for TimerHandler {
         // actually woke. They differ when the wake is late (the whole
         // point of exposing both, per the cron node's metadata).
         let scheduled = DateTime::from_timestamp_millis(due)
-            .ok_or_else(|| anyhow::anyhow!("timer moment {due} is outside the calendar"))?;
+            .ok_or_else(|| super::for_good(anyhow::anyhow!("timer moment {due} is outside the calendar")))?;
         let payload = serde_json::json!({
             "scheduledTime": scheduled.to_rfc3339(),
             "actualTime": Utc::now().to_rfc3339(),
@@ -165,7 +166,7 @@ impl KindHandler for TimerHandler {
             FireOutcome::Fired | FireOutcome::Filtered => {}
             // The row was read a moment ago, so the broker not knowing the
             // token means the signal went in between: nothing to fire.
-            FireOutcome::UnknownSignal | FireOutcome::NotHeld => return Ok(Some(woken.state)),
+            FireOutcome::UnknownSignal | FireOutcome::NotHeld => return Ok(Some(unchanged)),
             FireOutcome::EnqueueFailed => anyhow::bail!(
                 "the tick for {scheduled} could not be enqueued (see the warning before this line); \
                  the alarm delivers this wake again"
@@ -174,7 +175,7 @@ impl KindHandler for TimerHandler {
         // Losing the claim means another copy claimed this moment; its
         // tick and ours share one key, and it set the next wake.
         let claimed = ctx.fire.claim_kind_state(after.clone(), woken.seq).await?;
-        Ok(claimed.then_some(after))
+        Ok(claimed.then_some(Woke { state: after, seq: Some(woken.seq + 1) }))
     }
 
     fn process_entry(

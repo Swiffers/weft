@@ -56,6 +56,18 @@ pub struct InstallConfig {
     /// commit is warned against. Absent on a local install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<weft_core::install::WeftSource>,
+    /// How many minutes weft's own work may keep failing while weft
+    /// still retries it before it counts as stuck: an install that alerts
+    /// ([`Self::alert_after`]) alerts then.
+    #[serde(default = "default_alert_after_minutes", rename = "alertAfterMinutes")]
+    pub alert_after_minutes: u32,
+}
+
+/// [`InstallConfig::alert_after_minutes`] when the config leaves it out.
+pub const DEFAULT_ALERT_AFTER_MINUTES: u32 = 5;
+
+fn default_alert_after_minutes() -> u32 {
+    DEFAULT_ALERT_AFTER_MINUTES
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,12 +156,32 @@ pub struct GcpPlatform {
     /// The service account Cloud Build runs a project's build as.
     #[serde(rename = "builderServiceAccount")]
     pub builder_service_account: String,
-    /// The Cloud Tasks queue wakes go through.
+    /// The Cloud Tasks queue what keeps a user's triggers going goes
+    /// through (their timers, crons, polls and provider renewals, and a
+    /// holder's liveness check), retried with no time limit unless the
+    /// install sets one (`crate::alarm::WakeQueue::Triggers`).
     #[serde(rename = "tasksQueue")]
     pub tasks_queue: String,
+    /// How many deliveries of one trigger's wake in `tasks_queue` the
+    /// listener answers while it keeps failing (`crate::alarm::Delivery`;
+    /// one that never reached it is not counted): a failure on the last
+    /// gives up on the trigger the wake was for, shown on its node, until
+    /// it is registered again. The listener's alone: the holder's liveness
+    /// check is retried for as long as the queue retries it.
+    #[serde(rename = "wakeAttempts")]
+    pub wake_attempts: u32,
+    /// The Cloud Tasks queue weft's own wakes go through (a role's loop
+    /// coming due, a ring that failed), retried briefly
+    /// (`crate::alarm::WakeQueue::Internal`).
+    #[serde(rename = "ticksQueue")]
+    pub ticks_queue: String,
     /// The Pub/Sub topic news goes through (`crate::news`).
     #[serde(rename = "newsTopic")]
     pub news_topic: String,
+    /// The Pub/Sub topic the holders hear on: the set of held signals
+    /// changed, or a connection's access did.
+    #[serde(rename = "holdersTopic")]
+    pub holders_topic: String,
     /// The service account weft's own roles run as.
     #[serde(rename = "coreServiceAccount")]
     pub core_service_account: String,
@@ -187,6 +219,10 @@ pub struct GcpPlatform {
     /// version of a program, never per worker started.
     #[serde(default, rename = "buildMachine", skip_serializing_if = "Option::is_none")]
     pub build_machine: Option<String>,
+    /// Whether weft logs its stuck failures as alerts
+    /// ([`InstallConfig::alert_after`]), which the install's alert policy
+    /// emails; off when the install made no policy.
+    pub alerts: bool,
 }
 
 /// How the install authenticates its management API.
@@ -409,6 +445,26 @@ impl InstallConfig {
         WorkerSettings::default().with(&self.workers)
     }
 
+    /// How long a failure weft still retries is current before it counts
+    /// as stuck ([`Self::alert_after_minutes`]), at this install's pace
+    /// (`weft_core::time_scale`): the one reading of the setting, for what
+    /// `weft status` is shown and for when the install alerts.
+    pub fn alert_delay(&self) -> std::time::Duration {
+        weft_core::time_scale::scaled(std::time::Duration::from_secs(u64::from(self.alert_after_minutes) * 60))
+    }
+
+    /// When this install alerts on its stuck failures, how long one weft
+    /// still retries is current before it counts as stuck
+    /// ([`Self::alert_delay`]); `None` when it does not alert: a local
+    /// install shows them in `weft status` only, and a cloud install only
+    /// alerts where its config says so.
+    pub fn alert_after(&self) -> Option<std::time::Duration> {
+        match &self.platform {
+            PlatformConfig::Gcp(gcp) if gcp.alerts => Some(self.alert_delay()),
+            PlatformConfig::Gcp(_) | PlatformConfig::Local(_) => None,
+        }
+    }
+
     /// Refuse a config no install could run, naming the setting.
     pub fn validate(&self) -> Result<(), String> {
         self.worker_settings().validate()?;
@@ -449,7 +505,10 @@ impl InstallConfig {
                     return Err("a local install runs every role in its one process; remove the other placements".into());
                 }
             }
-            PlatformConfig::Gcp(_) => {
+            PlatformConfig::Gcp(gcp) => {
+                if gcp.wake_attempts == 0 {
+                    return Err("platform.wakeAttempts is 0: no wake could be delivered even once; set it to 1 or more".into());
+                }
                 // `local` trusts every caller as the one local tenant, and a
                 // GCP install's management API is on the internet.
                 if self.auth != AuthMode::OperatorKeys {
@@ -555,6 +614,7 @@ pub(crate) mod tests {
                 public_internet: false,
             }),
             source: None,
+            alert_after_minutes: DEFAULT_ALERT_AFTER_MINUTES,
         }
     }
 
@@ -572,7 +632,10 @@ pub(crate) mod tests {
             build_bucket: "b".into(),
             builder_service_account: "builder@p".into(),
             tasks_queue: "q".into(),
+            wake_attempts: 20,
+            ticks_queue: "t".into(),
             news_topic: "weft-news".into(),
+            holders_topic: "weft-holders".into(),
             core_service_account: "core@p".into(),
             holder_pool: "projects/p/locations/r/workerPools/weft-holder".into(),
             dispatcher_service: "weft-role-dispatcher".into(),
@@ -582,6 +645,7 @@ pub(crate) mod tests {
             workload_identity_provider: "w".into(),
             infra_network_tag: "it".into(),
             build_machine: None,
+            alerts: true,
         }));
         c.auth = AuthMode::OperatorKeys;
         c.public_url = "https://d.run.app".into();
@@ -592,6 +656,22 @@ pub(crate) mod tests {
         c.roles.set(CoreRole::Holder, Placement::Pool);
         c.validate().unwrap();
         c
+    }
+
+    #[test]
+    fn only_a_cloud_install_whose_config_says_so_alerts_and_the_delay_defaults_to_five_minutes() {
+        assert_eq!(local().alert_after(), None, "a local install shows its failures in `weft status` only");
+        let mut cloud = gcp();
+        assert_eq!(cloud.alert_after(), Some(std::time::Duration::from_secs(5 * 60)));
+        cloud.alert_after_minutes = 12;
+        assert_eq!(cloud.alert_after(), Some(std::time::Duration::from_secs(12 * 60)));
+        if let PlatformConfig::Gcp(platform) = &mut cloud.platform {
+            platform.alerts = false;
+        }
+        assert_eq!(cloud.alert_after(), None, "alerts turned off");
+        let mut unset = serde_json::to_value(local()).unwrap();
+        unset.as_object_mut().unwrap().remove("alertAfterMinutes");
+        assert_eq!(serde_json::from_value::<InstallConfig>(unset).unwrap().alert_after_minutes, DEFAULT_ALERT_AFTER_MINUTES);
     }
 
     #[test]
@@ -672,6 +752,14 @@ pub(crate) mod tests {
         let mut c = gcp();
         c.auth = AuthMode::Local;
         assert!(c.validate().unwrap_err().contains("set auth to operator_keys"));
+    }
+
+    #[test]
+    fn a_gcp_install_delivers_each_wake_at_least_once() {
+        let mut c = gcp();
+        let PlatformConfig::Gcp(gcp) = &mut c.platform else { unreachable!() };
+        gcp.wake_attempts = 0;
+        assert!(c.validate().unwrap_err().contains("platform.wakeAttempts is 0"));
     }
 
     /// A serverless role is at its own address wherever the caller stands,

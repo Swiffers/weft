@@ -109,7 +109,10 @@ line) and the verb is not sent, so a build that cannot run never starts.
   "Running...". While following a live run it is "Stop Execution".
 - **Trigger slot** (when the source declares triggers): "Activate" /
   "Deactivate" / "Resync" (amber "Out of sync" when the project changed
-  since activation). An eye toggle "Show trigger subgraph". When some
+  since activation). A resync that stopped with triggers down shows a red
+  "Resync stopped" with two buttons: "Resync" takes it up again where it
+  stopped, "Give up" ends it and leaves the triggers it took down off. An
+  eye toggle "Show trigger subgraph". When some
   triggers are off while the others run (an infra stop took down the ones
   reading it), a second button beside "Deactivate" turns them back on and
   names them: "Activate gmail.watch", or "Reactivate ..." when runs wait on
@@ -118,8 +121,8 @@ line) and the verb is not sent, so a build that cannot run never starts.
   (nothing dropped: everything that arrives waits and runs once the
   triggers are back), **Hibernate** (the same for a grace window, questions
   hidden, then refuse), **Wipe** (drop everything, cancels suspended runs), plus what to
-  do with running executions. Reactivating offers "Execute parked + keep
-  suspensions", "Keep suspensions only", "Wipe all".
+  do with running executions. Reactivating offers "Run what was kept, keep
+  the waiting runs", "Drop the kept events, keep the waiting runs", "Wipe all".
 
 Banners above the bar: red for a failed verb (click for full diagnostics),
 amber for infra drift ("Infrastructure has changed. Click Upgrade to

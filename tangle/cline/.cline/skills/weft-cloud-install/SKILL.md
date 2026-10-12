@@ -147,6 +147,20 @@ from the project, after `weft target add` (read weft-deploying): it reads the
 key from Secret Manager straight into `weft login --key-stdin`, so the key
 never passes through the chat or a file. Never print the key itself.
 
+The install emails when weft's own work is stuck (what `weft status --on
+prod` lists under `waiting on weft:`). It writes to the fork's repository
+secret `WEFT_ALERT_EMAIL` if there is one, and otherwise to the first person,
+by address, holding the Owner role directly on the project. If the user wants
+the emails somewhere else, set that secret before running the workflow
+(`gh secret set WEFT_ALERT_EMAIL --repo <fork> --body <address>`). If the
+workflow stops in "create the cloud" with `no email to send the alerts to was
+found`, neither exists: set the secret, or, if the user wants no emails, set
+`alerts_enabled` to `false` in `deploy/terraform/gcp/variables.tf`, then run
+the workflow again. `alert_after_minutes` in the same file is how many
+minutes weft keeps retrying before it emails (5 by default). For the rest
+(what triggers an email, how often, what it costs), go and read the cloud
+guide's section "What you get".
+
 The install needs no domain: its own address is HTTPS and free. A domain
 costs money, so it is never part of the install; read weft-deploying when
 the user asks for one.

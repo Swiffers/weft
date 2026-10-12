@@ -94,6 +94,13 @@ pub struct FireSignalSink {
     signals: Arc<BrokerSignalClient>,
     registry: Arc<crate::registry::Registry>,
     doors: Arc<dyn WorkerDoors>,
+    /// The holder's ear for what its signals say (`crate::hold::Holding`):
+    /// told when a give-up could not be written, so it looks and writes
+    /// it again.
+    said: Arc<tokio::sync::Notify>,
+    /// What the process keeps of where signals connect and as whom: a
+    /// signal given up keeps nothing.
+    reach: Arc<crate::reach::Reach>,
 }
 
 impl FireSignalSink {
@@ -102,8 +109,10 @@ impl FireSignalSink {
         signals: Arc<BrokerSignalClient>,
         registry: Arc<crate::registry::Registry>,
         doors: Arc<dyn WorkerDoors>,
+        said: Arc<tokio::sync::Notify>,
+        reach: Arc<crate::reach::Reach>,
     ) -> Self {
-        Self { tasks, signals, registry, doors }
+        Self { tasks, signals, registry, doors, said, reach }
     }
 
     /// Deliver one event of the signal `token`: an entry's straight to its
@@ -166,10 +175,19 @@ impl FireSignalSink {
     /// trigger's queue, already processed, so the install hands it to the
     /// worker once it is back (`weft_task_store::parked_fires`). Its id is
     /// the fire's: if the worker did take it before the call failed, handing
-    /// it over again finds the run already born.
+    /// it over again finds the run already born. A worker out of reach is
+    /// a failed hand-over: tried again shortly a few times, then it stops
+    /// (`weft_task_store::parked_fires::Turn::next`).
     async fn park(&self, fire: DoorFire, unreached: &str) -> Result<Delivered> {
         let held_by = fire.held_by.clone();
-        let parked = weft_task_store::parked_fires::waiting(fire.fire_id, fire.payload, None, 1, None);
+        let parked = weft_task_store::parked_fires::waiting(
+            fire.fire_id,
+            fire.payload,
+            None,
+            0,
+            weft_task_store::parked_fires::WaitsOn::Failure,
+            unreached,
+        );
         let token = fire.token;
         use weft_broker_client::protocol::DoorParked;
         match self.signals.park_fire(&token, &parked, held_by.as_deref()).await? {
@@ -223,6 +241,33 @@ impl FireSignalSink {
     /// landed.
     pub async fn claim_kind_state(&self, token: &str, kind_state: Value, from_seq: i64) -> Result<bool> {
         self.signals.write_kind_state(token, kind_state, from_seq).await
+    }
+
+    /// Give up registration `generation` of signal `token` for good: the
+    /// row says why (and lets go of its holder), and whatever runs under
+    /// the token here stops, keeping nothing of where it connects or as
+    /// whom (`crate::reach`). It stops here even when the row could not be
+    /// written, which is the error answered; a connection held here then
+    /// stays this process's claim until its next look writes it
+    /// (`Registry::unrecorded`), and any other signal's is its caller's to
+    /// try again.
+    pub async fn give_up(&self, token: &str, generation: i64, reason: &str) -> Result<()> {
+        let written = self
+            .signals
+            .give_up(&weft_broker_client::protocol::SignalGiveUpRequest { token: token.to_string(), generation, reason: reason.to_string() })
+            .await;
+        let was_down_holding = self.registry.clear_down(token) == Some(true);
+        let holding_here = self.registry.remove(token).is_some() || was_down_holding;
+        self.reach.forget(token);
+        match &written {
+            Ok(()) => self.registry.drop_unrecorded(token),
+            Err(_) if holding_here => {
+                self.registry.keep_unrecorded(token, crate::registry::GaveUp { generation, reason: reason.to_string() });
+                self.said.notify_one();
+            }
+            Err(_) => {}
+        }
+        written
     }
 }
 

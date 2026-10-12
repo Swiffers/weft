@@ -43,9 +43,12 @@ resource "google_project_service" "apis" {
     "compute.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
+    # emailing when weft's own work is stuck (alerts.tf)
+    "monitoring.googleapis.com",
     # carrying infra machine events to the supervisor (machines.tf)
     "logging.googleapis.com",
-    # and those, and what happens to a run, across weft's copies (news.tf)
+    # and those, what happens to a run, and what the holders must hear,
+    # across weft's copies (news.tf)
     "pubsub.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",

@@ -355,6 +355,7 @@ mod tests {
             value: "id".into(),
             page: None,
             public: false,
+            where_equals: BTreeMap::new(),
         }
     }
 

@@ -25,7 +25,9 @@ use weft_core::ExecutionId;
 /// How a run that only waits outside waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Quiet {
-    /// When its wait gives up at most (unix seconds).
+    /// When its quiet ends at most (unix seconds): its hold gives up, or,
+    /// for a step waiting on its caller, its own cap or the caller's
+    /// session cap ends ([`RunHold::quiet_on_caller`]).
     pub(crate) until: i64,
     /// Whether it could pause right now (steps waiting on each other
     /// beside a suspended one), so a stopping worker hands it back, rather
@@ -62,10 +64,11 @@ impl Holds {
         self.quiet.lock().expect("run holds")
     }
 
-    /// Run `execution_id`'s drive says how it waits ([`RunHold`]). Nothing
-    /// is kept for it until it first goes quiet.
-    pub(crate) fn of(self: &Arc<Self>, execution_id: ExecutionId) -> RunHold {
-        RunHold { holds: self.clone(), execution_id, quiet: AtomicBool::new(false) }
+    /// Run `execution_id`'s drive says how it waits ([`RunHold`]); its own
+    /// cap on this worker ends at `cap_ends` (unix seconds), never without
+    /// one. Nothing is kept for it until it first goes quiet.
+    pub(crate) fn of(self: &Arc<Self>, execution_id: ExecutionId, cap_ends: Option<i64>) -> RunHold {
+        RunHold { holds: self.clone(), execution_id, cap_ends, quiet: AtomicBool::new(false) }
     }
 
     fn set(&self, execution_id: ExecutionId, how: Option<Quiet>) {
@@ -88,11 +91,22 @@ impl Holds {
 pub(crate) struct RunHold {
     holds: Arc<Holds>,
     execution_id: ExecutionId,
+    /// When the run's own cap on this worker ends (unix seconds).
+    cap_ends: Option<i64>,
     /// Whether the run is among the quiet ones.
     quiet: AtomicBool,
 }
 
 impl RunHold {
+    /// The run only waits, and one of its steps waits on its caller's next
+    /// message, which no hold gives up: it is quiet until the first of its
+    /// own cap and its caller's session cap (`session_ends`), and with
+    /// neither it is not quiet at all, so its worker keeps ticking.
+    pub(crate) fn quiet_on_caller(&self, session_ends: Option<i64>, can_pause: bool) {
+        let until = self.cap_ends.into_iter().chain(session_ends).min();
+        self.quiet(until.map(|until| Quiet { until, can_pause }));
+    }
+
     /// The run only waits outside, as `how` says, or it moves again
     /// (`None`). Saying the same again changes nothing.
     pub(crate) fn quiet(&self, how: Option<Quiet>) {
@@ -128,7 +142,7 @@ mod tests {
             }
         }));
         let until = |until| Some(Quiet { until, can_pause: false });
-        let (a, b) = (holds.of(uuid::Uuid::from_u128(1)), holds.of(uuid::Uuid::from_u128(2)));
+        let (a, b) = (holds.of(uuid::Uuid::from_u128(1), None), holds.of(uuid::Uuid::from_u128(2), None));
         assert_eq!(holds.quiet(), (0, None), "nothing kept before a run goes quiet");
         a.quiet(until(100));
         b.quiet(until(300));

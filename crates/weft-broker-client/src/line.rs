@@ -29,10 +29,18 @@
 //! A broker that cuts a request after a while (Cloud Run's limit on one
 //! request) says so as the line opens (`Notice::Following`'s
 //! `max_age_secs`), and the line tells its process when that cut comes
-//! ([`BrokerLink::cut_at`]). The line is never renewed: a cut is a break
-//! like any other, except for a worker whose runs only wait, which must
-//! not read again and so stops before then; the process that starts in its
-//! place opens a line of its own.
+//! ([`BrokerLink::cut_at`]). A process can have its line replaced before
+//! then ([`BrokerLink::replace`]): a second line opens beside it, and once
+//! the broker follows on it, calls go out on it and what the first line
+//! still had to say is read until its calls are answered and it closes.
+//! The first line delivers until the second one follows, so nothing is
+//! missed and that `Following` is no recheck: nobody looks again, and the
+//! replacement reads nothing from the database. The exception is a first
+//! line that had stopped hearing: its gap is looked at once a line hears
+//! again, and a recheck it still sends while it retires is passed on. A worker replaces its line
+//! while it works; a worker whose runs only wait lets nothing open a line
+//! (the broker copy it lands on may have to read who it is), and stops
+//! before the cut instead.
 //!
 //! When the line breaks it comes back by itself. A call that had not been
 //! written yet goes out on the next line if that opens within the call's
@@ -347,21 +355,23 @@ impl BrokerLink {
 
     /// Call `path` with the JSON `body`, waiting as `wait` says.
     pub async fn call(&self, path: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
-        self.call_as(path, "application/json", body, wait).await
+        self.call_as(path, "application/json", &[], body, wait).await
     }
 
     /// Call `path` with `body` as raw bytes (a batch of records,
-    /// `weft_journal::frame`), waiting as `wait` says.
-    pub async fn call_bytes(&self, path: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
-        self.call_as(path, "application/octet-stream", body, wait).await
+    /// `weft_journal::frame`) and the extra `headers`, waiting as `wait`
+    /// says.
+    pub async fn call_bytes(&self, path: &str, headers: &[(&str, &str)], body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(path, "application/octet-stream", headers, body, wait).await
     }
 
-    async fn call_as(&self, path: &str, content_type: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+    async fn call_as(&self, path: &str, content_type: &str, extra: &[(&str, &str)], body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
         let bearer = self.inner.token.read(&self.inner.base_url).await?;
         let mut headers = vec![
             ("authorization".to_string(), format!("Bearer {bearer}")),
             ("content-type".to_string(), content_type.to_string()),
         ];
+        headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         headers.extend(self.inner.token.headers().into_iter().map(|(k, v)| (k.to_string(), v)));
         Ok(self.line().call(path, headers, body, wait).await?)
     }
@@ -377,6 +387,21 @@ impl BrokerLink {
     /// changes, so a process can stop before the cut (see the module doc).
     pub fn cut_at(&self) -> tokio::sync::watch::Receiver<Option<Cut>> {
         self.line().cut.subscribe()
+    }
+
+    /// Replace the open line with a new one, missing nothing (see the
+    /// module doc). Answers once the broker follows on the new line, which
+    /// [`Self::cut_at`] then reports, or with why it could not: the line was
+    /// not open, or the new one would not open or follow, and the open line
+    /// stays as it was.
+    pub async fn replace(&self) -> anyhow::Result<()> {
+        let line = self.line();
+        if let Some(why) = line.down.lock().expect("line down").clone() {
+            anyhow::bail!("the line is not open: {why}");
+        }
+        let (done, replaced) = oneshot::channel();
+        let _ = line.outbox.send(Out::Replace(done));
+        replaced.await.unwrap_or_else(|_| Err("the line stopped".into())).map_err(anyhow::Error::msg)
     }
 
     /// Hold the line open while the guard lives, calls or not, so what the
@@ -440,6 +465,9 @@ enum Out {
     Forget(u64),
     /// Nothing: the line is wanted open (a [`StayOpen`] was taken).
     Wake,
+    /// Replace the open line ([`BrokerLink::replace`]), answering how
+    /// that went.
+    Replace(oneshot::Sender<Result<(), String>>),
 }
 
 struct Line {
@@ -537,13 +565,7 @@ impl Line {
         self.cut.send_replace(None);
         let _ = self.notices.send(Heard::Lost);
         *self.down.lock().expect("line down") = Some(why.to_string());
-        let mut calls = self.calls.lock().expect("line calls");
-        let written: Vec<u64> = calls.iter().filter(|(_, w)| w.frame.is_none()).map(|(id, _)| *id).collect();
-        for id in written {
-            if let Some(waiting) = calls.remove(&id) {
-                let _ = waiting.answer.send(Err(LineError::Dropped(why.to_string())));
-            }
-        }
+        self.dropped(&self.written(), why);
     }
 
     /// The line closed for want of anything to do: nothing is heard until
@@ -573,6 +595,57 @@ impl Line {
         self.calls.lock().expect("line calls").get_mut(&id).and_then(|w| w.frame.take())
     }
 
+    /// The broker follows on the line that `opened` at that instant, its
+    /// listener hearing or not, cutting it after `max_age_secs`.
+    fn followed(&self, listening: bool, max_age_secs: Option<u64>, opened: tokio::time::Instant) {
+        self.cut.send_replace(max_age_secs.map(|secs| Cut { opened, max_age: Duration::from_secs(secs) }));
+        self.listening.store(listening, Ordering::Release);
+    }
+
+    /// The broker follows on the line that replaced the open one. While the
+    /// old one heard, it delivered until now, so nothing was missed and
+    /// nobody looks again. If the old one had stopped hearing, what was
+    /// pushed since is found only by looking again, which waiters do once
+    /// a line hears: now, if the new broker's listener hears, else at that
+    /// broker's own recheck. A new broker that does not hear means what is
+    /// kept on the line is not trusted until it does. Says whether waiters
+    /// were told to look again now.
+    fn followed_instead(&self, listening: bool, max_age_secs: Option<u64>, opened: tokio::time::Instant) -> bool {
+        let heard_until_now = self.listening.load(Ordering::Acquire);
+        self.followed(listening, max_age_secs, opened);
+        let told = match (heard_until_now, listening) {
+            (_, false) => Heard::Lost,
+            (false, true) => Heard::Recheck,
+            (true, true) => return false,
+        };
+        let rechecked = matches!(told, Heard::Recheck);
+        let _ = self.notices.send(told);
+        rechecked
+    }
+
+    /// The calls written so far and not answered yet: what a line being
+    /// replaced still owes.
+    fn written(&self) -> std::collections::HashSet<u64> {
+        self.calls.lock().expect("line calls").iter().filter(|(_, w)| w.frame.is_none()).map(|(id, _)| *id).collect()
+    }
+
+    /// The line being replaced broke, for `why`, with `owed` still out on
+    /// it: those may have landed.
+    fn dropped(&self, owed: &std::collections::HashSet<u64>, why: &str) {
+        let mut calls = self.calls.lock().expect("line calls");
+        for id in owed {
+            if let Some(waiting) = calls.remove(id) {
+                let _ = waiting.answer.send(Err(LineError::Dropped(why.to_string())));
+            }
+        }
+    }
+
+    /// Whether any of `owed` still waits for its answer.
+    fn owes_any(&self, owed: &std::collections::HashSet<u64>) -> bool {
+        let calls = self.calls.lock().expect("line calls");
+        owed.iter().any(|id| calls.contains_key(id))
+    }
+
     /// What the broker said on the line, which `opened` at that instant.
     fn heard(&self, notice: Notice, opened: tokio::time::Instant) {
         match notice {
@@ -582,8 +655,7 @@ impl Line {
             // broker hears. Set before the recheck goes out, so a waiter
             // reads it with the recheck.
             Notice::Following { listening, max_age_secs } => {
-                self.cut.send_replace(max_age_secs.map(|secs| Cut { opened, max_age: Duration::from_secs(secs) }));
-                self.listening.store(listening, Ordering::Release);
+                self.followed(listening, max_age_secs, opened);
                 let _ = self.notices.send(Heard::Recheck);
             }
             Notice::Recheck { listening } => {
@@ -646,7 +718,8 @@ async fn keep_open(
             Ok(socket) => {
                 retry = RECONNECT_FIRST;
                 *held.down.lock().expect("line down") = None;
-                match serve(socket, opening, &held, first.take(), &mut outbox, &mut closed, idle_after).await {
+                let opens = Opens { base_url: &base_url, token: &token };
+                match serve(socket, opening, &held, first.take(), &mut outbox, &mut closed, idle_after, opens).await {
                     Served::LetGo => return,
                     Served::Broke(why) => {
                         tracing::warn!(target: "weft_broker_client::line", reason = %why, "the line to the broker broke; opening it again");
@@ -655,13 +728,22 @@ async fn keep_open(
                     Served::Idle => {
                         held.idled();
                         drop(held);
-                        // Closed until something is asked of it.
-                        tokio::select! {
-                            out = outbox.recv() => match out {
-                                Some(out) => first = Some(out),
-                                None => return,
-                            },
-                            _ = closed.changed() => return,
+                        // Closed until something is asked of it. A closed
+                        // line has nothing to replace.
+                        loop {
+                            tokio::select! {
+                                out = outbox.recv() => match out {
+                                    Some(Out::Replace(done)) => {
+                                        let _ = done.send(Err("the line is closed while idle".into()));
+                                    }
+                                    Some(out) => {
+                                        first = Some(out);
+                                        break;
+                                    }
+                                    None => return,
+                                },
+                                _ = closed.changed() => return,
+                            }
                         }
                     }
                 }
@@ -729,24 +811,57 @@ fn line_url(base_url: &str) -> anyhow::Result<String> {
     Ok(format!("{rest}{LINE_PATH}"))
 }
 
+/// Where the line opens, for a line that replaces it.
+#[derive(Clone, Copy)]
+struct Opens<'a> {
+    base_url: &'a str,
+    token: &'a TokenSource,
+}
+
+type Stream = futures::stream::SplitStream<Socket>;
+
+/// A line opened to replace the open one, until the broker follows on it.
+struct Joining {
+    sink: Sink,
+    stream: Stream,
+    opened: tokio::time::Instant,
+    done: oneshot::Sender<Result<(), String>>,
+}
+
+/// A replaced line, read until the calls written on it (`owed`) are
+/// answered, then closed (`closing`) and read until the broker closes it:
+/// what it says meanwhile was said before the new line followed.
+struct Retiring {
+    sink: Sink,
+    stream: Stream,
+    owed: std::collections::HashSet<u64>,
+    closing: bool,
+    /// Waiters were told to look again when the new line followed: that
+    /// look already covers any gap the old broker could still recheck for,
+    /// so a recheck it sends is not passed on.
+    rechecked: bool,
+}
+
 /// Serve one open line, which `opened` at that instant, until it breaks,
-/// or until the process lets go of its last link (`closed`).
+/// or until the process lets go of its last link (`closed`), replacing it
+/// when asked ([`BrokerLink::replace`]).
 ///
 /// Every write is bounded by [`PONG_WAIT`]: a broker that vanished without
 /// closing leaves the socket's buffer full and a write waiting for minutes,
 /// which would also keep the ping's deadline from ever being looked at.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     socket: Socket,
-    opened: tokio::time::Instant,
+    mut opened: tokio::time::Instant,
     line: &Line,
     first: Option<Out>,
     outbox: &mut mpsc::UnboundedReceiver<Out>,
     closed: &mut tokio::sync::watch::Receiver<()>,
     idle_after: Duration,
+    opens: Opens<'_>,
 ) -> Served {
     let (mut sink, mut stream) = socket.split();
-    let follow = serde_json::to_string(&Notice::Follow).expect("a notice serializes");
-    if let Err(why) = write(&mut sink, Message::Text(follow), "asking to follow").await {
+    if let Err(why) = write(&mut sink, follow(), "asking to follow").await {
         return Served::Broke(why);
     }
     if let Some(out) = first {
@@ -761,6 +876,12 @@ async fn serve(
     idle_look.tick().await;
     // Since when the line has had nothing to do, while it has not.
     let mut idle_since: Option<tokio::time::Instant> = None;
+    // A replacement under way: the new line opening, then waiting for the
+    // broker to follow on it; the replaced line, until it is closed.
+    type Opening<'o> = (std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Socket>> + Send + 'o>>, tokio::time::Instant, oneshot::Sender<Result<(), String>>);
+    let mut opening: Option<Opening<'_>> = None;
+    let mut joining: Option<Joining> = None;
+    let mut retiring: Option<Retiring> = None;
     loop {
         let pong_deadline = pong_due.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
         let written = tokio::select! {
@@ -768,11 +889,117 @@ async fn serve(
                 // Nothing is waiting on the line any more; a polite close is
                 // all that is left, and its failing changes nothing.
                 let _ = write(&mut sink, Message::Close(None), "closing").await;
+                if let Some(retiring) = retiring.as_mut() {
+                    let _ = write(&mut retiring.sink, Message::Close(None), "closing").await;
+                }
                 return Served::LetGo;
             }
-            out = outbox.recv() => {
-                let Some(out) = out else { return Served::LetGo };
-                write_out(&mut sink, line, out).await
+            out = outbox.recv() => match out {
+                None => return Served::LetGo,
+                // One replacement at a time.
+                Some(Out::Replace(done)) if opening.is_some() || joining.is_some() || retiring.is_some() => {
+                    let _ = done.send(Err("the line is being replaced already".into()));
+                    Ok(())
+                }
+                Some(Out::Replace(done)) => {
+                    let connecting = tokio::time::timeout(CONNECT_WAIT, connect(opens.base_url, opens.token));
+                    let connecting = async move { connecting.await.unwrap_or_else(|_| Err(anyhow::anyhow!("opening it took more than {CONNECT_WAIT:?}"))) };
+                    opening = Some((Box::pin(connecting), tokio::time::Instant::now(), done));
+                    Ok(())
+                }
+                // A call written on the replaced line is forgotten there.
+                Some(Out::Forget(id)) if retiring.as_ref().is_some_and(|retiring| retiring.owed.contains(&id)) => {
+                    let retiring = retiring.as_mut().expect("looked at");
+                    let _ = write_out(&mut retiring.sink, line, Out::Forget(id)).await;
+                    Ok(())
+                }
+                Some(out) => write_out(&mut sink, line, out).await,
+            },
+            opened_new = async { opening.as_mut().expect("armed").0.as_mut().await }, if opening.is_some() => {
+                let (_, at, done) = opening.take().expect("armed");
+                match opened_new {
+                    Ok(socket) => {
+                        let (mut new_sink, new_stream) = socket.split();
+                        match write(&mut new_sink, follow(), "asking to follow").await {
+                            Ok(()) => joining = Some(Joining { sink: new_sink, stream: new_stream, opened: at, done }),
+                            Err(why) => drop(done.send(Err(why))),
+                        }
+                    }
+                    Err(e) => drop(done.send(Err(format!("{e:#}")))),
+                }
+                Ok(())
+            }
+            message = async { joining.as_mut().expect("armed").stream.next().await }, if joining.is_some() => {
+                let new = joining.as_mut().expect("armed");
+                let failed = match message {
+                    // The broker follows on the new line: calls go out on it
+                    // from now on, and the old one is read until it owes
+                    // nothing.
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(&text) {
+                        Ok(Notice::Following { listening, max_age_secs }) => {
+                            let new = joining.take().expect("armed");
+                            let owed = line.written();
+                            let old_sink = std::mem::replace(&mut sink, new.sink);
+                            let old_stream = std::mem::replace(&mut stream, new.stream);
+                            opened = new.opened;
+                            pong_due = None;
+                            let rechecked = line.followed_instead(listening, max_age_secs, opened);
+                            retiring = Some(Retiring { sink: old_sink, stream: old_stream, owed, closing: false, rechecked });
+                            let _ = new.done.send(Ok(()));
+                            None
+                        }
+                        // The broker says nothing else before it follows.
+                        Ok(_) => None,
+                        Err(e) => Some(format!("a notice that does not read ({text}): {e}")),
+                    },
+                    Some(Ok(Message::Ping(payload))) => write(&mut new.sink, Message::Pong(payload), "answering a ping").await.err(),
+                    Some(Ok(Message::Close(frame))) => Some(format!("the broker closed the new line ({frame:?})")),
+                    Some(Ok(_)) => None,
+                    Some(Err(e)) => Some(format!("reading the new line: {e}")),
+                    None => Some("the broker closed the new line".into()),
+                };
+                if let Some(why) = failed {
+                    let _ = joining.take().expect("armed").done.send(Err(why));
+                }
+                Ok(())
+            }
+            message = async { retiring.as_mut().expect("armed").stream.next().await }, if retiring.is_some() => {
+                let old = retiring.as_mut().expect("armed");
+                let broke = match message {
+                    Some(Ok(Message::Binary(bytes))) => read_answer(line, &bytes).err(),
+                    // What it pushes still counts, and so does a recheck: the
+                    // gap it covers may have opened before the new line
+                    // followed, and only the old broker knows of it, unless
+                    // waiters already looked again when the new line
+                    // followed, which covers that gap. How the old broker
+                    // listens no longer counts.
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(&text) {
+                        Ok(notice @ Notice::Signal { .. }) => {
+                            line.heard(notice, opened);
+                            None
+                        }
+                        Ok(Notice::Recheck { .. }) => {
+                            if !old.rechecked {
+                                let _ = line.notices.send(Heard::Recheck);
+                            }
+                            None
+                        }
+                        Ok(_) => None,
+                        Err(e) => Some(format!("a notice that does not read ({text}): {e}")),
+                    },
+                    Some(Ok(Message::Ping(payload))) if !old.closing => write(&mut old.sink, Message::Pong(payload), "answering a ping").await.err(),
+                    Some(Ok(Message::Close(_))) | None if old.closing => Some(String::new()),
+                    Some(Ok(Message::Close(frame))) => Some(format!("the broker closed the replaced line ({frame:?})")),
+                    Some(Ok(_)) => None,
+                    Some(Err(e)) => Some(format!("reading the replaced line: {e}")),
+                    None => Some("the broker closed the replaced line".into()),
+                };
+                if let Some(why) = broke {
+                    // What it still owed may have landed.
+                    line.dropped(&old.owed, &why);
+                    retiring = None;
+                }
+                Ok(())
             }
             _ = idle_look.tick() => {
                 // Looked at from this task alone, which is the one that
@@ -795,16 +1022,7 @@ async fn serve(
                 match message {
                     None => Err("the broker closed the line".into()),
                     Some(Err(e)) => Err(format!("reading: {e}")),
-                    Some(Ok(Message::Binary(bytes))) => match unframe::<AnswerHead>(&bytes) {
-                        Ok((head, body)) => match reqwest::StatusCode::from_u16(head.status) {
-                            Ok(status) => {
-                                line.answered(head.id, Answer { status, body: body.to_vec() });
-                                Ok(())
-                            }
-                            Err(e) => Err(format!("an answer with status {}: {e}", head.status)),
-                        },
-                        Err(e) => Err(format!("an answer that does not read: {e:#}")),
-                    },
+                    Some(Ok(Message::Binary(bytes))) => read_answer(line, &bytes),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Notice>(&text) {
                         Ok(notice) => {
                             line.heard(notice, opened);
@@ -828,7 +1046,28 @@ async fn serve(
         if let Err(why) = written {
             return Served::Broke(why);
         }
+        // The replaced line owes nothing any more: it is closed, and read
+        // until the broker closes it too.
+        if let Some(old) = retiring.as_mut().filter(|old| !old.closing && !line.owes_any(&old.owed)) {
+            old.closing = true;
+            if write(&mut old.sink, Message::Close(None), "closing the replaced line").await.is_err() {
+                retiring = None;
+            }
+        }
     }
+}
+
+/// The `Follow` a line opens with.
+fn follow() -> Message {
+    Message::Text(serde_json::to_string(&Notice::Follow).expect("a notice serializes"))
+}
+
+/// Hand the answer framed in `bytes` to its call.
+fn read_answer(line: &Line, bytes: &[u8]) -> Result<(), String> {
+    let (head, body) = unframe::<AnswerHead>(bytes).map_err(|e| format!("an answer that does not read: {e:#}"))?;
+    let status = reqwest::StatusCode::from_u16(head.status).map_err(|e| format!("an answer with status {}: {e}", head.status))?;
+    line.answered(head.id, Answer { status, body: body.to_vec() });
+    Ok(())
 }
 
 type Sink = futures::stream::SplitSink<Socket, Message>;
@@ -846,6 +1085,7 @@ async fn write_out(sink: &mut Sink, line: &Line, out: Out) -> Result<(), String>
             write(sink, Message::Text(forget), "forgetting a call").await
         }
         Out::Wake => Ok(()),
+        Out::Replace(_) => unreachable!("a replacement is asked of the open line, never written on it"),
     }
 }
 
@@ -878,6 +1118,230 @@ mod tests {
         assert_eq!(line_url("https://b.run.app").unwrap(), "wss://b.run.app/v1/line");
         assert_eq!(line_url("http://127.0.0.1:9").unwrap(), "ws://127.0.0.1:9/v1/line");
         assert!(line_url("b.run.app").is_err());
+    }
+
+    /// What a test has one line of a [`FakeBroker`] do.
+    enum Push {
+        Notice(Notice),
+        /// Answer the call it holds.
+        AnswerHeld,
+    }
+
+    /// A fake broker: each line it accepts follows at once (listening, cut
+    /// after an hour) and answers every call with the number of the line
+    /// it came on, except a call to `/v1/hold`, which it holds (counted in
+    /// `holding`) until told to answer it. `closed` counts the lines the
+    /// caller closed, and `lines` reaches each line by its number.
+    struct FakeBroker {
+        address: String,
+        closed: Arc<AtomicUsize>,
+        holding: Arc<AtomicUsize>,
+        lines: Arc<Mutex<HashMap<usize, mpsc::UnboundedSender<Push>>>>,
+    }
+
+    impl FakeBroker {
+        fn push(&self, line: usize, push: Push) {
+            self.lines.lock().unwrap()[&line].send(push).unwrap();
+        }
+    }
+
+    async fn fake_broker() -> FakeBroker {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broker = FakeBroker {
+            address: format!("http://{}", listener.local_addr().unwrap()),
+            closed: Arc::default(),
+            holding: Arc::default(),
+            lines: Arc::default(),
+        };
+        let (closed, holding, lines) = (broker.closed.clone(), broker.holding.clone(), broker.lines.clone());
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (pushes, mut pushed) = mpsc::unbounded_channel();
+                let number = {
+                    let mut lines = lines.lock().unwrap();
+                    let number = lines.len() + 1;
+                    lines.insert(number, pushes);
+                    number
+                };
+                let (closed, holding) = (closed.clone(), holding.clone());
+                tokio::spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    let mut held = None;
+                    loop {
+                        tokio::select! {
+                            message = socket.next() => match message {
+                                Some(Ok(Message::Text(text))) if serde_json::from_str::<Notice>(&text).unwrap() == Notice::Follow => {
+                                    let following = Notice::Following { listening: true, max_age_secs: Some(3600) };
+                                    socket.send(Message::Text(serde_json::to_string(&following).unwrap())).await.unwrap();
+                                }
+                                Some(Ok(Message::Binary(bytes))) => {
+                                    let (head, _) = unframe::<CallHead>(&bytes).unwrap();
+                                    if head.path == "/v1/hold" {
+                                        held = Some(head.id);
+                                        holding.fetch_add(1, Ordering::SeqCst);
+                                        continue;
+                                    }
+                                    let answer = frame(&AnswerHead { id: head.id, status: 200 }, number.to_string().as_bytes());
+                                    socket.send(Message::Binary(answer)).await.unwrap();
+                                }
+                                Some(Ok(Message::Close(_))) => {
+                                    closed.fetch_add(1, Ordering::SeqCst);
+                                    return;
+                                }
+                                Some(Ok(_)) => {}
+                                Some(Err(_)) | None => return,
+                            },
+                            Some(push) = pushed.recv() => match push {
+                                Push::Notice(notice) => {
+                                    socket.send(Message::Text(serde_json::to_string(&notice).unwrap())).await.unwrap();
+                                }
+                                Push::AnswerHeld => {
+                                    let id = held.take().expect("a call is held");
+                                    let answer = frame(&AnswerHead { id, status: 200 }, number.to_string().as_bytes());
+                                    socket.send(Message::Binary(answer)).await.unwrap();
+                                }
+                            },
+                        }
+                    }
+                });
+            }
+        });
+        broker
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    fn worker_link(broker: &FakeBroker) -> BrokerLink {
+        BrokerLink::new(broker.address.clone(), TokenSource::worker(Arc::new(weft_platform_traits::FixedToken("t".into())), "w-1"))
+    }
+
+    async fn line_number(link: &BrokerLink) -> String {
+        String::from_utf8(link.call("/v1/x", Vec::new(), DEFAULT_CALL_WAIT).await.unwrap().body).unwrap()
+    }
+
+    // A replaced line: calls go out on the new one, the old one closes once
+    // it owes nothing, the cut is counted from the new one, and nobody is
+    // told to look again (its `Following` is no recheck).
+    weft_core::stress_test! {
+        name: a_replaced_line_carries_on_and_tells_nobody_to_look_again,
+        runs: 10,
+        worker_threads: 4,
+        async fn body() {
+            let broker = fake_broker().await;
+            let link = worker_link(&broker);
+            let mut heard = link.subscribe();
+            let _open = link.stay_open();
+            assert_eq!(line_number(&link).await, "1");
+            assert!(matches!(heard.next().await.unwrap(), Heard::Recheck), "a line that opens is a recheck");
+            let first_cut = link.cut_at().borrow().expect("cut after an hour");
+
+            link.replace().await.expect("replaced");
+            assert_eq!(line_number(&link).await, "2", "calls go out on the new line");
+            let cut = link.cut_at().borrow().expect("cut after an hour");
+            assert!(cut.opened > first_cut.opened, "the cut counts from the new line");
+            until("the replaced line is closed", || broker.closed.load(Ordering::SeqCst) == 1).await;
+            let told = tokio::time::timeout(Duration::from_millis(200), heard.next()).await;
+            assert!(told.is_err(), "nothing told to look again: {told:?}");
+            assert!(link.subscribe().listening(), "what is kept on the line is still trusted");
+        }
+    }
+
+    // A line replaced while its broker's listener did not hear: what was
+    // pushed meanwhile is looked at again once the new line hears.
+    weft_core::stress_test! {
+        name: a_line_replaced_while_deaf_tells_everyone_to_look_again,
+        runs: 10,
+        worker_threads: 4,
+        async fn body() {
+            let broker = fake_broker().await;
+            let link = worker_link(&broker);
+            let mut heard = link.subscribe();
+            let _open = link.stay_open();
+            assert_eq!(line_number(&link).await, "1");
+            assert!(matches!(heard.next().await.unwrap(), Heard::Recheck), "a line that opens is a recheck");
+            broker.push(1, Push::Notice(Notice::Lost));
+            assert!(matches!(heard.next().await.unwrap(), Heard::Lost));
+
+            link.replace().await.expect("replaced");
+            let told = tokio::time::timeout(Duration::from_secs(10), heard.next()).await.expect("told");
+            assert!(matches!(told, Ok(Heard::Recheck)), "told to look again: {told:?}");
+            assert!(link.subscribe().listening(), "the new line hears");
+        }
+    }
+
+    // A recheck the replaced line sends while it is read to its end is
+    // passed on: the gap it covers may predate the new line.
+    weft_core::stress_test! {
+        name: a_recheck_on_the_replaced_line_is_passed_on,
+        runs: 10,
+        worker_threads: 4,
+        async fn body() {
+            let broker = fake_broker().await;
+            let link = worker_link(&broker);
+            let mut heard = link.subscribe();
+            let _open = link.stay_open();
+            assert_eq!(line_number(&link).await, "1");
+            assert!(matches!(heard.next().await.unwrap(), Heard::Recheck), "a line that opens is a recheck");
+            let held = tokio::spawn({
+                let link = link.clone();
+                async move { link.call("/v1/hold", Vec::new(), DEFAULT_CALL_WAIT).await.map(|answer| answer.body) }
+            });
+            until("the broker holds the call", || broker.holding.load(Ordering::SeqCst) == 1).await;
+
+            link.replace().await.expect("replaced");
+            broker.push(1, Push::Notice(Notice::Recheck { listening: false }));
+            let told = tokio::time::timeout(Duration::from_secs(10), heard.next()).await.expect("told");
+            assert!(matches!(told, Ok(Heard::Recheck)), "told to look again: {told:?}");
+            assert!(link.subscribe().listening(), "how the old broker listens no longer counts");
+
+            broker.push(1, Push::AnswerHeld);
+            assert_eq!(held.await.unwrap().unwrap(), b"1", "the old line answers what it owed");
+            until("the replaced line is closed", || broker.closed.load(Ordering::SeqCst) == 1).await;
+        }
+    }
+
+    // A line replaced while deaf already told everyone to look again when
+    // the new line followed, which covers any gap the old broker knows of:
+    // a recheck the replaced line sends afterwards is one read too many,
+    // and is not passed on.
+    weft_core::stress_test! {
+        name: a_recheck_after_the_swap_already_rechecked_is_not_passed_on,
+        runs: 10,
+        worker_threads: 4,
+        async fn body() {
+            let broker = fake_broker().await;
+            let link = worker_link(&broker);
+            let mut heard = link.subscribe();
+            let _open = link.stay_open();
+            assert_eq!(line_number(&link).await, "1");
+            assert!(matches!(heard.next().await.unwrap(), Heard::Recheck), "a line that opens is a recheck");
+            broker.push(1, Push::Notice(Notice::Lost));
+            assert!(matches!(heard.next().await.unwrap(), Heard::Lost));
+            let held = tokio::spawn({
+                let link = link.clone();
+                async move { link.call("/v1/hold", Vec::new(), DEFAULT_CALL_WAIT).await.map(|answer| answer.body) }
+            });
+            until("the broker holds the call", || broker.holding.load(Ordering::SeqCst) == 1).await;
+
+            link.replace().await.expect("replaced");
+            let told = tokio::time::timeout(Duration::from_secs(10), heard.next()).await.expect("told");
+            assert!(matches!(told, Ok(Heard::Recheck)), "told to look again at the swap: {told:?}");
+
+            broker.push(1, Push::Notice(Notice::Recheck { listening: true }));
+            broker.push(1, Push::AnswerHeld);
+            assert_eq!(held.await.unwrap().unwrap(), b"1", "the old line answers what it owed, after its recheck");
+            let told = tokio::time::timeout(Duration::from_millis(200), heard.next()).await;
+            assert!(told.is_err(), "nothing told to look again a second time: {told:?}");
+        }
     }
 
     #[test]

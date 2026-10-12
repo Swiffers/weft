@@ -24,7 +24,14 @@
 //! nothing queries it can sleep through a wait of hours. When that wait
 //! ends its run moves and the tick goes again, vouching for the next one
 //! (shorter or longer: it vouches again whenever what it would vouch for
-//! changed).
+//! changed). The dispatcher's look at lapsed leases stays booked for the
+//! latest end any tick vouched for, so a worker that dies after its
+//! waiting runs moved again is noticed then. A worker told to stop
+//! ([`UnderWay::Stopping`]) ticks with no vouch for as long as it lives
+//! (`crate::worker`), and the first of those ticks, when a vouch was out,
+//! says the lease got shorter ([`shortens`]): the broker rings that look,
+//! so the runs the stopping worker leaves behind are found a lease length
+//! after it goes.
 //!
 //! The lease is what the tick keeps: a run on record as this worker's is
 //! read as lost once the lease lapsed and a margin as long again went by
@@ -50,6 +57,9 @@ pub enum UnderWay {
     OnlyQuiet { vouch_until: i64 },
     /// Work: the tick goes on.
     Working,
+    /// The worker was told to stop: the tick goes on, vouching for nothing,
+    /// for as long as the process lives.
+    Stopping,
 }
 
 impl UnderWay {
@@ -71,7 +81,7 @@ impl UnderWay {
     pub fn vouch_until(self) -> Option<i64> {
         match self {
             UnderWay::OnlyQuiet { vouch_until } => Some(vouch_until),
-            UnderWay::Nothing | UnderWay::Working => None,
+            UnderWay::Nothing | UnderWay::Working | UnderWay::Stopping => None,
         }
     }
 }
@@ -95,8 +105,16 @@ pub(super) fn may_sleep(under_way: UnderWay, landed: Option<Landed>, door_idle: 
     match under_way {
         UnderWay::Nothing => landed.nothing_in_flight && door_idle && counts_reported,
         UnderWay::OnlyQuiet { vouch_until } => counts_reported && landed.vouched_until == Some(vouch_until),
-        UnderWay::Working => false,
+        UnderWay::Working | UnderWay::Stopping => false,
     }
+}
+
+/// Whether the tick of a worker with `under_way` says its lease got
+/// shorter: it was told to stop while the last tick that landed had
+/// `vouched` for it. The broker then rings the look at lapsed leases,
+/// which was booked for the vouch.
+pub(super) fn shortens(vouched: Option<i64>, under_way: UnderWay) -> bool {
+    under_way == UnderWay::Stopping && vouched.is_some()
 }
 
 /// The tick's sleep and wake (see the module doc).
@@ -161,7 +179,7 @@ mod tests {
     async fn ticking_with(under_way: impl Fn() -> UnderWay + Send + Sync + 'static) -> (Arc<Door>, Arc<FakeDoorBroker>) {
         let broker = FakeDoorBroker::new(vec![route("t1", "route", "x")]);
         let door = door(broker.clone());
-        door.start_ticks(Box::new(under_way)).await.unwrap();
+        door.start_ticks(Box::new(under_way));
         (door, broker)
     }
 
@@ -179,14 +197,14 @@ mod tests {
     async fn the_door_ticks_while_a_run_goes_then_once_more_then_never() {
         let (door, broker) = ticking(|| false).await;
         sleep(secs(10.0)).await;
-        assert_eq!(ticks(&broker).len(), 1, "only the first tick, at startup: nothing came since");
+        assert!(ticks(&broker).is_empty(), "a door with nothing under way never ticks, at startup neither");
 
         let minute = the_minute();
         let Arrived::Run(admitted, _) = arrive(&door, &HeaderMap::new()).await else { panic!("admitted") };
         sleep(secs(3.5)).await;
         let busy = ticks(&broker);
-        assert!(busy.len() >= 5, "the call is decided on what the copy last heard, then its tick goes out at once, then one a second: {}", busy.len());
-        assert!(busy[2..].iter().all(|tick| tick.in_flight.get("t1") == Some(&1)), "every tick after the admission says the run is in flight");
+        assert!(busy.len() >= 4, "the call is decided on what the copy last heard, then its tick goes out at once, then one a second: {}", busy.len());
+        assert!(busy.iter().all(|tick| tick.in_flight.get("t1") == Some(&1)), "every tick after the admission says the run is in flight");
 
         drop(admitted);
         sleep(secs(3.0)).await;
@@ -214,14 +232,14 @@ mod tests {
         })
         .await;
         sleep(secs(20.0)).await;
-        assert_eq!(ticks(&broker).len(), 1, "asleep since the first tick");
+        assert!(ticks(&broker).is_empty(), "asleep since it started");
         *broker.tick_takes.lock().unwrap() = secs(2.0);
         holds.store(true, Ordering::SeqCst);
         let asked = Instant::now();
         door.wake();
         assert_eq!(asked.elapsed(), Duration::ZERO, "the run waited for nothing");
         sleep(secs(0.5)).await;
-        assert_eq!(ticks(&broker).len(), 2, "the tick it woke went out at once");
+        assert_eq!(ticks(&broker).len(), 1, "the tick it woke went out at once");
     }
 
     /// The broker being away when the worker wakes refuses nothing: the
@@ -270,7 +288,7 @@ mod tests {
         door.wake();
         sleep(secs(3.5)).await;
         let held = ticks(&broker).len();
-        assert!(held >= 5, "a tick at once, then one a second: {held}");
+        assert!(held >= 4, "a tick at once, then one a second: {held}");
         holds.store(false, Ordering::SeqCst);
         sleep(secs(1.5)).await;
         let after = ticks(&broker).len();
@@ -290,9 +308,9 @@ mod tests {
         assert!(matches!(arrive(&door, &headers).await, Arrived::Answer(_)), "refused");
         sleep(secs(30.0)).await;
         let ticks = ticks(&broker);
-        assert_eq!(ticks.len(), 2, "one tick for the refusal, then silence");
-        if ticks[1].window_start == minute {
-            assert!(ticks[1].counts.iter().any(|count| count.key.starts_with("t:-:")), "the refused token is counted");
+        assert_eq!(ticks.len(), 1, "one tick for the refusal, then silence");
+        if ticks[0].window_start == minute {
+            assert!(ticks[0].counts.iter().any(|count| count.key.starts_with("t:-:")), "the refused token is counted");
         }
     }
 
@@ -307,9 +325,9 @@ mod tests {
         armed(&mut trigger).spec.limits = weft_core::signal::EntryLimits { per_minute: Some(1), ..Default::default() };
         let broker = FakeDoorBroker::new(vec![trigger]);
         let door = door(broker.clone());
-        door.start_ticks(Box::new(|| UnderWay::Nothing)).await.unwrap();
+        door.start_ticks(Box::new(|| UnderWay::Nothing));
         sleep(secs(20.0)).await;
-        assert_eq!(ticks(&broker).len(), 1, "asleep since the first tick");
+        assert!(ticks(&broker).is_empty(), "asleep since it started");
 
         // Meanwhile another copy ran the minute's one run.
         let minute = the_minute();
@@ -347,21 +365,20 @@ mod tests {
     /// a tick that vouches for the worker until the earliest wait gives up,
     /// even though the run is still going (and still counted); a later
     /// wait, or a shorter one, vouches again before the door sleeps on; once
-    /// the run moves, the door ticks at once and vouches no more.
+    /// the run moves, the door ticks at once and vouches no more. None of
+    /// that says the lease got shorter: only a stop does, once.
     #[tokio::test(start_paused = true)]
     async fn a_door_whose_only_run_waits_vouches_until_its_wait_ends_and_sleeps() {
-        let quiet = Arc::new(std::sync::Mutex::new(None::<i64>));
+        let quiet = Arc::new(std::sync::Mutex::new(UnderWay::Working));
         let (door, broker) = ticking_with({
             let quiet = quiet.clone();
-            move || match *quiet.lock().unwrap() {
-                Some(vouch_until) => UnderWay::OnlyQuiet { vouch_until },
-                None => UnderWay::Working,
-            }
+            move || *quiet.lock().unwrap()
         })
         .await;
+        let wait_until = |vouch_until| *quiet.lock().unwrap() = UnderWay::OnlyQuiet { vouch_until };
         let Arrived::Run(_admitted, _) = arrive(&door, &HeaderMap::new()).await else { panic!("admitted") };
         sleep(secs(3.5)).await;
-        *quiet.lock().unwrap() = Some(5_000);
+        wait_until(5_000);
         sleep(secs(30.0)).await;
         let asleep = ticks(&broker);
         let last = asleep.last().unwrap();
@@ -369,27 +386,48 @@ mod tests {
         assert_eq!(last.in_flight.get("t1"), Some(&1), "the waiting run is still going, and counted");
         assert_eq!(asleep.iter().filter(|tick| tick.vouch_until.is_some()).count(), 1, "one vouching tick, then sleep");
 
-        *quiet.lock().unwrap() = Some(9_000);
+        wait_until(9_000);
         door.wake();
         sleep(secs(30.0)).await;
         let again = ticks(&broker);
         assert_eq!(again.len(), asleep.len() + 1, "a later wait vouches once more, then sleep");
         assert_eq!(again.last().unwrap().vouch_until, Some(9_000));
 
-        *quiet.lock().unwrap() = Some(7_000);
+        wait_until(7_000);
         door.wake();
         sleep(secs(30.0)).await;
         let shorter = ticks(&broker);
         assert_eq!(shorter.len(), again.len() + 1, "a shorter wait vouches again too");
         assert_eq!(shorter.last().unwrap().vouch_until, Some(7_000));
-        let again = shorter;
 
-        *quiet.lock().unwrap() = None;
+        *quiet.lock().unwrap() = UnderWay::Working;
         door.wake();
-        sleep(secs(0.5)).await;
+        sleep(secs(2.5)).await;
         let moved = ticks(&broker);
-        assert_eq!(moved.len(), again.len() + 1, "the run moved: the door ticks at once");
-        assert_eq!(moved.last().unwrap().vouch_until, None);
+        assert!(moved.len() >= shorter.len() + 2, "the run moved: the door ticks at once, then every second");
+        assert!(moved[shorter.len()..].iter().all(|tick| tick.vouch_until.is_none()));
+        assert!(!moved.iter().any(|tick| tick.shortens), "a wait that moves or vouches again rings nothing");
+
+        wait_until(8_000);
+        door.wake();
+        sleep(secs(30.0)).await;
+        let vouched = ticks(&broker);
+        assert_eq!(vouched.last().unwrap().vouch_until, Some(8_000), "asleep again, vouched for");
+        *quiet.lock().unwrap() = UnderWay::Stopping;
+        door.wake();
+        sleep(secs(2.5)).await;
+        let stopping = &ticks(&broker)[vouched.len()..];
+        assert!(stopping.len() >= 2, "told to stop: the door ticks at once, then every second");
+        assert!(stopping.iter().all(|tick| tick.vouch_until.is_none()));
+        assert_eq!(stopping.iter().map(|tick| tick.shortens).collect::<Vec<_>>()[..2], [true, false], "the first tick of the stop says the lease got shorter, once");
+    }
+
+    #[test]
+    fn only_a_stop_after_a_vouch_shortens_a_lease() {
+        assert!(shortens(Some(100), UnderWay::Stopping), "told to stop while vouched for");
+        assert!(!shortens(None, UnderWay::Stopping), "nothing vouched, nothing to shorten");
+        assert!(!shortens(Some(100), UnderWay::Working), "a wait that moves again");
+        assert!(!shortens(Some(100), UnderWay::OnlyQuiet { vouch_until: 50 }), "a shorter wait");
     }
 
     #[test]
@@ -410,6 +448,7 @@ mod tests {
         assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 115 }, None, false, true), "the last tick failed");
         assert!(!may_sleep(UnderWay::OnlyQuiet { vouch_until: 115 }, landed(Some(115)), false, false), "a count not reported yet");
         assert!(!may_sleep(UnderWay::Working, idle, true, true));
+        assert!(!may_sleep(UnderWay::Stopping, idle, true, true), "a stopping worker ticks while it lives");
     }
 
     /// A wake that comes before the loop starts waiting is kept for it: the

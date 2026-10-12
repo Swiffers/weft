@@ -18,7 +18,8 @@ resource "google_pubsub_topic_iam_member" "core_announces_news" {
   member = local.core
 }
 
-# A broker copy attaches its subscription to this topic, and to no other.
+# A broker copy attaches its subscription to this topic (and a holder copy
+# to the holders topic below), and to no other.
 resource "google_project_iam_custom_role" "news_attach" {
   role_id     = "${replace(var.name, "-", "_")}_news_attach"
   title       = "weft news: attach a subscription"
@@ -31,9 +32,32 @@ resource "google_pubsub_topic_iam_member" "core_attaches_to_news" {
   member = local.core
 }
 
-# Making, pulling from and deleting the copy's own subscription. Its name
-# is made while it runs, so these rights cannot sit on the subscription
-# itself. An IAM Condition cannot match Pub/Sub subscriptions by name
+# What the holders need to hear without the database: the set of held
+# signals changed, or a connection's access changed. The dispatcher
+# announces it here, and every holder copy makes a subscription of its own
+# to this topic while it runs and pulls from it, as the broker copies do
+# with the news topic. The holders run as the core account too.
+resource "google_pubsub_topic" "holders" {
+  name       = "${var.name}-holders"
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_pubsub_topic_iam_member" "core_announces_to_holders" {
+  topic  = google_pubsub_topic.holders.id
+  role   = "roles/pubsub.publisher"
+  member = local.core
+}
+
+resource "google_pubsub_topic_iam_member" "core_attaches_to_holders" {
+  topic  = google_pubsub_topic.holders.id
+  role   = google_project_iam_custom_role.news_attach.id
+  member = local.core
+}
+
+# Making, pulling from and deleting a copy's own subscription, the broker
+# copies' on the news topic and the holder copies' on the holders one. Its
+# name is made while it runs, so these rights cannot sit on the
+# subscription itself. An IAM Condition cannot match Pub/Sub subscriptions by name
 # either: of Pub/Sub, only Pub/Sub Lite is among the services whose
 # resources IAM Conditions' resource attributes cover. So these three are
 # granted on the project, and the core account may also consume and delete

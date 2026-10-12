@@ -9,6 +9,7 @@ use super::ElevenLabsCloneVoiceNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("clones_and_emits_the_voice_id", clones),
+        NodeTest::fake("labels_ride_the_form_as_json", labels),
         NodeTest::fake("no_samples_fails_the_run_even_when_error_is_wired", no_samples),
         NodeTest::fake("a_refused_clone_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_clone_comes_out_on_error_when_it_is_wired", refused_wired),
@@ -42,6 +43,8 @@ async fn live_clone(rig: LiveRig) -> WeftResult<()> {
     let minted = outcome.output("voiceId")?.as_str().expect("voice id").to_string();
     weft::with_cleanup(
         || async {
+            let verification = outcome.output("requiresVerification")?;
+            assert!(verification.is_boolean(), "ElevenLabs says whether the voice needs verifying: {verification}");
             let read = weft::access::client::get_json(
                 conn.client(),
                 &format!("{}/voices/{minted}", crate::elevenlabs::API),
@@ -56,8 +59,22 @@ async fn live_clone(rig: LiveRig) -> WeftResult<()> {
     .await
 }
 
+/// The multipart body the clone went out with.
+fn clone_form(rig: &FakeRig) -> String {
+    rig.requests()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path == "/v1/voices/add")
+        .and_then(|r| r.body_text)
+        .expect("the node sent a multipart clone")
+}
+
+/// Whether the multipart `form` holds a text field `name` set to `value`.
+fn has_field(form: &str, name: &str, value: &str) -> bool {
+    form.contains(&format!("name=\"{name}\"\r\n\r\n{value}\r\n"))
+}
+
 async fn clones(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/v1/voices/add", json!({ "voice_id": "voice-new" }));
+    rig.respond("POST", "/v1/voices/add", json!({ "voice_id": "voice-new", "requires_verification": false }));
     let a = rig.store_file("sample_a.mp3", "audio/mpeg", b"aaa".to_vec());
     let b = rig.store_file("sample_b.mp3", "audio/mpeg", b"bbb".to_vec());
     let outcome = rig
@@ -73,6 +90,35 @@ async fn clones(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["voiceId"], json!("voice-new"));
+    assert_eq!(outcome.outputs["requiresVerification"], json!(false));
+
+    let form = clone_form(&rig);
+    assert!(has_field(&form, "name", "Narrator"), "{form}");
+    assert!(form.contains("name=\"files\"; filename=\"sample_a.mp3\""), "{form}");
+    assert!(form.contains("name=\"files\"; filename=\"sample_b.mp3\""), "{form}");
+    assert!(!form.contains("name=\"labels\""), "no labels given, none sent: {form}");
+    assert!(!form.contains("name=\"remove_background_noise\""), "noise removal stays off unless turned on: {form}");
+    Ok(())
+}
+
+async fn labels(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v1/voices/add", json!({ "voice_id": "voice-new", "requires_verification": true }));
+    let a = rig.store_file("sample_a.mp3", "audio/mpeg", b"aaa".to_vec());
+    let outcome = rig
+        .run(
+            &ElevenLabsCloneVoiceNode,
+            json!({
+                "account": rig.access("elevenlabs"),
+                "name": "Narrator",
+                "samples": [a],
+                "labels": { "language": "en", "accent": "en-US" },
+            }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["requiresVerification"], json!(true), "ElevenLabs's own flag, passed on");
+    let form = clone_form(&rig);
+    assert!(has_field(&form, "labels", r#"{"accent":"en-US","language":"en"}"#), "{form}");
     Ok(())
 }
 

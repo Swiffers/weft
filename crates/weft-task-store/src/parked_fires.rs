@@ -42,14 +42,23 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             payload JSONB NOT NULL,
             -- Who sent it, for a trigger somebody outside calls.
             caller TEXT,
-            -- How many times it failed to become a run, and the moment it
-            -- may be tried again (`park_backoff_secs`).
+            -- How many times it waited for room to run, and the moment
+            -- it may be tried again (`park_backoff_secs`).
             attempts INTEGER NOT NULL DEFAULT 0,
             not_before BIGINT NOT NULL,
-            -- Set while it waits on what its instance provides: the
-            -- refusal, naming each field. Not retried on a timer: the
-            -- instance's next change of values routes it again.
+            -- Set while it waits on something no clock brings
+            -- (`WaitsFor`, `<kind>: <reason>`): a value its instance has
+            -- not given, infra the run reads, connections the install has
+            -- not picked, or a hand-over that kept failing. Not retried on
+            -- a timer: what it waits on hands it over.
+            waits_for TEXT,
+            -- Read by nothing: the instance refusal the previous release
+            -- wrote where `waits_for` is now (its migration carries each
+            -- into `waits_for`), which its replicas still write while an
+            -- upgrade rolls out. The release after this one drops it.
             instance_gap JSONB,
+            -- How many hand-overs in a row failed (`Turn::next`).
+            failures INTEGER NOT NULL DEFAULT 0,
             -- An answer to a waiting run, rather than an event of an entry.
             is_resume BOOLEAN NOT NULL,
             -- An answer that is a person skipping the wait (its `/skip`
@@ -115,8 +124,99 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     seed: &[],
 };
 
+pub use weft_core::door_fire::{UnclockedWait, WaitsOn};
+
+/// What a queued event waits on that no clock brings, as
+/// `parked_fire.waits_for` holds it (`<kind>: <reason>`): a value its
+/// instance has not given, infra the run reads, connections the install
+/// has not picked, or a hand-over that kept failing ([`UnclockedWait`]).
+/// Shown per trigger by `weft status` and `ctx.instances().list()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub struct WaitsFor {
+    pub on: UnclockedWait,
+    /// Why, as whoever parked it said (an instance's refusal names each
+    /// field; a failure is its error).
+    pub reason: String,
+}
+
+impl WaitsFor {
+    /// What it waits on, for the kinds a clock does not bring.
+    pub fn new(on: WaitsOn, reason: &str) -> Option<Self> {
+        on.unclocked().map(|on| WaitsFor { on, reason: reason.to_string() })
+    }
+
+    /// Read `parked_fire.waits_for`.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let (kind, reason) = text.split_once(": ").ok_or_else(|| anyhow::anyhow!("'{text}' names no kind"))?;
+        WaitsOn::parse(kind)
+            .and_then(|on| Self::new(on, reason))
+            .ok_or_else(|| anyhow::anyhow!("'{kind}' is nothing a queued event waits on without a clock"))
+    }
+}
+
+impl From<WaitsFor> for String {
+    fn from(waits: WaitsFor) -> String {
+        format!("{}: {}", waits.on.as_str(), waits.reason)
+    }
+}
+
+impl TryFrom<String> for WaitsFor {
+    type Error = anyhow::Error;
+    fn try_from(text: String) -> anyhow::Result<Self> {
+        Self::parse(&text)
+    }
+}
+
+/// Seconds after which a hand-over that failed is tried again, in a row:
+/// past the last, the event stops ([`WaitsOn::Failure`]).
+const FAILURE_RETRIES_SECS: [i64; 2] = [5, 20];
+
+/// When, and on what, a queued event is tried again: the columns a park
+/// writes and a drain stamps on a head it could not hand over.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    pub attempts: u32,
+    pub not_before: i64,
+    pub waits_for: Option<WaitsFor>,
+    pub failures: u32,
+}
+
+impl Turn {
+    /// The turn of an event that waited for room `attempts` times and
+    /// failed `failures` times in a row before, and now waits on `on`
+    /// for `reason`, at `now` (unix seconds):
+    ///   - room or its trigger: after its backoff, which grows with each
+    ///     wait (the sweep leaves a parked trigger's queue alone, and the
+    ///     activation that brings it back hands it over whatever its
+    ///     clock says);
+    ///   - its instance, infra or picks: on that, never on a clock;
+    ///   - a failure: [`FAILURE_RETRIES_SECS`] later, and past the last
+    ///     it stops until something that may fix it hands it over.
+    pub fn next(attempts: u32, failures: u32, on: WaitsOn, reason: &str, now: i64) -> Self {
+        match on {
+            WaitsOn::Room | WaitsOn::Trigger => {
+                let attempts = attempts.saturating_add(1);
+                Turn { attempts, not_before: now + park_backoff_secs(attempts), waits_for: None, failures: 0 }
+            }
+            WaitsOn::Instance | WaitsOn::Infra | WaitsOn::Picks => Turn { attempts, not_before: now, waits_for: WaitsFor::new(on, reason), failures: 0 },
+            WaitsOn::Failure => {
+                let failures = failures.saturating_add(1);
+                match usize::try_from(failures - 1).ok().and_then(|tried| FAILURE_RETRIES_SECS.get(tried)) {
+                    Some(after) => Turn { attempts, not_before: now + after, waits_for: None, failures },
+                    None => Turn { attempts, not_before: now, waits_for: WaitsFor::new(on, reason), failures },
+                }
+            }
+        }
+    }
+}
+
 /// An event as it waits in its trigger's queue: what [`park`] writes.
+/// Read through [`WaitingWire`], so a park from a worker built by the
+/// previous release (whose program keeps running until it is built again)
+/// is taken too.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "WaitingWire")]
 pub struct Waiting {
     /// The event's identity: the run it starts is
     /// `weft_core::door_fire::run_of_fire(fire_id)`, so an event handed
@@ -129,20 +229,46 @@ pub struct Waiting {
     /// (`weft_core::door_fire::DoorFire::caller`): what its per-caller
     /// limit counts when it is handed over.
     pub caller: Option<String>,
-    /// How many times it failed to become a run. Zero for an event parked
-    /// by its trigger's standing. Drives the backoff ([`park_backoff_secs`]).
+    /// How many times it waited for room to run. Drives the backoff
+    /// ([`park_backoff_secs`]).
     pub attempts: u32,
     /// Not handed over before this instant (unix seconds).
     pub not_before: i64,
-    /// Set when it waits on what its instance provides: the refusal,
-    /// naming each field. Not retried on a timer: the instance's next
-    /// change of values routes it again. Shown per trigger by `weft status`
-    /// and `ctx.instances().list()`.
-    pub instance_gap: Option<String>,
+    /// Set while it waits on something no clock brings ([`WaitsFor`]).
+    pub waits_for: Option<WaitsFor>,
+    /// How many hand-overs of it failed in a row.
+    pub failures: u32,
     /// An answer (`is_resume`) that is a person skipping the wait, not a
     /// value: `payload` is then null and unread. Always false for an
     /// entry's event.
     pub skipped: bool,
+}
+
+/// [`Waiting`] as a worker sends it. A worker of the previous release
+/// sends neither `waits_for` nor `failures`, and says an event waits on
+/// its instance with `instance_gap` (the refusal, naming each field).
+#[derive(Deserialize)]
+struct WaitingWire {
+    fire_id: uuid::Uuid,
+    payload: Value,
+    caller: Option<String>,
+    attempts: u32,
+    not_before: i64,
+    #[serde(default)]
+    waits_for: Option<WaitsFor>,
+    #[serde(default)]
+    instance_gap: Option<String>,
+    #[serde(default)]
+    failures: u32,
+    skipped: bool,
+}
+
+impl From<WaitingWire> for Waiting {
+    fn from(wire: WaitingWire) -> Self {
+        let WaitingWire { fire_id, payload, caller, attempts, not_before, waits_for, instance_gap, failures, skipped } = wire;
+        let waits_for = waits_for.or_else(|| instance_gap.and_then(|gap| WaitsFor::new(WaitsOn::Instance, &gap)));
+        Waiting { fire_id, payload, caller, attempts, not_before, waits_for, failures, skipped }
+    }
 }
 
 impl Waiting {
@@ -161,17 +287,19 @@ fn answer_row(answer: &weft_core::primitive::WaitAnswer) -> (Value, bool) {
     }
 }
 
-fn stored_answer(payload: Value, skipped: bool) -> weft_core::primitive::WaitAnswer {
+/// A stored answer as the run takes it: a skip, or the value given.
+pub fn stored_answer(payload: Value, skipped: bool) -> weft_core::primitive::WaitAnswer {
     match skipped {
         true => weft_core::primitive::WaitAnswer::Skipped,
         false => weft_core::primitive::WaitAnswer::Given { value: payload },
     }
 }
 
-/// Seconds an event waits before its `attempts`-th retry: 1, 2, 4, ...
-/// doubling, capped at five minutes. The first failure retries almost at
-/// once (a transient read); an event that keeps failing settles at the cap
-/// and the dispatcher's parked-fire sweep picks it up when due.
+/// Seconds an event waits before its `attempts`-th try for room: 1, 2,
+/// 4, ... doubling, capped at five minutes. Room comes back as the
+/// program's runs end or a limit's window does, so the first try is
+/// almost at once; one that keeps finding none settles at the cap, and
+/// the dispatcher's parked-fire sweep picks it up when due.
 pub fn park_backoff_secs(attempts: u32) -> i64 {
     const CAP_SECS: i64 = 300;
     if attempts == 0 {
@@ -186,18 +314,24 @@ pub fn park_backoff_secs(attempts: u32) -> i64 {
 /// flood is refused loudly (`QueueFull`). A run's wait holds one answer.
 pub const MAX_PARKED_ENTRY_FIRES: i64 = 1000;
 
-/// An event that could not become a run now, as it waits: its
-/// `attempts`-th failure, retried after its backoff.
-pub fn waiting(fire_id: uuid::Uuid, payload: Value, caller: Option<String>, attempts: u32, instance_gap: Option<String>) -> Waiting {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    Waiting { fire_id, payload, caller, attempts, not_before: now + park_backoff_secs(attempts), instance_gap, skipped: false }
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-/// An answer to a waiting run, as it waits until the run can take it:
-/// [`waiting`] for a value, or a person's skip.
+/// An event that could not become a run now, as it waits: it waited for
+/// room `attempts` times before, and now waits on `on` for `reason`
+/// ([`Turn::next`]).
+pub fn waiting(fire_id: uuid::Uuid, payload: Value, caller: Option<String>, attempts: u32, on: WaitsOn, reason: &str) -> Waiting {
+    let Turn { attempts, not_before, waits_for, failures } = Turn::next(attempts, 0, on, reason, now_unix());
+    Waiting { fire_id, payload, caller, attempts, not_before, waits_for, failures, skipped: false }
+}
+
+/// An answer to a waiting run, as it waits until the run can take it: a
+/// value, or a person's skip. Handed over as soon as its run's trigger
+/// takes work.
 pub fn waiting_answer(fire_id: uuid::Uuid, answer: weft_core::primitive::WaitAnswer) -> Waiting {
     let (payload, skipped) = answer_row(&answer);
-    Waiting { skipped, ..waiting(fire_id, payload, None, 0, None) }
+    Waiting { fire_id, payload, caller: None, attempts: 0, not_before: now_unix(), waits_for: None, failures: 0, skipped }
 }
 
 /// THE one park. Every park site (an answer whose run cannot take it now, a
@@ -240,16 +374,17 @@ pub async fn park(pool: &sqlx::PgPool, token: &str, waiting: &Waiting, held_by: 
         return Ok(ParkAppend::Refused(ParkRefusal::QueueFull));
     }
     let inserted = sqlx::query(
-        "INSERT INTO parked_fire (token, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume, skipped) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (fire_id) DO NOTHING",
+        "INSERT INTO parked_fire (token, fire_id, payload, caller, attempts, not_before, waits_for, failures, is_resume, skipped) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (fire_id) DO NOTHING",
     )
     .bind(token)
     .bind(waiting.fire_id)
     .bind(&waiting.payload)
     .bind(&waiting.caller)
-    .bind(waiting.attempts as i32)
+    .bind(count(waiting.attempts))
     .bind(waiting.not_before)
-    .bind(waiting.instance_gap.as_ref().map(sqlx::types::Json))
+    .bind(waiting.waits_for.clone().map(String::from))
+    .bind(count(waiting.failures))
     .bind(is_resume)
     .bind(waiting.skipped)
     .execute(&mut *tx)
@@ -297,38 +432,47 @@ pub struct Head {
     pub is_resume: bool,
 }
 
+/// A count as its `INTEGER` column holds it.
+fn count(n: u32) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// The columns a head is read with.
+const HEAD_COLUMNS: &str = "token, seq, fire_id, payload, caller, attempts, not_before, waits_for, failures, is_resume, skipped";
+
 /// Take the head of `token`'s queue on the caller's transaction, locked
 /// for it (`FOR UPDATE SKIP LOCKED`: a head another drain holds is
 /// skipped, and the row behind it is no head while it waits). `None` when
 /// the queue is empty, its head is locked, or its head is not due at `now`
-/// (backing off, or waiting on its instance): one trigger's events never
-/// overtake each other.
+/// (backing off, or waiting on something no clock brings): one trigger's
+/// events never overtake each other.
 pub async fn take_head(tx: &mut sqlx::PgConnection, token: &str, now: i64) -> anyhow::Result<Option<Head>> {
-    let row: Option<HeadRow> = sqlx::query_as(
-        "SELECT token, seq, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume, skipped FROM parked_fire p \
+    let row: Option<HeadRow> = sqlx::query_as(&format!(
+        "SELECT {HEAD_COLUMNS} FROM parked_fire p \
          WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
-           AND p.not_before <= $2 AND p.instance_gap IS NULL \
-         FOR UPDATE SKIP LOCKED",
-    )
+           AND p.not_before <= $2 AND p.waits_for IS NULL \
+         FOR UPDATE SKIP LOCKED"
+    ))
     .bind(token)
     .bind(now)
     .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.map(HeadRow::into_head))
+    row.map(HeadRow::into_head).transpose()
 }
 
-/// The heads of `token`'s queue a person or an instance's change routes
-/// again, whatever their backoff: the same as [`take_head`] but due now.
+/// The head of `token`'s queue, whatever its turn says: the same as
+/// [`take_head`] for what something that happened hands over again (an
+/// activation, an instance's values changing, infra coming back).
 pub async fn take_head_now(tx: &mut sqlx::PgConnection, token: &str) -> anyhow::Result<Option<Head>> {
-    let row: Option<HeadRow> = sqlx::query_as(
-        "SELECT token, seq, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume, skipped FROM parked_fire p \
+    let row: Option<HeadRow> = sqlx::query_as(&format!(
+        "SELECT {HEAD_COLUMNS} FROM parked_fire p \
          WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
-         FOR UPDATE SKIP LOCKED",
-    )
+         FOR UPDATE SKIP LOCKED"
+    ))
     .bind(token)
     .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.map(HeadRow::into_head))
+    row.map(HeadRow::into_head).transpose()
 }
 
 /// A head handed over: it goes.
@@ -341,16 +485,16 @@ pub async fn remove_in(tx: &mut sqlx::PgConnection, head: &Head) -> anyhow::Resu
     Ok(())
 }
 
-/// A head that could not be handed over: it stays the head, tried again at
-/// `not_before` after `attempts` failures, or, waiting on its instance
-/// (`instance_gap`), on the instance's next change.
-pub async fn restamp_in(tx: &mut sqlx::PgConnection, head: &Head, attempts: u32, not_before: i64, instance_gap: Option<&str>) -> anyhow::Result<()> {
-    sqlx::query("UPDATE parked_fire SET attempts = $3, not_before = $4, instance_gap = $5 WHERE token = $1 AND seq = $2")
+/// A head that could not be handed over: it stays the head, tried again
+/// as `turn` says.
+pub async fn restamp_in(tx: &mut sqlx::PgConnection, head: &Head, turn: &Turn) -> anyhow::Result<()> {
+    sqlx::query("UPDATE parked_fire SET attempts = $3, not_before = $4, waits_for = $5, failures = $6 WHERE token = $1 AND seq = $2")
         .bind(&head.token)
         .bind(head.seq)
-        .bind(attempts as i32)
-        .bind(not_before)
-        .bind(instance_gap.map(sqlx::types::Json))
+        .bind(count(turn.attempts))
+        .bind(turn.not_before)
+        .bind(turn.waits_for.clone().map(String::from))
+        .bind(count(turn.failures))
         .execute(&mut *tx)
         .await?;
     Ok(())
@@ -377,16 +521,27 @@ pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, execution_
     Ok(())
 }
 
-/// The answers handed to run `execution_id` ([`hand_answer_in`]), oldest
-/// first: what the worker driving the run takes. They go once the run's
-/// record holds them (`weft_record_batch` deletes the answers a batch
-/// resolves).
+/// THE answers handed to runs ([`hand_answer_in`]), as a SQL `SELECT` of
+/// `(execution_id, token, payload, skipped, seq)` for the runs the SQL
+/// expression `runs` names (an id, or a subquery of ids). Read oldest first
+/// (`ORDER BY seq`), each answer decoded with [`stored_answer`]. Every
+/// reader of a run's answers ([`answers_for`], the broker's recheck of a
+/// worker's runs) reads them through here.
+pub fn handed_answers_sql(runs: &str) -> String {
+    format!("SELECT p.execution_id, p.token, p.payload, p.skipped, p.seq FROM parked_fire p WHERE p.execution_id IN ({runs})")
+}
+
+/// The answers handed to run `execution_id` ([`handed_answers_sql`]),
+/// oldest first: what the worker driving the run takes. They go once the
+/// run's record holds them (`weft_record_batch` deletes the answers a
+/// batch resolves).
 pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
-    let rows: Vec<(String, Value, bool)> = sqlx::query_as("SELECT token, payload, skipped FROM parked_fire WHERE execution_id = $1 ORDER BY seq")
-        .bind(execution_id)
-        .fetch_all(executor)
-        .await?;
-    Ok(rows.into_iter().map(|(token, payload, skipped)| (token, stored_answer(payload, skipped))).collect())
+    let rows: Vec<(weft_core::ExecutionId, String, Value, bool, i64)> =
+        sqlx::query_as(&format!("{} ORDER BY seq", handed_answers_sql("$1")))
+            .bind(execution_id)
+            .fetch_all(executor)
+            .await?;
+    Ok(rows.into_iter().map(|(_, token, payload, skipped, _)| (token, stored_answer(payload, skipped))).collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -398,27 +553,29 @@ struct HeadRow {
     caller: Option<String>,
     attempts: i32,
     not_before: i64,
-    instance_gap: Option<sqlx::types::Json<String>>,
+    waits_for: Option<String>,
+    failures: i32,
     is_resume: bool,
     skipped: bool,
 }
 
 impl HeadRow {
-    fn into_head(self) -> Head {
-        Head {
+    fn into_head(self) -> anyhow::Result<Head> {
+        Ok(Head {
             token: self.token,
             seq: self.seq,
             waiting: Waiting {
                 fire_id: self.fire_id,
                 payload: self.payload,
                 caller: self.caller,
-                attempts: self.attempts.max(0) as u32,
+                attempts: self.attempts.max(0).unsigned_abs(),
                 not_before: self.not_before,
-                instance_gap: self.instance_gap.map(|gap| gap.0),
+                waits_for: self.waits_for.as_deref().map(WaitsFor::parse).transpose()?,
+                failures: self.failures.max(0).unsigned_abs(),
                 skipped: self.skipped,
             },
             is_resume: self.is_resume,
-        }
+        })
     }
 }
 
@@ -440,12 +597,78 @@ mod park_backoff_tests {
         assert_eq!(park_backoff_secs(u32::MAX), 300);
     }
 
-    /// An event parked now waits its backoff: none for one that never
-    /// failed.
+    /// An event waiting for room or its trigger waits its backoff, longer
+    /// each time; one waiting on its instance, its infra or its picks is
+    /// never due on a clock.
     #[test]
-    fn an_event_waits_its_backoff() {
-        let fresh = waiting(uuid::Uuid::nil(), Value::Null, None, 0, None);
-        let failed = waiting(uuid::Uuid::nil(), Value::Null, None, 3, None);
-        assert_eq!(failed.not_before - fresh.not_before, 4);
+    fn an_event_waits_on_what_parked_it() {
+        let now = 1_000;
+        let room = Turn::next(3, 0, WaitsOn::Room, "full", now);
+        assert_eq!((room.attempts, room.not_before, room.waits_for), (4, now + 8, None));
+        let trigger = Turn::next(3, 2, WaitsOn::Trigger, "parked", now);
+        assert_eq!(trigger, Turn { attempts: 4, not_before: now + 8, waits_for: None, failures: 0 }, "a failure streak ends");
+        for (on, unclocked) in [
+            (WaitsOn::Instance, UnclockedWait::Instance),
+            (WaitsOn::Infra, UnclockedWait::Infra),
+            (WaitsOn::Picks, UnclockedWait::Picks),
+        ] {
+            let turn = Turn::next(3, 0, on, "why", now);
+            assert_eq!(turn.waits_for, Some(WaitsFor { on: unclocked, reason: "why".into() }));
+            assert_eq!(turn.attempts, 3, "waiting on an event is no try for room");
+        }
+    }
+
+    /// A hand-over that fails is tried again after 5 then 20 seconds,
+    /// and the third failure in a row stops it until something hands it
+    /// over.
+    #[test]
+    fn a_failing_event_tries_twice_more_then_stops() {
+        let now = 1_000;
+        let first = Turn::next(0, 0, WaitsOn::Failure, "unreachable", now);
+        assert_eq!((first.failures, first.not_before, first.waits_for), (1, now + 5, None));
+        let second = Turn::next(0, first.failures, WaitsOn::Failure, "unreachable", now);
+        assert_eq!((second.failures, second.not_before, second.waits_for), (2, now + 20, None));
+        let third = Turn::next(0, second.failures, WaitsOn::Failure, "unreachable", now);
+        assert_eq!(third.waits_for, Some(WaitsFor { on: UnclockedWait::Failure, reason: "unreachable".into() }));
+    }
+
+    /// What an event waits on reads back as it was written, and nothing
+    /// a clock brings is ever written.
+    #[test]
+    fn waits_for_reads_back_as_written() {
+        let waits = WaitsFor::new(WaitsOn::Instance, "instance 'ada' at 'answer': 'key' is not filled").unwrap();
+        let text = String::from(waits.clone());
+        assert_eq!(text, "instance: instance 'ada' at 'answer': 'key' is not filled");
+        assert_eq!(WaitsFor::parse(&text).unwrap(), waits);
+        assert!(WaitsFor::new(WaitsOn::Room, "full").is_none());
+        assert!(WaitsFor::parse("room: full").is_err());
+        assert!(WaitsFor::parse("no kind").is_err());
+    }
+
+    /// A park reads back on the broker as the worker sent it, what it
+    /// waits on included.
+    #[test]
+    fn a_park_reads_back_as_sent() {
+        let now = waiting(uuid::Uuid::nil(), Value::Null, None, 0, WaitsOn::Picks, "pick a connection");
+        let wire = serde_json::to_value(&now).unwrap();
+        assert_eq!(wire["waits_for"], serde_json::json!("picks: pick a connection"));
+        assert_eq!(serde_json::from_value::<Waiting>(wire).unwrap(), now);
+    }
+
+    /// A worker of the previous release parks without `waits_for` and
+    /// `failures`, and says an event waits on its instance with
+    /// `instance_gap`: its park is taken, waiting on that instance.
+    #[test]
+    fn a_park_from_the_previous_release_is_taken() {
+        let old = serde_json::json!({
+            "fire_id": uuid::Uuid::nil(), "payload": null, "caller": null, "attempts": 2, "not_before": 7,
+            "instance_gap": "instance 'ada' at 'answer': 'key' is not filled", "skipped": false,
+        });
+        let read = serde_json::from_value::<Waiting>(old.clone()).unwrap();
+        assert_eq!((read.attempts, read.not_before, read.failures), (2, 7, 0));
+        assert_eq!(read.waits_for, WaitsFor::new(WaitsOn::Instance, "instance 'ada' at 'answer': 'key' is not filled"));
+        let mut clocked = old;
+        clocked["instance_gap"] = Value::Null;
+        assert_eq!(serde_json::from_value::<Waiting>(clocked).unwrap().waits_for, None);
     }
 }

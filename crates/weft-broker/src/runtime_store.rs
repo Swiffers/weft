@@ -37,12 +37,12 @@ use crate::entitlement::{lock_tenant_storage, EntitlementSource};
 pub use weft_core::storage::DEFAULT_KEEP_TTL_SECS;
 
 /// How long an UN-KEPT completed exec file lingers after its run terminates
-/// before the expiry sweep deletes it. The terminate sweep stamps
+/// before it expires. The terminate sweep stamps
 /// `expires_at_unix = now + this` instead of deleting outright, so a user can
 /// still open the files list and download a run's output right after the run
-/// ends. Deletion then happens on the next expiry-sweep tick past the
-/// deadline, and the stamped expiry is what the file lists surface as the
-/// remaining lifetime.
+/// ends. It reads as gone once the deadline passes and the expiry loop
+/// removes it then, and the stamped expiry is what the file lists surface as
+/// the remaining lifetime.
 pub const EXEC_LINGER_TTL_SECS: i64 = 5 * 60;
 
 /// Default lifetime of a presigned URL when the caller doesn't choose one.
@@ -99,17 +99,66 @@ fn object_key(key: &str) -> String {
     format!("{RUNTIME_PREFIX}{key}")
 }
 
+/// The loop that removes expired files ([`RuntimeStore::expire`]).
+pub const FILE_EXPIRY_LOOP: &str = "runtime_file_expiry";
+
+/// Announced when a write sets a file's expiry sooner than the expiry
+/// loop may next look (as far as this broker copy knows): the loop looks
+/// at once and books its next look at the soonest expiry.
+pub const FILE_EXPIRY_CHANNEL: &str = "weft_file_expiry";
+
+/// What wakes the expiry loop.
+pub static FILE_EXPIRY_WAKE: &[weft_task_store::drain::WakeOn] = &[weft_task_store::drain::WakeOn::any(FILE_EXPIRY_CHANNEL)];
+
+/// What the expiry loop does, in a person's words.
+pub const FILE_EXPIRY_LABEL: &str = "expire stored files";
+
+/// The pauses between the expiry loop's tries of one row's reap: three
+/// tries in all, after which the row stays marked and the pass goes on. A
+/// reap on a person's upload is tried once: it never waits on these.
+const REAP_RETRY_PAUSES: [std::time::Duration; 2] = [std::time::Duration::from_millis(500), std::time::Duration::from_secs(2)];
+
+/// SQL: the row is fenced for removal ('reaping') and nobody is reaping
+/// it at `now_param` (a bind holding the store's clock): its claim lapsed
+/// ([`CLAIM_LEASE_SECS`]) because its reap crashed, or its reap failed
+/// and gave the claim back ([`RuntimeStore::mark_reap_failed`]). A claim
+/// still running is some call's reap in progress, and nothing else takes
+/// it.
+fn reap_lapsed(now_param: &str) -> String {
+    format!("(status = 'reaping' AND progressed_at_unix < {now_param} - {CLAIM_LEASE_SECS})")
+}
+
+/// SQL: fence row `$1` for removal ('reaping'), claimed at `$2` (the
+/// store's clock), where `condition` (more `AND` clauses, or nothing) still
+/// holds. Every flip to 'reaping' goes through here, so every reap holds a
+/// claim ([`reap_lapsed`]).
+fn fence_sql(condition: &str) -> String {
+    format!("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1 {condition}")
+}
+
+/// SQL condition: the row has not expired by `now_param` (a bind holding
+/// the store's clock). Every read of a file a person or a node sees
+/// carries it, so a file is gone the moment it expires whenever the
+/// expiry loop gets to it. Asset reads leave it out: an asset's life
+/// follows the sources that reference it, and publishing brings it back.
+fn unexpired(now_param: &str) -> String {
+    format!("(expires_at_unix IS NULL OR expires_at_unix >= {now_param})")
+}
+
 /// A key's upload row in any status, as [`PendingUpload`] reads it; callers
 /// add the status they accept.
 const PENDING_ROW_SELECT_ANY: &str = "SELECT status, tenant_id, keep_ttl_secs, upload_id, part_size, declared_size, replaces \
      FROM runtime_file WHERE key = $1";
 
-/// How long a completion may hold its 'completing' mark before the expiry
-/// sweep drives it itself. Only a completion whose process crashed or
-/// whose request was dropped mid-way stays marked; a live one finishes in
-/// one bucket call. Driving early is harmless (two drives of one upload
-/// agree), so this only spares the sweep work a live completion is doing.
-pub const COMPLETING_LEASE_SECS: i64 = 5 * 60;
+/// How long a claim on a row ('completing' or 'reaping', stamped in
+/// `progressed_at_unix`) holds before another call takes the row over.
+/// Only a claim whose process crashed or whose request was dropped
+/// mid-way stays that long (a failed reap gives its claim back at once);
+/// a live one finishes in a few
+/// bucket calls. A completion driven early is harmless (two drives of one
+/// upload agree), so for it this only spares work a live completion is
+/// doing; a reap is never run twice at once.
+pub const CLAIM_LEASE_SECS: i64 = 5 * 60;
 
 /// The statement deleting the row at key `$1` that also matches
 /// `condition`, for every path that ends an upload without completing
@@ -118,11 +167,14 @@ pub const COMPLETING_LEASE_SECS: i64 = 5 * 60;
 /// completion, a reap) the file's bytes may already be the new ones:
 /// the file moves to its next version either way, so a value read
 /// before can never pass for the content now there.
+/// Answers one row: whether the row deleted carried a failed reap's mark
+/// (`reap_error`).
 fn delete_upload_row(condition: &str) -> String {
     format!(
-        "WITH gone AS (DELETE FROM runtime_file WHERE key = $1 {condition} RETURNING replaces) \
-         UPDATE runtime_file SET version = version + 1 \
-         WHERE key IN (SELECT replaces FROM gone WHERE replaces IS NOT NULL)"
+        "WITH gone AS (DELETE FROM runtime_file WHERE key = $1 {condition} RETURNING replaces, reap_error), \
+         moved AS (UPDATE runtime_file SET version = version + 1 \
+                   WHERE key IN (SELECT replaces FROM gone WHERE replaces IS NOT NULL)) \
+         SELECT EXISTS (SELECT 1 FROM gone WHERE reap_error IS NOT NULL)"
     )
 }
 
@@ -289,11 +341,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- upload (its parts are final) and is having the bucket assemble
             -- the object; nothing may abort it, change its parts, or remove
             -- the file it replaces until it lands, and progressed_at_unix
-            -- holds the claim time, from which the expiry sweep drives a
-            -- completion its caller abandoned. 'reaping': a sweep fenced the row for removal
+            -- holds the claim time, from which the tenant's next upload drives
+            -- a completion its caller abandoned. 'reaping': a call fenced the row for removal
             -- (writers and reads are locked out; the bucket state goes next,
-            -- then the row; a crash mid-reap leaves the row in 'reaping' and
-            -- every sweep scan re-finds and retries it). Only 'active' rows
+            -- then the row), and progressed_at_unix holds the claim time; a
+            -- reap that crashed or failed leaves the row in 'reaping', and
+            -- once its claim lapsed (or a failed reap gave it back) the
+            -- expiry loop, a wipe or the tenant's next upload takes it
+            -- over. Only 'active' rows
             -- appear in user listings / gets; ALL statuses count toward the
             -- byte quota ('active' by size_bytes, others by reserved_bytes),
             -- which is what makes an in-flight upload unable to blow past the
@@ -328,7 +383,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             reserved_bytes     BIGINT NOT NULL DEFAULT 0,
             -- Progress clock for the abandoned-pending reap: bumped whenever a
             -- part is reserved, so a long multi-part upload that is still
-            -- moving is never reaped mid-flight.
+            -- moving is never reaped mid-flight. On a 'completing' or
+            -- 'reaping' row, the time of its claim; 0 on a 'reaping' row
+            -- whose reap failed, which gave its claim back.
             progressed_at_unix BIGINT NOT NULL DEFAULT 0,
             -- What the file is a copy OF, when the writer said (a message
             -- id, a document id at a provider): a begin naming an identity
@@ -355,7 +412,15 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- reused, so (key, version) names one content. Every stored
             -- file value carries it; a replacement that names the version
             -- it read is refused when the file has moved on since.
-            version            BIGINT NOT NULL DEFAULT 1
+            version            BIGINT NOT NULL DEFAULT 1,
+            -- On a 'reaping' row only: why a reap of it failed. While any
+            -- row is marked, a failure naming them is written down for
+            -- `weft status`. A failed reap gives its claim back: the expiry
+            -- loop's next pass, a wipe or the tenant's next upload takes it
+            -- again, and no look is booked for it until one does. The mark
+            -- stays while that reap runs, so its record clears only once
+            -- the row is gone.
+            reap_error         TEXT
         );
         -- One replacement in flight per file: its multipart writes onto
         -- the file's own object, so a second one would race it there.
@@ -386,7 +451,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         -- Per-tenant usage + listing range over the key prefix; the index on
         -- (tenant_id, key) serves the tenant-usage sum and the prefix list.
         CREATE INDEX IF NOT EXISTS idx_runtime_file_tenant ON runtime_file(tenant_id);
-        -- The expiry sweep ranges kept files by their expiry.
+        -- The expiry loop ranges files by their expiry.
         CREATE INDEX IF NOT EXISTS idx_runtime_file_expiry
             ON runtime_file(expires_at_unix) WHERE expires_at_unix IS NOT NULL;
         -- One row per minted PUBLIC RELAY link: the public
@@ -440,6 +505,9 @@ pub struct RuntimeStore {
     pool: PgPool,
     bucket: Arc<dyn ObjectStore>,
     clock: Arc<dyn Clock>,
+    /// The soonest expiry this copy rang the expiry loop for
+    /// ([`Self::ring_for`]).
+    rung: std::sync::Mutex<crate::notices::EarliestRung>,
 }
 
 /// One stored-file metadata row, the in-Rust shape of a `runtime_file` row.
@@ -558,10 +626,22 @@ enum Bucket {
 enum Fence {
     /// Flipped to 'reaping': the caller reaps it.
     Fenced,
-    /// Gone, or no longer matching the sweep's condition.
+    /// No longer matching the sweep's condition.
     Spared,
+    /// No row left under the key.
+    Gone,
     /// Left alone because a completion is landing on it.
     Completing,
+}
+
+/// What [`RuntimeStore::lock_for_removal`] found under a key.
+enum Removal {
+    /// No row.
+    Gone,
+    /// A completion forbids the removal, for this reason.
+    Blocked(String),
+    /// The row is locked and may be removed.
+    Free,
 }
 
 impl SweepEntry {
@@ -587,23 +667,98 @@ fn expiry_honoring_links(param: &str) -> String {
 
 impl RuntimeStore {
     pub fn new(pool: PgPool, bucket: Arc<dyn ObjectStore>, clock: Arc<dyn Clock>) -> Self {
-        Self { pool, bucket, clock }
+        Self { pool, bucket, clock, rung: Default::default() }
+    }
+
+    /// A write just gave a file the expiry `at`: ring the expiry loop when
+    /// no ring of this copy's covers it ([`crate::notices::EarliestRung`]).
+    /// Only writes that can make an expiry sooner call this (a keep, a new
+    /// lifetime, the linger stamp); an access pushes an expiry later and
+    /// rings nothing. A ring that cannot be sent is logged: the loop then
+    /// looks when its booking or a later ring says.
+    async fn ring_for(&self, at: Option<i64>) {
+        let Some(at) = at else { return };
+        if !self.rung.lock().expect("expiry rung").needs(at, self.clock.now_unix()) {
+            return;
+        }
+        match sqlx::query("SELECT pg_notify($1, '')").bind(FILE_EXPIRY_CHANNEL).execute(&self.pool).await {
+            Ok(_) => self.rung.lock().expect("expiry rung").rang(at),
+            Err(e) => tracing::error!(
+                target: "weft_broker::runtime_store", error = %e, at,
+                "could not ring the file expiry loop; a file expiring then is removed at the loop's next look"
+            ),
+        }
     }
 
     /// One tenant's live footprint (file_count, charged_bytes). Bytes count an
     /// ACTIVE file by its size and a PENDING upload by its reserved (quota-
     /// charged) bytes, so an in-flight upload is visible in usage the moment
-    /// it reserves, exactly as the quota check sees it. The quota check + the
-    /// usage view read this, so the two can never disagree.
+    /// it reserves, exactly as the quota check sees it. An expired file
+    /// counts for nothing. The quota check + the usage view read this, so the
+    /// two can never disagree. The tenant's abandoned uploads are reclaimed
+    /// first ([`Self::reclaim_abandoned`]), so they do not count either.
     pub async fn tenant_usage(&self, tenant: &str) -> Result<(u64, u64)> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE tenant_id = $1")
-                .bind(tenant)
-                .fetch_one(&self.pool)
-                .await
-                .context("tenant_usage count")?;
-        let bytes = charged_bytes_for(&self.pool, tenant).await?;
-        Ok((count as u64, bytes))
+        self.reclaim_abandoned(tenant).await?;
+        let now = self.clock.now_unix();
+        let count = count_files(&self.pool, tenant, now).await?;
+        let bytes = charged_bytes_for(&self.pool, tenant, now).await?;
+        Ok((count, bytes))
+    }
+
+    /// Reclaim `tenant`'s abandoned uploads, with no lock held (a bucket
+    /// call is never made under the tenant lock): drive every completion
+    /// claimed longer than [`CLAIM_LEASE_SECS`] ago (its process crashed or
+    /// its request was dropped), reap every pending upload with no progress
+    /// for [`PENDING_RESERVE_GRACE_SECS`], and finish every reap whose claim
+    /// lapsed ([`reap_lapsed`]), each tried once. Run when the tenant
+    /// uploads again or asks what it stores: an abandoned upload only
+    /// matters for what it holds of the tenant's quota. The bucket's rule
+    /// that aborts unfinished multipart uploads after a day covers the
+    /// bucket side of a tenant that never comes back.
+    async fn reclaim_abandoned(&self, tenant: &str) -> Result<()> {
+        let now = self.clock.now_unix();
+        let stale: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM runtime_file WHERE tenant_id = $1 AND status = 'completing' AND progressed_at_unix < $2",
+        )
+        .bind(tenant)
+        .bind(now - CLAIM_LEASE_SECS)
+        .fetch_all(&self.pool)
+        .await
+        .context("stale completion scan")?;
+        for key in stale {
+            if let Err(e) = self.drive_completion(&key, true).await {
+                tracing::error!(
+                    target: "weft_broker::runtime_store",
+                    key = %key, error = %e,
+                    "a stale completion did not land; it stays marked and the tenant's next upload retries it"
+                );
+            }
+        }
+        // A 'reaping' row whose reap crashed or failed still holds the
+        // tenant's quota, so it is finished here too.
+        // `$2` is the store's clock, in the scan and in the fence alike.
+        let abandoned = format!(
+            "((status = 'pending' AND progressed_at_unix < $2 - {PENDING_RESERVE_GRACE_SECS}) OR {})",
+            reap_lapsed("$2"),
+        );
+        let entries: Vec<SweepEntry> = sqlx::query_as(&format!(
+            "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file \
+             WHERE tenant_id = $1 AND {abandoned}"
+        ))
+        .bind(tenant)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .context("abandoned upload scan")?;
+        for entry in &entries {
+            // A pending row that progressed since the scan is no longer
+            // abandoned, and a lapsed reap another call took over since is
+            // claimed again: the fence's re-check spares both.
+            if self.fence_for_reap(&entry.key, &format!("AND {abandoned}"), now).await? == Fence::Fenced {
+                self.reap_with_tries(entry, &[]).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Would storing `incoming` more bytes push the tenant over their disk cap,
@@ -613,12 +768,13 @@ impl RuntimeStore {
     /// call it. `account_used_bytes` already includes this plane's charged
     /// bytes, so the check is just `total + incoming > cap`.
     async fn account_would_exceed(
+        &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         entitlements: &dyn EntitlementSource,
         tenant: &str,
         incoming: u64,
     ) -> Result<bool> {
-        let total = entitlements.account_used_bytes(tx, tenant).await?;
+        let total = entitlements.account_used_bytes(tx, tenant, self.clock.now_unix()).await?;
         Ok(entitlements.caps(tenant).await?.disk_bytes_would_exceed(total, incoming))
     }
 
@@ -714,6 +870,15 @@ impl RuntimeStore {
             _ => keep.and_then(KeepTtl::secs),
         };
 
+        // Before the reservation, with no lock held (both may call the
+        // bucket): the tenant's abandoned uploads stop holding its quota, and
+        // an expired file under this identity goes, so the identity is free
+        // for this upload.
+        self.reclaim_abandoned(&tenant).await.map_err(RuntimeStoreError::Other)?;
+        if let Some(identity) = identity {
+            self.reap_expired_identity(&key, identity).await.map_err(RuntimeStoreError::Other)?;
+        }
+
         // Open the bucket multipart FIRST, with NO lock held and NO row yet, so we
         // have its id (the resume handle) in hand before we write the row. This is
         // what keeps "a committed pending row always carries its upload handle"
@@ -797,14 +962,18 @@ impl RuntimeStore {
             // answer, a row still uploading (or being reaped) is a
             // conflict to retry once it settles. The scope is the key's
             // prefix (everything before the id), the same expression the
-            // unique index is built on.
+            // unique index is built on. A file that expired since it was
+            // reaped above is not this begin's answer: it is on its way out.
             if let Some(identity) = identity {
-                let existing: Option<(String, String)> = sqlx::query_as(
-                    "SELECT key, status FROM runtime_file \
+                let existing: Option<(String, String)> = sqlx::query_as(&format!(
+                    "SELECT key, CASE WHEN status = 'active' AND NOT {live} THEN 'expired' ELSE status END \
+                     FROM runtime_file \
                      WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2",
-                )
+                    live = unexpired("$3"),
+                ))
                 .bind(scope_prefix(&key))
                 .bind(identity)
+                .bind(now)
                 .fetch_optional(&mut *tx)
                 .await
                 .context("runtime begin_upload: check identity")
@@ -822,26 +991,23 @@ impl RuntimeStore {
                     None => {}
                 }
             }
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE tenant_id = $1")
-                    .bind(&tenant)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .context("runtime begin_upload: count tenant files")
-                    .map_err(RuntimeStoreError::Other)?;
+            let count = count_files(&mut *tx, &tenant, now)
+                .await
+                .context("runtime begin_upload: count tenant files")
+                .map_err(RuntimeStoreError::Other)?;
             let caps = entitlements
                 .caps(&tenant)
                 .await
                 .context("runtime begin_upload: resolve tenant caps")
                 .map_err(RuntimeStoreError::Other)?;
-            if caps.file_count_would_exceed(count as u64) {
+            if caps.file_count_would_exceed(count) {
                 return Err(RuntimeStoreError::QuotaExceeded(format!(
                     "tenant '{tenant}' is at its file cap ({} files); delete files or raise the cap",
                     caps.file_cap
                 )));
             }
             if let Some(declared) = declared_size {
-                if Self::account_would_exceed(&mut tx, entitlements, &tenant, declared)
+                if self.account_would_exceed(&mut tx, entitlements, &tenant, declared)
                     .await
                     .map_err(RuntimeStoreError::Other)?
                 {
@@ -984,10 +1150,12 @@ impl RuntimeStore {
                 .context("runtime begin_replace: begin reserve tx")
                 .map_err(RuntimeStoreError::Other)?;
             lock_tenant_storage(&mut tx, &tenant).await.map_err(RuntimeStoreError::Other)?;
-            let existing: Option<(String, String, i64)> = sqlx::query_as(
-                "SELECT mime_type, filename, version FROM runtime_file WHERE key = $1 AND status = 'active'",
-            )
+            let existing: Option<(String, String, i64)> = sqlx::query_as(&format!(
+                "SELECT mime_type, filename, version FROM runtime_file WHERE key = $1 AND status = 'active' AND {live}",
+                live = unexpired("$2"),
+            ))
             .bind(&replaced)
+            .bind(now)
             .fetch_optional(&mut *tx)
             .await
             .context("runtime begin_replace: read the replaced file")
@@ -1016,7 +1184,7 @@ impl RuntimeStore {
                 }
             }
             if let Some(declared) = declared_size {
-                if Self::account_would_exceed(&mut tx, entitlements, &tenant, declared)
+                if self.account_would_exceed(&mut tx, entitlements, &tenant, declared)
                     .await
                     .map_err(RuntimeStoreError::Other)?
                 {
@@ -1213,7 +1381,7 @@ impl RuntimeStore {
                     tracing::error!(
                         target: "weft_broker::runtime_store",
                         key = %key, error = %ab,
-                        "failed to abort assembly after error; the expiry sweep reaps it, or \
+                        "failed to abort assembly after error; the tenant's next upload reaps it, or \
                          drives it if a completion had claimed it"
                     );
                 }
@@ -1404,7 +1572,7 @@ impl RuntimeStore {
             // Stream: charge these parts now, under the lock. The account check
             // sums THIS plane's charged bytes (already including this upload's
             // reserved_bytes) plus the other plane's, both read on this tx.
-            if Self::account_would_exceed(&mut tx, entitlements, &pending.tenant_id, incoming)
+            if self.account_would_exceed(&mut tx, entitlements, &pending.tenant_id, incoming)
                 .await
                 .map_err(RuntimeStoreError::Other)?
             {
@@ -1614,9 +1782,9 @@ impl RuntimeStore {
     /// a verdict (the bucket unreachable, or refusing) stays 'completing'
     /// and answers [`RuntimeStoreError::Completing`]; the row never goes
     /// back to 'pending', since another drive may be landing its bytes. A
-    /// crashed, dropped or refused completion is driven by the expiry
-    /// sweep once the claim is [`COMPLETING_LEASE_SECS`] old, and that
-    /// drive gives the verdict.
+    /// crashed, dropped or refused completion is driven by the tenant's
+    /// next upload or usage read once the claim is [`CLAIM_LEASE_SECS`]
+    /// old ([`Self::reclaim_abandoned`]), and that drive gives the verdict.
     pub async fn complete_upload(
         &self,
         caller: &CallerAuth,
@@ -1677,8 +1845,9 @@ impl RuntimeStore {
                 // The file was deleted or expired while the new bytes were
                 // on their way: the replacement has nothing left to land
                 // on, so it is ended here like an abort.
-                sqlx::query("UPDATE runtime_file SET status = 'reaping' WHERE key = $1")
+                sqlx::query(&fence_sql(""))
                     .bind(key)
+                    .bind(self.clock.now_unix())
                     .execute(&mut *tx)
                     .await
                     .context("runtime complete_upload: fence an orphaned replacement")
@@ -1765,9 +1934,10 @@ impl RuntimeStore {
     /// the object; the rows fold once. With no 'completing' row, answers as
     /// a retry of a finished completion.
     ///
-    /// `recovering` is the expiry sweep's drive of a claim past its lease:
-    /// a bucket refusal then is final (the claim's own drive already had
-    /// its chance), where a live drive's refusal is left for that sweep.
+    /// `recovering` is the drive of a claim past its lease
+    /// ([`Self::reclaim_abandoned`]): a bucket refusal then is final (the
+    /// claim's own drive already had its chance), where a live drive's
+    /// refusal is left for that one.
     async fn drive_completion(&self, key: &str, recovering: bool) -> StoreResult<StoredFileMeta> {
         let row = sqlx::query_as::<_, PendingUpload>(&format!(
             "{PENDING_ROW_SELECT_ANY} AND status = 'completing'"
@@ -1874,7 +2044,7 @@ impl RuntimeStore {
                         }
                         return Err(RuntimeStoreError::Other(refused.context(format!(
                             "runtime complete_upload: the bucket refused to complete '{key}'; it \
-                             stays 'completing' and the expiry sweep retries it after the lease"
+                             stays 'completing' and the tenant's next upload after the lease retries it"
                         ))));
                     }
                     // Gone after a failure: a concurrent drive completed it.
@@ -1950,9 +2120,11 @@ impl RuntimeStore {
                 doomed.push(SweepEntry::file(replaced));
             }
         }
+        let now = self.clock.now_unix();
         for entry in &doomed {
-            sqlx::query("UPDATE runtime_file SET status = 'reaping' WHERE key = $1")
+            sqlx::query(&fence_sql(""))
                 .bind(&entry.key)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .context("runtime complete_upload: fence a lost completion")
@@ -1969,7 +2141,8 @@ impl RuntimeStore {
                 tracing::error!(
                     target: "weft_broker::runtime_store",
                     key = %entry.key, error = %e,
-                    "failed to reap a lost completion; its row stays 'reaping' and the expiry sweep retries"
+                    "failed to reap a lost completion; its row stays 'reaping' and the expiry loop's next pass, a wipe or the \
+                     tenant's next upload tries it again"
                 );
             }
         }
@@ -2037,6 +2210,10 @@ impl RuntimeStore {
                 .await;
         }
         let now = self.clock.now_unix();
+        // A replaced file's expiry is renewed, never made sooner. It is
+        // rung all the same: the expiry loop leaves a file out of its next
+        // look while its replacement completes, so no look may be booked
+        // for it.
         let meta = match &pending.replaces {
             Some(replaced) => Self::fold_replacement(&mut tx, key, replaced, actual, now).await?,
             None => Self::flip_active(&mut tx, key, pending, actual, now).await?,
@@ -2045,6 +2222,7 @@ impl RuntimeStore {
             .await
             .context("runtime complete_upload: commit fold")
             .map_err(RuntimeStoreError::Other)?;
+        self.ring_for(meta.expires_at_unix).await;
         Ok(meta)
     }
 
@@ -2273,7 +2451,7 @@ impl RuntimeStore {
     /// completion can claim it afterwards; then the bucket's multipart is
     /// aborted and the row deleted (freeing the reservation; the part rows
     /// cascade), exactly like a sweep's reap. A crash in between leaves a
-    /// 'reaping' row the expiry sweep finishes.
+    /// 'reaping' row the tenant's next upload finishes.
     pub async fn abort_upload(&self, caller: &CallerAuth, key: &str) -> StoreResult<()> {
         Self::wall_key(caller, key)?;
         let mut tx = self
@@ -2295,8 +2473,9 @@ impl RuntimeStore {
             };
         };
         pending.refuse_if_completing(key)?;
-        sqlx::query("UPDATE runtime_file SET status = 'reaping' WHERE key = $1")
+        sqlx::query(&fence_sql(""))
             .bind(key)
+            .bind(self.clock.now_unix())
             .execute(&mut *tx)
             .await
             .context("runtime abort_upload: fence the row")
@@ -2307,7 +2486,7 @@ impl RuntimeStore {
             .map_err(RuntimeStoreError::Other)?;
         self.reap_fenced(&pending.sweep_entry(key))
             .await
-            .context("runtime abort_upload (the row stays 'reaping'; the expiry sweep finishes it)")
+            .context("runtime abort_upload (the row stays 'reaping'; the tenant's next upload finishes it)")
             .map_err(RuntimeStoreError::Other)
     }
 
@@ -2363,16 +2542,18 @@ impl RuntimeStore {
         Ok(row.as_ref().map(FileRow::to_meta))
     }
 
-    /// The metadata row for an ACTIVE (finalized) file, or None if absent or still
-    /// pending. Every user-facing read (meta/get/download/keep/presign) goes through
-    /// here, so a half-uploaded 'pending' file reads as not-found until it finalizes.
-    /// Access does NOT bump a kept file's expiry here (a metadata peek is not an
-    /// access); the byte `get`/`download_url` bumps it.
+    /// The metadata row for an ACTIVE (finalized) file, or None if absent, still
+    /// pending, or expired. Every user-facing read (meta/get/download/keep/presign)
+    /// goes through here, so a half-uploaded 'pending' file reads as not-found
+    /// until it finalizes. Access does NOT bump a kept file's expiry here (a
+    /// metadata peek is not an access); the byte `get`/`download_url` bumps it.
     async fn row(&self, key: &str) -> Result<Option<FileRow>> {
         sqlx::query_as::<_, FileRow>(&format!(
-            "SELECT {FILE_ROW_COLUMNS} FROM runtime_file WHERE key = $1 AND status = 'active'"
+            "SELECT {FILE_ROW_COLUMNS} FROM runtime_file WHERE key = $1 AND status = 'active' AND {live}",
+            live = unexpired("$2"),
         ))
         .bind(key)
+        .bind(self.clock.now_unix())
         .fetch_optional(&self.pool)
         .await
         .context("runtime row")
@@ -2392,10 +2573,12 @@ impl RuntimeStore {
             .map_err(RuntimeStoreError::Denied)?;
         let row = sqlx::query_as::<_, FileRow>(&format!(
             "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
-             WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 AND status = 'active'"
+             WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 AND status = 'active' AND {live}",
+            live = unexpired("$3"),
         ))
         .bind(prefix.trim_end_matches('/'))
         .bind(identity)
+        .bind(self.clock.now_unix())
         .fetch_optional(&self.pool)
         .await
         .context("runtime find_identity")
@@ -2413,23 +2596,30 @@ impl RuntimeStore {
             .ok_or_else(|| RuntimeStoreError::NotFound(key))
     }
 
-    /// Read an active file and renew its expiry from its current TTL.
-    /// Leaves the expiry unchanged for files with no access-renewed TTL.
-    /// Never shortens below a live public link's expiry (a minted link is
-    /// a promise the bytes stay fetchable for its stated lifetime).
-    async fn bump_expiry(&self, key: &str) -> Result<Option<FileRow>> {
+    /// Read an active, unexpired file and renew its expiry from its current
+    /// TTL, then push an expiry that is still short of `cover_until` to it:
+    /// a link handed out for the file lives that long, and the bytes must
+    /// outlive it. Leaves no expiry on a file that has none. Never shortens
+    /// below a live public link's expiry (a minted link is a promise the
+    /// bytes stay fetchable for its stated lifetime). An expired file is
+    /// never brought back to life: it reads as gone.
+    async fn bump_expiry(&self, key: &str, cover_until: i64) -> Result<Option<FileRow>> {
         // Read the TTL from the locked row, not an earlier metadata read:
         // source publication may have protected or retired this asset since
         // that read. A reaper that already claimed the row wins over access.
         sqlx::query_as::<_, FileRow>(&format!(
             "UPDATE runtime_file SET expires_at_unix = CASE \
-                 WHEN keep_ttl_secs IS NULL THEN expires_at_unix ELSE {} END \
-             WHERE key = $2 AND status = 'active' \
+                 WHEN expires_at_unix IS NULL THEN NULL \
+                 WHEN keep_ttl_secs IS NULL THEN GREATEST(expires_at_unix, $3) \
+                 ELSE GREATEST({}, $3) END \
+             WHERE key = $2 AND status = 'active' AND {live} \
              RETURNING {FILE_ROW_COLUMNS}",
-            expiry_honoring_links("$1 + keep_ttl_secs")
+            expiry_honoring_links("$1 + keep_ttl_secs"),
+            live = unexpired("$1"),
         ))
         .bind(self.clock.now_unix())
         .bind(key)
+        .bind(cover_until)
         .fetch_optional(&self.pool)
         .await
         .context("bump expiry")
@@ -2440,8 +2630,8 @@ impl RuntimeStore {
     ///
     /// Delete a finished file: fence its row to 'reaping' (under its lock),
     /// then remove the object, then the row, the same three steps as every
-    /// reap, so a crash in between leaves a 'reaping' row the expiry sweep
-    /// finishes and never a row pointing at a deleted object. A file whose
+    /// reap, so a crash in between leaves a 'reaping' row the tenant's next
+    /// upload finishes and never a row pointing at a deleted object. A file whose
     /// replacement is completing is refused: the bucket may be writing its
     /// object.
     pub async fn delete(&self, parsed: &ParsedKey) -> StoreResult<()> {
@@ -2452,13 +2642,14 @@ impl RuntimeStore {
             .await
             .context("runtime delete: begin tx")
             .map_err(RuntimeStoreError::Other)?;
-        if let Some(blocker) = Self::lock_for_removal(&mut tx, &key).await.map_err(RuntimeStoreError::Other)? {
+        if let Removal::Blocked(blocker) = Self::lock_for_removal(&mut tx, &key).await.map_err(RuntimeStoreError::Other)? {
             return Err(RuntimeStoreError::Completing(format!(
                 "'{key}' cannot be deleted while {blocker}; delete it once that lands"
             )));
         }
-        let fenced = sqlx::query("UPDATE runtime_file SET status = 'reaping' WHERE key = $1 AND status = 'active'")
+        let fenced = sqlx::query(&fence_sql("AND status = 'active'"))
             .bind(&key)
+            .bind(self.clock.now_unix())
             .execute(&mut *tx)
             .await
             .context("runtime delete: fence the row")
@@ -2472,27 +2663,27 @@ impl RuntimeStore {
             .map_err(RuntimeStoreError::Other)?;
         self.reap_fenced(&SweepEntry::file(&key))
             .await
-            .context("runtime delete (the row stays 'reaping'; the expiry sweep finishes it)")
+            .context("runtime delete (the row stays 'reaping'; the tenant's next upload finishes it)")
             .map_err(RuntimeStoreError::Other)
     }
 
-    /// Lock a row before fencing it for removal, and say what forbids the
-    /// removal: the row is an upload a completion has claimed, or a file
-    /// whose replacement a completion has claimed (the bucket may be
-    /// writing its object). The check runs as its own statement after the
-    /// lock, so it sees a claim that committed while this waited; a claim
-    /// arriving later locks the same file and finds it fenced.
-    async fn lock_for_removal(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        key: &str,
-    ) -> Result<Option<String>> {
+    /// Lock a row before fencing it for removal, and say whether it is
+    /// there and what forbids the removal: the row is an upload a
+    /// completion has claimed, or a file whose replacement a completion
+    /// has claimed (the bucket may be writing its object). The check runs
+    /// as its own statement after the lock, so it sees a claim that
+    /// committed while this waited; a claim arriving later locks the same
+    /// file and finds it fenced.
+    async fn lock_for_removal(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, key: &str) -> Result<Removal> {
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1 FOR UPDATE")
             .bind(key)
             .fetch_optional(&mut **tx)
             .await
             .context("lock a row for removal")?;
-        if status.as_deref() == Some("completing") {
-            return Ok(Some(format!("its upload '{key}' is completing")));
+        match status.as_deref() {
+            None => return Ok(Removal::Gone),
+            Some("completing") => return Ok(Removal::Blocked(format!("its upload '{key}' is completing"))),
+            Some(_) => {}
         }
         let replacement: Option<String> = sqlx::query_scalar(
             "SELECT key FROM runtime_file WHERE replaces = $1 AND status = 'completing'",
@@ -2501,24 +2692,33 @@ impl RuntimeStore {
         .fetch_optional(&mut **tx)
         .await
         .context("look for a completing replacement")?;
-        Ok(replacement.map(|r| format!("its replacement '{r}' is completing")))
+        Ok(match replacement {
+            Some(r) => Removal::Blocked(format!("its replacement '{r}' is completing")),
+            None => Removal::Free,
+        })
     }
 
-    /// Fence one row for a sweep or wipe: lock it, skip it when a
-    /// completion forbids the removal ([`Self::lock_for_removal`]),
-    /// else flip it to 'reaping' where `fence_sql` (an UPDATE on `$1`,
-    /// with `binds` from `$2`) still matches.
-    async fn fence_for_reap(&self, key: &str, fence_sql: &str, binds: &[i64]) -> Result<Fence> {
+    /// Fence one row for a sweep or wipe: lock it, skip it when it is gone
+    /// or a completion forbids the removal ([`Self::lock_for_removal`]),
+    /// else flip it to 'reaping', claimed at `now`, where `condition`
+    /// ([`fence_sql`]'s, `$2` being `now`) still holds.
+    async fn fence_for_reap(&self, key: &str, condition: &str, now: i64) -> Result<Fence> {
         let mut tx = self.pool.begin().await.context("fence: begin tx")?;
-        if let Some(blocker) = Self::lock_for_removal(&mut tx, key).await? {
-            tracing::info!(target: "weft_broker::runtime_store", key = %key, "not reaped while {blocker}");
-            return Ok(Fence::Completing);
+        match Self::lock_for_removal(&mut tx, key).await? {
+            Removal::Gone => return Ok(Fence::Gone),
+            Removal::Blocked(blocker) => {
+                tracing::info!(target: "weft_broker::runtime_store", key = %key, "not reaped while {blocker}");
+                return Ok(Fence::Completing);
+            }
+            Removal::Free => {}
         }
-        let mut query = sqlx::query(fence_sql).bind(key);
-        for b in binds {
-            query = query.bind(*b);
-        }
-        let fenced = query.execute(&mut *tx).await.context("fence")?.rows_affected();
+        let fenced = sqlx::query(&fence_sql(condition))
+            .bind(key)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .context("fence")?
+            .rows_affected();
         tx.commit().await.context("fence: commit")?;
         Ok(if fenced > 0 { Fence::Fenced } else { Fence::Spared })
     }
@@ -2583,7 +2783,8 @@ impl RuntimeStore {
         ).bind(&referenced).execute(&mut *tx).await.context("keep the referenced assets")?;
         // What this project stopped referencing, and no other project
         // references either, starts its countdown.
-        sqlx::query(&format!(
+        let countdown = self.clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64;
+        let retired = sqlx::query(&format!(
             "UPDATE runtime_file SET \
                  expires_at_unix = COALESCE(expires_at_unix, {}), \
                  keep_ttl_secs = COALESCE(keep_ttl_secs, $3) \
@@ -2592,10 +2793,13 @@ impl RuntimeStore {
             expiry_honoring_links("$2")
         ))
         .bind(&before)
-        .bind(self.clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64)
+        .bind(countdown)
         .bind(DEFAULT_KEEP_TTL_SECS as i64)
         .execute(&mut *tx).await.context("retire the unreferenced assets")?;
         tx.commit().await.context("commit the project's asset references")?;
+        if retired.rows_affected() > 0 {
+            self.ring_for(Some(countdown)).await;
+        }
         Ok(missing)
     }
 
@@ -2627,14 +2831,16 @@ impl RuntimeStore {
     /// List every ACTIVE file under a key prefix (a scope, or a whole tenant). The
     /// prefix is produced by the wall (`prefix_for_list` / `tenant_prefix`), so it
     /// is always tenant-anchored. Pending (half-uploaded) files are excluded: they
-    /// are not real files a user can see yet.
+    /// are not real files a user can see yet; so are expired ones.
     pub async fn list(&self, prefix: &str) -> Result<Vec<StoredFileMeta>> {
         let pattern = like_prefix(prefix);
         let rows = sqlx::query_as::<_, FileRow>(&format!(
             "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
-             WHERE key LIKE $1 ESCAPE '\\' AND status = 'active' ORDER BY key"
+             WHERE key LIKE $1 ESCAPE '\\' AND status = 'active' AND {live} ORDER BY key",
+            live = unexpired("$2"),
         ))
         .bind(&pattern)
+        .bind(self.clock.now_unix())
         .fetch_all(&self.pool)
         .await
         .context("runtime list")?;
@@ -2661,19 +2867,49 @@ impl RuntimeStore {
 
     /// Steps 2+3 of a fenced reap (the caller has already flipped the row to
     /// 'reaping'): remove the bucket state, then the row. If the bucket reap
-    /// fails, the error propagates and the row STAYS in 'reaping', which every
-    /// sweep scan re-finds and retries. So a crash between the steps never
-    /// strands an object without a row (nothing would ever revisit it: all
-    /// reclaim paths are row-driven) nor a charged row pointing at deleted
-    /// bytes; the only residue is a 'reaping' row that self-heals next tick.
+    /// fails, the row is marked ([`Self::mark_reap_failed`]), the error
+    /// propagates, and the row STAYS in 'reaping', which the sweeps take
+    /// over (at once once marked, once its claim lapsed after a crash). So
+    /// a crash between the steps never strands an object without a row
+    /// (nothing would ever revisit it: all reclaim paths are row-driven)
+    /// nor a charged row pointing at deleted bytes; the only residue is a
+    /// 'reaping' row that the tenant's next upload (or the expiry loop's
+    /// next pass) finishes.
     async fn reap_fenced(&self, entry: &SweepEntry) -> Result<()> {
-        self.reap_bucket_state(entry).await?;
-        sqlx::query(&delete_upload_row(""))
+        self.try_reap(entry, &[]).await?
+    }
+
+    /// Reap a fenced row ([`Self::reap_fenced`]), trying again after each
+    /// of `pauses`, still under this call's claim. When every try failed,
+    /// the row stays 'reaping', marked, and `false` is answered: the
+    /// caller goes on with its other rows.
+    async fn reap_with_tries(&self, entry: &SweepEntry, pauses: &[std::time::Duration]) -> Result<bool> {
+        Ok(self.try_reap(entry, pauses).await?.is_ok())
+    }
+
+    /// [`Self::reap_with_tries`], answering a bucket reap that failed every
+    /// try (the row then marked) apart from a failure of the database:
+    /// `Ok(Err(_))` then, with the last try's error.
+    async fn try_reap(&self, entry: &SweepEntry, pauses: &[std::time::Duration]) -> Result<Result<()>> {
+        let mut pauses = pauses.iter();
+        while let Err(e) = self.reap_bucket_state(entry).await {
+            match pauses.next() {
+                Some(pause) => tokio::time::sleep(*pause).await,
+                None => {
+                    self.mark_reap_failed(&entry.key, &e).await?;
+                    return Ok(Err(e));
+                }
+            }
+        }
+        let was_marked: bool = sqlx::query_scalar(&delete_upload_row(""))
             .bind(&entry.key)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await
             .context("delete reaped row")?;
-        Ok(())
+        if was_marked {
+            self.record_reap_failures().await?;
+        }
+        Ok(Ok(()))
     }
 
     /// Remove a doomed key's bucket state: abort its in-flight multipart
@@ -2713,25 +2949,31 @@ impl RuntimeStore {
         let exec = matches!(parsed.scope, weft_core::storage::key::KeyScope::Exec { .. });
         let key = parsed.to_key();
         let ttl_secs = ttl.secs();
-        let expires_at = ttl_secs.map(|s| self.clock.now_unix() + s as i64);
+        let now = self.clock.now_unix();
+        let expires_at = ttl_secs.map(|s| now + s as i64);
         // KeepTtl::Never binds NULL (never expires, covers links
-        // trivially); a finite deadline never undercuts a live link.
+        // trivially); a finite deadline never undercuts a live link. A file
+        // that already expired stays expired.
         let row: Option<FileRow> = sqlx::query_as::<_, FileRow>(&format!(
             "UPDATE runtime_file SET keep = keep OR $4, keep_ttl_secs = $1, \
                  expires_at_unix = CASE WHEN $2::bigint IS NULL THEN NULL ELSE {} END \
-             WHERE key = $3 AND status <> 'reaping' \
+             WHERE key = $3 AND status <> 'reaping' AND {live} \
              RETURNING {FILE_ROW_COLUMNS}",
-            expiry_honoring_links("$2")
+            expiry_honoring_links("$2"),
+            live = unexpired("$5"),
         ))
         .bind(ttl_secs.map(|s| s as i64))
         .bind(expires_at)
         .bind(&key)
         .bind(exec)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await
         .context("runtime keep")
         .map_err(RuntimeStoreError::Other)?;
-        row.map(|r| r.to_meta()).ok_or_else(|| RuntimeStoreError::NotFound(key))
+        let row = row.ok_or_else(|| RuntimeStoreError::NotFound(key))?;
+        self.ring_for(row.expires_at_unix).await;
+        Ok(row.to_meta())
     }
 
     /// Mint a presigned GET URL signed for the bucket's PUBLIC endpoint, valid
@@ -2743,7 +2985,7 @@ impl RuntimeStore {
     /// link is `download_url` with the Internal audience: the public endpoint
     /// of a local install is the host's loopback, which a process cannot reach.
     pub async fn presign(&self, parsed: &ParsedKey, ttl_secs: Option<u64>) -> StoreResult<String> {
-        Ok(self.presign_get(parsed, PresignAudience::External, ttl_secs).await?.1)
+        Ok(self.presign_get(parsed, PresignAudience::External, ttl_secs, true).await?.1)
     }
 
     /// Mint a PUBLIC RELAY link token for a file: the returned token
@@ -2753,24 +2995,22 @@ impl RuntimeStore {
     /// from, signed for the runtime's own endpoint and the token's own
     /// lifetime. Minting counts as access (bumps a kept file's
     /// expiry), and a minted link is a PROMISE: a file already carrying
-    /// an expiry gets it pushed past the link's, so the bytes outlive
-    /// every live token (a file with no expiry outlives it trivially,
-    /// and the terminate sweep's linger stamp honors live links too).
+    /// an expiry gets it pushed past the link's ([`Self::presign_get`]), so
+    /// the bytes outlive every live token (a file with no expiry outlives
+    /// it trivially, and the terminate sweep's linger stamp honors live
+    /// links too).
     pub async fn mint_public_link(
         &self,
         parsed: &ParsedKey,
         ttl_secs: Option<u64>,
     ) -> StoreResult<String> {
-        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
-        let (meta, fetch_url) =
-            self.presign_get(parsed, PresignAudience::Runtime, Some(ttl)).await?;
+        let (meta, fetch_url, link_expiry) =
+            self.presign_get(parsed, PresignAudience::Runtime, ttl_secs, true).await?;
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let now = self.clock.now_unix();
-        let link_expiry = now + ttl as i64;
         // Opportunistic sweep: expired links are dead weight nobody can
         // act on, deleted on every mint so the table never accumulates.
         sqlx::query("DELETE FROM public_file_link WHERE expires_at_unix < $1")
-            .bind(now)
+            .bind(self.clock.now_unix())
             .execute(&self.pool)
             .await
             .context("public_file_link sweep")
@@ -2789,21 +3029,6 @@ impl RuntimeStore {
         .execute(&self.pool)
         .await
         .context("public_file_link insert")
-        .map_err(RuntimeStoreError::Other)?;
-        // The promise half: a file already on an expiry clock (kept with
-        // a TTL, or lingering after its execution) must not be reaped
-        // while this link lives. NULL expiries stay NULL (a live exec
-        // file's lifetime is its execution's, plus the linger stamp
-        // below at terminate; setting a clock here would ADD one).
-        sqlx::query(
-            "UPDATE runtime_file SET expires_at_unix = GREATEST(expires_at_unix, $2)
-             WHERE key = $1 AND expires_at_unix IS NOT NULL",
-        )
-        .bind(parsed.to_key())
-        .bind(link_expiry)
-        .execute(&self.pool)
-        .await
-        .context("public_file_link expiry cover")
         .map_err(RuntimeStoreError::Other)?;
         Ok(token)
     }
@@ -2833,39 +3058,50 @@ impl RuntimeStore {
     /// Mint a presigned GET URL a WORKER uses to read a runtime file's bytes
     /// DIRECTLY from the bucket, plus its metadata. Bytes never transit the broker.
     /// Signed for the INTERNAL endpoint (the worker is internal). Counts as access
-    /// (bumps a kept file's expiry), like the old streaming get did.
+    /// (bumps a kept file's expiry), like the old streaming get did. With
+    /// `hands_out`, the URL is handed to somebody to fetch later (a link a
+    /// node passes on), so the file outlives it; a read made now needs no
+    /// such promise.
     pub async fn download_url(
         &self,
         parsed: &ParsedKey,
         audience: PresignAudience,
         ttl_secs: Option<u64>,
+        hands_out: bool,
     ) -> StoreResult<(StoredFileMeta, String)> {
-        self.presign_get(parsed, audience, ttl_secs).await
+        let (meta, url, _) = self.presign_get(parsed, audience, ttl_secs, hands_out).await?;
+        Ok((meta, url))
     }
 
-    /// Shared body of the presigned-GET mints: load the row (404 if absent), bump a
-    /// kept file's expiry (minting IS an access), clamp the TTL, sign for `audience`.
-    /// Returns the file's metadata + the URL.
+    /// Shared body of the presigned-GET mints: clamp the TTL, load the row
+    /// (404 if absent or expired) bumping its expiry (minting IS an access)
+    /// and, for a URL handed out (`hands_out`), pushing the expiry past the
+    /// URL's life (a file on an expiry clock, a lingering run output among
+    /// them, outlives every URL handed out for it), sign for `audience`.
+    /// Returns the file's metadata, the URL, and when the URL stops working
+    /// (unix seconds).
     async fn presign_get(
         &self,
         parsed: &ParsedKey,
         audience: PresignAudience,
         ttl_secs: Option<u64>,
-    ) -> StoreResult<(StoredFileMeta, String)> {
+        hands_out: bool,
+    ) -> StoreResult<(StoredFileMeta, String, i64)> {
         let key = parsed.to_key();
+        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
+        let until = self.clock.now_unix() + ttl as i64;
         let row = self
-            .bump_expiry(&key)
+            .bump_expiry(&key, if hands_out { until } else { 0 })
             .await
             .map_err(RuntimeStoreError::Other)?
             .ok_or_else(|| RuntimeStoreError::NotFound(key.clone()))?;
-        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
         let url = self
             .bucket
             .presign_get(&object_key(&key), audience, ttl)
             .await
             .context("runtime presign GET")
             .map_err(RuntimeStoreError::Other)?;
-        Ok((row.to_meta(), url))
+        Ok((row.to_meta(), url, until))
     }
 
     /// Wipe every file under a wall-validated prefix (a `weft files rm` of a
@@ -2876,25 +3112,29 @@ impl RuntimeStore {
         // file's bucket state (in-flight upload + any object) is wiped too.
         // Same fenced three-step reap as the sweeps (fence the row to
         // 'reaping', reap bucket, delete row): a crash mid-wipe leaves only
-        // 'reaping' rows the expiry sweep re-finds and finishes, never a live
+        // 'reaping' rows the tenant's next upload finishes, never a live
         // row pointing at deleted bytes. The wipe is unconditional (the whole
-        // prefix dies), so the fence has no doom re-check; it exists purely to
-        // lock out writers/readers and make the residue self-healing.
+        // prefix dies), so the fence has no doom re-check; it exists to
+        // lock out writers/readers and make the residue self-healing. A row
+        // nobody is reaping (a reap that failed or crashed) is taken over
+        // like any other.
         //
-        // A completion in flight is the one thing a wipe leaves: the bucket
-        // may be writing that object. The wipe finishes everything else,
-        // then fails naming how many it left, so a second wipe after the
-        // completion lands takes them.
+        // Two things a wipe leaves: a completion in flight (the bucket may
+        // be writing that object) and a row another call is reaping right
+        // now (its claim is live). The wipe finishes everything else, then
+        // fails naming how many it left, so a second wipe once they are
+        // done takes what is still there.
+        let now = self.clock.now_unix();
         let mut removed = 0;
         let mut left = 0;
         for entry in self.keys_under(prefix).await? {
             match self
-                .fence_for_reap(&entry.key, "UPDATE runtime_file SET status = 'reaping' WHERE key = $1", &[])
+                .fence_for_reap(&entry.key, &format!("AND (status <> 'reaping' OR {})", reap_lapsed("$2")), now)
                 .await?
             {
                 Fence::Fenced => {}
-                Fence::Spared => continue,
-                Fence::Completing => {
+                Fence::Gone => continue,
+                Fence::Spared | Fence::Completing => {
                     left += 1;
                     continue;
                 }
@@ -2911,8 +3151,8 @@ impl RuntimeStore {
             .context("drop the wiped assets' references")?;
         if left > 0 {
             anyhow::bail!(
-                "wiped {removed} files under '{prefix}' and left {left} that are part of a completing \
-                 upload; wipe again once it lands"
+                "wiped {removed} files under '{prefix}' and left {left} that a completing upload or another \
+                 removal in progress holds; wipe again once they are done"
             );
         }
         Ok(removed)
@@ -2924,12 +3164,13 @@ impl RuntimeStore {
     /// - A COMPLETED un-kept file is not deleted here: it gets
     ///   `expires_at_unix = now + EXEC_LINGER_TTL_SECS` stamped, so the user
     ///   can still list/download a run's output right after the run ends; the
-    ///   expiry sweep deletes it once the linger passes. The stamped deadline
+    ///   expiry loop removes it once the linger passes (the stamp rings it,
+    ///   [`Self::ring_for`]). The stamped deadline
     ///   is what the file lists surface as the remaining lifetime.
     /// - A PENDING row (a crashed/abandoned upload) is reaped immediately,
     ///   in-flight multipart aborted: a half-uploaded file has nothing worth
     ///   downloading (even a kept-flagged one: keep only spares a COMPLETED
-    ///   file). A leftover 'reaping' row from a crashed reap is retried.
+    ///   file). A leftover 'reaping' row whose claim lapsed is retried.
     ///
     /// Returns `(reaped, lingering)`: rows removed now vs stamped to expire.
     pub async fn sweep_exec(&self, tenant: &str, execution_id: &str) -> Result<(u64, u64)> {
@@ -2952,7 +3193,7 @@ impl RuntimeStore {
                         target: "weft_broker::runtime_store",
                         key = %entry.key, error = %e,
                         "an execution's completing upload did not land; it gets the linger \
-                         stamp now and the expiry sweep lands it"
+                         stamp now and the tenant's next upload lands it"
                     );
                 }
             }
@@ -2968,39 +3209,40 @@ impl RuntimeStore {
                 // deadline out. The deadline honors any live public link on
                 // the file (a minted link is a promise the bytes stay
                 // fetchable for its stated lifetime).
-                let stamped = sqlx::query(&format!(
+                let stamped: Option<Option<i64>> = sqlx::query_scalar(&format!(
                     "UPDATE runtime_file SET expires_at_unix = {} \
                      WHERE key = $1 AND status IN ('active', 'completing') AND NOT keep \
-                       AND expires_at_unix IS NULL",
+                       AND expires_at_unix IS NULL \
+                     RETURNING expires_at_unix",
                     expiry_honoring_links("$2")
                 ))
                 .bind(&entry.key)
                 .bind(self.clock.now_unix() + EXEC_LINGER_TTL_SECS)
-                .execute(&self.pool)
+                .fetch_optional(&self.pool)
                 .await
-                .context("linger stamp")?
-                .rows_affected();
-                lingering += stamped;
+                .context("linger stamp")?;
+                if let Some(at) = stamped {
+                    lingering += 1;
+                    // The expiry loop must look by the linger's end; one
+                    // ring covers the run's other files, stamped later.
+                    self.ring_for(at).await;
+                }
                 continue;
             }
             // FENCE first: flip the row to 'reaping', atomically re-checking it
-            // is still a pending/reaping row (a completion that landed since
-            // the scan wins: the row is 'active' now and the clause spares it).
+            // is still a pending row or a reap whose claim lapsed (a completion
+            // that landed since the scan wins: the row is 'active' now and the
+            // clause spares it; so does another call's reap in progress).
             // The flip locks out every writer and reader (record_part/reserve
             // gate on 'pending'; keep/get/download gate on 'active'), so the
             // bucket reap below can never race an in-flight upload, and a
             // crash at any point leaves a 'reaping' row this sweep's retry
-            // (and the expiry sweep) re-finds. Neither delete-object-first (a
+            // (and the tenant's next upload) re-finds. Neither delete-object-first (a
             // charged row pointing at gone bytes on crash) nor
             // delete-row-first (an orphan object nothing row-driven ever
             // revisits) has that property.
             if self
-                .fence_for_reap(
-                    &entry.key,
-                    "UPDATE runtime_file SET status = 'reaping' \
-                     WHERE key = $1 AND status IN ('pending', 'reaping')",
-                    &[],
-                )
+                .fence_for_reap(&entry.key, &format!("AND (status = 'pending' OR {})", reap_lapsed("$2")), self.clock.now_unix())
                 .await?
                 != Fence::Fenced
             {
@@ -3012,111 +3254,191 @@ impl RuntimeStore {
         Ok((reaped, lingering))
     }
 
-    /// Expiry sweep: delete kept files whose `expires_at_unix` has passed AND reap
-    /// abandoned uploads (pending rows older than the reserve grace). Runs
-    /// periodically (an actively-used kept file's expiry is bumped on every access,
-    /// so only genuinely-idle survivors are reclaimed).
+    /// The expiry loop's pass: remove every file whose expiry passed (the
+    /// store's clock) and finish every reap nobody is working on (a crash
+    /// or a failure left it 'reaping'), then say when it next has a row to
+    /// look at. Each row is fenced first (flipped to 'reaping' under its
+    /// lock, re-checking it is still doomed: an access that renewed it
+    /// since the scan spares it, and so does another call's reap in
+    /// progress), so the bucket reap never races a writer, a reader or
+    /// another reap. A row whose reap keeps failing is marked
+    /// ([`Self::mark_reap_failed`]) and does not hold up the others.
     ///
-    /// The pending reap is what closes the abandoned-upload window for scopes an
-    /// exec sweep never touches (project/shared): a row is reserved at begin, so a
-    /// crash mid-upload leaves a 'pending' row holding a quota reservation and an
-    /// in-flight multipart upload. Once the row has made NO progress (no part
-    /// reserved or landed) for longer than the grace, it is abandoned: abort the
-    /// multipart, delete the row (freeing the reservation). The bucket's
-    /// `AbortIncompleteMultipartUpload` lifecycle rule is the belt-and-suspenders
-    /// floor for upload state this reap can never see (and for a part PUT that
-    /// raced an abort and landed after it).
-    ///
-    /// It also drives every completion whose claim is older than
-    /// [`COMPLETING_LEASE_SECS`] (its process crashed or its request was
-    /// dropped): the bucket says whether the multipart completed, and the
-    /// rows are folded or put back in flight to match. One that cannot be
-    /// told is logged as an error naming the key and left marked.
-    pub async fn sweep_expired(&self) -> Result<u64> {
+    /// The next look is booked at the soonest of two times: the expiry of
+    /// an active file, leaving out a file whose replacement is completing
+    /// (it cannot go until the replacement lands, and landing rings,
+    /// [`Self::finish_completion`]), and the lapse of a claim some call
+    /// holds on a 'reaping' row (if that call dies, its row is taken
+    /// then), a marked row a call took over included. A marked row nobody
+    /// took over holds no claim and books nothing: its reap failed, and it
+    /// waits for the next pass, a wipe or the tenant's next upload.
+    pub async fn expire(&self) -> Result<weft_task_store::drain::DrainStep> {
+        use weft_task_store::drain::DrainStep;
         let now = self.clock.now_unix();
-        let stale: Vec<String> = sqlx::query_scalar(
-            "SELECT key FROM runtime_file WHERE status = 'completing' AND progressed_at_unix < $1",
-        )
-        .bind(now - COMPLETING_LEASE_SECS)
-        .fetch_all(&self.pool)
-        .await
-        .context("stale completion scan")?;
-        for key in stale {
-            if let Err(e) = self.drive_completion(&key, true).await {
-                tracing::error!(
-                    target: "weft_broker::runtime_store",
-                    key = %key, error = %e,
-                    "a stale completion did not land; it stays marked and the next sweep retries"
-                );
-            }
-        }
-        let pending_cutoff = now - PENDING_RESERVE_GRACE_SECS;
-        // One scan for THREE conditions: an expired kept file, an abandoned
-        // pending upload, or a 'reaping' row a crashed reap left behind (from
-        // ANY sweep; this scan is the global retry net for those).
-        let doomed: Vec<SweepEntry> = sqlx::query_as(
-            "SELECT key, (keep AND status = 'active') AS kept_active, status, upload_id, replaces \
-             FROM runtime_file \
-             WHERE (expires_at_unix IS NOT NULL AND expires_at_unix < $1) \
-                OR (status = 'pending' AND progressed_at_unix < $2) \
-                OR status = 'reaping'",
-        )
+        // `$1` in the scan and `$2` in the fence are the store's clock.
+        let doomed = |now: &str| format!("((status = 'active' AND expires_at_unix < {now}) OR {})", reap_lapsed(now));
+        let entries: Vec<SweepEntry> = sqlx::query_as(&format!(
+            "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE {}",
+            doomed("$1")
+        ))
         .bind(now)
-        .bind(pending_cutoff)
         .fetch_all(&self.pool)
         .await
-        .context("expiry/pending scan")?;
+        .context("expired file scan")?;
         let mut removed = 0;
-        for entry in &doomed {
-            // FENCE first: flip the row to 'reaping', atomically re-checking
-            // the doom clause. A pending row that PROGRESSED between scan and
-            // fence is no longer abandoned: the clause spares it and its
-            // in-flight multipart survives. The flip locks out every writer
-            // and reader (record_part/reserve gate on the row lock; keep/get/
-            // download gate on 'active'), so the bucket reap can never race an
-            // in-flight upload, and a crash at any point leaves a 'reaping'
-            // row the next tick's scan re-finds. Neither delete-object-first
-            // (a charged row pointing at gone bytes on crash) nor
-            // delete-row-first (an orphan object nothing row-driven ever
-            // revisits) has that property.
-            if self
-                .fence_for_reap(
-                    &entry.key,
-                    "UPDATE runtime_file SET status = 'reaping' \
-                     WHERE key = $1 \
-                       AND ((expires_at_unix IS NOT NULL AND expires_at_unix < $2) \
-                            OR (status = 'pending' AND progressed_at_unix < $3) \
-                            OR status = 'reaping')",
-                    &[now, pending_cutoff],
-                )
-                .await?
-                != Fence::Fenced
-            {
-                continue;
+        for entry in &entries {
+            let fence = self.fence_for_reap(&entry.key, &format!("AND {}", doomed("$2")), now).await?;
+            if fence == Fence::Fenced && self.reap_with_tries(entry, &REAP_RETRY_PAUSES).await? {
+                removed += 1;
             }
-            self.reap_fenced(entry).await?;
-            removed += 1;
         }
-        Ok(removed)
+        if removed > 0 {
+            tracing::info!(target: "weft_broker::runtime_store", removed, "expired stored files removed");
+        }
+        let next: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT MIN(at) FROM ( \
+                 SELECT f.expires_at_unix AS at FROM runtime_file f \
+                  WHERE f.status = 'active' AND f.expires_at_unix IS NOT NULL \
+                    AND NOT EXISTS (SELECT 1 FROM runtime_file r WHERE r.replaces = f.key AND r.status = 'completing') \
+               UNION ALL \
+                 SELECT progressed_at_unix + {CLAIM_LEASE_SECS} FROM runtime_file \
+                  WHERE status = 'reaping' AND progressed_at_unix > 0 \
+             ) due"
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .context("next file expiry")?;
+        Ok(match next {
+            // An expiry and a claim's lapse are a second's mark: the row
+            // is doomed once it passed.
+            Some(at) => DrainStep::RetryIn(std::time::Duration::from_secs(u64::try_from(at + 1 - now).unwrap_or(0))),
+            None => DrainStep::Done,
+        })
+    }
+
+    /// Mark a fenced row whose bucket reap failed with `error`, give its
+    /// claim back (nobody is working on it any more, so the expiry loop's
+    /// next pass, a wipe or the tenant's next upload takes it), and write
+    /// the failure down ([`Self::record_reap_failures`]).
+    async fn mark_reap_failed(&self, key: &str, error: &anyhow::Error) -> Result<()> {
+        tracing::error!(
+            target: "weft_broker::runtime_store", key = %key, error = %format!("{error:#}"),
+            "a stored file could not be removed from the bucket; the expiry loop's next pass, a wipe or the tenant's \
+             next upload tries it again"
+        );
+        sqlx::query("UPDATE runtime_file SET reap_error = $2, progressed_at_unix = 0 WHERE key = $1 AND status = 'reaping'")
+            .bind(key)
+            .bind(weft_task_store::unanswered::pg_text(&format!("{error:#}")))
+            .execute(&self.pool)
+            .await
+            .context("mark a row whose reap failed")?;
+        self.record_reap_failures().await
+    }
+
+    /// Write down, as the failure `weft status` shows (`Callee::Reaps`, a
+    /// record of its own: the expiry loop writes and clears its own passes'
+    /// failures), every row a reap failed on, or clear it once none is
+    /// left. Run when a row is marked and when a marked row is removed,
+    /// after that change committed. Two of these run one after the other
+    /// (a transaction lock), so the last one reads every change made
+    /// before it and what it writes stands.
+    async fn record_reap_failures(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await.context("record failed reaps: begin tx")?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:runtime-file-reaps', 0))")
+            .execute(&mut *tx)
+            .await
+            .context("wait for another record of failed reaps")?;
+        let (failing, shown): (i64, Option<String>) = sqlx::query_as(
+            "SELECT COUNT(*), string_agg(key || ': ' || reap_error, '; ' ORDER BY key) FILTER (WHERE n <= 5) \
+             FROM (SELECT key, reap_error, row_number() OVER (ORDER BY key) AS n FROM runtime_file \
+                   WHERE status = 'reaping' AND reap_error IS NOT NULL) marked",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .context("read the rows a reap failed on")?;
+        let callee = weft_task_store::unanswered::Callee::Reaps;
+        let alerts = if failing == 0 {
+            weft_task_store::unanswered::answered(&mut *tx, callee).await?;
+            weft_task_store::unanswered::Alerts::default()
+        } else {
+            let error = format!(
+                "{failing} stored file(s) could not be removed from the bucket ({}{}); they hold their tenant's \
+                 quota until removed",
+                shown.unwrap_or_default(),
+                if failing > 5 { "; ..." } else { "" },
+            );
+            weft_task_store::unanswered::failed(&mut *tx, callee, None, &error).await?
+        };
+        tx.commit().await.context("record failed reaps: commit")?;
+        alerts.log();
+        Ok(())
+    }
+
+    /// Remove the active file stored under `identity` in `key`'s scope when
+    /// it expired, so an upload of the same thing takes its place. A
+    /// file whose replacement is completing is left (the begin then says
+    /// it is expired and to retry).
+    async fn reap_expired_identity(&self, key: &str, identity: &str) -> Result<()> {
+        let now = self.clock.now_unix();
+        let expired: Option<SweepEntry> = sqlx::query_as(
+            "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file \
+             WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 \
+               AND status = 'active' AND expires_at_unix < $3",
+        )
+        .bind(scope_prefix(key))
+        .bind(identity)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("look for an expired file under this identity")?;
+        let Some(entry) = expired else { return Ok(()) };
+        // Tried once, on the caller's upload: a bucket that refuses fails it.
+        let fence = self.fence_for_reap(&entry.key, "AND status = 'active' AND expires_at_unix < $2", now).await?;
+        if fence == Fence::Fenced {
+            self.reap_fenced(&entry).await?;
+        }
+        Ok(())
     }
 }
 
 /// The ONE definition of a tenant's charged bytes in the runtime-file plane:
-/// an active file counts by its size, a pending upload by its quota-charged
-/// reservation. Every quota check and usage view that needs the runtime-file
-/// footprint reads through here so the numbers can never disagree.
-pub async fn charged_bytes_for<'e, E>(executor: E, tenant: &str) -> Result<u64>
+/// an active file counts by its size (nothing once it expired by `now`, the
+/// store's clock), any other row by its quota-charged reservation. Every
+/// quota check and usage view that needs the runtime-file footprint reads
+/// through here so the numbers can never disagree.
+pub async fn charged_bytes_for<'e, E>(executor: E, tenant: &str, now: i64) -> Result<u64>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let bytes: Option<i64> = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(CASE WHEN status = 'active' THEN size_bytes ELSE reserved_bytes END), 0)::BIGINT \
+    let bytes: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(SUM(CASE WHEN status <> 'active' THEN reserved_bytes \
+                                  WHEN {live} THEN size_bytes ELSE 0 END), 0)::BIGINT \
          FROM runtime_file WHERE tenant_id = $1",
-    )
+        live = unexpired("$2"),
+    ))
     .bind(tenant)
+    .bind(now)
     .fetch_one(executor)
     .await
     .context("read tenant charged bytes")?;
     Ok(bytes.unwrap_or(0) as u64)
+}
+
+/// How many files a tenant holds against its file cap: every row but an
+/// active file expired by `now`.
+async fn count_files<'e, E>(executor: E, tenant: &str, now: i64) -> Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM runtime_file WHERE tenant_id = $1 AND (status <> 'active' OR {live})",
+        live = unexpired("$2"),
+    ))
+    .bind(tenant)
+    .bind(now)
+    .fetch_one(executor)
+    .await
+    .context("count tenant files")?;
+    Ok(count as u64)
 }
 

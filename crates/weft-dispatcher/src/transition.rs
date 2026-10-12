@@ -4,21 +4,27 @@
 //! The MODEL: a transitional state is a real DB value, entered via a
 //! single-flight guarded CAS: an activation's `status = activating /
 //! deactivating` on its `trigger_activation` row (`activation_store`),
-//! or the project row's build `transition = building/cancelling_build`
+//! or the project row's `transition = building/cancelling_build/resyncing`
 //! (`project_store`). While something sits in one, every conflicting
 //! verb is REJECTED instantly; the only offered action is the matching
 //! cancel. This module supplies what the DRIVING process needs around that:
 //!
 //! - `TransitionHeartbeat` / `ActivationHeartbeat`: drop-guarded
-//!   background tasks bumping the row's heartbeat so the stuck-transition
-//!   reaper (`reaper::sweep_stuck_transitions`) can tell a live transition
-//!   (driver bumping) from an orphaned one (driver process died).
+//!   background tasks bumping the row's heartbeat so the `lapses` loop
+//!   (`crate::lapses`) can tell a live transition (driver bumping) from an
+//!   orphaned one (driver process died).
 //! - `ProjectBuildGate` + `build_version_gated`: the `building`
 //!   transition around a version's build. The gate engages ONLY when
 //!   an image actually has to be built (a build whose images all exist
 //!   never flips the marker, so concurrent builds of an unchanged
 //!   project never serialize).
-//! - [`settle`]: the one way the build transition lands back at rest.
+//! - [`settle`]: the one way a build's transition lands back at rest.
+//!
+//! A resync's `resyncing` transition is held by its plan on the project
+//! row, from before its take-down until its task brought every trigger
+//! back or a person gave it up, each of which lands it at rest in the same
+//! statement, so no build registers a version between the two halves
+//! (`crate::task_kinds::resync`).
 //!
 //! Who holds the build transition: the request that entered it, while its
 //! builds are being started (its heartbeat, which beats until the last
@@ -29,7 +35,7 @@
 //! transition for their length; nor can a second marker or a task that
 //! outlives it, which a dispatcher that scales to zero would lose. The
 //! marker is cleared by whoever sees that nothing holds it any more
-//! (`crate::project_store::build_held`): the request letting go, a
+//! (`crate::project_store::transition_held`): the request letting go, a
 //! registration, the build loop, a cancel, and the stuck-transition
 //! reaper, all through [`settle`]. The marker stays the single value every
 //! guard reads (an activation's CAS, the status, the editor's cancel bar).
@@ -50,7 +56,7 @@ pub fn heartbeat_interval() -> std::time::Duration {
     weft_core::time_scale::scaled(std::time::Duration::from_secs(10))
 }
 
-/// How stale a heartbeat must be before the stuck-transition reaper
+/// How stale a heartbeat must be before the `lapses` loop
 /// treats the driver as dead: six bumps, 60 seconds in real time.
 /// Comfortably above the bump interval so a briefly-starved driver is
 /// never false-positived, while an orphaned transition is repaired
@@ -61,9 +67,9 @@ pub fn heartbeat_stale_secs() -> i64 {
 
 /// Drop-guarded heartbeat of a project's build transition: bumps
 /// `transition_heartbeat_unix` every [`heartbeat_interval`] until dropped.
-/// Held for exactly the window a build request drives the transition
+/// Held for exactly the window a request starts the builds
 /// ([`ProjectBuildGate`]); dropping it stops the bumps so an orphaned row
-/// goes stale and the reaper repairs it.
+/// goes stale and the `lapses` loop repairs it.
 pub struct TransitionHeartbeat {
     handle: tokio::task::JoinHandle<()>,
 }
@@ -100,30 +106,85 @@ impl Drop for TransitionHeartbeat {
 
 /// The same drop-guarded heartbeat for an activation in flight: bumps the
 /// heartbeat of every activation row the setup execution `activation` claimed.
+///
+/// It rests while the setup run goes: from the run's first event after its
+/// birth (a worker took it) until its ending. The run may wait days on a
+/// person, and meanwhile it is judged by its own worker's lease and its
+/// ending, never by this driver (`crate::activation_store::SETUP_RUN_GOES`).
+/// When the activation is carried out by a task (a program's call), the
+/// task's claim rests on the run the same way
+/// (`weft_task_store::executor::TaskClaim`). At its ending both beat again
+/// at once, for the rest of the activation.
 pub struct ActivationHeartbeat {
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl ActivationHeartbeat {
-    pub fn spawn(activations: crate::activation_store::ActivationStore, activation: uuid::Uuid) -> Self {
+    pub async fn spawn(state: &DispatcherState, project_id: uuid::Uuid, activation: uuid::Uuid) -> Self {
+        let state = state.clone();
+        let claim = weft_task_store::executor::current_claim();
+        let mut events = state.events.subscribe_project(project_id).await;
+        crate::lapses::book_after_or_log(&state, heartbeat_stale_secs()).await;
         let handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(heartbeat_interval());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The claim already stamped `now`; skip the immediate first tick.
             tick.tick().await;
+            let mut resting = false;
             loop {
-                tick.tick().await;
-                if let Err(e) = activations.bump_heartbeat(activation).await {
-                    tracing::warn!(
-                        target: "weft_dispatcher::transition",
-                        %activation,
-                        error = %e,
-                        "activation heartbeat bump failed; retrying next tick"
-                    );
+                let rest = tokio::select! {
+                    _ = tick.tick(), if !resting => {
+                        bump(&state, activation).await;
+                        continue;
+                    }
+                    heard = events.recv() => match heard {
+                        Ok(record) if record.event.execution_id() != Some(activation) => continue,
+                        Ok(record) if record.event.is_execution_terminal() => false,
+                        Ok(record) => !matches!(record.event, crate::events::DispatcherEvent::ExecutionStarted { .. }),
+                        // A gap in what was heard: the run's row says
+                        // whether it still goes.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            match weft_task_store::runs::ended(&state.pg_pool, activation).await {
+                                Ok(ended) => !ended && resting,
+                                Err(_) => false,
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+                    },
+                };
+                if rest == resting {
+                    continue;
+                }
+                resting = rest;
+                if let Some(claim) = &claim {
+                    let moved = match rest {
+                        true => claim.rest_on(activation).await,
+                        false => claim.resume().await,
+                    };
+                    if let Err(e) = moved {
+                        tracing::warn!(target: "weft_dispatcher::transition", %activation, error = %format!("{e:#}"), "could not move the task's claim with its setup run");
+                    }
+                }
+                if !rest {
+                    bump(&state, activation).await;
+                    crate::lapses::book_after_or_log(&state, heartbeat_stale_secs()).await;
                 }
             }
         });
         Self { handle }
+    }
+}
+
+/// Bump the heartbeat of the activation `activation`, logging a failure
+/// (the next beat tries again).
+async fn bump(state: &DispatcherState, activation: uuid::Uuid) {
+    if let Err(e) = state.activations.bump_heartbeat(activation).await {
+        tracing::warn!(
+            target: "weft_dispatcher::transition",
+            %activation,
+            error = %e,
+            "activation heartbeat bump failed; retrying next tick"
+        );
     }
 }
 
@@ -182,12 +243,12 @@ pub(crate) async fn publish_transition_changed(state: &DispatcherState, id: uuid
         .await;
 }
 
-/// Land at rest every project in a build transition that nothing holds
-/// any more (`ProjectStoreOps::settle_building`), `project` narrowing it
-/// to one, and announce each.
+/// Land at rest every project in a transition that nothing holds any
+/// more (`ProjectStoreOps::settle_transition`), `project` narrowing it to
+/// one, and announce each.
 pub(crate) async fn settle(state: &DispatcherState, project: Option<uuid::Uuid>) -> anyhow::Result<()> {
     let stale_before = crate::lease::now_unix() - heartbeat_stale_secs();
-    for id in state.projects.settle_building(project, stale_before).await? {
+    for id in state.projects.settle_transition(project, stale_before).await? {
         publish_transition_changed(state, id).await;
     }
     Ok(())
@@ -228,15 +289,19 @@ impl BuildGate for ProjectBuildGate {
                 .transition(self.id)
                 .await?
                 .unwrap_or(ProjectTransition::None);
+            if transition == ProjectTransition::Resyncing {
+                let why = transition.refusal().unwrap_or_default();
+                return Err(BuildRefused { resyncing: true, message: format!("cannot build now: {why}") }.into());
+            }
             let activations = self.state.activations.list(self.id).await?;
             let status = crate::activation_store::aggregate(activations.iter().map(|a| &a.lifecycle))
                 .status
                 .as_str();
-            anyhow::bail!(
-                "cannot build now: project is {} (status {status}); wait for it to \
-                 finish or cancel it first",
+            let message = format!(
+                "cannot build now: project is {} (status {status}); wait for it to finish or cancel it first",
                 if transition.is_building() { transition.as_str() } else { status },
             );
+            return Err(BuildRefused { resyncing: false, message }.into());
         }
         self.engaged.store(true, Ordering::Release);
         // Bumped until `let_go`, which may come after this request is gone
@@ -244,6 +309,9 @@ impl BuildGate for ProjectBuildGate {
         // reads a stale heartbeat as a start nobody drives any more.
         *self.heartbeat.lock().expect("the gate's heartbeat slot is never poisoned") =
             Some(TransitionHeartbeat::spawn(self.state.projects.clone(), self.id));
+        // Nothing announces a driver that died: the `lapses` loop looks
+        // once the beat could have gone stale.
+        crate::lapses::book_after_or_log(&self.state, heartbeat_stale_secs()).await;
         publish_transition_changed(&self.state, self.id).await;
         Ok(())
     }
@@ -259,7 +327,7 @@ impl BuildGate for ProjectBuildGate {
             return;
         }
         drop(self.heartbeat.lock().expect("the gate's heartbeat slot is never poisoned").take());
-        let released = match self.state.projects.release_build_driver(self.id).await {
+        let released = match self.state.projects.release_driver(self.id).await {
             Ok(()) => settle(&self.state, Some(self.id)).await,
             Err(e) => Err(e),
         };
@@ -268,12 +336,29 @@ impl BuildGate for ProjectBuildGate {
                 target: "weft_dispatcher::transition",
                 project_id = %self.id,
                 error = %format!("{e:#}"),
-                "letting go of the build transition failed; the stuck-transition reaper \
+                "letting go of the build transition failed; the lapses loop \
                  settles it once the heartbeat goes stale"
             );
         }
     }
 }
+
+/// Why the gate refused to start a build: another request holds the
+/// project's transition, or its triggers are mid-flip.
+#[derive(Debug)]
+struct BuildRefused {
+    /// A resync holds it: no ask of this build is starting builds.
+    resyncing: bool,
+    message: String,
+}
+
+impl std::fmt::Display for BuildRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BuildRefused {}
 
 /// Build one version of a project through the `building` transition:
 /// the gate engages only when an image actually has to be built
@@ -282,8 +367,9 @@ impl BuildGate for ProjectBuildGate {
 /// leaving the transition to it. A build that loses the single-flight is a
 /// 409 naming the in-flight state, marked
 /// [`weft_core::builds::BUILD_BUSY_HEADER`] (a caller resending an ask
-/// whose answer it lost waits and sends it again); a user cancel is a 409
-/// "build cancelled" rather than a 500.
+/// whose answer it lost waits and sends it again) unless a resync holds
+/// the project, which no ask of a build is; a user cancel is a 409 "build
+/// cancelled" rather than a 500.
 pub(crate) async fn build_version_gated(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -302,14 +388,16 @@ pub(crate) async fn build_version_gated(
         Err(e) if crate::build::cancelled(&e) => {
             Err((StatusCode::CONFLICT, format!("build cancelled by user: {e:#}")).into_response())
         }
-        // A lost single-flight (gate.begin refused) is a state
-        // conflict, not a server fault.
-        Err(e) if !gate.engaged() && format!("{e}").starts_with("cannot build now") => {
-            Err((StatusCode::CONFLICT, [(weft_core::builds::BUILD_BUSY_HEADER, "1")], format!("{e}")).into_response())
-        }
-        // `{e:#}` (alternate) prints the FULL chain so the compile
-        // diagnostics (`line:col message`) reach the client, not just
-        // the outermost context.
-        Err(e) => Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")).into_response()),
+        // A lost single-flight (gate.begin refused) is a state conflict,
+        // not a server fault. Anything else prints the FULL chain (`{e:#}`)
+        // so the compile diagnostics (`line:col message`) reach the
+        // client, not just the outermost context.
+        Err(e) => match e.chain().find_map(|cause| cause.downcast_ref::<BuildRefused>()) {
+            Some(BuildRefused { resyncing: true, message }) => Err((StatusCode::CONFLICT, message.clone()).into_response()),
+            Some(BuildRefused { resyncing: false, message }) => {
+                Err((StatusCode::CONFLICT, [(weft_core::builds::BUILD_BUSY_HEADER, "1")], message.clone()).into_response())
+            }
+            None => Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")).into_response()),
+        },
     }
 }

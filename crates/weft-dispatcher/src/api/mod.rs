@@ -305,6 +305,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // already wrote to the row stays in place).
         .route("/projects/{id}/cancel-running", post(project::cancel_running))
         .route("/projects/{id}/resync", post(project::resync))
+        .route("/projects/{id}/resync/resume", post(project::resume_resync))
         // Unified subworkflow endpoint for Start / Restart / Upgrade.
         // All three CLI verbs POST here; the dispatcher uses the
         // resolved-spec-hash to decide skip-vs-apply per node.
@@ -317,6 +318,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // interrupt the InfraSetup provisioning execution. HALT, not
         // rollback: per-node partial state stays visible.
         .route("/projects/{id}/infra/cancel", post(infra::cancel))
+        .route("/projects/{id}/infra/look", post(infra::look))
         // Per-node verbs for partial-state recovery.
         // `{node}` on every per-node infra route is the node's
         // PLACEMENT as a person spells it (`one.db`): an infra node inside
@@ -408,8 +410,6 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
             state.clone(),
             crate::authenticator::require_caller,
         ))
-        // Probes carry no credential.
-        .route("/health", get(|| async { "ok" }))
         .layer(cors)
         .merge(outside_caller_routes(state))
 }
@@ -562,7 +562,15 @@ pub fn permissive_cors() -> CorsLayer {
 pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.public);
     let routes = core_routes(cors, state.clone())
-        .layer(axum::middleware::from_fn_with_state(state.clone(), note_cli_version));
+        .layer(axum::middleware::from_fn_with_state(state.clone(), note_cli_version))
+        // Every call may write, and a write made while the process's watch
+        // is quiet would be announced to nobody, so each holds the watch
+        // while it is answered. What the door sends elsewhere (a frontend)
+        // does not come through here, and touches the database only to
+        // route.
+        .layer(axum::middleware::from_fn_with_state(state.signals.clone(), weft_task_store::pg_signal::keep_listening))
+        // Probes carry no credential and touch nothing.
+        .route("/health", get(|| async { "ok" }));
     with_hops(routes, hops).with_state(state)
 }
 

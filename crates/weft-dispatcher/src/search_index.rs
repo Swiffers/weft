@@ -9,26 +9,19 @@
 //! runs listing matches it (`--search`, `--through`), beside its other
 //! filters.
 //!
-//! Built behind the writes, never on a run's path: a run's ending queues it
-//! (`run_search_queue`, in the write that ends it), and a loop here takes
-//! the queue a thousand at a time, reads their records, and writes their
-//! entries, at most [`DEFAULT_RATE`] runs a second (`WEFT_SEARCH_RATE`),
-//! pausing while workers' records are being written: an entry costs the
-//! database about ten times what a record does, and must never compete
-//! with one. A run becomes searchable a few seconds after it ends, longer
-//! under heavy load; a search meanwhile answers from what is indexed, as
-//! if the newest runs had not happened yet.
+//! Built when somebody searches, never on a run's path and never on a
+//! timer: a run's ending queues it (`run_search_queue`, in the write that
+//! ends it), and a listing that reads the entries first builds the ones
+//! queued ([`index_queued`]). So an install where nobody searches spends
+//! nothing on it, and the first search after many runs ended takes longer.
 //!
 //! Words, not substrings: `ada@example.com` finds the runs that carried that
 //! address, and several words find the runs carrying all of them (a
 //! quoted phrase, the runs carrying it as written).
 
-use std::time::Duration;
-
 use sqlx::PgPool;
 use weft_core::ExecutionId;
 use weft_journal::ExecEvent;
-use weft_task_store::drain::{DrainLoop, DrainStep};
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "execution_search",
@@ -53,19 +46,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     seed: &[],
 };
 
-/// How many runs a second the loop indexes when nothing says otherwise.
-pub const DEFAULT_RATE: u32 = 2_000;
-
 /// How many queued runs one round takes.
 const ROUND: i64 = 1_000;
-
-/// How long the loop waits before looking again when the queue is empty,
-/// or the records are busy.
-const IDLE: Duration = Duration::from_secs(1);
-
-/// How often the loop looks when it found nothing to do: a run that just
-/// ended waits about this long to be searchable, on a quiet install.
-const QUIET_LOOK: Duration = Duration::from_secs(2);
 
 /// What one run's entry holds.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -89,51 +71,22 @@ impl Entry {
     }
 }
 
-/// `WEFT_SEARCH_RATE`, or [`DEFAULT_RATE`].
-pub fn rate_from_env() -> anyhow::Result<u32> {
-    match std::env::var("WEFT_SEARCH_RATE") {
-        Ok(raw) => {
-            let rate: u32 = raw.trim().parse().map_err(|e| anyhow::anyhow!("WEFT_SEARCH_RATE is not a whole number of runs a second: {e}"))?;
-            anyhow::ensure!(rate > 0, "WEFT_SEARCH_RATE must be at least 1");
-            Ok(rate)
+/// Build the entry of every run queued, a round of [`ROUND`] at a time,
+/// and answer how many. Each round takes its runs with `FOR UPDATE SKIP
+/// LOCKED`, so two searches at once never index one run twice.
+pub async fn index_queued(pool: &PgPool) -> anyhow::Result<usize> {
+    let mut indexed = 0;
+    loop {
+        let round = round(pool).await?;
+        indexed += round;
+        if (round as i64) < ROUND {
+            return Ok(indexed);
         }
-        Err(_) => Ok(DEFAULT_RATE),
     }
 }
 
-/// What one round found.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Round {
-    /// Workers' records are being written: nothing was indexed.
-    Busy,
-    /// This many runs indexed.
-    Indexed(usize),
-}
-
-/// The loop (see the module doc), paced to `rate` runs a second. Several
-/// dispatchers run it side by side: each round takes its runs with
-/// `FOR UPDATE SKIP LOCKED`, so no run is indexed twice.
-pub fn drain_loop(state: crate::state::DispatcherState, rate: u32) -> DrainLoop {
-    DrainLoop::new("search_index", &[], QUIET_LOOK, move || {
-        let pool = state.pg_pool.clone();
-        async move {
-            Ok(match round(&pool, rate).await? {
-                Round::Busy => DrainStep::RetryIn(IDLE),
-                Round::Indexed(0) => DrainStep::Done,
-                Round::Indexed(n) if n as i64 == ROUND => DrainStep::More,
-                Round::Indexed(_) => DrainStep::RetryIn(IDLE),
-            })
-        }
-    })
-}
-
-/// One round: up to [`ROUND`] queued runs indexed, paced to `rate` runs a
-/// second, unless workers' records are being written right now.
-pub async fn round(pool: &PgPool, rate: u32) -> anyhow::Result<Round> {
-    if records_busy(pool).await? {
-        return Ok(Round::Busy);
-    }
-    let started = tokio::time::Instant::now();
+/// One round: up to [`ROUND`] queued runs indexed; answers how many.
+async fn round(pool: &PgPool) -> anyhow::Result<usize> {
     let mut tx = pool.begin().await?;
     let ids: Vec<ExecutionId> = sqlx::query_scalar(
         "SELECT execution_id FROM run_search_queue ORDER BY execution_id LIMIT $1 FOR UPDATE SKIP LOCKED",
@@ -162,25 +115,7 @@ pub async fn round(pool: &PgPool, rate: u32) -> anyhow::Result<Round> {
     }
     sqlx::query("DELETE FROM run_search_queue WHERE execution_id = ANY($1)").bind(&ids).execute(&mut *tx).await?;
     tx.commit().await?;
-    let paced = Duration::from_secs_f64(ids.len() as f64 / f64::from(rate));
-    tokio::time::sleep_until(started + paced).await;
-    Ok(Round::Indexed(ids.len()))
-}
-
-/// Whether workers' records wait to be written: some broker has every
-/// connection of its record pool in use (they carry its name,
-/// `weft_task_store::db::RECORD_POOL_APPLICATION`), so its next batch
-/// waits for one. The loop waits for them then; under any lighter load it
-/// goes on, paced, and never starves.
-async fn records_busy(pool: &PgPool) -> anyhow::Result<bool> {
-    let busiest: Option<i64> = sqlx::query_scalar(
-        "SELECT max(going) FROM (SELECT count(*) AS going FROM pg_stat_activity \
-           WHERE state <> 'idle' AND starts_with(application_name, $1) GROUP BY application_name) AS broker",
-    )
-    .bind(format!("{}/", weft_task_store::db::RECORD_POOL_APPLICATION))
-    .fetch_one(pool)
-    .await?;
-    Ok(busiest.unwrap_or(0) >= i64::from(weft_task_store::db::RECORD_POOL_CONNECTIONS))
+    Ok(ids.len())
 }
 
 #[cfg(test)]

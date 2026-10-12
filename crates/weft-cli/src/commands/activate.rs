@@ -2,11 +2,13 @@
 //! ensure registered, activate. With arg: treat it as a project id
 //! and activate directly (assume already registered).
 //!
-//! When the project is currently inactive AND preserved state
-//! exists (parked + suspended counts both non-zero), the user is
-//! prompted to pick one of three reactivate choices. The choice is
-//! sent in the activate body (`reactivateChoice`); the dispatcher's
-//! activate handler decides whether to drain/wipe/keep based on it.
+//! When the triggers being turned on kept work while they were off
+//! (events that arrived meanwhile, or runs waiting on a person: either
+//! count non-zero), the user is prompted to pick one of three reactivate
+//! choices. The choice is sent in the activate body (`reactivateChoice`);
+//! the dispatcher's activate handler decides whether to run, drop or keep
+//! the kept work based on it. Only this command asks: a resync carries
+//! the kept work over.
 //!
 //! A worker built from an older image is replaced on the way:
 //! `--running-policy` says whether its running executions are
@@ -188,13 +190,13 @@ async fn prompt_reactivate_choice(
         return Ok(None);
     };
     println!("Kept while these triggers were off:");
-    println!("  - {parked} parked signal(s) (queued submissions, will execute on reactivate)");
-    println!("  - {suspended} pending suspension(s) (registered, no submission yet)");
+    println!("  - {parked} event(s) that arrived meanwhile, answers people sent to waiting runs included");
+    println!("  - {suspended} run(s) waiting on a person");
     println!();
     println!("Choose:");
-    println!("  1) execute_parked_keep_suspended  drain parked + keep suspensions");
-    println!("  2) keep_suspended_only            drop parked, keep suspensions");
-    println!("  3) wipe_all                       drop everything, fresh start");
+    println!("  1) execute_parked_keep_suspended  run the kept events and answers; waiting runs keep waiting");
+    println!("  2) keep_suspended_only            drop the kept events, answers people sent included; waiting runs keep waiting");
+    println!("  3) wipe_all                       drop everything and cancel the runs these triggers started: a fresh start");
     let line = crate::prompt::prompt_line("> ", "--reactivate-choice <choice>")?;
     let choice = match line.as_str() {
         "1" => ReactivateChoice::ExecuteParkedKeepSuspended,

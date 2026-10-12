@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsCreateAgent",
   "label": "Agent: Create",
-  "description": "Mint a voice agent on the account: name, system prompt, first message, voice, language. The agent id works in Agent: Place Call; manage it at elevenlabs.io/app/agents.",
+  "description": "Make a voice agent on the account, from its prompt and voice to its tools and what ElevenLabs checks after each conversation. The agent id works in Agent: Place Call; manage the agent at elevenlabs.io/app/agents.",
   "tags": [
     "ai",
     "audio",
@@ -12,32 +12,39 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access", "accepts": ["wire"],
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
       "required": true,
       "requiresScopes": [
         "agents"
       ],
-      "description": "Your own ElevenLabs account (the minted agent lives in it; the shared credential cannot serve this)."
+      "description": "Your own ElevenLabs account (the agent lives in it; the shared credential cannot serve this)."
     },
     {
       "name": "name",
       "type": "String",
       "required": true,
-      "description": "The agent's name on the account."
+      "description": "The agent's name on the account, to find it again."
     },
     {
       "name": "prompt",
       "type": "String",
-      "widget": { "kind": "textarea" },
+      "widget": {
+        "kind": "textarea"
+      },
       "required": true,
-      "description": "The agent's system prompt: who it is, what it does, how it talks. {{variables}} are filled per call.",
+      "description": "The agent's system prompt: who it is, what it does, how it talks. Each {{variable}} in it is filled per call, from Agent: Place Call's `dynamicVariables`.",
       "placeholder": "You are a friendly booking assistant for..."
     },
     {
       "name": "firstMessage",
       "type": "String",
-      "widget": { "kind": "textarea" },
-      "description": "What the agent says first. Absent = it waits for the caller."
+      "widget": {
+        "kind": "textarea"
+      },
+      "description": "What the agent says first. Leave empty and it waits for the other side to speak first."
     },
     {
       "name": "voice",
@@ -57,24 +64,410 @@
         ]
       },
       "label": "Voice",
-      "placeholder": "Pick a voice, or paste a voice id"
+      "placeholder": "Pick a voice, or paste a voice id",
+      "description": "The voice the agent speaks with. Leave empty for ElevenLabs's default voice."
     },
     {
       "name": "language",
       "type": "String",
-      "default": "en",
       "label": "Language",
-      "description": "The agent's ISO language code."
+      "placeholder": "en",
+      "description": "The agent's language as an ISO code, like `fr`. ElevenLabs uses it both to hear the other side and to speak. Leave empty for `en`."
+    },
+    {
+      "name": "llm",
+      "type": "String",
+      "label": "Model",
+      "placeholder": "Pick a model, or paste its id",
+      "description": "The model that writes the agent's replies. The list is every model ElevenLabs offers agents on this account, ones it is retiring included. `custom-llm` is your own Chat Completions endpoint, defined in `conversationConfig` under `agent.prompt.custom_llm` (its `url` at least). Leave empty for ElevenLabs's default, gemini-2.5-flash.",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/convai/llm/list",
+            "items": "llms",
+            "label": "llm",
+            "value": "llm"
+          }
+        ]
+      }
+    },
+    {
+      "name": "temperature",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 0.05
+      },
+      "description": "How freely the model picks its words: 0 is the most predictable. Leave empty for ElevenLabs's default, 0."
+    },
+    {
+      "name": "maxTokens",
+      "type": "Number",
+      "label": "Max tokens",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "description": "The most tokens the model may write in one reply. Leave empty for no limit."
+    },
+    {
+      "name": "reasoningEffort",
+      "type": "String",
+      "label": "Reasoning effort",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "description": "How hard the model thinks before it answers. Only some models take it, and each takes its own levels."
+    },
+    {
+      "name": "thinkingBudget",
+      "type": "Number",
+      "label": "Thinking budget",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "description": "The most tokens the model may spend thinking. 0 turns thinking off, on a model that allows it."
+    },
+    {
+      "name": "timezone",
+      "type": "String",
+      "placeholder": "Europe/Paris",
+      "description": "If you want the agent to know the date and time, give a timezone like `Europe/Paris`: ElevenLabs then puts the current time in the agent's prompt. Without one, the agent does not know the time unless a variable or a tool tells it."
+    },
+    {
+      "name": "toolIds",
+      "type": "List[String]",
+      "label": "Tools",
+      "description": "Ids of tools on the account that the agent can call."
+    },
+    {
+      "name": "mcpServerIds",
+      "type": "List[String]",
+      "label": "MCP servers",
+      "description": "Ids of MCP servers on the account whose tools the agent can call, at most 10."
+    },
+    {
+      "name": "builtInTools",
+      "type": "List[String]",
+      "label": "Built-in tools",
+      "default": [
+        "end_call"
+      ],
+      "widget": {
+        "kind": "multiselect",
+        "options": [
+          "end_call",
+          "language_detection",
+          "skip_turn",
+          "play_keypad_touch_tone",
+          "voicemail_detection"
+        ]
+      },
+      "description": "ElevenLabs's own tools the agent can use: `end_call` lets it hang up, `language_detection` lets it switch to the language the other side speaks, `skip_turn` lets it wait when the other side asks for a moment to think, `play_keypad_touch_tone` presses phone keys to get through a phone menu, and `voicemail_detection` ends the call when an answering machine picks up. A transfer needs its list of destinations, so it goes in `conversationConfig`, under `agent.prompt.built_in_tools`."
+    },
+    {
+      "name": "knowledgeBase",
+      "type": "List[{ id: String, name: String, type: String, usageMode?: String }]",
+      "label": "Knowledge base",
+      "description": "Documents from the account's knowledge base the agent can draw on. Each takes the document's `id`, its `name`, its `type` (`file`, `url`, `text` or `folder`), and optionally its `usageMode` (`auto`, the default, or `prompt`)."
+    },
+    {
+      "name": "ttsModel",
+      "type": "String",
+      "label": "Voice model",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "eleven_v4_turbo",
+          "eleven_v4",
+          "eleven_v3_conversational",
+          "eleven_flash_v2_5",
+          "eleven_flash_v2",
+          "eleven_multilingual_v2"
+        ]
+      },
+      "description": "The model that speaks the agent's replies. Leave empty for ElevenLabs's default, eleven_v4_turbo, which ElevenLabs calls its best model for agents. An English agent (and one with no `language`) takes only eleven_v4_turbo or eleven_flash_v2, which speaks English only."
+    },
+    {
+      "name": "stability",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "How steady the voice sounds, from 0 (more varied) to 1 (steadier). Leave empty for ElevenLabs's default, 0.5."
+    },
+    {
+      "name": "similarityBoost",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "How closely the speech sticks to the voice, from 0 to 1. Leave empty for ElevenLabs's default, 0.8."
+    },
+    {
+      "name": "speed",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0.7,
+        "max": 1.2,
+        "step": 0.05
+      },
+      "description": "How fast the agent speaks, from 0.7 to 1.2. Leave empty for 1, its normal speed."
+    },
+    {
+      "name": "outputAudioFormat",
+      "type": "String",
+      "label": "Output audio format",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "pcm_8000",
+          "pcm_16000",
+          "pcm_22050",
+          "pcm_24000",
+          "pcm_44100",
+          "pcm_48000",
+          "ulaw_8000"
+        ]
+      },
+      "description": "The audio format the agent speaks in. Leave empty for ElevenLabs's default, pcm_16000."
+    },
+    {
+      "name": "asrKeywords",
+      "type": "List[String]",
+      "label": "Words to expect",
+      "description": "Words the agent should expect to hear, so it transcribes them right: names, product names, jargon."
+    },
+    {
+      "name": "turnTimeout",
+      "type": "Number",
+      "label": "Reply wait",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 0.5
+      },
+      "description": "How many seconds the agent waits for a reply before it speaks again to re-engage. Leave empty for ElevenLabs's default, 7."
+    },
+    {
+      "name": "silenceEndCallTimeout",
+      "type": "Number",
+      "label": "End on silence",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 0.5
+      },
+      "description": "If you want the call to end when the other side goes quiet, how many seconds after they last spoke the agent hangs up. Leave empty to never end a call on silence."
+    },
+    {
+      "name": "maxDurationSeconds",
+      "type": "Number",
+      "label": "Max duration",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "description": "The longest a conversation may last, in seconds. Leave empty for ElevenLabs's default, 600."
+    },
+    {
+      "name": "dynamicVariables",
+      "type": "JsonDict",
+      "description": "Placeholder values for the prompt's {{variables}}, stored on the agent, e.g. { \"customer_name\": \"Ada\" }. A call gives its own values in Agent: Place Call's `dynamicVariables`."
+    },
+    {
+      "name": "dataCollection",
+      "type": "Dict[String, String | { type: String, description: String, enum?: List[String] }]",
+      "label": "Data to collect",
+      "description": "What ElevenLabs pulls out of each finished conversation, by item id. A plain text is the description of a text item: { \"customer_name\": \"The caller's full name\" }. An object gives the `type` (`string`, `boolean`, `integer` or `number`), the `description`, and for a string the allowed values in `enum`. Agent: Get Conversation emits the values on `dataCollection`."
+    },
+    {
+      "name": "evaluationCriteria",
+      "type": "Dict[String, String]",
+      "label": "Success criteria",
+      "description": "What makes a conversation a success, by criterion id: each value is the goal ElevenLabs checks the finished conversation against, at most 2000 characters, e.g. { \"booked\": \"The caller booked a table\" }. Agent: Get Conversation emits each result (`success`, `failure` or `unknown`) on `evaluation`."
+    },
+    {
+      "name": "allowOverrides",
+      "type": "List[String]",
+      "label": "Per-call changes allowed",
+      "widget": {
+        "kind": "multiselect",
+        "options": [
+          "agent.first_message",
+          "agent.language",
+          "agent.max_conversation_duration_message",
+          "agent.prompt.prompt",
+          "agent.prompt.llm",
+          "agent.prompt.tool_ids",
+          "agent.prompt.tool_ids_strict",
+          "agent.prompt.native_mcp_server_ids",
+          "agent.prompt.knowledge_base",
+          "tts.voice_id",
+          "tts.model_id",
+          "tts.supported_voices",
+          "tts.stability",
+          "tts.speed",
+          "tts.similarity_boost",
+          "tts.pronunciation_dictionary_locators",
+          "asr.keywords",
+          "conversation.text_only",
+          "conversation.max_duration_seconds",
+          "turn.soft_timeout_config.message",
+          "turn.soft_timeout_config.additional_soft_timeout_messages",
+          "starting_workflow_node_id",
+          "procedure_ids",
+          "custom_llm_extra_body"
+        ]
+      },
+      "description": "What a single call may change on this agent. ElevenLabs allows no change unless it is listed here. Each name is the setting a call sends: Agent: Place Call's `firstMessage`, `prompt`, `language` and `voice` need `agent.first_message`, `agent.prompt.prompt`, `agent.language` and `tts.voice_id`; the last three names allow the fields of the same name in its `clientData`."
+    },
+    {
+      "name": "tags",
+      "type": "List[String]",
+      "description": "Tags to sort and filter the agent by on the account."
+    },
+    {
+      "name": "conversationConfig",
+      "type": "JsonDict",
+      "label": "More conversation settings",
+      "widget": {
+        "kind": "code",
+        "language": "json"
+      },
+      "description": "Any other conversation setting, written as the JSON ElevenLabs takes in `conversation_config`, e.g. { \"turn\": { \"turn_eagerness\": \"eager\" } }. The inputs above go on top of it: objects merge key by key, and where both set the same key, the input wins."
+    },
+    {
+      "name": "platformSettings",
+      "type": "JsonDict",
+      "label": "Platform settings",
+      "widget": {
+        "kind": "code",
+        "language": "json"
+      },
+      "description": "The agent's platform settings, written as the JSON ElevenLabs takes in `platform_settings`: guardrails, privacy, call limits, the model that analyses conversations, and more. `dataCollection`, `evaluationCriteria` and `allowOverrides` go on top of it: objects merge key by key, and where both set the same key, the input wins."
+    },
+    {
+      "name": "workflow",
+      "type": "JsonDict",
+      "widget": {
+        "kind": "code",
+        "language": "json"
+      },
+      "description": "The agent's workflow, written as the JSON ElevenLabs takes in `workflow`: the nodes and edges that route a conversation between agents and tools."
     }
   ],
   "outputs": [
     {
       "name": "agentId",
       "type": "String",
-      "description": "The minted agent's id: what Agent: Place Call takes."
+      "description": "The new agent's id: what Agent: Place Call takes."
     }
   ],
   "features": {
     "catchErrors": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "llm",
+            "equals": "custom-llm"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "conversationConfig"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsCreateAgent '{id}' picks `custom-llm`, and ElevenLabs needs that model's definition: put it in `conversationConfig` under `agent.prompt.custom_llm` (its `url` at least), or pick another `llm`.",
+        "port": "llm"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_in_set",
+            "field": "ttsModel",
+            "values": [
+              "eleven_v4",
+              "eleven_v3_conversational",
+              "eleven_flash_v2_5",
+              "eleven_multilingual_v2"
+            ]
+          },
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "config_equals",
+                "field": "language",
+                "equals": "en"
+              },
+              {
+                "kind": "all",
+                "of": [
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "config_present",
+                      "field": "language"
+                    }
+                  },
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "input_wired",
+                      "port": "language"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsCreateAgent '{id}' makes an English agent with that `ttsModel`, and ElevenLabs takes an English agent only on eleven_v4_turbo or eleven_flash_v2: pick one of those, or leave `ttsModel` empty.",
+        "port": "ttsModel"
+      }
+    }
+  ]
 }

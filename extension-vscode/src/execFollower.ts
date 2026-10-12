@@ -91,7 +91,7 @@ export type DispatcherEvent = { event_id: string } & (
   | { kind: 'project_activated'; project_id: string }
   | { kind: 'project_deactivated'; project_id: string }
   // A lifecycle axis flipped (entering/leaving activating /
-  // deactivating / building / cancelling_build, or landing at rest).
+  // deactivating / building / cancelling_build / resyncing, or landing at rest).
   // Carries both axes; the host treats it as a status-refresh signal
   // like every other project_* event.
   | { kind: 'project_transition_changed'; project_id: string; status: string; transition: string }

@@ -431,6 +431,36 @@ async fn an_older_ask_never_lands_over_a_registered_newer_one(pool: PgPool) {
     assert_eq!(claims_of(&pool, late.build).await, 0, "and its claim let go");
 }
 
+/// No version registers while a resync holds the project, the one whose
+/// images were all there already included: the registration is refused
+/// as a resync's, and lands once the resync let go.
+#[sqlx::test]
+async fn no_version_registers_while_a_resync_holds_the_project(pool: PgPool) {
+    setup(&pool).await;
+    let project = uuid::Uuid::new_v4();
+    let projects = project_store(&pool, &[project]).await;
+    sqlx::query("UPDATE project SET transition = 'resyncing' WHERE id = $1").bind(project).execute(&pool).await.unwrap();
+    let ask = projects.next_build_ask(project).await.unwrap();
+    let version = version_asked(project, "under-resync", &[image(ImageKind::Worker, "reg:5000/weft-worker:under-resync")], ask);
+    let refused = waiting::register_version(projects.as_ref(), &pool, project, TENANT, &version, Registrar::Request { hold: ImageHold::new(&pool, project) })
+        .await
+        .expect_err("refused under the resync");
+    assert!(waiting::ResyncHolds::is(&refused), "{refused:#}");
+    // Letting go of the claim failing too keeps the refusal a resync's
+    // (the request answers 409), the release's failure added to it.
+    let closed = sqlx::postgres::PgPoolOptions::new().connect_with((*pool.connect_options()).clone()).await.unwrap();
+    let hold = ImageHold::new(&closed, project);
+    closed.close().await;
+    let refused = waiting::register_version(projects.as_ref(), &pool, project, TENANT, &version, Registrar::Request { hold })
+        .await
+        .expect_err("refused under the resync");
+    assert!(waiting::ResyncHolds::is(&refused), "{refused:#}");
+    assert!(format!("{refused:#}").contains("letting go of the build's claim on its images failed too"), "{refused:#}");
+    assert_eq!(running_binary(&pool, project).await, None);
+    sqlx::query("UPDATE project SET transition = 'none' WHERE id = $1").bind(project).execute(&pool).await.unwrap();
+    assert!(register_asked(&pool, &projects, project, "under-resync", ask).await, "lands once it let go");
+}
+
 /// A version waiting behind a newer one still waiting is written down
 /// superseded, and the newer one keeps waiting.
 #[sqlx::test]
@@ -480,7 +510,7 @@ async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: PgPool) {
         (garbled_program, serde_json::json!({ "not": "a program" }), serde_json::json!([])),
     ] {
         assert!(projects.try_begin_building(project, stale_before()).await.unwrap());
-        projects.release_build_driver(project).await.unwrap();
+        projects.release_driver(project).await.unwrap();
         sqlx::query(
             "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on, \
                                         state, asked_at) \
@@ -502,7 +532,7 @@ async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: PgPool) {
         assert_eq!(state, "failed");
         assert!(reason.as_deref().is_some_and(|r| r.contains(says)), "{reason:?}");
     }
-    let mut settled = projects.settle_building(None, stale_before()).await.unwrap();
+    let mut settled = projects.settle_transition(None, stale_before()).await.unwrap();
     settled.sort();
     let mut both = vec![garbled_images, garbled_program];
     both.sort();
@@ -701,7 +731,7 @@ async fn a_start_that_never_lands_ends_and_a_late_one_is_freed(pool: PgPool) {
     let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, project, TENANT, Some(2), crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
-    projects.release_build_driver(project).await.unwrap();
+    projects.release_driver(project).await.unwrap();
     follow::look(&pool, fake.as_ref()).await.unwrap();
     let state = build_state(&pool, image_ref, &name).await;
     assert_eq!(state.state, Some(BuildState::Failed), "a start that never landed ends failed");
@@ -990,21 +1020,21 @@ async fn a_waiting_version_holds_the_transition_until_it_registers(pool: PgPool)
 
     assert!(projects.try_begin_building(own, stale_before()).await.unwrap());
     let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, own, "held", &images, gate()).await.unwrap());
-    assert!(projects.settle_building(None, stale_before()).await.unwrap().is_empty(), "a live request holds it");
-    projects.release_build_driver(own).await.unwrap();
+    assert!(projects.settle_transition(None, stale_before()).await.unwrap().is_empty(), "a live request holds it");
+    projects.release_driver(own).await.unwrap();
 
     assert!(projects.try_begin_building(joiner, stale_before()).await.unwrap());
     let joined = waiting_on(ask(&builder(&pool, fake.clone()), &pool, joiner, "held", &images, gate()).await.unwrap());
     assert_eq!(joined.images, underway.images);
-    projects.release_build_driver(joiner).await.unwrap();
+    projects.release_driver(joiner).await.unwrap();
 
     fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded);
     follow::look(&pool, fake.as_ref()).await.unwrap();
-    assert!(projects.settle_building(None, stale_before()).await.unwrap().is_empty(), "the build ended, but both versions wait");
+    assert!(projects.settle_transition(None, stale_before()).await.unwrap().is_empty(), "the build ended, but both versions wait");
     assert_eq!(transition_of(&projects, own).await, "building");
 
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
-    let mut settled = projects.settle_building(None, stale_before()).await.unwrap();
+    let mut settled = projects.settle_transition(None, stale_before()).await.unwrap();
     settled.sort();
     let mut both = vec![own, joiner];
     both.sort();
@@ -1024,7 +1054,7 @@ async fn a_request_joins_a_waiting_version_but_never_a_live_start(pool: PgPool) 
     assert!(projects.try_begin_building(id, stale_before()).await.unwrap());
     assert!(!projects.try_begin_building(id, stale_before()).await.unwrap(), "a live start keeps the next out");
     let first = waiting_on(ask(&builder(&pool, fake.clone()), &pool, id, "again", &images, gate()).await.unwrap());
-    projects.release_build_driver(id).await.unwrap();
+    projects.release_driver(id).await.unwrap();
     assert!(projects.try_begin_building(id, stale_before()).await.unwrap(), "only its version holds it: a new request enters");
     let again = waiting_on(ask(&builder(&pool, fake.clone()), &pool, id, "again", &images, gate()).await.unwrap());
     assert_eq!(again.build, first.build, "the waiting version is answered again");
@@ -1051,7 +1081,7 @@ async fn a_cancel_stops_own_builds_and_ends_the_waiting_version(pool: PgPool) {
             .unwrap(),
     );
     assert_eq!(underway.images.len(), 2);
-    projects.release_build_driver(id).await.unwrap();
+    projects.release_driver(id).await.unwrap();
 
     assert!(projects.request_cancel_build(id).await.unwrap());
     assert!(projects.request_cancel_build(id).await.unwrap(), "a cancel asked twice is the same cancel");
@@ -1062,7 +1092,7 @@ async fn a_cancel_stops_own_builds_and_ends_the_waiting_version(pool: PgPool) {
     let state = version_state(&pool, id, underway.build).await;
     assert_eq!(state.state, VersionBuildStatus::Cancelled);
     assert_eq!(claims_of(&pool, underway.build).await, 0, "its claim goes with it");
-    assert_eq!(projects.settle_building(Some(id), stale_before()).await.unwrap(), [id]);
+    assert_eq!(projects.settle_transition(Some(id), stale_before()).await.unwrap(), [id]);
     assert_eq!(transition_of(&projects, id).await, "none");
     assert!(!projects.request_cancel_build(id).await.unwrap(), "nothing left to cancel");
 }
@@ -1089,11 +1119,11 @@ async fn a_claimed_build_wakes_the_loop_and_a_dead_start_lets_its_project_go(poo
     assert_eq!(woke.payload(), image_ref);
     // Its starter dies here: the request's heartbeat stops, and nothing
     // ever records the build on the builder or writes its version down.
-    projects.release_build_driver(id).await.unwrap();
+    projects.release_driver(id).await.unwrap();
     assert!(!follow::look(&pool, &fake).await.unwrap(), "the woken loop ends the build, and nothing runs after");
     let state = build_state(&pool, image_ref, &name).await;
     assert_eq!(state.state, Some(BuildState::Failed), "ended once nobody drives its start");
-    assert_eq!(projects.settle_building(Some(id), stale_before()).await.unwrap(), [id]);
+    assert_eq!(projects.settle_transition(Some(id), stale_before()).await.unwrap(), [id]);
     assert_eq!(transition_of(&projects, id).await, "none");
 }
 
@@ -1143,7 +1173,7 @@ async fn a_failed_request_lets_go_of_its_claim_and_its_project(pool: PgPool) {
     assert!(projects.request_cancel_build(id).await.unwrap());
     let e = started.await.expect_err("the request fails");
     assert!(weft_dispatcher::build::cancelled(&e), "{e:#}");
-    projects.release_build_driver(id).await.unwrap();
+    projects.release_driver(id).await.unwrap();
     let claims = || async {
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM image_claim WHERE project_id = $1").bind(id).fetch_one(&pool).await.unwrap()
     };
@@ -1155,7 +1185,7 @@ async fn a_failed_request_lets_go_of_its_claim_and_its_project(pool: PgPool) {
     }
     assert_eq!(claims().await, 0, "the failed request's claim goes with it");
     assert!(waiting::state(&pool, id, claim).await.unwrap().is_none(), "no version written down");
-    assert_eq!(projects.settle_building(Some(id), stale_before()).await.unwrap(), [id], "at rest while the build runs on");
+    assert_eq!(projects.settle_transition(Some(id), stale_before()).await.unwrap(), [id], "at rest while the build runs on");
     assert_eq!(status_of(&pool, image_ref).await, "running");
 
     let abandoned = ImageHold::new(&pool, id);
@@ -1204,7 +1234,7 @@ async fn a_start_nobody_drives_ends_at_once_and_a_driven_one_is_left(pool: PgPoo
     assert!(ended.reason.as_deref().is_some_and(|r| r.contains(&names[1]) && r.contains("never made on the builder")), "{ended:?}");
     assert_eq!(status_of(&pool, live_ref).await, "running", "a driven start is left to its starter");
     assert!(fake.polls().is_empty(), "neither has an id on the builder to ask about");
-    assert_eq!(projects.settle_building(None, stale_before()).await.unwrap(), [dead], "only the dead start's project settles");
+    assert_eq!(projects.settle_transition(None, stale_before()).await.unwrap(), [dead], "only the dead start's project settles");
     assert_eq!(transition_of(&projects, live).await, "building");
 }
 

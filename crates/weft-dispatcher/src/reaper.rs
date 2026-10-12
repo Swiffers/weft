@@ -7,13 +7,11 @@
 //! time, task reclaim is conditional), so a sweep that overlaps a request
 //! doing the same work is harmless.
 //!
-//! Two kinds of reaper, both `DrainLoop`s. The ones that react to a write
-//! sleep until that write is announced, with a slow safety tick for what
-//! no write announces. The ones that notice SILENCE (a lease that lapsed,
-//! a transition whose driver died) cannot be woken by anything, so they
-//! run on their safety tick alone, and only while something is in motion
-//! ([`in_motion`]): a lease nobody holds cannot lapse, so a quiet install
-//! looks at nothing and a dispatcher that scales to zero stays there.
+//! Each reaper is a `DrainLoop` that sleeps until a write it cares about
+//! is announced, and on a machine also looks on a slow safety tick. A
+//! machine's fronts are the one sweep on a timer alone: nothing announces
+//! a container that went down, and only a machine has them. What lapses
+//! with nobody announcing it is `crate::lapses`'s.
 
 use std::time::Duration;
 
@@ -33,8 +31,12 @@ pub(crate) static ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHAN
 /// when: a hibernation starting has a grace window to end.
 pub(crate) static ON_HIBERNATION: &[WakeOn] = &[WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
 /// An infra copy coming, going or changing status: one running again
-/// brings back the triggers that went down with it.
-pub(crate) static ON_INFRA_STATUS: &[WakeOn] = &[WakeOn::any(crate::held::INFRA_STATUS_CHANNEL)];
+/// brings back the triggers that went down with it, and the events that
+/// waited on it. An activation changing status or a held signal going: a
+/// trigger refused because another claim held it comes back once that
+/// claim ends.
+pub(crate) static ON_INFRA_RETURNS: &[WakeOn] =
+    &[WakeOn::any(crate::held::INFRA_STATUS_CHANNEL), WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
 
 /// Safety tick of the reapers that are woken by a write: 60 seconds in
 /// real time, at this install's pace (`weft_core::time_scale`).
@@ -42,163 +44,55 @@ fn woken_reaper_safety() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(60))
 }
 
-/// When anything in the install is next in motion: now (`Some(ZERO)`), in
-/// a while, or never until a write says so (`None`). Moving now is a task
-/// of the dispatcher's claimed, a run queued for a worker, an activation or
-/// a build under way, a lifecycle command not finished. A run a worker
-/// drives moves once its worker's lease could have lapsed for longer than
-/// the lost-run sweep's margin (`crate::worker_door`): a lease nobody
-/// renews any more is the only thing to watch for there, and a worker
-/// whose runs only wait vouched for itself until their waits give up, so
-/// the install looks once then rather than every safety interval. While
-/// nothing is in motion, no lease can lapse and no driver can die mid-way,
-/// so the loops that watch for that have nothing to watch. A run parked on
-/// a person keeps nothing here, so it does not keep the install awake.
-pub async fn in_motion(pool: &sqlx::PgPool) -> anyhow::Result<Option<Duration>> {
-    let (now, lapse_in): (bool, Option<i64>) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed') \
-             OR EXISTS (SELECT 1 FROM run WHERE state = 'queued') \
-             OR EXISTS (SELECT 1 FROM trigger_activation WHERE status IN ('activating', 'deactivating')) \
-             OR EXISTS (SELECT 1 FROM project WHERE transition <> 'none') \
-             OR EXISTS (SELECT 1 FROM infra_lifecycle_command WHERE completed_at_unix IS NULL), \
-         (SELECT MIN(COALESCE(l.leased_until_unix, 0)) - EXTRACT(EPOCH FROM NOW())::BIGINT \
-              FROM run r LEFT JOIN worker_lease l ON l.replica = r.owner WHERE r.state = 'running')",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(next_motion(now, lapse_in, crate::worker_door::lost_margin_secs()))
-}
-
-/// [`in_motion`]'s answer from what it read: something moves `now`, or
-/// the earliest lease of a running run's worker lapses `lapse_in` seconds
-/// from now (a run with no lease lapsed long ago), which the sweep judges
-/// once its `margin` passed too.
-fn next_motion(now: bool, lapse_in: Option<i64>, margin: i64) -> Option<Duration> {
-    match (now, lapse_in) {
-        (true, _) => Some(Duration::ZERO),
-        (false, Some(lapse_in)) => {
-            let judged_in = lapse_in.saturating_add(margin);
-            Some(if judged_in < 0 { Duration::ZERO } else { Duration::from_secs(judged_in.unsigned_abs() + 1) })
-        }
-        (false, None) => None,
-    }
-}
-
-/// `inner`, looked at again once it ran dry when anything is next in
-/// motion ([`in_motion`]), at its safety interval at the soonest, and left
-/// to sleep until a write wakes it once nothing is.
-pub fn while_in_motion(state: &DispatcherState, inner: DrainLoop) -> DrainLoop {
-    let state = state.clone();
-    let (drain, safety) = (inner.drain.clone(), inner.safety);
-    DrainLoop::new(inner.name, inner.wake_on, safety, move || {
-        let (state, drain) = (state.clone(), drain.clone());
-        async move {
-            match drain().await? {
-                DrainStep::Done => Ok(match in_motion(&state.pg_pool).await? {
-                    Some(after) => DrainStep::RetryIn(after.max(safety)),
-                    None => DrainStep::Done,
-                }),
-                step => Ok(step),
-            }
-        }
-    })
-}
-
 /// Every reaper, as the loops the dispatcher runs.
 pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
     let mut loops = vec![
-        // Silence detectors: nothing announces a lease that lapsed.
-        timed(state, Duration::from_secs(30), "removed_projects", |s| async move { sweep_removed_projects(&s).await }),
-        timed(state, Duration::from_secs(3600), "tasks", sweep_tasks),
-        while_in_motion(state, timed(state, Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions)),
-        timed(state, Duration::from_secs(3600), "retired_rows", sweep_retired_rows),
-        timed(state, Duration::from_secs(300), "ghost_infra_leases", |s| async move {
-            crate::infra_owner::release_ghost_leases(&s.pg_pool).await
+        // Queued events whose trigger takes them, when their clock comes
+        // due: a newly parked event wakes it at once; otherwise it sleeps
+        // until the earliest head is due, which a head stamped elsewhere
+        // books (`crate::parked_drain::book`).
+        woken(state, ON_PARKED_FIRE, crate::parked_drain::PARKED_FIRES, "hand queued trigger events to their runs", |s| async move {
+            crate::parked_drain::drain_due(&s).await
         }),
-        // The public edge's counters: minutes that no longer count, and
-        // slots of runs that never started.
-        while_in_motion(
-            state,
-            timed(state, Duration::from_secs(60), "entry_rate", |s| async move {
-                let now = crate::lease::now_unix();
-                crate::entry_limits::sweep(&s.pg_pool, now).await?;
-                crate::worker_door::sweep(&s.pg_pool, now).await
-            }),
-        ),
-        // A run whose worker went away: nothing announces a lease that
-        // lapsed.
-        while_in_motion(
-            state,
-            timed(state, Duration::from_secs(15), "lost_runs", |s| async move {
-                crate::worker_door::sweep_lost_runs(&s, crate::lease::now_unix()).await
-            }),
-        ),
-        // Queued events whose trigger takes them (a hand-over that failed
-        // retries after its backoff stamp): a newly parked event wakes it
-        // at once; otherwise it sleeps until the earliest head is due.
-        woken(state, ON_PARKED_FIRE, "parked_fires", |s| async move { crate::parked_drain::drain_due(&s).await }),
         // Storage plane: the durable terminate sweep (un-kept exec files of
         // a terminated execution). The queue deletes an execution's row only after
-        // the broker confirms the sweep; a transient broker failure leaves
-        // it and asks for another look soon. The kept-file expiry sweep is
-        // the broker's own loop (it owns the bucket + metadata).
-        woken(state, ON_STORAGE_SWEEP, "storage_sweep", crate::storage::process_sweep_queue),
+        // the broker confirms the sweep; a broker that keeps failing fails
+        // the pass, and the next run ending queued for a sweep tries every
+        // row again. The kept-file expiry sweep is the broker's own loop
+        // (it owns the bucket + metadata).
+        woken(state, ON_STORAGE_SWEEP, "storage_sweep", "clear the files of ended runs", crate::storage::process_sweep_queue),
         // A hibernation's grace window ending: its triggers stop listening
         // and taking work. Sleeps until the next one ends.
-        woken(state, ON_HIBERNATION, "hibernations", end_hibernations),
+        woken(state, ON_HIBERNATION, HIBERNATIONS, HIBERNATIONS_LABEL, end_hibernations),
         // An infra copy running again: the triggers its stop took down
-        // with it come back.
-        woken(state, ON_INFRA_STATUS, "infra_returns", crate::api::infra::bring_back_triggers_whose_infra_returned),
+        // with it come back, and the events that waited on it go.
+        woken(state, ON_INFRA_RETURNS, "infra_returns", "bring back triggers whose infra returned", crate::api::infra::bring_back_triggers_whose_infra_returned),
     ];
     // A machine's fronts are its own containers: one that went down is put
     // back, on a free port when another program took its own (and the
     // project's address follows). A cloud's front is the platform's to keep.
     if state.project_ports.is_some() {
-        loops.push(timed(state, Duration::from_secs(30), "fronts", |s| async move { crate::front::serve_all(&s, crate::front::Say::Changes).await }));
+        loops.push(timed(state, Duration::from_secs(30), "fronts", "put the projects' fronts back", |s| async move { crate::front::serve_all(&s, crate::front::Say::Changes).await }));
     }
     loops
 }
 
-/// End every hibernation whose grace window has passed: the listener lets
-/// go of its signals (`crate::listener::let_go_of_stopped`), and then its
-/// activation stops taking work (`crate::activation_store::end_grace_windows`).
-/// In that order, so one whose letting go failed (the listener down, a
-/// signal it cannot tear down yet) stays for the next pass, which lets go
-/// again, and holds back no other. Then sleep until the next window ends,
-/// or until an activation changes.
+/// The hibernations loop, by name.
+const HIBERNATIONS: &str = "hibernations";
+
+/// End every hibernation whose grace window has passed
+/// ([`end_grace_windows_over`], the listener letting go of its signals
+/// through `crate::listener::let_go_of_stopped`); a project left with
+/// nothing taking work lets go of its front. Then sleep until the next
+/// window ends, or until an activation changes.
 async fn end_hibernations(state: DispatcherState) -> anyhow::Result<DrainStep> {
-    let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<weft_core::activation::ActivationKey>> = Default::default();
-    for (project_id, key) in crate::activation_store::grace_windows_over(&state.pg_pool).await? {
-        by_project.entry(project_id).or_default().push(key);
-    }
-    let mut kept_any = false;
-    for (project_id, keys) in by_project {
-        let signals = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, &keys).await?;
-        let kept = crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &signals).await?;
-        let let_go: Vec<weft_core::activation::ActivationKey> = keys
-            .into_iter()
-            .filter(|key| {
-                !signals.iter().any(|s| {
-                    kept.contains(&s.token)
-                        && s.activation_trigger.as_deref() == Some(key.trigger.as_str())
-                        && s.instance.as_ref() == key.instance()
-                })
-            })
-            .collect();
-        kept_any |= !kept.is_empty();
-        let ended = crate::activation_store::end_grace_windows(&state.pg_pool, project_id, &let_go).await?;
-        if ended > 0 {
-            tracing::info!(
-                target: "weft_dispatcher::reaper",
-                %project_id, triggers = ended,
-                "a hibernation's grace window ended: its triggers stopped listening and take no more work"
-            );
-            // Nothing of the project may take work any more: its front goes.
-            crate::front::let_go_if_idle(&state, project_id).await?;
-        }
-    }
-    if kept_any {
-        return Ok(DrainStep::RetryIn(HIBERNATION_LET_GO_RETRY));
+    let let_go = |signals: Vec<crate::journal::SignalRegistration>| {
+        let state = state.clone();
+        async move { crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &signals).await }
+    };
+    for project_id in end_grace_windows_over(&state.pg_pool, let_go).await? {
+        // Nothing of the project may take work any more: its front goes.
+        crate::front::let_go_if_idle(&state, project_id).await?;
     }
     let now = crate::lease::now_unix();
     Ok(match crate::activation_store::next_grace_end(&state.pg_pool).await? {
@@ -207,20 +101,81 @@ async fn end_hibernations(state: DispatcherState) -> anyhow::Result<DrainStep> {
     })
 }
 
-/// How soon a hibernation whose signals the listener did not let go of is
-/// tried again.
-const HIBERNATION_LET_GO_RETRY: Duration = Duration::from_secs(30);
+/// End every hibernation whose grace window has passed: `let_go` has the
+/// listener let go of its signals and answers the ones it kept (with why),
+/// then its activation stops taking work
+/// (`crate::activation_store::end_grace_windows`), whatever the listener
+/// answered: a fire that still arrives is refused by the activation, and a
+/// holder hears it stop taking work (`crate::holders::HELD_SIGNALS_CHANNEL`).
+/// A signal the listener kept is marked on its own row
+/// (`crate::listener::note_let_go`) and the listener is told again at each
+/// pass until it lets go (or its trigger takes work again); while any is
+/// marked, its project's `weft status` names it (`Callee::LetGo`). Answers the
+/// projects whose windows ended.
+pub async fn end_grace_windows_over<F, Fut>(pool: &sqlx::PgPool, let_go: F) -> anyhow::Result<Vec<uuid::Uuid>>
+where
+    F: Fn(Vec<crate::journal::SignalRegistration>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<(String, String)>>>,
+{
+    let again = crate::journal::postgres::signals_kept_after_let_go(pool).await?;
+    if !again.is_empty() {
+        let kept = let_go(again.clone()).await?;
+        crate::listener::note_let_go(pool, &again, &kept).await?;
+    }
+    let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<weft_core::activation::ActivationKey>> = Default::default();
+    for (project_id, key) in crate::activation_store::grace_windows_over(pool).await? {
+        by_project.entry(project_id).or_default().push(key);
+    }
+    let mut ended_in = Vec::new();
+    for (project_id, keys) in by_project {
+        let signals = crate::journal::postgres::activation_signals(pool, project_id, &keys).await?;
+        let kept = let_go(signals.clone()).await?;
+        crate::listener::note_let_go(pool, &signals, &kept).await?;
+        let ended = crate::activation_store::end_grace_windows(pool, project_id, &keys).await?;
+        if ended > 0 {
+            tracing::info!(
+                target: "weft_dispatcher::reaper",
+                %project_id, triggers = ended,
+                "a hibernation's grace window ended: its triggers stopped listening and take no more work"
+            );
+            ended_in.push(project_id);
+        }
+    }
+    let kept: Vec<(uuid::Uuid, String, String)> =
+        sqlx::query_as("SELECT project_id, node_id, let_go_failed FROM signal WHERE let_go_failed IS NOT NULL ORDER BY project_id, node_id")
+            .fetch_all(pool)
+            .await?;
+    let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<String>> = Default::default();
+    for (project, node, why) in kept {
+        by_project.entry(project).or_default().push(format!("node {node}: {why}"));
+    }
+    let failing: Vec<uuid::Uuid> = by_project.keys().copied().collect();
+    weft_task_store::unanswered::still_failing(pool, weft_task_store::unanswered::PerProject::LetGo, &failing).await?;
+    for (project, named) in by_project {
+        tracing::error!(
+            target: "weft_dispatcher::reaper",
+            %project, signals = ?named,
+            "the listener kept serving signals whose hibernation ended; their activations take no work, so what they pick up \
+             is refused"
+        );
+        weft_task_store::unanswered::failed(pool, weft_task_store::unanswered::Callee::LetGo(project), None, &named.join("; ")).await?.log();
+    }
+    Ok(ended_in)
+}
 
-/// A sweep that runs on its interval alone. `interval` is given in real
-/// time and runs at this install's pace (`weft_core::time_scale`), like
-/// the leases these sweeps judge.
-fn timed<F, Fut>(state: &DispatcherState, interval: Duration, name: &'static str, sweep: F) -> DrainLoop
+/// What the hibernations loop does, in a person's words.
+const HIBERNATIONS_LABEL: &str = "end hibernations whose grace window passed";
+
+/// A sweep that runs on its interval alone (a machine's only). `interval`
+/// is given in real time and runs at this install's pace
+/// (`weft_core::time_scale`).
+fn timed<F, Fut>(state: &DispatcherState, interval: Duration, name: &'static str, label: &'static str, sweep: F) -> DrainLoop
 where
     F: Fn(DispatcherState) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let state = state.clone();
-    DrainLoop::new(name, NOTHING, weft_core::time_scale::scaled(interval), move || {
+    DrainLoop::new(name, label, NOTHING, weft_core::time_scale::scaled(interval), move || {
         let state = state.clone();
         let sweep = sweep.clone();
         async move {
@@ -232,13 +187,13 @@ where
 
 /// A sweep that runs when one of `wake_on` is announced, and on a slow
 /// safety tick. The body's step says whether to look again early.
-pub(crate) fn woken<F, Fut>(state: &DispatcherState, wake_on: &'static [WakeOn], name: &'static str, sweep: F) -> DrainLoop
+pub(crate) fn woken<F, Fut>(state: &DispatcherState, wake_on: &'static [WakeOn], name: &'static str, label: &'static str, sweep: F) -> DrainLoop
 where
     F: Fn(DispatcherState) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = anyhow::Result<DrainStep>> + Send + 'static,
 {
     let state = state.clone();
-    DrainLoop::new(name, wake_on, woken_reaper_safety(), move || {
+    DrainLoop::new(name, label, wake_on, woken_reaper_safety(), move || {
         let state = state.clone();
         let sweep = sweep.clone();
         async move {
@@ -250,113 +205,6 @@ where
                 .unwrap_or(DrainStep::RetryIn(weft_task_store::drain::LOCK_HELD_RETRY)))
         }
     })
-}
-
-/// Drop what a removed project left behind that no surviving run needs.
-///
-/// The removal itself already tries this, and `weft clean` tries again
-/// when it deletes a run; both are best-effort, because neither may fail
-/// over rows nobody reads. Once the project row is gone no request can
-/// reach those rows again (`weft rm` refuses a project it cannot find,
-/// and with no runs left there is nothing to clean), so without this loop
-/// one transient failure would leave them for good, unlisted and
-/// undeletable. Hourly: nothing here is urgent, and a project whose runs
-/// all survive is a no-op.
-async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
-    let mut orphans = state.projects.projects_with_orphan_definitions().await?;
-    orphans.extend(state.versions.projects_with_orphan_versions().await?);
-    // Executions whose project is gone: the erase at removal is
-    // best-effort, so a transient failure there lands here.
-    orphans.extend(state.journal.projects_with_orphan_executions().await?);
-    orphans.sort();
-    orphans.dedup();
-    let mut failed = 0usize;
-    for project in orphans {
-        match state.journal.delete_project_executions(project).await {
-            Ok(0) => {}
-            Ok(erased) => tracing::info!(
-                target: "weft_dispatcher::reaper",
-                project_id = %project, executions = erased,
-                "erased the executions of a project that is gone"
-            ),
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    target: "weft_dispatcher::reaper",
-                    project_id = %project, error = %e,
-                    "could not erase this removed project's executions; the next sweep tries again"
-                );
-            }
-        }
-        // Per project, because recovering from a failure on ONE is the
-        // whole reason this loop exists. Propagating the first error
-        // abandoned every project after it in id order, every hour, for
-        // good.
-        match crate::api::project::retire_what_no_run_needs(&state, project).await {
-            Ok(0) => {}
-            Ok(dropped) => tracing::info!(
-                target: "weft_dispatcher::reaper",
-                project_id = %project, rows = dropped,
-                "retired rows of a removed project that no surviving run needs"
-            ),
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(
-                    target: "weft_dispatcher::reaper",
-                    project_id = %project, error = %e,
-                    "could not retire this removed project's rows; the next sweep tries again"
-                );
-            }
-        }
-    }
-    if failed > 0 {
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            projects = failed,
-            "some removed projects' rows could not be retired this cycle"
-        );
-    }
-    Ok(())
-}
-
-/// Clear what removed projects left behind: the dispatcher's work queued
-/// for them, and the signals the listener still holds for them (a
-/// registration no project can fire or take down). None of it can do
-/// anything once the project row is gone. `weft rm` runs this as soon as
-/// the row is gone; the loop catches work queued in the moment of the
-/// removal.
-pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::Result<()> {
-    let dropped = drop_work_of_removed_projects(&state.pg_pool).await?;
-    if dropped > 0 {
-        tracing::info!(
-            target: "weft_dispatcher::reaper",
-            dropped,
-            "dropped work queued for removed projects"
-        );
-    }
-    let signals = crate::journal::postgres::remove_signals_of_removed_projects(&state.pg_pool).await?;
-    if !signals.is_empty() {
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            removed = signals.len(),
-            "removed the signals of projects that no longer exist"
-        );
-        state.listener.unregister_many(&signals).await;
-    }
-    Ok(())
-}
-
-/// Delete the pending tasks of projects that no longer exist; returns how
-/// many.
-pub async fn drop_work_of_removed_projects(pool: &sqlx::PgPool) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
-        "DELETE FROM task t \
-         WHERE t.status = 'pending' AND t.project_id IS NOT NULL \
-           AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = t.project_id)",
-    )
-    .execute(pool)
-    .await?
-    .rows_affected())
 }
 
 /// Run one sweep while holding the reaper's install-wide lock, or skip
@@ -376,88 +224,4 @@ where
         sweep,
     )
     .await
-}
-
-/// Stuck-transition reaper: the crash-recovery half of the project
-/// transitional-state model. A transition driven in-process by one
-/// dispatcher copy (an activation window, a build) carries
-/// a heartbeat the driver bumps; when the driver dies, the heartbeat
-/// goes stale and this sweep repairs the row per-transition,
-/// status-guarded (safe under N copies; a live driver's row is never
-/// touched because its heartbeat is fresh):
-///
-///   - an activation stuck `activating` -> the same wipe the activate
-///     rollback / cancel-activate performs (end the claim + cancel the
-///     leaked TriggerSetup execution + drop half-registered signals).
-///   - `building` / `cancelling_build` with no live request and no
-///     waiting version -> back at rest (`crate::transition::settle`): a
-///     request that died before it wrote its version down, or an end
-///     whose settle was missed. A waiting version keeps the marker: the
-///     build loop sees it through and settles the project at its end.
-async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
-    let stale_before = crate::lease::now_unix() - crate::transition::heartbeat_stale_secs();
-    crate::transition::settle(&state, None).await?;
-    for stuck in state.activations.list_stuck(stale_before).await? {
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            project_id = %stuck.project_id,
-            activation = %stuck.execution_id,
-            "activation orphaned (driver heartbeat stale); wiping activating state"
-        );
-        if let Err((code, msg)) = crate::api::project::wipe_activating_state(
-            &state,
-            stuck.project_id,
-            stuck.execution_id,
-            // The activation's driver died mid-transition and this sweep
-            // is repairing the row; nothing superseded the run and no
-            // person stopped it.
-            &weft_core::exec::CancelCause::Runtime {
-                detail: "the activation's driver died mid-transition; the reaper wiped its state".into(),
-            },
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                project_id = %stuck.project_id,
-                code = %code,
-                error = %msg,
-                "wipe of orphaned activation failed; retrying next sweep"
-            );
-            continue;
-        }
-        crate::transition::publish_transition_changed(&state, stuck.project_id).await;
-    }
-    Ok(())
-}
-
-/// Tasks-table retention sweep. Once an hour, delete terminal
-/// rows older than the retention window so the table stays small.
-async fn sweep_tasks(state: DispatcherState) -> anyhow::Result<()> {
-    let n = weft_task_store::tasks::sweep_terminal(&state.pg_pool).await?;
-    if n > 0 {
-        tracing::info!(
-            target: "weft_dispatcher::reaper",
-            swept = n,
-            "tasks sweeper retired terminal rows"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Something moving now wins; a running run's worker is looked at once
-    /// its lease could have lapsed past the margin (now when it already
-    /// did); with nothing, the loops sleep.
-    #[test]
-    fn a_running_run_is_looked_at_when_its_workers_lease_could_lapse() {
-        assert_eq!(next_motion(true, Some(300), 15), Some(Duration::ZERO));
-        assert_eq!(next_motion(false, Some(300), 15), Some(Duration::from_secs(316)), "a vouched lease: one look, past it");
-        assert_eq!(next_motion(false, Some(-10), 15), Some(Duration::from_secs(6)), "lapsed, the margin not passed yet");
-        assert_eq!(next_motion(false, Some(-100), 15), Some(Duration::ZERO), "lapsed past the margin: now");
-        assert_eq!(next_motion(false, None, 15), None);
-    }
 }

@@ -12,7 +12,10 @@
 #                         when that address goes through a pooler: a
 #                         direct one to the same database), WEFT_ACCESS_APPS
 #                         (optional: the access-apps.json holding OAuth
-#                         clients and the runtime's own keys)
+#                         clients and the runtime's own keys),
+#                         WEFT_ALERT_EMAIL (optional: where the alerts go
+#                         when weft's own work is stuck; without it, a
+#                         person holding Owner on the project)
 #
 # SYNC: the TF_VAR_* names <-> deploy/terraform/gcp/variables.tf
 name: install on GCP
@@ -139,6 +142,32 @@ jobs:
           # SYNC: `weft build-images` stdout and its order <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/release.yml (build + push shared images)
           echo "TF_VAR_runtime_image=$(sed -n 1p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
           echo "TF_VAR_builder_base_image=$(sed -n 2p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
+
+      # Where the install emails when weft's own work is stuck
+      # (deploy/terraform/gcp/alerts.tf): the repository secret
+      # WEFT_ALERT_EMAIL when set, or else a person holding the Owner role
+      # directly on the project (the first by address), usually the Google
+      # account that made it. This workflow signs in as the install's
+      # service account, which has no inbox. A secret, not a variable: a
+      # step prints its variables in its log before its script runs, and a
+      # fork's run logs can be public; a secret is masked from the start.
+      - name: who gets the alerts
+        shell: bash
+        env:
+          WEFT_ALERT_EMAIL: ${{ secrets.WEFT_ALERT_EMAIL }}
+        run: |
+          email="$WEFT_ALERT_EMAIL"
+          if [ -z "$email" ]; then
+            email=$(gcloud projects get-iam-policy "${{ vars.GCP_PROJECT_ID }}" \
+              --flatten=bindings --filter=bindings.role=roles/owner --format='value(bindings.members)' \
+              | tr ';' '\n' | sed -n 's/^user://p' | sort | head -n 1)
+          fi
+          # A fork's run logs can be public: the address is masked in them,
+          # Terraform's plan included.
+          if [ -n "$email" ]; then
+            echo "::add-mask::$email"
+          fi
+          echo "TF_VAR_alert_email=$email" >> "$GITHUB_ENV"
 
       - name: create the cloud
         working-directory: deploy/terraform/gcp

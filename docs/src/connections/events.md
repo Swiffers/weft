@@ -69,9 +69,10 @@ And the one you are most likely to meet:
 ```text
 this trigger needs 'slack' to deliver events TO your weft, which requires your
 weft to be reachable from the internet, and it is not. If you accept making its
-public trigger surface reachable, rerun ./setup.sh --public-url and re-activate;
-or use a connection that supports dialing out (your own provider app), where
-the service offers one.
+public trigger surface reachable, rerun `./setup.sh --public-url`, then `weft
+activate` (or `weft resync`, when the trigger is already on); or use a
+connection that supports dialing out (your own provider app), where the
+service offers one. See https://weavemindai.github.io/weft/connections/events.html
 ```
 
 A decision that a trigger cannot be served is final for that registration.

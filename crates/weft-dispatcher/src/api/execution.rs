@@ -165,7 +165,9 @@ pub async fn cancel_execution_ids(
 ///     run's flag and writes its ending with this cause, and a worker
 ///     that claims the run later reads the cancel with its claim;
 ///   - a run nobody drives (parked, queued) is ended here, its per-node
-///     cancels and its `ExecutionCancelled` written at `last_seq + 1`.
+///     cancels, its open charges booked unknown and its
+///     `ExecutionCancelled` written at `last_seq + 1`
+///     ([`cancel_terminal_events`]).
 ///
 /// Either all of it lands or none does, so a database failure mid-cancel
 /// leaves the run exactly as it was and the next attempt succeeds. After
@@ -202,8 +204,10 @@ pub async fn cancel_execution_id(
 }
 
 /// THE definition of a dispatcher-side cancel of a run nobody drives: the
-/// ordered events that end it, `NodeCancelled` per open node, then
-/// `ExecutionCancelled` (always the last). Pure, so every cancel writer
+/// ordered events that end it, `NodeCancelled` per open node, an unknown
+/// `CostReported` per charge its record leaves open
+/// (`weft_journal::unpriced_charges_closed`), then `ExecutionCancelled`
+/// (always the last). Pure, so every cancel writer
 /// writes IDENTICAL rows. They are written in one row under the run's row
 /// lock, so the ending never lands without its per-node cancels.
 pub fn cancel_terminal_events(
@@ -261,6 +265,10 @@ pub fn cancel_terminal_events(
             }
         }
     }
+    // A charge its record leaves open spent money no drive is left to
+    // price: booked unknown before the ending.
+    let why = format!("the run was cancelled before the job was read back: {reason}");
+    writes.extend(weft_journal::unpriced_charges_closed(execution_id, events, &why, now));
     writes.push(ExecEvent::ExecutionCancelled { execution_id, reason, cause: Some(cause.clone()), at_unix: now });
     Ok(writes)
 }
@@ -953,18 +961,6 @@ pub(crate) async fn clean_execution(
         .events
         .publish(DispatcherEvent::ExecutionDeleted { execution_id, project_id: owner.project_id })
         .await;
-    // This may have been the last run keeping a removed project's code
-    // and tree rows on file. A failure here leaves rows nobody reads and
-    // nothing else, and the reaper's `retired_rows` sweep comes back for
-    // them, so it is logged rather than failing a clean that has already
-    // done its work.
-    if let Err(e) = crate::api::project::retire_what_no_run_needs(state, owner.project_id).await {
-        tracing::warn!(
-            target: "weft_dispatcher::projection",
-            %execution_id, project_id = %owner.project_id, error = %e,
-            "could not retire what this run was the last to need; the reaper will retry"
-        );
-    }
     Ok(owner.project_id)
 }
 
@@ -999,6 +995,7 @@ mod waits_tests {
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
             holds: false,
+            generation: 0,
         }
     }
 
@@ -1082,6 +1079,28 @@ mod cancel_tests {
         let kinds: Vec<&str> = without.iter().map(ExecEvent::kind_str).collect();
         assert_eq!(kinds, vec!["execution_cancelled"]);
         assert!(matches!(&without[0], ExecEvent::ExecutionCancelled { cause: Some(CancelCause::User), .. }));
+    }
+
+    /// A charge the record leaves open is booked unknown, closing it,
+    /// after the per-node cancels and before the terminal.
+    #[test]
+    fn cancel_books_each_open_charge_unknown_before_the_terminal() {
+        let execution_id = ExecutionId::new_v4();
+        let mut record = open_firing(execution_id);
+        record.push(ExecEvent::ChargeOpened {
+            execution_id,
+            node_id: "wait".into(),
+            frames: vec![],
+            service: "jobs".into(),
+            charge: "job-1".into(),
+            scratch: serde_json::json!({}),
+            origin: weft_core::CredentialOwner::Platform,
+            at_unix: 2,
+        });
+        let writes = cancel_terminal_events(execution_id, &record, Some(&program()), &CancelCause::User, 9).unwrap();
+        let kinds: Vec<&str> = writes.iter().map(ExecEvent::kind_str).collect();
+        assert_eq!(kinds, vec!["node_cancelled", "cost_reported", "execution_cancelled"]);
+        assert!(matches!(&writes[1], ExecEvent::CostReported { charge: Some(charge), amount_usd: None, .. } if charge == "job-1"));
     }
 }
 

@@ -1447,10 +1447,10 @@ export class GraphViewController {
         break;
       case 'resyncProject':
         // The picker's spec rides along as trigger-deactivation flags.
-        void this.dispatchVerb(
-          'resync',
-          msg.spec ? this.deactivationFlags(msg.spec) : [],
-        );
+        void this.dispatchVerb('resync', this.deactivationFlags(msg.spec));
+        break;
+      case 'resumeResync':
+        void this.dispatchVerb('resync', ['--resume']);
         break;
       case 'infraUpgrade':
         void this.dispatchVerb('infra', [

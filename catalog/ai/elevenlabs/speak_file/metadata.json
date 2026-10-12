@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsSpeakFile",
   "label": "Speak to File",
-  "description": "Turn text into one spoken audio file with an ElevenLabs voice: whole text in, whole file out. For live streaming speech use the streaming speak node.",
+  "description": "Turn text into one spoken audio file with an ElevenLabs voice. If you want the speech to start playing while the text is still arriving, use Speak (streaming).",
   "tags": [
     "ai",
     "audio",
@@ -52,16 +52,25 @@
       "type": "String",
       "default": "eleven_multilingual_v2",
       "widget": {
-        "kind": "select",
+        "kind": "remote_select",
+        "access": "account",
         "free_text": true,
-        "options": [
-          "eleven_multilingual_v2",
-          "eleven_v3",
-          "eleven_flash_v2_5",
-          "eleven_turbo_v2_5"
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/models",
+            "items": "",
+            "label": "name",
+            "value": "model_id",
+            "where": {
+              "can_do_text_to_speech": true
+            }
+          }
         ]
       },
-      "label": "Model"
+      "label": "Model",
+      "description": "Every ElevenLabs model that speaks text, newest included. eleven_v4 is ElevenLabs's most expressive model; eleven_v4_turbo and the Flash models cost half as much per character and answer faster.",
+      "placeholder": "Pick a model, or paste its id"
     },
     {
       "name": "outputFormat",
@@ -72,9 +81,27 @@
         "options": [
           "mp3_44100_128",
           "mp3_44100_192",
-          "pcm_16000",
+          "mp3_44100_96",
+          "mp3_44100_64",
+          "mp3_44100_32",
+          "mp3_24000_48",
+          "mp3_22050_32",
+          "wav_44100",
+          "wav_48000",
+          "wav_32000",
+          "wav_24000",
+          "wav_22050",
+          "wav_16000",
+          "wav_8000",
           "pcm_44100",
+          "pcm_48000",
+          "pcm_32000",
+          "pcm_24000",
+          "pcm_22050",
+          "pcm_16000",
+          "pcm_8000",
           "ulaw_8000",
+          "alaw_8000",
           "opus_48000_32",
           "opus_48000_64",
           "opus_48000_96",
@@ -83,7 +110,7 @@
         ]
       },
       "label": "Output format",
-      "description": "mp3 for anything that plays a file, pcm or ulaw for telephony, opus_48000_* for a WhatsApp voice note (stored as Ogg Opus)."
+      "description": "If you want a file anything can play, pick mp3 or wav; for a phone line, ulaw or alaw; for raw samples you process yourself, pcm; for a WhatsApp voice note, opus_48000_* (stored as Ogg Opus). ElevenLabs gives mp3_44100_192 only on its Creator plan and above, and pcm or wav at 44100 only on Pro and above."
     },
     {
       "name": "stability",
@@ -94,7 +121,7 @@
         "max": 1,
         "step": 0.05
       },
-      "description": "Voice stability (0 varied, 1 monotone). Absent = the voice's own setting."
+      "description": "From 0 to 1: lower gives a wider emotional range, higher a steadier, flatter voice. Leave empty to use the voice's own setting."
     },
     {
       "name": "similarityBoost",
@@ -105,7 +132,7 @@
         "max": 1,
         "step": 0.05
       },
-      "description": "How closely the output sticks to the voice. Absent = the voice's own setting."
+      "description": "From 0 to 1: how closely the speech keeps to the voice. Leave empty to use the voice's own setting."
     },
     {
       "name": "speed",
@@ -116,14 +143,216 @@
         "max": 1.2,
         "step": 0.05
       },
-      "description": "Speaking speed multiplier. Absent = the voice's own setting."
+      "description": "How fast the voice speaks: 1 is normal, lower is slower, higher is faster. Leave empty to use the voice's own setting."
+    },
+    {
+      "name": "style",
+      "type": "Number",
+      "description": "How much the voice exaggerates its speaker's style: 0 leaves it as it is, and higher values amplify it, which ElevenLabs says can make the answer slower. Leave empty to use the voice's own setting.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "speakerBoost",
+      "type": "Boolean",
+      "label": "Speaker boost",
+      "description": "Makes the audio sound more like the voice's original speaker, at the cost of a slightly slower answer. Leave empty to use the voice's own setting."
+    },
+    {
+      "name": "languageCode",
+      "type": "String",
+      "label": "Language",
+      "placeholder": "en",
+      "description": "If you want the text read as one language, give its two-letter code, like `fr`; leave it empty to let the model decide. eleven_multilingual_v2, the default model, takes no language code, so weft refuses one there. On other models, a code the model does not support is quietly ignored."
+    },
+    {
+      "name": "textNormalization",
+      "type": "String",
+      "label": "Spell out numbers",
+      "description": "Whether numbers, dates and the like are written out into words before they are spoken. Leave empty for auto, which decides per text. On eleven_flash_v2_5, ElevenLabs leaves them as written unless you pick `on`, which only Enterprise accounts can.",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "auto",
+          "on",
+          "off"
+        ]
+      }
+    },
+    {
+      "name": "languageTextNormalization",
+      "type": "Boolean",
+      "default": false,
+      "label": "Japanese normalization",
+      "description": "If your text is Japanese, turn this on for better pronunciation. ElevenLabs warns that it can make the answer much slower."
+    },
+    {
+      "name": "previousText",
+      "type": "String",
+      "label": "Text before",
+      "widget": {
+        "kind": "textarea"
+      },
+      "description": "If this text continues an earlier one, put the earlier text here, so the delivery carries on smoothly. Set this or `previousRequestIds`, not both: ElevenLabs ignores the text when it has the ids."
+    },
+    {
+      "name": "nextText",
+      "type": "String",
+      "label": "Text after",
+      "widget": {
+        "kind": "textarea"
+      },
+      "description": "If another text follows this one, put it here, so the delivery leads into it. Set this or `nextRequestIds`, not both: ElevenLabs ignores the text when it has the ids."
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "description": "If you want to be able to make a similar take again, set a whole number from 0 to 4294967295, then run again with that number, the same text and the same settings. ElevenLabs tries to give the same audio back but does not promise it. Leave it empty and every run is a fresh take.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 4294967295,
+        "step": 1
+      }
+    },
+    {
+      "name": "pronunciationDictionaries",
+      "type": "List[String | { id: String, version?: String }]",
+      "label": "Pronunciation dictionaries",
+      "description": "If you want certain words said your way, list up to 3 pronunciation dictionaries from the connected ElevenLabs account; they apply in order. Give a dictionary's id to use its latest version, or `{ id, version }` to pin one version."
+    },
+    {
+      "name": "usePvcAsIvc",
+      "type": "Boolean",
+      "default": false,
+      "label": "Instant version of a professional voice",
+      "description": "If the voice is a professional voice clone and you want it more expressive or quicker to answer, turn this on: ElevenLabs then speaks with the voice's instant clone, which it says may help both."
+    },
+    {
+      "name": "previousRequestIds",
+      "type": "List[String]",
+      "label": "Request ids before",
+      "description": "If this text continues audio a Speak to File node made before it, wire the `requestId` of up to 3 of those generations here, in the order they were made, so the delivery carries on across them. The ids must be at most two hours old, and it works best when they used the same model. ElevenLabs does not offer this on eleven_v3."
+    },
+    {
+      "name": "nextRequestIds",
+      "type": "List[String]",
+      "label": "Request ids after",
+      "description": "If you are redoing a clip that other clips follow, wire the `requestId` of up to 3 of those following clips here, so the new take leads into them. The ids must be at most two hours old. ElevenLabs does not offer this on eleven_v3."
+    },
+    {
+      "name": "filterPreset",
+      "type": "String",
+      "label": "Filter",
+      "placeholder": "Pick a filter, or paste its id",
+      "description": "A filter that colors the voice, such as a phone line or an old radio.",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/audio-effects/catalog",
+            "items": "filter_presets",
+            "label": "name",
+            "value": "filter_preset_id"
+          }
+        ]
+      }
+    },
+    {
+      "name": "distance",
+      "type": "Number",
+      "description": "How far the speaker sounds from the microphone, from 0 (close, unchanged) to 1 (far). With an `environment`, farther also means more of the room's echo and less of the plain voice.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "environment",
+      "type": "String",
+      "label": "Environment",
+      "placeholder": "Pick a room, or paste its id",
+      "description": "A space the voice is placed in, such as a small room or a hall, heard as reverb that can ring on for a few seconds after the speech ends. Reverb makes the audio stereo, so it needs an mp3, wav or opus `outputFormat`.",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/audio-effects/catalog",
+            "items": "environments",
+            "label": "name",
+            "value": "environment_id"
+          }
+        ]
+      }
+    },
+    {
+      "name": "sendLevel",
+      "type": "Number",
+      "label": "Reverb amount",
+      "description": "How much of the voice feeds the `environment`'s reverb, from 0 (none, which turns the reverb off) to 1 (all of it). Needs an `environment`; leave empty for 1.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "backgroundNoise",
+      "type": "String",
+      "label": "Background noise",
+      "placeholder": "Pick a noise, or paste its id",
+      "description": "A background sound looped under the voice, such as a cafe or a keyboard.",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/audio-effects/catalog",
+            "items": "background_noises",
+            "label": "name",
+            "value": "background_noise_id"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pan",
+      "type": "Number",
+      "description": "Where the voice sits from left to right: -1 is hard left, 0 the center, 1 hard right. Only the voice moves; reverb and background noise stay in the center. Anything but 0 makes the audio stereo, so it needs an mp3, wav or opus `outputFormat`.",
+      "widget": {
+        "kind": "number",
+        "min": -1,
+        "max": 1,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "enableLogging",
+      "type": "Boolean",
+      "default": true,
+      "label": "Keep history",
+      "description": "If you want ElevenLabs to keep no history of this request (zero retention), turn this off; only Enterprise accounts can. The request then cannot carry on from or into other requests through `previousRequestIds` or `nextRequestIds`."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "Audio",
-      "description": "The spoken audio."
+      "description": "The spoken audio, kept for 30 days after it was last read."
     },
     {
       "name": "filename",
@@ -136,6 +365,231 @@
     {
       "name": "sizeBytes",
       "type": "Number"
+    },
+    {
+      "name": "requestId",
+      "type": "String",
+      "description": "If you want another Speak to File node's speech to carry on from this audio, wire this into its `previousRequestIds`; if you are redoing a clip that comes before this one, wire it into that node's `nextRequestIds`."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "sendLevel"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "environment"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' sets `sendLevel`, how much of the voice goes into the reverb, but has no `environment` to make that reverb: pick an `environment`, or leave `sendLevel` empty.",
+        "port": "sendLevel"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "environment"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "sendLevel",
+              "equals": 0
+            }
+          },
+          {
+            "kind": "config_matches",
+            "field": "outputFormat",
+            "regex": "^(pcm|ulaw|alaw)_"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' places the voice in an `environment`, whose reverb makes the audio stereo, and ElevenLabs refuses stereo audio in pcm, ulaw and alaw: pick an mp3, wav or opus `outputFormat`, or leave `environment` empty.",
+        "port": "environment"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "pan"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "pan",
+              "equals": 0
+            }
+          },
+          {
+            "kind": "config_matches",
+            "field": "outputFormat",
+            "regex": "^(pcm|ulaw|alaw)_"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' pans the voice, which makes the audio stereo, and ElevenLabs refuses stereo audio in pcm, ulaw and alaw: pick an mp3, wav or opus `outputFormat`, or leave `pan` empty.",
+        "port": "pan"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "enableLogging",
+            "equals": false
+          },
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "input_satisfied",
+                "port": "previousRequestIds"
+              },
+              {
+                "kind": "input_satisfied",
+                "port": "nextRequestIds"
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' turns `enableLogging` off, and ElevenLabs cannot carry a request it keeps no history of on from or into other requests: turn `enableLogging` on, or leave `previousRequestIds` and `nextRequestIds` empty.",
+        "port": "enableLogging"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "languageCode"
+          },
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "config_equals",
+                "field": "model",
+                "equals": "eleven_multilingual_v2"
+              },
+              {
+                "kind": "all",
+                "of": [
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "config_present",
+                      "field": "model"
+                    }
+                  },
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "input_wired",
+                      "port": "model"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' sets `languageCode`, and its `model`, eleven_multilingual_v2 (the default), takes no language code: pick another `model`, or leave `languageCode` empty.",
+        "port": "languageCode"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "model",
+            "equals": "eleven_v3"
+          },
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "input_satisfied",
+                "port": "previousRequestIds"
+              },
+              {
+                "kind": "input_satisfied",
+                "port": "nextRequestIds"
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' sets `previousRequestIds` or `nextRequestIds` on eleven_v3, which ElevenLabs does not support on that model: pick another `model`, or leave both empty.",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "previousText"
+          },
+          {
+            "kind": "input_satisfied",
+            "port": "previousRequestIds"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' sets both `previousText` and `previousRequestIds`, and ElevenLabs ignores the text when it has the ids: keep one of them.",
+        "port": "previousText"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "nextText"
+          },
+          {
+            "kind": "input_satisfied",
+            "port": "nextRequestIds"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeakFile '{id}' sets both `nextText` and `nextRequestIds`, and ElevenLabs ignores the text when it has the ids: keep one of them.",
+        "port": "nextText"
+      }
     }
   ],
   "features": {

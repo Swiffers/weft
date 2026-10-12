@@ -296,7 +296,7 @@ fn prompt_mode() -> anyhow::Result<DeactivationMode> {
     println!("Choose preservation mode for in-flight signals:");
     println!("  1) wipe       drop all signals, cancel suspended runs (fully fresh on reactivate)");
     println!("  2) hibernate  like park for a grace window, questions hidden; after it, nothing new is taken");
-    println!("  3) park       nothing is dropped: calls, answers and the triggers' own fires wait and run once they are back");
+    println!("  3) park       webhook calls, answers and the triggers' own fires wait and run once they are back; a caller on a live route is answered 503 and told to retry in 5s");
     let line = crate::prompt::prompt_line("Enter 1, 2, or 3: ", "--mode wipe | hibernate | park")?;
     Ok(match line.as_str() {
         "1" | "wipe" => DeactivationMode::Wipe,

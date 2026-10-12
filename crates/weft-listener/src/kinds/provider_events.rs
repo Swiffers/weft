@@ -12,8 +12,9 @@
 //!   - **dial-out**: the service declares a socket recipe and the
 //!     connection holds every value its mint call needs. A holder keeps
 //!     ONE shared socket per (connection, topic), fanning every inbound
-//!     event to all of that pair's subscriptions; the engine re-resolves
-//!     the connection and re-mints the address on every reconnect.
+//!     event to all of that pair's subscriptions; the engine re-mints the
+//!     address on every reconnect, with the connection as the process
+//!     keeps it (`crate::reach`).
 //!
 //! The registration settles the transport ([`KindHandler::settle`]) and
 //! records it on the row, so activating a trigger that cannot be served
@@ -46,7 +47,7 @@ use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget, PushEv
 use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woken};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woke, Woken};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct ProviderEventsHandler;
@@ -113,10 +114,10 @@ impl KindHandler for ProviderEventsHandler {
     /// claim leaves the row unclaimed for the alarm's retry, which ensures
     /// again. The claim has one winner, which records the subscription and
     /// sets the next wake; a copy whose claim lost ends quietly.
-    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Value>> {
-        let (cfg, access) = parse_spec(spec)?;
-        let ensured = ensure_via_broker(&ctx, &access, &cfg).await?;
-        let mut settled = Settled::read(&woken.state)?;
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Woke>> {
+        let (cfg, access) = parse_spec(spec).map_err(super::for_good)?;
+        let mut settled = Settled::read(&woken.state).map_err(super::for_good)?;
+        let ensured = ensure_via_broker(&ctx, &access, &cfg).await.map_err(crate::listener_access::for_good_when_answered)?;
         let margin_secs = settled.renew_margin_secs.unwrap_or(0);
         settled.renew_at_ms = ensured.expires_at_unix.map(|at| renew_at_ms(&ctx, &cfg, at, margin_secs, woken.now_ms));
         settled.subscribed = true;
@@ -129,7 +130,7 @@ impl KindHandler for ProviderEventsHandler {
             );
             return Ok(None);
         }
-        Ok(Some(after))
+        Ok(Some(Woke { state: after, seq: Some(woken.seq + 1) }))
     }
 
     fn broad_push_routed(&self) -> bool {
@@ -365,20 +366,23 @@ struct ResolvedTopic {
     topic: EventsSpec,
     values: BTreeMap<String, String>,
     provider_account: Option<String>,
+    /// Whether the credentials were fetched just now.
+    fresh: bool,
 }
 
 /// Resolve `access` through the broker and read its `topic`.
 async fn resolve_topic(access: &AccessRef, topic: &str, ctx: &SpawnCtx) -> Result<ResolvedTopic> {
-    let source = crate::listener_access::resolve(access, ctx).await?;
+    let resolved = crate::listener_access::resolve(access, ctx).await?;
+    let (source, fresh) = (resolved.source, resolved.fresh);
     let spec = source.events.get(topic).cloned().ok_or_else(|| {
-        anyhow::anyhow!(
+        super::for_good(anyhow::anyhow!(
             "'{}' declares no event topic named '{topic}'; reconnect the account (an older connection may predate the topic)",
             access.service
-        )
+        ))
     })?;
     let mut values = source.values;
     values.extend(source.recipe_values);
-    Ok(ResolvedTopic { topic: spec, values, provider_account: source.provider_account })
+    Ok(ResolvedTopic { topic: spec, values, provider_account: source.provider_account, fresh })
 }
 
 /// The transport decision plus everything it was decided FROM that
@@ -409,11 +413,14 @@ async fn resolve_and_decide(
 /// signal stops (its abort drops the membership guard). It resolves the
 /// connection (the topic and its own provider account), retrying on the
 /// ladder until it can (one unreachable broker must not keep it down
-/// for good), and serves the transport the registration `settled`; a row
-/// registered before its transport was settled decides it here. An
-/// unservable decision is TERMINAL: retrying would re-derive the same
-/// facts, and a reconnect of the account re-registers the signal and
-/// re-runs the decision.
+/// for good) unless asking again repeats the failure
+/// ([`super::held_attempt_failed`]), and serves the transport the
+/// registration `settled`; a row registered before its transport was
+/// settled decides it here. An unservable decision is TERMINAL: retrying
+/// would re-derive the same facts. The signal is given up on, and comes
+/// back, deciding again, when the account is reconnected (which lifts
+/// the give-up of every held signal acting as it) or the project is
+/// resynced (`weft resync`).
 fn serve_subscription(
     cfg: ProviderEvents,
     access: AccessRef,
@@ -423,34 +430,31 @@ fn serve_subscription(
     tokio::spawn(async move {
         let decided = {
             let mut backoff = crate::kinds::event_source::Backoff::new();
+            let mut said = crate::kinds::event_source::Said::new(super::serving_sink(&ctx));
             loop {
                 match resolve_and_decide(&cfg, &access, settled.clone(), &ctx).await {
                     Ok(decided) => break decided,
                     Err(e) => {
-                        set_status(&ctx, format!("{e:#}"));
-                        backoff.wait_then_climb().await;
+                        if super::held_attempt_failed("resolving the connection failed", e, &mut said, &mut backoff, &ctx.fire)
+                            .await
+                            .is_break()
+                        {
+                            return;
+                        }
                     }
                 }
             }
         };
         ctx.serving.lock().transport = Some(decided.transport.clone());
+        ctx.said.notify_one();
         match decided.transport {
-            Transport::Socket => {
-                set_status(&ctx, "connecting the event socket");
-                // The tail of the task: joins the shared socket and
-                // parks until aborted at unregister.
-                serve_socket(&cfg, &access, decided.provider_account, &ctx).await;
-            }
+            // The tail of the task: joins the shared socket and parks
+            // until aborted at unregister.
+            Transport::Socket => serve_socket(&cfg, &access, decided.provider_account, &ctx).await,
             Transport::Webhook => serve_webhook(&cfg, &access, &decided.topic, &ctx).await,
-            Transport::Unservable(reason) => {
-                tracing::warn!(
-                    target: "weft_listener::provider_events",
-                    token = %ctx.fire.token(), %reason,
-                    "the subscription cannot be served; ending the serving task (a \
-                     reconnect re-registers the signal and re-runs the decision)"
-                );
-                set_status(&ctx, reason);
-            }
+            // Given up on; a reconnect of the account or a resync brings
+            // it back, and the decision runs again.
+            Transport::Unservable(reason) => ctx.fire.give_up(&format!("the subscription cannot be served: {reason}")).await,
         }
     })
 }
@@ -488,6 +492,17 @@ struct SocketShare {
     /// through its drop alone, which is why the lint sees no read.
     #[allow(dead_code)]
     engine: TaskGuard,
+    /// The engine resolves as the subscription that started it, so what
+    /// the process keeps of the connection is kept under that one's token
+    /// (`crate::reach`) for as long as the share lives, and dropped with it.
+    kept_under: String,
+    reach: Arc<crate::reach::Reach>,
+}
+
+impl Drop for SocketShare {
+    fn drop(&mut self) {
+        self.reach.forget(&self.kept_under);
+    }
 }
 
 /// Membership in a socket share; dropping it (the per-signal task
@@ -533,11 +548,13 @@ async fn serve_socket(
             let report: super::ServingReport = {
                 let subscribers = subscribers.clone();
                 let last = last.clone();
+                let said = ctx.said.clone();
                 Arc::new(move |status: String| {
                     *last.lock() = status.clone();
                     for subscriber in subscribers.iter() {
                         subscriber.serving.lock().status = status.clone();
                     }
+                    said.notify_one();
                 })
             };
             let engine = spawn_shared_engine(
@@ -547,7 +564,13 @@ async fn serve_socket(
                 subscribers.clone(),
                 report,
             );
-            SocketShare { subscribers, last, engine: TaskGuard::new(engine) }
+            SocketShare {
+                subscribers,
+                last,
+                engine: TaskGuard::new(engine),
+                kept_under: ctx.fire.token().to_string(),
+                reach: ctx.reach.clone(),
+            }
         });
         share.subscribers.insert(
             ctx.fire.token().to_string(),
@@ -586,28 +609,28 @@ fn spawn_shared_engine(
     let recipe: Arc<parking_lot::Mutex<Option<EventsSpec>>> =
         Arc::new(parking_lot::Mutex::new(None));
     let recipe_for_events = recipe.clone();
+    let prepare_subscribers = subscribers.clone();
 
     let prepare = Box::new(move || {
         let ctx = prepare_ctx.clone();
         let access = prepare_access.clone();
         let topic_name = prepare_topic.clone();
         let recipe = recipe.clone();
+        let subscribers = prepare_subscribers.clone();
         async move {
-            let resolved = resolve_topic(&access, &topic_name, &ctx).await.map_err(PrepareError::Transient)?;
-            let socket = resolved.topic.socket.clone().ok_or_else(|| {
-                PrepareError::Transient(anyhow::anyhow!(
-                    "the '{topic_name}' topic declares no socket recipe"
-                ))
-            })?;
-            let url = socket_engine::mint_socket_url(&socket.minted, &resolved.values).await?;
-            *recipe.lock() = Some(resolved.topic);
-            Ok(CyclePlan {
-                url,
-                handshake: None,
-                heartbeat: None,
-                heartbeat_secs: 30,
-                replies: socket.minted.replies.clone(),
-            })
+            let plan = prepare_shared_cycle(&access, &topic_name, &ctx, &recipe).await;
+            // A cycle that can never serve: every subscription on it is
+            // given up on. A connection refused, gone or needing a
+            // reconnect comes back with a reconnect of the account; a
+            // recipe that cannot serve, once it is fixed, with a resync
+            // of the project (`weft resync`).
+            if let Err(PrepareError::Fatal(e)) = &plan {
+                let fires: Vec<FireContext> = subscribers.iter().map(|s| s.fire.clone()).collect();
+                for fire in fires {
+                    fire.give_up(&format!("{e:#}")).await;
+                }
+            }
+            plan
         }
         .boxed()
     });
@@ -673,6 +696,25 @@ fn spawn_shared_engine(
     // The engine is shared by every subscription of this (connection,
     // topic); `report` fans its state out to all of them (`serve_socket`).
     socket_engine::spawn(prepare, on_event, "provider_events", report)
+}
+
+/// One cycle of the shared socket: resolve, mint, and keep the recipe for
+/// the cycle's events.
+async fn prepare_shared_cycle(
+    access: &AccessRef,
+    topic_name: &str,
+    ctx: &SpawnCtx,
+    recipe: &parking_lot::Mutex<Option<EventsSpec>>,
+) -> Result<CyclePlan, PrepareError> {
+    let resolved = resolve_topic(access, topic_name, ctx).await.map_err(PrepareError::of_resolve)?;
+    let socket = resolved
+        .topic
+        .socket
+        .clone()
+        .ok_or_else(|| PrepareError::Transient(anyhow::anyhow!("the '{topic_name}' topic declares no socket recipe")))?;
+    let url = socket_engine::mint_signed_in(&socket.minted, &resolved.values, resolved.fresh, ctx).await?;
+    *recipe.lock() = Some(resolved.topic);
+    Ok(CyclePlan { url, handshake: None, heartbeat: None, heartbeat_secs: 30, replies: socket.minted.replies.clone() })
 }
 
 // ---------- Dial-in: the provider subscription lifecycle ----------
@@ -814,8 +856,9 @@ async fn ensure_via_broker(
 
 /// Keep the provider subscription alive: ensure, sleep until the
 /// renewal margin, re-ensure. A topic that never expires (or needs no
-/// subscribing at all) parks forever after the first ensure. Never
-/// returns except through the task's abort.
+/// subscribing at all) parks forever after the first ensure. Returns
+/// only once the signal is given up (a failure asking again repeats);
+/// otherwise it ends through the task's abort.
 async fn serve_webhook(
     cfg: &ProviderEvents,
     access: &AccessRef,
@@ -824,10 +867,11 @@ async fn serve_webhook(
 ) {
     let margin_secs = renew_margin_secs(topic).unwrap_or(0);
     let mut backoff = crate::kinds::event_source::Backoff::new();
+    let mut said = crate::kinds::event_source::Said::new(super::serving_sink(ctx));
     loop {
         match ensure_via_broker(ctx, access, cfg).await {
             Ok(ensured) => {
-                set_status(ctx, "subscribed; events arrive via push");
+                said.up("subscribed; events arrive via push");
                 match ensured.expires_at_unix {
                     None => std::future::pending::<()>().await,
                     Some(at) => {
@@ -840,11 +884,12 @@ async fn serve_webhook(
             }
             Err(e) => {
                 // The broker names the fix (no public address, a
-                // provider refusal); surface it on the trigger and
-                // keep trying: the operator may reinstall with the
-                // tunnel, or the provider may recover.
-                set_status(ctx, format!("subscription failed: {e:#}"));
-                backoff.wait_then_climb().await;
+                // provider refusal, a reconnect). An answer asking again
+                // repeats stops the signal, as the dial-in wake does;
+                // a broker not reached or a provider busy is tried again.
+                if super::held_attempt_failed("subscription failed", e, &mut said, &mut backoff, &ctx.fire).await.is_break() {
+                    return;
+                }
             }
         }
     }

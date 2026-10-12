@@ -3,126 +3,211 @@
 //! `infra_event` rows via the broker when a node's status changes.
 //!
 //! Two concerns:
-//!   1. Per-node windowed health-state transitions (flaky after N
-//!      seconds below threshold, recovered after N seconds above).
-//!      Drives `infra_event` flaky / recovered + `infra_node.status`.
+//!   1. Per-unit windowed health-state transitions (flaky after N
+//!      seconds not ready, recovered after N seconds ready). Drives
+//!      `infra_event` flaky / recovered + the unit's status.
 //!   2. HealthProtocols evaluation: ordered (condition → action)
 //!      rules. First match fires; while a project's protocol is in
 //!      flight, subsequent matches queue (next look re-checks once
 //!      the current one settles).
 //!
+//! Everything a look decides lives in the database, never in this
+//! process: a unit's latch and the window it is in on its row
+//! (`UnitRuntime`), what each protocol acted on and how its failures stand
+//! in `infra_health_protocol` (`HealthProtocolState`). So any process
+//! carries on where the last look left off, and the broker knows when
+//! the next look is due (a window ending, a protocol's retry) and books
+//! it for a supervisor that scales to zero.
+//!
 //! When it looks: in one process that lives as long as the install (a
 //! local one), every `health_interval`, every owned project. A supervisor
-//! that scales to zero looks when told to (a machine running a project's
-//! infra says how its unit stands changed, or the cloud says a machine
-//! went away), and then again at the health interval only while something
-//! it saw is not settled: a unit inside its flaky or recovery window, which
-//! only TIME passing closes, or an action under way or backing off. A
-//! unit that runs fine, or one broken and already declared flaky, needs no
-//! look until it changes. What this supervisor owns is followed as the ownership loop
-//! changes it: a lost project's health state is dropped the moment the
-//! loss is known (a look already running finishes; its status write is
-//! fenced by ownership), and a claim runs a tick right away.
+//! that scales to zero looks once per pass: when told to (a machine
+//! running a project's infra says how its unit stands changed, or the
+//! cloud says a machine went away, or a person asks), and when the broker
+//! booked it. What this supervisor owns is followed as the ownership loop
+//! changes it: a claim runs a tick right away.
 
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::Result;
+use uuid::Uuid;
+use weft_broker_client::protocol::{HealthProtocolState, InfraCopy, ProjectTrouble};
 use weft_core::truncate_user_string;
 
 use crate::health_engine::{
-    all_units_healthy, evaluate_protocols, observe_unit, rearm, record_fire, NodeDecision, NodeEdgeEvent, NodeHealthState,
-    NodeObservation, ProtocolEvalInputs,
+    all_units_healthy, evaluate_protocols, observe_unit, rearm, record_fire, NodeEdgeEvent, NodeHealthState, NodeObservation,
+    ProtocolEvalInputs,
 };
 use crate::protocol::{self, HealthProtocol, ProtocolAction, UnitView};
 use crate::SupervisorState;
 
-/// Exponential-backoff state for a (project, protocol) whose action
-/// keeps failing. Without this, an action that fails fast (broker
-/// rejects immediately) re-fires every poll interval (~5s) forever
-/// while infra stays broken, flooding the lifecycle-command table.
-#[derive(Clone)]
-struct BackoffState {
-    /// Consecutive failures since the last success. Drives the delay.
-    consecutive_failures: u32,
-    /// Earliest instant the protocol may re-fire. Until then, a match
-    /// is skipped.
-    next_retry_at: Instant,
-}
-
-/// Backoff delay for the Nth consecutive failure: 5s, 10s, 20s, 40s,
-/// doubling, capped at 5 min. The action still self-heals (it keeps
-/// retrying), just not in a tight loop while broken.
-fn backoff_delay(consecutive_failures: u32) -> Duration {
-    const BASE_SECS: u64 = 5;
-    const CAP_SECS: u64 = 300;
-    // failures>=1 here; shift caps at a large exponent to avoid overflow.
-    let shift = consecutive_failures.saturating_sub(1).min(20);
-    let secs = (BASE_SECS.saturating_mul(1u64 << shift)).min(CAP_SECS);
-    Duration::from_secs(secs)
-}
-
+/// What the health loop keeps in this process: the actions it is running,
+/// and what its looks came to, for the next ownership sync to report.
 #[derive(Default)]
 pub struct HealthRegistry {
-    /// Per-(project, copy_id, unit) state tracking. Records when the
-    /// unit was last seen Ready vs Not-Ready so we can apply windowed
-    /// transitions (flaky_after, recovery_after). Health is per-unit of
-    /// one deployed copy: a node that exists once per instance
-    /// has one copy on the host per instance, each with its own
-    /// health.
-    state: HashMap<(uuid::Uuid, String, String), NodeHealthState>,
-    /// Per-project "currently in flight" protocol names. While a
-    /// protocol is in flight, the supervisor doesn't re-fire any
-    /// protocol for that project (avoids action storms when health
-    /// flaps mid-action).
-    in_flight: HashSet<uuid::Uuid>,
-    /// Per-project protocols already fired, each with the copies its
-    /// action aimed at (empty for a notification, which aims at no
-    /// copy). A protocol fires again only for a copy it has not acted
-    /// on. Re-armed copy by copy (`health_engine::rearm`).
-    fired: HashMap<uuid::Uuid, HashMap<String, std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>>>,
-    /// Per-(project, protocol) exponential backoff after a failed
-    /// action. A matched protocol whose entry's `next_retry_at` is in
-    /// the future is skipped this tick. Cleared on success.
-    backoff: HashMap<(uuid::Uuid, String), BackoffState>,
+    /// Projects with a protocol's action in flight. While one is, the
+    /// supervisor doesn't fire any protocol for that project (avoids
+    /// action storms when health flaps mid-action).
+    in_flight: HashSet<Uuid>,
+    /// The steps of each project this process could not get through
+    /// since its last look: that look does not report it settled while
+    /// any is left.
+    troubled: HashMap<Uuid, HashSet<Step>>,
+    /// Projects this process looked at, whatever the look came to, not
+    /// yet reported by an ownership sync: the look took their failed
+    /// pass's retry.
+    looked: BTreeSet<Uuid>,
+    /// Projects whose look went through with nothing given up, not yet
+    /// reported by an ownership sync.
+    settled: BTreeSet<Uuid>,
+    /// What this process could not get through, by project, not yet
+    /// reported by an ownership sync.
+    troubles: Troubles,
+    /// The steps of a pass that cover every project it holds and could not
+    /// be got through (listing the host, reading what it owns), each with
+    /// its latest error, not yet reported by an ownership sync.
+    all_troubled: BTreeMap<Step, String>,
+}
+
+/// The step of a pass over a project that could not be got through.
+/// Each keeps its own latest error, so one that comes right (a command's
+/// ending written by its rerun) clears only itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Step {
+    /// The project's health look.
+    Look,
+    /// The sweep of its gone copies.
+    Sweep,
+    /// One of its health protocols gave up.
+    Protocol,
+    /// How this command ended could not be written.
+    End(i64),
+}
+
+impl Step {
+    /// A step that failed is tried again on a clock; a protocol that gave
+    /// up is not.
+    fn retried(self) -> bool {
+        self != Step::Protocol
+    }
+}
+
+/// The latest error of each step that could not be got through, by
+/// project.
+type Troubles = BTreeMap<Uuid, BTreeMap<Step, String>>;
+
+/// What an ownership sync reports of this process's looks
+/// (`SupervisorSyncOwnershipRequest`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Report {
+    pub(crate) looked: Vec<Uuid>,
+    pub(crate) settled: Vec<Uuid>,
+    troubles: Troubles,
+    all_troubled: BTreeMap<Step, String>,
+}
+
+impl Report {
+    /// Why a step over every project failed, each step's error once
+    /// (`SupervisorSyncOwnershipRequest::all_failed`).
+    pub(crate) fn all_failed(&self) -> Option<String> {
+        (!self.all_troubled.is_empty()).then(|| self.all_troubled.values().map(String::as_str).collect::<Vec<_>>().join("; "))
+    }
+
+    /// The projects a step of failed, each once with every step's error.
+    pub(crate) fn failed(&self) -> Vec<ProjectTrouble> {
+        self.troubles(true)
+    }
+
+    /// The projects only a health protocol gave up on.
+    pub(crate) fn gave_up(&self) -> Vec<ProjectTrouble> {
+        self.troubles(false)
+    }
+
+    fn troubles(&self, retried: bool) -> Vec<ProjectTrouble> {
+        self.troubles
+            .iter()
+            .filter(|(_, steps)| steps.keys().any(|s| s.retried()) == retried)
+            .map(|(project, steps)| ProjectTrouble {
+                project_id: *project,
+                error: steps.values().map(String::as_str).collect::<Vec<_>>().join("; "),
+            })
+            .collect()
+    }
 }
 
 impl HealthRegistry {
-    /// Drop every entry of a project `keep` refuses (deleted, or no
-    /// longer this supervisor's): a project this loop stops looking at would
-    /// otherwise keep its entries forever, and a reclaimed one would
-    /// start from stale windows.
-    fn keep_only(&mut self, keep: impl Fn(uuid::Uuid) -> bool) {
-        self.state.retain(|(project, _, _), _| keep(*project));
-        self.in_flight.retain(|project| keep(*project));
-        self.fired.retain(|project, _| keep(*project));
-        self.backoff.retain(|(project, _), _| keep(*project));
-    }
-
     /// True if a protocol action is currently in flight for the
     /// project. Exposed for introspection (e.g. asserting a hung
     /// action's timeout freed the slot).
-    pub fn is_in_flight(&self, project_id: uuid::Uuid) -> bool {
+    pub fn is_in_flight(&self, project_id: Uuid) -> bool {
         self.in_flight.contains(&project_id)
     }
 
-    /// True if `protocol_name` is latched in the project's fired set
-    /// (a successful action suppresses re-fire until re-arm). Exposed
-    /// for introspection (e.g. asserting a failed action un-latched).
-    pub fn is_fired(&self, project_id: uuid::Uuid, protocol_name: &str) -> bool {
-        self.fired
-            .get(&project_id)
-            .is_some_and(|fired| fired.contains_key(protocol_name))
+    /// This process could not get through `step` of `project`, with
+    /// `error`: its next look does not report it settled, and the next
+    /// sync reports the step's latest error.
+    pub(crate) fn troubled(&mut self, project: Uuid, step: Step, error: &str) {
+        self.troubled.entry(project).or_default().insert(step);
+        self.settled.remove(&project);
+        self.troubles.entry(project).or_default().insert(step, error.to_string());
     }
 
-    /// Consecutive-failure count for a (project, protocol)'s backoff,
-    /// 0 if none. Exposed for introspection (e.g. asserting a failed
-    /// action armed backoff and a success cleared it).
-    pub fn backoff_failures(&self, project_id: uuid::Uuid, protocol_name: &str) -> u32 {
-        self.backoff
-            .get(&(project_id, protocol_name.to_string()))
-            .map(|b| b.consecutive_failures)
-            .unwrap_or(0)
+    /// `step` of `project` came right after all (a command's rerun wrote
+    /// how it ended): neither its look nor the next sync counts it.
+    pub(crate) fn untroubled(&mut self, project: Uuid, step: Step) {
+        if self.troubled.get_mut(&project).is_some_and(|steps| steps.remove(&step) && steps.is_empty()) {
+            self.troubled.remove(&project);
+        }
+        if self.troubles.get_mut(&project).is_some_and(|steps| steps.remove(&step).is_some() && steps.is_empty()) {
+            self.troubles.remove(&project);
+        }
+    }
+
+    /// A step of a pass that covers every project it holds (`step`)
+    /// could not be got through, with `error`: no project is reported
+    /// settled, and the next sync reports the step's latest error as a
+    /// failure of every project the pass held.
+    pub(crate) fn all_troubled(&mut self, step: Step, error: &str) {
+        self.all_troubled.insert(step, error.to_string());
+    }
+
+    /// What looks came to since the last call, to report. A project that
+    /// failed is reported failed only: its retry looks again at all of it.
+    /// With a step over every project failed, none is reported settled.
+    pub(crate) fn take_report(&mut self) -> Report {
+        let all_troubled = std::mem::take(&mut self.all_troubled);
+        let settled = std::mem::take(&mut self.settled);
+        Report {
+            looked: std::mem::take(&mut self.looked).into_iter().collect(),
+            settled: match all_troubled.is_empty() {
+                true => settled.into_iter().collect(),
+                false => Vec::new(),
+            },
+            troubles: std::mem::take(&mut self.troubles),
+            all_troubled,
+        }
+    }
+
+    /// Report `report` at the next sync again: this one did not go
+    /// through. What happened since takes precedence over it: a step
+    /// that failed again since keeps its newer error, and a project
+    /// troubled since is not reported settled.
+    pub(crate) fn report_again(&mut self, report: Report) {
+        for (step, error) in report.all_troubled {
+            self.all_troubled.entry(step).or_insert(error);
+        }
+        self.looked.extend(report.looked);
+        self.settled.extend(report.settled.iter().filter(|p| !self.troubles.contains_key(p)));
+        for (project, steps) in report.troubles {
+            if self.settled.contains(&project) {
+                continue;
+            }
+            let kept = self.troubles.entry(project).or_default();
+            for (step, error) in steps {
+                kept.entry(step).or_insert(error);
+            }
+        }
     }
 }
 
@@ -153,71 +238,73 @@ pub async fn run_loop(
     }
 }
 
-/// Follow one ownership change: a lost project's health state is dropped
-/// at once; a claim runs a tick now rather than at the next interval.
-/// Exposed so integration tests can step it.
+/// Follow one ownership change: a claim runs a tick now rather than at
+/// the next interval. Exposed so integration tests can step it.
 pub async fn on_ownership_change(state: &SupervisorState, change: &crate::ownership::OwnershipChange) -> Result<()> {
-    if !change.lost.is_empty() {
-        state.health.lock().await.keep_only(|project| !change.lost.contains(&project));
-    }
     if !change.claimed.is_empty() {
         tick(state).await?;
     }
     Ok(())
 }
 
-/// One tick of the health loop: evaluate every owned project. Exposed
-/// (rather than only running inside `run_loop`) so integration tests can
-/// step the loop one tick at a time. Answers whether anything it saw is
-/// not settled yet (see the module doc): a project whose look failed
-/// counts as unsettled, so it is looked at again.
-pub async fn tick(state: &SupervisorState) -> Result<bool> {
-    let projects = state.broker.owned_projects(&state.replica).await?;
-    let mut unsettled = false;
+/// One tick of the health loop: look at every owned project. A project
+/// whose look fails is reported failed (`crate::failed`), and a later
+/// pass looks again. Exposed (rather than only running inside `run_loop`) so
+/// integration tests can step the loop one tick at a time.
+pub async fn tick(state: &SupervisorState) -> Result<()> {
+    let projects = crate::patiently(state, || state.broker.owned_projects(&state.replica)).await?;
     for project in &projects {
         match tick_project(state, project).await {
-            Ok(project_unsettled) => unsettled |= project_unsettled,
-            Err(e) => {
-                unsettled = true;
-                tracing::warn!(
-                    project_id = %project.project_id,
-                    error = %e,
-                    "health tick (project) failed"
-                );
+            Ok(look) => {
+                let mut registry = state.health.lock().await;
+                registry.looked.insert(project.project_id);
+                let troubled = registry.troubled.remove(&project.project_id).is_some();
+                if look == Look::Settled && !troubled {
+                    registry.settled.insert(project.project_id);
+                    registry.troubles.remove(&project.project_id);
+                }
             }
+            Err(e) => look_failed(state, project.project_id, &format!("could not look at its health: {e:#}")).await,
         }
     }
-
-    // Sweep ALL per-project registry maps for projects that no longer
-    // exist (deleted between ticks). A deleted project is never
-    // iterated again, so its entries would leak forever without this.
-    {
-        let live: std::collections::HashSet<uuid::Uuid> =
-            projects.iter().map(|p| p.project_id).collect();
-        state.health.lock().await.keep_only(|project| live.contains(&project));
-    }
-    Ok(unsettled)
+    Ok(())
 }
 
-/// Look at one project's health; answers whether anything there is not
-/// settled yet: a unit whose latch time passing alone can change
-/// (`NodeHealthState::waits_on_time`), or a protocol's action under way or
-/// waiting out its backoff. A unit broken and already declared flaky is
-/// settled: nothing changes until the unit does, which its machine says.
+/// The look at `project` failed with `error`: it counts as looked at
+/// (the look took its failed pass's retry) and as failed, so the next
+/// sync sets the next retry until it gives up (`crate::failed`).
+async fn look_failed(state: &SupervisorState, project: Uuid, error: &str) {
+    let mut registry = state.health.lock().await;
+    registry.looked.insert(project);
+    registry.troubled.remove(&project);
+    drop(registry);
+    crate::failed(state, project, Step::Look, error).await;
+}
+
+/// What one look at a project came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// Nothing is given up.
+    Settled,
+    /// A protocol's action gave up, now or before.
+    GaveUp,
+}
+
+/// Look at one project's health: each unit's latch from what the host
+/// reports, then its protocols.
 async fn tick_project(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
-) -> Result<bool> {
+) -> Result<Look> {
     // Stand down, copy by copy, while a user infra action runs on it:
     // an uncompleted supervisor command (apply / stop / terminate) that
     // reaches a copy means the lifecycle handler owns that copy's status
     // right now. Health must NOT look at it (units going down
     // during a stop are the action, not a fault), or its autonomous
     // reconcile would race and clobber the action's transition. Every
-    // other copy keeps its health. A stood-down copy's latches are
-    // cleared, so the look after the command starts from the row it
-    // left (`NodeHealthState::seeded_from`).
-    let commands = state.broker.infra_commands_in_flight(project.project_id).await?;
+    // other copy keeps its health.
+    // The first read waits out a broker that cannot answer right now.
+    let commands = crate::patiently(state, || state.broker.infra_commands_in_flight(project.project_id)).await?;
     let nodes = state.broker.infra_nodes(project.project_id).await?;
 
     // How the host sees every unit of the project, by `(copy_id,
@@ -235,11 +322,6 @@ async fn tick_project(
         .map(|o| ((o.copy_id, o.unit), o.state))
         .collect();
 
-    // Per unit of each copy: its windowed health (flaky/recovered
-    // transitions, which drive the dispatcher-visible status badge
-    // whether or not any HealthProtocol fires) and the view the
-    // protocols read.
-    //
     // ONLY units whose status implies "should be running right now"
     // ({running, flaky}). Skip the rest:
     //   - `stopped` / `stopping`: user intentionally scaled to 0;
@@ -249,10 +331,7 @@ async fn tick_project(
     //     is the source of truth until it writes Running.
     //   - `failed`: apply errored; the failure stage carries the
     //     diagnosis, health-flaky would just clobber it.
-    // Also skipped: a copy a command in flight reaches (above). Clear
-    // the in-memory health state for skipped units so a post-restart
-    // cycle starts clean (no stale last_ready_at / last_not_ready_at
-    // from before the Stop biasing the next flaky-window arithmetic).
+    // Also skipped: a copy a command in flight reaches (above).
     //
     // A unit the host does not report yet is UNKNOWN: no decision, no
     // view, so no protocol reads it as broken (a copy just applied can
@@ -260,153 +339,85 @@ async fn tick_project(
     // comes from the row's `units` map.
     //
     // The state-machine math lives in `health_engine`; this loop is
-    // just the I/O harness around it. Each decision carries the unit's
-    // observed row status, so the I/O layer below reconciles drift in
-    // either direction in one place.
-    let mut decisions: Vec<(
-        String,
-        Option<weft_core::instance::InstanceId>,
-        String,
-        NodeDecision,
-        weft_broker_client::protocol::InfraNodeStatus,
-        String,
-    )> = Vec::new();
+    // just the I/O harness around it. A unit's latch or window that
+    // moved is written back with its status, in one write, which also
+    // reconciles a status another writer drifted (the latch is the
+    // single source of truth for the row's status).
+    let now = state.clock.now_unix();
     let mut units: Vec<UnitView> = Vec::new();
-    // Whether time passing alone can change what a unit's latch says.
-    let mut units_unsettled = false;
-    {
-        let mut registry = state.health.lock().await;
-        for n in &nodes {
-            let stood_down = commands.iter().any(|c| c.reaches(&n.node_id, n.instance.as_ref()));
-            for (unit, unit_rt) in &n.units {
-                let key = (project.project_id, n.copy_id.clone(), unit.clone());
-                if stood_down || !unit_rt.status.expects_running_units() {
-                    registry.state.remove(&key);
-                    continue;
-                }
-                let reading = seen.get(&(n.copy_id.clone(), unit.clone()));
-                let observed = reading.map(|s| NodeObservation { ready: *s == weft_platform_traits::UnitRunState::Ready });
-                // No latch yet (first look by this supervisor, or the copy's
-                // latches were cleared by a lifecycle command): start
-                // from what the row says, see `seeded_from`.
-                let now = state.clock.now();
-                let flaky_after = Duration::from_secs(unit_rt.flaky_after_seconds as u64);
-                let prior = registry.state.get(&key).cloned().unwrap_or_else(|| {
-                    NodeHealthState::seeded_from(
-                        unit_rt.status,
-                        n.applied_at_unix,
-                        flaky_after,
-                        now,
-                        state.clock.now_unix(),
-                    )
-                });
-                let Some(decision) = observe_unit(
-                    prior,
-                    observed,
-                    now,
-                    flaky_after,
-                    Duration::from_secs(unit_rt.recovery_after_seconds as u64),
-                ) else {
-                    continue;
-                };
-                let ready = observed.is_some_and(|o| o.ready);
-                units_unsettled |= decision.next.waits_on_time(ready);
-                units.push(UnitView {
-                    node_id: n.node_id.clone(),
-                    instance: n.instance.clone(),
-                    unit: unit.clone(),
-                    ready,
-                    flaky: decision.next.declared_flaky,
-                });
-                registry.state.insert(key, decision.next.clone());
+    for n in &nodes {
+        if commands.iter().any(|c| c.reaches(&n.node_id, n.instance.as_ref())) {
+            continue;
+        }
+        for (unit, unit_rt) in n.units.iter().filter(|(_, rt)| rt.status.expects_running_units()) {
+            let reading = seen.get(&(n.copy_id.clone(), unit.clone()));
+            let observed = reading.map(|s| NodeObservation { ready: *s == weft_platform_traits::UnitRunState::Ready });
+            let prior = NodeHealthState::of(unit_rt);
+            let Some(decision) = observe_unit(
+                prior.clone(),
+                observed,
+                n.applied_at_unix,
+                now,
+                Duration::from_secs(unit_rt.flaky_after_seconds as u64),
+                Duration::from_secs(unit_rt.recovery_after_seconds as u64),
+            ) else {
+                continue;
+            };
+            units.push(UnitView {
+                node_id: n.node_id.clone(),
+                instance: n.instance.clone(),
+                unit: unit.clone(),
+                ready: observed.is_some_and(|o| o.ready),
+                flaky: decision.next.declared_flaky,
+            });
+            if let Some(edge) = &decision.event {
                 // Why it is not ready, in the host's words, for the
                 // flaky event.
-                let why = match reading {
-                    Some(weft_platform_traits::UnitRunState::NotReady { why })
-                    | Some(weft_platform_traits::UnitRunState::Failed { why }) => why.clone(),
-                    Some(weft_platform_traits::UnitRunState::Starting { step }) => format!("still starting ({step})"),
-                    Some(weft_platform_traits::UnitRunState::Stopped) => "stopped outside weft".into(),
-                    Some(weft_platform_traits::UnitRunState::Ready) => "ready".into(),
-                    None => "the host no longer reports it".into(),
+                let infra_event = match edge {
+                    NodeEdgeEvent::BecameFlaky => {
+                        let why = match reading {
+                            Some(weft_platform_traits::UnitRunState::NotReady { why })
+                            | Some(weft_platform_traits::UnitRunState::Failed { why }) => why.clone(),
+                            Some(weft_platform_traits::UnitRunState::Starting { step }) => format!("still starting ({step})"),
+                            Some(weft_platform_traits::UnitRunState::Stopped) => "stopped outside weft".into(),
+                            Some(weft_platform_traits::UnitRunState::Ready) => "ready".into(),
+                            None => "the host no longer reports it".into(),
+                        };
+                        weft_broker_client::protocol::InfraEvent::Flaky(weft_broker_client::protocol::FlakyPayload {
+                            reason: format!("unit '{unit}' is not ready: {why}"),
+                        })
+                    }
+                    NodeEdgeEvent::Recovered => weft_broker_client::protocol::InfraEvent::Recovered,
                 };
-                decisions.push((n.node_id.clone(), n.instance.clone(), unit.clone(), decision, unit_rt.status, why));
+                state.broker.event_record(project.project_id, Some(&n.node_id), n.instance.as_ref(), infra_event).await?;
             }
-        }
-
-        // If every unit is healthy again, drop the project's backoff
-        // entries (a recovered project starts fresh; otherwise stale
-        // backoff would delay the first action of the next degradation
-        // episode). What the protocols fired re-arms copy by copy once
-        // the protocols are read, below.
-        if all_units_healthy(&units) {
-            registry.backoff.retain(|(proj, _), _| *proj != project.project_id);
-        }
-    }
-
-    // Dispatch outside the lock so sibling per-project ticks
-    // don't block on slow broker calls.
-    //
-    // Two orthogonal things happen per node:
-    //   1. EDGE: if `decision.event` is `Some`, publish an
-    //      `infra_event` row. Edges only fire on Flaky / Recovered
-    //      transitions; no event means "same state as last tick."
-    //   2. STATUS: if the row's observed status drifted from the
-    //      latch's desired status, write set_status. This handles
-    //      BOTH directions of drift:
-    //        - sibling `set_applied` flipped Flaky→Running while
-    //          we still latch Flaky → re-write Flaky;
-    //        - external write to Flaky while we latch Running →
-    //          re-write Running.
-    //      The latch is the single source of truth for the row's
-    //      status; the broker write is a reconcile, not a
-    //      consequence of the edge.
-    for (node_id, instance, unit, decision, observed_status, why) in decisions {
-        if let Some(edge) = decision.event {
-            let infra_event = match edge {
-                NodeEdgeEvent::BecameFlaky => weft_broker_client::protocol::InfraEvent::Flaky(
-                    weft_broker_client::protocol::FlakyPayload { reason: format!("unit '{unit}' is not ready: {why}") },
-                ),
-                NodeEdgeEvent::Recovered => {
-                    weft_broker_client::protocol::InfraEvent::Recovered
+            if unit_rt.status != decision.desired_status || prior != decision.next {
+                // Fenced on ownership, on no command reaching the copy and
+                // on the unit still being in the roster: a stale outcome
+                // means one of those moved since this look read them, and
+                // the write is dropped.
+                let outcome = state
+                    .broker
+                    .set_unit_health(
+                        &state.replica,
+                        project.project_id,
+                        &n.node_id,
+                        n.instance.as_ref(),
+                        unit,
+                        decision.desired_status,
+                        decision.next.not_ready_since_unix,
+                        decision.next.ready_since_unix,
+                    )
+                    .await?;
+                if !outcome.is_applied() {
+                    tracing::debug!(
+                        project_id = %project.project_id,
+                        node_id = %n.node_id,
+                        unit = %unit,
+                        ?outcome,
+                        "the unit's health write was not applied (row removed, unit left the roster, a command is in flight, or ownership moved); skipping"
+                    );
                 }
-            };
-            state
-                .broker
-                .event_record(project.project_id, Some(&node_id), instance.as_ref(), infra_event)
-                .await?;
-        }
-        if observed_status != decision.desired_status {
-            // Autonomous per-unit reconcile: no lifecycle command in
-            // flight. `command_id = None` skips the broker's
-            // command-ownership check; tenant scope still applies. The
-            // broker sets this unit's status then recomputes the node
-            // rollup. A stale outcome means the row was removed, the
-            // unit left the roster (an apply dropped it after this tick
-            // read the roster; the broker fences per-unit stamps on
-            // membership) or a command appeared (fenced); drop the
-            // write silently.
-            let outcome = state
-                .broker
-                .set_status(
-                    &state.replica,
-                    None,
-                    project.project_id,
-                    &node_id,
-                    instance.as_ref(),
-                    Some(&unit),
-                    decision.desired_status,
-                    None,
-                    None,
-                )
-                .await?;
-            if !outcome.is_applied() {
-                tracing::debug!(
-                    project_id = %project.project_id,
-                    node_id = %node_id,
-                    unit = %unit,
-                    ?outcome,
-                    "health-reconcile set_status not applied (row removed, unit left the roster, or a command is in flight); skipping"
-                );
             }
         }
     }
@@ -415,25 +426,18 @@ async fn tick_project(
     // fires, if any) lives in `health_engine::evaluate_protocols`.
     // This block just gathers the inputs, calls the pure fn, then
     // dispatches the matched action.
-    let protocols_value = state.broker.health_protocols(project.project_id).await?;
-    let protocols: protocol::HealthProtocols = match protocols_value {
+    let read = state.broker.health_protocols(project.project_id).await?;
+    let protocols: protocol::HealthProtocols = match read.protocols {
         Some(v) => match serde_json::from_value::<protocol::HealthProtocols>(v.clone()) {
             Ok(p) => p,
             Err(e) => {
                 // The user's protocol config is broken (unreadable). Emit a
-                // `protocol_config_error` event so the action bar
-                // shows it, then SKIP this tick's evaluation. The
-                // previous shape fell back to default_protocols,
-                // which silently overrode user intent (an auto-
-                // recover protocol could fire on a project the
-                // user explicitly configured for park-only). Skip
-                // is safer: the next tick re-reads the column and
-                // recovers automatically once the user fixes it.
-                // serde error strings can balloon on deeply nested
-                // protocol shapes (each tried untagged-enum branch
-                // shows up in the message). Bound it before shipping
-                // so a verbose error doesn't blow the 7800-byte
-                // Postgres NOTIFY cap and cause a sibling listener to drop out.
+                // `protocol_config_error` event so the action bar shows it,
+                // then SKIP this look's evaluation rather than fall back to
+                // the defaults, which would override the user's intent; the
+                // next look re-reads the column. serde error strings can
+                // balloon on deeply nested protocol shapes, so the message
+                // is bounded below the 7800-byte Postgres NOTIFY cap.
                 state
                     .broker
                     .event_record(
@@ -452,7 +456,7 @@ async fn tick_project(
                     error = %e,
                     "health_protocols_json malformed; skipping protocol eval until fixed"
                 );
-                return Ok(units_unsettled);
+                return Ok(Look::Settled);
             }
         },
         None => protocol::default_protocols(),
@@ -462,132 +466,137 @@ async fn tick_project(
         project_status: project.status,
         health_parked: project.health_parked,
     };
-
-    // Re-arm what the protocols fired, copy by copy, then snapshot the
-    // per-project in_flight + fired sets under the lock, evaluate
-    // purely, then re-take the lock to mutate. This is safe because
-    // tick_project is the only writer for its own project_id;
-    // concurrent ticks are scoped to other projects.
-    let (in_flight_snap, fired_snap) = {
-        let mut registry = state.health.lock().await;
-        if let Some(fired) = registry.fired.get_mut(&project.project_id) {
-            rearm(fired, &protocols, &inputs);
-            if fired.is_empty() {
-                registry.fired.remove(&project.project_id);
-            }
+    let mut rows: HashMap<String, HealthProtocolState> = read.state.into_iter().map(|s| (s.protocol.clone(), s)).collect();
+    let before = rows.clone();
+    let look = act(state, project, &protocols, &inputs, &mut rows, now).await;
+    if rows != before {
+        let mut protocols: Vec<HealthProtocolState> = rows.into_values().collect();
+        protocols.sort_by(|a, b| a.protocol.cmp(&b.protocol));
+        let req = weft_broker_client::protocol::SupervisorSetHealthStateRequest {
+            replica: state.replica.clone(),
+            project_id: project.project_id,
+            protocols,
+        };
+        if !state.broker.set_health_state(&req).await?.is_applied() {
+            tracing::info!(project_id = %project.project_id, "the project's lease moved; its protocols' state is the new owner's");
         }
-        (
-            registry.in_flight.contains(&project.project_id),
-            registry
-                .fired
-                .get(&project.project_id)
-                .cloned()
-                .unwrap_or_default(),
-        )
-    };
+    }
+    Ok(look)
+}
 
-    let Some(matched) = evaluate_protocols(&protocols, &fired_snap, in_flight_snap, &inputs) else {
-        let backing_off = state.health.lock().await.backoff.keys().any(|(proj, _)| *proj == project.project_id);
-        return Ok(units_unsettled || in_flight_snap || backing_off);
+/// Re-arm what the protocols did against this look, fire the first one
+/// with something to do, and keep how it went in `rows` (the project's
+/// [`HealthProtocolState`]s, which the caller writes back when they
+/// changed).
+async fn act(
+    state: &SupervisorState,
+    project: &weft_broker_client::protocol::SupervisorProject,
+    protocols: &protocol::HealthProtocols,
+    inputs: &ProtocolEvalInputs,
+    rows: &mut HashMap<String, HealthProtocolState>,
+    now: i64,
+) -> Look {
+    // A protocol that gave up tries again once what it looked at changed
+    // (a machine said so), or every unit is healthy; one a person's
+    // command or look touched since comes back from the broker armed
+    // already.
+    let seen = serde_json::to_value(&inputs.units).expect("a unit view serializes");
+    let healthy = all_units_healthy(&inputs.units);
+    for row in rows.values_mut() {
+        if healthy || row.gave_up_seen.as_ref().is_some_and(|s| *s != seen) {
+            *row = HealthProtocolState { acted: row.acted.take(), ..unarmed(&row.protocol) };
+        }
+    }
+    // What the protocols fired, re-armed copy by copy.
+    let mut fired: HashMap<String, BTreeSet<InfraCopy>> =
+        rows.values().filter_map(|r| r.acted.clone().map(|acted| (r.protocol.clone(), acted))).collect();
+    rearm(&mut fired, protocols, inputs);
+    for row in rows.values_mut() {
+        row.acted = fired.remove(&row.protocol);
+    }
+    rows.retain(|_, r| *r != unarmed(&r.protocol));
+
+    let gave_up = |rows: &HashMap<String, HealthProtocolState>| {
+        if rows.values().any(|r| r.gave_up_at_unix.is_some()) {
+            Look::GaveUp
+        } else {
+            Look::Settled
+        }
     };
-    let matched_name = matched.protocol.name.clone();
-    let matched_proto = matched.protocol.clone();
+    let in_flight = state.health.lock().await.in_flight.contains(&project.project_id);
+    let fired: HashMap<String, BTreeSet<InfraCopy>> =
+        rows.values().filter_map(|r| r.acted.clone().map(|acted| (r.protocol.clone(), acted))).collect();
+    let Some(matched) = evaluate_protocols(protocols, &fired, in_flight, inputs) else {
+        return gave_up(rows);
+    };
+    let proto = matched.protocol.clone();
     let scope = matched.scope;
-
-    // Backoff gate + claim, in ONE critical section so the check and
-    // the in_flight/fired insert can't interleave with another tick
-    // (the gate-then-insert window must be atomic). If this protocol's
-    // action recently failed, skip until its backoff window elapses:
-    // the protocol stays un-latched from `fired` (so it WILL retry),
-    // just not on every poll tick.
-    let backoff_key = (project.project_id, matched_name.clone());
-    let acted_before = {
-        let mut registry = state.health.lock().await;
-        if let Some(b) = registry.backoff.get(&backoff_key) {
-            if state.clock.now() < b.next_retry_at {
-                return Ok(true);
-            }
+    // Backing off, or given up: the protocol waits (the broker books its
+    // retry).
+    if let Some(row) = rows.get(&proto.name) {
+        if row.gave_up_at_unix.is_some() || row.next_retry_at_unix.is_some_and(|at| now < at) {
+            return gave_up(rows);
         }
-        registry.in_flight.insert(project.project_id);
-        let fired = registry.fired.entry(project.project_id).or_default();
-        let acted_before = fired.get(&matched_name).cloned();
-        record_fire(fired, &matched_proto, &scope);
-        acted_before
-    };
-    tracing::info!(
-        project_id = %project.project_id,
-        protocol = %matched_name,
-        "HealthProtocol matched; firing action"
-    );
+    }
+    {
+        let mut registry = state.health.lock().await;
+        if !registry.in_flight.insert(project.project_id) {
+            return gave_up(rows);
+        }
+    }
+    tracing::info!(project_id = %project.project_id, protocol = %proto.name, "HealthProtocol matched; firing action");
     // Bound the action by the protocol's timeout (always set:
     // `timeout_seconds` is non-optional with a safe default, so
     // "unbounded" can't be expressed). A hung broker/host call would
-    // otherwise pin `in_flight` forever (the remove below only runs
-    // after the await), wedging this project's health monitoring.
-    // The timeout maps a wedged action to a loud failure so the slot
-    // frees and the protocol un-latches (below).
-    let secs = matched_proto.timeout_seconds;
-    let dur = std::time::Duration::from_secs(secs as u64);
-    let result =
-        match tokio::time::timeout(dur, run_action(state, project, &matched_proto, &scope)).await {
-            Ok(r) => r,
-            Err(_elapsed) => Err(anyhow::anyhow!(
-                "HealthProtocol action timed out after {secs}s (broker/host call hung)"
-            )),
-        };
-    let now = state.clock.now();
-    {
-        let mut registry = state.health.lock().await;
-        registry.in_flight.remove(&project.project_id);
-        if result.is_err() {
-            // On failure (incl. timeout), un-latch the protocol from
-            // `fired` so it retries. `fired` suppresses re-firing a
-            // SUCCESSFUL action until the project re-arms (goes fully
-            // healthy); a failed action never took effect, so leaving
-            // it latched would wedge the project (e.g. an AutoRecover
-            // that fails would never retry, and "all nodes healthy"
-            // can never become true because recovery is what makes it
-            // true). The in_flight guard already prevents storms
-            // DURING the run, so only success latches.
-            // Back to what it had acted on before this attempt.
-            if let Some(fired) = registry.fired.get_mut(&project.project_id) {
-                match acted_before {
-                    Some(acted) => {
-                        fired.insert(matched_name.clone(), acted);
-                    }
-                    None => {
-                        fired.remove(&matched_name);
-                    }
+    // otherwise pin `in_flight` forever, wedging this project's health
+    // monitoring; the timeout maps it to a loud failure.
+    let secs = proto.timeout_seconds;
+    let result = match tokio::time::timeout(Duration::from_secs(secs as u64), run_action(state, project, &proto, &scope)).await {
+        Ok(r) => r,
+        Err(_elapsed) => Err(anyhow::anyhow!("HealthProtocol action timed out after {secs}s (broker/host call hung)")),
+    };
+    state.health.lock().await.in_flight.remove(&project.project_id);
+    let row = rows.entry(proto.name.clone()).or_insert_with(|| unarmed(&proto.name));
+    match result {
+        Ok(()) => {
+            // Only a success latches: a failed action never took effect.
+            let mut acted = HashMap::from([(proto.name.clone(), row.acted.take().unwrap_or_default())]);
+            record_fire(&mut acted, &proto, &scope);
+            *row = HealthProtocolState { acted: acted.remove(&proto.name), ..unarmed(&proto.name) };
+        }
+        Err(e) => {
+            let error = format!("{e:#}");
+            row.consecutive_failures += 1;
+            row.last_error = Some(error.clone());
+            match weft_broker_client::protocol::supervisor_retry_after(row.consecutive_failures) {
+                None => {
+                    row.next_retry_at_unix = None;
+                    row.gave_up_at_unix = Some(now);
+                    row.gave_up_seen = Some(seen);
+                    crate::give_up(state, project.project_id, &format!("its health protocol '{}' failed {} times: {error}", proto.name, row.consecutive_failures)).await;
                 }
-                if fired.is_empty() {
-                    registry.fired.remove(&project.project_id);
+                Some(delay) => {
+                    let delay = delay.as_secs() as i64;
+                    row.next_retry_at_unix = Some(now + delay);
+                    tracing::warn!(project_id = %project.project_id, protocol = %proto.name, %error, retry_in_secs = delay, "HealthProtocol action failed; it tries again");
                 }
             }
-            // Bump exponential backoff so the un-latched protocol
-            // doesn't re-fire every poll tick (~5s) while infra stays
-            // broken. Grows the retry delay 5s→10s→...→cap 300s.
-            let entry = registry.backoff.entry(backoff_key.clone()).or_insert(BackoffState {
-                consecutive_failures: 0,
-                next_retry_at: now,
-            });
-            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-            entry.next_retry_at = now + backoff_delay(entry.consecutive_failures);
-        } else {
-            // Success: clear any backoff so the next degradation
-            // fires immediately.
-            registry.backoff.remove(&backoff_key);
         }
     }
-    if let Err(e) = result {
-        tracing::warn!(
-            project_id = %project.project_id,
-            protocol = %matched_name,
-            error = %e,
-            "HealthProtocol action failed; un-latched from fired set to retry next tick"
-        );
+    gave_up(rows)
+}
+
+/// A protocol's state with nothing fired and nothing failed.
+fn unarmed(protocol: &str) -> HealthProtocolState {
+    HealthProtocolState {
+        protocol: protocol.to_string(),
+        acted: None,
+        consecutive_failures: 0,
+        next_retry_at_unix: None,
+        gave_up_at_unix: None,
+        gave_up_seen: None,
+        last_error: None,
     }
-    // An action just ran: what it changed is looked at next.
-    Ok(true)
 }
 
 /// What `plan_action` decided. The I/O wrapper turns each variant
@@ -803,6 +812,61 @@ mod tests {
     use super::*;
     use crate::protocol::{HealthCondition, HealthProtocol, ProtocolAction};
     use weft_broker_client::protocol::{InfraCopy, SupervisorInfraNode};
+
+    /// A project is reported once per sync with each step's latest error:
+    /// failed when any step failed (tried again), given up when only a
+    /// protocol gave up. A report that did not go through is reported
+    /// again, but never over what happened since: a newer error of a
+    /// step, a look that settled the project, or a trouble that keeps a
+    /// project it reported settled from being settled.
+    #[test]
+    fn a_report_carries_each_project_once_and_what_happened_since_wins() {
+        let (a, b, c, d) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3), Uuid::from_u128(4));
+        let mut registry = HealthRegistry::default();
+        registry.troubled(a, Step::Protocol, "the protocol gave up");
+        registry.troubled(a, Step::Sweep, "the sweep failed");
+        registry.troubled(b, Step::Protocol, "the protocol gave up");
+        registry.settled.extend([c, d]);
+        let report = registry.take_report();
+        let trouble = |project, error: &str| ProjectTrouble { project_id: project, error: error.into() };
+        assert_eq!(report.failed(), vec![trouble(a, "the sweep failed; the protocol gave up")]);
+        assert_eq!(report.gave_up(), vec![trouble(b, "the protocol gave up")]);
+        assert_eq!(report.settled, vec![c, d]);
+
+        registry.troubled(a, Step::Sweep, "the sweep failed again");
+        registry.settled.insert(b);
+        // `d` fails, and its look clears what it failed since that look
+        // without settling it: its trouble is still to be reported.
+        registry.troubled(d, Step::Sweep, "the sweep failed");
+        registry.troubled.clear();
+        registry.report_again(report);
+        let again = registry.take_report();
+        assert_eq!(
+            again.failed(),
+            vec![trouble(a, "the sweep failed again; the protocol gave up"), trouble(d, "the sweep failed")],
+            "the newer error stands"
+        );
+        assert!(again.gave_up().is_empty(), "a project settled since is not reported given up");
+        assert_eq!(again.settled, vec![b, c], "a project troubled since is not reported settled");
+    }
+
+    /// A command's ending that a rerun wrote clears only that trouble: the
+    /// project's look settles it when nothing else failed, and the other
+    /// steps' errors stay reported.
+    #[test]
+    fn a_written_ending_clears_only_its_own_trouble() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut registry = HealthRegistry::default();
+        registry.troubled(a, Step::End(7), "its command 7 ran, and how it ended could not be written");
+        registry.troubled(b, Step::End(8), "its command 8 ran, and how it ended could not be written");
+        registry.troubled(b, Step::Sweep, "the sweep failed");
+        registry.untroubled(a, Step::End(7));
+        registry.untroubled(b, Step::End(8));
+        assert!(!registry.troubled.contains_key(&a), "the look of `a` may settle it");
+        assert!(registry.troubled.contains_key(&b), "`b` still failed its sweep");
+        let report = registry.take_report();
+        assert_eq!(report.failed(), vec![ProjectTrouble { project_id: b, error: "the sweep failed".into() }]);
+    }
 
     fn proto(action: ProtocolAction) -> HealthProtocol {
         HealthProtocol {

@@ -41,7 +41,7 @@ use weft_core::exec::ready::{
 };
 use weft_core::exec::skip::SkipReason;
 use weft_core::exec::{
-    latest_firing, latest_firing_mut, next_firing_ordinal, NodeExecution, NodeExecutionStatus,
+    firing_at, firing_at_mut, NodeExecution, NodeExecutionStatus,
 };
 use weft_core::frames::{FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{
@@ -494,24 +494,18 @@ impl Fold {
                 if self.node_def(node_id, ev).is_none() {
                     return effects;
                 }
-                // Live dispatch opens a new record per firing whenever
-                // no non-terminal one exists (it ships NodeResumed,
-                // never a second NodeStarted, to continue a
-                // non-terminal record). So a NodeStarted whose latest
-                // same-key record is TERMINAL is a legitimate second
-                // firing (a streaming/bus node fired its consumer
-                // twice), and one whose latest record is still open is
-                // a row the writer could not have produced: corruption,
-                // skipped whole (absorbing its pulses into no record
-                // would strand them for the resume-time un-absorb).
-                let has_non_terminal = self
-                    .latest_record(node_id, frames)
-                    .map(|e| !e.status.is_terminal())
-                    .unwrap_or(false);
-                if has_non_terminal {
+                // One execution fires a node once per frames: the live
+                // dispatch opens a record with NodeStarted and continues
+                // it with NodeResumed, never a second NodeStarted. So one
+                // over any record already here (open, or ended) is a row
+                // the writer could not have produced: corruption, skipped
+                // whole (absorbing its pulses into no record would strand
+                // them for the resume-time un-absorb).
+                if let Some(record) = self.record_at(node_id, frames) {
+                    let what = if record.status.is_terminal() { "already ended" } else { "already open" };
                     self.report(
                         CorruptionSite::NodeLifecycle,
-                        format!("{}: a firing is already open at these frames", describe(ev)),
+                        format!("{}: a firing is {what} at these frames, and a node fires once per frames", describe(ev)),
                     );
                     return effects;
                 }
@@ -520,7 +514,6 @@ impl Fold {
                 if let Some(k) = self.snap.kicked.get_mut(&FiringLocation::new(node_id.clone(), frames.clone())) {
                     k.dispatched = true;
                 }
-                let ordinal = next_firing_ordinal(&self.snap.executions, node_id, execution_id, frames);
                 {
                     self.snap.executions.entry(node_id.clone()).or_default().push(NodeExecution {
                         id: Uuid::new_v4(),
@@ -529,8 +522,8 @@ impl Fold {
                         node_id: node_id.clone(),
                         status: NodeExecutionStatus::Running,
                         pulses_absorbed: absorbed,
-                        ordinal,
                         error: None,
+                        gave_up_wait: false,
                         callback_id: None,
                         started_at: *at_unix,
                         completed_at: None,
@@ -593,16 +586,16 @@ impl Fold {
                 }
             }
             ExecEvent::NodeCompleted { node_id, frames, at_unix, .. } => {
-                self.terminate(node_id, frames, NodeExecutionStatus::Completed, None, None, *at_unix, ev, &mut effects);
+                self.terminate(node_id, frames, NodeExecutionStatus::Completed, None, None, false, *at_unix, ev, &mut effects);
             }
-            ExecEvent::NodeFailed { node_id, frames, error, at_unix, .. } => {
-                self.terminate(node_id, frames, NodeExecutionStatus::Failed, Some(error), None, *at_unix, ev, &mut effects);
+            ExecEvent::NodeFailed { node_id, frames, error, gave_up_wait, at_unix, .. } => {
+                self.terminate(node_id, frames, NodeExecutionStatus::Failed, Some(error), None, *gave_up_wait, *at_unix, ev, &mut effects);
             }
             ExecEvent::NodeSkipped { node_id, frames, reason, at_unix, .. } => {
-                self.terminate(node_id, frames, NodeExecutionStatus::Skipped, None, Some(reason), *at_unix, ev, &mut effects);
+                self.terminate(node_id, frames, NodeExecutionStatus::Skipped, None, Some(reason), false, *at_unix, ev, &mut effects);
             }
             ExecEvent::NodeCancelled { node_id, frames, reason, at_unix, .. } => {
-                self.terminate(node_id, frames, NodeExecutionStatus::Cancelled, Some(reason), None, *at_unix, ev, &mut effects);
+                self.terminate(node_id, frames, NodeExecutionStatus::Cancelled, Some(reason), None, false, *at_unix, ev, &mut effects);
             }
             ExecEvent::LoopInstantiated { group_id, parent_frames, .. } => {
                 let loop_in_id = boundary_in_id(group_id);
@@ -823,7 +816,7 @@ impl Fold {
             // in the event's own row.
             ExecEvent::CostReported { node_id, frames, amount_usd, .. } => {
                 if let Some(amount) = amount_usd {
-                    if let Some(e) = self.latest_record_mut(node_id, frames) {
+                    if let Some(e) = self.record_at_mut(node_id, frames) {
                         e.cost_usd += amount;
                     }
                 }
@@ -833,8 +826,10 @@ impl Fold {
             // straight from the row stream by the inspector, not from the
             // snapshot. Caller events are additionally non-durable by
             // design (a live connection dies with its worker), so they
-            // never contribute to a resumed run's state.
-            ExecEvent::LogLine { .. }
+            // never contribute to a resumed run's state. A charge's
+            // opening is read by [`ChargeBook`], which the drive reads.
+            ExecEvent::ChargeOpened { .. }
+            | ExecEvent::LogLine { .. }
             | ExecEvent::FileEdited { .. }
             | ExecEvent::TriggerCaptured { .. }
             | ExecEvent::ExecutionTagged { .. }
@@ -855,7 +850,7 @@ impl Fold {
 
     // ----- Display accessors ------------------------------------------
 
-    /// What the latest firing at `(node, frames)` received: the bag
+    /// What the firing at `(node, frames)` received: the bag
     /// its body read and the wired ports that arrived closed, rebuilt
     /// from the pulses the record absorbed (or, for a kicked entry
     /// node, from its kick). `None` when no firing sits there.
@@ -870,20 +865,22 @@ impl Fold {
         })
     }
 
-    /// What the latest firing at `(node, frames)` handed out, merged
+    /// What the firing at `(node, frames)` handed out, merged
     /// across its emissions (later wins per port). `None` for a firing
     /// that emitted nothing, or none there.
     pub fn output_of(&self, node_id: &str, frames: &LoopFrames) -> Option<Value> {
-        let record = self.latest_record(node_id, frames)?;
-        self.record_output(record)
+        let bag = self.firing_output(node_id, frames)?;
+        (!bag.is_empty()).then(|| Value::Object(owned_bag(bag)))
     }
 
-    pub fn record_output(&self, record: &NodeExecution) -> Option<Value> {
-        let bag = self.outputs.get(&record.id)?;
-        if bag.is_empty() {
-            return None;
-        }
-        Some(Value::Object(owned_bag(bag)))
+    /// The values the firing at `(node, frames)` handed out, one per
+    /// port (a generator port's last item); `None` for a firing that
+    /// emitted nothing, or none there. What a body resumed after a
+    /// pause reads its earlier emissions from. By place, never by a
+    /// record id: the worker's own record of a firing carries an id of
+    /// its own.
+    pub fn firing_output(&self, node_id: &str, frames: &LoopFrames) -> Option<&OutputBag> {
+        self.outputs.get(&self.record_at(node_id, frames)?.id)
     }
 
     /// The run's outputs: per node, what its last completed firing
@@ -940,7 +937,7 @@ impl Fold {
     }
 
     fn firing_view_of(&self, node_id: &str, frames: &LoopFrames) -> Option<weft_core::exec::ready::FiringInput> {
-        self.latest_record(node_id, frames).map(|record| record.received.clone())
+        self.record_at(node_id, frames).map(|record| record.received.clone())
     }
 
     fn receiving(&self, node_id: &str, frames: &LoopFrames) -> weft_core::exec::ready::FiringInput {
@@ -982,7 +979,7 @@ impl Fold {
                 if let Some(record) = self.snap.executions.get(&dispatch.node_id)
                     .and_then(|records| records.iter().find(|record| record.id == *record_id))
                 {
-                    let id = boundary_emission(&dispatch.node_id, &dispatch.frames, record.ordinal);
+                    let id = boundary_emission(&dispatch.node_id, &dispatch.frames);
                     let provided_ports = record.received.provided_ports.clone();
                     let closed_failures = record.received.closed_failures.clone();
                     let skipped = record.status == NodeExecutionStatus::Skipped;
@@ -1138,7 +1135,8 @@ impl Fold {
     /// member into a skip. A loop boundary otherwise closes nothing on
     /// its own: a failing one whose instance never existed closes the
     /// loop's outward surface here; every other loop teardown rode a
-    /// `LoopTerminated` row.
+    /// `LoopTerminated` row. `gave_up_wait` is a failure's
+    /// (`NodeExecution::gave_up_wait`).
     #[allow(clippy::too_many_arguments)]
     fn terminate(
         &mut self,
@@ -1147,6 +1145,7 @@ impl Fold {
         status: NodeExecutionStatus,
         error: Option<&str>,
         skip_reason: Option<&SkipReason>,
+        gave_up_wait: bool,
         at_unix: u64,
         ev: &ExecEvent,
         effects: &mut FoldEffects,
@@ -1160,7 +1159,9 @@ impl Fold {
         // consumption: whatever was left pending for its feeds (a
         // stream's items) goes with it. A body that ran and ended
         // skipped (a person skipped what it waited for) ends like one that
-        // completed: what arrived meanwhile stays for the next firing.
+        // completed: it took its inputs when it started, and a stream
+        // item reaching it after its end is dropped by the routing, as
+        // for any ended consumer.
         if status == NodeExecutionStatus::Skipped && skip_reason != Some(&SkipReason::WaitSkipped) {
             let more = self.absorb_pending(node_id, frames, true);
             if let Some(e) = self.record_mut(node_id, record_id) {
@@ -1172,13 +1173,13 @@ impl Fold {
             }
         }
         let e = self.record_mut(node_id, record_id).expect("`firing_record_id` found this record and nothing removes records");
-        let ordinal = e.ordinal;
         e.status = status.clone();
         e.skip_reason = skip_reason.cloned();
         e.completed_at = Some(at_unix);
         if let Some(err) = error {
             e.error = Some(err.to_string());
         }
+        e.gave_up_wait = gave_up_wait;
         e.callback_id = None;
         let is_loop_boundary = matches!(def.node_type.as_str(), "LoopIn" | "LoopOut");
         let in_scope = def
@@ -1186,7 +1187,7 @@ impl Fold {
             .as_ref()
             .filter(|gb| gb.role == GroupBoundaryRole::In)
             .map(|gb| gb.group_id.clone());
-        let emission_id = terminal_sweep_emission(node_id, frames, ordinal);
+        let emission_id = terminal_sweep_emission(node_id, frames);
         match (&status, skip_reason) {
             (NodeExecutionStatus::Skipped, Some(reason)) if in_scope.is_some() => {
                 let group_id = in_scope.expect("checked");
@@ -1257,7 +1258,7 @@ impl Fold {
         }
     }
 
-    /// The id of the latest record at `(node, frames)`, or a
+    /// The id of the record at `(node, frames)`, or a
     /// corruption at `site` when there is none (a row about a firing
     /// the journal never opened), or when the node is a group boundary
     /// (see `node_def`).
@@ -1266,7 +1267,7 @@ impl Fold {
             self.report(site, format!("{}: '{node_id}' is a group boundary, which never journals a row", describe(ev)));
             return None;
         }
-        match self.latest_record(node_id, frames).map(|e| e.id) {
+        match self.record_at(node_id, frames).map(|e| e.id) {
             Some(id) => Some(id),
             None => {
                 self.report(site, format!("{}: no firing of '{node_id}' at these frames", describe(ev)));
@@ -1302,13 +1303,13 @@ impl Fold {
     }
 
     /// The record a row about `(node, frames)` is about: the same
-    /// `latest_firing` the live engine ends and sweeps by.
-    fn latest_record(&self, node_id: &str, frames: &LoopFrames) -> Option<&NodeExecution> {
-        latest_firing(&self.snap.executions, node_id, self.snap.execution_id, frames)
+    /// `firing_at` the live engine ends and sweeps by.
+    fn record_at(&self, node_id: &str, frames: &LoopFrames) -> Option<&NodeExecution> {
+        firing_at(&self.snap.executions, node_id, self.snap.execution_id, frames)
     }
 
-    fn latest_record_mut(&mut self, node_id: &str, frames: &LoopFrames) -> Option<&mut NodeExecution> {
-        latest_firing_mut(&mut self.snap.executions, node_id, self.snap.execution_id, frames)
+    fn record_at_mut(&mut self, node_id: &str, frames: &LoopFrames) -> Option<&mut NodeExecution> {
+        firing_at_mut(&mut self.snap.executions, node_id, self.snap.execution_id, frames)
     }
 
     /// The record `firing_record_id` named, by id within its node's
@@ -1433,6 +1434,119 @@ pub struct FiringView {
     pub provided_ports: Vec<String>,
     pub backup_ports: Vec<String>,
     pub inherited_ports: std::collections::BTreeMap<String, ExecutionId>,
+}
+
+/// The charges a run opened (`ExecEvent::ChargeOpened`) that no cost on
+/// its record closed yet: what a drive picking the run up again holds
+/// open, so the read that states their amount prices them, and what a run
+/// ending for good books as unknown. Keyed as the worker keeps them
+/// (`weft_engine::metering`): by service and the provider's id.
+///
+/// Kept apart from [`Fold`]: it needs no program. A drive reads it before
+/// anything else of the run; whoever ends a run with no drive (a cancel,
+/// a worker's give-up) reads it to close what is left
+/// ([`unpriced_charges_closed`]).
+#[derive(Debug, Default)]
+pub struct ChargeBook {
+    open: BTreeMap<(String, String), OpenedCharge>,
+}
+
+/// One charge still open, as its `ChargeOpened` wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenedCharge {
+    pub node_id: String,
+    pub frames: LoopFrames,
+    pub service: String,
+    /// The id the provider gave the charge.
+    pub charge: String,
+    pub scratch: Value,
+    pub origin: weft_core::CredentialOwner,
+}
+
+impl ChargeBook {
+    /// The charges `events`, a run's record in order, leave open.
+    pub fn of_record<'a>(events: impl IntoIterator<Item = &'a ExecEvent>) -> Self {
+        let mut book = Self::default();
+        for event in events {
+            book.apply(event);
+        }
+        book
+    }
+
+    /// Apply one row: an opening adds its charge, a cost naming a charge
+    /// closes it, every other row leaves the book as it is.
+    pub fn apply(&mut self, ev: &ExecEvent) {
+        match ev {
+            ExecEvent::ChargeOpened { node_id, frames, service, charge, scratch, origin, .. } => {
+                self.open.insert((service.clone(), charge.clone()), OpenedCharge {
+                    node_id: node_id.clone(),
+                    frames: frames.clone(),
+                    service: service.clone(),
+                    charge: charge.clone(),
+                    scratch: scratch.clone(),
+                    origin: origin.clone(),
+                });
+            }
+            ExecEvent::CostReported { service, charge: Some(charge), .. } => {
+                self.open.remove(&(service.clone(), charge.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    /// The charges still open, in a stable order.
+    pub fn into_open(self) -> impl Iterator<Item = OpenedCharge> {
+        self.open.into_values()
+    }
+}
+
+/// What a run ending with no drive to price them writes before its ending:
+/// one unknown `CostReported` per charge `events` (the run's whole record,
+/// in order) leaves open, closing it, booked where its `ChargeOpened` was
+/// (node, iteration, service, whose key). `why` says how the run ended.
+/// Every writer of such an ending (the dispatcher's cancel of a run nobody
+/// drives, the broker's give-up of a run whose worker could not write its
+/// record) goes through here, so no spend ends neither priced nor unknown.
+pub fn unpriced_charges_closed(execution_id: ExecutionId, events: &[ExecEvent], why: &str, at_unix: u64) -> Vec<ExecEvent> {
+    ChargeBook::of_record(events)
+        .into_open()
+        .map(|charge| {
+            let (model, metadata) = unpriced_cost(charge.scratch, why);
+            ExecEvent::CostReported {
+                execution_id,
+                node_id: charge.node_id,
+                frames: charge.frames,
+                cost_id: Uuid::now_v7().to_string(),
+                service: charge.service,
+                model,
+                amount_usd: None,
+                billed: false,
+                origin: charge.origin,
+                metadata,
+                charge: Some(charge.charge),
+                at_unix,
+            }
+        })
+        .collect()
+}
+
+/// The model and metadata an open charge is booked unknown with: the
+/// meter's state for it (`scratch`), its resolution naming `why` nothing
+/// priced it. The one wording, whether the worker that held the charge
+/// books it or the run ended with no drive ([`unpriced_charges_closed`]).
+pub fn unpriced_cost(scratch: Value, why: &str) -> (Option<String>, Value) {
+    // `scratch` is meter-owned and a meter may replace it wholesale, so
+    // it is not guaranteed to be an object. Indexing a non-object `Value`
+    // panics, and the worker reaches this from a destructor that can run
+    // during an unwind, where a panic aborts the process. Keep whatever
+    // the meter left, under a key, rather than trusting its shape.
+    let mut metadata = match scratch {
+        object @ Value::Object(_) => object,
+        other => serde_json::json!({ "meterState": other }),
+    };
+    metadata["resolution"] = serde_json::json!(format!("the call spent, and no response ever stated what it cost ({why})"));
+    let model = metadata["model"].as_str().map(str::to_string);
+    (model, metadata)
 }
 
 /// Fold a whole log at once.
@@ -2047,7 +2161,7 @@ mod tests {
         let mut fold = Fold::new(execution_id(), fan_out_project()).with_output_history();
         for event in [
             started_execution(), kicked("src"), started("src", vec![], 0),
-            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), gave_up_wait: false, at_unix: 1 },
             started("a", vec![], 2),
             ExecEvent::NodeSkipped {
                 execution_id: execution_id(), node_id: "a".into(), frames: vec![],
@@ -2061,6 +2175,27 @@ mod tests {
         assert_eq!(a_out.failure.as_ref(), Some(&down), "the skip passes the failure on, in the history too");
     }
 
+    /// Whether a failure gave up a wait rides its `NodeFailed` row, so the
+    /// record a refold builds on any worker says it; a row written before
+    /// the fact existed reads as a failure that gave up nothing.
+    #[test]
+    fn a_failure_that_gave_up_a_wait_says_so_after_a_refold() {
+        let failed = |gave_up_wait| ExecEvent::NodeFailed {
+            execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "gave up its wait".into(), gave_up_wait, at_unix: 1,
+        };
+        for gave_up_wait in [true, false] {
+            let row = serde_json::to_value(failed(gave_up_wait)).unwrap();
+            assert_eq!(row.get("gave_up_wait").is_some(), gave_up_wait, "only a wait given up is written: {row}");
+            let back: ExecEvent = serde_json::from_value(row).unwrap();
+            let events = [started_execution(), kicked("src"), started("src", vec![], 0), back];
+            let snap = fold_to_snapshot(execution_id(), fan_out_project(), &events);
+            assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+            let record = &snap.executions["src"][0];
+            assert_eq!(record.status, NodeExecutionStatus::Failed);
+            assert_eq!(record.gave_up_wait, gave_up_wait);
+        }
+    }
+
     /// A scope gated off by a gate that closed on a failure closes
     /// outward with it, and the history remembers the Out's ports so.
     #[test]
@@ -2068,7 +2203,7 @@ mod tests {
         let mut fold = Fold::new(execution_id(), nested_group_project()).with_output_history();
         for event in [
             started_execution(), kicked("src"), started("src", vec![], 0),
-            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), gave_up_wait: false, at_unix: 1 },
         ] { assert!(!fold.apply(&event).rejected()); }
         let snap = fold.snapshot();
         assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Skipped);
@@ -2119,7 +2254,7 @@ mod tests {
         let mut fold = Fold::new(execution_id(), nested_group_project()).with_output_history();
         for event in [
             started_execution(), kicked("src"), started("src", vec![], 0),
-            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "src".into(), frames: vec![], error: "the database is down".into(), gave_up_wait: false, at_unix: 1 },
         ] { assert!(!fold.apply(&event).rejected()); }
         let snap = fold.snapshot();
         assert_eq!(snap.executions["h__in"][0].status, NodeExecutionStatus::Skipped);
@@ -2419,6 +2554,7 @@ mod tests {
             node_id: "lp__in".into(),
             frames: vec![],
             error: "boom".into(),
+            gave_up_wait: false,
             at_unix: 9,
         });
         let snap = fold_to_snapshot(execution_id(), loop_project(false), &events);
@@ -2439,6 +2575,7 @@ mod tests {
                 node_id: "lp__in".into(),
                 frames: vec![],
                 error: "config".into(),
+                gave_up_wait: false,
                 at_unix: 1,
             },
         ];
@@ -2566,21 +2703,27 @@ mod tests {
         assert_eq!(snap.executions["a"][0].status, NodeExecutionStatus::Running);
     }
 
-    /// A second firing at a terminal location opens a second record;
-    /// its sweep closes a second time with its own pulse ids.
+    /// A node fires once per frames: a second `NodeStarted` where the
+    /// firing already ended is corruption, opens nothing, and sweeps no
+    /// second closure downstream.
     #[test]
-    fn node_started_after_terminal_opens_new_record_and_sweeps_apart() {
+    fn node_started_after_terminal_is_corruption() {
         let events = vec![
             started("src", vec![], 0),
             completed("src", vec![], 1),
             started("a", vec![], 2),
             completed("a", vec![], 3),
-            started("a", vec![], 4),
-            completed("a", vec![], 5),
+            started("src", vec![], 4),
+            completed("src", vec![], 5),
         ];
         let snap = fold_to_snapshot(execution_id(), fan_out_project(), &events);
-        assert_eq!(snap.executions["a"].len(), 2);
-        assert!(snap.executions["a"].iter().all(|e| e.status == NodeExecutionStatus::Completed));
+        let sites: Vec<CorruptionSite> = snap.corruptions.iter().map(|c| c.site).collect();
+        assert_eq!(sites, vec![CorruptionSite::NodeLifecycle], "{:?}", snap.corruptions);
+        assert!(snap.corruptions[0].reason.contains("already ended"), "{:?}", snap.corruptions[0]);
+        assert_eq!(snap.executions["src"].len(), 1, "the second start opened nothing");
+        assert_eq!(snap.executions["src"][0].status, NodeExecutionStatus::Completed);
+        assert_eq!(snap.pulses["a"].len(), 1, "one closure, from the one firing");
+        assert_eq!(snap.pulses["a"][0].status, PulseStatus::Absorbed);
     }
 
     /// A stream take removes the pulse from the table (no tombstone),
@@ -2809,36 +2952,6 @@ mod tests {
         assert!(!snap.pulses.contains_key("h__in"), "nothing forwarded");
     }
 
-    /// Two firings at one location sweep under different emission ids,
-    /// so once the consumer took the first closure, the second firing's
-    /// closure is a second pulse and not a replay of the first.
-    #[test]
-    fn a_second_firing_sweeps_a_second_closure() {
-        let skipped = |node: &str, at: u64| ExecEvent::NodeSkipped {
-            execution_id: execution_id(),
-            node_id: node.into(),
-            frames: vec![],
-            reason: SkipReason::RequiredInputClosed { port: "in".into(), failure: None },
-            at_unix: at,
-        };
-        let events = vec![
-            started("src", vec![], 0),
-            completed("src", vec![], 1),
-            started("a", vec![], 2),
-            skipped("a", 2),
-            started("src", vec![], 3),
-            completed("src", vec![], 4),
-        ];
-        let snap = fold_to_snapshot(execution_id(), fan_out_project(), &events);
-        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        assert_eq!(snap.executions["src"].iter().map(|e| e.ordinal).collect::<Vec<_>>(), vec![0, 1]);
-        let closures: Vec<&weft_core::pulse::Pulse> = snap.pulses["a"].iter().filter(|p| p.closed).collect();
-        assert_eq!(closures.len(), 2, "one closure per firing");
-        assert_ne!(closures[0].id, closures[1].id);
-        assert_eq!(closures[0].status, PulseStatus::Absorbed);
-        assert_eq!(closures[1].status, PulseStatus::Pending, "the second firing closes `a` again");
-    }
-
     #[test]
     fn inherited_input_keeps_its_original_backup_and_only_supplies_the_child_frontier() {
         let project = project(
@@ -2952,5 +3065,100 @@ mod tests {
         assert_eq!(view.input, json!({ "in": 1, "also": 2 }));
         assert!(view.closed_ports.is_empty());
         assert_eq!(fold.final_outputs(), json!({ "src": { "out": 1, "other": 2 } }));
+    }
+
+    fn charge_opened(service: &str, charge: &str, node: &str) -> ExecEvent {
+        ExecEvent::ChargeOpened {
+            execution_id: execution_id(),
+            node_id: node.into(),
+            frames: vec![frame(1)],
+            service: service.into(),
+            charge: charge.into(),
+            scratch: json!({ "route": "jobs" }),
+            origin: weft_core::CredentialOwner::Author,
+            at_unix: 1,
+        }
+    }
+
+    fn cost(service: &str, charge: Option<&str>) -> ExecEvent {
+        ExecEvent::CostReported {
+            execution_id: execution_id(),
+            node_id: "n".into(),
+            frames: vec![],
+            cost_id: Uuid::now_v7().to_string(),
+            service: service.into(),
+            model: None,
+            amount_usd: Some(1.0),
+            billed: false,
+            origin: weft_core::CredentialOwner::Author,
+            metadata: json!({}),
+            charge: charge.map(str::to_string),
+            at_unix: 2,
+        }
+    }
+
+    /// A charge is open from its opening until a cost names it: a cost
+    /// priced on its own response closes nothing, the same id under
+    /// another service is another charge, and what stays open keeps the
+    /// node, iteration and meter state it was opened with.
+    #[test]
+    fn the_charge_book_holds_what_was_opened_and_not_yet_closed() {
+        let record = vec![
+            started_execution(),
+            charge_opened("jobs", "job-1", "dub"),
+            charge_opened("jobs", "job-2", "dub"),
+            charge_opened("other", "job-1", "voice"),
+            cost("jobs", None),
+            cost("jobs", Some("job-1")),
+        ];
+        let open: Vec<_> = ChargeBook::of_record(&record).into_open().collect();
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert_eq!((open[0].service.as_str(), open[0].charge.as_str()), ("jobs", "job-2"));
+        assert_eq!(open[1], OpenedCharge {
+            node_id: "voice".into(),
+            frames: vec![frame(1)],
+            service: "other".into(),
+            charge: "job-1".into(),
+            scratch: json!({ "route": "jobs" }),
+            origin: weft_core::CredentialOwner::Author,
+        });
+
+        let closed = [record, vec![cost("jobs", Some("job-2")), cost("other", Some("job-1"))]].concat();
+        assert_eq!(ChargeBook::of_record(&closed).into_open().count(), 0, "every charge was closed");
+    }
+
+    /// A run ending with no drive closes each charge its record leaves
+    /// open with one unknown cost, booked where the charge was opened and
+    /// naming why; a charge already priced gets nothing, and the record
+    /// then holds no open charge.
+    #[test]
+    fn a_run_ending_with_no_drive_books_its_open_charges_unknown() {
+        let mut opened_with_model = charge_opened("jobs", "job-2", "dub");
+        if let ExecEvent::ChargeOpened { scratch, .. } = &mut opened_with_model {
+            *scratch = json!({ "model": "eleven" });
+        }
+        let mut opened_bare = charge_opened("other", "job-3", "voice");
+        if let ExecEvent::ChargeOpened { scratch, .. } = &mut opened_bare {
+            *scratch = json!("pending");
+        }
+        let record = vec![started_execution(), charge_opened("jobs", "job-1", "dub"), opened_with_model, opened_bare, cost("jobs", Some("job-1"))];
+        let closing = unpriced_charges_closed(execution_id(), &record, "the run was cancelled", 7);
+        assert_eq!(closing.len(), 2, "{closing:?}");
+        let ExecEvent::CostReported { node_id, frames, service, model, amount_usd, origin, metadata, charge, at_unix, .. } = &closing[0] else {
+            panic!("a cost: {:?}", closing[0]);
+        };
+        assert_eq!((node_id.as_str(), service.as_str(), charge.as_deref()), ("dub", "jobs", Some("job-2")));
+        assert_eq!((frames, model.as_deref(), *amount_usd, origin, *at_unix), (&vec![frame(1)], Some("eleven"), None, &weft_core::CredentialOwner::Author, 7));
+        assert_eq!(
+            metadata["resolution"],
+            json!("the call spent, and no response ever stated what it cost (the run was cancelled)")
+        );
+        let ExecEvent::CostReported { metadata, model, charge, .. } = &closing[1] else { panic!("a cost: {:?}", closing[1]) };
+        assert_eq!((charge.as_deref(), model), (Some("job-3"), &None));
+        assert_eq!(metadata["meterState"], json!("pending"), "a meter state that is not an object is kept under a key");
+
+        let ended = [record, closing].concat();
+        assert_eq!(ChargeBook::of_record(&ended).into_open().count(), 0, "every charge is closed");
+        assert!(unpriced_charges_closed(execution_id(), &ended, "again", 8).is_empty());
     }
 }

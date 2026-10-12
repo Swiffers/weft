@@ -85,14 +85,24 @@ about 400 hours awake. The database sleeps 5 minutes after the last thing that
 used it, and an idle install wakes nothing: weft books a wake-up only for a
 moment something is actually due (a hibernation ending, a queued event's
 retry), and its services hold no busy connection to the database once quiet.
-Infrastructure that runs fine keeps nothing awake either, because a machine
-reports only when its state changes.
+The database stays asleep through a run waiting on a person or on a caller
+who says nothing (though the worker holding that caller stays up), through
+a hibernation window, and while infrastructure runs fine (a machine reports
+only when its state changes). It also stays asleep while a trigger keeps a
+connection open: its holder hears changes over Pub/Sub and proves
+it is alive with a Cloud Tasks check every 60 seconds, none of which
+touches the database. The holder still costs its Cloud Run worker pool
+while it runs, and the database wakes when an event arrives on
+that connection, or when the connection drops or comes back.
 
-Two things do keep it awake. A trigger that keeps a connection open keeps it
-awake around the clock, because its holder checks in through weft every 10
-seconds; on the free plan that uses up the month's hours, and when they run
-out the database stops until the next month or a paid plan, and the install
-stops with it. A VS Code editor pointed at the install keeps it awake while
-the person uses it; once the window has been out of focus or untouched for 5
-minutes, the editor stops its live connection so the install can sleep, and
-picks back up when they return.
+What wakes it is something happening: a run doing work (its worker reports
+every second), a timer or schedule the user programmed coming due, a
+poll that finds something new (a poll that finds nothing touches no
+database at all), an outside event (a route
+called, a webhook, an event on a held connection), or a person's command.
+A live view keeps it awake too: `weft follow` while it runs, and a VS Code
+editor pointed at the install while the person uses it; once the window has
+been out of focus or untouched for 5 minutes, the editor stops its live
+connection so the install can sleep, and picks back up when they return. If
+the free plan's hours run out, the database stops until the next month or a
+paid plan, and the install stops with it.

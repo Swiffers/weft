@@ -324,7 +324,7 @@ async fn door_tick(
         .bind(req.window_start)
         .bind(&keys)
         .bind(&hits)
-        .bind(&req.tokens)
+        .bind(req.shortens)
         .fetch_one(&state.pool)
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("tick")))?;

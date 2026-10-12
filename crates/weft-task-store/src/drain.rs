@@ -1,60 +1,84 @@
 //! The wake-and-drain loop every role's background work runs.
 //!
 //! The loops that use it (the dispatcher's task picker, its delivery of
-//! executions, the lifecycle claimer, the reapers; the supervisor's and
-//! the broker's sweeps) all have the same shape: sleep until a write they
-//! care about is announced on the process's [`PgSignalWatch`] (see
+//! executions, the lifecycle claimer, the reapers; the broker's expiry of
+//! stored files) all have the same shape: sleep until a write they care
+//! about is announced on the process's [`PgSignalWatch`] (see
 //! [`crate::pg_signal`]), then run their drain body until it reports the
-//! queue empty. A safety tick drains anyway every so often, for the
-//! notification that was lost, and for the rows whose readiness no write
-//! announces (a lease that lapsed, a delay that ran out). A loop that only
-//! notices silence has no channel at all and runs on its safety tick.
+//! queue empty, or that it needs another look at a given moment (a lease
+//! that may lapse, a delay that runs out).
 //!
 //! A role runs its loops one of two ways, by where it is placed:
 //!
-//! - in a local install's one process, [`run_forever`] per loop, sleeping
-//!   on the process's one `LISTEN` connection, and looking anyway at its
-//!   safety interval ([`Looks::AtSafety`]);
-//! - as a service that scales to zero, [`drain_due`] once per tick: the
-//!   role is called (by the process that wrote what a loop waits on,
-//!   naming the loops it concerns, or by its own next alarm), drains those
-//!   loops and the ones due, and answers when the next look is due. A
-//!   process at zero hears no notification, so this is the only way its
-//!   loops run there. A tick may land on any instance of the role, so
-//!   when each loop is due lives in the database (the `role_loop_due`
-//!   table, [`GROUP`]), shared by them all. A process of the role that is
-//!   up and hears the database also runs its loops for as long as it
-//!   lives, looking on their safety interval only while it has work
-//!   ([`Looks::WhileWorking`]): its timed looks are the ticks'.
+//! - in a local install's one process, [`run_forever`](DrainLoop::run_forever)
+//!   per loop, sleeping on the process's one `LISTEN` connection, and
+//!   looking anyway at its safety interval ([`Looks::AtSafety`]), for the
+//!   notification that was lost.
+//! - as a service that scales to zero, nothing is looked at "just in
+//!   case". Each loop is either rung (the process that wrote what it waits
+//!   on calls the role's tick naming it) or booked: when a pass leaves a
+//!   loop with a look to come, the moment goes into the `role_loop_due`
+//!   table ([`GROUP`]), shared by every instance of the role, with one
+//!   wake on the platform's alarm that calls the role's tick then
+//!   ([`Booking`]). A booking that moves sets the new wake before it
+//!   commits and cancels the old one after, so a crash leaves at most one
+//!   stray wake, never a booking without one. A tick runs the loops it was
+//!   rung for, the loop its wake was booked for, and any loop already due
+//!   ([`drain_due`]). An instance that is up and hears the database also
+//!   runs its loops for as long as it lives, woken by what it hears
+//!   ([`Looks::WhileWorking`]); it keeps no timer and books nothing, since
+//!   the tick rung for the same write books what is left.
+//!   A loop nothing rings and nothing books would never run again there,
+//!   so a role refuses to start with one ([`check_woken`]).
 //!
-//! Scaled to zero, nothing is looked at "just in case": a loop with
-//! nothing left sleeps until a write wakes it, and only a look a loop
-//! asked for ([`DrainStep::RetryIn`]) books a wake. A loop no write wakes
-//! (a sweep for what nobody announces) runs again once its safety
-//! interval has passed, on whichever pass the role makes next, and books
-//! no wake of its own. So an install with nothing going on wakes nothing,
-//! and its database sleeps.
+//! A loop whose drain fails books its next look a little later, a few
+//! times ([`RETRY_PAUSES`]); past the last it books nothing, keeps no look
+//! already past (which would run it again on every pass of its role), and
+//! is written down with its error (`crate::unanswered`, for `weft
+//! status`): it runs again when a write that concerns it rings it, and its
+//! next drain that goes through clears what was written. A next look whose
+//! wake cannot be set is tried a few times in the pass, then written down
+//! the same way, the booking left as it was. Either way the pass answers
+//! its tick as done. Only a pass that could not write this down for some
+//! loop (the database did not answer it) fails its tick, naming those
+//! loops ([`PassFailed`]), so the platform's queue calls it again for as
+//! long as its retry window allows. When that tick was a writer's ring,
+//! the writer writes the failure down for the loops it names
+//! ([`pass_failed`]), through the same database. While that database does
+//! not answer, the writer cannot write it down either, and only logs:
+//! what carries those loops then is the ring's own retry (the alarm calls
+//! the tick again with them), and the first of those calls the database
+//! answers runs them, each one that fails then written down by its own
+//! booking. A pass that could not even read when its loops are due names
+//! every loop its call names, or every loop of the role for a call naming
+//! none, so a short blip the writer does get through writes all of those
+//! down, each until its next drain that goes through.
 //!
 //! The subsystem provides its drain body, which channels wake it, and its
-//! safety interval; the coalescing and the timing live here.
+//! safety interval; the coalescing, the booking and the timing live here.
 //!
 //! [`PgSignalWatch`]: crate::pg_signal::PgSignalWatch
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::time::Instant;
+use weft_platform_traits::roles::TICK_PATH;
+use weft_platform_traits::{Alarm, CoreRole, Wake, WakeQueue};
 
-use crate::pg_signal::{PgSignalWatch, Subscription};
+use crate::pg_signal::{Heard, PgSignalWatch, Subscription};
+use crate::unanswered::{self, Callee};
 
-/// The usual safety net for missed notifications while a local install's
-/// process is up, and how soon a failed drain is tried again anywhere. Notifications are
-/// best-effort by Postgres design (a reconnecting listener can lose
-/// some, though it says so with a recheck), so this only catches what
-/// slipped past; 30s of delay on a lost one is acceptable, and a tighter
-/// tick would hammer the DB for nothing.
+/// How often a local install's process looks at a loop anyway, for the
+/// notification that was lost. Notifications are best-effort by Postgres
+/// design (a reconnecting listener can lose some, though it says so with a
+/// recheck), so this only catches what slipped past; 30s of delay on a
+/// lost one is acceptable, and a tighter tick would hammer the DB for
+/// nothing.
 pub const SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a loop's row in `role_loop_due` stays once no pass of this
@@ -69,6 +93,15 @@ const FORGET_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// lock is held for one drain, so a short pause finds it free.
 pub const LOCK_HELD_RETRY: Duration = Duration::from_secs(2);
 
+/// How many times a booking tries to set its wake before it gives up and
+/// writes the failure down.
+const SET_TRIES: u32 = 3;
+
+/// How long a loop whose drain failed waits before each of its retries,
+/// booked like any look, by how many of its drains in a row failed before
+/// this one. Past the last it books nothing and is written down.
+const RETRY_PAUSES: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(5), Duration::from_secs(20)];
+
 /// What a subsystem's drain body returns after one iteration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainStep {
@@ -77,8 +110,8 @@ pub enum DrainStep {
     /// otherwise expects siblings behind it.
     More,
     /// Nothing is left that a look before the next write would find:
-    /// the runner sleeps until a wake (on a local install, at most its
-    /// safety interval; scaled to zero, until woken, see the module docs).
+    /// the runner sleeps until a write wakes it (on a local install, at
+    /// most its safety interval).
     Done,
     /// Something is left that will need a look without anything
     /// announcing it (a row whose writer has not committed, a delay that
@@ -108,25 +141,37 @@ impl WakeOn {
     }
 }
 
-/// One background loop of a role: what wakes it, how often it looks
-/// anyway, and its drain body.
+/// One background loop of a role: what wakes it, how often a local
+/// install looks anyway, and its drain body.
 #[derive(Clone)]
 pub struct DrainLoop {
     /// For logs, the key its install-wide lock (when it takes one) is
     /// named by, and its row in `role_loop_due` ([`GROUP`]).
     pub name: &'static str,
+    /// What the loop does, in a person's words, finishing "weft's
+    /// dispatcher could not ...": what `weft status` says when it gave up.
+    pub label: &'static str,
     pub wake_on: &'static [WakeOn],
+    /// The other loops of the role that book this one's looks
+    /// ([`Booking::book_sooner`]), for a loop no write wakes.
+    pub booked_by: &'static [&'static str],
     pub safety: Duration,
-    pub drain: std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<DrainStep>> + Send + Sync>,
+    pub drain: Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<DrainStep>> + Send + Sync>,
 }
 
 impl DrainLoop {
-    pub fn new<F, Fut>(name: &'static str, wake_on: &'static [WakeOn], safety: Duration, drain: F) -> Self
+    pub fn new<F, Fut>(name: &'static str, label: &'static str, wake_on: &'static [WakeOn], safety: Duration, drain: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<DrainStep>> + Send + 'static,
     {
-        Self { name, wake_on, safety, drain: std::sync::Arc::new(move || Box::pin(drain())) }
+        Self { name, label, wake_on, booked_by: &[], safety, drain: Arc::new(move || Box::pin(drain())) }
+    }
+
+    /// This loop's looks are booked by `loops`, other loops of its role.
+    pub fn booked_by(mut self, loops: &'static [&'static str]) -> Self {
+        self.booked_by = loops;
+        self
     }
 
     /// Run this loop for the life of the process (see [`run`]).
@@ -134,12 +179,27 @@ impl DrainLoop {
         let drain = self.drain.clone();
         run(signals, self.wake_on, self.safety, looks, self.name, move || drain()).await
     }
+}
 
-    /// Whether a write wakes this loop, or only time does (a sweep for
-    /// what nobody announces).
-    pub fn woken_by_writes(&self) -> bool {
-        !self.wake_on.is_empty()
+/// Refuse to run `role`'s `loops` as a service that scales to zero when
+/// one of them would never run again there: one no write wakes and no
+/// other loop books, or booked by a loop the role does not have.
+pub fn check_woken(role: CoreRole, loops: &[DrainLoop]) -> Result<()> {
+    for l in loops {
+        anyhow::ensure!(
+            !l.wake_on.is_empty() || !l.booked_by.is_empty(),
+            "the {role}'s loop '{}' is woken by no write and booked by no other loop, so scaled to zero it would never run again",
+            l.name
+        );
+        for by in l.booked_by {
+            anyhow::ensure!(
+                loops.iter().any(|other| other.name == *by),
+                "the {role}'s loop '{}' says '{by}' books it, which is no loop of the {role}",
+                l.name
+            );
+        }
     }
+    Ok(())
 }
 
 /// How a loop run for the life of its process ([`run`]) looks when
@@ -148,12 +208,11 @@ impl DrainLoop {
 pub enum Looks {
     /// At its safety interval: a machine's process, up for good.
     AtSafety,
-    /// At its safety interval only while the process has work
-    /// ([`PgSignalWatch::worked_since`]): a process of a role that scales
-    /// to zero, left idle, queries nothing, and its timed looks are the
-    /// role's ticks' ([`drain_due`]). Each drain holds the watch
-    /// ([`PgSignalWatch::looking`]), so it listens while the drain runs.
-    WhileWorking(std::sync::Arc<PgSignalWatch>),
+    /// Only when a write wakes it: a process of a role that scales to
+    /// zero, whose looks are the role's ticks' (see [`run`]). Each drain
+    /// holds the watch ([`PgSignalWatch::busy`]), so it listens while the
+    /// drain runs.
+    WhileWorking(Arc<PgSignalWatch>),
 }
 
 /// The `role_loop_due` table: when each loop of a role that scales to zero
@@ -171,13 +230,27 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- When the loop next wants a look, in unix milliseconds on the
             -- database's clock, so instances whose own clocks disagree
             -- still agree on it. Empty while it has nothing to look at
-            -- until a write wakes it (or, for a loop no write wakes, until
-            -- its safety interval has passed since `written_ms`, on the
-            -- role's next pass).
+            -- until a write wakes it.
             due_ms BIGINT,
             -- When this row was last written, on the same clock: how a
             -- pass tells whether a sibling booked a look since it read.
             written_ms BIGINT NOT NULL,
+            -- How many bookings this row has had: the generation of the
+            -- wake set for `due_ms`, so a wake set again never reuses the
+            -- name of one delivered or cancelled.
+            seq BIGINT NOT NULL DEFAULT 0,
+            -- How many times a tick the wake of booking `seq` arrived
+            -- early at set it again (`BookedLook::set_again`): the wake
+            -- of this booking still waiting is the one under that count,
+            -- which a booking that moves cancels.
+            set_again INT NOT NULL DEFAULT 0,
+            -- How many of the loop's drains in a row failed: which of its
+            -- retries comes next (`RETRY_PAUSES`).
+            failures INT NOT NULL DEFAULT 0,
+            -- Whether a failure of the loop is written down for `weft
+            -- status` (`unanswered_call`): its next drain that goes
+            -- through clears it.
+            failure_written BOOLEAN NOT NULL DEFAULT FALSE,
             PRIMARY KEY (role, loop_name)
         )"#],
     seed: &[],
@@ -187,48 +260,102 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
 /// written on it, never on a process's own clock.
 pub const DB_NOW_MS: &str = "(extract(epoch from clock_timestamp()) * 1000)::bigint";
 
-/// What a pass does with one loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Plan {
-    /// Drain it now.
-    Run,
-    /// Leave it until this moment (unix ms, the database's clock).
-    SleepUntil(i64),
-    /// Leave it until a write wakes it (or, for a loop no write wakes,
-    /// until a later pass finds its safety interval passed).
-    Asleep,
-    /// The due times could not be read: leave it, and look again at its
-    /// safety interval.
-    Unknown,
+/// The body of a role's tick wake ([`weft_platform_traits::WakeCall`]'s
+/// `body`): what the tick runs besides the loops already due. A tick with
+/// no body (a ring, a role's first pass) runs what its query names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickBody {
+    /// Loops to run whether or not they are due: a ring that could not be
+    /// delivered at once, carried by the alarm instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loops: Vec<String>,
+    /// The booking this wake was set for: its loop runs when the booking
+    /// is still the current one, however the clocks disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub booked: Option<BookedLook>,
+    /// Set on a ring carried by the alarm: the tick that takes it answers
+    /// the ring, so `weft status` stops saying the role cannot be reached.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_failed_ring: bool,
 }
 
-/// A loop's row in `role_loop_due`, as a pass reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Booked {
-    due_ms: Option<i64>,
-    written_ms: i64,
+impl TickBody {
+    /// The booking (its `seq`) of loop `name` this wake was set for.
+    fn booking_of(&self, name: &str) -> Option<i64> {
+        self.booked.as_ref().filter(|b| b.loop_name == name).map(|b| b.seq)
+    }
 }
 
-/// What a pass that read the due times at `read_at` (`None` when the read
-/// failed) does with a loop booked as `booked` (`None` with no row). A
-/// woken loop always runs; one with no row is due now. `sweeps_every` is
-/// the safety interval of a loop no write wakes, which runs again once it
-/// has passed since the loop was last booked; `None` for a loop a write
-/// wakes, which sleeps until then.
-fn plan(woken: bool, read_at: Option<i64>, booked: Option<Booked>, sweeps_every: Option<Duration>) -> Plan {
-    if woken {
-        return Plan::Run;
+/// One booking of a loop's look ([`Booking`]), as its wake carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookedLook {
+    pub loop_name: String,
+    pub seq: i64,
+    /// How many times a tick this booking's wake arrived early at set it
+    /// again for its moment: each is a booking of its own, named apart,
+    /// since the task being answered still holds the name of the one
+    /// before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub set_again: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl BookedLook {
+    /// The wake that calls `role`'s tick for this booking at `at_ms`.
+    pub fn wake(&self, role: CoreRole, at_ms: i64) -> Wake {
+        let name = &self.loop_name;
+        Wake {
+            key: weft_platform_traits::alarm::again_key(&format!("loop:{role}:{name}"), self.set_again),
+            at_unix_ms: at_ms,
+            generation: self.seq,
+            queue: WakeQueue::Internal,
+            role,
+            path: TICK_PATH.to_string(),
+            body: serde_json::to_value(TickBody { booked: Some(self.clone()), ..TickBody::default() }).expect("a tick body serializes"),
+        }
     }
-    let Some(now) = read_at else { return Plan::Unknown };
-    match booked {
-        None => Plan::Run,
-        Some(Booked { due_ms: Some(at), .. }) if at > now => Plan::SleepUntil(at),
-        Some(Booked { due_ms: Some(_), .. }) => Plan::Run,
-        Some(Booked { due_ms: None, written_ms }) => match sweeps_every {
-            Some(every) if written_ms.saturating_add(millis(every)) <= now => Plan::Run,
-            _ => Plan::Asleep,
-        },
+
+    /// The same booking, set again by a tick its wake arrived early at.
+    pub fn set_again(&self) -> Self {
+        Self { set_again: self.set_again + 1, ..self.clone() }
     }
+}
+
+/// The wake that calls `role`'s tick for its loop `name` booked at `at_ms`
+/// as the row's `seq`th booking.
+pub fn loop_wake(role: CoreRole, name: &str, at_ms: i64, seq: i64) -> Wake {
+    BookedLook { loop_name: name.to_string(), seq, set_again: 0 }.wake(role, at_ms)
+}
+
+/// Ask the alarm to call `role`'s tick in about a second for `loops`, for
+/// a writer whose own ring could not get through: the platform's queue
+/// tries it again for as long as its window allows.
+pub async fn ring_later(alarm: &dyn Alarm, role: CoreRole, loops: Vec<String>) -> Result<()> {
+    let body = TickBody { loops, booked: None, after_failed_ring: true };
+    alarm
+        .set(Wake {
+            key: format!("ring:{role}"),
+            at_unix_ms: now_ms() + 1000,
+            // A name of its own every time, whichever process sets it:
+            // two whose rings failed in the same millisecond each carry
+            // their own loops.
+            generation: uuid::Uuid::new_v4().as_u64_pair().0 as i64,
+            queue: WakeQueue::Internal,
+            role,
+            path: TICK_PATH.to_string(),
+            body: serde_json::to_value(body).expect("a tick body serializes"),
+        })
+        .await
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock past UNIX_EPOCH")
+        .as_millis() as i64
 }
 
 /// `d` in whole milliseconds, saturating.
@@ -236,11 +363,318 @@ fn millis(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// `at_ms` on the database's clock as an instant of this process, given
-/// `clock`: a reading of the database's clock and the instant it was
-/// taken at.
-fn instant_of(clock: (i64, Instant), at_ms: i64) -> Instant {
-    clock.1 + Duration::from_millis(at_ms.saturating_sub(clock.0).max(0).unsigned_abs())
+/// The sooner of two looks, an empty one being the latest of all.
+fn sooner(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What a pass did with a loop, as its booking records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    /// It drained, and wants its next look this long from now (`None`:
+    /// when a write wakes it).
+    Drained(Option<Duration>),
+    /// Its drain failed with `error`: it retries shortly, or, past its
+    /// retries, is written down and waits for a write. `spent`: the
+    /// booking (its `seq`) whose wake ran this pass, whose look is used up
+    /// whatever the clocks say.
+    Failed { error: String, spent: Option<i64> },
+    /// Someone else books it (another loop, another role) for this
+    /// moment: its failures stay as they are, unless that wake cannot be
+    /// set.
+    Booked(Option<i64>),
+}
+
+/// Whose look stands when a row is booked again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// The new look stands, sooner or later: the booker knows.
+    Exactly,
+    /// Never later than what is booked: a look asked for without having
+    /// read the row.
+    Sooner,
+    /// The new look stands unless a sibling wrote the row since this pass
+    /// read it at this moment; then the sooner of the two does, so the
+    /// sibling's wake is never pushed back. A row written in the very
+    /// millisecond of the read counts as a sibling's: keeping the sooner
+    /// look costs one extra pass at most, overwriting it could cost a wake.
+    SinceRead(i64),
+}
+
+/// Booking the looks of one role's loops: the `role_loop_due` rows and
+/// the alarm's wakes that go with them.
+#[derive(Clone)]
+pub struct Booking {
+    pool: PgPool,
+    role: CoreRole,
+    alarm: Arc<dyn Alarm>,
+}
+
+impl Booking {
+    pub fn new(pool: PgPool, role: CoreRole, alarm: Arc<dyn Alarm>) -> Self {
+        Self { pool, role, alarm }
+    }
+
+    /// Book `name`'s next look at `at_ms` on the database's clock (`None`:
+    /// none), whatever was booked before: for a booker that computed the
+    /// one right moment (the broker booking the supervisor's next pass).
+    pub async fn book(&self, name: &str, at_ms: Option<i64>) -> Result<()> {
+        self.rebook(name, None, Step::Booked(at_ms), Rule::Exactly).await
+    }
+
+    /// Book `name`'s next look at `at_ms` on the database's clock unless
+    /// one at or before it is booked already: for a loop that makes work
+    /// another loop must look at by then. Reads the row first, so a look
+    /// already booked in time costs no write.
+    pub async fn book_sooner(&self, name: &str, at_ms: i64) -> Result<()> {
+        let booked: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT due_ms FROM role_loop_due WHERE role = $1 AND loop_name = $2")
+                .bind(self.role.as_str())
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        if booked.flatten().is_some_and(|due| due <= at_ms) {
+            return Ok(());
+        }
+        self.rebook(name, None, Step::Booked(Some(at_ms)), Rule::Sooner).await
+    }
+
+    /// [`Self::book_sooner`], `after` from now on the database's clock.
+    pub async fn book_sooner_after(&self, name: &str, after: Duration) -> Result<()> {
+        let now: i64 = sqlx::query_scalar(&format!("SELECT {DB_NOW_MS}")).fetch_one(&self.pool).await?;
+        self.book_sooner(name, now.saturating_add(millis(after))).await
+    }
+
+    /// Book `name` (labelled `label`) again after `step`, as `rule` says:
+    /// set the new look's wake, commit the row, cancel the old wake, in
+    /// that order, so a crash between leaves a stray wake (one extra pass)
+    /// and never a booking without one: a wake that cannot be set leaves
+    /// the booking as it was.
+    ///
+    /// A failed drain books its next retry ([`RETRY_PAUSES`]); past the
+    /// last it books nothing and drops a look already past. A failed drain
+    /// past its retries, or a wake that could not be set, is written down
+    /// with its error in the same transaction; the loop's next drain that
+    /// goes through clears what was written. An error only when the
+    /// database could not be written: nothing was written down then.
+    async fn rebook(&self, name: &str, label: Option<&str>, step: Step, rule: Rule) -> Result<()> {
+        let role = self.role.as_str();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms) VALUES ($1, $2, NULL, {DB_NOW_MS}) \
+             ON CONFLICT (role, loop_name) DO NOTHING"
+        ))
+        .bind(role)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        let (due, seq, set_again, failures, failure_written, written_ms, now): (Option<i64>, i64, i32, i32, bool, i64, i64) =
+            sqlx::query_as(&format!(
+                "SELECT due_ms, seq, set_again, failures, failure_written, written_ms, {DB_NOW_MS} FROM role_loop_due \
+                 WHERE role = $1 AND loop_name = $2 FOR UPDATE"
+            ))
+            .bind(role)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?;
+        let sibling_wrote = matches!(rule, Rule::SinceRead(read_at) if written_ms >= read_at);
+        // What a failed drain keeps of the booking: a look still to come
+        // that is not the one whose wake ran this pass, or one a sibling
+        // booked since this pass read. A look already past, or spent, was
+        // the one that just failed; kept, it would run the loop again on
+        // every later pass of its role.
+        let kept = match &step {
+            Step::Failed { spent, .. } if !sibling_wrote => due.filter(|at| *at > now && *spent != Some(seq)),
+            _ => due,
+        };
+        let by_rule = |wanted: Option<i64>| match rule {
+            Rule::Exactly => wanted,
+            Rule::SinceRead(_) if !sibling_wrote => wanted,
+            Rule::SinceRead(_) | Rule::Sooner => sooner(due, wanted),
+        };
+        let retry = RETRY_PAUSES.get(usize::try_from(failures).unwrap_or(usize::MAX));
+        let mut next = match &step {
+            Step::Failed { .. } => sooner(kept, retry.map(|pause| now.saturating_add(millis(*pause)))),
+            Step::Drained(after) => by_rule(after.map(|after| now.saturating_add(millis(after)))),
+            Step::Booked(at) => by_rule(*at),
+        };
+        let mut next_seq = seq;
+        let mut unset: Option<String> = None;
+        if next != due {
+            if let Some(at) = next {
+                if let Err(e) = set_with_tries(&*self.alarm, loop_wake(self.role, name, at, seq + 1)).await {
+                    // No wake, no booking: the row keeps the booking whose
+                    // wake is set, so a later booking sets one again.
+                    unset = Some(format!("its next look could not be set: {e:#}"));
+                    next = kept;
+                } else {
+                    next_seq = seq + 1;
+                }
+            }
+        }
+        let error = match (&step, &unset) {
+            (Step::Failed { error, .. }, Some(unset)) => Some(format!("{error}; and {unset}")),
+            // Past its last retry.
+            (Step::Failed { error, .. }, None) if retry.is_none() => Some(error.clone()),
+            (_, unset) => unset.clone(),
+        };
+        let failures_now = match &step {
+            Step::Failed { .. } => failures.saturating_add(1),
+            Step::Drained(_) => 0,
+            Step::Booked(_) => failures,
+        };
+        let cleared = matches!(step, Step::Drained(_)) && error.is_none() && failure_written;
+        let callee = Callee::Loop { role, name };
+        let mut alerts = unanswered::Alerts::default();
+        if let Some(error) = &error {
+            tracing::error!(target: "weft_task_store::drain", role, subsystem = name, %error, failures = failures_now, "a loop's pass failed and is written down; it runs again when a write that concerns it rings it");
+            alerts = unanswered::gave_up(&mut *tx, callee, label, error).await?;
+        } else if cleared {
+            unanswered::answered(&mut *tx, callee).await?;
+        }
+        sqlx::query(&format!(
+            "UPDATE role_loop_due SET due_ms = $3, seq = $4, set_again = $5, failures = $6, failure_written = $7, written_ms = {DB_NOW_MS} \
+             WHERE role = $1 AND loop_name = $2"
+        ))
+        .bind(role)
+        .bind(name)
+        .bind(next)
+        .bind(next_seq)
+        .bind(if next_seq == seq { set_again } else { 0 })
+        .bind(failures_now)
+        .bind(error.is_some() || (failure_written && !cleared))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        alerts.log();
+        if next != due {
+            if let Some(old) = due {
+                let old_wake = BookedLook { loop_name: name.to_string(), seq, set_again: u32::try_from(set_again).unwrap_or(0) }.wake(self.role, old);
+                if let Err(e) = self.alarm.cancel(&old_wake).await {
+                    tracing::warn!(
+                        target: "weft_task_store::drain", role, subsystem = name, error = %format!("{e:#}"),
+                        "could not cancel a loop's old wake; it goes off once and finds nothing to do"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The tick `booked`'s wake arrived early at set it again (its
+/// [`BookedLook::set_again`] counts that set): the row of its loop says
+/// so while that booking is still the current one, so a booking that moves
+/// cancels the wake still waiting rather than the one already delivered.
+pub async fn set_again_recorded(pool: &PgPool, role: CoreRole, booked: &BookedLook) -> Result<()> {
+    sqlx::query("UPDATE role_loop_due SET set_again = GREATEST(set_again, $4) WHERE role = $1 AND loop_name = $2 AND seq = $3")
+        .bind(role.as_str())
+        .bind(&booked.loop_name)
+        .bind(booked.seq)
+        .bind(i32::try_from(booked.set_again).unwrap_or(i32::MAX))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A pass that could not write down how some of its loops went (the
+/// database did not answer it): those loops, and why. A tick answers it as
+/// its failure's body, so a writer whose ring the tick was writes it down
+/// for exactly those loops ([`pass_failed`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassFailed {
+    /// The loops whose failure the pass could not write down.
+    pub loops: Vec<String>,
+    pub error: String,
+}
+
+impl std::fmt::Display for PassFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (loops: {})", self.error, self.loops.join(", "))
+    }
+}
+
+impl std::error::Error for PassFailed {}
+
+/// A pass of `role` could not write down how its loops went (`failed`:
+/// it answered a writer's ring with that, the database not answering it):
+/// the writer writes it down for the loops `failed` names, each loop's
+/// next drain that goes through clearing it. Only the flag that says so
+/// changes on a loop's row, its booking kept; a loop with no row gets one
+/// due now, which is what having no row means ([`plan`]), so writing the
+/// failure down never puts a due loop to sleep.
+pub async fn pass_failed(pool: &PgPool, role: CoreRole, failed: &PassFailed) -> Result<()> {
+    let error = format!("its pass could not write down how it went: {}", failed.error);
+    let mut tx = pool.begin().await?;
+    let mut alerts = unanswered::Alerts::default();
+    for name in &failed.loops {
+        sqlx::query(&format!(
+            "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, failure_written) VALUES ($1, $2, {DB_NOW_MS}, {DB_NOW_MS}, TRUE) \
+             ON CONFLICT (role, loop_name) DO UPDATE SET failure_written = TRUE"
+        ))
+        .bind(role.as_str())
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        alerts = alerts.and(unanswered::failed(&mut *tx, Callee::Loop { role: role.as_str(), name }, None, &error).await?);
+    }
+    tx.commit().await?;
+    alerts.log();
+    Ok(())
+}
+
+/// Set `wake`, trying [`SET_TRIES`] times with a short pause between.
+async fn set_with_tries(alarm: &dyn Alarm, wake: Wake) -> Result<()> {
+    let mut pause = Duration::from_millis(200);
+    let mut tries = 1;
+    loop {
+        match alarm.set(wake.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) if tries >= SET_TRIES => return Err(e),
+            Err(e) => {
+                tracing::warn!(target: "weft_task_store::drain", key = %wake.key, error = %format!("{e:#}"), "could not set a loop's wake; trying again");
+                tokio::time::sleep(pause).await;
+                pause *= 4;
+                tries += 1;
+            }
+        }
+    }
+}
+
+/// What a pass does with one loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// Drain it now.
+    Run,
+    /// Leave it: its own wake or a write calls it when it is wanted.
+    Leave,
+}
+
+/// A loop's row in `role_loop_due`, as a pass reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Booked {
+    due_ms: Option<i64>,
+    seq: i64,
+}
+
+/// What a pass that read the due times at `now` does with a loop booked
+/// as `booked` (`None` with no row). A woken loop always runs, and so does
+/// the loop whose current booking this pass's wake was set for
+/// (`current_seq`); one with no row is due now, one due by now runs, and
+/// every other one is left.
+fn plan(woken: bool, current_seq: Option<i64>, now: i64, booked: Option<Booked>) -> Plan {
+    if woken {
+        return Plan::Run;
+    }
+    match booked {
+        None => Plan::Run,
+        Some(b) if current_seq == Some(b.seq) && b.due_ms.is_some() => Plan::Run,
+        Some(Booked { due_ms: Some(at), .. }) if at <= now => Plan::Run,
+        Some(_) => Plan::Leave,
+    }
 }
 
 /// What a pass reads of `role`'s due times: the database's clock, each
@@ -252,13 +686,13 @@ struct ReadDue {
 }
 
 /// One row of [`read_due`]'s query: the clock, then a loop's name, when
-/// it is due, when it was written, and whether nobody has booked it for
+/// it is due, its seq, and whether nobody has booked it for
 /// [`FORGET_AFTER`] (all four `None` when the role has no row).
 type DueRow = (i64, Option<String>, Option<i64>, Option<i64>, Option<bool>);
 
 async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
     let rows: Vec<DueRow> = sqlx::query_as(&format!(
-        "SELECT c.now_ms, d.loop_name, d.due_ms, d.written_ms, d.written_ms < c.now_ms - $2 \
+        "SELECT c.now_ms, d.loop_name, d.due_ms, d.seq, d.written_ms < c.now_ms - $2 \
          FROM (SELECT {DB_NOW_MS} AS now_ms) c \
          LEFT JOIN role_loop_due d ON d.role = $1"
     ))
@@ -267,154 +701,164 @@ async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
     .fetch_all(pool)
     .await?;
     let now = rows.first().map(|r| r.0).context("the clock query returned no row")?;
-    let unbooked = rows.iter().filter(|r| r.4 == Some(true)).filter_map(|r| r.1.clone()).collect();
-    let booked = rows
-        .into_iter()
-        .filter_map(|(_, name, due_ms, written_ms, _)| Some((name?, Booked { due_ms, written_ms: written_ms? })))
-        .collect();
+    let mut booked = HashMap::new();
+    let mut unbooked = Vec::new();
+    for (_, name, due_ms, seq, stale) in rows {
+        let (Some(name), Some(seq)) = (name, seq) else { continue };
+        if stale == Some(true) {
+            unbooked.push(name.clone());
+        }
+        booked.insert(name, Booked { due_ms, seq });
+    }
     Ok(ReadDue { now, booked, unbooked })
 }
 
-/// Book `role`'s loop `name` for a look `after` from now on the database's
-/// clock (`None`: asleep until woken), and answer when it is now due and
-/// the clock at the write. When a sibling wrote the row since this pass
-/// read it at `read_at` (or the read failed), the sooner of the two looks
-/// stands, so a wake the sibling booked is never pushed back (an empty
-/// due is the latest of all). A row written in the very millisecond of the
-/// read counts as a sibling's: keeping the sooner look costs one extra
-/// pass at most, overwriting it could cost a wake.
-async fn book(pool: &PgPool, role: &str, name: &str, after: Option<Duration>, read_at: Option<i64>) -> Result<(Option<i64>, i64)> {
-    let after_ms = after.map(|after| i64::try_from(after.as_millis()).context("a look further out than the clock reaches")).transpose()?;
-    let row: (Option<i64>, i64) = sqlx::query_as(&format!(
-        "INSERT INTO role_loop_due AS d (role, loop_name, due_ms, written_ms) \
-         SELECT $1, $2, c.now_ms + $3, c.now_ms FROM (SELECT {DB_NOW_MS} AS now_ms) c \
-         ON CONFLICT (role, loop_name) DO UPDATE SET \
-             due_ms = CASE WHEN d.written_ms < $4::bigint THEN excluded.due_ms \
-                           ELSE LEAST(d.due_ms, excluded.due_ms) END, \
-             written_ms = excluded.written_ms \
-         RETURNING due_ms, written_ms"
-    ))
-    .bind(role)
-    .bind(name)
-    .bind(after_ms)
-    .bind(read_at)
-    .fetch_one(pool)
-    .await?;
-    Ok(row)
-}
-
-/// How long one pass of [`drain_due`] keeps draining, shared out evenly
-/// between the loops it runs: a loop with more left once its share is
-/// spent books itself due now for the next tick. Every loop the pass runs
-/// drains at least once, so a loop that always has more (a steady stream
-/// of tasks) never keeps the loops after it waiting, nor holds the tick
-/// open until the platform cuts it.
-pub const TICK_SLICE: Duration = Duration::from_secs(60);
-
-/// One pass of a role that scales to zero: drain the loops named in
-/// `woken` (the writes they wait on happened) and the ones whose next
-/// look is due, each until it has nothing left (or asks to look again
-/// later, or spent its share of [`TICK_SLICE`]), book each one's next
-/// look in `role_loop_due`, and answer how soon any loop of `role` next
-/// wants a look, or `None` when none does. The others stay asleep, so a
-/// pass run because a journal event was written does not also run the
-/// hourly sweeps. A loop with nothing left sleeps until woken (see the
-/// module docs); one that asked to look again does so then; a drain that
-/// fails is logged and, when a write would wake it, looked at again at
-/// its safety interval (a sweep that fails runs again on a later pass
-/// like one that did not). When the due times cannot be read or written,
-/// that is logged too, and the loops it leaves unknown are looked at again
-/// at their safety interval.
-pub async fn drain_due(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[String]) -> Option<Duration> {
-    drain_pass(pool, role, loops, woken, TICK_SLICE).await
-}
-
-/// [`drain_due`] with the pass's draining time as `slice`.
-async fn drain_pass(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[String], slice: Duration) -> Option<Duration> {
-    let (read_at, booked, unbooked) = match read_due(pool, role).await {
-        Ok(read) => (Some(read.now), read.booked, read.unbooked),
-        Err(e) => {
-            tracing::warn!(
-                target: "weft_task_store::drain", role, error = %format!("{e:#}"),
-                "could not read when the loops are due; running only the woken ones, the rest look again at their safety interval"
-            );
-            (None, HashMap::new(), Vec::new())
+/// One pass of a role that scales to zero, for a tick that says `call`:
+/// drain the loops it names, the loop its booking is still current for,
+/// and every loop already due, each until it has nothing left (or asks to
+/// look again later, or spent its share of `slice`), and book each one's
+/// next look. The others stay as they are, each with its own wake, so a
+/// pass run because a journal event was written does not also run every
+/// other loop.
+///
+/// `slice` is how long the pass keeps draining, shared out evenly between
+/// the loops it runs: a loop with more left once its share is spent books
+/// itself due now for the next tick. Every loop the pass runs drains at
+/// least once, so a loop that always has more (a steady stream of tasks)
+/// never keeps the loops after it waiting, nor holds the tick open until
+/// the platform cuts it. `listen` is the process's watch, held while a
+/// loop drains (its writes are what other roles wait on), and only once a
+/// loop runs: a wake whose booking moved since reads the due times and
+/// nothing more.
+///
+/// A loop that failed, or whose next look could not be set, is booked or
+/// written down as [`Booking::rebook`] says, and the pass goes on. An
+/// error only when the database could not be read or written, so nothing
+/// was written down for the loops it names, never none: every loop `call`
+/// names when the due times could not be read (none ran; every loop of
+/// the role when `call` names none), else the loops whose rebook failed.
+/// The tick answers it as a failure: the platform's queue calls a wake's
+/// tick again, and a writer whose ring it was hands it to the alarm and
+/// writes it down, when the database answers it (see the module docs).
+pub async fn drain_due(
+    booking: &Booking,
+    loops: &[DrainLoop],
+    call: &TickBody,
+    slice: Duration,
+    listen: Option<&PgSignalWatch>,
+) -> std::result::Result<(), PassFailed> {
+    let role = booking.role.as_str();
+    let read = read_due(&booking.pool, role).await.map_err(|e| {
+        let named: Vec<String> =
+            loops.iter().filter(|l| call.loops.iter().any(|w| w == l.name) || call.booking_of(l.name).is_some()).map(|l| l.name.to_string()).collect();
+        PassFailed {
+            // None ran: a call that names no loop (a role's first pass)
+            // names them all, so a failed pass always says which loops it
+            // is about.
+            loops: if named.is_empty() { loops.iter().map(|l| l.name.to_string()).collect() } else { named },
+            error: format!("could not read when the loops are due: {e:#}"),
         }
-    };
-    // A loop renamed or dropped by a later weft leaves its row behind,
-    // forgotten once nobody has booked it for `FORGET_AFTER`.
-    let gone: Vec<&String> = unbooked.iter().filter(|name| !loops.iter().any(|l| l.name == name.as_str())).collect();
-    if !gone.is_empty() {
-        if let Err(e) = sqlx::query("DELETE FROM role_loop_due WHERE role = $1 AND loop_name = ANY($2)")
-            .bind(role)
-            .bind(&gone)
-            .execute(pool)
-            .await
-        {
-            tracing::warn!(target: "weft_task_store::drain", role, error = %format!("{e:#}"), "could not forget the due times of loops this role no longer has; the next pass tries again");
-        }
-    }
-    let mut clock = read_at.map(|now| (now, Instant::now()));
-    let mut next: Option<Instant> = None;
+    })?;
+    forget(booking, loops, &read.unbooked).await;
     let plans: Vec<Plan> = loops
         .iter()
         .map(|l| {
-            let sweeps_every = (!l.woken_by_writes()).then_some(l.safety);
-            plan(woken.iter().any(|w| w == l.name), read_at, booked.get(l.name).copied(), sweeps_every)
+            let woken = call.loops.iter().any(|w| w == l.name);
+            plan(woken, call.booking_of(l.name), read.now, read.booked.get(l.name).copied())
         })
         .collect();
-    let share = slice / u32::try_from(plans.iter().filter(|p| **p == Plan::Run).count().max(1)).unwrap_or(u32::MAX);
+    let running = plans.iter().filter(|p| **p == Plan::Run).count();
+    if running == 0 {
+        return Ok(());
+    }
+    let _busy = match listen {
+        Some(watch) => Some(watch.busy().await),
+        None => None,
+    };
+    let share = slice / u32::try_from(running).unwrap_or(u32::MAX);
+    let rule = Rule::SinceRead(read.now);
+    let mut failed: Vec<(&str, String)> = Vec::new();
     for (l, plan) in loops.iter().zip(plans) {
-        let look = match plan {
-            Plan::SleepUntil(at) => Some(instant_of(clock.expect("a planned sleep comes from a read clock"), at)),
-            Plan::Asleep => None,
-            Plan::Unknown => Some(Instant::now() + l.safety),
-            Plan::Run => {
-                let started = Instant::now();
-                let after = loop {
-                    match (l.drain)().await {
-                        Ok(DrainStep::More) if started.elapsed() >= share => break Some(Duration::ZERO),
-                        Ok(DrainStep::More) => continue,
-                        Ok(DrainStep::Done) => break None,
-                        Ok(DrainStep::RetryIn(after)) => break Some(after),
-                        Err(e) => {
-                            tracing::warn!(target: "weft_task_store::drain", subsystem = l.name, error = %e, "drain failed; will retry at its next look");
-                            break l.woken_by_writes().then_some(l.safety);
-                        }
-                    }
-                };
-                match book(pool, role, l.name, after, read_at).await {
-                    Ok((due_ms, now)) => {
-                        let at = (now, Instant::now());
-                        clock = Some(at);
-                        due_ms.map(|due_ms| instant_of(at, due_ms))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "weft_task_store::drain", role, subsystem = l.name, error = %format!("{e:#}"),
-                            "could not book the loop's next look; looking again at its safety interval"
-                        );
-                        Some(Instant::now() + after.map_or(l.safety, |after| after.min(l.safety)))
-                    }
+        if plan == Plan::Leave {
+            continue;
+        }
+        let started = Instant::now();
+        let step = loop {
+            match (l.drain)().await {
+                Ok(DrainStep::More) if started.elapsed() >= share => break Step::Drained(Some(Duration::ZERO)),
+                Ok(DrainStep::More) => continue,
+                Ok(DrainStep::Done) => break Step::Drained(None),
+                Ok(DrainStep::RetryIn(after)) => break Step::Drained(Some(after)),
+                Err(e) => {
+                    tracing::warn!(target: "weft_task_store::drain", subsystem = l.name, error = %format!("{e:#}"), "drain failed");
+                    break Step::Failed { error: format!("{e:#}"), spent: call.booking_of(l.name) };
                 }
             }
         };
-        if let Some(look) = look {
-            next = Some(next.map_or(look, |n| n.min(look)));
+        if let Err(e) = booking.rebook(l.name, Some(l.label), step, rule).await {
+            failed.push((l.name, format!("{}: {e:#}", l.name)));
         }
     }
-    next.map(|n| n.saturating_duration_since(Instant::now()))
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let errors: Vec<&str> = failed.iter().map(|(_, error)| error.as_str()).collect();
+    Err(PassFailed {
+        error: errors.join("; "),
+        loops: failed.into_iter().map(|(name, _)| name.to_string()).collect(),
+    })
 }
 
-/// Drive the drain loop forever: drain once at start (rows that landed
-/// before the loop subscribed), then after every wake, every `RetryIn`,
-/// and every `safety` interval (only when the process had work since the
-/// last look, for [`Looks::WhileWorking`]). Returns only when the
-/// process's signal watch stops, since nothing could wake the loop again;
-/// the caller's supervisor crashes the process on that.
+/// Forget the rows of loops this role no longer has and nobody has booked
+/// for [`FORGET_AFTER`] (a loop renamed or dropped by a later weft), and
+/// any failure of theirs still written down. A wake one of them still had
+/// finds no loop of its name, and runs nothing.
+async fn forget(booking: &Booking, loops: &[DrainLoop], unbooked: &[String]) {
+    let gone: Vec<&str> = unbooked.iter().map(String::as_str).filter(|name| !loops.iter().any(|l| l.name == *name)).collect();
+    if gone.is_empty() {
+        return;
+    }
+    if let Err(e) = sqlx::query(&format!(
+        "WITH gone AS (DELETE FROM role_loop_due WHERE role = $1 AND loop_name = ANY($2) RETURNING loop_name) \
+         DELETE FROM unanswered_call WHERE callee IN (SELECT {} FROM gone)",
+        unanswered::loop_key_sql("$1", "gone.loop_name")
+    ))
+    .bind(booking.role.as_str())
+    .bind(&gone)
+    .execute(&booking.pool)
+    .await
+    {
+        tracing::warn!(target: "weft_task_store::drain", role = booking.role.as_str(), error = %format!("{e:#}"), "could not forget the due times of loops this role no longer has; the next pass tries again");
+    }
+}
+
+/// Whether `heard` wakes a loop listening as `wake_on`. Only a write it
+/// waits on, or a recheck (notifications may have been lost); a watch
+/// back from a quiet spell ([`Heard::Resumed`]) missed nothing a loop
+/// waits on, since the process that wrote rang the loop's role itself.
+fn wakes_loop(heard: &Heard, wake_on: &[WakeOn]) -> bool {
+    match heard {
+        Heard::Signal { channel, payload } => wake_on.iter().any(|w| w.hears(channel, payload)),
+        Heard::Recheck => true,
+        Heard::Resumed | Heard::Lost => false,
+    }
+}
+
+/// Drive the drain loop forever: after every wake, and, by `looks`, once
+/// at start and on every `safety` interval and `RetryIn` (a local
+/// install's process), or only when woken (a process of a role that scales
+/// to zero). Returns only when the process's signal watch stops, since
+/// nothing could wake the loop again; the caller's supervisor crashes the
+/// process on that.
+///
+/// Scaled to zero, a drain here books nothing: every write that wakes it
+/// also rings the role's tick for the same loop (the writer's waker rings
+/// by the same rules the loop wakes by), and that tick's pass drains after
+/// the write and books the loop's next look from what it finds. One owner
+/// for every booking, and a drain on the run's path writes nothing more.
 ///
 /// `signals` must be subscribed before the call, and `target` is the
-/// tracing target, so subsystems log under their own module name.
+/// tracing field, so subsystems log under their own loop name.
 pub async fn run<F, Fut>(
     mut signals: Subscription,
     wake_on: &[WakeOn],
@@ -426,41 +870,35 @@ pub async fn run<F, Fut>(
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<DrainStep>>,
 {
-    // A look the drain asked for (the first one: at once), and the next
-    // look on the safety interval.
-    let mut asked = Some(Instant::now());
+    // A look the drain asked for: on a local install the first one is at
+    // once (rows that landed before the loop subscribed), since nothing
+    // else catches them there; scaled to zero, the role's ticks do.
+    let mut asked = match &looks {
+        Looks::AtSafety => Some(Instant::now()),
+        Looks::WhileWorking(_) => None,
+    };
     let mut sweep = Instant::now() + safety;
-    let mut last_look = Instant::now();
     loop {
-        let deadline = asked.map_or(sweep, |at| at.min(sweep));
-        // A loop that listens to no channel runs on its interval alone: a
-        // recheck (the watch fell behind, or reconnected) concerns only the
-        // loops that wait on a channel, and waking a timed sweep on one
-        // would run it back to back while notifications pour in.
-        let woken = if Instant::now() >= deadline {
-            false
-        } else if wake_on.is_empty() {
-            tokio::time::sleep_until(deadline).await;
-            false
-        } else {
-            match signals.woken_before(deadline, |channel, payload| wake_on.iter().any(|w| w.hears(channel, payload))).await {
-                Ok(woken) => woken,
-                Err(e) => {
-                    tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
-                    return;
+        let waited = match &looks {
+            Looks::AtSafety => {
+                let deadline = asked.map_or(sweep, |at| at.min(sweep));
+                if Instant::now() >= deadline {
+                    Ok(())
+                } else if wake_on.is_empty() {
+                    // A loop that listens to no channel runs on its
+                    // interval alone: waking a timed sweep on a recheck
+                    // would run it back to back while notifications pour in.
+                    tokio::time::sleep_until(deadline).await;
+                    Ok(())
+                } else {
+                    woken_before(&mut signals, deadline, wake_on).await
                 }
             }
+            Looks::WhileWorking(_) => woken(&mut signals, wake_on).await,
         };
-        let now = Instant::now();
-        // The safety look alone, in a process that scales to zero: skipped
-        // while the process has had no work, so an idle one queries nothing.
-        if !woken && asked.is_none_or(|at| at > now) {
-            if let Looks::WhileWorking(watch) = &looks {
-                if !watch.worked_since(last_look) {
-                    sweep = now + safety;
-                    continue;
-                }
-            }
+        if let Err(e) = waited {
+            tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
+            return;
         }
         // Everything heard up to here is covered by the drain that
         // follows, so a burst of notifications costs one drain, not one
@@ -469,12 +907,11 @@ pub async fn run<F, Fut>(
             tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
             return;
         }
-        last_look = now;
-        sweep = now + safety;
+        sweep = Instant::now() + safety;
         asked = None;
-        let looking = match &looks {
+        let busy = match &looks {
             Looks::AtSafety => None,
-            Looks::WhileWorking(watch) => Some(watch.looking().await),
+            Looks::WhileWorking(watch) => Some(watch.busy().await),
         };
         // Drain until the body reports it has nothing left. This is what
         // makes a burst of more rows than one batch finish in one wake.
@@ -483,33 +920,49 @@ pub async fn run<F, Fut>(
                 Ok(DrainStep::More) => continue,
                 Ok(DrainStep::Done) => break,
                 Ok(DrainStep::RetryIn(after)) => {
-                    asked = Some(Instant::now() + after);
+                    if let Looks::AtSafety = looks {
+                        asked = Some(Instant::now() + after);
+                    }
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        target: "weft_task_store::drain",
-                        subsystem = target,
-                        error = %e,
-                        "drain failed; will retry on next wake"
-                    );
+                    tracing::warn!(target: "weft_task_store::drain", subsystem = target, error = %format!("{e:#}"), "drain failed; will retry on next wake");
                     break;
                 }
             }
         }
-        drop(looking);
+        drop(busy);
+    }
+}
+
+/// Wait until `deadline` at most for a notification that wakes a loop
+/// listening as `wake_on` ([`wakes_loop`]).
+async fn woken_before(signals: &mut Subscription, deadline: Instant, wake_on: &[WakeOn]) -> Result<()> {
+    match tokio::time::timeout_at(deadline, woken(signals, wake_on)).await {
+        Err(_) => Ok(()),
+        Ok(woken) => woken,
+    }
+}
+
+/// Wait, however long it takes, for a notification that wakes a loop
+/// listening as `wake_on` ([`wakes_loop`]).
+async fn woken(signals: &mut Subscription, wake_on: &[WakeOn]) -> Result<()> {
+    loop {
+        if wakes_loop(&signals.next().await?, wake_on) {
+            return Ok(());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use crate::pg_signal::Heard;
+    use std::sync::Mutex;
     use tokio::sync::broadcast;
 
     const CHANNEL: &str = "chan";
     const WAKE: &[WakeOn] = &[WakeOn { channel: CHANNEL, concerns: |p| p == "mine" }];
+    const LOOP: &str = "test";
 
     /// A drain body that records when it ran and answers from a script
     /// (then `Done` once the script is spent).
@@ -534,7 +987,7 @@ mod tests {
         let (_tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
         let body = scripted(runs.clone(), vec![DrainStep::More, DrainStep::More]);
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", body));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, body));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.lock().unwrap().len(), 3, "More, More, Done");
     }
@@ -543,7 +996,7 @@ mod tests {
     async fn a_wake_that_concerns_it_drains_and_one_that_does_not_is_ignored() {
         let (tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         tx.send(signal("theirs")).unwrap();
         tx.send(Heard::Signal { channel: "other", payload: "mine".into() }).unwrap();
@@ -554,12 +1007,17 @@ mod tests {
         assert_eq!(runs.lock().unwrap().len(), 2);
     }
 
+    /// A recheck (notifications may have been lost) drains; a watch back
+    /// from a quiet spell does not: the process that wrote rang the role.
     #[tokio::test(start_paused = true)]
-    async fn a_recheck_drains() {
+    async fn a_recheck_drains_and_a_resume_does_not() {
         let (tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(Heard::Resumed).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(runs.lock().unwrap().len(), 1, "a resume is not a reason to look");
         tx.send(Heard::Recheck).unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.lock().unwrap().len(), 2);
@@ -571,7 +1029,7 @@ mod tests {
     async fn a_timed_loop_ignores_rechecks() {
         let (tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), &[], Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), &[], Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         for _ in 0..3 {
             tx.send(Heard::Recheck).unwrap();
@@ -586,7 +1044,7 @@ mod tests {
     async fn a_burst_of_wakes_costs_one_drain() {
         let (tx, rx) = broadcast::channel(64);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         for _ in 0..20 {
             tx.send(signal("mine")).unwrap();
@@ -599,7 +1057,7 @@ mod tests {
     async fn with_no_signal_the_safety_tick_drains() {
         let (_tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(61)).await;
         let runs = runs.lock().unwrap().clone();
         assert_eq!(runs, vec![Duration::ZERO, Duration::from_secs(30), Duration::from_secs(60)]);
@@ -610,7 +1068,7 @@ mod tests {
         let (_tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
         let body = scripted(runs.clone(), vec![DrainStep::RetryIn(Duration::from_millis(100)), DrainStep::Done]);
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", body));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, body));
         tokio::time::sleep(Duration::from_secs(1)).await;
         let runs = runs.lock().unwrap().clone();
         assert_eq!(runs, vec![Duration::ZERO, Duration::from_millis(100)]);
@@ -620,10 +1078,27 @@ mod tests {
     async fn a_stopped_watch_ends_the_loop() {
         let (tx, rx) = broadcast::channel::<Heard>(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        let handle = tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
+        let handle = tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         drop(tx);
         handle.await.unwrap();
+    }
+
+    fn drain_loop(name: &'static str, wake_on: &'static [WakeOn]) -> DrainLoop {
+        DrainLoop::new(name, "test things", wake_on, Duration::from_secs(30), || async { Ok(DrainStep::Done) })
+    }
+
+    /// A role scaled to zero refuses to start with a loop nothing would
+    /// ever run again: woken by no write, booked by no loop it has.
+    #[test]
+    fn a_loop_nothing_wakes_or_books_is_refused() {
+        let rung = drain_loop("rung", WAKE);
+        let booked = drain_loop("booked", &[]).booked_by(&["rung"]);
+        check_woken(CoreRole::Dispatcher, &[rung.clone(), booked]).expect("every loop is rung or booked");
+        let err = check_woken(CoreRole::Dispatcher, &[rung.clone(), drain_loop("sweep", &[])]).unwrap_err();
+        assert!(err.to_string().contains("'sweep'"), "{err}");
+        let err = check_woken(CoreRole::Dispatcher, &[rung, drain_loop("orphan", &[]).booked_by(&["gone"])]).unwrap_err();
+        assert!(err.to_string().contains("'gone'"), "{err}");
     }
 }
 
@@ -631,53 +1106,60 @@ mod tests {
 mod plan_tests {
     use super::*;
 
-    fn due(at: i64) -> Option<Booked> {
-        Some(Booked { due_ms: Some(at), written_ms: 0 })
+    fn due(at: i64, seq: i64) -> Option<Booked> {
+        Some(Booked { due_ms: Some(at), seq })
     }
 
-    fn asleep(written_ms: i64) -> Option<Booked> {
-        Some(Booked { due_ms: None, written_ms })
+    fn asleep(seq: i64) -> Option<Booked> {
+        Some(Booked { due_ms: None, seq })
     }
-
-    const SWEEP: Option<Duration> = Some(Duration::from_millis(50));
 
     #[test]
     fn a_woken_loop_always_runs() {
-        assert_eq!(plan(true, Some(100), due(1_000), None), Plan::Run);
-        assert_eq!(plan(true, Some(100), asleep(100), None), Plan::Run);
-        assert_eq!(plan(true, None, None, None), Plan::Run, "even when the due times could not be read");
+        assert_eq!(plan(true, None, 100, due(1_000, 1)), Plan::Run);
+        assert_eq!(plan(true, None, 100, asleep(1)), Plan::Run);
     }
 
     #[test]
-    fn a_loop_with_no_row_or_a_row_due_runs_and_one_booked_later_sleeps() {
-        assert_eq!(plan(false, Some(100), None, None), Plan::Run, "no row: due now");
-        assert_eq!(plan(false, Some(100), due(100), None), Plan::Run);
-        assert_eq!(plan(false, Some(100), due(50), None), Plan::Run);
-        assert_eq!(plan(false, Some(100), due(101), None), Plan::SleepUntil(101));
+    fn a_loop_with_no_row_or_a_row_due_runs_and_one_booked_later_is_left() {
+        assert_eq!(plan(false, None, 100, None), Plan::Run, "no row: due now");
+        assert_eq!(plan(false, None, 100, due(100, 1)), Plan::Run);
+        assert_eq!(plan(false, None, 100, due(50, 1)), Plan::Run);
+        assert_eq!(plan(false, None, 100, due(101, 1)), Plan::Leave, "its own wake comes then");
     }
 
-    /// A loop with nothing left sleeps until a write wakes it, however
-    /// long ago it was booked; a sweep no write wakes runs again on the
-    /// first pass after its interval, and never sooner.
+    /// The wake of the current booking runs its loop even when the
+    /// database's clock says a hair too early; a stale wake (its booking
+    /// moved since) runs nothing.
     #[test]
-    fn an_asleep_loop_waits_for_a_write_and_a_sweep_for_its_interval() {
-        assert_eq!(plan(false, Some(1_000_000), asleep(0), None), Plan::Asleep);
-        assert_eq!(plan(false, Some(100), asleep(60), SWEEP), Plan::Asleep);
-        assert_eq!(plan(false, Some(110), asleep(60), SWEEP), Plan::Run);
-        assert_eq!(plan(false, Some(100), due(150), SWEEP), Plan::SleepUntil(150), "a look it asked for stands");
+    fn the_current_bookings_wake_runs_its_loop_and_a_stale_one_does_not() {
+        assert_eq!(plan(false, Some(4), 100, due(150, 4)), Plan::Run);
+        assert_eq!(plan(false, Some(3), 100, due(150, 4)), Plan::Leave);
+        assert_eq!(plan(false, Some(4), 100, asleep(4)), Plan::Leave, "the booking was cleared since");
+    }
+
+    /// A loop with nothing left waits for a write however long ago it was
+    /// booked: nothing runs "just in case".
+    #[test]
+    fn an_asleep_loop_waits_for_a_write() {
+        assert_eq!(plan(false, None, 1_000_000, asleep(0)), Plan::Leave);
     }
 
     #[test]
-    fn an_unread_due_time_is_unknown() {
-        assert_eq!(plan(false, None, due(1), None), Plan::Unknown);
-        assert_eq!(plan(false, None, None, SWEEP), Plan::Unknown);
+    fn sooner_reads_an_empty_look_as_the_latest() {
+        assert_eq!(sooner(None, Some(5)), Some(5));
+        assert_eq!(sooner(Some(3), Some(5)), Some(3));
+        assert_eq!(sooner(None, None), None);
     }
 
+    /// A tick body with nothing in it is the empty one, and an old or
+    /// foreign body (a push from another service) reads as one too.
     #[test]
-    fn a_due_time_converts_to_an_instant_on_the_reading_it_came_with() {
-        let taken = Instant::now();
-        assert_eq!(instant_of((1_000, taken), 3_500), taken + Duration::from_millis(2_500));
-        assert_eq!(instant_of((1_000, taken), 400), taken, "one already past is due at the reading");
+    fn a_tick_body_round_trips_and_defaults() {
+        let body = TickBody { loops: vec!["a".into()], booked: Some(BookedLook { loop_name: "b".into(), seq: 2, set_again: 1 }), after_failed_ring: true };
+        assert_eq!(serde_json::from_value::<TickBody>(serde_json::to_value(&body).unwrap()).unwrap(), body);
+        assert_eq!(serde_json::to_value(TickBody::default()).unwrap(), serde_json::json!({}));
+        assert_eq!(serde_json::from_value::<TickBody>(serde_json::json!({ "message": {} })).unwrap(), TickBody::default());
     }
 }
 
@@ -685,159 +1167,332 @@ mod plan_tests {
 mod drain_due_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
+    use std::sync::Mutex;
+    use weft_platform_traits::FakeAlarm;
 
-    const NONE: &[WakeOn] = &[];
     const WRITES: &[WakeOn] = &[WakeOn::any("chan")];
-    const ROLE: &str = "dispatcher";
+    const ROLE: CoreRole = CoreRole::Dispatcher;
 
     async fn schema(pool: &PgPool) {
-        crate::apply_groups(pool, &[&GROUP]).await.expect("role_loop_due schema");
+        crate::apply_groups(pool, &[&GROUP, &crate::unanswered::GROUP]).await.expect("role_loop_due schema");
+        crate::unanswered::judged_run_columns(pool).await.expect("the run columns");
     }
 
-    fn counting(name: &'static str, safety: u64) -> (DrainLoop, Arc<AtomicU32>) {
+    fn booking(pool: &PgPool) -> (Booking, Arc<FakeAlarm>) {
+        let alarm = Arc::new(FakeAlarm::new());
+        (Booking::new(pool.clone(), ROLE, alarm.clone()), alarm)
+    }
+
+    fn counting(name: &'static str, step: DrainStep) -> (DrainLoop, Arc<AtomicU32>) {
         let runs = Arc::new(AtomicU32::new(0));
         let counter = runs.clone();
-        let l = DrainLoop::new(name, NONE, Duration::from_secs(safety), move || {
+        let l = DrainLoop::new(name, "count", WRITES, Duration::from_secs(30), move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            async { Ok(DrainStep::Done) }
+            async move { Ok(step) }
         });
         (l, runs)
     }
 
-    fn approx(d: Duration, secs: u64) -> bool {
-        d <= Duration::from_secs(secs) && d + Duration::from_secs(2) > Duration::from_secs(secs)
+    /// A tick's pass, with a minute to drain and no watch.
+    async fn pass(booking: &Booking, loops: &[DrainLoop], call: &TickBody) -> std::result::Result<(), PassFailed> {
+        drain_due(booking, loops, call, Duration::from_secs(60), None).await
     }
 
-    async fn due_ms(pool: &PgPool, name: &str) -> Option<i64> {
-        sqlx::query_scalar("SELECT due_ms FROM role_loop_due WHERE role = $1 AND loop_name = $2")
-            .bind(ROLE)
+    async fn written(pool: &PgPool) -> Vec<(String, Option<String>, String)> {
+        sqlx::query_as("SELECT callee, label, error FROM unanswered_call ORDER BY callee").fetch_all(pool).await.unwrap()
+    }
+
+    async fn row(pool: &PgPool, name: &str) -> (Option<i64>, i64, i32) {
+        sqlx::query_as("SELECT due_ms, seq, failures FROM role_loop_due WHERE role = $1 AND loop_name = $2")
+            .bind(ROLE.as_str())
             .bind(name)
             .fetch_one(pool)
             .await
             .unwrap()
     }
 
+    async fn db_now(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(&format!("SELECT {DB_NOW_MS}")).fetch_one(pool).await.unwrap()
+    }
+
+    fn named(names: &[&str]) -> TickBody {
+        TickBody { loops: names.iter().map(|n| n.to_string()).collect(), ..TickBody::default() }
+    }
+
+    /// A fresh pass drains every loop; one that asks for a look books it
+    /// with one wake for exactly that loop, and one with nothing left
+    /// books nothing.
     #[sqlx::test]
-    async fn a_fresh_pass_drains_every_loop_and_answers_the_soonest_look(pool: PgPool) {
+    async fn a_fresh_pass_drains_every_loop_and_books_only_the_looks_asked_for(pool: PgPool) {
         schema(&pool).await;
+        let (booking, alarm) = booking(&pool);
         let a_runs = Arc::new(AtomicU32::new(0));
         let runs = a_runs.clone();
-        let a = DrainLoop::new("a", NONE, Duration::from_secs(60), move || {
+        let a = DrainLoop::new("a", "a things", WRITES, Duration::from_secs(60), move || {
             let n = runs.fetch_add(1, Ordering::SeqCst);
             async move { Ok(if n < 2 { DrainStep::More } else { DrainStep::Done }) }
         });
-        let b = DrainLoop::new("b", NONE, Duration::from_secs(30), || async { Ok(DrainStep::RetryIn(Duration::from_secs(5))) });
-        let c = DrainLoop::new("c", NONE, Duration::from_secs(90), || async { anyhow::bail!("boom") });
-        let next = drain_due(&pool, ROLE, &[a, b, c], &[]).await;
+        let (b, _) = counting("b", DrainStep::RetryIn(Duration::from_secs(5)));
+        let before = db_now(&pool).await;
+        pass(&booking, &[a, b], &TickBody::default()).await.unwrap();
         assert_eq!(a_runs.load(Ordering::SeqCst), 3, "More, More, Done");
-        assert!(approx(next.expect("a look is due"), 5), "the RetryIn is the soonest: {next:?}");
+        assert_eq!(row(&pool, "a").await.0, None, "nothing left: asleep until woken");
+        let (due, seq, _) = row(&pool, "b").await;
+        let due = due.expect("b asked for a look");
+        assert!(due >= before + 5_000 && due < before + 7_000, "{due} vs {before}");
+        let wakes = alarm.wakes();
+        assert_eq!(wakes, vec![loop_wake(ROLE, "b", due, seq)], "one wake, for b alone");
+        assert_eq!(wakes[0].queue, WakeQueue::Internal);
     }
 
-    /// Two loops that always have more both drain within one pass, each
-    /// for its share of it, and both book themselves due now.
+    /// Moving a booking sets the new wake and cancels the old one; clearing
+    /// it cancels it; a booking that does not move touches no wake.
     #[sqlx::test]
-    async fn loops_that_always_have_more_share_the_pass(pool: PgPool) {
+    async fn a_booking_that_moves_replaces_its_wake_and_one_cleared_cancels_it(pool: PgPool) {
         schema(&pool).await;
-        let busy = |name: &'static str| {
-            let runs = Arc::new(AtomicU32::new(0));
-            let counter = runs.clone();
-            let l = DrainLoop::new(name, NONE, Duration::from_secs(60), move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                async {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    Ok(DrainStep::More)
-                }
-            });
-            (l, runs)
-        };
-        let ((first, first_runs), (second, second_runs)) = (busy("first"), busy("second"));
-        sqlx::query("INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms) VALUES ($1, 'renamed', 0, 0)").bind(ROLE).execute(&pool).await.unwrap();
-        let next = drain_pass(&pool, ROLE, &[first, second], &[], Duration::from_millis(200)).await;
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM role_loop_due WHERE loop_name = 'renamed'").fetch_one(&pool).await.unwrap();
-        assert_eq!(left, 0, "a loop this role no longer has is forgotten");
-        book(&pool, ROLE, "another_wefts", Some(Duration::from_secs(60)), None).await.unwrap();
-        let (fresh, _) = busy("fresh");
-        drain_pass(&pool, ROLE, &[fresh], &[], Duration::from_millis(50)).await;
-        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM role_loop_due WHERE loop_name = 'another_wefts'").fetch_one(&pool).await.unwrap();
-        assert_eq!(kept, 1, "a loop another weft booked lately is left to it");
-        assert!(first_runs.load(Ordering::SeqCst) > 1 && second_runs.load(Ordering::SeqCst) > 1, "both drained");
-        assert!(next.expect("a look is due") < Duration::from_secs(1), "and both are due again at once: {next:?}");
-        let now: i64 = sqlx::query_scalar(&format!("SELECT {DB_NOW_MS}")).fetch_one(&pool).await.unwrap();
-        assert!(due_ms(&pool, "first").await.unwrap() <= now && due_ms(&pool, "second").await.unwrap() <= now);
+        let (booking, alarm) = booking(&pool);
+        let now = db_now(&pool).await;
+        booking.book("x", Some(now + 60_000)).await.unwrap();
+        booking.book("x", Some(now + 60_000)).await.unwrap();
+        assert_eq!(alarm.wakes().len(), 1, "the same moment again is no new wake");
+        booking.book("x", Some(now + 3_600_000)).await.unwrap();
+        let first = loop_wake(ROLE, "x", now + 60_000, 1);
+        let second = loop_wake(ROLE, "x", now + 3_600_000, 2);
+        assert_eq!(alarm.wakes(), vec![first.clone(), second.clone()]);
+        assert_eq!(alarm.cancelled(), vec![first.clone()], "moved later: the old wake is cancelled");
+        assert_ne!(first.name(), second.name());
+        booking.book("x", None).await.unwrap();
+        assert_eq!(alarm.cancelled(), vec![first, second], "cleared: its wake too");
+        assert!(alarm.pending().is_empty());
+        assert_eq!(row(&pool, "x").await, (None, 2, 0));
     }
 
-    /// A quiet install books no wake at all: a loop with nothing left
-    /// sleeps until a write wakes it, and a sweep (which no write wakes)
-    /// waits for a pass that happens anyway. Only a loop a write wakes that
-    /// failed is looked at again, at its safety interval.
+    /// Booking a sooner look never pushes one already booked back, and a
+    /// look already booked in time costs no write.
     #[sqlx::test]
-    async fn a_quiet_pass_books_no_wake_and_a_failed_one_its_safety(pool: PgPool) {
+    async fn a_sooner_look_never_pushes_a_booking_back(pool: PgPool) {
         schema(&pool).await;
-        let quiet = DrainLoop::new("quiet", WRITES, Duration::from_secs(30), || async { Ok(DrainStep::Done) });
-        let (sweep, _) = counting("sweep", 30);
-        assert_eq!(drain_due(&pool, ROLE, &[quiet.clone(), sweep.clone()], &[]).await, None);
-        assert_eq!(due_ms(&pool, "quiet").await, None, "asleep until woken");
-        assert_eq!(drain_due(&pool, ROLE, &[quiet, sweep], &[]).await, None, "and a pass right after runs nothing");
-        let failing_sweep = DrainLoop::new("failing_sweep", NONE, Duration::from_secs(90), || async { anyhow::bail!("boom") });
-        assert_eq!(drain_due(&pool, ROLE, &[failing_sweep], &[]).await, None, "a sweep that failed runs on a later pass");
-        let failing = DrainLoop::new("failing", WRITES, Duration::from_secs(90), || async { anyhow::bail!("boom") });
-        assert!(approx(drain_due(&pool, ROLE, &[failing], &[]).await.expect("a look is due"), 90));
+        let (booking, alarm) = booking(&pool);
+        let now = db_now(&pool).await;
+        booking.book_sooner("lapses", now + 60_000).await.unwrap();
+        booking.book_sooner("lapses", now + 120_000).await.unwrap();
+        assert_eq!(row(&pool, "lapses").await.0, Some(now + 60_000));
+        assert_eq!(alarm.wakes().len(), 1, "a later look leaves the booking as it is");
+        booking.book_sooner("lapses", now + 30_000).await.unwrap();
+        assert_eq!(row(&pool, "lapses").await.0, Some(now + 30_000));
+        assert_eq!(alarm.pending(), vec![loop_wake(ROLE, "lapses", now + 30_000, 2)]);
     }
 
-    /// The due times are the database's, not a process's: a pass started
-    /// fresh (any instance the tick lands on) sees what an earlier pass
-    /// booked, and a pass for one woken loop leaves the others asleep
-    /// until they are due, so a write never sets off every sweep.
+    /// The wake of a booking still current runs its loop even before the
+    /// database's clock reaches it; a wake whose booking moved since runs
+    /// nothing; a woken loop runs whatever its booking.
     #[sqlx::test]
-    async fn a_woken_pass_runs_the_woken_loop_and_leaves_the_rest_until_due(pool: PgPool) {
+    async fn a_tick_runs_its_current_booking_and_its_woken_loops_only(pool: PgPool) {
         schema(&pool).await;
-        let (hourly, hourly_runs) = counting("hourly", 3600);
-        let picker_runs = Arc::new(AtomicU32::new(0));
-        let counter = picker_runs.clone();
-        let picker = DrainLoop::new("picker", NONE, Duration::from_secs(30), move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-            async { Ok(DrainStep::RetryIn(Duration::from_secs(30))) }
-        });
-        let loops = [hourly, picker];
-        drain_due(&pool, ROLE, &loops, &[]).await;
-        let next = drain_due(&pool, ROLE, &loops, &["picker".to_string()]).await;
-        assert_eq!(hourly_runs.load(Ordering::SeqCst), 1, "not due again until its interval");
-        assert_eq!(picker_runs.load(Ordering::SeqCst), 2, "woken");
-        assert!(approx(next.expect("a look is due"), 30), "{next:?}");
-        drain_due(&pool, ROLE, &loops, &[]).await;
-        assert_eq!(picker_runs.load(Ordering::SeqCst), 2, "nothing woken, nothing due");
-        let (other_role, other_runs) = counting("hourly", 3600);
-        drain_due(&pool, "broker", &[other_role], &[]).await;
-        assert_eq!(other_runs.load(Ordering::SeqCst), 1, "another role's loop of the same name has its own row");
+        let (booking, _) = booking(&pool);
+        let (x, x_runs) = counting("x", DrainStep::Done);
+        let (y, y_runs) = counting("y", DrainStep::Done);
+        let loops = [x, y];
+        pass(&booking, &loops, &TickBody::default()).await.unwrap();
+        assert_eq!((x_runs.load(Ordering::SeqCst), y_runs.load(Ordering::SeqCst)), (1, 1), "no rows: both due");
+        let now = db_now(&pool).await;
+        booking.book("x", Some(now + 600_000)).await.unwrap();
+        let stale = TickBody { booked: Some(BookedLook { loop_name: "x".into(), seq: 0, set_again: 0 }), ..TickBody::default() };
+        pass(&booking, &loops, &stale).await.unwrap();
+        assert_eq!(x_runs.load(Ordering::SeqCst), 1, "a stale wake runs nothing");
+        let current = TickBody { booked: Some(BookedLook { loop_name: "x".into(), seq: 1, set_again: 0 }), ..TickBody::default() };
+        pass(&booking, &loops, &current).await.unwrap();
+        assert_eq!(x_runs.load(Ordering::SeqCst), 2, "the current booking's wake runs it");
+        assert_eq!(y_runs.load(Ordering::SeqCst), 1, "and nothing else");
+        pass(&booking, &loops, &named(&["y"])).await.unwrap();
+        assert_eq!((x_runs.load(Ordering::SeqCst), y_runs.load(Ordering::SeqCst)), (2, 2));
     }
 
-    /// In a process that scales to zero, a loop run for the life of the
-    /// process drains at start and when a write wakes it, and on its
-    /// safety interval only once the process had work since: a process
-    /// left idle queries nothing.
+    /// The tick body of the wake booking `seq` of `name` set.
+    fn booked(name: &str, seq: i64) -> TickBody {
+        TickBody { booked: Some(BookedLook { loop_name: name.into(), seq, set_again: 0 }), ..TickBody::default() }
+    }
+
+    /// A drain that fails books its retries, a little later each time,
+    /// and its pass goes through; past the last retry it books nothing,
+    /// keeps no look already spent, and is written down for `weft status`.
+    /// From then on only a ring runs it, each failure rewriting the error,
+    /// and its next success clears what was written.
     #[sqlx::test]
-    async fn a_loop_looks_on_its_interval_only_while_its_process_works(pool: PgPool) {
-        let watch = PgSignalWatch::start(&pool.connect_options(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
+    async fn a_failing_loop_retries_then_stops_written_down_until_a_ring_drains_it(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, alarm) = booking(&pool);
+        let error: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some("the database is down")));
+        let failing = error.clone();
         let runs = Arc::new(AtomicU32::new(0));
         let counter = runs.clone();
-        let l = DrainLoop::new("woken", WRITES, Duration::from_millis(200), move || {
+        let l = DrainLoop::new("flaky", "hand queued runs to workers", WRITES, Duration::from_secs(30), move || {
             counter.fetch_add(1, Ordering::SeqCst);
+            let error = *failing.lock().unwrap();
+            async move {
+                match error {
+                    Some(error) => anyhow::bail!(error),
+                    None => Ok(DrainStep::Done),
+                }
+            }
+        });
+        let loops = [l];
+        let mut call = named(&["flaky"]);
+        for (n, pause) in RETRY_PAUSES.iter().enumerate() {
+            let before = db_now(&pool).await;
+            pass(&booking, &loops, &call).await.expect("a retry booked is a pass that went through");
+            let (due, seq, failures) = row(&pool, "flaky").await;
+            let due = due.expect("a retry is booked");
+            assert!(due >= before + millis(*pause) && due < before + millis(*pause) + 2_000, "retry {n}: {due} vs {before}");
+            assert_eq!((seq, failures), (n as i64 + 1, n as i32 + 1));
+            assert!(written(&pool).await.is_empty(), "nothing written down while it retries");
+            call = booked("flaky", seq);
+        }
+        assert_eq!(alarm.wakes().len(), RETRY_PAUSES.len());
+        pass(&booking, &loops, &call).await.expect("written down, the pass went through");
+        assert_eq!(row(&pool, "flaky").await, (None, RETRY_PAUSES.len() as i64, RETRY_PAUSES.len() as i32 + 1), "no look left");
+        let label = Some("hand queued runs to workers".to_string());
+        assert_eq!(written(&pool).await, vec![("loop:dispatcher:flaky".into(), label.clone(), "the database is down".into())]);
+        assert_eq!(alarm.wakes().len(), RETRY_PAUSES.len(), "no wake past the last retry");
+
+        let ran = runs.load(Ordering::SeqCst);
+        pass(&booking, &loops, &TickBody::default()).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), ran, "another pass of its role leaves it alone");
+        *error.lock().unwrap() = Some("permission denied");
+        pass(&booking, &loops, &named(&["flaky"])).await.unwrap();
+        assert_eq!(row(&pool, "flaky").await.0, None, "a ring that fails books nothing either");
+        assert_eq!(written(&pool).await, vec![("loop:dispatcher:flaky".into(), label, "permission denied".into())], "the latest error");
+        *error.lock().unwrap() = None;
+        pass(&booking, &loops, &named(&["flaky"])).await.unwrap();
+        assert_eq!(row(&pool, "flaky").await, (None, RETRY_PAUSES.len() as i64, 0));
+        assert!(written(&pool).await.is_empty(), "its success clears it");
+    }
+
+    /// A booking whose wake cannot be set leaves the booking as it was and
+    /// is written down, and the call goes through: a later booking sets the
+    /// wake, and the loop's next drain clears what was written.
+    #[sqlx::test]
+    async fn a_wake_that_cannot_be_set_leaves_no_booking_without_one(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, alarm) = booking(&pool);
+        alarm.fail_sets(true);
+        let now = db_now(&pool).await;
+        booking.book("x", Some(now + 60_000)).await.expect("written down");
+        assert_eq!(row(&pool, "x").await, (None, 0, 0));
+        assert_eq!(written(&pool).await.into_iter().map(|w| w.0).collect::<Vec<_>>(), vec!["loop:dispatcher:x".to_string()]);
+        alarm.fail_sets(false);
+        booking.book_sooner("x", now + 60_000).await.unwrap();
+        assert_eq!(row(&pool, "x").await, (Some(now + 60_000), 1, 0));
+        assert_eq!(alarm.pending(), vec![loop_wake(ROLE, "x", now + 60_000, 1)]);
+        assert_eq!(written(&pool).await.len(), 1, "a booking that goes through is not a drain");
+        let (x, _) = counting("x", DrainStep::Done);
+        pass(&booking, &[x], &named(&["x"])).await.unwrap();
+        assert!(written(&pool).await.is_empty());
+    }
+
+    /// A wake set again by a tick it arrived early at is the one a booking
+    /// that moves cancels, once the loop's row knows of it; a wake of a
+    /// booking no longer current changes nothing.
+    #[sqlx::test]
+    async fn a_booking_that_moves_cancels_its_wake_as_set_again(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, alarm) = booking(&pool);
+        let now = db_now(&pool).await;
+        booking.book("x", Some(now + 3_600_000)).await.unwrap();
+        let again = BookedLook { loop_name: "x".into(), seq: 1, set_again: 2 };
+        set_again_recorded(&pool, ROLE, &again).await.unwrap();
+        set_again_recorded(&pool, ROLE, &BookedLook { set_again: 1, ..again.clone() }).await.unwrap();
+        set_again_recorded(&pool, ROLE, &BookedLook { loop_name: "x".into(), seq: 0, set_again: 9 }).await.unwrap();
+        booking.book("x", Some(now + 60_000)).await.unwrap();
+        assert_eq!(alarm.cancelled(), vec![again.wake(ROLE, now + 3_600_000)]);
+        booking.book("x", Some(now + 120_000)).await.unwrap();
+        assert_eq!(alarm.cancelled()[1], loop_wake(ROLE, "x", now + 60_000, 2), "a new booking starts from its own wake");
+    }
+
+    /// A pass that failed and could not write that down is written down by
+    /// the writer whose ring it answered, without changing when any loop
+    /// is due: a loop with no row stays due now, one booked keeps its
+    /// look. The loop's next drain that goes through clears it.
+    #[sqlx::test]
+    async fn a_failed_pass_written_down_by_its_ringer_is_cleared_by_the_next_drain(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, _) = booking(&pool);
+        let later = db_now(&pool).await + 3_600_000;
+        booking.book("y", Some(later)).await.unwrap();
+        let failed = PassFailed { loops: vec!["x".to_string(), "y".to_string()], error: "the database is down".to_string() };
+        pass_failed(&pool, ROLE, &failed).await.unwrap();
+        let why = "its pass could not write down how it went: the database is down".to_string();
+        assert_eq!(
+            written(&pool).await.into_iter().map(|w| (w.0, w.2)).collect::<Vec<_>>(),
+            vec![("loop:dispatcher:x".to_string(), why.clone()), ("loop:dispatcher:y".to_string(), why.clone())]
+        );
+        assert_eq!(row(&pool, "y").await.0, Some(later), "a booked look is kept");
+        let (x, x_runs) = counting("x", DrainStep::Done);
+        let (y, y_runs) = counting("y", DrainStep::Done);
+        pass(&booking, &[x, y], &TickBody::default()).await.unwrap();
+        assert_eq!((x_runs.load(Ordering::SeqCst), y_runs.load(Ordering::SeqCst)), (1, 0), "x was due and still is; y waits for its look");
+        assert_eq!(written(&pool).await.into_iter().map(|w| w.0).collect::<Vec<_>>(), vec!["loop:dispatcher:y".to_string()]);
+    }
+
+    /// A pass whose database stops answering partway names only the loops
+    /// it could not write down: one that drained and was booked before is
+    /// not among them.
+    #[sqlx::test]
+    async fn a_failed_pass_names_only_the_loops_it_could_not_write_down(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, _) = booking(&pool);
+        let (a, _) = counting("a", DrainStep::Done);
+        let breaks = pool.clone();
+        let b = DrainLoop::new("b", "break the table", WRITES, Duration::from_secs(30), move || {
+            let pool = breaks.clone();
+            async move {
+                sqlx::query("ALTER TABLE role_loop_due RENAME TO role_loop_gone").execute(&pool).await?;
+                Ok(DrainStep::Done)
+            }
+        });
+        let failed = pass(&booking, &[a, b], &named(&["a", "b"])).await.unwrap_err();
+        assert_eq!(failed.loops, vec!["b".to_string()]);
+        assert!(failed.error.contains("b: "), "{}", failed.error);
+    }
+
+    /// A pass that cannot read when the loops are due runs nothing and
+    /// fails, so the queue calls the tick again, naming the loops its call
+    /// names, or every loop when it names none.
+    #[sqlx::test]
+    async fn a_pass_that_cannot_read_the_due_times_fails(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, _) = booking(&pool);
+        sqlx::query("DROP TABLE role_loop_due").execute(&pool).await.unwrap();
+        let (x, runs) = counting("x", DrainStep::Done);
+        let (y, _) = counting("y", DrainStep::Done);
+        let loops = [x, y];
+        assert_eq!(pass(&booking, &loops, &named(&["x"])).await.unwrap_err().loops, vec!["x".to_string()]);
+        assert_eq!(pass(&booking, &loops, &TickBody::default()).await.unwrap_err().loops, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    /// A loop drains with its process's watch held, and a pass that runs
+    /// no loop (a wake whose booking moved since) does not take it.
+    #[sqlx::test]
+    async fn a_pass_holds_the_watch_only_while_a_loop_runs(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, _) = booking(&pool);
+        let watch = PgSignalWatch::start(&pool.connect_options(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let (seen, looking) = (held.clone(), watch.clone());
+        let l = DrainLoop::new("x", "test things", WRITES, Duration::from_secs(30), move || {
+            seen.lock().unwrap().push(looking.holds());
             async { Ok(DrainStep::Done) }
         });
-        let subscription = watch.subscribe();
-        let looks = Looks::WhileWorking(watch.clone());
-        tokio::spawn(async move { l.run_forever(subscription, looks).await });
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the start drain, and no safety look since");
-        sqlx::query("SELECT pg_notify('chan', '')").execute(&pool).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "a write wakes it");
-        drop(watch.busy().await);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(runs.load(Ordering::SeqCst), 3, "work since: the safety look runs");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(runs.load(Ordering::SeqCst), 3, "and none after it while nothing works");
+        let loops = [l];
+        let now = db_now(&pool).await;
+        booking.book("x", Some(now + 600_000)).await.unwrap();
+        let stale = TickBody { booked: Some(BookedLook { loop_name: "x".into(), seq: 0, set_again: 0 }), ..TickBody::default() };
+        drain_due(&booking, &loops, &stale, Duration::from_secs(60), Some(&watch)).await.unwrap();
+        assert!(held.lock().unwrap().is_empty() && !watch.holds(), "nothing ran, nothing held");
+        drain_due(&booking, &loops, &named(&["x"]), Duration::from_secs(60), Some(&watch)).await.unwrap();
+        assert_eq!(*held.lock().unwrap(), vec![true]);
+        assert!(!watch.holds(), "let go once the pass ended");
     }
 
     /// A pass that drained a loop replaces its booking when nobody wrote
@@ -846,25 +1501,76 @@ mod drain_due_tests {
     #[sqlx::test]
     async fn a_booking_keeps_a_sooner_look_a_sibling_wrote_since_the_read(pool: PgPool) {
         schema(&pool).await;
+        let (booking, _) = booking(&pool);
         let soon = Duration::from_secs(10);
         let later = Duration::from_secs(3600);
 
-        // Nobody wrote since the read: the new booking stands, even later.
-        book(&pool, ROLE, "x", Some(soon), None).await.unwrap();
+        booking.rebook("x", None, Step::Drained(Some(soon)), Rule::Exactly).await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let read_at = read_due(&pool, ROLE).await.unwrap().now;
-        let (due, now) = book(&pool, ROLE, "x", Some(later), Some(read_at)).await.unwrap();
-        assert_eq!(due, Some(now + 3_600_000));
-        assert_eq!(due_ms(&pool, "x").await, due);
+        let read_at = read_due(&pool, ROLE.as_str()).await.unwrap().now;
+        booking.rebook("x", None, Step::Drained(Some(later)), Rule::SinceRead(read_at)).await.unwrap();
+        let due = row(&pool, "x").await.0.unwrap();
+        assert!(due >= read_at + 3_600_000, "nobody wrote since the read: the later look stands");
 
-        // A sibling booked a sooner look after this pass read: it stands,
-        // even over a pass that found nothing left.
-        let read_at = read_due(&pool, ROLE).await.unwrap().now;
+        let read_at = read_due(&pool, ROLE.as_str()).await.unwrap().now;
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let (sibling_due, _) = book(&pool, ROLE, "x", Some(soon), None).await.unwrap();
-        let (asleep, _) = book(&pool, ROLE, "x", None, Some(read_at)).await.unwrap();
-        assert_eq!(asleep, sibling_due, "the sibling's look outlasts an empty booking");
-        let (due, _) = book(&pool, ROLE, "x", Some(later), Some(read_at)).await.unwrap();
-        assert_eq!(due, sibling_due, "the sibling's sooner look is kept");
+        booking.rebook("x", None, Step::Drained(Some(soon)), Rule::Exactly).await.unwrap();
+        let sibling_due = row(&pool, "x").await.0;
+        booking.rebook("x", None, Step::Drained(None), Rule::SinceRead(read_at)).await.unwrap();
+        assert_eq!(row(&pool, "x").await.0, sibling_due, "the sibling's look outlasts an empty booking");
+        booking.rebook("x", None, Step::Drained(Some(later)), Rule::SinceRead(read_at)).await.unwrap();
+        assert_eq!(row(&pool, "x").await.0, sibling_due, "the sibling's sooner look is kept");
+    }
+
+    /// Scaled to zero, a loop run for the life of its process drains only
+    /// when a write wakes it (no start drain, no timed look), and keeps no
+    /// timer for the look its drain asks for: the tick books it.
+    #[sqlx::test]
+    async fn a_working_process_never_looks_on_a_timer(pool: PgPool) {
+        schema(&pool).await;
+        let watch = PgSignalWatch::start(&pool.connect_options(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
+        let runs = Arc::new(AtomicU32::new(0));
+        let counter = runs.clone();
+        let l = DrainLoop::new("woken", "test things", WRITES, Duration::from_millis(200), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok(DrainStep::RetryIn(Duration::from_millis(100))) }
+        });
+        let subscription = watch.subscribe();
+        let looks = Looks::WhileWorking(watch.clone());
+        tokio::spawn(async move { l.run_forever(subscription, looks).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no start drain, no safety look");
+        sqlx::query("SELECT pg_notify('chan', '')").execute(&pool).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "a write wakes it");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "and nothing after it, not even the look it asked for");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM role_loop_due").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0, "and it books nothing: the tick rung for the same write does");
+    }
+
+    /// A row of a loop this role no longer has is forgotten once nobody
+    /// booked it for a day; one booked lately is left to the other weft
+    /// that may still run it.
+    #[sqlx::test]
+    async fn a_loop_this_role_no_longer_has_is_forgotten(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, _) = booking(&pool);
+        sqlx::query("INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, seq) VALUES ($1, 'renamed', 5, 0, 3)")
+            .bind(ROLE.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = db_now(&pool).await;
+        booking.book("another_wefts", Some(now + 60_000)).await.unwrap();
+        for name in ["renamed", "another_wefts"] {
+            crate::unanswered::failed(&pool, Callee::Loop { role: ROLE.as_str(), name }, None, "it failed").await.unwrap().log();
+        }
+        let (fresh, _) = counting("fresh", DrainStep::Done);
+        pass(&booking, &[fresh], &TickBody::default()).await.unwrap();
+        let names: Vec<String> = sqlx::query_scalar("SELECT loop_name FROM role_loop_due ORDER BY loop_name").fetch_all(&pool).await.unwrap();
+        assert_eq!(names, vec!["another_wefts".to_string(), "fresh".to_string()]);
+        let written: Vec<String> = written(&pool).await.into_iter().map(|w| w.0).collect();
+        assert_eq!(written, vec!["loop:dispatcher:another_wefts".to_string()], "its failure written down goes with it");
     }
 }

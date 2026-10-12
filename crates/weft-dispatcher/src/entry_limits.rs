@@ -34,8 +34,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         // Count one hit on a key in a minute, and answer its hits so far,
         // this one included. The increment and the read are one statement,
-        // so two replicas counting at once each see the other's hit.
+        // so two replicas counting at once each see the other's hit. The
+        // minutes that no longer count (every one before the last two)
+        // go first: a hit is rare (a refused token), so the table is kept
+        // small by the writes that fill it.
+        // SYNC: 60 <-> weft_core::signal::limits::WINDOW_SECS
         r#"CREATE OR REPLACE FUNCTION weft_rate_hit(p_key TEXT, p_window_start BIGINT) RETURNS INTEGER AS $$
+            DELETE FROM entry_rate WHERE window_start < p_window_start - 60;
             INSERT INTO entry_rate (key, window_start, hits) VALUES (p_key, p_window_start, 1)
             ON CONFLICT (key, window_start) DO UPDATE SET hits = entry_rate.hits + 1
             RETURNING hits
@@ -141,18 +146,6 @@ pub async fn recent_runs(pool: &PgPool, project: uuid::Uuid, now: i64) -> Result
         }
     }
     Ok(runs)
-}
-
-/// Drop the minutes that no longer count: every one before the last two.
-/// The reaper runs this.
-pub async fn sweep(pool: &PgPool, now: i64) -> Result<()> {
-    let (start, _) = window(now);
-    sqlx::query("DELETE FROM entry_rate WHERE window_start < $1")
-        .bind(start - WINDOW_SECS)
-        .execute(pool)
-        .await
-        .context("drop old rate windows")?;
-    Ok(())
 }
 
 /// The `429` a refused call gets: which limit, and when to come back.

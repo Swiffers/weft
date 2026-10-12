@@ -57,8 +57,16 @@ pub struct DispatcherState {
     /// takes.
     pub holder_pool: Arc<dyn weft_platform_traits::HolderPool>,
     pub holder_settings: weft_platform_traits::config::HolderSettings,
+    /// What tells the holders the held set or a connection's access
+    /// changed (`crate::holders`).
+    pub holder_news: Arc<dyn weft_platform_traits::HolderNews>,
     /// The worker settings every project starts from.
     pub worker_defaults: weft_platform_traits::WorkerSettings,
+    /// How long weft's own work may keep waiting before it is written down
+    /// for `weft status`, in seconds at this install's pace: the install's
+    /// alert delay (`InstallConfig::alert_delay`; a run its workers keep
+    /// answering busy, `crate::delivery::busy`).
+    pub alert_after_secs: i64,
     /// Builds a project version inside the install (`crate::build`): the
     /// one way a project's program and images come to exist.
     pub builder: Arc<crate::build::VersionBuilder>,
@@ -121,6 +129,11 @@ pub struct DispatcherState {
     /// Each project's own port, on a local install
     /// (`crate::project_ports`); `None` on a platform that gives none.
     pub project_ports: Option<Arc<crate::project_ports::ProjectPorts>>,
+    /// The looks of the dispatcher's loops, when it scales to zero: a loop
+    /// that makes work another loop must look at by a moment books that
+    /// look (`crate::lapses`). `None` on a machine, where every loop looks
+    /// on its own.
+    pub booking: Option<weft_task_store::drain::Booking>,
 }
 
 impl DispatcherState {

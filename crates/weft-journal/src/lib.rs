@@ -18,7 +18,7 @@ pub mod traits;
 pub mod unrecorded;
 
 pub use events::{redacted, ExecEvent, Seed};
-pub use fold::{fold_to_snapshot, EndedWait, FiringView, Fold, FoldEffects};
+pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeBook, EndedWait, FiringView, Fold, FoldEffects, OpenedCharge};
 pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
 pub use traits::{BatchError, JournalClient, JournalRow, NoopJournal, Position, RecordClient};
 
@@ -33,11 +33,21 @@ pub const RUN_LOG_CHANNEL: &str = "weft_run_log";
 
 /// The channel runs that ended with somebody to tell (watched, or holding
 /// signals to take down) are announced on: the dispatcher handles them at
-/// once. A wake-up only: the dispatcher also rescans for such runs
-/// (`run_end_unhandled`), so a lost one only waits. The payload is the run
-/// ids ([`run_ended_payloads`]).
+/// once. A wake-up only: the dispatcher reads the flagged runs off their
+/// rows (`run_end_unhandled`), so a wake-up for several costs one look.
+/// The payload is the run ids ([`run_ended_payloads`]).
 // SYNC: RUN_ENDED_CHANNEL <-> crates/weft-broker/src/notices.rs, crates/weft-journal/src/record.rs (append_locked_in), crates/weft-dispatcher/src/run_ends.rs
 pub const RUN_ENDED_CHANNEL: &str = "weft_run_ended";
+
+/// The channel that wakes the dispatcher's retention: a run ended whose
+/// erase time (`run.keep_until`) may be earlier than any look retention
+/// has booked. No payload: retention reads the earliest erase time itself.
+/// The broker rings it for the runs its batches end only when one may need
+/// it (`weft_broker::notices`), never per run; the rarer endings the
+/// dispatcher and the broker write one at a time
+/// ([`record::append_locked_in`]) ring it each.
+// SYNC: RETENTION_CHANNEL <-> crates/weft-broker/src/notices.rs, crates/weft-journal/src/record.rs (append_locked_in), crates/weft-dispatcher/src/retention.rs
+pub const RETENTION_CHANNEL: &str = "weft_retention";
 
 /// Postgres refuses a notification payload of 8,000 bytes or more.
 const PAYLOAD_MAX: usize = 7_900;

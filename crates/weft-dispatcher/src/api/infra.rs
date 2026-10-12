@@ -701,6 +701,11 @@ pub(crate) async fn finish_sync(
 /// in the rows are what it acts on: one that died midway leaves them for
 /// the next pass. One a person took down since carries no mark and stays
 /// down, and one whose other copies are still down waits for their start.
+/// Also woken when an activation ends or a held signal goes, so one
+/// refused because another claim held its trigger comes back once that
+/// claim ends. Then the queued events that waited on infra are handed over
+/// again, and a stopped resync waiting on either change is taken up again
+/// (`crate::task_kinds::resync::retry_stopped`).
 pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherState) -> anyhow::Result<weft_task_store::drain::DrainStep> {
     // SYNC: 'infra' <-> weft_broker_client::activation::DownWith::Infra
     let marked: Vec<uuid::Uuid> = sqlx::query_scalar(
@@ -711,13 +716,17 @@ pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherSt
     for id in marked {
         bring_back_what_went_down_with_infra(&state, id).await?;
     }
+    // The events that waited on infra the run reads: each is held to the
+    // copies as they are now, and waits again if one is still down.
+    crate::parked_drain::drain_waiting_on(&state, weft_core::door_fire::UnclockedWait::Infra, None).await?;
+    crate::task_kinds::resync::retry_stopped(&state).await?;
     Ok(weft_task_store::drain::DrainStep::Done)
 }
 
 /// [`bring_back_triggers_whose_infra_returned`] for project `id`. Owner by
 /// owner, since one setup run is one owner's: one that cannot come back is
 /// logged with its owner and the others still come back.
-async fn bring_back_what_went_down_with_infra(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
+pub(crate) async fn bring_back_what_went_down_with_infra(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
     let Some(project) = state.projects.project(id).await? else { return Ok(()) };
     let deps = crate::api::project::compute_trigger_deps(&project);
     let copies = crate::infra_node::statuses(&state.pg_pool, id).await?;
@@ -766,6 +775,20 @@ async fn bring_back_what_went_down_with_infra(state: &DispatcherState, id: uuid:
             // switching them on.
             Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Claimed)) => {
                 tracing::info!(target: "weft_dispatcher::infra", project_id = %id, ?instance, ?triggers, "already being brought back");
+            }
+            // A resync holds the project: they come back once it ends
+            // (`crate::task_kinds::resync`).
+            Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Resyncing)) => {
+                tracing::info!(target: "weft_dispatcher::infra", project_id = %id, ?instance, ?triggers, "a resync holds the project; brought back once it ends");
+            }
+            // `weft rm` marked the project: its triggers go with it.
+            Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Removing)) => {
+                tracing::info!(
+                    target: "weft_dispatcher::infra",
+                    project_id = %id, ?instance, ?triggers,
+                    "the infra the triggers read is up, but they stay down: {}",
+                    weft_core::projects::PROJECT_BEING_REMOVED
+                );
             }
             Err(error) => {
                 let (status, message) = <(axum::http::StatusCode, String)>::from(error);
@@ -853,6 +876,23 @@ pub async fn cancel(
             "no infra operation in flight to cancel".into(),
         ));
     }
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `POST /projects/{id}/infra/look`: a person asks the supervisor to look
+/// at the project's infra again, so what it gave up on (`weft status`) is
+/// tried once more, its health protocols that gave up included. The
+/// notice wakes a supervisor that scales to zero
+/// (`weft_broker_client::lifecycle_command::LOOK_WAKE`).
+pub async fn look(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    authorize_project(&state, &caller.0, id).await?;
+    infra_lifecycle_command::person_asks_for_look(&state.pg_pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ask the supervisor to look: {e:#}")))?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -1294,7 +1334,12 @@ pub(crate) async fn read_live(
     node: &str,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
-    let endpoint_url = live_endpoint_url(state, id, node, instance).await?;
+    fetch_live(state, &live_endpoint_url(state, id, node, instance).await?).await
+}
+
+/// What the container at `endpoint_url` (a node's `live_endpoint`,
+/// [`live_endpoint_url`]) shows on its `/live`. Asks only the container.
+pub(crate) async fn fetch_live(state: &DispatcherState, endpoint_url: &str) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
     let live_url = format!("{}/live", endpoint_url.trim_end_matches('/'));
     // Reuse the dispatcher's shared HTTP client (one connection pool for the
     // process, not a fresh pool per request). Bound the WHOLE exchange, connect +
@@ -1892,17 +1937,9 @@ pub async fn delete_project(
                 format!("delete the connections this project's nodes published: {e}"),
             )
         })?;
-    // Step 4: release the project's exclusive supervisor lease
-    // (`infra_owner`). Left behind, the supervisor would renew a lease on
-    // a ghost until the reaper's ghost sweep dropped it.
-    crate::infra_owner::release_project(&state.pg_pool, id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("release the project's infra lease: {e}"),
-            )
-        })?;
+    // The project's exclusive supervisor lease (`infra_owner`) goes with
+    // its row (`crate::project_store::ProjectStoreOps::remove`): released
+    // here, a supervisor could claim it again before the row went.
     Ok(())
 }
 

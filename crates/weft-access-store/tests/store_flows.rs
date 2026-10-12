@@ -56,6 +56,10 @@ struct FakeProvider {
     pub scope_echo: Mutex<Option<String>>,
     /// expires_in on the token response, if any.
     pub expires_in: Mutex<Option<i64>>,
+    /// The status a token request is refused with, if any.
+    pub token_refusal: Mutex<Option<u16>>,
+    /// The status the exchange-style renewal is refused with, if any.
+    pub exchange_refusal: Mutex<Option<u16>>,
 }
 
 impl FakeProvider {
@@ -67,6 +71,8 @@ impl FakeProvider {
             next_refresh: Mutex::new(None),
             scope_echo: Mutex::new(None),
             expires_in: Mutex::new(None),
+            token_refusal: Mutex::new(None),
+            exchange_refusal: Mutex::new(None),
         })
     }
 
@@ -80,6 +86,10 @@ impl FakeProvider {
                 post(|State(s): State<Arc<FakeProvider>>, body: String| async move {
                     s.calls.lock().unwrap().push(format!("/token {body}"));
                     s.token_requests.fetch_add(1, Ordering::SeqCst);
+                    if let Some(status) = *s.token_refusal.lock().unwrap() {
+                        let status = axum::http::StatusCode::from_u16(status).unwrap();
+                        return (status, axum::Json(json!({ "error": "refused" })));
+                    }
                     let mut resp = json!({ "access_token": *s.next_token.lock().unwrap() });
                     if let Some(rt) = s.next_refresh.lock().unwrap().clone() {
                         resp["refresh_token"] = json!(rt);
@@ -90,7 +100,7 @@ impl FakeProvider {
                     if let Some(e) = *s.expires_in.lock().unwrap() {
                         resp["expires_in"] = json!(e);
                     }
-                    axum::Json(resp)
+                    (axum::http::StatusCode::OK, axum::Json(resp))
                 }),
             )
             .route(
@@ -154,11 +164,15 @@ impl FakeProvider {
                 "/exchange",
                 get(|State(s): State<Arc<FakeProvider>>, Query(q): Query<BTreeMap<String, String>>| async move {
                     s.calls.lock().unwrap().push(format!("/exchange {q:?}"));
+                    if let Some(status) = *s.exchange_refusal.lock().unwrap() {
+                        let status = axum::http::StatusCode::from_u16(status).unwrap();
+                        return (status, axum::Json(json!({ "error": "refused" })));
+                    }
                     let mut resp = json!({ "access_token": *s.next_token.lock().unwrap() });
                     if let Some(e) = *s.expires_in.lock().unwrap() {
                         resp["expires_in"] = json!(e);
                     }
-                    axum::Json(resp)
+                    (axum::http::StatusCode::OK, axum::Json(resp))
                 }),
             )
             .with_state(self.clone());
@@ -730,6 +744,47 @@ async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: PgPool) {
     );
 }
 
+/// A declared renewal call the provider answers busy or down (429, 503)
+/// leaves the grant alone and is tried again; one refusing the credential
+/// (401) or the request (400) asks for a reconnect, and the grant still
+/// renews once the provider is back.
+#[sqlx::test]
+async fn a_declared_renewal_the_provider_could_not_answer_is_tried_again_not_a_reconnect(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let mut spec = oauth_spec(&base, "coexisting");
+    if let weft_core::access::spec::Acquisition::OAuth2 { refresh, .. } = &mut spec.acquisition {
+        *refresh = Some(
+            serde_json::from_value(json!({
+                "url": format!("{base}/exchange?fb_exchange_token={{token}}"),
+                "captures": [{ "name": "token", "path": "access_token" }]
+            }))
+            .unwrap(),
+        );
+    }
+    *fake.expires_in.lock().unwrap() = Some(1);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+
+    for status in [429, 503] {
+        *fake.exchange_refusal.lock().unwrap() = Some(status);
+        let err = resolve().await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{status}: {err:#}");
+    }
+    for status in [401, 400] {
+        *fake.exchange_refusal.lock().unwrap() = Some(status);
+        let err = resolve().await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })), "{status}: {err:#}");
+    }
+
+    *fake.exchange_refusal.lock().unwrap() = None;
+    *fake.next_token.lock().unwrap() = "tok-back".into();
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    let resolved = resolve().await.expect("the renewal succeeds once the provider answers");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-back"));
+}
+
 #[sqlx::test]
 async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
@@ -748,6 +803,36 @@ async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool
         }
         other => panic!("expected NeedsReconnect, got {other:?} ({err})"),
     }
+}
+
+/// A refresh the token endpoint answers busy or down (429, 503) leaves
+/// the grant alone and is tried again; one it refuses (400) asks for a
+/// reconnect, and the grant still renews once the provider is back.
+#[sqlx::test]
+async fn a_refresh_the_provider_could_not_answer_is_tried_again_not_a_reconnect(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "coexisting");
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = Some(1);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+
+    for status in [429, 503] {
+        *fake.token_refusal.lock().unwrap() = Some(status);
+        let err = resolve().await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{status}: {err:#}");
+    }
+    *fake.token_refusal.lock().unwrap() = Some(400);
+    let err = resolve().await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })), "{err:#}");
+
+    *fake.token_refusal.lock().unwrap() = None;
+    *fake.next_token.lock().unwrap() = "tok-back".into();
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    let resolved = resolve().await.expect("the refresh succeeds once the provider answers");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-back"));
 }
 
 #[sqlx::test]
@@ -2267,4 +2352,102 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
     assert_eq!(stored[0].service.as_deref(), Some("fakestatic"));
     assert_eq!(stored[1].instance, Some(ada));
     assert!(stored_fields(&pool, TENANT_B, PROJECT_1).await.unwrap().is_empty(), "another tenant sees nothing");
+}
+
+/// A picker session lives 15 minutes: one past its life cannot finish (it
+/// would widen the connection's grants long after the person picked), and
+/// the page loading it finds it expired and deletes it.
+#[sqlx::test]
+async fn a_picker_past_its_life_cannot_finish(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let done = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            spec: static_spec(&base),
+            door: Door::Own,
+            registration: None,
+            values: [("token".to_string(), "tok-abc".to_string())].into_iter().collect(),
+            label: None,
+            permissions: vec![],
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .expect("the fixture connects");
+    let state = weft_access_store::begin_picker(
+        &pool,
+        TENANT_A,
+        weft_access_store::BeginPicker {
+            access_id: done.grant.id,
+            for_instance: None,
+            service: "fakestatic".into(),
+            script: "https://chooser.example.com/api.js".into(),
+            code: "weft.done({id: 'x', label: 'X'})".into(),
+            mime_types: Vec::new(),
+            grants: vec!["drive.file".into()],
+        },
+    )
+    .await
+    .expect("the picker session parks");
+    sqlx::query("UPDATE access_picker SET created_at = now() - interval '16 minutes'").execute(&pool).await.unwrap();
+
+    let err = weft_access_store::finish_picker(&pool, &state, json!({ "picked": { "id": "file-1", "label": "File one" } }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("expired"), "{err}");
+    let listed = list_grants(&pool, TENANT_A, Some("fakestatic"), weft_access_store::GrantOwnerScope::Author).await.unwrap();
+    let row = listed.iter().find(|g| g.id == done.grant.id).unwrap();
+    assert!(!row.scopes.contains(&"drive.file".to_string()), "nothing widened: {:?}", row.scopes);
+
+    assert!(weft_access_store::load_picker(&pool, &state).await.is_err());
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_picker").fetch_one(&pool).await.unwrap();
+    assert_eq!(left, 0, "found expired, deleted");
+}
+
+/// Connect attempts past their life go with no timer: when the next one
+/// of their kind is made, and when a poll finds them gone.
+#[sqlx::test]
+async fn an_abandoned_connect_goes_when_the_next_is_made_or_a_poll_finds_it_gone(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let begin = || {
+        let (pool, base) = (pool.clone(), base.clone());
+        async move {
+            begin_oauth(
+                &pool,
+                TENANT_A,
+                BeginOAuth {
+                    spec: oauth_spec(&base, "coexisting"),
+                    door: Door::Own,
+                    registration: Some(oauth_app()),
+                    permissions: vec!["read".into()],
+                    project_id: Some(PROJECT_1),
+                    instance: None,
+                    upgrade_grant_id: None,
+                    redirect_uri: "http://disp.example/access/oauth/callback".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .state
+        }
+    };
+    let rows = || async {
+        sqlx::query_scalar::<_, String>("SELECT state FROM access_connect ORDER BY state").fetch_all(&pool).await.unwrap()
+    };
+    begin().await;
+    sqlx::query("UPDATE access_connect SET created_at = now() - interval '16 minutes'").execute(&pool).await.unwrap();
+    let new = begin().await;
+    assert_eq!(rows().await, vec![new.clone()], "the abandoned one went as the next was made");
+
+    sqlx::query("UPDATE access_connect SET created_at = now() - interval '16 minutes'").execute(&pool).await.unwrap();
+    let err = take_connect_result(&pool, TENANT_A, &new).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Gone(_))), "{err}");
+    assert!(rows().await.is_empty(), "the poll that found it gone deleted it");
 }

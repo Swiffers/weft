@@ -73,6 +73,7 @@
 		onCancelRunning,
 		onResumeActive,
 		onResync,
+		onResumeResync,
 		onStartInfra,
 		onStopInfra,
 		onTerminateInfra,
@@ -158,6 +159,7 @@
 		onCancelRunning?: () => void;
 		onResumeActive?: () => void;
 		onResync?: () => void;
+		onResumeResync?: () => void;
 		onStartInfra?: () => void;
 		onStopInfra?: () => void;
 		onTerminateInfra?: () => void;
@@ -4333,6 +4335,7 @@
 			{onCancelRunning}
 			{onResumeActive}
 			{onResync}
+			{onResumeResync}
 			{onStartInfra}
 			{onStopInfra}
 			{onTerminateInfra}

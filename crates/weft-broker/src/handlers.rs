@@ -531,7 +531,9 @@ fn require_declared_infra(
 /// look at the project's health (`lifecycle_command::LOOK_WAKE`). The
 /// machine's token names the copy it runs, so it asks only about that
 /// copy's project; a worker asks about its own, weft's own roles about
-/// any.
+/// any. Unlike a person's look (the dispatcher's `infra::look`), it
+/// records nothing: a health protocol that gave up is armed again by what
+/// the look sees changing, never by the asking.
 pub async fn infra_look(
     State(state): State<Arc<BrokerState>>,
     headers: axum::http::HeaderMap,
@@ -547,10 +549,7 @@ pub async fn infra_look(
             scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
         }
     }
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL)
-        .bind(weft_broker_client::lifecycle_command::look_payload(req.project_id))
-        .execute(&state.pool)
+    weft_task_store::infra_command::ask_for_look(&state.pool, req.project_id)
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("announce the look")))?;
     Ok(Json(InfraLookResponse {}))
@@ -948,10 +947,24 @@ pub async fn supervisor_sync_ownership(
     Json(req): Json<SupervisorSyncOwnershipRequest>,
 ) -> Resp<SupervisorSyncOwnershipResponse> {
     require_supervisor(&caller)?;
-    let synced = crate::lifecycle_writes::sync_ownership(&state.pool, &req.replica, &req.held_projects)
+    let synced = crate::lifecycle_writes::sync_ownership(&state.pool, &req, state.supervisor_booking.as_ref())
         .await
         .map_err(internal)?;
     Ok(Json(synced))
+}
+
+/// Replace a project's health protocol state, for the supervisor holding
+/// its lease (410 otherwise).
+pub async fn supervisor_set_health_state(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SupervisorSetHealthStateRequest>,
+) -> Resp<SupervisorSetHealthStateResponse> {
+    require_supervisor(&caller)?;
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
+    let outcome = crate::lifecycle_writes::set_health_state(&state.pool, &req).await.map_err(internal)?;
+    fenced_to_http(outcome, || format!("set_health_state(project={})", req.project_id))?;
+    Ok(Json(SupervisorSetHealthStateResponse {}))
 }
 
 /// Pure read: the projects a supervisor process currently owns, joined to
@@ -1140,7 +1153,8 @@ pub async fn supervisor_health_protocols(
             .try_get::<Option<serde_json::Value>, _>("health_protocols_json")
             .map_err(|e| internal(anyhow::anyhow!("decode health_protocols_json: {e}")))?,
     };
-    Ok(Json(SupervisorHealthProtocolsResponse { protocols }))
+    let state = crate::lifecycle_writes::health_state(&state.pool, id).await.map_err(internal)?;
+    Ok(Json(SupervisorHealthProtocolsResponse { protocols, state }))
 }
 
 pub async fn supervisor_claim_command(
@@ -1149,14 +1163,16 @@ pub async fn supervisor_claim_command(
     Json(req): Json<SupervisorClaimCommandRequest>,
 ) -> Resp<SupervisorClaim> {
     require_supervisor(&caller)?;
-    // Which command is next, and why that answer is safe without a row
-    // lock: `lifecycle_writes::next_command`.
+    // Which command is next, and what its claim marks:
+    // `lifecycle_writes::claim_next`.
     //
     // Held: with nothing waiting, the request sleeps until a command is
     // issued anywhere (the row's own trigger announces it) and looks
     // again. Any issue wakes it, not only one for a project this process
     // owns: ownership can move during the hold, and the look is one
-    // indexed read.
+    // indexed read. A person cancelling one of the commands this process
+    // runs (`cancel:<id>`, from the trigger on `cancel_requested`) wakes
+    // it too, and comes back as the cancel.
     //
     // A wake that finds nothing for this process may be a command for a
     // project nobody owns yet (ownership is taken on the supervisors'
@@ -1166,8 +1182,23 @@ pub async fn supervisor_claim_command(
     let deadline = held_until(req.wait_ms);
     let mut heard = state.signals.subscribe();
     let mut woken_once = false;
+    let cancel_heard = |channel: &str, payload: &str| {
+        channel == INFRA_COMMAND_CHANNEL
+            && matches!(
+                InfraCommandSignal::parse(payload),
+                Some(InfraCommandSignal::Cancel { id }) if req.busy_commands.contains(&id) && !req.cancelling.contains(&id)
+            )
+    };
     loop {
-        let next = crate::lifecycle_writes::next_command(
+        if !req.busy_commands.is_empty() {
+            let cancels = crate::lifecycle_writes::cancels_for(&state.pool, &req.busy_commands, &req.cancelling)
+                .await
+                .map_err(internal)?;
+            if !cancels.is_empty() {
+                return Ok(Json(SupervisorClaim::Cancel { commands: cancels }));
+            }
+        }
+        let next = crate::lifecycle_writes::claim_next(
             &state.pool,
             &req.claimer_replica,
             &req.busy_commands,
@@ -1181,7 +1212,7 @@ pub async fn supervisor_claim_command(
             return Ok(Json(SupervisorClaim::UnownedWork));
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| ISSUED_WAKE.hears(channel, payload))
+            .woken_before(deadline, |channel, payload| ISSUED_WAKE.hears(channel, payload) || cancel_heard(channel, payload))
             .await
             .map_err(internal)?;
         if !woken {
@@ -1989,46 +2020,6 @@ pub async fn supervisor_command_complete(
     Ok(Json(SupervisorCommandCompleteResponse {}))
 }
 
-/// Poll target for an executing supervisor: has the user requested
-/// cancellation of the claimed command? Tenant-scoped like
-/// `supervisor_command_complete`. A missing row (project removed
-/// mid-command) reads as cancelled: the executor should stop working
-/// on it either way.
-pub async fn supervisor_command_cancel_requested(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<weft_broker_client::protocol::SupervisorCommandCancelRequestedRequest>,
-) -> Resp<weft_broker_client::protocol::SupervisorCommandCancelRequestedResponse> {
-    require_supervisor(&caller)?;
-    use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT tenant_id, cancel_requested FROM infra_lifecycle_command WHERE id = $1",
-    )
-    .bind(req.command_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let Some(row) = row else {
-        return Ok(Json(
-            weft_broker_client::protocol::SupervisorCommandCancelRequestedResponse {
-                cancel_requested: true,
-            },
-        ));
-    };
-    let tenant_id: String = row
-        .try_get("tenant_id")
-        .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?;
-    scope::require_tenant_in_scope(&caller, &tenant_id)?;
-    let cancel_requested: bool = row
-        .try_get("cancel_requested")
-        .map_err(|e| internal(anyhow::anyhow!("decode cancel_requested: {e}")))?;
-    Ok(Json(
-        weft_broker_client::protocol::SupervisorCommandCancelRequestedResponse {
-            cancel_requested,
-        },
-    ))
-}
-
 /// Hold `node_id` to what a row may be keyed on, TRIMMING IT IN PLACE
 /// so every later read of it is already the key.
 ///
@@ -2148,9 +2139,9 @@ pub async fn signal_write_kind_state(
     Ok(Json(SignalWriteKindStateResponse { written }))
 }
 
-/// One look of a holder: renew, report, take (see
-/// `SignalHoldRequest`). Bound to the calling replica, so a holder only
-/// ever renews or takes in its own name.
+/// One look of a holder: keep, report, take (see `SignalHoldRequest`).
+/// Bound to the calling replica, so a holder only ever keeps or takes in
+/// its own name.
 pub async fn signal_hold(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -2160,17 +2151,34 @@ pub async fn signal_hold(
         return Err((StatusCode::FORBIDDEN, "listener only".into()));
     }
     require_replica_matches(&caller, &req.replica)?;
-    let out = crate::held_signals::hold(
-        &state.pool,
-        &req.replica,
-        &req.holding,
-        req.room,
-        &req.want,
-        weft_broker_client::protocol::hold_lease_secs(),
-    )
-    .await
-    .map_err(internal)?;
+    let out = crate::held_signals::hold(&state.pool, &req.replica, &req.holding, req.room, &req.want)
+        .await
+        .map_err(internal)?;
     Ok(Json(out))
+}
+
+/// The listener or a holder gave up on a signal for good (see
+/// `SignalGiveUpRequest`). A caller with no replica gives up only a
+/// signal nobody holds.
+pub async fn signal_give_up(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SignalGiveUpRequest>,
+) -> Resp<serde_json::Value> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    let written =
+        crate::held_signals::give_up(&state.pool, &req.token, req.generation, &req.reason, caller.replica.as_deref())
+            .await
+            .map_err(internal)?;
+    if !written {
+        tracing::info!(
+            target: "weft_broker::held", token = %req.token, generation = req.generation,
+            "a give-up wrote nothing: the signal was registered again, already given up, or held by another"
+        );
+    }
+    Ok(Json(serde_json::json!({})))
 }
 
 /// What a signal's kind decides about holding it, for a row that said
@@ -2187,6 +2195,32 @@ pub async fn signal_set_holds(
     Ok(Json(serde_json::json!({})))
 }
 
+/// A holder's check going off (`weft_platform_traits::HeldCheck`): the
+/// holder stopped pushing it ahead of itself, so it is taken for dead and
+/// every claim it holds is freed for the others. Mounted behind the guard
+/// that lets only weft itself in (the alarm calls with the core account).
+/// Answered 200 once handled, whatever was freed, so the alarm does not
+/// call again; a body that never reads is dropped the same way. A
+/// database that fails answers 500, and the alarm tries again.
+pub async fn held_check(State(state): State<Arc<BrokerState>>, body: axum::body::Bytes) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let call: weft_platform_traits::WakeCall<weft_platform_traits::HeldCheck> = match serde_json::from_slice(&body) {
+        Ok(call) => call,
+        Err(e) => {
+            tracing::error!(target: "weft_broker::held", error = %e, "a holder's check does not read; dropped");
+            return Ok(Json(serde_json::json!({ "dropped": true })));
+        }
+    };
+    let check = call.body;
+    let freed = crate::held_signals::release(&state.pool, &check.replica).await.map_err(unavailable_or_internal)?;
+    if freed > 0 {
+        tracing::warn!(
+            target: "weft_broker::held", replica = %check.replica, generation = check.generation, freed,
+            "a holder stopped pushing its check; its claims are freed"
+        );
+    }
+    Ok(Json(serde_json::json!({})))
+}
+
 /// A holder giving up its claims (it is stopping).
 pub async fn signal_let_go(
     State(state): State<Arc<BrokerState>>,
@@ -2197,7 +2231,7 @@ pub async fn signal_let_go(
         return Err((StatusCode::FORBIDDEN, "listener only".into()));
     }
     require_replica_matches(&caller, &req.replica)?;
-    crate::held_signals::let_go(&state.pool, &req.replica).await.map_err(internal)?;
+    crate::held_signals::release(&state.pool, &req.replica).await.map_err(internal)?;
     Ok(Json(serde_json::json!({})))
 }
 

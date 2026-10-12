@@ -1388,8 +1388,9 @@ impl NodeMetadata {
     /// `Option` serialized as null, on port entries and in widgets,
     /// wherever a widget sits, which only ever mean "absent"). Data
     /// is never touched: a remote-select source's `label` path, a
-    /// literal's own fields, and the nulls inside a `default` or a
-    /// rule's `equals` ride through untouched. Node authors keep
+    /// literal's own fields, and the nulls inside a `default`, a
+    /// rule's `equals` or a list source's `where` ride through
+    /// untouched. Node authors keep
     /// reading the full
     /// `metadata.json`: this is the view for writing programs WITH a
     /// node, not for writing the node.
@@ -1451,7 +1452,8 @@ impl NodeMetadata {
 /// are dropped only from port entries and from widgets (input
 /// widgets and the spec-field widgets under `portsFromConfig`).
 /// Free-form values (a `default`'s contents, a rule's `equals`
-/// payload) keep every key name and every null they hold.
+/// payload, a list source's `where`) keep every key name and every
+/// null they hold.
 pub const COMPACT_KEEP_TOP_LEVEL: [&str; 11] = [
     "type",
     "description",
@@ -1685,13 +1687,17 @@ fn strip_noise_nulls(entry: &mut serde_json::Value) {
 
 /// Null-valued keys out at every depth, for closed struct families
 /// only (a port entry's widget): every null there is an absent
-/// optional knob, never data.
+/// optional knob, never data. The one free-form value a widget holds,
+/// a list source's `where` (values an item is compared against, so a
+/// null in it is a value to match), is left whole.
 fn strip_nulls(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             map.retain(|_, value| !value.is_null());
-            for inner in map.values_mut() {
-                strip_nulls(inner);
+            for (key, inner) in map.iter_mut() {
+                if key.as_str() != "where" {
+                    strip_nulls(inner);
+                }
             }
         }
         serde_json::Value::Array(items) => {
@@ -3326,6 +3332,14 @@ pub struct Lookup {
     /// signs even when one is).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub public: bool,
+    /// Keep only the items matching every entry: a dotted path
+    /// (relative to one item, like `label` / `value`) mapped to the
+    /// value the item must hold there, compared as JSON (an item with
+    /// nothing at the path is dropped). For a service answering one
+    /// list for several jobs, e.g. `{"can_do_text_to_speech": true}`.
+    /// Empty keeps every item.
+    #[serde(default, rename = "where", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub where_equals: std::collections::BTreeMap<String, Value>,
 }
 
 /// Cursor pagination on a [`Lookup`]: the request param the cursor is
@@ -5271,7 +5285,8 @@ mod compact_view_tests {
     /// shapes: an input whose label/placeholder are presentation but
     /// whose description/default/accepts are wiring facts; a
     /// remote-select whose sources' `label`/`value` are DATA paths and
-    /// must survive untouched; a config-derived port spec whose
+    /// whose list `where` holds a null to match, all of which must
+    /// survive untouched; a config-derived port spec whose
     /// kind/keyField/fields/addsOutputs survive while its label and
     /// render hint go; and a validation rule whose `equals` payload
     /// carries a `label` key of its own.
@@ -5311,7 +5326,8 @@ mod compact_view_tests {
                         "access": "account",
                         "free_text": true,
                         "sources": [
-                            { "kind": "list", "get": "https://api.example.com/models", "items": "data", "label": "displayName", "value": "id" },
+                            { "kind": "list", "get": "https://api.example.com/models", "items": "data", "label": "displayName", "value": "id",
+                              "where": { "chat": true, "retired_at": null } },
                             { "kind": "granted", "from": "models", "label": "name", "value": "id" }
                         ]
                     }
@@ -5399,6 +5415,11 @@ mod compact_view_tests {
         let sources = model["widget"]["sources"].as_array().unwrap();
         assert_eq!(sources[0]["label"], "displayName", "a source's display path is data");
         assert_eq!(sources[0]["value"], "id");
+        assert_eq!(
+            sources[0]["where"],
+            serde_json::json!({ "chat": true, "retired_at": null }),
+            "a list source's `where` is data: its null is a value to match, not an absent knob"
+        );
         assert_eq!(sources[1]["label"], "name", "a granted source's display path is data");
         assert_eq!(sources[1]["value"], "id");
         assert_eq!(model["widget"]["access"], "account", "the authenticating input is a wiring fact");

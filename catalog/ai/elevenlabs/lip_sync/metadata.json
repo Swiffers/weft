@@ -1,0 +1,105 @@
+{
+  "type": "ElevenLabsLipSync",
+  "label": "Lip-Sync Video",
+  "description": "Turn a still picture of a person or character into a video of them speaking an audio track, made by Creatify Aurora through ElevenLabs. If you set something the model does not take, the call is refused before anything is charged. Needs your own ElevenLabs account on a Pro plan or above.",
+  "tags": [
+    "ai",
+    "video",
+    "generation",
+    "lip-sync"
+  ],
+  "icon": "ScanFace",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
+      "required": true,
+      "requiresScopes": [
+        "image_video"
+      ],
+      "description": "Your own ElevenLabs account: wire an ElevenLabsAccess node whose connection has \"Images and video\" ticked. weft's built-in connection cannot make images or videos, and each one is paid from this account's credits."
+    },
+    {
+      "name": "image",
+      "type": "Image",
+      "required": true,
+      "description": "A picture of the person or character who speaks."
+    },
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": true,
+      "description": "What they say."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "default": "creatify-aurora",
+      "label": "Model",
+      "description": "Creatify Aurora, the only lip-sync model ElevenLabs's API serves.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "creatify-aurora"
+        ]
+      }
+    },
+    {
+      "name": "resolution",
+      "type": "String",
+      "label": "Resolution",
+      "description": "Leave empty for 720p.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "480p",
+          "720p"
+        ]
+      }
+    },
+    {
+      "name": "guidanceScale",
+      "type": "Number",
+      "label": "Picture guidance",
+      "description": "How closely the video keeps to the picture, from 0 to 5. Leave empty for the model's default.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 5,
+        "step": 0.1
+      }
+    },
+    {
+      "name": "audioGuidanceScale",
+      "type": "Number",
+      "label": "Audio guidance",
+      "description": "How closely the lips follow the audio, from 0 to 5. Leave empty for the model's default.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 5,
+        "step": 0.1
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "video",
+      "type": "Video",
+      "description": "The generated video, kept for 30 days after it was last read."
+    }
+  ],
+  "features": {
+    "catchErrors": true
+  },
+  "display": {
+    "kind": "media",
+    "output": "video"
+  }
+}

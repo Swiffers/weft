@@ -30,7 +30,7 @@ and `wss://`). You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
 built; `weft activate` only turns them on.
 
-Each project also has an address of its own where the program answers its routes at the root with nothing of weft's in between, which is the fastest way in: on this machine a free port it gets the first time it is activated (14200 or above) and keeps, moving to another free one if a program took it (`http://127.0.0.1:14200/hello`; `weft activate --port <n>` opens a chosen one and keeps it; if another program or project holds it, the command fails and nothing is activated), on a cloud install the project's own Cloud Run address. `weft activate` prints it and `weft status` shows it, or says why it is unavailable. While a route's trigger is parked or still coming on, a call is answered `503` with `Retry-After: 5`, so tell the frontend to retry on a 503; once the project is switched off (wiped), its own port is closed and `/connect/local/<project id>/<path>` answers 404. When you brief a frontend, give it the `/connect/local/<project id>/` address: it has the same shape on every install, so the frontend's code runs unchanged on a cloud.
+Each project also has an address of its own where the program answers its routes at the root with nothing of weft's in between, which is the fastest way in: on this machine a free port it gets the first time it is activated (14200 or above) and keeps, moving to another free one if a program took it (`http://127.0.0.1:14200/hello`; `weft activate --port <n>` opens a chosen one and keeps it; if another program or project holds it, the command fails and nothing is activated), on a cloud install the project's own Cloud Run address. `weft activate` prints it and `weft status` shows it, or says why it is unavailable. While a route's trigger is parked or still coming on, a call is answered `503` with `Retry-After: 5`, so tell the frontend to retry a `503` that carries `Retry-After`, and never one without it; once the project is switched off (wiped), its own port is closed and `/connect/local/<project id>/<path>` answers 404. When you brief a frontend, give it the `/connect/local/<project id>/` address: it has the same shape on every install, so the frontend's code runs unchanged on a cloud.
 
 Both local addresses, the project's own port and `127.0.0.1:14111`, answer only on this machine. When the install has a public address (a tunnel), `weft daemon status` prints it, and each route answers there at `<public address>/connect/local/<project id>/<path>`, reaching the same program. A frontend that runs
 anywhere else (a hosted site, a phone, a browser on another machine) uses the
@@ -95,6 +95,22 @@ run ends, it is recorded as failed, and the caller gets `500` with the body
 arrived`. If you
 catch yourself wiring a branch that reaches no [answer], stop and write:
 "Wait. Every branch answers." Then end that branch on a `Reply` or `Close`.
+
+That `500` is one of three things a caller hears when the run ends before
+answering:
+
+| Status | When |
+|---|---|
+| `500` | the program failed, got stuck, or ended without answering |
+| `504` | a time limit ran out: the run's hour on a cloud install (it stops itself 59 minutes after it started on its worker), the route's `maxSessionSecs`, a wait held for its whole `holdSecs`, or, on a cloud install, the worker stopping just before Cloud Run cuts its connection to weft (which it does after an hour), because every run on it was only waiting |
+| `503` | weft or a person stopped the run (`weft stop`, a deactivate, `ctx.stop_tagged`, or a new build whose `--drain-timeout` ran out), or it carries on without this caller (it paused, or moved to another worker) |
+
+This `503` has no `Retry-After`, unlike the one a parked route answers: the
+run may still be going, and calling again would start a second one beside
+it. If a streamed answer had already started, its status line is gone, so
+the error comes in the body: a JSON-lines answer ends with `{"error": "...",
+"status": 504}`. A socket closes with `1011` for a failure or a time limit,
+and `1013` when the run was stopped or carries on without this caller.
 
 Two routes of one account can share a call as long as one of them spells out
 what the other captures: `chat/general` beside `chat/{room}` is fine, and the
@@ -192,7 +208,7 @@ the line with `outlivesCaller` off) still waits on a timer or a form: the wait
 holds the worker and the call open, and the answer carries the run on. If
 nothing moves in the run for the route's `holdSecs` (60 by default, `0` to
 never wait), the waiting node fails saying it gave up, and the caller hears
-that.
+`504`.
 
 A route also has `durable`, off by default, and it cannot be combined with `recorded: false`. With it off, a run whose worker dies ends cancelled. With it on, another worker carries the run on from its finished steps, but the caller's connection died with the old worker, so a step that answers the caller after that fails and the caller has to call again. For the details, go and read How a run is kept in the `weft-language` skill.
 

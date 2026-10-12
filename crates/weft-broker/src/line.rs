@@ -33,23 +33,26 @@ use weft_task_store::pg_signal::{Heard, Subscription};
 
 use crate::state::BrokerState;
 
-/// `api` with the line beside it. Each call on a line holds the database's
-/// listening while it is answered, as a request does
-/// (`weft_task_store::pg_signal::keep_listening`), and a line with no call
-/// running holds nothing: a worker whose runs only wait keeps its line
-/// open without keeping the database awake.
+/// `api` with the line beside it. Each call, as a request or on a line,
+/// holds the database's listening while it is answered
+/// (`weft_task_store::pg_signal::keep_listening`): a write made while the
+/// watch is quiet would be announced to nobody. Opening a line, and a line
+/// with no call running, hold nothing: a worker whose runs only wait keeps
+/// its line open without keeping the database awake. Probes touch nothing.
 pub fn routes(api: Router, state: Arc<BrokerState>) -> Router {
-    let served = api.clone().layer(axum::middleware::from_fn_with_state(state.signals.clone(), weft_task_store::pg_signal::keep_listening));
+    let served = api.layer(axum::middleware::from_fn_with_state(state.signals.clone(), weft_task_store::pg_signal::keep_listening));
+    let on_line = served.clone();
     Router::new()
         .route(
             LINE_PATH,
             get(move |State(state): State<Arc<BrokerState>>, headers: HeaderMap, ws: WebSocketUpgrade| {
-                let api = served.clone();
+                let api = on_line.clone();
                 async move { open(state, headers, ws, api).await }
             }),
         )
+        .route("/health", get(crate::handlers::health))
         .with_state(state)
-        .merge(api)
+        .merge(served)
 }
 
 async fn open(state: Arc<BrokerState>, headers: HeaderMap, ws: WebSocketUpgrade, api: Router) -> Response {
@@ -245,6 +248,17 @@ impl LineFanout {
     fn say_to_all(&self, notice: Notice) {
         let listening = matches!(notice, Notice::Recheck { listening: true } | Notice::Resumed);
         self.listening.store(listening, Ordering::Release);
+        self.send_to_all(notice);
+    }
+
+    /// Every open line looks again, the database's listener being as it
+    /// is: what the install's news says when it may have missed some
+    /// (`crate::news`).
+    pub fn recheck_lines(&self) {
+        self.send_to_all(Notice::Recheck { listening: self.listening.load(Ordering::Acquire) });
+    }
+
+    fn send_to_all(&self, notice: Notice) {
         let mut lines = self.lines.lock().expect("line fanout");
         let behind: Vec<u64> = lines
             .by_project

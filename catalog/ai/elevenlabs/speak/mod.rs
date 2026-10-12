@@ -11,28 +11,225 @@
 //! flushed, the session drains, and the full audio is also stored and
 //! emitted as a file.
 //!
+//! The session's settings ride two places, as the protocol has them:
+//! the URL's query string (model, format, language, seed, ...) and the
+//! opener, the first message (voice settings, the chunk schedule, the
+//! pronunciation dictionaries).
+//!
 //! The audio bus is BYTES with creator metadata declaring the format
 //! (`{ "sample_rate": 16000, "encoding": "pcm_s16le" }` for the
 //! default pcm_16000), the same convention the transcribe node reads,
 //! so speak -> telephony and transcribe <- telephony meet on one
 //! frame format.
+//!
+//! When `alignment` is wired, the session is opened with
+//! `sync_alignment`, the frames carry the timing of the characters
+//! they speak (relative to the frame's own audio, ElevenLabs's
+//! reference point), and the node places them on the whole speech by
+//! the audio bytes relayed before the frame.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use weft::access::socket::SocketMessage;
-use weft::bus::{BusEntryKind, BusOptions, BusPayloadKind, WirePayload};
+use weft::bus::{BusEntryKind, BusHandle, BusOptions, BusPayloadKind, WirePayload};
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{
+    node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, ValueBag, WeftError, WeftResult,
+};
 
 use super::elevenlabs::{audio_file_type, WS_API};
+use super::flows::set_some;
+use super::speech::voice_settings;
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsSpeakNode;
+
+/// A pronunciation dictionary the session applies. The socket's
+/// locator requires the version as well as the id (the batch speech
+/// routes take a bare id as the latest version; this one does not).
+#[derive(Deserialize)]
+struct Dictionary {
+    id: String,
+    version: String,
+}
+
+/// Everything the session is opened with, read from the node's inputs.
+struct Session {
+    model: String,
+    output_format: String,
+    language: Option<String>,
+    logging: bool,
+    normalization: Option<String>,
+    seed: Option<u64>,
+    ssml: bool,
+    auto_mode: bool,
+    schedule: Vec<f64>,
+    dictionaries: Vec<Dictionary>,
+    voice_settings: Option<Value>,
+    /// The audio's bytes per second when `alignment` is wired: what
+    /// places each frame's characters on the whole speech.
+    timing: Option<f64>,
+}
+
+impl Session {
+    /// Read the session from the node's inputs, refusing before
+    /// anything is sent what the socket would refuse or ignore.
+    /// `voice_settings` is the run's [`voice_settings`], and `aligned`
+    /// whether anything reads the `alignment` output.
+    fn read(inputs: &ValueBag, voice_settings: Option<Value>, aligned: bool) -> WeftResult<Self> {
+        let model: String = inputs.get("model")?;
+        let output_format: String = inputs.get("outputFormat")?;
+        let language: Option<String> = inputs.opt("languageCode")?;
+        let auto_mode: bool = inputs.get("autoMode")?;
+        let schedule: Vec<f64> = inputs.list("chunkLengthSchedule")?;
+        if let Some(refusal) = refusal(&model, language.is_some(), auto_mode, &schedule, &output_format, aligned) {
+            return Err(WeftError::Input(refusal));
+        }
+        Ok(Self {
+            timing: if aligned { byte_rate(&output_format) } else { None },
+            model,
+            output_format,
+            language,
+            logging: inputs.get("enableLogging")?,
+            normalization: inputs.opt("textNormalization")?,
+            // A whole number: the widget's step holds a wired value to
+            // whole numbers too.
+            seed: inputs.opt("seed")?,
+            ssml: inputs.get("enableSsmlParsing")?,
+            auto_mode,
+            schedule,
+            dictionaries: inputs.list("pronunciationDictionaries")?,
+            voice_settings,
+        })
+    }
+
+    /// The session's address: the voice, then every setting the
+    /// protocol takes in the query string. The voice id is typed text
+    /// that becomes a path segment: encoded, it can only ever name a
+    /// voice. The idle window is the maximum the protocol allows; the
+    /// keep-alive in the loop covers longer pauses.
+    fn url(&self, voice: &str) -> String {
+        let mut url = format!(
+            "{WS_API}/text-to-speech/{}/stream-input?model_id={}&output_format={}&inactivity_timeout=180",
+            urlencoding::encode(voice),
+            urlencoding::encode(&self.model),
+            urlencoding::encode(&self.output_format),
+        );
+        let mut put = |key: &str, value: &str| url.push_str(&format!("&{key}={}", urlencoding::encode(value)));
+        if self.auto_mode {
+            put("auto_mode", "true");
+        }
+        if let Some(language) = &self.language {
+            put("language_code", language.as_str());
+        }
+        if !self.logging {
+            put("enable_logging", "false");
+        }
+        if let Some(normalization) = &self.normalization {
+            put("apply_text_normalization", normalization.as_str());
+        }
+        if let Some(seed) = self.seed {
+            put("seed", seed.to_string().as_str());
+        }
+        if self.ssml {
+            put("enable_ssml_parsing", "true");
+        }
+        if self.timing.is_some() {
+            put("sync_alignment", "true");
+        }
+        url
+    }
+
+    /// The protocol's opener: a single space plus the settings the
+    /// session keeps, which only the first message may carry.
+    fn opener(&self) -> Value {
+        let mut opener = json!({ "text": " " });
+        set_some(&mut opener, "voice_settings", self.voice_settings.clone());
+        if !self.schedule.is_empty() {
+            opener["generation_config"] = json!({ "chunk_length_schedule": self.schedule });
+        }
+        if !self.dictionaries.is_empty() {
+            opener["pronunciation_dictionary_locators"] = Value::Array(
+                self.dictionaries
+                    .iter()
+                    .map(|d| json!({ "pronunciation_dictionary_id": d.id, "version_id": d.version }))
+                    .collect(),
+            );
+        }
+        opener
+    }
+}
+
+/// The settings the streaming socket will not take, or that would do
+/// nothing there, said before anything is sent (the compiler refuses
+/// the same when they are written; this is the floor for wired ones),
+/// or `None` when the session is fine.
+fn refusal(
+    model: &str,
+    language: bool,
+    auto_mode: bool,
+    schedule: &[f64],
+    output_format: &str,
+    aligned: bool,
+) -> Option<String> {
+    // ElevenLabs's text to speech socket takes no v3 or v4 model (those
+    // stream through its text to dialogue socket). That is also why the
+    // metadata lists the socket's models by hand instead of asking
+    // `/v1/models` for every model that can do text to speech: that
+    // list would offer the v3 and v4 models this socket refuses.
+    if model.starts_with("eleven_v3") || model.starts_with("eleven_v4") {
+        return Some(format!(
+            "'{model}' does not stream through ElevenLabs's text to speech socket, which takes no eleven_v3 or \
+             eleven_v4 model: pick a Flash or Multilingual v2 `model`, or speak v3 and v4 with ElevenLabsSpeakFile"
+        ));
+    }
+    if language && model == "eleven_multilingual_v2" {
+        return Some(
+            "eleven_multilingual_v2 takes no `languageCode`: pick another `model`, or leave `languageCode` empty".into(),
+        );
+    }
+    // In auto mode ElevenLabs decides when to generate by itself; only
+    // with it off does the model wait for text to match the schedule.
+    if auto_mode && !schedule.is_empty() {
+        return Some(
+            "`chunkLengthSchedule` is set with `autoMode` on, and in auto mode ElevenLabs decides when to generate \
+             without waiting on a schedule: turn `autoMode` off, or leave `chunkLengthSchedule` empty"
+                .into(),
+        );
+    }
+    if let Some(n) = schedule.iter().find(|n| !(50.0..=500.0).contains(*n)) {
+        return Some(format!(
+            "`chunkLengthSchedule` holds {n}, and ElevenLabs takes each number of characters between 50 and 500"
+        ));
+    }
+    if aligned && byte_rate(output_format).is_none() {
+        return Some(format!(
+            "`alignment` places each character on the whole speech by counting the audio bytes before it, and \
+             '{output_format}' does not pin that down: pick a pcm, ulaw or alaw `outputFormat`, or leave \
+             `alignment` unwired"
+        ));
+    }
+    None
+}
+
+/// Bytes per second of a format whose byte count is its duration
+/// exactly: 16-bit pcm, and one-byte ulaw and alaw. `None` for the
+/// compressed formats and for wav, whose header shifts the count.
+fn byte_rate(output_format: &str) -> Option<f64> {
+    let (family, rate) = output_format.split_once('_')?;
+    let rate: f64 = rate.parse().ok().filter(|r: &f64| r.is_finite() && *r > 0.0)?;
+    match family {
+        "pcm" => Some(rate * 2.0),
+        "ulaw" | "alaw" => Some(rate),
+        _ => None,
+    }
+}
 
 /// The chunk of text one bus entry carries: a plain string message
 /// (an LLM stream's delta) or an object with a `text` field (a
@@ -41,11 +238,28 @@ fn text_of(payload: &Value) -> Option<&str> {
     payload.as_str().or_else(|| payload["text"].as_str())
 }
 
+/// One spoken character: its text, and its start and length in
+/// milliseconds from the start of its frame's audio.
+#[derive(Debug, PartialEq)]
+struct Character {
+    text: String,
+    start_ms: f64,
+    duration_ms: f64,
+}
+
 /// One parsed session frame: the audio bytes it carries (empty when
-/// the frame carried none; the final frame's `audio` is null) and
-/// whether it declared the generation complete. A refusal or an
-/// unparseable frame is an error quoting the provider.
-fn classify_session_frame(payload: &str) -> WeftResult<(Vec<u8>, bool)> {
+/// the frame carried none; the final frame's `audio` is null), the
+/// characters it speaks when the session was opened for timing and the
+/// frame carried it, and whether it declared the generation complete.
+struct Frame {
+    audio: Vec<u8>,
+    characters: Option<Vec<Character>>,
+    is_final: bool,
+}
+
+/// Parse one session frame. `timed` reads its `alignment` too. A
+/// refusal or an unparseable frame is an error quoting the provider.
+fn classify_session_frame(payload: &str, timed: bool) -> WeftResult<Frame> {
     let msg: Value = serde_json::from_str(payload)
         .map_err(|e| node_error(format!("unparseable session frame: {e}")))?;
     if let Some(err) = msg["error"].as_str() {
@@ -57,20 +271,95 @@ fn classify_session_frame(payload: &str) -> WeftResult<(Vec<u8>, bool)> {
             .node_err("decoding an audio chunk")?,
         None => Vec::new(),
     };
-    Ok((audio, msg["isFinal"].as_bool() == Some(true)))
+    let characters = if timed { characters_of(&msg["alignment"])? } else { None };
+    Ok(Frame { audio, characters, is_final: msg["isFinal"].as_bool() == Some(true) })
+}
+
+/// A frame's `alignment` (`chars`, `charStartTimesMs`,
+/// `charDurationsMs`, three lists of one length) as characters, or
+/// `None` when the frame carried none.
+fn characters_of(alignment: &Value) -> WeftResult<Option<Vec<Character>>> {
+    if alignment.is_null() {
+        return Ok(None);
+    }
+    fn list<'a>(alignment: &'a Value, key: &str) -> WeftResult<&'a Vec<Value>> {
+        alignment[key].as_array().node_err(format!("a frame's alignment carries no `{key}` list"))
+    }
+    let (chars, starts, durations) =
+        (list(alignment, "chars")?, list(alignment, "charStartTimesMs")?, list(alignment, "charDurationsMs")?);
+    if starts.len() != chars.len() || durations.len() != chars.len() {
+        weft::node_bail!(
+            "a frame's alignment lists {} characters, {} start times and {} durations",
+            chars.len(),
+            starts.len(),
+            durations.len()
+        );
+    }
+    chars
+        .iter()
+        .zip(starts)
+        .zip(durations)
+        .map(|((text, start), duration)| -> WeftResult<Character> {
+            Ok(Character {
+                text: text.as_str().node_err("a frame's alignment holds a character that is not text")?.to_string(),
+                start_ms: start.as_f64().node_err("a frame's alignment holds a start time that is not a number")?,
+                duration_ms: duration.as_f64().node_err("a frame's alignment holds a duration that is not a number")?,
+            })
+        })
+        .collect::<WeftResult<Vec<_>>>()
+        .map(Some)
+}
+
+/// A frame's characters placed on the whole speech, `offset` seconds
+/// of audio having come before the frame: `{ text, start, end }` in
+/// seconds, what the `alignment` bus carries.
+fn placed(characters: &[Character], offset: f64) -> Value {
+    Value::Array(
+        characters
+            .iter()
+            .map(|c| {
+                let start = offset + c.start_ms / 1000.0;
+                json!({ "text": c.text, "start": start, "end": start + c.duration_ms / 1000.0 })
+            })
+            .collect(),
+    )
+}
+
+/// One session frame relayed: its characters, placed on the whole
+/// speech, onto the `alignment` bus when `timing` (that bus and the
+/// audio's bytes per second) is given, then its audio onto the `audio`
+/// bus and into the full-copy buffer. `true` when the frame said the
+/// session is complete.
+fn relay_frame(
+    payload: &str,
+    audio_bus: &BusHandle,
+    timing: Option<(&BusHandle, f64)>,
+    full: &mut Vec<u8>,
+) -> WeftResult<bool> {
+    let frame = classify_session_frame(payload, timing.is_some())?;
+    let characters = frame.characters.as_ref().filter(|c| !c.is_empty());
+    if let (Some((bus, rate)), Some(characters)) = (timing, characters) {
+        // The frame's times count from its own first byte, which comes
+        // after every byte relayed so far.
+        let offset = full.len() as f64 / rate;
+        bus.send("alignment", placed(characters, offset)).node_err("relaying the character timing")?;
+    }
+    if !frame.audio.is_empty() {
+        full.extend_from_slice(&frame.audio);
+        audio_bus.send_bytes("audio", frame.audio).node_err("relaying an audio chunk")?;
+    }
+    Ok(frame.is_final)
 }
 
 /// The audio bus's creator metadata for a declared output format, so
 /// a consumer knows the frame format before the first chunk.
 fn bus_meta(output_format: &str) -> Value {
-    if let Some(rate) = output_format.strip_prefix("pcm_").and_then(|r| r.parse::<u64>().ok())
-    {
-        return json!({ "sample_rate": rate, "encoding": "pcm_s16le" });
+    let (family, rate) = output_format.split_once('_').unwrap_or((output_format, ""));
+    match (family, rate.parse::<u64>()) {
+        ("pcm", Ok(rate)) => json!({ "sample_rate": rate, "encoding": "pcm_s16le" }),
+        ("ulaw" | "alaw", Ok(rate)) => json!({ "sample_rate": rate, "encoding": family }),
+        _ => json!({ "encoding": output_format }),
     }
-    if output_format == "ulaw_8000" {
-        return json!({ "sample_rate": 8000, "encoding": "ulaw" });
-    }
-    json!({ "encoding": output_format })
 }
 
 #[cfg(feature = "node-tests")]
@@ -86,29 +375,18 @@ impl Node for ElevenLabsSpeakNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let voice: String = ctx.inputs.get("voice")?;
-        let model: String = ctx.inputs.get("model")?;
-        let output_format: String = ctx.inputs.get("outputFormat")?;
+        let session = Session::read(&ctx.inputs, voice_settings(&ctx)?, ctx.is_output_wired("alignment"))?;
         // Resolved before the session opens: a format this node cannot
         // store must refuse before any paid synthesis, not after.
-        let (ext, mime) = audio_file_type(&output_format)?;
+        let (ext, mime) = audio_file_type(&session.output_format)?;
         let text = ctx.bus_from_input("text")?;
         // Read from the earliest message still buffered: the producer
         // may have started before this node attached.
         let mut chunks = text.cursor_from_start();
 
         let conn = ctx.open(&account).await?;
-        let url = format!(
-            "{WS_API}/text-to-speech/{voice}/stream-input\
-             ?model_id={}&output_format={}&auto_mode=true&inactivity_timeout=180",
-            urlencoding::encode(&model),
-            urlencoding::encode(&output_format),
-        );
-        let mut session = conn.socket(&url).await?;
-        // The protocol's opener: a single space plus the settings the
-        // session keeps.
-        session
-            .send(SocketMessage::Text(json!({ "text": " " }).to_string()))
-            .await?;
+        let mut socket = conn.socket(&session.url(&voice)).await?;
+        socket.send(SocketMessage::Text(session.opener().to_string())).await?;
 
         // The live audio bus: marker emitted before any synthesis (a
         // downstream consumer reads while chunks land), closed on
@@ -120,28 +398,22 @@ impl Node for ElevenLabsSpeakNode {
                 BusOptions {
                     ephemeral: true,
                     payload: BusPayloadKind::Bytes,
-                    meta: bus_meta(&output_format),
+                    meta: bus_meta(&session.output_format),
                     ..Default::default()
                 },
                 "speaker",
             )
             .await?;
-
-        /// One session frame's audio, relayed onto the bus and into
-        /// the full-copy buffer; `true` when the frame said the
-        /// session is complete.
-        fn relay_frame(
-            payload: &str,
-            bus: &weft::bus::BusHandle,
-            full: &mut Vec<u8>,
-        ) -> WeftResult<bool> {
-            let (audio, is_final) = classify_session_frame(payload)?;
-            if !audio.is_empty() {
-                full.extend_from_slice(&audio);
-                bus.send_bytes("audio", audio).node_err("relaying an audio chunk")?;
-            }
-            Ok(is_final)
-        }
+        // The character timing, only when something reads it, and as
+        // transient as the frames it describes.
+        let alignment_bus = match session.timing {
+            Some(_) => Some(
+                ctx.open_bus("alignment", BusOptions { ephemeral: true, ..Default::default() }, "speaker")
+                    .await?,
+            ),
+            None => None,
+        };
+        let timing = alignment_bus.as_deref().zip(session.timing);
 
         let mut full: Vec<u8> = Vec::new();
         // Whether any chunk carried a pronounceable character.
@@ -167,7 +439,7 @@ impl Node for ElevenLabsSpeakNode {
         loop {
             tokio::select! {
                 _ = keepalive.tick() => {
-                    session
+                    socket
                         .send(SocketMessage::Text(json!({ "text": " " }).to_string()))
                         .await?;
                 }
@@ -179,7 +451,7 @@ impl Node for ElevenLabsSpeakNode {
                         {
                             if let Some(t) = text_of(p).filter(|t| !t.is_empty()) {
                                 spoke |= t.chars().any(|c| !c.is_whitespace());
-                                session
+                                socket
                                     .send(SocketMessage::Text(
                                         json!({ "text": t }).to_string(),
                                     ))
@@ -195,13 +467,13 @@ impl Node for ElevenLabsSpeakNode {
                     // The text ended; the drain below takes over.
                     None => break,
                 },
-                frame = session.recv() => match frame? {
+                frame = socket.recv() => match frame? {
                     Some(msg) => {
                         // A final frame is not expected before the
                         // goodbye below; one arriving here means the
                         // session ended its generation while text was
                         // still coming, so the tail would go unspoken.
-                        if relay_frame(&msg.into_text()?, &audio_bus, &mut full)? {
+                        if relay_frame(&msg.into_text()?, &audio_bus, timing, &mut full)? {
                             return Err(node_error(
                                 "the session finished before the text ended; the tail would go \
                                  unspoken",
@@ -218,12 +490,12 @@ impl Node for ElevenLabsSpeakNode {
         // The text ended: close the generation (the protocol's
         // empty-text goodbye flushes whatever is buffered), then
         // drain the session's queued audio until its final frame.
-        session
+        socket
             .send(SocketMessage::Text(json!({ "text": "" }).to_string()))
             .await?;
         let mut finished = false;
-        while let Some(msg) = session.recv().await? {
-            if relay_frame(&msg.into_text()?, &audio_bus, &mut full)? {
+        while let Some(msg) = socket.recv().await? {
+            if relay_frame(&msg.into_text()?, &audio_bus, timing, &mut full)? {
                 finished = true;
                 break;
             }
@@ -236,7 +508,8 @@ impl Node for ElevenLabsSpeakNode {
                 "the session closed before it finished speaking; the audio would be truncated",
             ));
         }
-        session.close().await?;
+        socket.close().await?;
+        drop(alignment_bus);
         drop(audio_bus);
 
         // A zero-byte file would look like a success and only fail

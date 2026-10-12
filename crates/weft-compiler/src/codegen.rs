@@ -1128,7 +1128,8 @@ mod registry;
 static GLOBAL: weft_engine::Jemalloc = weft_engine::Jemalloc;
 
 // SYNC: the worker's environment <-> crates/weft-platform-local/src/runner.rs,
-//       crates/weft-platform-gcp/src/runner.rs (what each sets)
+//       crates/weft-platform-gcp/src/runner.rs (what each sets),
+//       crates/weft-engine/src/test_runner.rs (Args::Serve run_cap_secs reads WEFT_RUN_CAP_SECS too)
 #[derive(Debug, Parser)]
 #[command(name = "weft-project-worker", version)]
 struct Args {{

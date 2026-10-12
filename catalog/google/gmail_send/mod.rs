@@ -16,6 +16,8 @@ use weft::access::client::{get_json, required_str};
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
+use lettre::message::Mailbox;
+
 use super::gmail::{b64url, build_mime, header, OutAttachment, OutMessage, API};
 
 #[derive(NodeManifest)]
@@ -40,7 +42,19 @@ impl Node for GmailSendNode {
         let text: Option<String> = ctx.inputs.opt("text")?;
         let html: Option<String> = ctx.inputs.opt("html")?;
         let reply_to = ctx.inputs.opt::<String>("replyTo")?.filter(|r| !r.trim().is_empty());
-        let alias = ctx.inputs.opt::<String>("from")?.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        // `from` is an address, with or without a display name
+        // ("Name <address>"); only the address decides who may send.
+        let wanted = ctx
+            .inputs
+            .opt::<String>("from")?
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .map(|a| {
+                a.parse::<Mailbox>().map_err(|e| {
+                    weft::WeftError::Input(format!("gmail: from ('{a}') is not an email address, or a name and an address like 'Name <name@example.com>': {e}"))
+                })
+            })
+            .transpose()?;
         let handles: Vec<Value> = ctx.inputs.list("attachments")?;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
@@ -56,15 +70,17 @@ impl Node for GmailSendNode {
                  reconnect it on the access node"
             )
         };
-        let other_address = alias.as_ref().is_some_and(|a| !a.eq_ignore_ascii_case(&own));
         let http = ctx.client(&account).await?;
-        let from = match alias {
-            None => own,
-            Some(alias) if other_address => {
-                send_as_check(&http, &own, &alias).await?;
-                alias
+        let (from, replies_to) = match wanted {
+            None => (own_mailbox(&own)?, None),
+            Some(wanted) if !wanted.email.to_string().eq_ignore_ascii_case(&own) => {
+                // Sent as Gmail itself sends from that alias: its saved
+                // name when `from` gives none, its own reply-to address.
+                let alias = send_as(&http, &own, &wanted.email.to_string()).await?;
+                let name = wanted.name.clone().or(alias.name);
+                (Mailbox::new(name, wanted.email), alias.reply_to)
             }
-            Some(alias) => alias,
+            Some(wanted) => (wanted, None),
         };
 
         // Reply threading: the original's Message-ID header + thread.
@@ -109,6 +125,7 @@ impl Node for GmailSendNode {
 
         let mime = build_mime(&OutMessage {
             from: &from,
+            reply_to: replies_to.as_ref(),
             to: &to,
             cc: &cc,
             bcc: &bcc,
@@ -137,17 +154,35 @@ impl Node for GmailSendNode {
     }
 }
 
+/// The account's own address as a sender, as the connection recorded it.
+fn own_mailbox(own: &str) -> WeftResult<Mailbox> {
+    own.parse().map_err(|e| {
+        weft::WeftError::Input(format!(
+            "gmail: the Google connection's recorded address ('{own}') is not an email address: {e}; reconnect it on the access node"
+        ))
+    })
+}
+
+/// One of the account's Send mail as addresses, as Gmail keeps it: the
+/// name it sends under and where replies to it go, when set.
+#[derive(Debug, Default, PartialEq)]
+struct SendAs {
+    name: Option<String>,
+    reply_to: Option<Mailbox>,
+}
+
 /// Gmail honours a From only when it is one of the account's Send mail
 /// as addresses, and silently sends from the account's own address
-/// otherwise. So a `from` that is not the account's own address is
-/// checked against that list first, and a miss fails naming the
-/// addresses that would work. Reading the list needs 'Read mail' or
-/// 'Organize mail' on the connection (send-mail alone cannot).
-async fn send_as_check(
+/// otherwise. So a `from` address that is not the account's own is
+/// looked up in that list first, and a miss fails naming the addresses
+/// that would work; a hit answers what Gmail keeps for it. Reading the
+/// list needs 'Read mail' or 'Organize mail' on the connection
+/// (send-mail alone cannot).
+async fn send_as(
     http: &weft::reqwest_middleware::ClientWithMiddleware,
     own: &str,
-    alias: &str,
-) -> WeftResult<()> {
+    address: &str,
+) -> WeftResult<SendAs> {
     // A connection with send-mail alone is refused here (403,
     // "insufficient authentication scopes"); the attempt's name says
     // which permission to tick so that refusal reads as its own fix.
@@ -158,24 +193,34 @@ async fn send_as_check(
          'Read mail' or 'Organize mail' ticked on the Google access node)",
     )
     .await?;
-    // The primary address is on the list too. Gmail sets
-    // `verificationStatus` only on a custom alias, and one still
-    // "pending" is rewritten to the primary exactly like an unknown
-    // address; an entry without the field (the primary, a Workspace
-    // domain alias) is usable as is.
-    let allowed: Vec<&str> = answer["sendAs"]
+    send_as_in(&answer, own, address)
+}
+
+/// [`send_as`] from the list Gmail answered. The primary address is on
+/// the list too. Gmail sets `verificationStatus` only on a custom alias,
+/// and one still "pending" is rewritten to the primary exactly like an
+/// unknown address; an entry without the field (the primary, a Workspace
+/// domain alias) is usable as is.
+fn send_as_in(answer: &Value, own: &str, address: &str) -> WeftResult<SendAs> {
+    let usable: Vec<&Value> = answer["sendAs"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
         .filter(|s| s["verificationStatus"].as_str().is_none_or(|v| v == "accepted"))
-        .filter_map(|s| s["sendAsEmail"].as_str())
         .collect();
-    if allowed.iter().any(|a| a.eq_ignore_ascii_case(alias)) {
-        return Ok(());
+    fn address_of<'v>(entry: &&'v Value) -> Option<&'v str> {
+        entry["sendAsEmail"].as_str()
     }
+    if let Some(entry) = usable.iter().find(|s| address_of(s).is_some_and(|a| a.eq_ignore_ascii_case(address))) {
+        let text = |key: &str| entry[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+        // A saved reply-to Gmail could not read back as an address is
+        // left off rather than guessed at; the mail still goes out.
+        return Ok(SendAs { name: text("displayName"), reply_to: text("replyToAddress").and_then(|r| r.parse().ok()) });
+    }
+    let allowed: Vec<&str> = usable.iter().filter_map(address_of).collect();
     Err(weft::WeftError::Input(format!(
-        "gmail: '{alias}' is not one of this account's Send mail as addresses, so Gmail \
+        "gmail: '{address}' is not one of this account's Send mail as addresses, so Gmail \
          would send from {own} instead. Allowed: {}. Add the address under Gmail's \
          Settings > Accounts > Send mail as, or pick one of these.",
         if allowed.is_empty() { own.to_string() } else { allowed.join(", ") }

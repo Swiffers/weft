@@ -115,11 +115,13 @@ pub trait EntitlementSource: Send + Sync {
 
     /// The tenant's TOTAL currently-stored bytes across every storage plane the
     /// runtime has, read on `tx` so it composes into the caller's locked
-    /// transaction. THE single account-usage definition.
+    /// transaction. THE single account-usage definition. A file expired by
+    /// `now` (unix seconds, the store's clock) counts for nothing.
     async fn account_used_bytes(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         tenant: &str,
+        now: i64,
     ) -> anyhow::Result<u64>;
 }
 
@@ -159,9 +161,10 @@ impl EntitlementSource for LocalEntitlementSource {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         tenant: &str,
+        now: i64,
     ) -> anyhow::Result<u64> {
         // One plane here: the runtime-file table's charged bytes ARE the account.
-        charged_bytes_for(&mut **tx, tenant).await
+        charged_bytes_for(&mut **tx, tenant, now).await
     }
 }
 

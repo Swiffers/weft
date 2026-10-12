@@ -58,6 +58,52 @@ and the setup runs that `weft activate` and `weft infra start` make. The
 dispatcher hands a queued run to a worker, which claims it (the row names that
 worker from then on) and carries it on from its record.
 
+If the worker is still starting, that is no fault: the run waits 40 seconds
+and joins that same start.
+
+If the worker answers that it is busy (its own `503`: its memory is nearly
+full, or it is stopping), that costs the run no try. It waits and is handed
+out again, for as long as the workers keep answering busy. Each wait is as
+long as the run has been turned away so far, at least 5 seconds and at most
+a minute.
+
+If the workers keep that up for longer than the install's alert delay
+(`alert_after_minutes`, 5 minutes by default), `weft status` lists it under
+`waiting on weft:`, ending in ``this project's worker has answered busy for
+<time> (memory full); raise its memory (`weft workers set --memory
+<size>`)``, and on Google Cloud the install sends an alert email. The line
+goes away once none of the project's queued runs is still waiting on its
+workers (answered busy, refused, or not reached at all) and a run of the
+project has since left the queue: either the last one that was waiting
+(it reached a worker, it ended, or you cancelled it) or one started after
+the last failure. Changing the project's worker settings clears it too, and
+tries every queued run again from the start.
+
+Whether an answer counts as a refusal depends on who gave it:
+
+- The worker: any error it answers other than its busy `503`.
+- The platform, answering in the worker's place: any `4xx` except `404`,
+  `408` and `429`. A `404`, `408`, `429` or `5xx` from it is no answer.
+- Google Cloud, when weft asks it to create the worker: a `400`, `401` or
+  `403`. A `429`, a `5xx` or a timeout is no answer.
+- weft itself, when the project's worker settings together are a shape no
+  platform could run.
+
+The run is handed out again 5 seconds after the first refusal and 20
+seconds after the second, and the third cancels it, with a reason naming
+who said the last no: `its worker refused it 3 times: <error>`, `the
+platform refused weft's calls for it 3 times: <error>`, or `its project's
+worker settings kept it from any worker 3 times: <error>`. The `<error>`
+says what the last no was: the worker's or the platform's status and
+answer, or which worker setting no platform could run. If nothing answers at
+all, the run is handed out again 5 seconds later, then 20. If the third
+try gets no answer either, the run is not ended: it stays queued and waits
+until a worker of its project comes alive or a build of the project
+registers, and then its tries start over. Either way, `weft status` shows
+the error under `waiting on weft:`. If you change the
+project's worker settings (`weft workers set` or `reset`), every run still
+queued is handed out at once, with its tries forgotten.
+
 If a trigger starts a fast run and its worker dies straight away, the run may
 never show up in `weft executions`, because a fast run's record trails a few
 milliseconds behind it and may not have reached the database yet.
@@ -249,12 +295,46 @@ it, because Postgres makes every write that announces something commit one at
 a time, so announcing from inside each write would
 line up every write in the database behind the others.
 
-Some endings leave the dispatcher work (finishing a trigger's setup, clearing a
-run's pending waits). If it crashes or loses its Postgres connection it can
-miss such an ending, but it finds the work anyway: it looks when it starts
-and when the connection comes back, and on your machine also every 30 seconds
-while it is up. A cloud install sets no timer for this, so a dispatcher at
-zero stays there; the next call that starts one also looks.
+Some work has no write to announce it. A worker that dies just stops
+renewing its lease, and only the clock can show that. So the dispatcher
+works out the earliest moment a lease could run out, and looks again exactly
+then. On your machine that is a timer in the process. Each piece of
+background work there also looks on an interval of its own (15 seconds for
+the one that notices dead workers, 30 or 60 seconds for most others) in case
+an announcement was lost.
+
+A cloud install has no such timer. The dispatcher writes the moment into the
+database and books one Cloud Tasks wake for it. When the moment changes, it
+books the new wake before it deletes the old one, so a crash at the wrong
+time costs one wasted wake, never a missed one.
+
+On a cloud install, if whoever wrote the work cannot reach the dispatcher,
+it books a Cloud Tasks wake to call it instead, which Cloud Tasks retries
+for up to ten minutes. Until a call gets through, `weft status` lists the
+dispatcher under `waiting on weft:`. After ten minutes, the next write for
+the dispatcher, or the next part of weft to start, calls it again.
+
+If a piece of background work itself fails on a cloud install, weft books
+it again 1 second later, then 5, then 20. If the fourth try
+fails too, it stops trying and writes the error to `weft status`, under
+`waiting on weft:`. It runs again the next time weft writes work for it,
+and the line goes once a try works. Each failed try still answers Cloud
+Tasks' call as handled, so the queue does not call it again on its own.
+Cloud Tasks only retries a call whose failure could not even be written
+down, because the database did not answer. On your machine a failed piece
+of background work only logs the error, and runs again at its next
+interval or the next write for it.
+
+When a run a worker drives gets an answer or is cancelled, weft announces it
+through the install's news (the `weft-news` topic on a cloud install), in
+batches. If a batch is refused, weft tries it again after half a second, 2
+seconds and 5 seconds, then marks it refused, and `weft status` shows `weft
+could not tell the install's news (a cancel or an answer reaching a run a
+worker drives); those runs hear of it late` under `waiting on weft:`. Each
+time news is written, and when a weft process starts, weft first sends the
+new news on its own, so refused news never holds it up, then tries the
+refused news again one piece at a time, stopping at the first piece refused
+again. The line goes once no refused news is left.
 
 ## The listener
 
@@ -272,14 +352,67 @@ what it needs between two events, and the listener does exactly that:
   your machine that is the runtime's one process. On a cloud install the
   holders run in a pool, as many as those connections need and none when
   there are none. Each holder claims the triggers it holds, so no two
-  holders hold the same one, and it renews those claims every 10 seconds. If a holder crashes, its claims run
-  out after 30 seconds and another holder takes its triggers. A holder that
-  is shut down gives them up at once.
+  holders hold the same one. A claim lasts until its holder lets go, so there
+  is nothing to renew: a holder calls weft only when it has something new to
+  say, and Pub/Sub tells it when the triggers to hold change. Since claims never run out,
+  a holder that crashed would keep its triggers for good, so each holder
+  keeps a dead man's switch: a Cloud Tasks check set three minutes ahead,
+  which it moves forward every minute. A holder that dies stops moving it,
+  the check goes off, and the broker frees everything that holder claimed,
+  for another holder to take. A holder that cannot move its check in time
+  lets go of everything and exits before the check goes off, so its
+  triggers are never handed to another holder while it still holds them. A
+  holder that is shut down gives its triggers up at once.
 - **An event subscription** needs a holder only when it dials out to the
   service. On a cloud install, when the service can push the subscribed events
   for one account, weft subscribes with the service instead and renews that
   on a timer, so nothing stays open for it. A subscription to every account
   of your app always dials out.
+
+If the wake of a schedule, a delay, a poll or a subscription renewal keeps
+failing (the broker or the service does not answer, or the event it picked
+up cannot be handed on), the alarm delivers it again, waiting longer each
+time. The listener gets 20 tries at it, and a delivery uses one only when it
+gets an answer other than a 5xx: one with no answer at all (the listener
+down) or a 5xx (from the listener or from something in front of it) uses
+none. After 20 failed tries the listener gives the trigger
+up and stops waking it, and its node shows `its wake failed each of the 20
+times the listener handled it, the last with: <error>`. If the last one did
+what the wake was for but could not set the wake after it, the node shows
+`its wake was handled, but the wake after it could not be set on the last of
+the 20 times the listener handled it, so nothing wakes it again: <error>`
+instead. On your machine the 20 tries take about an hour when the listener
+answered every one, and up to about 95 minutes when an outage had already
+stretched the wait between tries to its longest, 5 minutes. On a cloud install the count is `wake_attempts` in
+`deploy/terraform/gcp/variables.tf`. If the broker answers that only a
+person can fix the trigger's connection (it is gone, it needs reconnecting,
+or the service refused what was asked, a missing permission for instance:
+a 400, 404, 409 or 410), the trigger is given up at once.
+
+A trigger that keeps a connection open (a socket, a stream, an SSE
+subscription, a service's events, a webhook subscription it keeps renewed)
+retries on its own when that connection fails, and its live panel shows
+`reconnecting since <time>: <error>` meanwhile. If the failure is one only a
+person can fix (the same broker answers, a credential refused right after it
+was fetched, or a setup error that would fail the same way every time), it
+stops instead: its live panel shows `stopped: <why>`, and the reason stays on
+its node. A service that is busy or limiting how often you call it is still
+retried.
+
+If you want a stopped or given-up trigger back, fix what stopped it and
+register it again. If it was its connection, reconnecting that connection is
+enough: weft brings back every trigger that uses it, the ones that keep a
+connection open included. If it was anything else, a setup error for
+instance, run `weft resync` once it is fixed. `weft activate` does not bring
+it back, because the trigger still counts as on.
+
+A trigger that acts as one of your connections keeps that connection's
+credentials for as long as it is registered. If you reconnect the
+connection, rotate it or remove it, weft registers again each trigger that
+uses it and that no holder holds, and tells the holders to drop what they
+kept for it, so nothing goes on with the old credentials. A token refresh
+does neither: what was kept already says when it stops being good, and is
+fetched again before then.
 
 If you want a new kind of trigger, you only write listener code: the listener
 is the only role that tells kinds apart.
@@ -294,7 +427,9 @@ cloud install a Compute Engine machine of its own, with its disks and GPUs.
 Two supervisors changing the same project at once would overwrite each other,
 so before it changes anything a supervisor takes an exclusive lease on the
 project. It keeps renewing that lease while the work runs, and if it expires
-another supervisor picks the project up.
+another supervisor picks the project up. When a supervisor takes up
+projects, it takes the ones with something due now first (a command waiting,
+a retry whose moment came).
 
 Inside the one supervisor that holds a project, the work on different copies
 runs side by side: three instances started together come up together. Work on
@@ -312,8 +447,57 @@ install sleep: the agent on each machine watches its unit right there, for
 free, and asks for a look when how the unit stands changes (a container
 stopped, a check started failing or passing again), and Compute Engine's own
 record of a machine stopping or failing asks too. Once something is not fine,
-the supervisor keeps looking until it is settled, which is what its flaky and
-recovery windows need.
+the supervisor's next look is booked for the exact moment it needs one, such
+as when a unit that stopped being ready would count as flaky. What the
+supervisor does about an unhealthy unit (restart it, take down the triggers
+that read it) is called a health protocol. If one fails, it is tried again
+after 5 and then 10 seconds. At the third failure the supervisor gives up on
+it and `weft status` lists it under `waiting on weft:`. It tries again once
+the units report a change, once they are all healthy, once you start, stop,
+upgrade or terminate the project's infra, or once you run `weft infra look`.
+
+The supervisor's own pass over a project can fail too: it could not look at
+the project's health, could not delete what the host still holds for copies
+that are gone, or ran a command and could not write down how it ended. If
+it could not list what the host holds (an error starting `could not list
+what the host holds to delete what its gone copies left`) or could not read
+which projects it owns (`could not read what it owns to look at its
+health`), the whole pass fails, and every project it holds counts a failed
+pass. `weft status` shows it under `waiting on weft:` as `weft's supervisor
+could not get through this project's infra`. On your machine the line ends
+`(tried again at the supervisor's next look)`, and the supervisor never
+gives up: its next look tries the project again. On a cloud install the supervisor tries the project again 5 seconds
+after the first failure and 10 seconds after the second, and the line ends
+with how many passes failed in a row and when it tries again, for example
+`(failure 1 in a row; tried again in 5 s)`. At the third failure the
+supervisor stops trying, and the line ends ``(failed 3 times in a row, so the
+supervisor stopped trying; `weft infra look` tries again)``. A pass over
+the project that goes through starts the count again from zero, and so does
+a `weft infra look`, which gives the project a fresh round of three tries. The line goes once a pass over the project works.
+
+When a project is removed, the supervisor deletes what the infra host still
+holds of it, disks included. A removed project has no status of its own, so
+if that fails, every project's `weft status` shows it under `waiting on
+weft:` as `weft's supervisor could not delete what the infra host still
+holds of removed projects (their disks included)`. The error names each
+removed project, what went wrong, and what happens next. On your machine it
+ends `(tried again at the supervisor's next look)`. On a cloud install the
+supervisor tries again 5 seconds after the first failure and 10 seconds
+after the second, and at the third the error ends `(failed 3 times in a
+row, so the supervisor stopped trying; its next pass tries again)`. From
+then on every pass of the supervisor tries again, and `weft infra look` in
+any project starts one. The line goes once the host holds nothing of any
+removed project.
+
+A command (a start, a stop, an upgrade) whose run or whose ending keeps
+failing would be taken up again forever, so the supervisor gives it up once
+it has taken it up 3 times without it ending. This holds on your machine
+too. The command ends failed with `the supervisor took this command up 3
+times and it never ended (its run, or the write of how it ended, kept
+failing), so it gave the command up; issue it again`, the commands it was
+holding back go ahead, and `weft status` lists it under `waiting on weft:`
+until the ending of a later infra command of the project is written. If you
+want it done, fix the cause and issue the command again.
 
 ## The broker, and who may talk to what
 
@@ -335,11 +519,16 @@ cancels and answers, and an idle one reports to the broker every second
 (that it is alive, and how many runs it drives), so its connection opens
 again within a second of closing. On Google Cloud a connection is cut after
 an hour, the most Cloud Run lets one request last, and the broker says so
-when it opens. A busy worker lets it be cut and opens another, like any
-broken connection. A worker whose runs all only wait never does, since
-opening one makes it read again, which would wake the database: once its
-connection is within a minute of the cut and its runs only wait, it stops
-the way it does when Cloud Run stops it. The runs that can pause are
+when it opens. A busy worker opens a second connection once the first is 30
+minutes old (or, if it was idle then, as soon as it gets busy), and moves
+over once the broker answers on it. The first connection keeps delivering until then,
+so the worker misses nothing and does not have to read the database again to
+catch up. A worker whose runs all only wait (on a person's answer, or on the
+next message from a caller on a socket) opens no new
+connection, because a broker copy that has not met that worker may read the
+database to check who it is. Instead, once its connection is within a
+minute of the cut and its runs only wait, it stops the way it does when
+Cloud Run stops it. The runs that can pause are
 handed back for a fresh worker to carry on, the others end with a message
 naming the limit, and the worker exits, so the next request starts a new
 one. When the connection breaks, it comes back by
@@ -388,17 +577,25 @@ A lost fast run is not marked cancelled the moment its worker dies: the
 dispatcher notices and ends it. Every worker reports that it is alive through
 the broker once a second, and counts as gone 15 seconds after its last report.
 The dispatcher ends a run once its worker has been gone for another 15
-seconds, and it looks for that at most once every 15 seconds, so a fast run
-ends 30 to 45 seconds after its worker last reported. Its journal holds what reached the database
+seconds, and it looks again exactly when the first such worker's extra 15
+seconds run out, so a fast run ends about 30 seconds after its worker last
+reported. Its journal holds what reached the database
 before the worker died.
 
 A worker whose runs are all only waiting on something outside them (a
-person's answer, while the run cannot pause) stops reporting, so the
-database is not woken every second for a wait that can last hours. Its last
-report says it is alive until the first of those waits would give up (its
-`holdSecs` running out), plus 15 seconds, and it reports again as soon as
-one of its runs moves (that first wait giving up included) or a new run
-comes, saying again how long it is alive for. The answer or the cancel that ends
+person's answer while the run cannot pause, or the next message of a caller
+on a socket) stops reporting, so the database is not woken every second for
+a wait that can last hours. Its last report says it is alive until the first
+of those waits would give up, plus 15 seconds. A wait on a person gives up
+when its `holdSecs` runs out. A wait for a caller's next message has no
+time limit of its own, so the worker's last report covers it until the
+run's hour ends or the route's or socket's `maxSessionSecs` runs out (the
+longest one connection may stay open; unset, there is none), whichever
+comes first. On your machine a run has no hour limit, so for a route or
+socket without `maxSessionSecs` the worker keeps reporting every second. The
+worker reports again as soon as one of its runs moves (that first wait
+giving up included) or a new run comes, saying again how long it is alive
+for. The answer or the cancel that ends
 the wait is written by the dispatcher, which also tells the broker copy
 holding the worker's connection, without going through the database (on
 Google Cloud, over Pub/Sub). That broker copy stays up for the length of the
@@ -407,11 +604,11 @@ only then does the worker read it. Nothing else reads while a run waits: the
 worker read its answers once as the run started waiting, and the broker
 reads only for the calls a worker makes. So the database sleeps for as long
 as the run waits, and wakes for the answer, the cancel, or the run's end,
-or when the connection breaks, after which the worker reads once to catch
-up. On Google Cloud such a wait lasts at most until the worker stops before
+or when the connection breaks, after which the worker reads once, for all
+its runs together, to catch up. On Google Cloud such a wait lasts at most until the worker stops before
 its connection is cut, within the hour (see [the
 broker](#the-broker-and-who-may-talk-to-what)). If the worker dies during the wait, its
-runs are ended (or carried on, if durable) 30 to 45 seconds after that
+runs are ended (or carried on, if durable) about 30 seconds after that
 first wait would have given up.
 
 In that same check, a durable run whose worker died is queued again, and the
@@ -462,7 +659,7 @@ answers), the runs in that batch end failed (for why, go and read [why a
 failed write stops the run](the-journal.md#why-a-failed-write-stops-the-run)).
 
 If a worker freezes or loses its connection to the broker, it stops reporting,
-and its runs go the way a dead worker's do: 30 to 45 seconds later a durable
+and its runs go the way a dead worker's do: about 30 seconds later a durable
 run moves to another worker and a fast run ends. The run's row carries a
 number that goes up every time a worker takes the run or loses it, and the
 broker refuses any write made under another number. So from then on the frozen worker's writes to that run

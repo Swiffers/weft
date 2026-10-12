@@ -207,9 +207,9 @@ an unrecorded run has no record a tag could point at. The compiler also
 refuses `durable: true` with `recorded: false`.
 
 **On a cloud install, one stretch of a run lasts an hour at most.** Cloud Run
-cuts a request at 60 minutes, so a run stops itself 59 minutes after a worker
-starts it. It ends cancelled with a message saying so, instead of being cut
-off mid-step with no ending written. A run that pauses whole (every branch
+cuts a request at 60 minutes, so a run stops itself 59 minutes after it
+started on its worker. It ends cancelled with a message saying so, instead
+of being cut off mid-step with no ending written. A run that pauses whole (every branch
 waiting on a timer or a form) starts a fresh hour when it picks back up; one
 branch waiting while another runs does not. So if a job can take longer than
 an hour, split it with a pause. On your machine no run is cut.
@@ -223,6 +223,31 @@ carries on under a call weft holds open for it, with a fresh hour. Moving works
 from the run's record, so the compiler refuses `outlivesCaller: true` with
 `recorded: false`. A run with a bus open cannot move, since a bus lives in its worker's memory
 alone, so it keeps running on that worker for as long as the worker stays up.
+
+If a run ends before it has finished answering its caller, the caller gets
+one of these statuses instead, with the reason in the body:
+
+| Status | When |
+|---|---|
+| `500` | the program failed, got stuck, or ended without answering |
+| `504` | a time limit ran out (the four limits are listed below the table) |
+| `503` | weft, a person, or another run (`ctx.stop_tagged`) stopped the run, weft could not keep it going, or it carries on without this caller (it paused on a wait, or moved to another worker) |
+
+A `504` means one of four limits ran out: on a cloud install, the run's
+hour; the route's or socket's `maxSessionSecs` (the longest one connection
+may stay open, off unless you set it); a wait that held for its whole
+`holdSecs`; or, on a cloud install, the hour a worker's connection to weft
+may last, when it runs out while every run on that worker only waits (for
+why, go and read
+[the broker](../running/architecture.md#the-broker-and-who-may-talk-to-what)).
+
+A `503` here carries no `Retry-After`, because calling again would start a
+second run beside the one that may still be going. If the answer had already
+started, its status was already sent, so the error comes at the end of the
+body instead: a JSON-lines answer ends with `{"error": "...", "status": 504}`,
+a server-sent-events answer with an `error` event, and any other answer with
+a line `[error] ...`. A socket closes with `1011` where a call would get `500`
+or `504`, and with `1013` where it would get `503`.
 
 ## Answering on a socket
 

@@ -4,24 +4,45 @@
 //! written by `weft_journal::record`, and the worker leases this rule reads
 //! are this crate's (`crate::worker_door`).
 
+/// Until when (unix seconds) a running run's owner holds it, as a SQL
+/// expression over a `run` row aliased `$run`: the later of its owner's
+/// lease (`worker_lease`) and the grace its claim or birth gave it before
+/// that lease is written (`run.delivered_until`,
+/// `weft_journal::record::delivered_until`); 0 when it has neither. Only
+/// a running run's reads this way: a queued run's `delivered_until` is its
+/// delivery's. The run is worked on while this is ahead of the clock
+/// ([`in_flight_sql!`]) and lost once it is a margin behind; the
+/// dispatcher's lost-run sweep, the look it books at the earliest of
+/// these, and a drain's next count all read it from here.
+#[macro_export]
+macro_rules! run_held_until_sql {
+    ($run:literal) => {
+        concat!(
+            "GREATEST(COALESCE(",
+            $run,
+            ".delivered_until, 0), COALESCE((SELECT held_lease.leased_until_unix FROM worker_lease held_lease WHERE held_lease.replica = ",
+            $run,
+            ".owner), 0))"
+        )
+    };
+}
+
 /// THE rule for "this run is being worked on", as a SQL predicate over a
-/// `run` row aliased `$run`: it is running and its owner's lease
-/// (`worker_lease`) is alive. A run whose owner's lease lapsed is lost
-/// (the lost-run sweep ends or requeues it); a parked or queued run is
-/// not being worked on. Every reader that asks (a drain's count, a
-/// cancel, the infra-setup guard) spells it through here, or through
-/// [`in_flight`].
+/// `run` row aliased `$run`: it is running and its owner still holds it
+/// ([`run_held_until_sql!`] is ahead of the database's clock). A run whose
+/// owner let it lapse is lost (the lost-run sweep ends or requeues it); a
+/// parked or queued run is not being worked on. Every reader that asks (a
+/// drain's count, a cancel, the infra-setup guard) spells it through here,
+/// or through [`in_flight`].
 #[macro_export]
 macro_rules! in_flight_sql {
     ($run:literal) => {
         concat!(
             "(",
             $run,
-            ".state = 'running' AND EXISTS (SELECT 1 FROM worker_lease in_flight_lease WHERE in_flight_lease.replica = ",
-            $run,
-            ".owner AND ",
-            $crate::worker_alive!("in_flight_lease"),
-            "))"
+            ".state = 'running' AND ",
+            $crate::run_held_until_sql!($run),
+            " >= EXTRACT(EPOCH FROM NOW())::BIGINT)"
         )
     };
 }
@@ -30,6 +51,14 @@ macro_rules! in_flight_sql {
 /// ([`in_flight_sql!`]).
 pub async fn in_flight<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
     Ok(sqlx::query_scalar(concat!("SELECT EXISTS (SELECT 1 FROM run r WHERE r.execution_id = $1 AND ", in_flight_sql!("r"), ")"))
+        .bind(execution_id)
+        .fetch_one(executor)
+        .await?)
+}
+
+/// Whether `execution_id` has ended (or is gone).
+pub async fn ended<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
+    Ok(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM run WHERE execution_id = $1 AND state <> 'ended')")
         .bind(execution_id)
         .fetch_one(executor)
         .await?)

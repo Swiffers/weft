@@ -1,0 +1,104 @@
+{
+  "type": "ElevenLabsRunTemplate",
+  "label": "Run Template",
+  "description": "Run a published ElevenLabs Flows template. Add one port for each of the template's inputs and one for each output you want, each named by its id in the template: `ElevenLabsRunTemplate(prompt: String, reference: Image) -> (product_still: Image)`. If you do not know the ids, declare one output under any name and run: before anything is paid, the node checks your ports against the template and its refusal lists the template's inputs and outputs with their types. Give each port the type of the template's matching input or output: String for text or a voice (give the voice id), Number for a number or a whole number, and Boolean, Image, Video or Audio for those; an input that takes a list is a List of the item type. A template with an object input cannot run here yet, because ElevenLabs's API cannot take one. Needs your own ElevenLabs account on a Pro plan or above.",
+  "tags": [
+    "ai",
+    "image",
+    "video",
+    "template"
+  ],
+  "icon": "Workflow",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "accepts": [
+        "wire"
+      ],
+      "required": true,
+      "requiresScopes": [
+        "image_video"
+      ],
+      "description": "Your own ElevenLabs account: wire an ElevenLabsAccess node whose connection has \"Images and video\" ticked. weft's built-in connection cannot run templates, and each run is paid from this account's credits."
+    },
+    {
+      "name": "template",
+      "type": "String",
+      "required": true,
+      "label": "Template",
+      "placeholder": "Pick a template, or paste its id",
+      "description": "The template to run. If it was shared with you by link, or published to Explore from another workspace, it is not in the list, so paste its id (it looks like `tmpl_abc123`).",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "image_video"
+            ],
+            "get": "https://api.elevenlabs.io/v1/flows/templates?search={query}",
+            "items": "templates",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "next_cursor"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "version",
+      "type": "String",
+      "label": "Version",
+      "placeholder": "The latest published version",
+      "description": "If you want this node to keep running the same version when the template changes, pin it here. Leave empty for the latest published one. A pinned version stops working once ten newer ones are published: weft checks your ports against it before paying, and ElevenLabs lists only a template's 10 newest versions. The refusal names the versions you can pin instead.",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "template"
+        ],
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "image_video"
+            ],
+            "get": "https://api.elevenlabs.io/v1/flows/templates/{template}",
+            "items": "versions",
+            "label": "version_id",
+            "value": "version_id"
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": [],
+  "features": {
+    "catchErrors": true,
+    "canAddInputPorts": true,
+    "canAddOutputPorts": true
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "custom_outputs_declared"
+        }
+      },
+      "then": {
+        "message": "ElevenLabsRunTemplate '{id}' reads none of the template's outputs. Declare one port per output you want, named by its id in the template, with its type: `ElevenLabsRunTemplate(...) -> (product_still: Image, title: String)`. If you do not know the ids, declare one under any name and run: the refusal lists them, before anything is paid.",
+        "level": "runtime",
+        "severity": "error"
+      }
+    }
+  ]
+}

@@ -743,9 +743,16 @@ fn answered(taken: &[Taken], runs: usize, answer: Result<BatchAnswer, BatchError
                         run.born_elsewhere.store(true, Ordering::Release);
                         run.fail(format!("another worker bore run {} first; it is that worker's", run.execution_id));
                     }
+                    Fate::ProjectRemoving => {
+                        run.fail(format!(
+                            "run {} was not started: {}",
+                            run.execution_id,
+                            weft_core::projects::PROJECT_BEING_REMOVED
+                        ));
+                    }
                     Fate::Refused => {
                         run.fail(format!(
-                            "this worker no longer drives run {} (another worker took it, or it ended); nothing more of it is recorded",
+                            "this worker no longer drives run {} (another worker took it, it ended, or its project was removed); nothing more of it is recorded",
                             run.execution_id
                         ));
                     }

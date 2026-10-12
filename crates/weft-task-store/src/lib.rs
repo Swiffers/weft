@@ -35,6 +35,7 @@ pub mod db;
 pub mod drain;
 pub mod executor;
 pub mod held_copy;
+pub mod infra_command;
 pub mod infra_copies;
 pub mod kinds;
 pub mod locks;
@@ -53,7 +54,7 @@ pub use schema_guard::{apply_groups, Migration, SchemaGroup};
 pub use executor::{dispatcher_picker_loop, TaskExecutor, TaskRegistry, TaskRegistryBuilder};
 pub use kinds::{FireSignalPayload, StopTaggedPayload, TaskKind, WithdrawSignalPayload};
 pub use tasks::{
-    claim_duration_secs, claim_heartbeat_interval, claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,
+    claim_duration_secs, claim_heartbeat_interval, claim_next, complete, enqueue, enqueue_dedup, fail, heartbeat, Claim,
     DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus, TERMINAL_RETENTION_SECS,
 };
 pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};

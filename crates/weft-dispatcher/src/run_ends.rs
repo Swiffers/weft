@@ -12,10 +12,15 @@
 //!   and the listener is told to let go of them.
 //!
 //! The write that ends such a run announces it on
-//! `weft_journal::RUN_ENDED_CHANNEL`, which wakes this loop at once. It
-//! also looks on its own: at its first drain (a boot), after every recheck
-//! of the process's database listener, and on its safety tick, so an
-//! announcement lost in a crash only delays the work.
+//! `weft_journal::RUN_ENDED_CHANNEL`, which wakes this loop at once. A run
+//! whose work fails stays flagged, and the loop fails with it: it is tried
+//! again shortly a few times, then written down for `weft status` until a
+//! later ending wakes the loop (`weft_task_store::drain`).
+//!
+//! A watched run's ending may also leave a hold with nobody to take it
+//! back: an activation whose driver died while its setup run went, a task
+//! claim that rested on that run. The `lapses` loop judges those, so it is
+//! booked to look.
 
 use weft_core::ExecutionId;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
@@ -28,7 +33,7 @@ pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(weft_journal::RUN_ENDED_CHA
 const PAGE: i64 = 100;
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new("run_ends", WAKE_ON, SAFETY_POLL_INTERVAL, move || {
+    DrainLoop::new("run_ends", "finish what runs' endings leave to do", WAKE_ON, SAFETY_POLL_INTERVAL, move || {
         let state = state.clone();
         async move { handle_endings(&state).await }
     })
@@ -39,9 +44,13 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
 /// (so two dispatchers never take the same run, and a crash midway leaves
 /// it flagged for the next look), its flags cleared once its work is done.
 /// A run whose work fails stays flagged and is said in the log, the runs
-/// after it are handled all the same, and the next look tries it again.
+/// after it are handled all the same, and the drain fails naming how many.
 async fn handle_endings(state: &DispatcherState) -> anyhow::Result<DrainStep> {
     let mut after: Option<ExecutionId> = None;
+    let mut failed = 0usize;
+    let mut watched = false;
+    // The earliest erase time of the runs unflagged.
+    let mut erased_at: Option<i64> = None;
     loop {
         let page: Vec<ExecutionId> = sqlx::query_scalar(
             "SELECT execution_id FROM run WHERE state = 'ended' AND (watch_end OR holds_signals) \
@@ -56,24 +65,35 @@ async fn handle_endings(state: &DispatcherState) -> anyhow::Result<DrainStep> {
             let Some(ending) = take_flagged(&mut tx, *execution_id).await? else { continue };
             match handle_ending(state, &ending).await {
                 Ok(()) => {
-                    clear_flags(&mut tx, &ending).await?;
+                    let kept = clear_flags(&mut tx, &ending).await?;
                     tx.commit().await?;
+                    erased_at = kept.into_iter().chain(erased_at).min();
+                    watched |= ending.watch_end;
                 }
                 Err(e) => {
+                    failed += 1;
                     tracing::error!(
                         target: "weft_dispatcher::run_ends",
                         execution_id = %ending.execution_id,
                         error = %format!("{e:#}"),
-                        "what a run's ending left could not be done; it is tried again at the next look"
+                        "what a run's ending left could not be done"
                     );
                 }
             }
         }
         if (page.len() as i64) < PAGE {
-            return Ok(DrainStep::Done);
+            break;
         }
         after = page.last().copied();
     }
+    if let Some(at) = erased_at {
+        crate::retention::book_at(state, at).await?;
+    }
+    if watched {
+        crate::lapses::book_after(state, 0).await?;
+    }
+    anyhow::ensure!(failed == 0, "what {failed} runs' endings left could not be done");
+    Ok(DrainStep::Done)
 }
 
 /// What `ending` left: its trigger setup's bake, its resume signals taken
@@ -112,13 +132,14 @@ pub async fn take_flagged(conn: &mut sqlx::PgConnection, execution_id: Execution
     .await?)
 }
 
-/// The work `ending` left is done: its flags go.
-pub async fn clear_flags(conn: &mut sqlx::PgConnection, ending: &Flagged) -> anyhow::Result<()> {
-    sqlx::query("UPDATE run SET watch_end = FALSE, holds_signals = FALSE WHERE execution_id = $1")
+/// The work `ending` left is done: its flags go. Answers until when the
+/// run is kept (`None`: for ever): retention left it alone while it was
+/// flagged, so no look it booked counts it.
+pub async fn clear_flags(conn: &mut sqlx::PgConnection, ending: &Flagged) -> anyhow::Result<Option<i64>> {
+    Ok(sqlx::query_scalar("UPDATE run SET watch_end = FALSE, holds_signals = FALSE WHERE execution_id = $1 RETURNING keep_until")
         .bind(ending.execution_id)
-        .execute(conn)
-        .await?;
-    Ok(())
+        .fetch_one(conn)
+        .await?)
 }
 
 /// Bake the trigger setup `execution_id` from its record, when it is one

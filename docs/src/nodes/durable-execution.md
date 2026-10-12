@@ -17,11 +17,13 @@ resume inside your `await`. It starts over.
 | `ctx.await_signal` that was answered | Returns the answer straight away, without waiting |
 | `ctx.await_signal` that was given up | Fails the same way again, without waiting |
 | `ctx.run("name", ...)` that finished | Returns what it returned last time, without running the closure |
+| An emit or close on a port this firing already sent on or closed | Does nothing: the first value stands, and nothing downstream fires twice |
 | Anything else in your body | **Runs again** |
-| Anything you emitted | Runs again, which is why emitting before an await is refused |
 
 So the shape is: do the work, wrap anything expensive or irreversible in
-`ctx.run`, wait, then emit.
+`ctx.run`, wait, then emit. If you want a node downstream to start before the
+wait (an image node sending `stats` at once and `image` when the provider is
+done), emit that port first, then wait, then emit the rest.
 
 ```rust
 let quote = ctx.run("fetch quote", || async {
@@ -111,14 +113,14 @@ it, `rig.signal_given_up()` makes the next wait fail this way.
 
 ## Two things weft refuses
 
-**Emitting, then awaiting.** A replay would emit again, and the value already
-went downstream.
+**Yielding on a stream, then awaiting.** A replay keeps an ordinary port's
+first value, but a stream's items went out live and cannot be sent again.
 
 ```text
-node 'review' called await_signal after emitting or closing an output port; a
-node that touches a port then durably suspends would touch it again on replay.
-Emit and close after all awaits, or (for a co-alive node) stay warm with
-bus.recv() instead of await_signal.
+node 'narrate' called await_signal after yielding on or closing a stream
+output; a pause replays the body from the top, and a stream's items went out
+live and cannot be sent again. Wait before the stream starts, or (for a
+co-alive node) stay warm with bus.recv() instead of await_signal.
 ```
 
 **Awaiting in a node that reads a stream.** A replay cannot re-pull items that

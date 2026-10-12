@@ -128,9 +128,43 @@ gets `text_list`, `String` gets `text`, and everything else gets `textarea`.
 | `picker` | `script`, `code`, `grants`, `mime_types` | The provider's own chooser, opened on a weft page |
 | `from_url` | `pattern` | The person pastes a link and the first capture group is the id |
 
-A `Lookup` takes `get` (a URL with `{query}` in it), `items` (a dotted path to
-the array), `label`, `value`, optional `page` (`cursor_param` and
-`cursor_path`), and `public` when the call carries no credential at all.
+A `Lookup` takes `get`, `items`, `label` and `value`, and optionally `page` (an
+object holding `cursor_param` and `cursor_path`), `public` and `where`. `get` is the URL to
+call. `items` is the dotted path to the array in the answer (`data.channels` for
+`{"data": {"channels": [...]}}`), or `""` when the answer is the array itself.
+`label` and `value` are dotted paths inside one item: the text the person sees
+and the id that gets saved.
+
+If you want the service to do the searching, put `{query}` in `get`, and it
+becomes what the person typed in the search box. If `get` has no `{query}`, the
+service never sees the search text, and the list only shows the items whose
+label or id contains it, ignoring case. If you want another input's value
+in the URL, list that input in the widget's `depends_on` and write its name in
+braces: `{team}` becomes whatever is set on `team`. Weft percent-encodes every
+value it puts into the URL.
+
+If the endpoint is https and needs no credential, add `"public": true`. The list
+then works before anyone picks a connection, and the call never carries the
+connection's credential, even after they pick one.
+
+If you only want some of the items the service sends back, add `where`. Each
+key is a dotted path inside one item, and its value is what the item must hold
+there. An item is kept only if every path matches, type included: `true` does
+not match `"true"`. An item with nothing at a path is dropped, so `null` only
+matches a field the service sends as `null`.
+
+ElevenLabs' models endpoint answers with a bare array of every model, each
+carrying flags like `can_do_text_to_speech`, so a text-to-speech node sets
+`"items": ""` and keeps the ones that can speak:
+
+```json
+{ "kind": "list", "get": "https://api.elevenlabs.io/v1/models", "items": "",
+  "label": "name", "value": "model_id", "where": { "can_do_text_to_speech": true } }
+```
+
+If the lookup also has a `page`, `where` filters each page as it arrives: a page where
+nothing matches adds nothing to the list, and the editor still shows "More..."
+for the next one.
 
 ## validate
 

@@ -28,6 +28,7 @@ pub mod hold;
 pub mod infra_address;
 pub mod kinds;
 pub mod listener_access;
+pub mod reach;
 pub mod registry;
 pub mod router;
 pub mod socket_engine;
@@ -39,7 +40,7 @@ pub use router::router;
 use std::sync::Arc;
 
 use weft_broker_client::{BrokerLink, BrokerSignalClient};
-use weft_platform_traits::Alarm;
+use weft_platform_traits::{Alarm, HolderLiveness, HolderNews};
 use weft_task_store::TaskStoreClient;
 
 use crate::fire_sink::FireSignalSink;
@@ -62,6 +63,17 @@ pub struct ListenerState {
     /// What this process holds and has said about it, when it holds
     /// (`ListenerConfig::holds_here`).
     pub holding: Arc<hold::Holding>,
+    /// What holders hear, and how a dead one is noticed.
+    pub holders: HolderPlatform,
+    /// Where this process connects and as whom, as the broker last said.
+    pub reach: Arc<reach::Reach>,
+}
+
+/// The platform's side of holding (`weft_platform_traits::holders`).
+#[derive(Clone)]
+pub struct HolderPlatform {
+    pub news: Arc<dyn HolderNews>,
+    pub liveness: Arc<dyn HolderLiveness>,
 }
 
 impl ListenerState {
@@ -71,10 +83,13 @@ impl ListenerState {
         link: BrokerLink,
         alarm: Arc<dyn Alarm>,
         doors: Arc<dyn fire_sink::WorkerDoors>,
+        holders: HolderPlatform,
     ) -> Self {
         let signals = BrokerSignalClient::new(link.clone());
         let registry = Arc::new(Registry::new());
-        let fire_sink = FireSignalSink::new(tasks, signals.clone(), registry.clone(), doors);
+        let holding = Arc::<hold::Holding>::default();
+        let reach = Arc::<reach::Reach>::default();
+        let fire_sink = FireSignalSink::new(tasks, signals.clone(), registry.clone(), doors, holding.changed.clone(), reach.clone());
         let events_broker = weft_broker_client::BrokerEventsClient::new(link);
         Self {
             config: Arc::new(config),
@@ -83,7 +98,9 @@ impl ListenerState {
             signals,
             events_broker,
             alarm,
-            holding: Arc::default(),
+            holding,
+            holders,
+            reach,
         }
     }
 }

@@ -61,10 +61,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- so the same id registered again never inherits a tree it did
             -- not make and no version keeps naming stored files of a
             -- project that no longer exists. The journal's executions go
-            -- the same way, at the same moment, so a removal leaves the
-            -- person their files and nothing else.
-            -- `retire_unused_versions` is the backstop for a removal that
-            -- failed halfway, not a step of the ordinary one.
+            -- just before, so a removal leaves the person their files and
+            -- nothing else.
             project_id   UUID NOT NULL,
             parent_id    TEXT,
             manifest     JSONB NOT NULL,
@@ -169,28 +167,6 @@ pub trait VersionStoreOps: Send + Sync {
     /// The source manifest the project's running build was registered
     /// with, if any: its blobs stay alive whatever the tree drops.
     async fn registered_source(&self, project: uuid::Uuid) -> anyhow::Result<Option<Manifest>>;
-
-    /// Once the project row is gone, drop every version no surviving run
-    /// needs, and answer how many went.
-    ///
-    /// A version is kept when a surviving run (any `run` row) was started
-    /// on it, OR when a kept version descends from it: a run's place in
-    /// the tree is its lineage, and deleting an ancestor would leave the
-    /// survivor parented on a row that is gone.
-    ///
-    /// The mirror of `ProjectStore::retire_unused_definitions`, and for
-    /// the same reason: a run outlives its project, so what describes that
-    /// run has to outlive it too, while the versions nothing points at any
-    /// more are of no use to anybody. Refuses to do anything while the
-    /// project still exists, so a live project's tree can never be
-    /// swept by this path.
-    async fn retire_unused_versions(&self, project: uuid::Uuid) -> anyhow::Result<u64>;
-
-    /// Every project id that still has tree rows while the project itself
-    /// is gone. What the reaper sweeps; see
-    /// `ProjectStore::projects_with_orphan_definitions` for why one
-    /// best-effort retirement is not enough.
-    async fn projects_with_orphan_versions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
 
     /// The run `execution_id` as the tree reads it, when it is a run of a
     /// program version (any run but a node test).
@@ -405,54 +381,6 @@ impl VersionStoreOps for PostgresVersionStore {
         Ok(source.flatten().map(serde_json::from_value).transpose()?)
     }
 
-    async fn projects_with_orphan_versions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
-        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT DISTINCT pv.project_id FROM project_version pv \
-             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = pv.project_id)",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
-    }
-
-    async fn retire_unused_versions(&self, project: uuid::Uuid) -> anyhow::Result<u64> {
-        // Nothing at all while the project row is there. Checked in the
-        // same statement as the DELETE, so a project registered again in
-        // between cannot lose its history.
-        let mut tx = self.pool.begin().await?;
-        // A version a KEPT version descends from must stay too, or the
-        // survivor's `parent_id` points at a row that is gone (nothing
-        // rejects that, there is no foreign key on it).
-        let retired: Vec<String> = sqlx::query_scalar(
-            "WITH RECURSIVE kept AS ( \
-                 SELECT pv.id FROM project_version pv \
-                 WHERE pv.project_id = $1 \
-                   AND EXISTS (SELECT 1 FROM run r WHERE r.project_id = pv.project_id AND r.source_version = pv.id) \
-                 UNION \
-                 SELECT parent.id FROM project_version parent \
-                 JOIN project_version child ON child.parent_id = parent.id \
-                                           AND child.project_id = parent.project_id \
-                 JOIN kept ON kept.id = child.id \
-                 WHERE parent.project_id = $1 \
-             ) \
-             DELETE FROM project_version pv \
-             WHERE pv.project_id = $1 \
-               AND NOT EXISTS (SELECT 1 FROM kept WHERE kept.id = pv.id) \
-               AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = $1) \
-             RETURNING pv.id",
-        )
-        .bind(project)
-        .fetch_all(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM version_runs WHERE project_id = $1 AND source_version = ANY($2)")
-            .bind(project)
-            .bind(&retired)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(retired.len() as u64)
-    }
-
     async fn run(&self, execution_id: ExecutionId) -> anyhow::Result<Option<RunRow>> {
         let row: Option<RunTuple> = sqlx::query_as(&format!(
             "SELECT {RUN_COLUMNS} FROM run WHERE execution_id = $1 AND {IN_TREE}"
@@ -653,16 +581,6 @@ impl FakeVersionStore {
         self.runs.lock().unwrap().retain(|r| r.project_id != project);
     }
 
-    /// Drop ONLY the project row, leaving its tree behind: the state a
-    /// removal that failed halfway leaves, and the only state the
-    /// retirement sweep can still find work in. Not a shape `weft rm`
-    /// produces, which is why it is spelled differently from
-    /// [`Self::remove_project`].
-    pub fn forget_project_row(&self, project: uuid::Uuid) {
-        self.projects.lock().unwrap().remove(&project);
-        self.heads.lock().unwrap().remove(&project);
-    }
-
     /// A run the tree shows: its version is still in the tree.
     fn in_tree(&self, run: &RunRow) -> bool {
         self.versions.lock().unwrap().iter().any(|v| v.project_id == run.project_id && v.id == run.version_id)
@@ -726,50 +644,6 @@ impl VersionStoreOps for FakeVersionStore {
         // No test registers a build's source here; the real column is
         // written by the project store, not the tree.
         Ok(None)
-    }
-
-    async fn projects_with_orphan_versions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
-        let live = self.projects.lock().unwrap();
-        let mut ids: Vec<uuid::Uuid> = self
-            .versions
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|v| v.project_id)
-            .filter(|id| !live.contains(id))
-            .collect();
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
-    }
-
-    async fn retire_unused_versions(&self, project: uuid::Uuid) -> anyhow::Result<u64> {
-        // Nothing at all while the project row is there, which is what
-        // Postgres's `NOT EXISTS (SELECT 1 FROM project ...)` says.
-        if self.projects.lock().unwrap().contains(&project) {
-            return Ok(0);
-        }
-        let runs = self.runs.lock().unwrap();
-        let mut versions = self.versions.lock().unwrap();
-        let before = versions.len();
-        // Every version a surviving run needs, closed up the lineage so a
-        // survivor's parent is never deleted out from under it.
-        let mut kept: BTreeSet<String> = runs.iter().filter(|r| r.project_id == project).map(|r| r.version_id.clone()).collect();
-        kept.extend(self.trigger_runs.lock().unwrap().keys().filter(|(p, _)| *p == project).map(|(_, version)| version.clone()));
-        loop {
-            let parents: BTreeSet<String> = versions
-                .iter()
-                .filter(|v| v.project_id == project && kept.contains(&v.id))
-                .filter_map(|v| v.parent_id.clone())
-                .filter(|p| !kept.contains(p))
-                .collect();
-            if parents.is_empty() {
-                break;
-            }
-            kept.extend(parents);
-        }
-        versions.retain(|v| v.project_id != project || kept.contains(&v.id));
-        Ok((before - versions.len()) as u64)
     }
 
     async fn forget_head_run(&self, execution_id: ExecutionId) -> anyhow::Result<()> {
@@ -1159,12 +1033,9 @@ mod tests {
         assert!(refusal.reasons[0].contains("version armed is activated"), "{:?}", refusal.reasons);
     }
 
-    /// A removed project keeps exactly the tree its surviving runs need.
-    ///
     /// `weft rm` takes the whole tree with the project, in the same
-    /// transaction, and the runs cascade off it. Nothing of a removed
-    /// project is left to prune, which is the point: what used to be
-    /// kept could not be reached or freed by anything afterwards.
+    /// transaction, its runs erased just before: nothing of a removed
+    /// project is left.
     #[tokio::test]
     async fn removing_a_project_takes_its_whole_tree() {
         let store = FakeVersionStore::new();
@@ -1174,48 +1045,8 @@ mod tests {
         store.upsert_version(&version("never-ran", Some("ran"), &[("main.weft", "2")], 2)).await.unwrap();
         store.add_run(run(1, "ran", 3));
 
-        // Nothing is pruned while the project is still registered: a
-        // version with no run is still a version you can go back to.
-        assert_eq!(store.retire_unused_versions(project).await.unwrap(), 0);
-        assert_eq!(store.versions(project).await.unwrap().len(), 2);
-
         store.remove_project(project);
         assert!(store.versions(project).await.unwrap().is_empty(), "the tree went with it");
         assert!(store.runs(project).await.unwrap().is_empty(), "and the runs with it");
-        // So the prune finds nothing rather than something: it exists
-        // for a removal that failed halfway, not for the ordinary one.
-        assert_eq!(store.retire_unused_versions(project).await.unwrap(), 0);
-    }
-
-    /// The versions no surviving run was started on go, and the lineage of
-    /// a surviving run stays whole: `parent_id` carries no foreign key, so
-    /// deleting a run-less ancestor would leave the survivor parented on a
-    /// row that is gone, and nothing would reject it. A version only a
-    /// trigger's runs were started on is kept like one a run started by
-    /// hand was.
-    ///
-    /// This uses `forget_project_row` rather than `remove_project`: an
-    /// ordinary removal takes the whole tree, so the only way tree rows
-    /// outlive their project is a removal that failed halfway, which is
-    /// the case this sweep exists for.
-    #[tokio::test]
-    async fn retirement_keeps_what_surviving_runs_need_and_their_lineage() {
-        let store = FakeVersionStore::new();
-        let project = uuid::Uuid::nil();
-        store.add_project(project);
-        // root (no runs) -> middle (no runs) -> leaf (one run by hand)
-        store.upsert_version(&version("root", None, &[("main.weft", "1")], 1)).await.unwrap();
-        store.upsert_version(&version("middle", Some("root"), &[("main.weft", "2")], 2)).await.unwrap();
-        store.upsert_version(&version("leaf", Some("middle"), &[("main.weft", "3")], 3)).await.unwrap();
-        store.add_run(run(1, "leaf", 4));
-        // A version only a trigger ran on, and one nothing ran on.
-        store.upsert_version(&version("fired", Some("root"), &[("main.weft", "4")], 5)).await.unwrap();
-        store.add_trigger_runs(project, "fired", TriggerRuns { runs: 3, last: execution_id(2) });
-        store.upsert_version(&version("bare", Some("root"), &[("main.weft", "5")], 6)).await.unwrap();
-
-        store.forget_project_row(project);
-        assert_eq!(store.retire_unused_versions(project).await.unwrap(), 1, "only the bare version");
-        let left: Vec<String> = store.versions(project).await.unwrap().into_iter().map(|v| v.id).collect();
-        assert_eq!(left, vec!["root", "middle", "leaf", "fired"], "the survivors' ancestors stay");
     }
 }

@@ -1,3 +1,4 @@
-# The output format rides the speech-to-speech URL's query string.
+# The output format and zero retention ride the speech-to-speech URL's
+# query string, and the voice id its path.
 [dependencies]
 urlencoding = "2"

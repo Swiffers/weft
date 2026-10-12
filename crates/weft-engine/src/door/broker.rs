@@ -127,11 +127,6 @@ impl Triggers {
         self.by_token.get(token)
     }
 
-    /// Every trigger's token: what the door's counts are stated for.
-    pub fn tokens(&self) -> impl Iterator<Item = &String> {
-        self.by_token.keys()
-    }
-
     /// The route serving `method` on `path`: the most specific pattern wins
     /// (`weft_core::route::find_route`).
     pub fn route(&self, method: &str, path: &str) -> weft_core::route::RouteMatch<&Arc<HeldTrigger>> {

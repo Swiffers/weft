@@ -135,6 +135,12 @@ async fn start(
         .await
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal is held under token {}", req.token)))?;
+    // The row it replaced set wakes for its own spec; they go first.
+    if let Some(replaced) = &req.replaced {
+        if let Err(e) = kinds::cancel_wakes(&state, &req.token, replaced.generation, &replaced.spec, &replaced.kind_state).await {
+            tracing::error!(target: "weft_listener::router", token = %req.token, error = %format!("{e:#}"), "the wakes of the row this one replaced cannot be named; they go off once and find a newer registration");
+        }
+    }
     // A fresh one's refusal is this registration's.
     crate::registry::start(&state, row, req.mode).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
@@ -149,7 +155,9 @@ async fn live(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, format!("unknown token: {}", req.token)))?;
     let mut live = kinds::compute_live(&kinds::LiveCtx { sig: &sig, address: req.address.as_deref() });
-    if let Some(reason) = state.registry.down_reason(&req.token) {
+    if let Some(reason) = sig.gave_up.as_ref() {
+        live.items.insert(0, weft_core::live::LiveItem::text("State", format!("stopped: {reason}")));
+    } else if let Some(reason) = state.registry.down_reason(&req.token) {
         live.items.insert(0, weft_core::live::LiveItem::text("State", format!("down, retrying: {reason}")));
     }
     kinds::read_only_display(&sig.spec.kind, &live).map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
@@ -214,9 +222,18 @@ async fn wake_by_hand(
 }
 
 /// A `Wakes` signal's wake, delivered by the platform's alarm. A failure
-/// answers 500, which every alarm takes as "try again"; the kind's claim
-/// keeps a retried wake from acting twice. The moment it was aimed at
-/// rides in the body (`WakeBody::due_at_ms`), not the delivery time.
+/// that may pass answers 424
+/// (`weft_platform_traits::alarm::WAKE_FAILED_STATUS`), which every alarm
+/// takes as "try again" and counts as one of the wake's deliveries (a 5xx
+/// it would not count); the kind's claim keeps a retried wake from acting
+/// twice. A wake whose row
+/// can never be acted on, or that failed on the last delivery the alarm
+/// gives it (`weft_platform_traits::Delivery`, read off the call's
+/// headers), gives the signal up (shown on its node) and is answered 200
+/// `{"dropped": true, "reason": ...}`, like a body that can never be read.
+/// A call that does not say which delivery it is did not come from this
+/// install's alarm, and is answered 400 with why. The moment it was aimed
+/// at rides in the body (`WakeBody::due_at_ms`), not the delivery time.
 ///
 /// A body that can never be read as a wake (not JSON, the wrong shape)
 /// is dropped here, on every platform the same way: logged as an error
@@ -226,7 +243,11 @@ async fn wake_by_hand(
 /// a 4xx would redeliver the same unreadable body forever. The body is
 /// read by hand for that reason: axum's `Json` extractor would answer
 /// the 4xx itself.
-async fn wake(State(state): State<ListenerState>, body: axum::body::Bytes) -> Result<Response, (StatusCode, String)> {
+async fn wake(
+    State(state): State<ListenerState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, (StatusCode, String)> {
     let call: weft_platform_traits::WakeCall<kinds::WakeBody> = match serde_json::from_slice(&body) {
         Ok(call) => call,
         Err(e) => {
@@ -240,8 +261,18 @@ async fn wake(State(state): State<ListenerState>, body: axum::body::Bytes) -> Re
             return Ok((StatusCode::OK, Json(serde_json::json!({ "dropped": true, "reason": reason }))).into_response());
         }
     };
-    kinds::wake(&state, call.body).await.map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let delivery = state.alarm.delivery(&headers).map_err(|e| {
+        tracing::error!(target: "weft_listener::wake", token = %call.body.token, error = %format!("{e:#}"), "refused a wake call that does not say which delivery it is");
+        (StatusCode::BAD_REQUEST, format!("{e:#}"))
+    })?;
+    let failed = |e: anyhow::Error| {
+        let status = StatusCode::from_u16(weft_platform_traits::alarm::WAKE_FAILED_STATUS).expect("a valid status");
+        (status, format!("{e:#}"))
+    };
+    match kinds::wake_delivered(&state, call.body, delivery).await.map_err(failed)? {
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(reason) => Ok((StatusCode::OK, Json(serde_json::json!({ "dropped": true, "reason": reason }))).into_response()),
+    }
 }
 
 async fn list_signals(State(state): State<ListenerState>) -> Json<Value> {

@@ -52,6 +52,8 @@ pub struct SupervisorState {
     pub ownership_interval: Duration,
     /// How often the health loop looks at every owned project.
     pub health_interval: Duration,
+    /// The health loop's actions in flight, and what its looks came to
+    /// since the last ownership sync reported it.
     pub health: Arc<tokio::sync::Mutex<health::HealthRegistry>>,
     /// Raised by the lifecycle loop when the broker says a command waits
     /// on a project nobody owns: the ownership loop ticks at once rather
@@ -63,11 +65,9 @@ pub struct SupervisorState {
     /// it alone. See [`ProjectLocks`].
     pub project_locks: Arc<ProjectLocks>,
     /// Held for the whole of one [`tick`], so the passes of a supervisor
-    /// that scales to zero run one after another in this process. Two
-    /// wakes landing together otherwise ran two passes side by side, and
-    /// both claimed and ran the same command: claiming marks nothing on
-    /// the broker, and only the commands a running pass names as its own
-    /// stop a second claim of one.
+    /// that scales to zero run one after another in this process: a pass
+    /// gives every lease back as it ends, which must never take a lease
+    /// from under a command another pass of this process runs.
     pub pass: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -105,9 +105,9 @@ impl ProjectLocks {
         self.entry(project).read_owned().await
     }
 
-    /// The project's lock alone, if nobody holds it (the sweep, which must
-    /// never wait: an apply can hold a project for minutes, and the
-    /// ownership tick that sweeps also renews every lease).
+    /// The project's lock alone, if nobody holds it (the sweep, which
+    /// never waits: an apply can hold a project for minutes, and the next
+    /// tick sweeps the project again).
     pub fn try_alone(&self, project: uuid::Uuid) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         self.entry(project).try_write_owned().ok()
     }
@@ -132,46 +132,144 @@ pub async fn run_loops(state: SupervisorState) -> anyhow::Result<()> {
     }
 }
 
-/// One pass of every loop, for a supervisor that scales to zero: renew
-/// and claim, run every waiting command of what it owns, look at their
-/// health. Each command runs to its end inside the pass, side by side with
-/// the others the way [`run_loops`] runs them, and the leases are renewed
-/// all along as they are there: a start or a stop takes the cloud a minute
-/// or two, and a lease left to lapse meanwhile hands the project to a
-/// sibling, which runs the command again from the start. Answers when to
-/// look again: at the health interval while a project it owns has a
-/// command waiting, while the host listing or the gone-copy sweep left
-/// something, or while the health it saw is not settled (`health::tick`);
-/// otherwise when the soonest lease a sibling holds over a project with a
-/// command waiting, or over one the host holds copies of, lapses (the
-/// sibling may be gone, and only a lapsed lease is taken over), and the
-/// moment after. `None` when there is nothing to look at anywhere: infra
-/// that runs fine needs no look, and a command being issued, a machine
-/// saying how its unit stands changed, or the cloud saying a machine went
-/// away wakes it.
-pub async fn tick(state: &SupervisorState) -> anyhow::Result<Option<Duration>> {
+/// What one [`tick`] came to.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Pass {
+    /// The projects it looked at, and ran the commands of, with nothing
+    /// given up: what was written down as given up on them is cleared.
+    pub settled: Vec<uuid::Uuid>,
+}
+
+/// One pass of every loop, for a supervisor that scales to zero: renew and
+/// claim, sweep the gone copies, run every waiting command of what it
+/// owns, look at their health, and give its leases back. Each command runs
+/// to its end inside the pass, side by side with the others the way
+/// [`run_loops`] runs them. The leases are renewed for as long as the pass
+/// acts on the host, the sweep and the health look included: deleting a
+/// copy's disks, a start, a stop or a protocol's restart takes the cloud a
+/// minute or more, and a lease left to lapse meanwhile hands the project to
+/// a sibling, which would act on it at the same time. The pass runs inside
+/// the request that woke it, which is what keeps its CPU on.
+///
+/// Nothing here books the next look: the broker books it each time the
+/// pass syncs its ownership (`SupervisorSyncOwnershipResponse::next_due_unix`),
+/// from what is in the database: a health window ending, a protocol's
+/// retry, a failed pass's retry, a lease of a sibling lapsing. What the
+/// pass could not get through goes with its last sync ([`failed`],
+/// [`give_up`], and a step over every project in [`act`]), and a pass
+/// always ends.
+pub async fn tick(state: &SupervisorState) -> Pass {
     // A wake that lands during another pass waits for it and then runs
     // its own, which finds whatever that one left waiting.
     let _pass = state.pass.lock().await;
-    let mut owned = std::collections::HashSet::new();
-    let synced = ownership::tick(state, &mut owned).await?;
-    let (changes, ownership_changed) = tokio::sync::mpsc::unbounded_channel();
-    tokio::select! {
-        drained = lifecycle::drain(state.clone(), ownership_changed) => drained?,
-        renewing = ownership::keep_renewing(state.clone(), owned, vec![changes]) => {
-            renewing?;
-            anyhow::bail!("the supervisor's ownership renewal ended mid-pass");
+    let mut ownership = ownership::Ownership::default();
+    match ownership::claim(state, &mut ownership).await {
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "the supervisor could not sync its ownership; it looks again at the next wake"),
+        Ok((_, held)) => {
+            let (changes, ownership_changed) = tokio::sync::mpsc::unbounded_channel();
+            tokio::select! {
+                emptied = act(state, held, ownership_changed) => ownership.emptied(&emptied),
+                renewing = ownership::keep_renewing(state.clone(), ownership.clone(), vec![changes]) => {
+                    tracing::error!(result = ?renewing, "the supervisor's ownership renewal ended mid-pass");
+                }
+            }
         }
     }
-    let unsettled = health::tick(state).await?;
-    Ok(next_look(&synced, unsettled, state.health_interval))
+    match ownership::end(state, ownership.held_projects()).await {
+        Ok(pass) => pass,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "the supervisor could not give its leases back; they lapse on their own");
+            Pass::default()
+        }
+    }
 }
 
-/// When a supervisor that scales to zero looks again after a pass that
-/// found `synced`, and health `unsettled` or not.
-fn next_look(synced: &ownership::Synced, unsettled: bool, health_interval: Duration) -> Option<Duration> {
-    if synced.owns_work || unsettled {
-        return Some(health_interval);
+/// What a pass does under the leases [`tick`] renews beside it: sweep the
+/// gone copies of what the host `held` (when it could be listed), run the
+/// commands, then look at the health of what it owns. `ownership_changed`
+/// carries what the renewal changed, and lives as long as this does.
+///
+/// A step over every project that fails (listing what the host holds,
+/// reading what it owns for the health look) fails the pass over each
+/// project it holds as it ends, the ones a renewal claimed mid-pass
+/// included, and, with no listing, over each project whose failed pass's
+/// retry was due and that only the listing could make ownable: the end of
+/// the pass reports it (`SupervisorSyncOwnershipRequest::all_failed`), so
+/// each is tried again on the failed pass's clock until it gives up,
+/// written down for `weft status`.
+///
+/// Hands back the projects whose every copy the sweep deleted, which the
+/// pass's last sync no longer carries in its listing.
+async fn act(
+    state: &SupervisorState,
+    held: anyhow::Result<Vec<weft_core::infra::NodeRef>>,
+    mut ownership_changed: tokio::sync::mpsc::UnboundedReceiver<ownership::OwnershipChange>,
+) -> Vec<uuid::Uuid> {
+    let emptied = match held {
+        Ok(copies) => ownership::sweep_gone_copies(state, copies).await,
+        Err(e) => {
+            let error = format!("could not list what the host holds to delete what its gone copies left: {e:#}");
+            tracing::error!(error, "the supervisor's pass sweeps nothing; a later pass tries again");
+            state.health.lock().await.all_troubled(health::Step::Sweep, &error);
+            Vec::new()
+        }
+    };
+    if let Err(e) = lifecycle::drain(state.clone(), &mut ownership_changed).await {
+        tracing::error!(error = %format!("{e:#}"), "the supervisor's commands stopped mid-pass");
     }
-    synced.others_lapse_in.map(|lapse| lapse + Duration::from_secs(1))
+    if let Err(e) = health::tick(state).await {
+        let error = format!("could not read what it owns to look at its health: {e:#}");
+        tracing::error!(error, "the supervisor's pass looks at nothing; a later pass tries again");
+        state.health.lock().await.all_troubled(health::Step::Look, &error);
+    }
+    emptied
+}
+
+/// How long a step of a pass asks the broker again while it says it
+/// cannot answer right now ([`weft_broker_client::client::broker_unavailable`]).
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// Run `step`, again while the broker says it cannot answer right now,
+/// for at most [`PATIENCE`]: a broker starting up or its database waking
+/// passes in moments. Any other failure, or one that outlasts it, is the
+/// step's answer.
+pub(crate) async fn patiently<T, F, Fut>(state: &SupervisorState, mut step: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let started = state.clock.now();
+    let mut wait = Duration::from_millis(250);
+    loop {
+        match step().await {
+            Err(e) if weft_broker_client::client::broker_unavailable(&e) && state.clock.now() - started < PATIENCE => {
+                tracing::warn!(error = %format!("{e:#}"), retry_in_ms = wait.as_millis() as u64, "the broker could not answer; asking again");
+                state.clock.sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(4));
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// A `step` of a pass over `project` failed (a health look, a sweep of
+/// its gone copies, a command's ending that could not be written): log
+/// `error`, and the next ownership sync reports it, which writes it down
+/// for `weft status` and has a later pass try the project again until it
+/// gives up (`SupervisorSyncOwnershipRequest::failed`). A project that
+/// failed is not reported settled by its pass, unless the step comes
+/// right within it (`HealthRegistry::untroubled`).
+pub(crate) async fn failed(state: &SupervisorState, project: uuid::Uuid, step: health::Step, error: &str) {
+    tracing::error!(project_id = %project, error, "the supervisor could not get through the project's infra; a later pass tries again");
+    state.health.lock().await.troubled(project, step, error);
+}
+
+/// A health protocol of `project` gave up: log `error`, and the next
+/// ownership sync writes it down for `weft status` until a pass reports
+/// the project settled. Nothing tries it again on a clock: a person's
+/// look or command, or what the machines report changing, does
+/// (`SupervisorSyncOwnershipRequest::gave_up`).
+pub(crate) async fn give_up(state: &SupervisorState, project: uuid::Uuid, error: &str) {
+    tracing::error!(project_id = %project, error, "a health protocol gave up on the project's infra; a look asked for it, or its next change, tries again");
+    state.health.lock().await.troubled(project, health::Step::Protocol, error);
 }

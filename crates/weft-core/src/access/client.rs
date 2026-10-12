@@ -55,19 +55,97 @@ pub enum ConnectCallError {
     /// The provider was not reached, or did not answer in time: nothing
     /// says the call itself is wrong, and trying again is the fix.
     Unreached(String),
-    /// The provider answered, and refused.
-    Refused(String),
+    /// The provider answered, and refused; `kind` says what fixes it.
+    Refused { kind: RefusalKind, why: String },
 }
 
 impl std::fmt::Display for ConnectCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectCallError::Unbuildable(why) | ConnectCallError::Unreached(why) | ConnectCallError::Refused(why) => f.write_str(why),
+            ConnectCallError::Unbuildable(why) | ConnectCallError::Unreached(why) | ConnectCallError::Refused { why, .. } => {
+                f.write_str(why)
+            }
         }
     }
 }
 
 impl std::error::Error for ConnectCallError {}
+
+/// What a provider's refusal says about its fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The provider refused who is calling (401, 403, or a code naming
+    /// the token or its scope): the credential has to change, which a
+    /// reconnect does.
+    Auth,
+    /// The provider could not answer now (408, 429, 5xx, or a code
+    /// saying it is busy or down, whatever the status): asking again
+    /// later can pass.
+    Temporary,
+    /// The provider refused the request itself: asking again repeats it.
+    Other,
+}
+
+impl RefusalKind {
+    /// The kind of refusal a provider's answer is, read off its status and
+    /// its `body` (`Null` when it had none, or none in JSON). The codes the
+    /// body names ([`error_codes`]) decide first, since a status alone can
+    /// mislead: Google answers its rate limits 403, naming
+    /// `rateLimitExceeded`. A code saying the provider is busy wins, then
+    /// one a new sign-in fixes, then one refusing the request; a body
+    /// naming no code known here is read off its status (a success status
+    /// carrying a refusal, Slack's `ok: false`, is then
+    /// [`RefusalKind::Other`]). The one reading of every provider answer
+    /// weft classifies.
+    pub fn of_answer(status: reqwest::StatusCode, body: &serde_json::Value) -> Self {
+        let named: Vec<RefusalKind> = error_codes(body).into_iter().filter_map(RefusalKind::of_code).collect();
+        [RefusalKind::Temporary, RefusalKind::Auth, RefusalKind::Other]
+            .into_iter()
+            .find(|kind| named.contains(kind))
+            .unwrap_or_else(|| RefusalKind::of_status(status))
+    }
+
+    fn of_status(status: reqwest::StatusCode) -> Self {
+        use reqwest::StatusCode;
+        match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => RefusalKind::Auth,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => RefusalKind::Temporary,
+            s if s.is_server_error() => RefusalKind::Temporary,
+            _ => RefusalKind::Other,
+        }
+    }
+
+    /// What an error code known here says, `None` for one it does not
+    /// know. Slack's and OAuth's codes are snake_case, Google's `reason`
+    /// camelCase and its `status` upper case. Auth only when a reconnect
+    /// can fix it: a token refused, or a scope missing (Google's
+    /// `insufficientPermissions`); Google's API not switched on for the
+    /// project (`accessNotConfigured`) is no credential's fault. Google's
+    /// `PERMISSION_DENIED` is left to the status, since it stands for both.
+    fn of_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "invalid_auth" | "not_authed" | "token_revoked" | "token_expired" | "account_inactive" | "missing_scope"
+            | "not_allowed_token_type" | "insufficientPermissions" | "authError" | "UNAUTHENTICATED" => RefusalKind::Auth,
+            "ratelimited" | "service_unavailable" | "request_timeout" | "internal_error" | "fatal_error"
+            | "temporarily_unavailable" | "server_error" | "rateLimitExceeded" | "userRateLimitExceeded" | "backendError"
+            | "RESOURCE_EXHAUSTED" | "UNAVAILABLE" => RefusalKind::Temporary,
+            "accessNotConfigured" => RefusalKind::Other,
+            _ => return None,
+        })
+    }
+}
+
+/// The error codes an answer's body names: Slack's `{"ok": false,
+/// "error": code}` and an OAuth endpoint's `{"error": code}`, or
+/// Google's `{"error": {"status": code, "errors": [{"reason": code}]}}`.
+pub fn error_codes(body: &serde_json::Value) -> Vec<&str> {
+    let Some(error) = body.get("error") else { return Vec::new() };
+    if let Some(code) = error.as_str() {
+        return vec![code];
+    }
+    let reasons = error.get("errors").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("reason"));
+    error.get("status").into_iter().chain(reasons).filter_map(serde_json::Value::as_str).collect()
+}
 
 /// How long one declared call ([`run_connect_call`]) may take, end to end.
 /// These are short control calls to a provider (mint a socket address,
@@ -116,20 +194,21 @@ pub async fn run_connect_call(
         .map_err(|e| ConnectCallError::Unreached(format!("the answer from {shown} did not arrive: {}", e.without_url())))?;
     let body: serde_json::Value = serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        return Err(ConnectCallError::Refused(format!(
-            "{shown} answered {status}: {}",
-            body.get("error")
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| body_text.chars().take(300).collect())
-        )));
+        return Err(ConnectCallError::Refused {
+            kind: RefusalKind::of_answer(status, &body),
+            why: format!(
+                "{shown} answered {status}: {}",
+                body.get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| body_text.chars().take(300).collect())
+            ),
+        });
     }
     // The Slack-style 200-with-ok:false refusal, same guard as every
     // other declared call.
     if body.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        return Err(ConnectCallError::Refused(format!(
-            "{shown} refused: {}",
-            body.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
-        )));
+        let code = body.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error");
+        return Err(ConnectCallError::Refused { kind: RefusalKind::of_answer(status, &body), why: format!("{shown} refused: {code}") });
     }
     Ok(body)
 }
@@ -199,22 +278,52 @@ pub async fn checked_send(
 /// The provider's own words in a failure body, when it carries one of
 /// the common JSON error envelopes: `{"error": {"message": ...}}` /
 /// `{"error": "..."}` (Google, and most JSON APIs), top-level
-/// `{"message": ...}` (GitHub), top-level `{"detail": ...}` (FastAPI
-/// services) or top-level `{"description": ...}` (Telegram).
-/// Otherwise the raw body (truncated), so an HTML 502 from a proxy is
-/// still legible.
+/// `{"message": ...}` (GitHub), `{"detail": ...}` as a string or as an
+/// object with a `message` (FastAPI services, ElevenLabs), FastAPI's
+/// validation list (`{"detail": [{"loc": [...], "msg": ...}]}`), or
+/// top-level `{"description": ...}` (Telegram). Otherwise the raw body
+/// (truncated), so an HTML 502 from a proxy is still legible.
 #[cfg(feature = "runtime")]
-fn error_detail(body: &str) -> String {
+pub(crate) fn error_detail(body: &str) -> String {
     let nested = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
         v["error"]["message"]
             .as_str()
             .or_else(|| v["error"].as_str())
             .or_else(|| v["message"].as_str())
             .or_else(|| v["detail"].as_str())
+            .or_else(|| v["detail"]["message"].as_str())
             .or_else(|| v["description"].as_str())
             .map(str::to_string)
+            .or_else(|| validation_errors(&v["detail"]))
     });
     nested.unwrap_or_else(|| body.chars().take(500).collect::<String>())
+}
+
+/// A FastAPI validation list as one line, each entry where it is and
+/// what is wrong there: `body.resolution: Input should be '480p' or
+/// '720p'; body.seed: Extra inputs are not permitted`. `None` when
+/// `detail` is not such a list.
+#[cfg(feature = "runtime")]
+fn validation_errors(detail: &serde_json::Value) -> Option<String> {
+    let entries = detail.as_array().filter(|entries| !entries.is_empty())?;
+    let lines = entries
+        .iter()
+        .map(|entry| {
+            let msg = entry["msg"].as_str()?;
+            let loc = entry["loc"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .map(|part| part.as_str().map(str::to_string).unwrap_or_else(|| part.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .unwrap_or_default();
+            Some(if loc.is_empty() { msg.to_string() } else { format!("{loc}: {msg}") })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(lines.join("; "))
 }
 
 /// Send a prepared request expecting a JSON answer: refuse a
@@ -1048,6 +1157,83 @@ mod tests {
         assert!(!err.contains("s3cr3t-value"), "echoed the secret: {err}");
     }
 
+    /// A declared call's refusal carries what fixes it: a credential
+    /// refused (401/403, Slack's `invalid_auth`), a provider that could not
+    /// answer now (429, 5xx, Slack's `ratelimited`), or the request itself.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn a_declared_calls_refusal_says_what_kind_it_is() {
+        let cases = [
+            (401, "{}", RefusalKind::Auth),
+            (403, "{}", RefusalKind::Auth),
+            (200, r#"{"ok":false,"error":"invalid_auth"}"#, RefusalKind::Auth),
+            (200, r#"{"ok":false,"error":"not_authed"}"#, RefusalKind::Auth),
+            (200, r#"{"ok":false,"error":"missing_scope"}"#, RefusalKind::Auth),
+            (408, "{}", RefusalKind::Temporary),
+            (429, "{}", RefusalKind::Temporary),
+            (503, "{}", RefusalKind::Temporary),
+            (200, r#"{"ok":false,"error":"ratelimited"}"#, RefusalKind::Temporary),
+            (403, r#"{"error":{"code":403,"status":"PERMISSION_DENIED","errors":[{"reason":"rateLimitExceeded"}]}}"#, RefusalKind::Temporary),
+            (400, "{}", RefusalKind::Other),
+            (404, "{}", RefusalKind::Other),
+            (200, r#"{"ok":false,"error":"channel_not_found"}"#, RefusalKind::Other),
+        ];
+        for (status, body, expected) in cases {
+            let (base, _) = serve(move |_| (status, body.to_string())).await;
+            let call: crate::access::spec::ConnectCall = serde_json::from_value(serde_json::json!({ "url": base })).unwrap();
+            match run_connect_call(&call, &values(&[])).await {
+                Err(ConnectCallError::Refused { kind, .. }) => assert_eq!(kind, expected, "{status} {body}"),
+                other => panic!("{status} {body}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// An error code says what fixes it, whichever answer carried it
+    /// (Slack's `ok: false`, an OAuth token endpoint's `error`).
+    #[test]
+    fn an_error_code_says_what_fixes_it() {
+        let ok = reqwest::StatusCode::OK;
+        let slack = |code: &str| serde_json::json!({ "ok": false, "error": code });
+        for code in ["invalid_auth", "token_revoked", "missing_scope", "not_allowed_token_type"] {
+            assert_eq!(RefusalKind::of_answer(ok, &slack(code)), RefusalKind::Auth, "{code}");
+        }
+        for code in ["ratelimited", "service_unavailable", "temporarily_unavailable", "server_error"] {
+            assert_eq!(RefusalKind::of_answer(ok, &slack(code)), RefusalKind::Temporary, "{code}");
+        }
+        for code in ["channel_not_found", "invalid_grant", "unknown error"] {
+            assert_eq!(RefusalKind::of_answer(ok, &slack(code)), RefusalKind::Other, "{code}");
+        }
+        let oauth = |code: &str| serde_json::json!({ "error": code, "error_description": "no" });
+        let bad_request = reqwest::StatusCode::BAD_REQUEST;
+        assert_eq!(RefusalKind::of_answer(bad_request, &oauth("invalid_grant")), RefusalKind::Other);
+        assert_eq!(RefusalKind::of_answer(bad_request, &oauth("temporarily_unavailable")), RefusalKind::Temporary);
+        assert_eq!(RefusalKind::of_answer(bad_request, &oauth("invalid_auth")), RefusalKind::Auth, "a code a reconnect fixes, on any status");
+    }
+
+    /// A code in the body wins over the status it came with: Google
+    /// answers a rate limit 403, which alone reads as a refused credential.
+    #[test]
+    fn a_code_saying_busy_wins_over_the_status() {
+        let forbidden = reqwest::StatusCode::FORBIDDEN;
+        let google = |status: &str, reason: &str| {
+            serde_json::json!({ "error": { "code": 403, "message": "no", "status": status, "errors": [{ "reason": reason }] } })
+        };
+        for reason in ["rateLimitExceeded", "userRateLimitExceeded", "backendError"] {
+            assert_eq!(RefusalKind::of_answer(forbidden, &google("PERMISSION_DENIED", reason)), RefusalKind::Temporary, "{reason}");
+        }
+        let exhausted = serde_json::json!({ "error": { "code": 429, "status": "RESOURCE_EXHAUSTED" } });
+        assert_eq!(RefusalKind::of_answer(forbidden, &exhausted), RefusalKind::Temporary);
+        assert_eq!(RefusalKind::of_answer(forbidden, &google("PERMISSION_DENIED", "insufficientPermissions")), RefusalKind::Auth);
+        assert_eq!(
+            RefusalKind::of_answer(forbidden, &google("PERMISSION_DENIED", "accessNotConfigured")),
+            RefusalKind::Other,
+            "an API not switched on is no credential's fault"
+        );
+        assert_eq!(RefusalKind::of_answer(forbidden, &google("PERMISSION_DENIED", "forbidden")), RefusalKind::Auth, "unknown codes leave it to the status");
+        assert_eq!(RefusalKind::of_answer(forbidden, &serde_json::Value::Null), RefusalKind::Auth, "a plain 403");
+        assert_eq!(RefusalKind::of_answer(forbidden, &serde_json::json!({ "error": "ratelimited" })), RefusalKind::Temporary);
+    }
+
     #[test]
     fn header_query_basic_and_path_prefix_apply() {
         let steps = resolve_steps(
@@ -1392,6 +1578,28 @@ mod tests {
         let (base, _) = serve(|_| (200, "plain".to_string())).await;
         let resp = checked_send(http.get(&base), "fetch").await.unwrap();
         assert_eq!(resp.text().await.unwrap(), "plain");
+    }
+
+    /// The provider's words come out of every common envelope: a
+    /// `detail` object carrying a `message` (ElevenLabs), and FastAPI's
+    /// validation list, each entry where it is and what is wrong there.
+    /// Anything else stays the raw body.
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn error_detail_reads_detail_objects_and_validation_lists() {
+        let elevenlabs = r#"{"detail":{"type":"payment_required","code":"paid_plan_required","message":"The Image & Video API requires a Pro plan or above."}}"#;
+        assert_eq!(error_detail(elevenlabs), "The Image & Video API requires a Pro plan or above.");
+        let fastapi = r#"{"detail":[{"loc":["body","veo-3.1-generate-001","resolution"],"msg":"Input should be '720p', '1080p' or '4K'","type":"literal_error"},{"loc":["body","veo-3.1-generate-001","seedx"],"msg":"Extra inputs are not permitted","type":"extra_forbidden"}]}"#;
+        assert_eq!(
+            error_detail(fastapi),
+            "body.veo-3.1-generate-001.resolution: Input should be '720p', '1080p' or '4K'; \
+             body.veo-3.1-generate-001.seedx: Extra inputs are not permitted"
+        );
+        let indexed = r#"{"detail":[{"loc":["body","images",0],"msg":"Unsupported image type"}]}"#;
+        assert_eq!(error_detail(indexed), "body.images.0: Unsupported image type");
+        assert_eq!(error_detail(r#"{"detail":"bad key"}"#), "bad key");
+        let unknown = r#"{"detail":[{"what":"no msg here"}]}"#;
+        assert_eq!(error_detail(unknown), unknown, "an entry with no msg leaves the raw body");
     }
 
     /// `required_str` hands back a present string field and fails loud

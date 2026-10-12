@@ -121,10 +121,24 @@ impl ListenerClient {
 
     /// Bring up the signal whose row was just committed under `token`
     /// (its first wake, its held connection), as a new registration or a
-    /// row put back (see `StartMode`). A kind refusing to come up answers
-    /// its reason.
-    pub async fn start(&self, token: &str, mode: weft_core::signal::listener_protocol::StartMode) -> Result<()> {
-        let req = weft_core::signal::listener_protocol::StartRequest { token: token.to_string(), mode };
+    /// row put back (see `StartMode`). `replaced` is the row the commit
+    /// wrote over, whose wakes the listener cancels; `None` for a token's
+    /// first row. A kind refusing to come up answers its reason.
+    pub async fn start(
+        &self,
+        token: &str,
+        mode: weft_core::signal::listener_protocol::StartMode,
+        replaced: Option<&crate::journal::SignalRegistration>,
+    ) -> Result<()> {
+        let replaced = match replaced {
+            Some(row) => Some(weft_core::signal::listener_protocol::ReplacedSignal {
+                spec: row.spec()?,
+                kind_state: row.kind_state.clone(),
+                generation: row.generation,
+            }),
+            None => None,
+        };
+        let req = weft_core::signal::listener_protocol::StartRequest { token: token.to_string(), mode, replaced };
         Self::ok(self.post("/start", &req).await?, "/start").await?;
         Ok(())
     }
@@ -180,6 +194,7 @@ impl ListenerClient {
             tenant_id: sig.tenant_id.clone(),
             spec: sig.spec()?,
             kind_state: sig.kind_state.clone(),
+            generation: sig.generation,
             reused,
         })
     }
@@ -232,7 +247,7 @@ pub async fn project_is_listening(pool: &sqlx::PgPool, project: uuid::Uuid) -> R
 
 /// How long one call to the listener while letting go may take: a
 /// teardown can call out to a provider, so this is generous; one that
-/// runs past it is tried again on the next pass.
+/// runs past it counts as kept.
 const LET_GO_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How many signals are let go of at once.
@@ -245,30 +260,31 @@ const LET_GO_AT_ONCE: usize = 16;
 /// listening by now (a reactivation landed meanwhile, and its own bring-up
 /// may have been undone by the teardown) is torn down and brought up again
 /// whole (what fails there is logged with its recovery, never stopping the
-/// others). Answers the tokens the listener did not let go of, for the
-/// caller to try again; fails only when the look after could not be made.
+/// others). Answers the signals the listener did not let go of, each by
+/// token with why, for the caller to write down ([`note_let_go`]); fails
+/// only when the look after could not be made.
 pub async fn let_go_of_stopped(
     pool: &sqlx::PgPool,
     listener: &ListenerClient,
     signals: &[crate::journal::SignalRegistration],
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, String)>> {
     use futures::StreamExt;
     if signals.is_empty() {
         return Ok(Vec::new());
     }
-    let kept: Vec<String> = futures::stream::iter(signals.iter().cloned())
+    let kept: Vec<(String, String)> = futures::stream::iter(signals.iter().cloned())
         .map(|sig| {
             let listener = listener.clone();
             async move {
                 match tokio::time::timeout(LET_GO_WAIT, listener.unregister_replaced(&sig)).await {
                     Ok(Ok(_)) => None,
                     Ok(Err(e)) => {
-                        tracing::warn!(target: "weft_dispatcher::listener", token = %sig.token, error = %format!("{e:#}"), "the listener did not let go of a signal; tried again later");
-                        Some(sig.token.clone())
+                        tracing::warn!(target: "weft_dispatcher::listener", token = %sig.token, error = %format!("{e:#}"), "the listener did not let go of a signal");
+                        Some((sig.token.clone(), format!("{e:#}")))
                     }
                     Err(_) => {
-                        tracing::warn!(target: "weft_dispatcher::listener", token = %sig.token, "the listener did not answer in time when told to let go of a signal; tried again later");
-                        Some(sig.token.clone())
+                        tracing::warn!(target: "weft_dispatcher::listener", token = %sig.token, "the listener did not answer in time when told to let go of a signal");
+                        Some((sig.token.clone(), format!("the listener did not answer within {}s", LET_GO_WAIT.as_secs())))
                     }
                 }
             }
@@ -316,4 +332,29 @@ pub async fn let_go_of_stopped(
         );
     }
     Ok(kept)
+}
+
+/// Write down, on each of `signals`, whether the listener let go of it
+/// ([`let_go_of_stopped`] answered the ones it `kept`, with why), in
+/// `signal.let_go_failed`: one it kept, and whose trigger still takes no
+/// work, is marked, to be asked again
+/// (`crate::journal::postgres::signals_kept_after_let_go` reads them back);
+/// the rest are cleared.
+pub async fn note_let_go(pool: &sqlx::PgPool, signals: &[crate::journal::SignalRegistration], kept: &[(String, String)]) -> Result<()> {
+    let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
+    let why: Vec<Option<&str>> =
+        signals.iter().map(|s| kept.iter().find(|(token, _)| token == &s.token).map(|(_, why)| why.as_str())).collect();
+    sqlx::query(&format!(
+        "UPDATE signal SET let_go_failed = t.why \
+         FROM (SELECT s.token, CASE WHEN {listens} THEN NULL ELSE k.why END AS why \
+               FROM unnest($1::text[], $2::text[]) AS k(token, why) JOIN signal s ON s.token = k.token {join}) t \
+         WHERE signal.token = t.token AND signal.let_go_failed IS DISTINCT FROM t.why",
+        listens = weft_broker_client::protocol::ACTIVATION_LISTENS,
+        join = weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    ))
+    .bind(&tokens)
+    .bind(&why)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

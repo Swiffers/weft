@@ -28,12 +28,12 @@ async fn a_route_holds_its_wait_and_gives_up_after_its_hold() -> anyhow::Result<
         assert!(started.elapsed() >= Duration::from_secs(1), "{path}: the reply came after the wait");
     }
 
-    // A thirty second timer under a one second hold: given up, and the
-    // caller hears why long before the timer.
+    // A thirty second timer under a one second hold: given up, a time
+    // limit (504), and the caller hears why long before the timer.
     let started = Instant::now();
     let (status, _, body) = live::http_request(&disp, Method::GET, &format!("{base}/impatient"), &[], None).await?;
     let said = String::from_utf8_lossy(&body).to_string();
-    assert_eq!(status.as_u16(), 500, "{said}");
+    assert_eq!(status.as_u16(), 504, "{said}");
     assert!(said.contains("gave up its wait") && said.contains("holdSecs"), "{said}");
     assert!(started.elapsed() < Duration::from_secs(20), "given up after its hold, not the timer");
 

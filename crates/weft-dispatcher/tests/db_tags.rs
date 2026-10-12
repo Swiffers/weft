@@ -375,6 +375,7 @@ fn resume_signal(token: &str, project_id: Uuid, execution_id: weft_core::Executi
         access_id: None,
         port_snapshot: None,
         holds: false,
+        generation: 0,
     }
 }
 
@@ -436,11 +437,11 @@ async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
 /// The listing's `node` and `search` filters, both read from the search
 /// index: `node` finds the runs a node started in, `search` the runs whose
 /// recorded values carry every word asked for. A run is indexed after it
-/// ended, once, by the search loop; a run still going is in neither.
+/// ended, once, by the first listing that reads the index, with nothing
+/// running in the background; a run still going is in neither.
 #[sqlx::test]
 async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: PgPool) {
     use std::sync::Arc;
-    use weft_dispatcher::search_index::{round, Round};
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
@@ -473,8 +474,6 @@ async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: P
     for finished in [ada, bob, idle] {
         write(&journal, finished, &[ExecEvent::ExecutionCompleted { execution_id: finished, at_unix: 3 }]).await;
     }
-    assert_eq!(round(&pool, 1_000).await.unwrap(), Round::Indexed(3), "each ended run, once");
-    assert_eq!(round(&pool, 1_000).await.unwrap(), Round::Indexed(0));
 
     let listed = |node: Option<&'static str>, search: Option<&'static str>| {
         let journal = &journal;
@@ -497,6 +496,8 @@ async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: P
         ids
     };
     assert_eq!(listed(Some("wait"), None).await, sorted(vec![ada, bob]), "the run still going is not indexed yet");
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM run_search_queue").fetch_one(&pool).await.unwrap();
+    assert_eq!(queued, 0, "the first search indexed every ended run");
     assert_eq!(listed(Some("elsewhere"), None).await, Vec::<weft_core::ExecutionId>::new());
     assert_eq!(listed(None, Some("ada@example.com")).await, vec![ada], "the run still going has no document yet");
     assert_eq!(listed(None, Some("4217")).await, sorted(vec![ada, bob]), "numbers are words too");

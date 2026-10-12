@@ -153,6 +153,55 @@ pub(crate) fn registered_place<'a>(
     Ok((weft_core::project::address_of(project, &id, &path), node))
 }
 
+/// What a registration is filed under: its place (the row's key, see
+/// [`registered_place`]), the tags its node carries (the signal-token
+/// enumeration filter reads them), and, for an entry, the project's
+/// defaults its trigger's unset inputs take (`weft.toml` `[runs]`,
+/// `[triggers]`).
+#[derive(Debug, PartialEq)]
+pub(crate) struct Filed {
+    pub place: String,
+    pub tags: Vec<String>,
+    pub entry_defaults: Option<weft_core::project::ProjectDefaults>,
+}
+
+/// Where the registration of `node_id` at `frames` is filed, read off the
+/// program its run runs (`found`).
+///
+/// A run with no program (a node test's, which runs a package's image and
+/// never a project definition) files its wait under the node's own id,
+/// with no tags: there is no program to spell a place in or to read tags
+/// off. It has no call sites either, so a call frame on it is refused, and
+/// an entry is refused, since an entry's address and its defaults are its
+/// program's. A run whose program is recorded but does not read is refused
+/// with why.
+pub(crate) fn filed_under(
+    found: &crate::projection::ProgramLookup,
+    node_id: &str,
+    frames: &LoopFrames,
+    is_resume: bool,
+) -> Result<Filed> {
+    use crate::projection::ProgramLookup;
+    match found {
+        ProgramLookup::Found(program) => {
+            let (place, node) = registered_place(program, node_id, frames)?;
+            Ok(Filed { place, tags: node.tags(), entry_defaults: (!is_resume).then_some(program.defaults) })
+        }
+        ProgramLookup::NoProgram => {
+            anyhow::ensure!(is_resume, "an entry registers only from a run with a program, and this run has none");
+            let sites = weft_core::frames::call_path(frames);
+            anyhow::ensure!(
+                sites.is_empty(),
+                "node '{node_id}' waits under the call site(s) {sites:?}, but its run has no program, so it has no call sites"
+            );
+            Ok(Filed { place: node_id.to_string(), tags: Vec::new(), entry_defaults: None })
+        }
+        ProgramLookup::Unreadable(why) | ProgramLookup::ProgramGone(why) => {
+            anyhow::bail!("the run's original program is unavailable: {why}")
+        }
+    }
+}
+
 /// Is there a registered route that shares a call with this one and
 /// that nothing can arbitrate between? Sharing a call is fine when one
 /// of the two is the more specific: it serves what it spells out and
@@ -190,7 +239,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 owner.phase == weft_core::context::Phase::TriggerSetup && owner.binary_hash.is_some(),
                 "entry capture requires a trigger-setup run with a pinned program"
             );
-            let found = crate::projection::execution_program(state, execution_id).await?;
+            let found = crate::projection::program_of_owner(state, execution_id, &owner).await?;
             let project = found.program().context("entry capture has no original program")?;
             let node_id = captured_trigger_address(&project, &payload.node_id, &payload.frames, payload.call_index)?;
             let ports = payload.port_snapshot.as_ref().context("entry capture requires its input port snapshot")?;
@@ -230,7 +279,7 @@ impl RegisterSignalExecutor {
         // The tenant stamped on the execution, not one re-derived from
         // the project store: same answer while the project lives, and
         // still an answer once it does not.
-        let tenant = owner.tenant;
+        let tenant = owner.tenant.clone();
         // Whose signal: the run's instance (an instance's trigger setup arms
         // that instance's copy; an instance's run waits as that instance).
         let instance = owner.instance.clone();
@@ -239,20 +288,15 @@ impl RegisterSignalExecutor {
         // The place this registration is for, spelled: the row's key.
         // Read off the original program, the one this registration's
         // node was compiled into, so the spelling is the one that
-        // program's source reads.
-        let project_def = crate::projection::execution_program(state, execution_id).await?
-            .program().context("register_signal: original program is unavailable")?;
-        let (place, node) = registered_place(&project_def, &payload.node_id, &payload.frames)
+        // program's source reads. Tags drive the signal-token enumeration
+        // filter; charset already validated at parse time.
+        let found = crate::projection::program_of_owner(state, execution_id, &owner).await?;
+        let Filed { place, tags, entry_defaults } = filed_under(&found, &payload.node_id, &payload.frames, payload.is_resume)
             .with_context(|| format!("register_signal: project_id={project_id}"))?;
-        // Tags drive the signal-token enumeration filter; charset
-        // already validated at parse time.
-        let tags = node.tags();
         // An entry takes its project's defaults where its trigger's own
-        // inputs left them unset (`weft.toml` `[runs]`, `[triggers]`), so
-        // the worker's door and every run it starts read them off the one
-        // spec.
-        if !payload.is_resume {
-            let defaults = &project_def.defaults;
+        // inputs left them unset, so the worker's door and every run it
+        // starts read them off the one spec.
+        if let Some(defaults) = entry_defaults {
             payload.spec.limits = payload.spec.limits.under(&defaults.triggers);
             payload.spec.settings = payload.spec.settings.keeping_for(Some(payload.spec.settings.kept_for(defaults.keep_for())));
         }
@@ -373,6 +417,7 @@ impl RegisterSignalExecutor {
                         kind_state: prepared.kind_state,
                         kind_state_seq: prior_seq,
                         holds,
+                        generation: 0,
                     })
                     .await?;
                 match written {
@@ -419,8 +464,12 @@ impl RegisterSignalExecutor {
                     .is_some_and(|r| r.status == reqwest::StatusCode::SERVICE_UNAVAILABLE),
             };
             let replaced_stopped = served_otherwise && !untouched;
+            let replaced = match &undo {
+                ArmUndo::Replaced(prior) => Some(prior.as_ref()),
+                ArmUndo::Created => None,
+            };
             let started = match stopped {
-                Ok(_) => state.listener.start(&token, StartMode::New).await,
+                Ok(_) => state.listener.start(&token, StartMode::New, replaced).await,
                 Err(e) => Err(e.context("stopping the row it replaces, which was served the other way")),
             };
             if let Err(e) = started {
@@ -478,14 +527,14 @@ enum Restart {
 /// production; a recorder in unit tests, which have no listener.
 #[async_trait]
 pub(crate) trait SignalHolder: Send + Sync {
-    async fn start(&self, token: &str, mode: StartMode) -> Result<()>;
+    async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::journal::SignalRegistration>) -> Result<()>;
     async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]);
 }
 
 #[async_trait]
 impl SignalHolder for crate::listener::ListenerClient {
-    async fn start(&self, token: &str, mode: StartMode) -> Result<()> {
-        crate::listener::ListenerClient::start(self, token, mode).await
+    async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::journal::SignalRegistration>) -> Result<()> {
+        crate::listener::ListenerClient::start(self, token, mode, replaced).await
     }
     async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
         crate::listener::ListenerClient::unregister_many(self, signals).await
@@ -527,14 +576,15 @@ async fn undo_arm(
     match undo_registration(journal, token, prior, restart).await? {
         Undone::Removed(removed) => listener.unregister_many(&removed).await,
         // A put-back: whatever the listener runs under the token came from
-        // the replacement, so it is replaced; the row ran before this arm,
-        // so a failure bringing it back is the listener's to retry, never
-        // a refusal that turns a live trigger off.
-        Undone::Restored { rerun: true } => listener
-            .start(token, StartMode::PutBack)
+        // the replacement, so it is replaced (and its wakes cancelled); the
+        // row ran before this arm, so a failure bringing it back is the
+        // listener's to retry, never a refusal that turns a live trigger
+        // off.
+        Undone::Restored { rerun: Some(replacement) } => listener
+            .start(token, StartMode::PutBack, Some(&replacement))
             .await
             .context("its row is back, but the listener did not confirm it runs it (a listener that answered stopped the replacement and keeps retrying the row, shown as down)")?,
-        Undone::Restored { rerun: false } => {}
+        Undone::Restored { rerun: None } => {}
     }
     Ok(())
 }
@@ -567,8 +617,9 @@ enum Undone {
     Removed(Vec<crate::journal::SignalRegistration>),
     /// The row existed before (an entry's reused token, a resume's
     /// retry) and is back to it. `rerun` when the listener has to bring
-    /// the restored row up again to match it (see [`undo_registration`]).
-    Restored { rerun: bool },
+    /// the restored row up again to match it (see [`undo_registration`]):
+    /// the replacement it runs instead, as it last read.
+    Restored { rerun: Option<Box<crate::journal::SignalRegistration>> },
 }
 
 /// Undo a registration whose row is written. `prior` is the row it
@@ -610,7 +661,7 @@ async fn undo_registration(
         let rerun = restart == Restart::Yes || current.kind_state_seq != written_seq;
         let restored = crate::journal::SignalRegistration { kind_state_seq: current.kind_state_seq, ..prior.clone() };
         match journal.signal_restore(&restored).await? {
-            crate::journal::SignalWrite::Written => return Ok(Undone::Restored { rerun }),
+            crate::journal::SignalWrite::Written => return Ok(Undone::Restored { rerun: rerun.then(|| Box::new(current)) }),
             crate::journal::SignalWrite::StateMoved => continue,
         }
     }
@@ -682,8 +733,8 @@ async fn refuse_unarmable_route(
 #[cfg(test)]
 mod tests {
     use super::{
-        ambiguous_route, captured_trigger_address, mount_methods_for, mount_path_for, registered_place,
-        RegisteredRoute,
+        ambiguous_route, captured_trigger_address, filed_under, mount_methods_for, mount_path_for, registered_place,
+        Filed, RegisteredRoute,
     };
     use weft_core::frames::Frame;
     use weft_core::primitive::SignalSurface;
@@ -748,6 +799,40 @@ mod tests {
         assert_eq!(registered_place(&p, "Api.work", &looped).unwrap().0, "two.work");
         let err = registered_place(&p, "one.nothing", &Vec::new()).unwrap_err().to_string();
         assert!(err.contains("'one.nothing' not in project"), "{err}");
+    }
+
+    /// A wait of a run with a program is filed under its place with its
+    /// node's tags, and an entry carries its project's defaults; a wait of
+    /// a run with no program (a node test's) is filed under the node's own
+    /// id, with nothing read off a program.
+    #[test]
+    fn a_wait_is_filed_under_its_programs_place_or_its_own_id_without_one() {
+        use crate::projection::ProgramLookup;
+        let mut p = program_with_included_triggers();
+        p.nodes.iter_mut().find(|n| n.id == "Api.work").unwrap().config = serde_json::json!({ weft_core::tag::TAGS_CONFIG_KEY: ["billing"] });
+        let found = ProgramLookup::Found(std::sync::Arc::new(p));
+        let under_one = vec![Frame::Call { site: "one".into() }];
+        let filed = filed_under(&found, "Api.work", &under_one, true).unwrap();
+        assert_eq!(filed, Filed { place: "one.work".into(), tags: vec!["billing".into()], entry_defaults: None });
+        assert!(filed_under(&found, "top", &vec![], false).unwrap().entry_defaults.is_some(), "an entry takes its project's defaults");
+
+        let looped = vec![Frame::Loop { index: 2 }];
+        let filed = filed_under(&ProgramLookup::NoProgram, "node", &looped, true).unwrap();
+        assert_eq!(filed, Filed { place: "node".into(), tags: Vec::new(), entry_defaults: None });
+    }
+
+    /// With no program, an entry and a call site have nothing to be read
+    /// off; a program that is recorded but does not read says why.
+    #[test]
+    fn what_a_run_without_a_readable_program_cannot_register_is_refused() {
+        use crate::projection::ProgramLookup;
+        let err = filed_under(&ProgramLookup::NoProgram, "node", &vec![], false).unwrap_err().to_string();
+        assert!(err.contains("an entry registers only from a run with a program"), "{err}");
+        let under_one = vec![Frame::Call { site: "one".into() }];
+        let err = filed_under(&ProgramLookup::NoProgram, "node", &under_one, true).unwrap_err().to_string();
+        assert!(err.contains("has no call sites"), "{err}");
+        let err = filed_under(&ProgramLookup::ProgramGone("pruned".into()), "node", &vec![], true).unwrap_err().to_string();
+        assert!(err.contains("unavailable: pruned"), "{err}");
     }
 
     #[test]
@@ -894,7 +979,7 @@ mod tests {
 
         assert!(matches!(
             undo_registration(&j, "tok", Some(prior.clone()), Restart::No).await.unwrap(),
-            Undone::Restored { rerun: false }
+            Undone::Restored { rerun: None }
         ));
         let row = j.signal_get("tok").await.unwrap().unwrap();
         assert_eq!(row.spec_json, prior.spec_json);
@@ -924,10 +1009,10 @@ mod tests {
         claimed.kind_state = serde_json::json!({ "next_at": 6 });
         j.signal_insert(&claimed).await.unwrap();
 
-        assert!(matches!(
-            undo_registration(&j, "tok", Some(prior.clone()), Restart::No).await.unwrap(),
-            Undone::Restored { rerun: true }
-        ));
+        let Undone::Restored { rerun: Some(replacement) } = undo_registration(&j, "tok", Some(prior.clone()), Restart::No).await.unwrap() else {
+            panic!("the listener runs the prior row again")
+        };
+        assert_eq!(replacement.kind_state, serde_json::json!({ "next_at": 6 }), "over the replacement as the wake left it");
         let row = j.signal_get("tok").await.unwrap().unwrap();
         assert_eq!(row.spec_json, prior.spec_json);
         assert_eq!(row.kind_state, prior.kind_state);
@@ -961,20 +1046,21 @@ mod tests {
 
     use super::{disarm, ArmUndo, Armed, SignalHolder};
 
-    /// A listener that records what it is told and refuses to start the
-    /// tokens named in `refuse`.
+    /// A listener that records what it is told (each start with the spec
+    /// of the row it replaced) and refuses to start the tokens named in
+    /// `refuse`.
     #[derive(Default)]
     struct Recorder {
-        started: std::sync::Mutex<Vec<(String, StartMode)>>,
+        started: std::sync::Mutex<Vec<(String, StartMode, Option<String>)>>,
         forgotten: std::sync::Mutex<Vec<String>>,
         refuse: Vec<String>,
     }
 
     #[async_trait::async_trait]
     impl SignalHolder for Recorder {
-        async fn start(&self, token: &str, mode: StartMode) -> anyhow::Result<()> {
+        async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::journal::SignalRegistration>) -> anyhow::Result<()> {
             anyhow::ensure!(!self.refuse.iter().any(|t| t == token), "refused {token}");
-            self.started.lock().unwrap().push((token.to_string(), mode));
+            self.started.lock().unwrap().push((token.to_string(), mode, replaced.map(|r| r.spec_json.clone())));
             Ok(())
         }
         async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
@@ -1009,11 +1095,11 @@ mod tests {
 
         // Key 1 arms and starts.
         assert_eq!(j.signal_insert(&rearm(&priors[0])).await.unwrap(), SignalWrite::Written);
-        listener.start("t1", StartMode::New).await.unwrap();
+        listener.start("t1", StartMode::New, Some(&priors[0])).await.unwrap();
         let armed = vec![Armed { token: "t1".into(), undo: ArmUndo::Replaced(Box::new(priors[0].clone())) }];
         // Key 2 is written, fails to start, and undoes itself.
         assert_eq!(j.signal_insert(&rearm(&priors[1])).await.unwrap(), SignalWrite::Written);
-        assert!(listener.start("t2", StartMode::New).await.is_err());
+        assert!(listener.start("t2", StartMode::New, Some(&priors[1])).await.is_err());
         super::undo_arm(&j, &listener, "t2", ArmUndo::Replaced(Box::new(priors[1].clone())), super::Restart::No).await.unwrap();
 
         disarm(&j, &listener, armed).await.unwrap();
@@ -1024,8 +1110,11 @@ mod tests {
         }
         assert_eq!(
             *listener.started.lock().unwrap(),
-            vec![("t1".to_string(), StartMode::New), ("t1".to_string(), StartMode::PutBack)],
-            "t1 started with the new spec, then restored with its prior row",
+            vec![
+                ("t1".to_string(), StartMode::New, Some(r#"{"old":0}"#.to_string())),
+                ("t1".to_string(), StartMode::PutBack, Some(r#"{"new":true}"#.to_string())),
+            ],
+            "t1 started with the new spec over its prior row, then restored with its prior row over the new one",
         );
         assert!(listener.forgotten.lock().unwrap().is_empty());
     }

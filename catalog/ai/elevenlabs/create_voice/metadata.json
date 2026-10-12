@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsCreateVoice",
   "label": "Create Voice",
-  "description": "Mint a designed preview (from Design Voice) into a durable voice on the account. The minted voice id works in every speak node from then on.",
+  "description": "Mint a preview from Design Voice or Remix Voice into a durable voice on the account. The minted voice id works in every speak node from then on.",
   "tags": [
     "ai",
     "audio",
@@ -30,13 +30,18 @@
       "type": "String",
       "widget": { "kind": "textarea" },
       "required": true,
-      "description": "The voice description (kept with the voice)."
+      "description": "The voice's description, kept with the voice, in 20 to 1000 characters."
     },
     {
       "name": "previewId",
       "type": "String",
       "required": true,
-      "description": "The chosen preview's voiceId from Design Voice."
+      "description": "The chosen preview's voiceId, from Design Voice or Remix Voice."
+    },
+    {
+      "name": "labels",
+      "type": "Dict[String, String]",
+      "description": "Labels to store with the voice, each a name and a value, like `{ \"language\": \"en\" }`."
     }
   ],
   "outputs": [
@@ -44,6 +49,40 @@
       "name": "voiceId",
       "type": "String",
       "description": "The minted voice's id: what the speak nodes take."
+    },
+    {
+      "name": "previewUrl",
+      "type": "String",
+      "description": "A link to ElevenLabs's preview of the voice, when it answers one."
+    },
+    {
+      "name": "labels",
+      "type": "Dict[String, String]",
+      "description": "The labels ElevenLabs keeps on the voice."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "description",
+        "regex": "(?s)^.{0,19}$"
+      },
+      "then": {
+        "message": "ElevenLabsCreateVoice '{id}' has a `description` under 20 characters, and ElevenLabs takes 20 to 1000: describe the voice in more detail.",
+        "port": "description"
+      }
+    },
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "description",
+        "regex": "(?s)^.{1001}"
+      },
+      "then": {
+        "message": "ElevenLabsCreateVoice '{id}' has a `description` over 1000 characters, and ElevenLabs takes 20 to 1000: shorten it.",
+        "port": "description"
+      }
     }
   ],
   "features": {

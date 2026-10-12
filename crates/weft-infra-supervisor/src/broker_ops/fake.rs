@@ -22,7 +22,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use weft_broker_client::protocol::{
-    SupervisorClaim, SupervisorCommandRow, SupervisorInfraNode, SupervisorProject,
+    HealthProtocolState, ProjectTrouble, SupervisorClaim, SupervisorCommandRow, SupervisorHealthProtocolsResponse, SupervisorInfraNode,
+    SupervisorProject, SupervisorSetHealthStateRequest, SupervisorSetHealthStateResponse, SupervisorSyncOwnershipRequest,
     SupervisorSyncOwnershipResponse,
 };
 
@@ -38,6 +39,8 @@ fn unit_runtime(
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
         image_refs: Default::default(),
+        not_ready_since_unix: None,
+        ready_since_unix: None,
     }
 }
 
@@ -47,7 +50,13 @@ fn unit_runtime(
 pub enum BrokerCall {
     SyncOwnership {
         replica: String,
-        held_projects: Vec<uuid::Uuid>,
+        held_projects: Option<Vec<uuid::Uuid>>,
+        looked: Vec<uuid::Uuid>,
+        settled: Vec<uuid::Uuid>,
+        failed: Vec<ProjectTrouble>,
+        gave_up: Vec<ProjectTrouble>,
+        all_failed: Option<String>,
+        ending: bool,
     },
     OwnedProjects {
         replica: String,
@@ -62,9 +71,14 @@ pub enum BrokerCall {
     HealthProtocols {
         project_id: uuid::Uuid,
     },
+    SetHealthState {
+        project_id: uuid::Uuid,
+        protocols: Vec<HealthProtocolState>,
+    },
     ClaimCommand {
         claimer: String,
         busy_commands: Vec<i64>,
+        cancelling: Vec<i64>,
     },
     EventRecord {
         project_id: uuid::Uuid,
@@ -74,7 +88,7 @@ pub enum BrokerCall {
         payload: serde_json::Value,
     },
     SetStatus {
-        command_id: Option<i64>,
+        command_id: i64,
         project_id: uuid::Uuid,
         node_id: String,
         instance: Option<weft_core::instance::InstanceId>,
@@ -82,6 +96,15 @@ pub enum BrokerCall {
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<String>,
+    },
+    SetUnitHealth {
+        project_id: uuid::Uuid,
+        node_id: String,
+        instance: Option<weft_core::instance::InstanceId>,
+        unit: String,
+        status: weft_broker_client::protocol::InfraNodeStatus,
+        not_ready_since_unix: Option<i64>,
+        ready_since_unix: Option<i64>,
     },
     SetWaiting {
         command_id: i64,
@@ -100,9 +123,6 @@ pub enum BrokerCall {
         command_id: i64,
         error: Option<String>,
         cancelled: bool,
-    },
-    CommandCancelRequested {
-        command_id: i64,
     },
     InfraCommandsInFlight {
         project_id: uuid::Uuid,
@@ -158,12 +178,16 @@ struct Inner {
     /// `Ok(None)` (caller falls back to `default_protocols`).
     health_protocols: HashMap<uuid::Uuid, Option<serde_json::Value>>,
 
+    /// What each project's health protocols did, as `set_health_state`
+    /// last wrote it.
+    health_state: HashMap<uuid::Uuid, Vec<HealthProtocolState>>,
+
     /// Every issued lifecycle command, oldest first; tests push via
     /// `enqueue_command`. A command stays here after it is claimed, as
     /// the broker's row does: `completed_commands` is what retires it.
     commands: Vec<SupervisorCommandRow>,
 
-    /// Commands whose cancel checks answer only once released, so a test
+    /// Commands whose `set_waiting` answers only once released, so a test
     /// can hold a command mid-run.
     held_commands: HashMap<i64, Arc<tokio::sync::Semaphore>>,
 
@@ -178,10 +202,17 @@ struct Inner {
     /// cancelled flag).
     completed_commands: Vec<(i64, Option<String>, bool)>,
 
-    /// Per-command `cancel_requested` flag returned by
-    /// `command_cancel_requested`. Absent = false. Tests set it to
-    /// simulate the user's `/infra/cancel` landing mid-command.
-    cancel_requested: HashMap<i64, bool>,
+    /// Commands a person asked to cancel: handed out flagged, and
+    /// answered as a cancel to the held claim of the process running them.
+    cancel_requested: std::collections::HashSet<i64>,
+
+    /// How many of the next `command_complete` calls fail, as a broker
+    /// that cannot answer would.
+    completions_failing: usize,
+
+    /// How many of the next `owned_projects` calls fail, as a broker
+    /// whose read errors does.
+    owned_reads_failing: usize,
 
     /// project_id of each claimed command, so `command_complete` (which
     /// carries only a command_id) can apply the same per-project
@@ -243,7 +274,9 @@ impl Inner {
 
     /// The oldest uncompleted command of an owned project, not in `busy`,
     /// that no older uncompleted command of its project reaches a copy of,
-    /// as the broker's `next_command` picks it.
+    /// as the broker's `next_command` picks it, flagged when a person
+    /// asked to cancel it. A single supervisor: a command it claimed
+    /// before and does not name busy is its to run again.
     fn next_command(&self, busy: &[i64]) -> Option<SupervisorCommandRow> {
         let waiting: Vec<&SupervisorCommandRow> = self.commands.iter().filter(|c| !self.completed(c.id)).collect();
         waiting
@@ -253,7 +286,7 @@ impl Inner {
                     && !busy.contains(&c.id)
                     && !waiting.iter().any(|o| o.project_id == c.project_id && o.id < c.id && o.overlaps(c))
             })
-            .map(|c| (*c).clone())
+            .map(|c| SupervisorCommandRow { cancel_requested: self.cancel_requested.contains(&c.id), ..(*c).clone() })
     }
 
     /// Whether a supervisor may own `project_id`, as the broker's
@@ -267,12 +300,6 @@ impl Inner {
     /// `has_infra_nodes` answers it.
     fn has_infra_nodes(&self, project_id: uuid::Uuid) -> bool {
         self.infra_nodes.keys().any(|k| k.0 == project_id)
-    }
-
-    /// Whether `project_id` has infra copies expected to run, as the
-    /// broker's `runs_infra` answers it.
-    fn runs_infra(&self, project_id: uuid::Uuid) -> bool {
-        self.infra_nodes.iter().any(|(k, n)| k.0 == project_id && n.status.expects_running_units())
     }
 
     /// Whether `project_id` gives its owner something to do now that
@@ -532,14 +559,15 @@ impl FakeBroker {
         self.inner.lock().displaced_on_claim.insert(project_id);
     }
 
-    /// Hold command `command_id` at its next cancel check until
+    /// Hold command `command_id` at its next `set_waiting` (a stop's or a
+    /// terminate's, before the host works on a copy) until
     /// [`Self::release_command`]: it stays mid-run for as long as the test
     /// needs it running.
     pub fn hold_command(&self, command_id: i64) {
         self.inner.lock().held_commands.insert(command_id, Arc::new(tokio::sync::Semaphore::new(0)));
     }
 
-    /// Let every held and later cancel check of `command_id` answer.
+    /// Let every held and later `set_waiting` of `command_id` answer.
     pub fn release_command(&self, command_id: i64) {
         if let Some(gate) = self.inner.lock().held_commands.get(&command_id) {
             gate.close();
@@ -592,8 +620,8 @@ impl FakeBroker {
             .collect()
     }
 
-    /// All `set_status` calls in order, as `(project_id, node_id,
-    /// instance, status)`.
+    /// All `set_status` and `set_unit_health` calls in order, as
+    /// `(project_id, node_id, instance, status)`.
     pub fn status_writes(
         &self,
     ) -> Vec<(uuid::Uuid, String, Option<weft_core::instance::InstanceId>, weft_broker_client::protocol::InfraNodeStatus)> {
@@ -602,13 +630,10 @@ impl FakeBroker {
             .calls
             .iter()
             .filter_map(|c| match c {
-                BrokerCall::SetStatus {
-                    project_id,
-                    node_id,
-                    instance,
-                    status,
-                    ..
-                } => Some((*project_id, node_id.clone(), instance.clone(), *status)),
+                BrokerCall::SetStatus { project_id, node_id, instance, status, .. }
+                | BrokerCall::SetUnitHealth { project_id, node_id, instance, status, .. } => {
+                    Some((*project_id, node_id.clone(), instance.clone(), *status))
+                }
                 _ => None,
             })
             .collect()
@@ -650,10 +675,58 @@ impl FakeBroker {
         self.inner.lock().completed_commands.clone()
     }
 
-    /// Script the user's `/infra/cancel` landing mid-command: the next
-    /// `command_cancel_requested(command_id)` poll returns true.
+    /// Script the user's `/infra/cancel`: the command is handed out
+    /// flagged, and a claim held by the process running it wakes and
+    /// answers the cancel, as the broker's does on `cancel:<id>`.
     pub fn set_cancel_requested(&self, command_id: i64) {
-        self.inner.lock().cancel_requested.insert(command_id, true);
+        self.inner.lock().cancel_requested.insert(command_id);
+        self.issued.notify_waiters();
+    }
+
+    /// Make the next `count` calls of `command_complete` fail, as a broker
+    /// that cannot answer does.
+    pub fn fail_completions(&self, count: usize) {
+        self.inner.lock().completions_failing = count;
+    }
+
+    /// Make the next `count` calls of `owned_projects` fail, as a broker
+    /// whose read errors does.
+    pub fn fail_owned_reads(&self, count: usize) {
+        self.inner.lock().owned_reads_failing = count;
+    }
+
+    /// What `set_health_state` last wrote for the project.
+    pub fn health_state(&self, project_id: uuid::Uuid) -> Vec<HealthProtocolState> {
+        self.inner.lock().health_state.get(&project_id).cloned().unwrap_or_default()
+    }
+
+    /// Seed what the project's health protocols did.
+    pub fn set_health_state_rows(&self, project_id: uuid::Uuid, protocols: Vec<HealthProtocolState>) {
+        self.inner.lock().health_state.insert(project_id, protocols);
+    }
+
+    /// The projects syncs reported failed (tried again), in order, one
+    /// entry per sync that reported it.
+    pub fn failed(&self) -> Vec<uuid::Uuid> {
+        self.troubles(|failed, _| failed)
+    }
+
+    /// The projects syncs reported a health protocol gave up on, in
+    /// order, one entry per sync that reported it.
+    pub fn gave_up(&self) -> Vec<uuid::Uuid> {
+        self.troubles(|_, gave_up| gave_up)
+    }
+
+    fn troubles(&self, which: for<'a> fn(&'a [ProjectTrouble], &'a [ProjectTrouble]) -> &'a [ProjectTrouble]) -> Vec<uuid::Uuid> {
+        self.inner
+            .lock()
+            .calls
+            .iter()
+            .flat_map(|c| match c {
+                BrokerCall::SyncOwnership { failed, gave_up, .. } => which(failed, gave_up).iter().map(|t| t.project_id).collect(),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     /// Commands completed with the `cancelled` outcome.
@@ -679,62 +752,69 @@ impl Default for FakeBroker {
 
 #[async_trait]
 impl BrokerSupervisorOps for FakeBroker {
-    async fn sync_ownership(&self, replica: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
+    async fn sync_ownership(&self, req: &SupervisorSyncOwnershipRequest) -> Result<SupervisorSyncOwnershipResponse> {
         // A single supervisor: it takes every project nobody holds that
         // it may own (`ownable`) and renews what it owns while it may
         // still own it; a lease it stops renewing lapses (at once here,
-        // after the lease time on the broker). Partitioning between
-        // supervisors is covered by the broker's SQL-level tests. The
-        // owned set is every lease it holds, as the broker's is.
+        // after the lease time on the broker). Ending a pass gives every
+        // lease back. Partitioning between supervisors, the failures'
+        // retries and the booking of the next pass are covered by the
+        // broker's SQL-level tests. The owned set is every lease it holds,
+        // as the broker's is.
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::SyncOwnership {
-            replica: replica.to_string(),
-            held_projects: held_projects.to_vec(),
+            replica: req.replica.clone(),
+            held_projects: req.held_projects.clone(),
+            looked: req.looked.clone(),
+            settled: req.settled.clone(),
+            failed: req.failed.clone(),
+            gave_up: req.gave_up.clone(),
+            all_failed: req.all_failed.clone(),
+            ending: req.ending,
         });
-        let lapsed: Vec<uuid::Uuid> = inner
-            .projects
-            .keys()
-            .filter(|id| inner.owns(**id) && !inner.ownable(**id, held_projects))
-            .copied()
-            .collect();
-        for id in lapsed {
-            inner.owners.insert(id, Owner::Nobody);
+        let held_projects: &[uuid::Uuid] = req.held_projects.as_deref().unwrap_or_default();
+        let mut claimed = Vec::new();
+        match req.ending {
+            true => {
+                let given_back: Vec<uuid::Uuid> = inner.projects.keys().filter(|id| inner.owns(**id)).copied().collect();
+                for id in given_back {
+                    inner.owners.insert(id, Owner::Nobody);
+                }
+            }
+            false => {
+                let lapsed: Vec<uuid::Uuid> = inner
+                    .projects
+                    .keys()
+                    .filter(|id| inner.owns(**id) && !inner.ownable(**id, held_projects))
+                    .copied()
+                    .collect();
+                for id in lapsed {
+                    inner.owners.insert(id, Owner::Nobody);
+                }
+                let mut taken: Vec<uuid::Uuid> = inner
+                    .owners
+                    .iter()
+                    .filter(|(id, owner)| **owner == Owner::Nobody && inner.ownable(**id, held_projects))
+                    .map(|(id, _)| *id)
+                    .collect();
+                taken.sort_unstable();
+                for id in &taken {
+                    inner.owners.insert(*id, Owner::Us);
+                }
+                claimed = taken.into_iter().filter(|id| inner.projects.contains_key(id)).collect();
+            }
         }
-        let mut taken: Vec<uuid::Uuid> = inner
-            .owners
-            .iter()
-            .filter(|(id, owner)| **owner == Owner::Nobody && inner.ownable(**id, held_projects))
-            .map(|(id, _)| *id)
-            .collect();
-        taken.sort_unstable();
-        for id in &taken {
-            inner.owners.insert(*id, Owner::Us);
-        }
-        let claimed = taken.into_iter().filter(|id| inner.projects.contains_key(id)).collect();
         let owned = inner.projects.values().filter(|p| inner.owns(p.project_id)).cloned().collect();
-        // Every project row, whoever holds its lease, as the broker reads
-        // its `project` table. The fake keeps no lease times: a sibling's
-        // lease lapses a whole lease from now, and one nobody holds has
-        // lapsed.
-        let with_work: Vec<uuid::Uuid> = inner.projects.keys().copied().filter(|id| inner.has_work(*id)).collect();
-        let owns_work = with_work.iter().any(|id| inner.owns(*id));
-        let others_lapse_in_secs = inner
-            .projects
-            .keys()
-            .filter(|id| inner.has_work(**id) || inner.runs_infra(**id) || held_projects.contains(id))
-            .filter_map(|id| match inner.owners.get(id) {
-                Some(Owner::Other) => Some(weft_broker_client::lifecycle_command::infra_owner_lease_secs()),
-                Some(Owner::Nobody) => Some(0),
-                // The fake's default owner is this supervisor (`owns`).
-                Some(Owner::Us) | None => None,
-            })
-            .min();
-        Ok(SupervisorSyncOwnershipResponse { owned, claimed, owns_work, others_lapse_in_secs })
+        Ok(SupervisorSyncOwnershipResponse { owned, claimed, next_due_unix: None })
     }
 
     async fn owned_projects(&self, replica: &str) -> Result<Vec<SupervisorProject>> {
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::OwnedProjects { replica: replica.to_string() });
+        if inner.owned_reads_failing > 0 {
+            inner.owned_reads_failing -= 1;
+            anyhow::bail!("the owned projects did not read");
+        }
         // A project whose ownership moved away is no longer this
         // supervisor's, which is what the broker's lease query answers too.
         Ok(inner.projects.values().filter(|p| inner.owns(p.project_id)).cloned().collect())
@@ -789,34 +869,45 @@ impl BrokerSupervisorOps for FakeBroker {
             .collect())
     }
 
-    async fn health_protocols(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> Result<Option<serde_json::Value>> {
+    async fn health_protocols(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthProtocolsResponse> {
         let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::HealthProtocols {
-            project_id,
-        });
-        Ok(inner
-            .health_protocols
-            .get(&project_id)
-            .cloned()
-            .unwrap_or(None))
+        inner.calls.push(BrokerCall::HealthProtocols { project_id });
+        Ok(SupervisorHealthProtocolsResponse {
+            protocols: inner.health_protocols.get(&project_id).cloned().unwrap_or(None),
+            state: inner.health_state.get(&project_id).cloned().unwrap_or_default(),
+        })
     }
 
-    /// The broker's held claim: the next command, else a hold (on the
-    /// tokio clock) until one is issued or `wait` ends. A wake that
-    /// finds nothing for this supervisor answers `UnownedWork` when a command
-    /// waits on a project nobody holds, as the broker does after a wake.
+    async fn set_health_state(
+        &self,
+        req: &SupervisorSetHealthStateRequest,
+    ) -> Result<weft_broker_client::WriteOutcome<SupervisorSetHealthStateResponse>> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(BrokerCall::SetHealthState { project_id: req.project_id, protocols: req.protocols.clone() });
+        if !inner.owns(req.project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
+        }
+        inner.health_state.insert(req.project_id, req.protocols.clone());
+        Ok(weft_broker_client::WriteOutcome::Applied(SupervisorSetHealthStateResponse {}))
+    }
+
+    /// The broker's held claim: the busy commands a person asked to
+    /// cancel (none of `cancelling`), else the next command, else a hold
+    /// (on the tokio clock) until one is issued or cancelled or `wait`
+    /// ends. A wake that finds nothing for this supervisor answers
+    /// `UnownedWork` when a command waits on a project nobody holds, as
+    /// the broker does after a wake.
     async fn claim_command(
         &self,
         claimer: &str,
         busy_commands: &[i64],
+        cancelling: &[i64],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim> {
         self.inner.lock().calls.push(BrokerCall::ClaimCommand {
             claimer: claimer.to_string(),
             busy_commands: busy_commands.to_vec(),
+            cancelling: cancelling.to_vec(),
         });
         let deadline = tokio::time::Instant::now() + wait;
         let mut woken_once = false;
@@ -828,6 +919,14 @@ impl BrokerSupervisorOps for FakeBroker {
             issued.as_mut().enable();
             {
                 let mut inner = self.inner.lock();
+                let cancels: Vec<i64> = busy_commands
+                    .iter()
+                    .filter(|id| inner.cancel_requested.contains(id) && !cancelling.contains(id))
+                    .copied()
+                    .collect();
+                if !cancels.is_empty() {
+                    return Ok(SupervisorClaim::Cancel { commands: cancels });
+                }
                 if let Some(cmd) = inner.next_command(busy_commands) {
                     inner.claimed_command_project.insert(cmd.id, cmd.project_id);
                     if inner.displaced_on_claim.remove(&cmd.project_id) {
@@ -869,7 +968,7 @@ impl BrokerSupervisorOps for FakeBroker {
     async fn set_status(
         &self,
         _replica: &str,
-        command_id: Option<i64>,
+        command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
@@ -889,8 +988,8 @@ impl BrokerSupervisorOps for FakeBroker {
             failure_stage,
             failure_message: failure_message.map(|s| s.to_string()),
         });
-        // Every write is ownership-gated, with or without a command,
-        // matching the broker. A lost-ownership project is Displaced.
+        // Every write is ownership-gated, matching the broker. A
+        // lost-ownership project is Displaced.
         if !inner.owns(project_id) {
             return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
@@ -932,6 +1031,44 @@ impl BrokerSupervisorOps for FakeBroker {
         }
     }
 
+    async fn set_unit_health(
+        &self,
+        _replica: &str,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        unit: &str,
+        status: weft_broker_client::protocol::InfraNodeStatus,
+        not_ready_since_unix: Option<i64>,
+        ready_since_unix: Option<i64>,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(BrokerCall::SetUnitHealth {
+            project_id,
+            node_id: node_id.to_string(),
+            instance: instance.cloned(),
+            unit: unit.to_string(),
+            status,
+            not_ready_since_unix,
+            ready_since_unix,
+        });
+        if !inner.owns(project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
+        }
+        // The broker's per-unit fence: a unit not in the roster is Gone.
+        let Some(node) = inner.infra_nodes.get_mut(&copy_key(project_id, node_id, instance)) else {
+            return Ok(weft_broker_client::WriteOutcome::Gone);
+        };
+        let Some(ur) = node.units.get_mut(unit) else {
+            return Ok(weft_broker_client::WriteOutcome::Gone);
+        };
+        ur.status = status;
+        ur.not_ready_since_unix = not_ready_since_unix;
+        ur.ready_since_unix = ready_since_unix;
+        node.status = weft_broker_client::protocol::InfraNodeStatus::rollup(node.units.values().map(|u| &u.status));
+        Ok(weft_broker_client::WriteOutcome::Applied(weft_broker_client::protocol::SupervisorSetStatusResponse {}))
+    }
+
     async fn set_waiting(
         &self,
         _replica: &str,
@@ -941,14 +1078,22 @@ impl BrokerSupervisorOps for FakeBroker {
         instance: Option<&weft_core::instance::InstanceId>,
         waiting: &str,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetWaitingResponse>> {
-        let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::SetWaiting {
-            command_id,
-            project_id,
-            node_id: node_id.to_string(),
-            instance: instance.cloned(),
-            waiting: waiting.to_string(),
-        });
+        let gate = {
+            let mut inner = self.inner.lock();
+            inner.calls.push(BrokerCall::SetWaiting {
+                command_id,
+                project_id,
+                node_id: node_id.to_string(),
+                instance: instance.cloned(),
+                waiting: waiting.to_string(),
+            });
+            inner.held_commands.get(&command_id).cloned()
+        };
+        if let Some(gate) = gate {
+            // Releasing the gate closes it: every acquire then returns.
+            let _ = gate.acquire().await;
+        }
+        let inner = self.inner.lock();
         if !inner.owns(project_id) {
             return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
@@ -998,6 +1143,10 @@ impl BrokerSupervisorOps for FakeBroker {
             error: error.map(|s| s.to_string()),
             cancelled,
         });
+        if inner.completions_failing > 0 {
+            inner.completions_failing -= 1;
+            anyhow::bail!("the broker could not answer");
+        }
         // Ownership-gated, like the broker: if this supervisor lost ownership of
         // the command's project, completion is Displaced and the command
         // stays uncompleted for the new owner to finish.
@@ -1017,19 +1166,6 @@ impl BrokerSupervisorOps for FakeBroker {
         Ok(weft_broker_client::WriteOutcome::Applied(
             weft_broker_client::protocol::SupervisorCommandCompleteResponse {},
         ))
-    }
-
-    async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
-        let gate = {
-            let mut inner = self.inner.lock();
-            inner.calls.push(BrokerCall::CommandCancelRequested { command_id });
-            inner.held_commands.get(&command_id).cloned()
-        };
-        if let Some(gate) = gate {
-            // Releasing the gate closes it: every acquire then returns.
-            let _ = gate.acquire().await;
-        }
-        Ok(self.inner.lock().cancel_requested.get(&command_id).copied().unwrap_or(false))
     }
 
     async fn infra_commands_in_flight(
@@ -1202,10 +1338,22 @@ mod tests {
     async fn sync_ownership_records_call_and_returns_seeded() {
         let b = FakeBroker::new("alice");
         b.add_project(P1);
-        let synced = b.sync_ownership("sup-1", &[]).await.unwrap();
+        let req = SupervisorSyncOwnershipRequest {
+            replica: "sup-1".into(),
+            held_projects: Some(vec![]),
+            looked: vec![],
+            settled: vec![],
+            failed: vec![],
+            gave_up: vec![],
+            all_failed: None,
+            ending: false,
+        };
+        let synced = b.sync_ownership(&req).await.unwrap();
         assert_eq!(synced.owned.len(), 1);
         assert!(synced.claimed.is_empty(), "a seeded project is already owned");
-        assert!(!synced.owns_work, "a project with no node, copy or command gives nothing to look at");
+        // Ending a pass gives the lease back.
+        let ended = b.sync_ownership(&SupervisorSyncOwnershipRequest { ending: true, ..req }).await.unwrap();
+        assert!(ended.owned.is_empty());
         assert!(b.calls().iter().any(|c| matches!(c, BrokerCall::SyncOwnership { replica, .. } if replica == "sup-1")));
     }
 
@@ -1220,7 +1368,7 @@ mod tests {
         );
         b.set_status(
             "sup-1",
-            None,
+            1,
             P1,
             "n1",
             None,
@@ -1266,11 +1414,12 @@ mod tests {
             spec_json: None,
             force: false,
             copies: weft_core::instance::Copies::Shared,
+            cancel_requested: false,
         }
     }
 
     async fn claim(b: &FakeBroker, busy: &[i64]) -> SupervisorClaim {
-        b.claim_command("sup-1", busy, std::time::Duration::ZERO).await.unwrap()
+        b.claim_command("sup-1", busy, &[], std::time::Duration::ZERO).await.unwrap()
     }
 
     #[tokio::test]
@@ -1282,6 +1431,19 @@ mod tests {
         assert!(matches!(claim(&b, &[1]).await, SupervisorClaim::Nothing), "a command already running here is not handed out again");
         b.command_complete("sup-1", 1, None, false).await.unwrap();
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Nothing));
+    }
+
+    /// A cancel flags the command it is handed out with, and answers the
+    /// claim of the process running it once, until it says it heard.
+    #[tokio::test]
+    async fn a_cancel_is_handed_out_and_answered_to_its_runner() {
+        let b = FakeBroker::new("alice");
+        b.enqueue_command(stop(1, P1));
+        b.set_cancel_requested(1);
+        assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Command(c) if c.cancel_requested));
+        assert!(matches!(claim(&b, &[1]).await, SupervisorClaim::Cancel { commands } if commands == vec![1]));
+        let heard = b.claim_command("sup-1", &[1], &[1], std::time::Duration::ZERO).await.unwrap();
+        assert!(matches!(heard, SupervisorClaim::Nothing));
     }
 
     #[tokio::test]
@@ -1297,14 +1459,14 @@ mod tests {
         let b = FakeBroker::new("alice");
         b.set_project_unowned(P1);
         let wait = std::time::Duration::from_secs(25);
-        let held = b.claim_command("sup-1", &[], wait);
+        let held = b.claim_command("sup-1", &[], &[], wait);
         tokio::pin!(held);
         assert!(futures::poll!(held.as_mut()).is_pending(), "nothing to hand out: the claim holds");
         b.enqueue_command(stop(1, P1));
         assert!(matches!(held.await.unwrap(), SupervisorClaim::UnownedWork));
         // Without a wake the hold ends on its own, answering Nothing.
         assert!(matches!(
-            b.claim_command("sup-1", &[], wait).await.unwrap(),
+            b.claim_command("sup-1", &[], &[], wait).await.unwrap(),
             SupervisorClaim::Nothing
         ));
     }

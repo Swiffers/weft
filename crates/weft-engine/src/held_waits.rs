@@ -41,11 +41,15 @@ pub(crate) enum Unsuspendable {
     TiedCaller,
     /// A bus is open, and a bus lives in this worker's memory alone.
     LiveBus,
+    /// It runs no program a worker could pick it back up with: a node
+    /// test's run, whose handles say so (`RunnerHandle::without_program`).
+    NoProgram,
 }
 
 impl Unsuspendable {
     pub(crate) fn why(self) -> &'static str {
         match self {
+            Self::NoProgram => "it is a node test, which has no program to be picked back up with",
             Self::Unrecorded => "it keeps no record to be picked back up from (its trigger has `recorded: false`)",
             Self::TiedCaller => "it is tied to its caller, which cannot follow it (its route does not have `outlivesCaller`)",
             Self::LiveBus => "a bus between its nodes is open, and a bus lives in its worker's memory alone",
@@ -53,9 +57,10 @@ impl Unsuspendable {
     }
 }
 
-/// Whether the run can be suspended right now: the one check behind a wait
-/// that holds, a held wait that pauses after all, and a run asked to leave
-/// its worker that drains or stays.
+/// Whether a run driven over its program can be suspended right now: the
+/// one check behind a wait that holds, a held wait that pauses after all,
+/// and a run asked to leave its worker that drains or stays. A run with no
+/// program never can ([`Unsuspendable::NoProgram`]).
 pub(crate) fn unsuspendable(
     caller: Option<&Arc<dyn weft_core::caller::CallerConnection>>,
     bus_coordinator: &crate::context::BusCoordinator,

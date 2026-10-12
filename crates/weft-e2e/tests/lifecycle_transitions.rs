@@ -509,3 +509,41 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
 
     project.finish().await
 }
+
+/// A resync that parks its triggers over a run waiting on a person brings
+/// them straight back on without asking what to do with what they kept
+/// (only `weft activate` asks): the run keeps waiting, and the form is
+/// still answerable afterwards, resuming the ORIGINAL execution.
+#[tokio::test]
+async fn a_park_resync_keeps_a_run_waiting_on_a_person() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("human_form", disp.clone()).await?;
+    let pid = project.id();
+
+    let feed = SseFake::start().await?;
+    project.substitute_in_main("__E2E_FAKE_URL__", &feed.url())?;
+    project.activate().await?;
+
+    let before = run::executions(&disp, &pid).await?;
+    feed.wait_for_subscriber(Duration::from_secs(60)).await?;
+    feed.push_event("go", &json!({ "value": "the change" }).to_string());
+    let execution_id =
+        run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
+
+    // The rig is non-interactive, so a resync that asked would fail here.
+    project
+        .weft(&["resync", "--mode", "park", "--running-policy", "wait"])
+        .await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    let status = exec_status(&disp, execution_id).await?;
+    anyhow::ensure!(status == "waiting_for_input", "the resync must leave the waiting run waiting; got '{status}'");
+
+    human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
+    SettledRun::observe(&disp, execution_id)
+        .await?
+        .completed()?
+        .assert_input("out", "data", &json!(true))?;
+
+    project.finish().await
+}

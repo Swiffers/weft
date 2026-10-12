@@ -50,6 +50,10 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # the schema guard). These tests are skipped when no DATABASE_URL is set
 # (CI provides one).
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "macros", "migrate"] }
+# The fake alarm the booking tests read the wakes set and cancelled from.
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+# Counting the alert lines a stuck failure logs (tests/unanswered.rs).
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

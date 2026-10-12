@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
+  backendFromSnapshot,
   describeProgress,
   emptyActionAvailability,
   parseRunning,
@@ -58,6 +59,13 @@ describe('parseStatusPayload', () => {
     expect(snap.projectStatus).toBe('unknown');
     expect(snap.transition).toBe('none');
     expect(snap.infraRollup).toBe('none');
+  });
+
+  it('carries a project being removed onto the bar', () => {
+    const snap = parseStatusPayload({ removing: true, status: 'inactive', available_actions: [] });
+    expect(snap.removing).toBe(true);
+    expect(backendFromSnapshot(snap).removing).toBe(true);
+    expect(parseStatusPayload({}).removing).toBe(false);
   });
 
   it('fills defaults for an empty payload without throwing', () => {

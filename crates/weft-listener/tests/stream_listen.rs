@@ -178,21 +178,16 @@ weft_core::stress_test!(
     }
 );
 
-async fn run_scenario() {
-    let run_id = uuid::Uuid::new_v4().simple().to_string();
-    let sig_token = format!("sig-{run_id}");
-    let peer = spawn_peer().await;
-    let broker_base = spawn_broker().await;
-
-    let tasks = Arc::new(FakeTasks);
-    let doors = Arc::new(FakeDoors::default());
-    let state = ListenerState::new(
+/// A listener holding signals here, talking to the broker at
+/// `broker_base` and firing into `doors`.
+fn listener_state(run_id: &str, broker_base: String, doors: Arc<FakeDoors>) -> ListenerState {
+    ListenerState::new(
         ListenerConfig {
             replica: format!("test-listener-{run_id}"),
             holds_here: true,
             prefer_push: false,
         },
-        tasks.clone(),
+        Arc::new(FakeTasks),
         // The fake broker ignores the bearer.
         weft_broker_client::BrokerLink::new(
             broker_base,
@@ -203,12 +198,21 @@ async fn run_scenario() {
             ),
         ),
         Arc::new(weft_platform_traits::FakeAlarm::new()),
-        doors.clone(),
-    );
+        doors,
+        weft_listener::HolderPlatform {
+            news: Arc::new(weft_platform_traits::FakeHolderNews::default()),
+            liveness: Arc::new(weft_platform_traits::OneProcessHolds),
+        },
+    )
+}
 
+/// The mailbox signal on `peer_address`, signing in through an `email`
+/// connection, brought up from its row the way a restarted listener
+/// does.
+async fn bring_up_mailbox(state: &ListenerState, sig_token: &str, peer_address: &str) {
     let access = Access::new(uuid::Uuid::new_v4().to_string(), "email", None);
     let mut kind = StreamListen::new(
-        &peer.address,
+        peer_address,
         Framing::Delimiter { bytes: "\r\n".into() },
         r"^\* \d+ (EXISTS|RECENT)",
     )
@@ -221,16 +225,26 @@ async fn run_scenario() {
     // The peer is plaintext: an in-process pipe has no certificate.
     kind.tls = false;
 
-    // Brought up from its row, the way a restarted listener does.
     let row = json!({
         "token": sig_token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
         "spec_json": serde_json::to_string(&to_spec(kind)).unwrap(), "is_resume": false, "execution_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
         "auth_config": null, "kind_state": {}, "kind_state_seq": 1, "holds": true, "serving": null
     });
-    bring_up(&state, serde_json::from_value(row).unwrap(), weft_core::signal::listener_protocol::StartMode::Restore)
+    bring_up(state, serde_json::from_value(row).unwrap(), weft_core::signal::listener_protocol::StartMode::Restore)
         .await
         .expect("registration succeeds");
+}
+
+async fn run_scenario() {
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let sig_token = format!("sig-{run_id}");
+    let peer = spawn_peer().await;
+    let broker_base = spawn_broker().await;
+
+    let doors = Arc::new(FakeDoors::default());
+    let state = listener_state(&run_id, broker_base, doors.clone());
+    bring_up_mailbox(&state, &sig_token, &peer.address).await;
 
     // The dialogue ran with the connection's values interpolated.
     wait_until(|| peer.received.lock().unwrap().len() >= 2, "the dialogue").await;
@@ -264,6 +278,65 @@ async fn run_scenario() {
         2,
         "the non-matching line must not have fired"
     );
+}
+
+/// A broker whose answer about the connection is that only a reconnect
+/// brings it back (the access store's 409): resolving again repeats it,
+/// so the held signal is given up with why, once, instead of retried on
+/// the ladder. Records each resolve and each give-up's reason.
+#[derive(Default)]
+struct RefusingBroker {
+    resolves: std::sync::atomic::AtomicUsize,
+    gave_up: Mutex<Vec<String>>,
+}
+
+async fn spawn_refusing_broker(broker: Arc<RefusingBroker>) -> String {
+    use axum::routing::post;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let resolving = broker.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/access/listener-resolve",
+            post(move || {
+                let broker = resolving.clone();
+                async move {
+                    broker.resolves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (axum::http::StatusCode::CONFLICT, "the 'email' access needs reconnecting: the refresh was refused")
+                }
+            }),
+        )
+        .route(
+            "/v1/signal/give_up",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let broker = broker.clone();
+                async move {
+                    broker.gave_up.lock().unwrap().push(req["reason"].as_str().unwrap().to_string());
+                    axum::Json(json!({}))
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, weft_broker_client::line::server::with_line(app)).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_connection_needing_a_reconnect_stops_the_held_signal() {
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let peer = spawn_peer().await;
+    let broker = Arc::new(RefusingBroker::default());
+    let state = listener_state(&run_id, spawn_refusing_broker(broker.clone()).await, Arc::new(FakeDoors::default()));
+    bring_up_mailbox(&state, &format!("sig-{run_id}"), &peer.address).await;
+
+    wait_until(|| !broker.gave_up.lock().unwrap().is_empty(), "the give-up").await;
+    let reason = broker.gave_up.lock().unwrap()[0].clone();
+    assert!(reason.contains("needs reconnecting"), "says why: {reason}");
+    // The ladder's first step is a second; past it, a loop still retrying
+    // would have resolved again.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(broker.resolves.load(std::sync::atomic::Ordering::SeqCst), 1, "never asked again");
+    assert_eq!(broker.gave_up.lock().unwrap().len(), 1, "given up once");
+    assert!(peer.received.lock().unwrap().is_empty(), "never dialed the peer");
 }
 
 /// The project's worker, as the listener hands it events: records each

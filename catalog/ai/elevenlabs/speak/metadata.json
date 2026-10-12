@@ -54,11 +54,12 @@
         "free_text": true,
         "options": [
           "eleven_flash_v2_5",
-          "eleven_turbo_v2_5",
+          "eleven_flash_v2",
           "eleven_multilingual_v2"
         ]
       },
-      "label": "Model"
+      "label": "Model",
+      "description": "The streaming socket speaks with Flash and Multilingual v2. ElevenLabs's v3 and v4 models do not stream through it, so use Speak to File for those. Flash costs half as much per character and answers faster, and eleven_flash_v2 speaks English only."
     },
     {
       "name": "outputFormat",
@@ -68,13 +69,151 @@
         "kind": "select",
         "options": [
           "pcm_16000",
+          "pcm_8000",
+          "pcm_22050",
+          "pcm_24000",
+          "pcm_32000",
           "pcm_44100",
+          "pcm_48000",
           "ulaw_8000",
-          "mp3_44100_128"
+          "alaw_8000",
+          "mp3_44100_128",
+          "mp3_44100_192",
+          "mp3_44100_96",
+          "mp3_44100_64",
+          "mp3_44100_32",
+          "mp3_24000_48",
+          "mp3_22050_32",
+          "wav_44100",
+          "wav_48000",
+          "wav_32000",
+          "wav_24000",
+          "wav_22050",
+          "wav_16000",
+          "wav_8000",
+          "opus_48000_32",
+          "opus_48000_64",
+          "opus_48000_96",
+          "opus_48000_128",
+          "opus_48000_192"
         ]
       },
       "label": "Output format",
-      "description": "pcm_16000 is the audio-bus standard the other realtime nodes speak."
+      "description": "pcm_16000 is the audio-bus standard the other realtime nodes speak, and `alignment` needs a pcm, ulaw or alaw format. ElevenLabs gives mp3_44100_192 only on its Creator plan and above, and pcm or wav at 44100 only on Pro and above."
+    },
+    {
+      "name": "stability",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "Voice stability (0 varied, 1 monotone). Absent = the voice's own setting."
+    },
+    {
+      "name": "similarityBoost",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "How closely the output sticks to the voice. Absent = the voice's own setting."
+    },
+    {
+      "name": "speed",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0.7,
+        "max": 1.2,
+        "step": 0.05
+      },
+      "description": "Speaking speed multiplier. Absent = the voice's own setting."
+    },
+    {
+      "name": "style",
+      "type": "Number",
+      "description": "How much the voice exaggerates its speaker's style: 0 leaves it as it is, and higher values amplify it, which ElevenLabs says can make the answer slower.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "speakerBoost",
+      "type": "Boolean",
+      "label": "Speaker boost",
+      "description": "Makes the audio sound more like the voice's original speaker, at the cost of a slightly slower answer."
+    },
+    {
+      "name": "languageCode",
+      "type": "String",
+      "label": "Language",
+      "placeholder": "en",
+      "description": "If you want the text read as one language, give its two-letter code, like `fr`. A code the model does not support is ignored, not refused, and eleven_multilingual_v2 takes no language code at all. Leave empty to let the model decide."
+    },
+    {
+      "name": "textNormalization",
+      "type": "String",
+      "label": "Spell out numbers",
+      "description": "Whether numbers, dates and the like are written out into words before they are spoken. Leave empty for auto, which decides per text. ElevenLabs keeps it off on Flash v2.5 by default, and only Enterprise accounts can turn it on there.",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "auto",
+          "on",
+          "off"
+        ]
+      }
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "description": "If you want to be able to make a similar take again, set any whole number here, then run again with that number and the same text. ElevenLabs tries to give the same audio back but does not promise it. Leave empty for a new random seed each run.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 4294967295,
+        "step": 1
+      }
+    },
+    {
+      "name": "pronunciationDictionaries",
+      "type": "List[{ id: String, version: String }]",
+      "label": "Pronunciation dictionaries",
+      "description": "Pronunciation dictionaries of the connected ElevenLabs account, each as `{ id, version }`: the streaming socket needs the version. ElevenLabs matches a dictionary's words only inside one message of the `text` bus, and a dictionary that uses phonemes also needs `enableSsmlParsing`."
+    },
+    {
+      "name": "enableSsmlParsing",
+      "type": "Boolean",
+      "default": false,
+      "label": "SSML parsing",
+      "description": "Turn on if a pronunciation dictionary uses phonemes: on the streaming socket, ElevenLabs applies phoneme rules only with this on."
+    },
+    {
+      "name": "autoMode",
+      "type": "Boolean",
+      "default": true,
+      "label": "Auto mode",
+      "description": "On, ElevenLabs decides by itself when to turn the text so far into audio. Turn it off to set `chunkLengthSchedule`: ElevenLabs then waits until enough text has arrived to match the schedule before it speaks."
+    },
+    {
+      "name": "chunkLengthSchedule",
+      "type": "List[Number]",
+      "label": "Chunk schedule",
+      "description": "With `autoMode` off, how many characters ElevenLabs waits for before generating: the first number before the first audio, the next before the second, and the last for every chunk after that. Each is between 50 and 500. Leave empty for ElevenLabs's 120, 160, 250, 290. Smaller numbers answer sooner and can sound worse."
+    },
+    {
+      "name": "enableLogging",
+      "type": "Boolean",
+      "default": true,
+      "label": "Keep history",
+      "description": "Turn off for zero retention: ElevenLabs then keeps no history of the session. Only Enterprise accounts can turn it off."
     }
   ],
   "outputs": [
@@ -82,6 +221,11 @@
       "name": "audio",
       "type": "Bus",
       "description": "The live audio: raw byte frames in the declared format (bus metadata carries sample_rate and encoding)."
+    },
+    {
+      "name": "alignment",
+      "type": "Bus",
+      "description": "When wired, the timing of each spoken character, live: one message per audio frame, a list of `{ text, start, end }` in seconds from the start of the whole speech. Needs a pcm, ulaw or alaw `outputFormat`."
     },
     {
       "name": "file",
@@ -99,6 +243,89 @@
     {
       "name": "sizeBytes",
       "type": "Number"
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "model",
+        "regex": "^eleven_v[34]"
+      },
+      "then": {
+        "message": "ElevenLabsSpeak '{id}' picks a v3 or v4 `model`, and ElevenLabs's streaming text to speech socket takes neither: pick a Flash or Multilingual v2 `model`, or speak v3 and v4 with ElevenLabsSpeakFile.",
+        "port": "model"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "languageCode"
+          },
+          {
+            "kind": "config_equals",
+            "field": "model",
+            "equals": "eleven_multilingual_v2"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeak '{id}' sets `languageCode`, and eleven_multilingual_v2 takes no language code: pick another `model`, or leave `languageCode` empty.",
+        "port": "languageCode"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "chunkLengthSchedule"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "autoMode",
+              "equals": false
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "autoMode"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeak '{id}' sets `chunkLengthSchedule` with `autoMode` on, and in auto mode ElevenLabs decides when to generate without waiting on a schedule: turn `autoMode` off, or leave `chunkLengthSchedule` empty.",
+        "port": "chunkLengthSchedule"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "output_wired",
+            "port": "alignment"
+          },
+          {
+            "kind": "config_matches",
+            "field": "outputFormat",
+            "regex": "^(mp3|opus|wav)_"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsSpeak '{id}' wires `alignment`, which places each character on the whole speech by counting the audio bytes before it, and only the pcm, ulaw and alaw formats pin that down exactly: pick one of those for `outputFormat`, or leave `alignment` unwired.",
+        "port": "outputFormat"
+      }
     }
   ],
   "display": {

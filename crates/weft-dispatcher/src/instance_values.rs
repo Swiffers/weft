@@ -25,7 +25,8 @@
 //! whichever door the change came through.
 //!
 //! Once a change is stored, the instance's fires that parked waiting on a
-//! value they had not given (`parked_fire.instance_gap`) are routed again,
+//! value they had not given (`parked_fire.waits_for`, on the instance) are
+//! routed again,
 //! through the same drain every parked fire takes: each is held to what is
 //! stored now, and parks again, naming what is still missing, if a gap is
 //! left. Those fires are never retried on a timer, since only a change
@@ -142,7 +143,7 @@ async fn apply(
     loop {
         // Subscribed before looking, so a claim ending between the look
         // and the wait still wakes it.
-        let mut events = state.events.subscribe_project(project_id).await;
+        let mut heard = state.signals.subscribe();
         // The project row, locked: no activation claims a trigger until
         // this pass has decided (and, when nothing live reads the change,
         // stored it). What is stored and what is live are read under it,
@@ -185,7 +186,7 @@ async fn apply(
             // this instance's, an activate): this change re-arms after it,
             // on what it leaves.
             drop(tx);
-            wait_for_activations(&mut events).await;
+            wait_for_activations(&mut heard).await?;
             continue;
         }
         let live: Vec<ActivationKey> = reading
@@ -224,7 +225,7 @@ async fn apply(
             // one left Active (a deactivate took it down: look again, it
             // is no longer re-armed). A build is the refusal itself.
             Err(crate::api::project::ActivateError::Refused(ClaimRefused::Claimed)) => {
-                wait_for_activations(&mut events).await
+                wait_for_activations(&mut heard).await?
             }
             Err(crate::api::project::ActivateError::Refused(ClaimRefused::NotExpected)) => {}
             Err(error) => return Err(error.into()),
@@ -238,7 +239,7 @@ async fn apply(
 /// parked for the instance's next change or the trigger's next activation,
 /// and says so in the log.
 async fn route_waiting_fires(state: &DispatcherState, project_id: uuid::Uuid, instance: &InstanceId) {
-    let tokens = match crate::api::signal::instance_gap_tokens(&state.pg_pool, project_id, instance).await {
+    let tokens = match crate::api::signal::instance_waiting_tokens(&state.pg_pool, project_id, instance).await {
         Ok(tokens) => tokens,
         Err(e) => {
             tracing::error!(
@@ -250,15 +251,13 @@ async fn route_waiting_fires(state: &DispatcherState, project_id: uuid::Uuid, in
             return;
         }
     };
-    for token in tokens {
-        if let Err(e) = crate::parked_drain::drain_token(state, &token, crate::parked_drain::Due::Now).await {
-            tracing::error!(
-                target: "weft_dispatcher::instance_values",
-                %project_id, instance = %instance, token = %token, error = %e,
-                "instance values changed, but routing the fires waiting on them failed; they stay parked \
-                 until the instance's next change or `weft activate --instance` drains them"
-            );
-        }
+    if let Err(e) = crate::parked_drain::drain_tokens(state, &tokens).await {
+        tracing::error!(
+            target: "weft_dispatcher::instance_values",
+            %project_id, instance = %instance, error = %format!("{e:#}"),
+            "instance values changed, but routing the fires waiting on them failed; they stay parked \
+             until the instance's next change or `weft activate --instance` drains them"
+        );
     }
 }
 
@@ -326,15 +325,18 @@ pub(crate) fn triggers_reading<'a>(
         .collect()
 }
 
-/// Until the project's activations move: every claim and every end of
-/// one announces itself (`transition::publish_transition_changed`, fanned
-/// out across processes), and the safety interval covers an announcement lost
-/// on the way.
-pub(crate) async fn wait_for_activations(events: &mut tokio::sync::broadcast::Receiver<crate::events::LiveEvent>) {
-    tokio::select! {
-        _ = events.recv() => {}
-        _ = tokio::time::sleep(weft_task_store::drain::SAFETY_POLL_INTERVAL) => {}
-    }
+/// Until an activation moves: every change of one's status is announced
+/// on `crate::holders::HELD_SIGNALS_CHANNEL` by its row's own trigger,
+/// whoever wrote it, and a watch that may have missed one says so
+/// (`Heard::Recheck`, `Heard::Resumed`). `heard` is subscribed before the
+/// caller looked, so a change between the look and the wait wakes it.
+/// One whose driver died is ended by `crate::lapses`, which writes its
+/// status and so announces it.
+pub(crate) async fn wait_for_activations(heard: &mut weft_task_store::pg_signal::Subscription) -> Result<(), ApiError> {
+    heard
+        .woken(|channel, _| channel == crate::holders::HELD_SIGNALS_CHANNEL)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wait for the activations to move: {e:#}")))
 }
 
 /// An access-store failure as the API answers it (a refusal the store

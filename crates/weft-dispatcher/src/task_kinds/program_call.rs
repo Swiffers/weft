@@ -307,7 +307,7 @@ async fn infra_down(
                 TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll } => None,
                 TakeDown::Stop { .. } | TakeDown::Terminate { .. } => Some(crate::take_down::DownWith::Infra),
             },
-            Some(asker),
+            crate::take_down::TakeDownAsker::Run(asker),
         )
         .await?;
     }
@@ -385,7 +385,7 @@ async fn triggers_deactivate(
     let target = crate::take_down::TakeDownTarget::Activations(keys);
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
     let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.execution_id == asker);
-    crate::take_down::take_down(state, project_id, &target, spec, None, Some(asker)).await?;
+    crate::take_down::take_down(state, project_id, &target, spec, None, crate::take_down::TakeDownAsker::Run(asker)).await?;
     let stops_asker = stop_self == StopSelf::Include && asker_fired;
     stop_asker(state, asker, stops_asker).await?;
     Ok(ProgramCallOutcome { value: serde_json::json!({ "deactivated": true }), stops_asker })
@@ -548,7 +548,7 @@ async fn instances(
     .await
     .map_err(internal("instance tokens"))?;
     let copies = observed_copies(state, project_id).await?;
-    let waiting = crate::api::signal::instance_waits(&state.pg_pool, project_id).await.map_err(internal("waiting fires"))?;
+    let waiting = crate::api::signal::waiting_fires(&state.pg_pool, project_id).await.map_err(internal("waiting fires"))?;
     let triggers: Vec<(InstanceId, InstanceTrigger)> = state
         .activations
         .list(project_id)

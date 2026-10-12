@@ -26,40 +26,41 @@ pub(crate) enum Landed {
     /// It is dealt with: a run started (or had already), or it was dropped
     /// (and why is logged).
     Done,
-    /// It waits in its trigger's queue: the trigger is parked, its runs at
-    /// once are all going, what it reads is not ready, or its worker was
-    /// out of reach. `instance_gap` when it waits on what its instance
-    /// provides.
-    Waits { reason: String, instance_gap: bool },
+    /// It waits in its trigger's queue on `on`: the trigger is parked, its
+    /// runs at once are all going, what it reads is not ready, or its
+    /// worker was out of reach.
+    Waits { reason: String, on: weft_core::door_fire::WaitsOn },
     /// A caller past the trigger's per-caller limit, and when to come back.
     Refused { reason: String, retry_after_secs: u64 },
 }
 
-/// Every instance trigger's events waiting on a value its instance has not
-/// given (`parked_fire.instance_gap`) in `project_id`: how many, and the
-/// reason the one parked last gave.
-pub async fn instance_waits(
+/// Every trigger's events in `project_id` waiting on something no clock
+/// brings (`parked_fire.waits_for`: an instance's value, infra, picks, or
+/// a hand-over that kept failing): how many, and what the one parked or
+/// stopped last waits on.
+pub async fn waiting_fires(
     pool: &sqlx::PgPool,
     project_id: uuid::Uuid,
 ) -> anyhow::Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::program::WaitingFires>> {
     let rows: Vec<(String, Option<String>, i64, String)> = sqlx::query_as(
         "SELECT s.activation_trigger, s.instance_id, count(*)::bigint, \
-                (array_agg(p.instance_gap #>> '{}' ORDER BY p.seq DESC))[1] \
+                (array_agg(p.waits_for ORDER BY p.seq DESC))[1] \
          FROM parked_fire p JOIN signal s ON s.token = p.token \
-         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND p.instance_gap IS NOT NULL \
+         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND p.waits_for IS NOT NULL \
          GROUP BY s.activation_trigger, s.instance_id",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(trigger, instance, fires, reason)| {
+        .map(|(trigger, instance, fires, waits_for)| {
             let instance = instance
                 .map(weft_core::instance::InstanceId::new)
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("signal.instance_id for trigger {trigger}: {e}"))?;
             let key = weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(instance));
-            Ok((key, weft_core::program::WaitingFires { fires: fires as u32, reason }))
+            let waits = weft_task_store::parked_fires::WaitsFor::parse(&waits_for)?;
+            Ok((key, weft_core::program::WaitingFires { fires: fires as u32, on: waits.on, reason: waits.reason }))
         })
         .collect()
 }
@@ -67,7 +68,7 @@ pub async fn instance_waits(
 /// The signals of `instance` in `project_id` whose queue holds an event
 /// waiting on that instance's values, and whose activation is Active: what
 /// a change of the instance's values routes again.
-pub async fn instance_gap_tokens(
+pub async fn instance_waiting_tokens(
     pool: &sqlx::PgPool,
     project_id: uuid::Uuid,
     instance: &weft_core::instance::InstanceId,
@@ -76,8 +77,9 @@ pub async fn instance_gap_tokens(
         "SELECT s.token FROM signal s {} \
          WHERE s.project_id = $1 AND s.instance_id = $2 \
            AND COALESCE(a.status, 'active') = 'active' \
-           AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND p.instance_gap IS NOT NULL)",
+           AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND {})",
         weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+        crate::parked_drain::waits_on_sql("p", weft_core::door_fire::UnclockedWait::Instance),
     ))
     .bind(project_id)
     .bind(instance.as_str())
@@ -448,14 +450,15 @@ pub(crate) async fn fire_entry(state: &DispatcherState, routing: &FireGateInfo, 
         }
         Ok(Fired::Refused { reason, retry_after_secs }) => return Ok(Landed::Refused { reason, retry_after_secs }),
         // The worker put it in the queue itself.
-        Ok(Fired::Parked { reason, instance_gap }) => return Ok(Landed::Waits { reason, instance_gap }),
+        Ok(Fired::Parked { reason, on }) => return Ok(Landed::Waits { reason, on }),
         Err(e) => format!("its worker could not take it: {e:#}"),
     };
-    let parked = weft_task_store::parked_fires::waiting(fire.fire_id, fire.payload, fire.caller, fire.attempts + 1, None);
+    let on = weft_core::door_fire::WaitsOn::Failure;
+    let parked = weft_task_store::parked_fires::waiting(fire.fire_id, fire.payload, fire.caller, fire.attempts, on, &reason);
     match park(&state.pg_pool, &fire.token, &parked, None).await? {
         ParkAppend::Parked | ParkAppend::Refused(ParkRefusal::AlreadyQueued) => {
             tracing::warn!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, "a fire waits in its trigger's queue: {reason}");
-            Ok(Landed::Waits { reason, instance_gap: false })
+            Ok(Landed::Waits { reason, on })
         }
         ParkAppend::Refused(refusal) => anyhow::bail!("{reason}, and it could not be queued ({refusal:?})"),
     }
@@ -1311,6 +1314,19 @@ pub(crate) async fn read_signal_live(
     node: &str,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
+    let at = signal_live_at(state, id, node, instance).await?;
+    fetch_signal_live(state, node, &at).await
+}
+
+/// Where the display of the trigger at `node` is asked for: the token the
+/// listener holds it by, and the address a caller reaches it at. Reads the
+/// signal's row.
+pub(crate) async fn signal_live_at(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    node: &str,
+    instance: Option<&weft_core::instance::InstanceId>,
+) -> Result<SignalLiveAt, (StatusCode, String)> {
     // The entry registered at this place for this copy, read once: it carries the
     // token the listener is asked by, and the address the caller is
     // shown. A resume row of the same node is another registration
@@ -1322,12 +1338,6 @@ pub(crate) async fn read_signal_live(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{node}'")))?;
-    let not_listening = || {
-        (
-            StatusCode::NOT_FOUND,
-            format!("the listener does not hold the trigger '{node}'; activate the project to register it"),
-        )
-    };
     // Where a caller reaches this signal. The row is the authority (it
     // holds the tenant-namespaced mount path) and `public_url` is the
     // one place that knows a held-connection kind is served under
@@ -1340,13 +1350,31 @@ pub(crate) async fn read_signal_live(
     // trigger), and the reader's host says nothing about what that
     // party reaches.
     let address = entry.public_url(state.external_base_url());
+    Ok(SignalLiveAt { token: entry.token, address })
+}
+
+/// Where a trigger's display is asked for ([`signal_live_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalLiveAt {
+    pub token: String,
+    pub address: Option<String>,
+}
+
+/// What the trigger at `node` shows, asked of the listener at `at`. Reads
+/// no row of its own.
+pub(crate) async fn fetch_signal_live(state: &DispatcherState, node: &str, at: &SignalLiveAt) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
     // The listener's own text names the route already.
     state
         .listener
-        .live(&entry.token, address.as_deref())
+        .live(&at.token, at.address.as_deref())
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the trigger's display: {e}")))?
-        .ok_or_else(not_listening)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("the listener does not hold the trigger '{node}'; activate the project to register it"),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1458,6 +1486,7 @@ mod public_url_tests {
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
             holds: false,
+            generation: 0,
         }
     }
 
@@ -1588,6 +1617,7 @@ mod can_cancel_tests {
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
             holds: false,
+            generation: 0,
         }
     }
 
@@ -1704,6 +1734,7 @@ mod signal_file_scope_tests {
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
             holds: false,
+            generation: 0,
         }
     }
 

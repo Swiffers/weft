@@ -186,6 +186,12 @@ impl LiveFold {
     pub fn snapshot(&self) -> ExecutionSnapshot {
         self.fold.current_snapshot()
     }
+
+    /// What the firing at `(node, frames)` handed out so far
+    /// (`Fold::firing_output`).
+    pub fn firing_output(&self, node_id: &str, frames: &weft_core::frames::LoopFrames) -> Option<&weft_core::exec::postprocess::OutputBag> {
+        self.fold.firing_output(node_id, frames)
+    }
 }
 
 #[cfg(test)]
@@ -293,7 +299,7 @@ mod tests {
         let parent = execution_id(1);
         let mut parent_rows = vec![birth(parent,None,"a")];
         parent_rows.push(ExecEvent::NodeStarted {execution_id:parent,node_id:"a".into(),frames:vec![],at_unix:1});
-        parent_rows.push(ExecEvent::NodeFailed {execution_id:parent,node_id:"a".into(),frames:vec![],error:"failed".into(),at_unix:2});
+        parent_rows.push(ExecEvent::NodeFailed {execution_id:parent,node_id:"a".into(),frames:vec![],error:"failed".into(),gave_up_wait:false,at_unix:2});
         let rows = vec![birth(execution_id(2),Some(Seed {parent,origins:BTreeMap::from([(Located::top("a"), parent)])}),"b")];
         let chain = chain(&rows,&HashMap::from([(parent,parent_rows)])).await.unwrap();
         assert!(fold_seeded(execution_id(2),program(),&chain,&rows).err().unwrap().to_string().contains("no complete reusable result"));

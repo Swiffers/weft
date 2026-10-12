@@ -439,8 +439,7 @@
     /// Topology for the bus + await_signal matrix: a bus `creator` wired
     /// to a `peer` (the pair holds the worker alive), PLUS an independent
     /// `waiter` entry node that does the `await_signal`. The waiter does
-    /// NOT touch the bus and does NOT emit before awaiting (the engine
-    /// forbids emit-then-await: replay would re-emit). All three are
+    /// NOT touch the bus and emits nothing. All three are
     /// kicked as entry roots. This mirrors reality: a HumanQuery-style
     /// node waits for input while OTHER nodes keep a bus conversation
     /// alive; the bus only prevents the worker dying.
@@ -1230,7 +1229,7 @@
                 .await
                 .unwrap();
             }
-            let clients = EngineClients { tasks, runs: answers, ..clients(j.clone()) };
+            let clients = EngineClients { tasks, told: answers.told.clone(), runs: answers, ..clients(j.clone()) };
             run_checked(Arc::new(project), configurable_catalog(), execution_id, j, clients, CancellationFlag::new_arc(), None)
                 .await
         });
@@ -2337,14 +2336,18 @@
             Some(fake.clone() as Arc<dyn CallerConnection>), tasks.clone(),
         ).await;
         assert!(
-            matches!(&outcome, ExecutionOutcome::Failed { error } if error.contains("gave up its wait") && error.contains("`outlivesCaller`")),
-            "a caller-tied run gives up a wait nothing answers; got {outcome:?}"
+            matches!(&outcome, ExecutionOutcome::Failed { error, held_too_long: true } if error.contains("gave up its wait") && error.contains("`outlivesCaller`")),
+            "a caller-tied run gives up a wait nothing answers, a time limit for its caller; got {outcome:?}"
         );
         let token = tasks.minted().expect("the wait was registered");
         assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![token.clone()], "the wait given up is withdrawn");
         let events = journal.events.lock().unwrap().clone();
         assert!(events.iter().any(|e| matches!(e, ExecEvent::SuspensionGaveUp { token: t, .. } if *t == token)), "{events:?}");
         assert!(!events.iter().any(|e| matches!(e, ExecEvent::NodeSuspended { .. })), "nothing parked: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, ExecEvent::NodeFailed { gave_up_wait: true, .. })),
+            "the failure's row says it gave up a wait, so any worker ending the run reads it: {events:?}"
+        );
     }
 
     /// The node may handle a wait given up like any outcome of its step,
@@ -2364,6 +2367,43 @@
             Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+    }
+
+    /// A node that handles a wait given up, then fails on its own.
+    struct RecoversThenFailsNode;
+    test_manifest!(RecoversThenFailsNode, "RecoversThenFails");
+    #[async_trait]
+    impl Node for RecoversThenFailsNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            match ctx.await_signal(human_form()).await {
+                Err(weft_core::error::WeftError::WaitGaveUp(_)) => {}
+                other => panic!("the wait is given up: {other:?}"),
+            }
+            Err(weft_core::error::WeftError::NodeExecution("the provider refused the request".into()))
+        }
+    }
+
+    /// A wait given up earlier in the run does not make a later, unrelated
+    /// failure a time limit: what the caller hears is decided by the error
+    /// of the step that failed the run.
+    #[tokio::test]
+    async fn a_failure_after_a_wait_given_up_and_handled_is_the_programs() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(RecoversThenFailsNode)) });
+        let project = single_node_project("RecoversThenFails");
+        let execution_id = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed_holding(&journal, execution_id, &project, "entry", 1).await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+
+        let outcome = run_with_caller_tasks(
+            project, catalog, journal, execution_id,
+            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+        ).await;
+        assert!(
+            matches!(&outcome, ExecutionOutcome::Failed { error, held_too_long: false } if error.contains("the provider refused")),
+            "{outcome:?}"
+        );
     }
 
     /// The hold clock runs only while the run is quiet: a run whose other

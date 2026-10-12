@@ -1019,6 +1019,9 @@
     // guide here), which means the choice is always needed.
     deactivationIntent = 'resync';
   }
+  // A resync that stopped is taken up again with the take-down choice it
+  // was started with, so no picker opens, and never as a new resync.
+  function onResumeResync() { send({ kind: 'resumeResync' }); }
   function onStartInfra() {
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'infraStart' });
@@ -1226,6 +1229,7 @@
       {onCancelRunning}
       {onResumeActive}
       {onResync}
+      {onResumeResync}
       {onStartInfra}
       {onStopInfra}
       {onTerminateInfra}

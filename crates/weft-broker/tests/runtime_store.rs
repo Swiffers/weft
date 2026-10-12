@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use weft_broker::entitlement::{Entitlement, EntitlementSource};
 use weft_broker::runtime_store::{
     charged_bytes_for, BeginUpload, RuntimeStore, RuntimeStoreError, UploadSpec,
-    COMPLETING_LEASE_SECS, DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, EXEC_LINGER_TTL_SECS,
+    CLAIM_LEASE_SECS, DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, EXEC_LINGER_TTL_SECS,
 };
 use weft_core::storage::key::CallerAuth;
 use weft_core::storage::{bytes_stream, ByteRange, KeepTtl, PartAsk, StorageScope, StoredFileMeta};
@@ -69,8 +69,9 @@ impl EntitlementSource for TestEntitlements {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         tenant: &str,
+        now: i64,
     ) -> anyhow::Result<u64> {
-        let mine = charged_bytes_for(&mut **tx, tenant).await?;
+        let mine = charged_bytes_for(&mut **tx, tenant, now).await?;
         Ok(mine.saturating_add(self.extra_other_plane_bytes))
     }
 }
@@ -86,9 +87,11 @@ fn big() -> TestEntitlements {
 }
 
 async fn store(pool: &PgPool) -> (Arc<RuntimeStore>, Arc<FakeObjectStore>, Arc<FakeClock>) {
-    weft_task_store::apply_groups(pool, &[&weft_broker::runtime_store::GROUP])
+    weft_task_store::apply_groups(pool, &[&weft_broker::runtime_store::GROUP, &weft_task_store::unanswered::GROUP])
         .await
         .unwrap();
+    // Every write of a failure (a reap the bucket refused) reads these.
+    weft_task_store::unanswered::judged_run_columns(pool).await.unwrap();
     let clock = FakeClock::new();
     let bucket = Arc::new(FakeObjectStore::new());
     (
@@ -96,6 +99,14 @@ async fn store(pool: &PgPool) -> (Arc<RuntimeStore>, Arc<FakeObjectStore>, Arc<F
         bucket,
         clock,
     )
+}
+
+/// One pass of the expiry loop: how many rows it removed.
+async fn expire(s: &RuntimeStore, pool: &PgPool) -> u64 {
+    let rows = || async { sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runtime_file").fetch_one(pool).await.unwrap() };
+    let before = rows().await;
+    s.expire().await.unwrap();
+    (before - rows().await) as u64
 }
 
 fn body(b: &[u8]) -> bytes::Bytes {
@@ -214,7 +225,7 @@ async fn get_via(
     range: Option<weft_core::storage::ByteRange>,
 ) -> Result<(StoredFileMeta, bytes::Bytes), RuntimeStoreError> {
     let (meta, _url) = s
-        .download_url(parsed, weft_platform_traits::PresignAudience::Internal, None)
+        .download_url(parsed, weft_platform_traits::PresignAudience::Internal, None, false)
         .await?;
     let key = parsed.to_key();
     let bytes = match range {
@@ -614,7 +625,7 @@ async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
     assert_eq!(s.meta(&scratch_parsed).await.unwrap().expires_at_unix, stamped.expires_at_unix);
     // Past the linger, the expiry sweep reclaims the scratch; kept survives.
     clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert_eq!(expire(&s, &pool).await, 1);
     assert!(get_via(&s, &bucket, &kept_parsed, None).await.is_ok(), "kept survives");
     assert!(matches!(get_via(&s, &bucket, &scratch_parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 }
@@ -641,7 +652,7 @@ async fn public_link_outlives_terminate_and_dies_with_its_file(pool: PgPool) {
 
     // Past the plain linger but inside the link's life: file + link live.
     clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64 + 1));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    assert_eq!(expire(&s, &pool).await, 0);
     assert!(s.resolve_public_link(&token).await.unwrap().is_some());
 
     // Past the link's expiry: the token resolves to nothing, and the
@@ -649,7 +660,7 @@ async fn public_link_outlives_terminate_and_dies_with_its_file(pool: PgPool) {
     // sweep has nothing left to find.
     clock.advance(Duration::from_secs(link_ttl));
     assert!(s.resolve_public_link(&token).await.unwrap().is_none(), "expired token is gone");
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert_eq!(expire(&s, &pool).await, 1);
     assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 
     // A deleted file takes a still-live link with it: dead token, clean miss.
@@ -697,7 +708,7 @@ async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
     // Past the link's cover the normal clocks apply again: the sweep
     // reclaims the file once its (link-extended) deadline passes.
     clock.advance(Duration::from_secs(3601));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1, "past the link cover the file dies normally");
+    assert_eq!(expire(&s, &pool).await, 1, "past the link cover the file dies normally");
 }
 
 #[sqlx::test]
@@ -710,15 +721,15 @@ async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: PgPool) {
     let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
     // Before the TTL, the expiry sweep keeps it.
     clock.advance(Duration::from_secs(50));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    assert_eq!(expire(&s, &pool).await, 0);
     assert!(get_via(&s, &bucket, &parsed, None).await.is_ok());
     // A get bumps the expiry to now+100, so advancing another 80s (total 130 >
     // 100 from put, but only 80 since the access-bump) still keeps it.
     clock.advance(Duration::from_secs(80));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0, "access bumped the expiry");
+    assert_eq!(expire(&s, &pool).await, 0, "access bumped the expiry");
     // Now let it sit past the bumped TTL.
     clock.advance(Duration::from_secs(101));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert_eq!(expire(&s, &pool).await, 1);
     assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 }
 
@@ -944,7 +955,7 @@ async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_acces
     let old_key = weft_core::storage::key::parse_key(&old.key).unwrap();
     s.set_asset_references("t1", "p1", &[old.key.clone(), current.key.clone()], &[]).await.unwrap();
     clock.advance(Duration::from_secs(400 * 86400));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0, "current source may be idle for months");
+    assert_eq!(expire(&s, &pool).await, 0, "current source may be idle for months");
 
     s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key), &[]).await.unwrap();
     let deadline = s.meta(&old_key).await.unwrap().expires_at_unix.unwrap();
@@ -956,10 +967,10 @@ async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_acces
     get_via(&s, &bucket, &old_key, None).await.unwrap();
     assert_eq!(s.meta(&old_key).await.unwrap().expires_at_unix, Some(clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64));
     clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS - 1));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    assert_eq!(expire(&s, &pool).await, 0);
     clock.advance(Duration::from_secs(2));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
-    assert!(matches!(s.download_url(&old_key, WORKER, None).await, Err(RuntimeStoreError::NotFound(_))));
+    assert_eq!(expire(&s, &pool).await, 1);
+    assert!(matches!(s.download_url(&old_key, WORKER, None, false).await, Err(RuntimeStoreError::NotFound(_))));
     assert!(bucket.get(&object_key(&old.key)).await.unwrap().is_none());
     assert!(bucket.get(&object_key(&current.key)).await.unwrap().is_some());
 }
@@ -978,7 +989,7 @@ async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
     assert_eq!(s.meta(&published_key).await.unwrap().expires_at_unix, None, "publishing clears the countdown");
     assert_eq!(s.meta(&orphan_key).await.unwrap().expires_at_unix, orphan.expires_at_unix, "the orphan's countdown runs on");
     clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert_eq!(expire(&s, &pool).await, 1);
     assert!(bucket.get(&object_key(&orphan.key)).await.unwrap().is_none());
     assert!(bucket.get(&object_key(&published.key)).await.unwrap().is_some());
 }
@@ -998,7 +1009,7 @@ async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_suppor
     // Access must use the current lifetime, not resurrect an old countdown.
     s.presign(&parsed, None).await.unwrap();
     clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    assert_eq!(expire(&s, &pool).await, 0);
 }
 
 /// One content is one file per tenant: a second project storing it uploads
@@ -1055,7 +1066,7 @@ async fn an_asset_lives_while_any_project_references_it(pool: PgPool) {
     s.set_asset_references("t1", "p1", &[], &[]).await.unwrap();
     assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, None, "p2 still references it");
     clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    assert_eq!(expire(&s, &pool).await, 0);
 
     s.set_asset_references("t1", "p2", &[], &[]).await.unwrap();
     assert_eq!(
@@ -1064,7 +1075,7 @@ async fn an_asset_lives_while_any_project_references_it(pool: PgPool) {
         "the last reference gone, the countdown starts"
     );
     clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert_eq!(expire(&s, &pool).await, 1);
     assert!(bucket.get(&object_key(&shared.key)).await.unwrap().is_none());
 }
 
@@ -1152,9 +1163,9 @@ async fn a_lifetime_expires_a_project_file_like_a_kept_one(pool: PgPool) {
     clock.advance(Duration::from_secs(80));
     assert!(get_via(&s, &bucket, &parsed, None).await.is_ok(), "an access renews it");
     clock.advance(Duration::from_secs(80));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0, "renewed by the access");
+    assert_eq!(expire(&s, &pool).await, 0, "renewed by the access");
     clock.advance(Duration::from_secs(30));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert_eq!(expire(&s, &pool).await, 1);
     assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 
     // With no lifetime a project file lives until deleted, and a keep after
@@ -1370,10 +1381,10 @@ async fn a_dropped_completion_the_bucket_finished_is_recovered(pool: PgPool) {
     task.abort();
     let _ = task.await;
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"));
-    s.sweep_expired().await.unwrap();
+    s.tenant_usage("t1").await.unwrap();
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"), "a live claim is left alone");
-    clock.advance(Duration::from_secs(COMPLETING_LEASE_SECS as u64 + 1));
-    s.sweep_expired().await.unwrap();
+    clock.advance(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1));
+    s.tenant_usage("t1").await.unwrap();
     assert_eq!(status_of(&pool, &key).await, None, "folded into the file");
     let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
     let meta = s.meta(&parsed).await.unwrap();
@@ -1427,8 +1438,8 @@ async fn a_dropped_completion_before_the_bucket_is_recovered(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    clock.advance(Duration::from_secs(COMPLETING_LEASE_SECS as u64 + 1));
-    s.sweep_expired().await.unwrap();
+    clock.advance(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1));
+    s.tenant_usage("t1").await.unwrap();
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("active"));
     let parsed = weft_core::storage::key::parse_key(&key).unwrap();
     assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"abc"));
@@ -1463,7 +1474,7 @@ async fn a_completion_the_bucket_cannot_account_for_is_ended(pool: PgPool) {
     }
     let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
     assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"old"));
-    assert_eq!(charged_bytes_for(&pool, "t1").await.unwrap(), 3, "only the old file is charged");
+    assert_eq!(charged_bytes_for(&pool, "t1", clock.now_unix()).await.unwrap(), 3, "only the old file is charged");
 }
 
 #[sqlx::test]
@@ -1479,18 +1490,18 @@ async fn a_refused_completion_stays_completing_until_the_sweep_ends_it(pool: PgP
     assert!(matches!(s.complete_upload(&w, &key).await, Err(RuntimeStoreError::Completing(_))));
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"));
     assert!(matches!(s.abort_upload(&w, &key).await, Err(RuntimeStoreError::Completing(_))));
-    clock.advance(Duration::from_secs(COMPLETING_LEASE_SECS as u64 + 1));
-    s.sweep_expired().await.unwrap();
+    clock.advance(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1));
+    s.tenant_usage("t1").await.unwrap();
     assert_eq!(status_of(&pool, &key).await, None, "ended and reaped");
     assert!(bucket.in_progress_uploads().is_empty());
-    assert_eq!(charged_bytes_for(&pool, "t1").await.unwrap(), 0);
+    assert_eq!(charged_bytes_for(&pool, "t1", clock.now_unix()).await.unwrap(), 0);
 }
 
 #[sqlx::test]
 async fn a_size_mismatched_completion_removes_rows_before_bytes(pool: PgPool) {
     // A part whose bytes differ from its reservation (only a bucket anomaly
     // could do it; here a direct part upload skips the signed length).
-    let (s, bucket, _c) = store(&pool).await;
+    let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, _) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(3)).await.unwrap();
     s.reserve_parts(&w, &key, &[ask(1, 3)], &big(), WORKER).await.unwrap();
@@ -1500,7 +1511,7 @@ async fn a_size_mismatched_completion_removes_rows_before_bytes(pool: PgPool) {
     assert!(matches!(s.complete_upload(&w, &key).await, Err(RuntimeStoreError::Lost(_))));
     assert_eq!(status_of(&pool, &key).await, None);
     assert!(bucket.get(&object_key(&key)).await.unwrap().is_none());
-    assert_eq!(charged_bytes_for(&pool, "t1").await.unwrap(), 0);
+    assert_eq!(charged_bytes_for(&pool, "t1", clock.now_unix()).await.unwrap(), 0);
 }
 
 #[sqlx::test]
@@ -1616,9 +1627,9 @@ async fn upload_verbs_reject_a_key_begin_never_minted(pool: PgPool) {
 async fn an_abandoned_upload_is_reaped_after_grace(pool: PgPool) {
     use weft_broker::runtime_store::PENDING_RESERVE_GRACE_SECS;
     // A crashed upload: begin + land a part, never complete. The reservation
-    // holds quota and an in-flight multipart. The expiry sweep reaps it once
-    // it has made no progress past the grace: multipart aborted, row gone,
-    // charge freed.
+    // holds quota and an in-flight multipart. The tenant's next look at what
+    // it stores (or its next upload) reaps it once it has made no progress
+    // past the grace: multipart aborted, row gone, charge freed.
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     // A project-scoped upload (no exec sweep, no expiry) is the case only this
@@ -1632,12 +1643,11 @@ async fn an_abandoned_upload_is_reaped_after_grace(pool: PgPool) {
     assert_eq!(s.tenant_usage("t1").await.unwrap().1, 6, "in-flight charge visible");
     // Within the grace: not reaped (an upload could still legitimately finish).
     clock.advance(Duration::from_secs((PENDING_RESERVE_GRACE_SECS - 1) as u64));
-    assert_eq!(s.sweep_expired().await.unwrap(), 0, "not reaped within grace");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 6), "not reaped within grace");
     // Past the grace: reaped, multipart aborted, charge freed.
     clock.advance(Duration::from_secs(2));
-    assert_eq!(s.sweep_expired().await.unwrap(), 1, "reaped past grace");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "reaped past grace: no leftover row/charge");
     assert!(bucket.in_progress_uploads().is_empty(), "multipart aborted");
-    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "no leftover row/charge");
 }
 
 #[sqlx::test]
@@ -1653,7 +1663,7 @@ async fn progress_defers_the_abandoned_reap(pool: PgPool) {
     for n in 1..=3 {
         clock.advance(Duration::from_secs((PENDING_RESERVE_GRACE_SECS - 10) as u64));
         s.reserve_parts(&w, &key, &[ask(n, part_size)], &big(), WORKER).await.expect("still alive");
-        assert_eq!(s.sweep_expired().await.unwrap(), 0, "progressing upload not reaped");
+        assert_eq!(s.tenant_usage("t1").await.unwrap().0, 1, "progressing upload not reaped");
     }
 }
 
@@ -1765,32 +1775,201 @@ async fn concurrent_begins_cannot_blow_past_the_byte_cap(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn sweep_reap_failure_self_heals_on_retry(pool: PgPool) {
-    // A sweep's bucket reap can fail mid-flight (transient store error). The
-    // fenced three-step reap (row -> 'reaping', reap bucket, delete row) must
-    // leave a residue the NEXT sweep re-finds and finishes: no orphan object
-    // without a row, no charged row pointing at deleted bytes.
+async fn one_failing_row_does_not_block_the_others(pool: PgPool) {
+    // A reap can keep failing (the bucket refuses one object). The fenced
+    // three-step reap (row -> 'reaping', reap bucket, delete row) leaves a
+    // residue nothing orphans: the object and a row still pointing at it,
+    // marked with the error, while every other expired file goes in the same
+    // pass. The marked row books no look, and its failure is written down for
+    // `weft status` naming it, on a record of its own beside the loop's. The
+    // failed reap gave its claim back, so the next pass finishes it at once
+    // and the failure is cleared.
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", Some(KeepTtl::Secs { secs: 10 }), &big(), body(b"xyz"))
+    let put = |name: &'static str| {
+        let (s, bucket, w) = (s.clone(), bucket.clone(), w.clone());
+        async move {
+            put_via(&s, &bucket, &w, &StorageScope::Execution, "b", name, Some(KeepTtl::Secs { secs: 10 }), &big(), body(b"xyz"))
+                .await
+                .unwrap()
+        }
+    };
+    let stuck = put("stuck").await;
+    let fine = put("fine").await;
+    let later = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "later", Some(KeepTtl::Secs { secs: 1000 }), &big(), body(b"z"))
         .await
         .unwrap();
-    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    let parsed = weft_core::storage::key::parse_key(&stuck.key).unwrap();
     clock.advance(Duration::from_secs(11));
-    // First sweep: the object delete fails after the row is fenced.
-    bucket.fail_next_delete(&format!("runtime/{}", f.key));
-    let err = s.sweep_expired().await.unwrap_err();
-    assert!(format!("{err:#}").contains("injected delete failure"), "{err:?}");
-    // Residue: the object is still in the bucket AND a row still points at it
-    // (fenced as 'reaping', so reads/keep are locked out but the sweep can
-    // re-find it). Nothing is orphaned.
-    assert_eq!(bucket.keys(), vec![format!("runtime/{}", f.key)]);
+    bucket.fail_next_deletes(&format!("runtime/{}", stuck.key), 3);
+    let step = s.expire().await.unwrap();
+    assert_eq!(
+        step,
+        weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs((later.expires_at_unix.unwrap() + 1 - clock.now_unix()) as u64)),
+        "the next look is the next expiry; the stuck row books nothing"
+    );
+    assert_eq!(status_of(&pool, &fine.key).await, None, "the other expired file went");
+    assert_eq!(status_of(&pool, &stuck.key).await.as_deref(), Some("reaping"));
+    let error: Option<String> = sqlx::query_scalar("SELECT reap_error FROM runtime_file WHERE key = $1")
+        .bind(&stuck.key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(error.unwrap().contains("injected delete failure"), "marked with why");
+    // Nothing is orphaned, and the row is locked out of reads and keeps.
+    assert!(bucket.keys().contains(&format!("runtime/{}", stuck.key)));
     assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
     assert!(matches!(s.keep(&parsed, KeepTtl::Default).await, Err(RuntimeStoreError::NotFound(_))));
-    // Second sweep: re-finds the 'reaping' row and finishes the reap.
-    assert_eq!(s.sweep_expired().await.unwrap(), 1);
-    assert!(bucket.is_empty(), "object reclaimed on retry");
-    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "nothing left charged");
+    let failing = |callee: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT error FROM unanswered_call WHERE callee = $1")
+                .bind(callee)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let shown = failing("reaps:").await.expect("the failed reap is written down");
+    assert!(shown.contains(&stuck.key) && shown.contains("injected delete failure"), "{shown}");
+    // The loop's own record is its passes': a pass that goes through
+    // clears it, and leaves the reap's failure shown.
+    weft_task_store::unanswered::answered(
+        &pool,
+        weft_task_store::unanswered::Callee::Loop { role: "broker", name: weft_broker::runtime_store::FILE_EXPIRY_LOOP },
+    )
+    .await
+    .unwrap();
+    assert!(failing("reaps:").await.is_some(), "a good pass of the loop does not hide it");
+    // Nobody holds the marked row's claim: the next pass finishes it and
+    // clears the failure.
+    assert_eq!(expire(&s, &pool).await, 1);
+    assert!(!bucket.keys().contains(&format!("runtime/{}", stuck.key)), "object reclaimed on retry");
+    assert_eq!(failing("reaps:").await, None, "nothing failing is shown any more");
+    assert_eq!(failing("loop:broker:runtime_file_expiry").await, None, "the loop's own record was never written");
+}
+
+/// A reap a call holds the claim of books the expiry loop's look at the
+/// claim's lapse, so a reap whose process died is finished then; a pass
+/// before the lapse leaves it to its call.
+#[sqlx::test]
+async fn a_live_reap_claim_books_a_look_at_its_lapse(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
+    // A reap fenced the row, then its process died.
+    sqlx::query("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1")
+        .bind(&f.key)
+        .bind(clock.now_unix())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.expire().await.unwrap(),
+        weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1)),
+        "the look is booked at the claim's lapse"
+    );
+    assert_eq!(status_of(&pool, &f.key).await.as_deref(), Some("reaping"), "left to its call until then");
+    clock.advance(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1));
+    assert_eq!(expire(&s, &pool).await, 1, "the lapsed claim is taken over");
+    assert!(!bucket.keys().contains(&format!("runtime/{}", f.key)));
+}
+
+/// A row whose reap failed and that a call took over again keeps its mark
+/// while that call reaps it, and still books the look at the claim's
+/// lapse, so a call that dies mid-reap does not leave it waiting on an
+/// unrelated wake.
+#[sqlx::test]
+async fn a_failed_reap_taken_over_books_a_look_at_its_lapse(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
+    // A reap failed and marked the row, then a call fenced it again and died.
+    sqlx::query("UPDATE runtime_file SET status = 'reaping', reap_error = 'the bucket refused', progressed_at_unix = $2 WHERE key = $1")
+        .bind(&f.key)
+        .bind(clock.now_unix())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.expire().await.unwrap(),
+        weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1)),
+        "the look is booked at the claim's lapse"
+    );
+}
+
+/// A wipe takes over a row whose reap failed (nobody is working on it), and
+/// fails naming a row another call is reaping right now instead of saying
+/// everything went.
+#[sqlx::test]
+async fn a_wipe_takes_a_failed_reap_and_fails_on_a_live_one(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let failed = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "failed", None, &big(), body(b"xyz")).await.unwrap();
+    let live = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "live", None, &big(), body(b"xyz")).await.unwrap();
+    bucket.fail_next_deletes(&format!("runtime/{}", failed.key), 1);
+    assert!(s.delete(&weft_core::storage::key::parse_key(&failed.key).unwrap()).await.is_err(), "the bucket refused");
+    sqlx::query("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1")
+        .bind(&live.key)
+        .bind(clock.now_unix())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let wiped = s.wipe_prefix("t1/").await.expect_err("a row another call is reaping is left");
+    assert!(format!("{wiped:#}").contains("wiped 1 files") && format!("{wiped:#}").contains("left 1"), "{wiped:#}");
+    assert_eq!(status_of(&pool, &failed.key).await, None, "the failed reap was taken over");
+    assert!(!bucket.keys().contains(&format!("runtime/{}", failed.key)));
+    assert_eq!(status_of(&pool, &live.key).await.as_deref(), Some("reaping"), "the live one is its call's");
+}
+
+/// A reap that failed is finished by the tenant's next upload, tried once:
+/// a bucket that still refuses leaves the row marked and the upload goes
+/// on without waiting.
+#[sqlx::test]
+async fn an_upload_finishes_a_failed_reap_with_one_try(pool: PgPool) {
+    let (s, bucket, _clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    bucket.fail_next_deletes(&format!("runtime/{}", f.key), 2);
+    assert!(s.delete(&parsed).await.is_err(), "the bucket refused");
+    assert_eq!(status_of(&pool, &f.key).await.as_deref(), Some("reaping"));
+    s.tenant_usage("t1").await.unwrap();
+    assert_eq!(
+        status_of(&pool, &f.key).await.as_deref(),
+        Some("reaping"),
+        "refused once more and not tried again (a second try would have gone through)"
+    );
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "finished, the quota freed");
+    assert!(!bucket.keys().contains(&format!("runtime/{}", f.key)));
+}
+
+/// A replacement landing on a file the expiry loop left out of its look
+/// (its replacement was completing) rings the loop, so the file's renewed
+/// expiry gets a look booked.
+#[sqlx::test]
+async fn a_replacement_landing_rings_the_expiry_loop(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", Some(KeepTtl::Secs { secs: 10 }), &big(), body(b"old"))
+        .await
+        .unwrap();
+    let (key, part_size) = s.begin_replace(&w, &f.key, Some(3), Some(1), &big()).await.unwrap();
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"new"), &big()).await.unwrap();
+    let (task, release) = completion_held(&s, &bucket, &w, &key).await;
+    clock.advance(Duration::from_secs(11));
+    assert_eq!(s.expire().await.unwrap(), weft_task_store::drain::DrainStep::Done, "the file is left out while it is replaced");
+    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    heard.listen(weft_broker::runtime_store::FILE_EXPIRY_CHANNEL).await.unwrap();
+    release.send(()).unwrap();
+    let replaced = task.await.unwrap().unwrap();
+    assert_eq!(replaced.expires_at_unix, Some(clock.now_unix() + 10));
+    tokio::time::timeout(Duration::from_secs(10), heard.recv()).await.expect("rung").unwrap();
+    assert_eq!(
+        s.expire().await.unwrap(),
+        weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(11)),
+        "the next look is at the renewed expiry"
+    );
 }
 
 #[sqlx::test]
@@ -1883,4 +2062,92 @@ async fn known_size_parts_keep_their_offsets_when_reserved_out_of_order(pool: Pg
         s.record_part(&w, &key, part.part_number, &etag).await.unwrap();
     }
     assert_eq!(s.complete_upload(&w, &key).await.unwrap().size_bytes, total);
+}
+
+/// A file past its expiry is gone the moment it expires, before the expiry
+/// loop removes it: no read, list or identity lookup finds it, a keep or
+/// an access does not bring it back, and it counts for nothing against the
+/// tenant's quota or file cap.
+#[sqlx::test]
+async fn an_expired_file_is_gone_before_the_loop_removes_it(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let spec = UploadSpec {
+        scope: &StorageScope::Project,
+        mime: "b",
+        filename: "f",
+        keep: Some(KeepTtl::Secs { secs: 10 }),
+        declared_size: Some(3),
+        content_hash: None,
+        identity: Some("source:1"),
+    };
+    let BeginUpload::Ready { key, part_size } = s.begin_upload(&w, &spec, &big()).await.unwrap() else { panic!("fresh") };
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"abc"), &big()).await.unwrap();
+    let file = s.complete_upload(&w, &key).await.unwrap();
+    let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 3));
+
+    clock.advance(Duration::from_secs(11));
+    assert!(matches!(s.meta(&parsed).await, Err(RuntimeStoreError::NotFound(_))), "not readable");
+    assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))), "no access bump");
+    assert!(matches!(s.keep(&parsed, KeepTtl::Default).await, Err(RuntimeStoreError::NotFound(_))), "not kept back to life");
+    let prefix = weft_core::storage::key::prefix_for_list(&w, &StorageScope::Project).unwrap();
+    assert!(s.list(&prefix).await.unwrap().is_empty(), "not listed");
+    assert!(s.find_identity(&w, &StorageScope::Project, "source:1").await.unwrap().is_none(), "not found by identity");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "counted for nothing");
+    let expires: Option<i64> = sqlx::query_scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1")
+        .bind(&file.key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(expires, file.expires_at_unix, "nothing moved its expiry");
+
+    // Storing the same source again takes its place.
+    let again = s.begin_upload(&w, &spec, &big()).await.unwrap();
+    assert!(matches!(again, BeginUpload::Ready { .. }), "a fresh upload, not the expired file: {again:?}");
+    assert_eq!(status_of(&pool, &file.key).await, None, "the expired file was removed to make way");
+}
+
+/// The end of a run stamps its files' linger, which rings the expiry loop
+/// once (a later stamp is covered by that ring), and the loop's pass books
+/// its next look at the linger's end.
+#[sqlx::test]
+async fn a_linger_stamp_books_the_loop_at_its_end(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    heard.listen(weft_broker::runtime_store::FILE_EXPIRY_CHANNEL).await.unwrap();
+    for run in ["c1", "c2"] {
+        let w = worker("t1", "p1", Some(run));
+        put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "out", None, &big(), body(b"x")).await.unwrap();
+    }
+    assert_eq!(s.sweep_exec("t1", "c1").await.unwrap(), (0, 1));
+    let end = clock.now_unix() + EXEC_LINGER_TTL_SECS;
+    tokio::time::timeout(Duration::from_secs(10), heard.recv()).await.expect("rung").unwrap();
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(s.sweep_exec("t1", "c2").await.unwrap(), (0, 1));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), heard.recv()).await.is_err(),
+        "a later linger end is covered by the first ring"
+    );
+    assert_eq!(
+        s.expire().await.unwrap(),
+        weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs((end + 1 - clock.now_unix()) as u64)),
+        "the next look is at the first linger's end"
+    );
+}
+
+/// A link handed out for a lingering file keeps the file past the linger
+/// for as long as the link lives.
+#[sqlx::test]
+async fn a_presigned_link_keeps_a_lingering_file_for_its_life(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let file = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "out", None, &big(), body(b"x")).await.unwrap();
+    let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
+    s.sweep_exec("t1", "c1").await.unwrap();
+    s.presign(&parsed, Some(900)).await.unwrap();
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, Some(clock.now_unix() + 900));
+    clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64 + 1));
+    assert!(s.meta(&parsed).await.is_ok(), "still there past the linger");
+    assert_eq!(expire(&s, &pool).await, 0);
 }

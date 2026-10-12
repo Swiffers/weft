@@ -23,7 +23,7 @@
       "name": "from",
       "type": "String",
       "label": "From",
-      "description": "Send from this address instead of the account's own; it must be one of the account's Send mail as addresses set up in Gmail, and anything else fails naming the allowed ones. An address other than the account's own needs Read mail or Organize mail on the connection, to read that list."
+      "description": "Send from this address instead of the account's own, as an address or a name and an address (Quentin <quentin@example.com>). It must be one of the account's Send mail as addresses set up in Gmail, and anything else fails naming the allowed ones. The mail goes out the way Gmail sends from that address: under the name you give, or else the name Gmail keeps for it, and with its reply-to address when it has one. An address other than the account's own needs Read mail or Organize mail on the connection, to read that list."
     },
     {
       "name": "to",

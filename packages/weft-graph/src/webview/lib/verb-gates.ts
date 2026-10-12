@@ -20,11 +20,16 @@
 // know that, so `transitional` below suppresses every starter verb.
 // SYNC: the verb gates <-> crates/weft-dispatcher/src/api/project.rs compute_available_actions, packages/weft-graph/src/protocol.ts ActionVerb
 
-import type { ActionVerb, BackendSnapshot, InfraRollup } from '../../protocol';
+import type { ActionVerb, BackendSnapshot, InfraRollup, ProjectTransition } from '../../protocol';
 
 /// What the source in front of the user says about the project, plus
 /// the lifetime facts only the dispatcher can report.
 export interface VerbInputs {
+	/// `weft rm` marked the project and has not finished removing it: the
+	/// dispatcher offers nothing, and nothing the source says brings a
+	/// verb back, since every one of them is refused until `weft rm` runs
+	/// again.
+	removing: boolean;
 	/// The verbs the dispatcher offers right now. Empty on a project it
 	/// has never registered, and on one the daemon did not answer about.
 	available: readonly ActionVerb[];
@@ -35,6 +40,8 @@ export interface VerbInputs {
 	infraRollup: InfraRollup;
 	/// The lifecycle status the last status fetch reported.
 	status: BackendSnapshot['status'];
+	/// The single-flight transition the last status fetch reported.
+	transition: ProjectTransition;
 	/// An infra operation the rollup cannot see yet is in flight (a
 	/// claimed stop still draining, a provisioning run before any node
 	/// row flips). The dispatcher's own field, for the window where the
@@ -53,11 +60,13 @@ export function sourceInfraReady(inputs: VerbInputs): boolean {
 /// table to one cancel verb?
 ///
 /// The dispatcher returns exactly that during an activation, a
-/// deactivation, and any infra operation in flight. The source says
-/// nothing about it, so a starter verb offered here would be a button
-/// whose click can only 409. The table still speaks for itself: the
-/// cancel verb it names is offered, because it comes from `available`.
+/// deactivation, a resync, and any infra operation in flight. The source
+/// says nothing about it, so a starter verb offered here would be a
+/// button whose click can only 409. The table still speaks for itself:
+/// the cancel verb it names is offered, because it comes from `available`
+/// (and a resync that stopped names two, see [`resyncStopped`]).
 export function transitional(inputs: VerbInputs): boolean {
+	if (inputs.transition === 'resyncing') return true;
 	if (inputs.status === 'activating' || inputs.status === 'deactivating') return true;
 	const infraLive = inputs.hasInfra || inputs.infraRollup !== 'none';
 	return infraLive
@@ -65,6 +74,15 @@ export function transitional(inputs: VerbInputs): boolean {
 			|| inputs.infraRollup === 'provisioning'
 			|| inputs.infraRollup === 'stopping'
 			|| inputs.infraRollup === 'terminating');
+}
+
+/// A resync that stopped with the triggers it took down still down: the
+/// dispatcher then offers taking it up again (`resync`) and giving it up
+/// (`cancel_activate`), where a resync under way offers only the cancel
+/// of the step it is at, never `resync`.
+// SYNC: resyncStopped <-> crates/weft-dispatcher/src/api/project.rs compute_available_actions (the resync_stopped branch)
+export function resyncStopped(inputs: VerbInputs): boolean {
+	return inputs.transition === 'resyncing' && inputs.available.includes('resync');
 }
 
 /// The starter fallback, one entry per verb, each under the condition
@@ -101,6 +119,7 @@ function starterGate(verb: ActionVerb, inputs: VerbInputs): boolean | undefined 
 /// Whether a verb is currently offered at all. The slots layer their own
 /// conditions (an overlay in flight, an empty graph) on top of this.
 export function isVerbOffered(verb: ActionVerb, inputs: VerbInputs): boolean {
+	if (inputs.removing) return false;
 	if (inputs.available.includes(verb)) return true;
 	if (transitional(inputs)) return false;
 	return starterGate(verb, inputs) === true;

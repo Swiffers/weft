@@ -64,6 +64,9 @@ pub async fn put(
                 return Err(unserved(e));
             }
         }
+        // A queued event a failing hand-over stopped may run on the new
+        // levers.
+        crate::parked_drain::retry_stopped(&state, id).await;
     }
     Ok(Json(answer(&state, id).await?))
 }

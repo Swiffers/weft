@@ -107,14 +107,18 @@ pub fn postprocess_output(
     // A single-shot input port holds one value per firing of its
     // consumer. The compiler's `duplicate-input-port` rule gives every
     // input exactly one wire (it keys on the edge's target port, and
-    // the compiler names one on every edge it builds), so the only
-    // way a second, different
-    // value can reach a port with one already pending is the SAME
-    // producer firing again at the same location before the consumer
-    // took the first: refused before anything is committed. An equal
-    // value dedups in `emit_value_on_edge`; a closure is never a
-    // collision (a data pulse outranks it); a generator target takes
-    // repeated pulses by design (see `edge_targets_generator`).
+    // the compiler names one on every edge it builds), a location fires
+    // once per execution (`exec::execution::firing_at`), and the runner
+    // sends an ordinary port at most once per firing (a body replayed
+    // after a pause sends it again as nothing). So the engine never
+    // brings a second, different value onto a port with one pending;
+    // only a journal can, with rows that say so (two `PortEmitted` for
+    // one port at one location, or a supplied value landing where its
+    // source's own emission waits). That is refused before anything is
+    // committed, and the fold reports it as corruption rather than pick
+    // one. An equal value dedups in `emit_value_on_edge`; a closure is
+    // never a collision (a data pulse outranks it); a generator target
+    // takes repeated pulses by design (see `edge_targets_generator`).
     for d in &deliveries {
         let Some(value) = &d.value else { continue };
         if super::ready::edge_targets_generator(program_idx, d.edge) {
@@ -135,9 +139,8 @@ pub fn postprocess_output(
         if earlier_value_pending {
             return Err(WeftError::NodeExecution(format!(
                 "'{node_id}.{port}' emitted a value onto '{target}.{target_port}' at frames \
-                 {frames:?} while a DIFFERENT value from an earlier firing of '{node_id}' is \
-                 still pending there; a consumer takes one value per firing, so the earlier \
-                 one has to be consumed before the next lands",
+                 {frames:?} while a DIFFERENT value from '{node_id}' is still pending there; \
+                 a consumer takes one value per firing, so the two cannot both stand",
                 port = d.port,
                 target = d.edge.target,
                 target_port = target_handle,
@@ -797,10 +800,10 @@ mod fan_in_tests {
         )
     }
 
-    /// The producer fires again at the same location with a DIFFERENT
-    /// value while its first value is still pending at the consumer:
-    /// the second firing fails atomically, no pulse committed, no
-    /// emission reported. The same value again dedups to one pulse.
+    /// A second, DIFFERENT value on a port whose first is still pending
+    /// at the consumer (what only a journal's rows can bring, never the
+    /// runner): refused atomically, no pulse committed, no emission
+    /// reported. The same value again dedups to one pulse.
     #[test]
     fn a_second_value_over_a_pending_one_errors_with_no_partial_state() {
         let project = project_with_edges(&["out1"]);

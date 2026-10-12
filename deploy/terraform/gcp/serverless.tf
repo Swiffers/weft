@@ -33,7 +33,10 @@ locals {
       buildBucket              = google_storage_bucket.builds.name
       builderServiceAccount    = google_service_account.builder.email
       tasksQueue               = google_cloud_tasks_queue.wakes.name
+      wakeAttempts             = var.wake_attempts
+      ticksQueue               = google_cloud_tasks_queue.ticks.name
       newsTopic                = google_pubsub_topic.news.name
+      holdersTopic             = google_pubsub_topic.holders.name
       coreServiceAccount       = google_service_account.core.email
       holderPool               = "projects/${var.project_id}/locations/${var.region}/workerPools/${local.holder_pool}"
       dispatcherService        = "${var.name}-role-dispatcher"
@@ -43,6 +46,8 @@ locals {
       workloadIdentityProvider = google_iam_workload_identity_pool_provider.github.name
       infraNetworkTag          = local.infra_tag
       buildMachine             = var.build_machine == "" ? null : var.build_machine
+      # SYNC: alerts <-> alerts.tf (count = var.alerts_enabled)
+      alerts = var.alerts_enabled
     }
     auth      = "operator_keys"
     publicUrl = local.role_urls["dispatcher"]
@@ -80,6 +85,7 @@ locals {
       repository = var.weft_repository
       commit     = var.weft_commit
     }
+    alertAfterMinutes = var.alert_after_minutes
   }
   # Which secret each environment variable of the runtime is read from.
   runtime_secrets = { for k in nonsensitive(keys(local.secrets)) : k => google_secret_manager_secret.install[k].secret_id }

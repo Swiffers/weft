@@ -28,7 +28,7 @@ async fn lists_every_instance(rig: FakeRig) -> WeftResult<()> {
             "copies": [],
             "triggers": [{
                 "trigger": "bot.inbox", "mode": "active",
-                "waiting": { "fires": 3, "reason": "instance 'bob' at 'bot.answer': 'key' is not filled" }
+                "waiting": { "fires": 3, "on": "instance", "reason": "instance 'bob' at 'bot.answer': 'key' is not filled" }
             }]
         }
     ]);

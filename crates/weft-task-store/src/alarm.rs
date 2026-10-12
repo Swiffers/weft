@@ -16,8 +16,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     tables: &["alarm"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS alarm (
-            -- The wake's name (`Wake::name`): the same key and time is the
-            -- same wake, set once however often it is asked for.
+            -- The wake's name (`Wake::name`): the same key, time and
+            -- generation is the same wake, set once however often it is
+            -- asked for, and deleted by name when it is cancelled.
             name TEXT PRIMARY KEY,
             key TEXT NOT NULL,
             -- When it is due (unix milliseconds). A claimed wake has this
@@ -29,7 +30,14 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             role TEXT NOT NULL,
             path TEXT NOT NULL,
             body JSONB NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0
+            -- Deliveries claimed, whatever became of them: how long the
+            -- next try waits.
+            attempts INTEGER NOT NULL DEFAULT 0,
+            -- Deliveries the receiver answered and failed
+            -- (`weft_platform_traits::alarm::answered_by_receiver`): what
+            -- the receiver is told, so one it never got spends none of
+            -- its tries.
+            answered INTEGER NOT NULL DEFAULT 0
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_alarm_due ON alarm(at_unix_ms)"#,
     ],
@@ -46,6 +54,7 @@ pub struct AlarmRow {
     pub path: String,
     pub body: serde_json::Value,
     pub attempts: i32,
+    pub answered: i32,
 }
 
 /// Store a wake. Setting one already stored does nothing.
@@ -81,7 +90,7 @@ pub async fn claim_due(pool: &PgPool, now_ms: i64, lease_ms: i64, limit: i64) ->
          WHERE name IN ( \
              SELECT name FROM alarm WHERE at_unix_ms <= $1 \
              ORDER BY at_unix_ms LIMIT $3 FOR UPDATE SKIP LOCKED) \
-         RETURNING name, key, set_for_unix_ms, role, path, body, attempts",
+         RETURNING name, key, set_for_unix_ms, role, path, body, attempts, answered",
     )
     .bind(now_ms)
     .bind(lease_ms)
@@ -97,9 +106,15 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A delivery failed: try again at `at_unix_ms`.
-pub async fn retry_at(pool: &PgPool, name: &str, at_unix_ms: i64) -> Result<()> {
-    sqlx::query("UPDATE alarm SET at_unix_ms = $2 WHERE name = $1").bind(name).bind(at_unix_ms).execute(pool).await?;
+/// A delivery failed: try again at `at_unix_ms`. `answered`: the receiver
+/// answered it, so it counts as one of its tries.
+pub async fn retry_at(pool: &PgPool, name: &str, at_unix_ms: i64, answered: bool) -> Result<()> {
+    sqlx::query("UPDATE alarm SET at_unix_ms = $2, answered = answered + CASE WHEN $3 THEN 1 ELSE 0 END WHERE name = $1")
+        .bind(name)
+        .bind(at_unix_ms)
+        .bind(answered)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

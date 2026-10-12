@@ -7,7 +7,8 @@ use serde_json::json;
 
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::elevenlabs::{emit_audio, API};
+use super::elevenlabs::{audio_file_type, emit_audio, API};
+use super::flows::set_some;
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsSoundEffectNode;
@@ -25,26 +26,20 @@ impl Node for ElevenLabsSoundEffectNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let text: String = ctx.inputs.get("text")?;
+        let model: String = ctx.inputs.get("model")?;
+        let output_format: String = ctx.inputs.get("outputFormat")?;
         let duration: Option<f64> = ctx.inputs.opt("durationSecs")?;
         let looped: bool = ctx.inputs.get("loop")?;
         let influence: Option<f64> = ctx.inputs.opt("promptInfluence")?;
 
-        let mut body = json!({ "text": text, "loop": looped });
-        if let Some(secs) = duration {
-            body["duration_seconds"] = json!(secs);
-        }
-        if let Some(v) = influence {
-            body["prompt_influence"] = json!(v);
-        }
+        let mut body = json!({ "text": text, "model_id": model, "loop": looped });
+        set_some(&mut body, "duration_seconds", duration);
+        set_some(&mut body, "prompt_influence", influence);
+        let (extension, mime) = audio_file_type(&output_format)?;
+        let filename = format!("sound_effect.{extension}");
 
         let http = ctx.client(&account).await?;
-        emit_audio(
-            &ctx,
-            http.post(format!("{API}/sound-generation")).json(&body),
-            "elevenlabs: generate the sound effect",
-            "sound_effect.mp3",
-            "audio/mpeg",
-        )
-        .await
+        let url = format!("{API}/sound-generation?output_format={}", urlencoding::encode(&output_format));
+        emit_audio(&ctx, http.post(url).json(&body), "generate the sound effect on ElevenLabs", &filename, mime).await
     }
 }

@@ -49,10 +49,9 @@ impl NodeExecutionStatus {
 /// emission rows; the record retains which ports were mentioned and closed.
 ///
 /// Suspend-then-resume keeps the same record. The `status`
-/// transitions through Running ↔ WaitingForInput on the same
-/// record without churning new entries. A location gets a SECOND
-/// record only when the first went terminal and the node fired again
-/// there (a streaming or bus consumer); `ordinal` tells them apart.
+/// transitions through Running and WaitingForInput on the same
+/// record without churning new entries. One execution fires a node
+/// once per frames, so a location holds at most one record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeExecution {
     pub id: uuid::Uuid,
@@ -64,14 +63,13 @@ pub struct NodeExecution {
     pub skip_reason: Option<super::skip::SkipReason>,
     /// Input pulses consumed by this dispatch.
     pub pulses_absorbed: Vec<uuid::Uuid>,
-    /// This firing's rank among the records at its `(node, execution,
-    /// frames)`: 0 for the first, 1 for a second firing after the
-    /// first went terminal. Stamped at creation (`next_firing_ordinal`)
-    /// on the live side and in the fold alike; the firing's derived
-    /// emissions (its termination sweep, a boundary's forwarding) key
-    /// on it, so two firings at one location never share a pulse id.
-    pub ordinal: usize,
     pub error: Option<String>,
+    /// The firing failed on a wait it gave up at a time limit
+    /// (`WeftError::WaitGaveUp`): a run this failure ends reached a time
+    /// limit, and its caller hears it as one. Carried by the `NodeFailed`
+    /// row, so whichever worker ends the run reads it here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gave_up_wait: bool,
     /// Suspension token (set while `status == WaitingForInput`).
     pub callback_id: Option<String>,
     pub started_at: u64,
@@ -80,8 +78,10 @@ pub struct NodeExecution {
     pub logs: Vec<Value>,
     /// The output ports this firing has put on a wire or closed (an
     /// emission, a close): what its termination sweep leaves alone,
-    /// closing every other output port. Kept on the record so the
-    /// worker and the fold read one thing.
+    /// closing every other output port, and what a body resumed after
+    /// a pause starts from, so its replayed emissions on these ports
+    /// send nothing. Kept on the record so the worker and the fold
+    /// read one thing.
     #[serde(default)]
     pub mentioned_ports: HashSet<String>,
     /// Explicit output closures, including generator ends already delivered.
@@ -100,40 +100,24 @@ pub struct NodeExecution {
 /// One entry per node, growing as each dispatch records its lifecycle.
 pub type NodeExecutionTable = BTreeMap<String, Vec<NodeExecution>>;
 
-/// The ordinal the NEXT record opened at `(node, execution_id, frames)` gets:
-/// the count of records already there. Every site that opens a record
-/// (the scheduler, the boundary pass, the journal fold) stamps it on
-/// `NodeExecution::ordinal` at creation; nothing re-derives it later.
-pub fn next_firing_ordinal(
-    executions: &NodeExecutionTable,
-    node_id: &str,
-    execution_id: ExecutionId,
-    frames: &LoopFrames,
-) -> usize {
-    executions
-        .get(node_id)
-        .map(|v| v.iter().filter(|e| e.execution_id == execution_id && &e.frames == frames).count())
-        .unwrap_or(0)
-}
-
-/// The latest record at `(node, execution_id, frames)`: the firing every
+/// The record at `(node, execution_id, frames)`: the one firing every
 /// row and every sweep about that location is about.
-pub fn latest_firing<'a>(
+pub fn firing_at<'a>(
     executions: &'a NodeExecutionTable,
     node_id: &str,
     execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> Option<&'a NodeExecution> {
-    executions.get(node_id)?.iter().rev().find(|e| e.execution_id == execution_id && &e.frames == frames)
+    executions.get(node_id)?.iter().find(|e| e.execution_id == execution_id && &e.frames == frames)
 }
 
-/// `latest_firing`, mutably: the record a lifecycle row about the
-/// location updates.
-pub fn latest_firing_mut<'a>(
+/// `firing_at`, mutably: the record a lifecycle row about the location
+/// updates.
+pub fn firing_at_mut<'a>(
     executions: &'a mut NodeExecutionTable,
     node_id: &str,
     execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> Option<&'a mut NodeExecution> {
-    executions.get_mut(node_id)?.iter_mut().rev().find(|e| e.execution_id == execution_id && &e.frames == frames)
+    executions.get_mut(node_id)?.iter_mut().find(|e| e.execution_id == execution_id && &e.frames == frames)
 }

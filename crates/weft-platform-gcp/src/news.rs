@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use weft_platform_traits::config::GcpPlatform;
 use weft_platform_traits::news::LISTEN_CAPACITY;
-use weft_platform_traits::{Listening, News, NewsHeard, NewsKind, RunNews};
+use weft_platform_traits::{Listening, MayMiss, News, NewsHeard, NewsKind, RunNews};
 
 use crate::api::{is_status, Google};
 
@@ -105,17 +105,81 @@ impl PubSubCalls for GooglePubSub {
     }
 }
 
-pub struct PubSubNews {
+impl GooglePubSub {
+    pub fn new(google: Google) -> Self {
+        Self { google }
+    }
+}
+
+/// One topic, and this process's own subscription to it once something
+/// listens: what every kind of news on Pub/Sub shares. `H` is what a
+/// listener hears; `read` says which message is one (`None` for a
+/// message this process does not read).
+pub struct Subscribed<H> {
     calls: Arc<dyn PubSubCalls>,
     /// `projects/<p>/topics/<topic>`.
     topic: String,
     /// `projects/<p>/subscriptions/<name>`: this process's own.
     subscription: String,
-    heard: broadcast::Sender<NewsHeard>,
+    heard: broadcast::Sender<H>,
+    read: fn(&Value) -> Option<H>,
     /// The loop pulling from the subscription, once something listens.
     pulling: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether the subscription was made: only one that was is deleted.
     made: Arc<AtomicBool>,
+}
+
+impl<H: MayMiss + Send + 'static> Subscribed<H> {
+    /// Topic `topic` of `project`, through `calls`, this process's
+    /// subscription named after the topic and a name of its own.
+    pub fn over(calls: Arc<dyn PubSubCalls>, project: &str, topic: &str, read: fn(&Value) -> Option<H>) -> Self {
+        let own = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            calls,
+            topic: format!("projects/{project}/topics/{topic}"),
+            subscription: format!("projects/{project}/subscriptions/{topic}-{own}"),
+            heard: broadcast::channel(LISTEN_CAPACITY).0,
+            read,
+            pulling: parking_lot::Mutex::new(None),
+            made: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Publish `body` (`{"messages": [...]}`) on the topic.
+    pub async fn publish(&self, body: &Value) -> anyhow::Result<()> {
+        self.calls.publish(&self.topic, body).await
+    }
+
+    /// Everything heard from now on; the first call starts the pulling.
+    pub fn listen(&self) -> Listening<H> {
+        let listening = self.heard.subscribe();
+        let mut pulling = self.pulling.lock();
+        if pulling.is_none() {
+            *pulling = Some(tokio::spawn(pull_forever(
+                self.calls.clone(),
+                self.topic.clone(),
+                self.subscription.clone(),
+                self.heard.clone(),
+                self.read,
+                self.made.clone(),
+            )));
+        }
+        listening.into()
+    }
+
+    /// Stop pulling and delete the subscription, when one was made.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        let Some(pulling) = self.pulling.lock().take() else { return Ok(()) };
+        pulling.abort();
+        if !self.made.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.calls.delete_subscription(&self.subscription).await
+    }
+}
+
+pub struct PubSubNews {
+    topic: Subscribed<NewsHeard>,
 }
 
 impl PubSubNews {
@@ -123,18 +187,9 @@ impl PubSubNews {
         Self::over(Arc::new(GooglePubSub { google }), &gcp.project, &gcp.news_topic)
     }
 
-    /// News on topic `topic` of `project`, through `calls`, this process's
-    /// subscription named after the topic and a name of its own.
+    /// News on topic `topic` of `project`, through `calls`.
     pub fn over(calls: Arc<dyn PubSubCalls>, project: &str, topic: &str) -> Self {
-        let own = uuid::Uuid::new_v4().simple().to_string();
-        Self {
-            calls,
-            topic: format!("projects/{project}/topics/{topic}"),
-            subscription: format!("projects/{project}/subscriptions/{topic}-{own}"),
-            heard: broadcast::channel(LISTEN_CAPACITY).0,
-            pulling: parking_lot::Mutex::new(None),
-            made: Arc::new(AtomicBool::new(false)),
-        }
+        Self { topic: Subscribed::over(calls, project, topic, |message| news_in(message).map(NewsHeard::News)) }
     }
 }
 
@@ -194,25 +249,33 @@ fn subscription_body(topic: &str) -> Value {
     })
 }
 
-/// What a pull answered: each message's ack id, and the news it is
-/// (`None` for a message that is not, acknowledged and dropped loudly:
-/// nothing but weft publishes to the topic).
-fn pulled(answer: &Value) -> Vec<(String, Option<RunNews>)> {
+/// What a pull answered: each message's ack id, and what `read` makes of
+/// it (`None` for a message it does not read, acknowledged and dropped
+/// loudly: nothing but weft publishes to the topic).
+fn pulled<H>(answer: &Value, read: fn(&Value) -> Option<H>) -> Vec<(String, Option<H>)> {
     let Some(received) = answer.get("receivedMessages").and_then(Value::as_array) else { return Vec::new() };
     received
         .iter()
-        .filter_map(|r| Some((r.get("ackId").and_then(Value::as_str)?.to_string(), r.get("message").and_then(news_in))))
+        .filter_map(|r| Some((r.get("ackId").and_then(Value::as_str)?.to_string(), r.get("message").and_then(read))))
         .collect()
 }
 
 /// Make the subscription and pull from it, handing on what it hears, for
-/// as long as the process lives (the task is stopped by [`News::close`]).
-/// [`NewsHeard::MissedSome`] goes out as soon as a subscription is made:
+/// as long as the process lives (the task is stopped by
+/// [`Subscribed::close`]). "Missed some" goes out as soon as a
+/// subscription is made:
 /// Pub/Sub keeps for it every message published from then on, so whatever
 /// came before is all that was missed. A call that fails, a subscription
 /// that keeps going away included, waits a growing pause before the next,
 /// so listeners are told to look again at that pace at most.
-async fn pull_forever(calls: Arc<dyn PubSubCalls>, topic: String, subscription: String, heard: broadcast::Sender<NewsHeard>, made: Arc<AtomicBool>) {
+async fn pull_forever<H: MayMiss>(
+    calls: Arc<dyn PubSubCalls>,
+    topic: String,
+    subscription: String,
+    heard: broadcast::Sender<H>,
+    read: fn(&Value) -> Option<H>,
+    made: Arc<AtomicBool>,
+) {
     let mut retry = RETRY_FIRST;
     let pull = json!({ "maxMessages": PULL_AT_MOST });
     let pause = |retry: &mut Duration| {
@@ -226,31 +289,31 @@ async fn pull_forever(calls: Arc<dyn PubSubCalls>, topic: String, subscription: 
             Ok(()) => {}
             Err(e) if is_status(&e, 409) => {}
             Err(e) => {
-                tracing::warn!(target: "weft_platform_gcp::news", %subscription, error = %format!("{e:#}"), "could not subscribe to the install's news; trying again");
+                tracing::warn!(target: "weft_platform_gcp::news", %topic, %subscription, error = %format!("{e:#}"), "could not subscribe to the topic; trying again");
                 pause(&mut retry).await;
                 continue;
             }
         }
         made.store(true, Ordering::Release);
-        tracing::info!(target: "weft_platform_gcp::news", %subscription, "listening to the install's news");
+        tracing::info!(target: "weft_platform_gcp::news", %topic, %subscription, "listening to the topic");
         // Nobody listening yet is fine: a listener comes later.
-        let _ = heard.send(NewsHeard::MissedSome);
+        let _ = heard.send(H::missed_some());
         loop {
             let answer = match calls.pull(&subscription, &pull).await {
                 Ok(answer) => answer,
                 Err(e) if is_status(&e, 404) => {
-                    tracing::warn!(target: "weft_platform_gcp::news", %subscription, "the news subscription is gone; making it again");
+                    tracing::warn!(target: "weft_platform_gcp::news", %topic, %subscription, "the subscription to the topic is gone; making it again");
                     pause(&mut retry).await;
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(target: "weft_platform_gcp::news", %subscription, error = %format!("{e:#}"), "could not pull the install's news; trying again");
+                    tracing::warn!(target: "weft_platform_gcp::news", %topic, %subscription, error = %format!("{e:#}"), "could not pull from the topic; trying again");
                     pause(&mut retry).await;
                     continue;
                 }
             };
             retry = RETRY_FIRST;
-            let messages = pulled(&answer);
+            let messages = pulled(&answer, read);
             if messages.is_empty() {
                 continue;
             }
@@ -258,16 +321,16 @@ async fn pull_forever(calls: Arc<dyn PubSubCalls>, topic: String, subscription: 
             for (ack, news) in messages {
                 match news {
                     Some(news) => {
-                        let _ = heard.send(NewsHeard::News(news));
+                        let _ = heard.send(news);
                     }
-                    None => tracing::error!(target: "weft_platform_gcp::news", %subscription, "a message on the news topic that is not news; dropped"),
+                    None => tracing::error!(target: "weft_platform_gcp::news", %subscription, "a message on the topic that this process does not read; dropped"),
                 }
                 acks.push(ack);
             }
             // A message not acknowledged comes again, which costs a look
             // and nothing else.
             if let Err(e) = calls.acknowledge(&subscription, &json!({ "ackIds": acks })).await {
-                tracing::warn!(target: "weft_platform_gcp::news", %subscription, error = %format!("{e:#}"), "could not acknowledge the news heard; it comes again");
+                tracing::warn!(target: "weft_platform_gcp::news", %topic, %subscription, error = %format!("{e:#}"), "could not acknowledge the messages pulled; they come again");
             }
         }
     }
@@ -276,31 +339,15 @@ async fn pull_forever(calls: Arc<dyn PubSubCalls>, topic: String, subscription: 
 #[async_trait]
 impl News for PubSubNews {
     async fn announce(&self, news: &[RunNews]) -> anyhow::Result<()> {
-        self.calls.publish(&self.topic, &publish_body(news)).await
+        self.topic.publish(&publish_body(news)).await
     }
 
     fn listen(&self) -> Listening {
-        let listening = self.heard.subscribe();
-        let mut pulling = self.pulling.lock();
-        if pulling.is_none() {
-            *pulling = Some(tokio::spawn(pull_forever(
-                self.calls.clone(),
-                self.topic.clone(),
-                self.subscription.clone(),
-                self.heard.clone(),
-                self.made.clone(),
-            )));
-        }
-        listening.into()
+        self.topic.listen()
     }
 
     async fn close(&self) -> anyhow::Result<()> {
-        let Some(pulling) = self.pulling.lock().take() else { return Ok(()) };
-        pulling.abort();
-        if !self.made.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.calls.delete_subscription(&self.subscription).await
+        self.topic.close().await
     }
 }
 
@@ -318,15 +365,15 @@ mod tests {
         for kind in [NewsKind::Answer, NewsKind::Cancel] {
             let body = publish_body(&[news(kind)]);
             let answer = json!({ "receivedMessages": [{ "ackId": "a1", "message": body["messages"][0] }] });
-            assert_eq!(pulled(&answer), vec![("a1".to_string(), Some(news(kind)))]);
+            assert_eq!(pulled(&answer, news_in), vec![("a1".to_string(), Some(news(kind)))]);
         }
     }
 
     #[test]
     fn a_message_that_is_not_news_is_still_acknowledged() {
         let answer = json!({ "receivedMessages": [{ "ackId": "a1", "message": { "data": "eA==" } }] });
-        assert_eq!(pulled(&answer), vec![("a1".to_string(), None)]);
-        assert!(pulled(&json!({})).is_empty(), "an empty pull hears nothing");
+        assert_eq!(pulled(&answer, news_in), vec![("a1".to_string(), None)]);
+        assert!(pulled(&json!({}), news_in).is_empty(), "an empty pull hears nothing");
     }
 
     #[test]

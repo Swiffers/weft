@@ -21,6 +21,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
 use weft_core::net::EmptyBody;
 use weft_core::ExecutionId;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
@@ -31,8 +32,26 @@ use crate::state::DispatcherState;
 /// straight back for them.
 const BATCH: i64 = 32;
 
-/// A run being queued wakes the loop.
-pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(weft_task_store::runs::RUN_QUEUED_CHANNEL)];
+/// A run being queued wakes the loop (runs whose tries stopped come back
+/// that way when a build of their project registers, [`retry_stopped`]),
+/// and so does a project's worker levers changing: the write that changes
+/// them makes the project's waiting runs takeable again, their tries
+/// forgotten (`crate::project_store::ProjectStoreOps::set_worker_overrides`).
+/// A worker's lease coming alive (once per stretch of its work) wakes it
+/// too, only when its project has runs whose tries stopped
+/// ([`WORKERS_BACK_CHANNEL`]): those are taken again ([`take`]).
+pub(crate) static WAKE_ON: &[WakeOn] = &[
+    WakeOn::any(weft_task_store::runs::RUN_QUEUED_CHANNEL),
+    WakeOn::any(crate::held::WORKER_SETTINGS_CHANNEL),
+    WakeOn::any(WORKERS_BACK_CHANNEL),
+];
+
+/// The channel that says a project's workers may take its runs again, with
+/// the project as the payload: a worker's lease coming alive while the
+/// project has queued runs whose tries stopped ([`UNREACHED_TO_STOP`]). A
+/// trigger on `worker_lease` in the journal's schema sends it.
+// SYNC: WORKERS_BACK_CHANNEL <-> 'weft_workers_back' in worker_lease_workers_back_notify (crate::journal::postgres::GROUP)
+pub const WORKERS_BACK_CHANNEL: &str = "weft_workers_back";
 
 /// How long a run handed to a worker stays out of the queue for it to
 /// claim: 30 seconds at this install's pace. One unclaimed by then is
@@ -41,65 +60,246 @@ fn delivery_lease_secs() -> i64 {
     weft_core::time_scale::scaled_secs(30)
 }
 
-/// The safety look, for a delivery that ran out (its worker never
-/// claimed), which no write announces: 30 seconds at this install's pace.
+/// How long a run whose worker is still starting waits before it is
+/// handed out again, joining the same bring-up: twice as long as a cloud
+/// holds a caller while a worker comes up, at this install's pace.
+pub fn starting_wait_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(40)
+}
+
+/// How long a run waits before it is handed out again after each try its
+/// workers did not take (a refusal, a hand-off that got no answer) but the
+/// last: the last refusal ends it ([`REFUSALS_TO_END`]), the last
+/// hand-off with no answer stops its tries ([`UNREACHED_TO_STOP`]).
+pub const RETRY_WAITS: [i64; 2] = [5, 20];
+
+/// How many refusals end a run.
+pub const REFUSALS_TO_END: i16 = RETRY_WAITS.len() as i16 + 1;
+
+/// How many hand-offs that got no answer stop a run's tries: it stays
+/// queued, untaken, until something that can fix it happens (a worker of
+/// its project comes alive, a build of the project registers, its worker
+/// levers change), each of which starts its tries again.
+// SYNC: UNREACHED_TO_STOP <-> the 3 in worker_lease_workers_back_notify (crate::journal::postgres::GROUP)
+pub const UNREACHED_TO_STOP: i16 = RETRY_WAITS.len() as i16 + 1;
+
+/// How often a machine's process looks anyway: 30 seconds at this
+/// install's pace.
 fn safety() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(30))
 }
 
 /// One queued run taken for delivery.
 #[derive(Debug, sqlx::FromRow)]
-struct Delivery {
-    execution_id: ExecutionId,
-    project_id: uuid::Uuid,
-    tenant_id: String,
+pub struct Delivery {
+    pub execution_id: ExecutionId,
+    pub project_id: uuid::Uuid,
+    pub tenant_id: String,
     /// The image it runs on; `None` for a run of no program, which no
     /// worker can claim.
-    binary_hash: Option<String>,
+    pub binary_hash: Option<String>,
 }
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new("delivery", WAKE_ON, safety(), move || {
+    DrainLoop::new("delivery", "hand queued runs to workers", WAKE_ON, safety(), move || {
         let state = state.clone();
         async move {
-            let taken = take(&state.pg_pool, crate::lease::now_unix(), BATCH).await?;
+            let now = crate::lease::now_unix();
+            let taken = take(&state.pg_pool, now, BATCH).await?;
             let full = taken.len() as i64 == BATCH;
             for delivery in taken {
                 let state = state.clone();
                 tokio::spawn(async move { deliver(&state, delivery).await });
             }
-            Ok(if full { DrainStep::More } else { DrainStep::Done })
+            if full {
+                return Ok(DrainStep::More);
+            }
+            // A run handed out and never claimed, or waiting to be tried
+            // again, is handed out once its wait runs out, which nothing
+            // announces.
+            Ok(match next_hand_out(&state.pg_pool).await? {
+                Some(at) => DrainStep::RetryIn(Duration::from_secs((at + 1 - now).max(1).unsigned_abs())),
+                None => DrainStep::Done,
+            })
         }
     })
 }
 
-/// Take up to `limit` queued runs nobody is delivering, oldest first, and
-/// mark each delivered until a lease from `now` runs out.
-async fn take(pool: &sqlx::PgPool, now: i64, limit: i64) -> anyhow::Result<Vec<Delivery>> {
+/// Take up to `limit` queued runs to hand out, oldest first, and mark each
+/// out with its delivery until a lease from `now` runs out: a run whose
+/// wait passed, and a run whose tries stopped ([`UNREACHED_TO_STOP`]) once
+/// a worker of its project came alive in the second they stopped or later
+/// (`worker_lease.alive_since`, whole seconds like the stop: a worker
+/// alive in that same second may have come up after the stop, so it
+/// counts), whose tries start again, their busy stretch with them, while
+/// `run.waited_on_workers` (its workers failed it) stays until it is
+/// claimed. A delivery that never comes back (its process died) leaves its mark to
+/// run out, and the run is taken again then.
+pub async fn take(pool: &sqlx::PgPool, now: i64, limit: i64) -> anyhow::Result<Vec<Delivery>> {
     Ok(sqlx::query_as(
-        "UPDATE run SET delivered_until = $1 + $2 WHERE execution_id IN ( \
-             SELECT execution_id FROM run \
-             WHERE state = 'queued' AND (delivered_until IS NULL OR delivered_until < $1) \
-             ORDER BY started_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
+        "UPDATE run SET delivered_until = $1 + $2, waits = FALSE, \
+             unreached = CASE WHEN unreached >= $4 THEN 0 ELSE unreached END, \
+             busy_since = CASE WHEN unreached >= $4 THEN NULL ELSE busy_since END \
+         WHERE execution_id IN ( \
+             SELECT r.execution_id FROM run r \
+             WHERE r.state = 'queued' \
+               AND ((r.unreached < $4 AND (r.delivered_until IS NULL OR r.delivered_until < $1)) \
+                    OR (r.unreached >= $4 AND EXISTS (SELECT 1 FROM worker_lease l \
+                                                      WHERE l.project_id = r.project_id AND l.alive_since >= r.delivered_until))) \
+             ORDER BY r.started_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
          RETURNING execution_id, project_id, tenant_id, binary_hash",
     )
     .bind(now)
     .bind(delivery_lease_secs())
     .bind(limit)
+    .bind(UNREACHED_TO_STOP)
     .fetch_all(pool)
     .await?)
 }
 
-/// Give a delivery back, so the next pass makes it again instead of
-/// waiting out its lease. Not announced: a worker still starting would
-/// otherwise be called again in a tight loop; the next pass is the next
-/// run queued, or the safety look.
-async fn give_back(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<()> {
-    sqlx::query("UPDATE run SET delivered_until = NULL WHERE execution_id = $1 AND state = 'queued'")
+/// When the earliest queued run still tried is due to be handed out again
+/// (unix seconds): one out with a delivery whose lease runs out, or one
+/// waiting to be tried again. A run whose tries stopped is due on no clock.
+pub async fn next_hand_out(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
+    Ok(sqlx::query_scalar("SELECT MIN(delivered_until) FROM run WHERE state = 'queued' AND unreached < $1")
+        .bind(UNREACHED_TO_STOP)
+        .fetch_one(pool)
+        .await?)
+}
+
+/// How long a run a busy worker turned away first waits before it is
+/// handed out again: 5 seconds at this install's pace, about as long as
+/// the worker's own `Retry-After`.
+pub fn busy_wait_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(5)
+}
+
+/// The longest a run a busy worker turned away waits before it is handed
+/// out again: a minute at this install's pace.
+pub fn busy_wait_cap_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(60)
+}
+
+/// Give back a queued run whose worker is still starting, to be handed
+/// out again once [`starting_wait_secs`] passed, joining the same
+/// bring-up, counting no try. Not announced: the loop looks again when
+/// the earliest such wait runs out.
+pub async fn wait_for_worker(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<()> {
+    sqlx::query("UPDATE run SET delivered_until = $2, waits = TRUE WHERE execution_id = $1 AND state = 'queued'")
         .bind(execution_id)
+        .bind(crate::lease::now_unix() + starting_wait_secs())
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Give back a queued run its worker answered busy, its busy stretch
+/// starting now unless one is going (`run.busy_since`, which a claim
+/// clears). It is handed out again after a pause as long as the stretch
+/// so far, at least [`busy_wait_secs`] and at most
+/// [`busy_wait_cap_secs`], and for as long as the workers answer busy: it
+/// is real work waiting for room. Answers how long the stretch has lasted,
+/// in seconds, `None` when it is no longer queued.
+pub async fn busy(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "UPDATE run SET busy_since = COALESCE(busy_since, $2), waits = TRUE, waited_on_workers = TRUE, \
+             delivered_until = $2 + LEAST(GREATEST($2 - COALESCE(busy_since, $2), $3), $4) \
+         WHERE execution_id = $1 AND state = 'queued' RETURNING $2 - busy_since",
+    )
+    .bind(execution_id)
+    .bind(crate::lease::now_unix())
+    .bind(busy_wait_secs())
+    .bind(busy_wait_cap_secs())
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// What `weft status` shows for a project whose workers answered a run
+/// busy for `secs` seconds.
+fn busy_for_words(secs: i64) -> String {
+    let lasted = match secs / 60 {
+        0 => format!("{secs} seconds"),
+        1 => "1 minute".to_string(),
+        minutes => format!("{minutes} minutes"),
+    };
+    format!(
+        "this project's worker has answered busy for {lasted} (memory full); raise its memory (`weft workers set --memory <size>`)"
+    )
+}
+
+/// Count one more refusal of a queued run by its workers: it is given back
+/// to be tried again after the wait that refusal earns ([`RETRY_WAITS`]).
+/// Answers how many refusals it has now, `None` when it is no longer
+/// queued; the [`REFUSALS_TO_END`]th ends it ([`refused_cause`]).
+pub async fn refused(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<Option<i16>> {
+    Ok(sqlx::query_scalar(
+        "UPDATE run SET refusals = refusals + 1, waits = TRUE, waited_on_workers = TRUE, \
+             delivered_until = $2 + (($3::bigint[])[LEAST(refusals + 1, array_length($3::bigint[], 1))]) \
+         WHERE execution_id = $1 AND state = 'queued' RETURNING refusals",
+    )
+    .bind(execution_id)
+    .bind(crate::lease::now_unix())
+    .bind(RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec())
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Count one more hand-off of a queued run that got no answer from its
+/// workers or the platform: it is given back to be tried again after the
+/// wait that try earns ([`RETRY_WAITS`]), and the [`UNREACHED_TO_STOP`]th
+/// stops its tries, its `delivered_until` then saying when on the
+/// database's clock (the clock a worker's `alive_since` is on), until
+/// something that can fix it starts them again ([`take`],
+/// [`retry_stopped`], `crate::project_store::ProjectStoreOps::set_worker_overrides`).
+/// Answers how many it has now, `None` when it is no longer queued (its
+/// worker claimed it before the call broke).
+pub async fn unreached(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<Option<i16>> {
+    Ok(sqlx::query_scalar(
+        "UPDATE run SET unreached = unreached + 1, waits = TRUE, waited_on_workers = TRUE, \
+             delivered_until = CASE WHEN unreached + 1 >= $3 THEN EXTRACT(EPOCH FROM NOW())::BIGINT \
+                 ELSE $2 + (($4::bigint[])[unreached + 1]) END \
+         WHERE execution_id = $1 AND state = 'queued' RETURNING unreached",
+    )
+    .bind(execution_id)
+    .bind(crate::lease::now_unix())
+    .bind(UNREACHED_TO_STOP)
+    .bind(RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec())
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Start again the tries of `project_id`'s queued runs that stopped
+/// because its workers could not be reached ([`UNREACHED_TO_STOP`]), in
+/// the caller's transaction, announcing them
+/// queued so the delivery takes them: for a build of the project
+/// registering, which can fix that. `run.waited_on_workers` (their
+/// workers failed them) stays until each is claimed.
+pub async fn retry_stopped(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<()> {
+    let retried = sqlx::query(
+        "UPDATE run SET unreached = 0, busy_since = NULL, waits = FALSE, delivered_until = NULL \
+         WHERE project_id = $1 AND state = 'queued' AND unreached >= $2",
+    )
+    .bind(project_id)
+    .bind(UNREACHED_TO_STOP)
+    .execute(&mut *conn)
+    .await?;
+    if retried.rows_affected() > 0 {
+        weft_journal::record::notify_queued_in(conn, project_id).await?;
+    }
+    Ok(())
+}
+
+/// What a run refused [`REFUSALS_TO_END`] times is ended for, naming who
+/// gave the last refusal (`by`) and what it said (`error`). It ends the
+/// way every run the dispatcher ends itself does
+/// ([`crate::api::execution::cancel_execution_id`]).
+pub fn refused_cause(by: RefusedBy, error: &str) -> weft_core::exec::CancelCause {
+    let who = match by {
+        RefusedBy::Worker => "its worker refused it",
+        RefusedBy::Platform => "the platform refused weft's calls for it",
+        RefusedBy::Settings => "its project's worker settings kept it from any worker",
+    };
+    weft_core::exec::CancelCause::Runtime { detail: format!("{who} {REFUSALS_TO_END} times: {error}") }
 }
 
 /// End a queued run no worker can ever claim (a run of no program): until
@@ -112,9 +312,25 @@ async fn end_undeliverable(state: &DispatcherState, execution_id: ExecutionId, r
     crate::api::execution::cancel_execution_id(state, execution_id, &cause).await
 }
 
+/// The project a worker target was asked for does not exist (it was
+/// removed): no worker of it can ever take a run.
+#[derive(Debug)]
+pub struct NotRegistered(pub uuid::Uuid);
+
+impl std::fmt::Display for NotRegistered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "project {} is not registered", self.0)
+    }
+}
+
+impl std::error::Error for NotRegistered {}
+
 /// The worker target a run runs on: the project's workers at the image it
 /// was born on, with the project's own levers over
-/// the install's.
+/// the install's. [`NotRegistered`] when the project is gone; a
+/// [`Refusal`] naming the lever when the settings together are a shape no
+/// platform could run (the install's changed under a project's own), a
+/// definite no that changing them answers.
 pub async fn worker_target(
     state: &DispatcherState,
     tenant: &str,
@@ -127,14 +343,27 @@ pub async fn worker_target(
         Some(held) => held,
         None => state.held.worker_overrides.load_fresh(project, || state.projects.worker_overrides(project)).await?,
     };
-    let overrides = overrides.as_ref().as_ref().ok_or_else(|| anyhow::anyhow!("project {project} is not registered"))?;
+    let overrides = overrides.as_ref().as_ref().ok_or(NotRegistered(project))?;
     Ok(weft_platform_traits::WorkerTarget {
         tenant: tenant.to_string(),
         project,
         image: state.builder.images.image_ref(&weft_compiler::build::worker_image_tag(binary_hash)),
         binary_hash: Some(binary_hash.to_string()),
-        settings: state.worker_defaults.with(overrides),
+        settings: worker_settings(&state.worker_defaults, overrides, project)?,
     })
+}
+
+/// The settings `project`'s workers run with: its own levers over the
+/// install's, or a [`Refusal`] naming the lever when together they are a
+/// shape no platform could run.
+fn worker_settings(
+    install: &weft_platform_traits::WorkerSettings,
+    overrides: &weft_platform_traits::WorkerOverrides,
+    project: uuid::Uuid,
+) -> Result<weft_platform_traits::WorkerSettings, Refusal> {
+    let settings = install.with(overrides);
+    settings.validate().map_err(|e| Refusal { by: RefusedBy::Settings, why: format!("project {project}'s worker settings cannot run: {e}") })?;
+    Ok(settings)
 }
 
 async fn deliver(state: &DispatcherState, delivery: Delivery) {
@@ -151,6 +380,12 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
     let target = worker_target(state, &delivery.tenant_id, delivery.project_id, binary_hash).await;
     drop(busy);
     let outcome = match target {
+        Err(e) if e.downcast_ref::<NotRegistered>().is_some() => {
+            if let Err(e) = end_undeliverable(state, execution_id, "its project was removed").await {
+                tracing::error!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not end a run whose project was removed; its delivery runs out and it is tried again");
+            }
+            return;
+        }
         Err(e) => Err(e),
         Ok(target) => run_on_worker(state, &target, execution_id).await,
     };
@@ -164,58 +399,223 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
         Ok(answer) => tracing::debug!(target: "weft_dispatcher::delivery", %execution_id, ?answer, "worker answered"),
         Err(e) => {
             let _busy = state.signals.busy().await;
-            // Nothing claimed it: give the delivery back so the next pass
-            // makes it again instead of waiting out the lease. A worker
-            // still starting is the platform's bring-up going on without
-            // this delivery: the run stays queued, and each later pass
-            // joins the same bring-up until it lands. The platform logs
-            // that bring-up once; per delivery it is only worth a debug
-            // line.
-            match GiveBack::of(&e) {
-                GiveBack::WorkerStarting => tracing::debug!(
-                    target: "weft_dispatcher::delivery",
-                    %execution_id,
-                    project = %delivery.project_id,
-                    reason = %format!("{e:#}"),
-                    "the run waits for its worker to start; it is handed out again on the next pass"
-                ),
-                GiveBack::CouldNotHand => {
-                    let error = format!("{e:#}");
-                    tracing::warn!(
-                        target: "weft_dispatcher::delivery",
-                        %execution_id,
-                        project = %delivery.project_id,
-                        %error,
-                        "could not hand the run to a worker; it is handed out again on the next pass"
-                    );
-                    let callee = weft_task_store::unanswered::Callee::Workers(delivery.project_id);
-                    if let Err(e) = weft_task_store::unanswered::failed(&state.pg_pool, callee, &error).await {
-                        tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not write down a hand-off that failed");
-                    }
-                }
-            }
-            if let Err(e) = give_back(&state.pg_pool, execution_id).await {
-                tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, error = %e, "could not give the delivery back; it is made again once its lease runs out");
+            // The worker may have claimed the run before the call broke:
+            // whether it went away with it is for the `lapses` loop to
+            // notice, once the grace the claim gave it runs out.
+            crate::lapses::book_after_or_log(state, crate::worker_door::lost_margin_secs() * 2).await;
+            if let Err(e) = hand_back(state, &delivery, &e).await {
+                tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not give the delivery back; it is made again once its lease runs out");
             }
         }
     }
 }
 
-/// Why a delivery goes back to the queue. Both are given back the same
-/// way; they differ in what they say, since a worker starting is the
-/// normal first minutes of a new build and no fault.
+/// Give back a delivery no worker took (`e` says why), to be handed out
+/// again. A worker still starting is the platform's bring-up going on
+/// without this delivery: the run waits, and joins the same bring-up when
+/// it is handed out again. The platform logs that bring-up once; per
+/// delivery it is only worth a debug line. A worker that answered it is
+/// too busy now is up: the run waits a growing pause and counts no try
+/// ([`busy`]), and once the workers answered it busy for the install's
+/// alert delay (`DispatcherState::alert_after_secs`) that is written down
+/// for `weft status` on each try. A refusal (the worker, the platform or
+/// the project's worker settings said no) waits a little longer each
+/// time, and the last one ends the run naming who refused it. Anything
+/// else (no answer, this side's own read failing) waits the same way and
+/// counts no refusal; the last such try stops the run's tries until
+/// something that can fix it happens ([`UNREACHED_TO_STOP`]). Both are
+/// written down for `weft status`, the last try as given up, and only for
+/// a run still queued: one its worker claimed before the call broke is
+/// that worker's. Whatever is written stays current while any queued run
+/// of the project still waits on its workers
+/// (`weft_task_store::unanswered::delivery_failed_sql`), and goes once a
+/// run they failed since its last claim (`run.waited_on_workers`, which
+/// its tries starting again leave set) leaves the queue and leaves none
+/// waiting (`weft_task_store::unanswered::delivery_waits_ended`), or once
+/// a later run of the project reaches a worker with none waiting.
+async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Error) -> anyhow::Result<()> {
+    let execution_id = delivery.execution_id;
+    let error = format!("{e:#}");
+    let workers = weft_task_store::unanswered::Callee::Workers(delivery.project_id);
+    match GiveBack::of(e) {
+        GiveBack::WorkerStarting => {
+            tracing::debug!(
+                target: "weft_dispatcher::delivery",
+                %execution_id,
+                project = %delivery.project_id,
+                reason = %error,
+                "the run waits for its worker to start"
+            );
+            wait_for_worker(&state.pg_pool, execution_id).await
+        }
+        GiveBack::WorkerBusy => {
+            let Some(busy_for) = busy(&state.pg_pool, execution_id).await? else { return Ok(()) };
+            if busy_for < state.alert_after_secs {
+                tracing::debug!(
+                    target: "weft_dispatcher::delivery",
+                    %execution_id,
+                    project = %delivery.project_id,
+                    reason = %error,
+                    busy_for_secs = busy_for,
+                    "the run waits for its worker to have room"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                target: "weft_dispatcher::delivery",
+                %execution_id,
+                project = %delivery.project_id,
+                %error,
+                busy_for_secs = busy_for,
+                "the project's workers keep answering the run busy"
+            );
+            // A record this starts begins with the run's busy stretch, so
+            // the install's alert delay counts from the first busy answer.
+            // A stretch a sibling replica's clock puts in the future began now.
+            let lasted = std::time::Duration::from_secs(busy_for.max(0).unsigned_abs());
+            weft_task_store::unanswered::failed_for(&state.pg_pool, workers, None, &busy_for_words(busy_for), lasted).await?.log();
+            Ok(())
+        }
+        GiveBack::Refused(by) => {
+            let Some(refusals) = refused(&state.pg_pool, execution_id).await? else { return Ok(()) };
+            tracing::warn!(
+                target: "weft_dispatcher::delivery",
+                %execution_id,
+                project = %delivery.project_id,
+                %error,
+                refusals,
+                refused_by = ?by,
+                "a hand-off of the run was refused"
+            );
+            if refusals < REFUSALS_TO_END {
+                weft_task_store::unanswered::failed(&state.pg_pool, workers, None, &error).await?.log();
+                return Ok(());
+            }
+            weft_task_store::unanswered::gave_up(&state.pg_pool, workers, None, &error).await?.log();
+            crate::api::execution::cancel_execution_id(state, execution_id, &refused_cause(by, &error)).await
+        }
+        GiveBack::NotDelivered => {
+            let Some(tries) = unreached(&state.pg_pool, execution_id).await? else { return Ok(()) };
+            tracing::warn!(
+                target: "weft_dispatcher::delivery",
+                %execution_id,
+                project = %delivery.project_id,
+                %error,
+                tries,
+                stopped = tries >= UNREACHED_TO_STOP,
+                "could not reach the project's workers with the run"
+            );
+            let alerts = match tries < UNREACHED_TO_STOP {
+                true => weft_task_store::unanswered::failed(&state.pg_pool, workers, None, &error).await?,
+                false => weft_task_store::unanswered::gave_up(&state.pg_pool, workers, None, &error).await?,
+            };
+            alerts.log();
+            Ok(())
+        }
+    }
+}
+
+/// Why a delivery goes back to the queue: the platform still bringing the
+/// worker up (the normal first minutes of a new build, no fault), the
+/// worker up and too busy to take it now ([`WorkerBusy`]), a definite no
+/// ([`Refusal`], or the platform refusing to bring the worker up:
+/// `weft_platform_traits::runner::PlatformRefused`), or no answer at all.
 #[derive(Debug, PartialEq, Eq)]
 enum GiveBack {
     WorkerStarting,
-    CouldNotHand,
+    WorkerBusy,
+    Refused(RefusedBy),
+    NotDelivered,
 }
 
 impl GiveBack {
     fn of(e: &anyhow::Error) -> Self {
         if weft_platform_traits::WorkerStarting::is(e) {
             GiveBack::WorkerStarting
+        } else if e.downcast_ref::<WorkerBusy>().is_some() {
+            GiveBack::WorkerBusy
+        } else if let Some(refusal) = e.downcast_ref::<Refusal>() {
+            GiveBack::Refused(refusal.by)
+        } else if weft_platform_traits::runner::PlatformRefused::is(e) {
+            GiveBack::Refused(RefusedBy::Platform)
         } else {
-            GiveBack::CouldNotHand
+            GiveBack::NotDelivered
+        }
+    }
+}
+
+/// Who answered a hand-off with a definite no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBy {
+    /// The worker took the call and answered an error.
+    Worker,
+    /// The platform refused weft's call, to bring a worker up or to reach
+    /// one (permission denied, a quota, a request it calls invalid).
+    Platform,
+    /// Weft itself: the project's worker settings are a shape no platform
+    /// could run ([`worker_target`]).
+    Settings,
+}
+
+/// A hand-off answered with a definite no, and who said it: what counts
+/// as a refusal of the run ([`refused`]).
+#[derive(Debug)]
+struct Refusal {
+    by: RefusedBy,
+    why: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// The worker answered that it cannot take the run now (its memory nearly
+/// full, or it is stopping): it is up, and will have room once its runs
+/// leave it or the platform adds a copy.
+#[derive(Debug)]
+struct WorkerBusy {
+    why: String,
+}
+
+impl std::fmt::Display for WorkerBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for WorkerBusy {}
+
+/// What an answer to a hand-off that is not a success says about the run.
+#[derive(Debug, PartialEq, Eq)]
+enum NotTaken {
+    /// The worker's own busy `503` (`weft_engine::busy`, a worker stopping).
+    WorkerBusy,
+    /// The worker answered any other error: a no from it.
+    WorkerRefused,
+    /// The platform answered a client error in the worker's place (its
+    /// `403`: weft's account may not invoke it): a no from it.
+    PlatformRefused,
+    /// The platform answered in the worker's place that it could not
+    /// serve the call now (`429` with no copy free, `502`/`503`/`504`
+    /// while scaling, `404` for a service gone, `408`): no answer from
+    /// the workers.
+    NoAnswer,
+}
+
+impl NotTaken {
+    fn of(call: weft_platform_traits::WorkerCall) -> Self {
+        use weft_platform_traits::WorkerCall;
+        match call {
+            WorkerCall::Answered { status: 503, from_worker: true } => NotTaken::WorkerBusy,
+            WorkerCall::Answered { from_worker: true, .. } => NotTaken::WorkerRefused,
+            WorkerCall::Answered { status, from_worker: false } if (400..500).contains(&status) && !matches!(status, 404 | 408 | 429) => {
+                NotTaken::PlatformRefused
+            }
+            WorkerCall::Answered { .. } | WorkerCall::NoAnswer { .. } => NotTaken::NoAnswer,
         }
     }
 }
@@ -227,7 +627,16 @@ async fn run_on_worker(
     target: &weft_platform_traits::WorkerTarget,
     execution_id: ExecutionId,
 ) -> anyhow::Result<weft_core::door_fire::RunAnswer> {
-    let endpoint = state.runner.endpoint(target, weft_platform_traits::Patience::Brief).await?;
+    // The platform refusing to give an address (permission denied, a
+    // quota, an invalid request) is a no, kept typed through the context;
+    // any other failure to give one (its API timing out or failing) is no
+    // answer. Below, an answer that is not a success is read by who gave
+    // it and what it says ([`NotTaken`]).
+    let endpoint = state
+        .runner
+        .endpoint(target, weft_platform_traits::Patience::Brief)
+        .await
+        .context("the platform gave no address for the project's workers")?;
     let resp = state
         .http
         .post(format!("{}/_weft/run/{execution_id}", endpoint.base_url.trim_end_matches('/')))
@@ -242,12 +651,24 @@ async fn run_on_worker(
     let status = resp.status();
     let call = weft_platform_traits::WorkerCall::answered(status, resp.headers());
     state.runner.call_ended(target, call);
-    if call.platform_refused() {
-        anyhow::bail!("the platform refused weft's call to the worker at {} ({status}): weft's account may not invoke it", endpoint.base_url);
-    }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("the worker answered {status}: {body}");
+        let body = resp.text().await.unwrap_or_else(|e| format!("(its body could not be read: {e})"));
+        let at = &endpoint.base_url;
+        return Err(match NotTaken::of(call) {
+            NotTaken::WorkerBusy => WorkerBusy { why: format!("the worker at {at} is busy ({status}): {body}") }.into(),
+            NotTaken::WorkerRefused => Refusal { by: RefusedBy::Worker, why: format!("the worker answered {status}: {body}") }.into(),
+            NotTaken::PlatformRefused if call.platform_refused() => Refusal {
+                by: RefusedBy::Platform,
+                why: format!("the platform refused weft's call to the worker at {at} ({status}): weft's account may not invoke it"),
+            }
+            .into(),
+            NotTaken::PlatformRefused => Refusal {
+                by: RefusedBy::Platform,
+                why: format!("the platform refused weft's call to the worker at {at} ({status}): {body}"),
+            }
+            .into(),
+            NotTaken::NoAnswer => anyhow::anyhow!("the platform could not serve weft's call to the worker at {at} now ({status}): {body}"),
+        });
     }
     let answer: weft_core::door_fire::RunAnswer = resp.json().await.map_err(|e| anyhow::anyhow!("read the worker's answer: {e}"))?;
     // Held until here: a platform that stops idle workers itself counts
@@ -258,12 +679,77 @@ async fn run_on_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::GiveBack;
+    use super::{GiveBack, NotTaken, RefusedBy};
+    use weft_platform_traits::WorkerCall;
 
+    /// A worker still starting, a worker too busy, a no from the worker or
+    /// the platform, and a hand-off that got no answer are told apart:
+    /// only the no counts as a refusal, naming who said it.
     #[test]
-    fn a_worker_still_starting_is_told_apart_from_a_failed_hand_off() {
+    fn a_refusal_is_told_apart_from_a_worker_starting_and_from_no_answer() {
         let starting = anyhow::Error::new(weft_platform_traits::WorkerStarting { what: "w".into() }).context("endpoint");
         assert_eq!(GiveBack::of(&starting), GiveBack::WorkerStarting, "found through a context");
-        assert_eq!(GiveBack::of(&anyhow::anyhow!("the worker answered 500")), GiveBack::CouldNotHand);
+        let busy = anyhow::Error::new(super::WorkerBusy { why: "the worker at http://w is busy".into() }).context("deliver");
+        assert_eq!(GiveBack::of(&busy), GiveBack::WorkerBusy, "found through a context");
+        let refused = anyhow::Error::new(super::Refusal { by: RefusedBy::Worker, why: "the worker answered 500".into() }).context("deliver");
+        assert_eq!(GiveBack::of(&refused), GiveBack::Refused(RefusedBy::Worker), "found through a context");
+        let platform = anyhow::Error::new(weft_platform_traits::runner::PlatformRefused { why: "Google answered 403".into() })
+            .context("the platform gave no address for the project's workers");
+        assert_eq!(GiveBack::of(&platform), GiveBack::Refused(RefusedBy::Platform), "the platform refusing to bring a worker up is its no");
+        assert_eq!(GiveBack::of(&anyhow::anyhow!("call the worker at http://w: timed out")), GiveBack::NotDelivered);
+        assert_eq!(GiveBack::of(&anyhow::anyhow!("pool timed out")), GiveBack::NotDelivered, "this side's own read failing");
+    }
+
+    /// A busy answer is never a refusal: the worker's own busy `503` waits
+    /// for room, and the platform's answers while it scales or has no copy
+    /// free are no answer. Only a definite no refuses, from whoever gave it.
+    #[test]
+    fn a_busy_answer_is_never_a_refusal() {
+        let worker = |status| NotTaken::of(WorkerCall::Answered { status, from_worker: true });
+        let platform = |status| NotTaken::of(WorkerCall::Answered { status, from_worker: false });
+        assert_eq!(worker(503), NotTaken::WorkerBusy, "weft_engine::busy, or a worker stopping");
+        assert_eq!(worker(500), NotTaken::WorkerRefused);
+        assert_eq!(worker(429), NotTaken::WorkerRefused, "the program's own answer on its run");
+        for status in [429, 502, 503, 504, 404, 408, 500] {
+            assert_eq!(platform(status), NotTaken::NoAnswer, "the platform's {status}");
+        }
+        assert_eq!(platform(403), NotTaken::PlatformRefused, "weft's account may not invoke it");
+        assert_eq!(platform(400), NotTaken::PlatformRefused);
+    }
+
+    /// What `weft status` shows for a busy worker says for how long, in
+    /// the unit a person reads, and what to do about it.
+    #[test]
+    fn a_busy_worker_is_shown_with_how_long_and_what_to_raise() {
+        assert!(super::busy_for_words(30).contains("answered busy for 30 seconds (memory full); raise its memory"));
+        assert!(super::busy_for_words(90).contains("for 1 minute (memory full)"));
+        assert!(super::busy_for_words(7 * 60 + 5).contains("for 7 minutes (memory full)"));
+        assert!(super::busy_for_words(300).contains("`weft workers set --memory <size>`"));
+    }
+
+    /// The cause a refused run ends with names who refused it.
+    #[test]
+    fn a_refused_run_names_who_refused_it() {
+        let detail = |by| match super::refused_cause(by, "no") {
+            weft_core::exec::CancelCause::Runtime { detail } => detail,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(detail(RefusedBy::Worker), "its worker refused it 3 times: no");
+        assert_eq!(detail(RefusedBy::Platform), "the platform refused weft's calls for it 3 times: no");
+        assert!(detail(RefusedBy::Settings).starts_with("its project's worker settings"));
+    }
+
+    /// Worker settings no platform could run are a no that names the
+    /// lever, never a hand-off that got no answer.
+    #[test]
+    fn settings_no_platform_could_run_are_a_refusal() {
+        let install: weft_platform_traits::WorkerSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        let project = uuid::Uuid::nil();
+        let fine = weft_platform_traits::WorkerOverrides::default();
+        assert!(super::worker_settings(&install, &fine, project).is_ok());
+        let none: weft_platform_traits::WorkerOverrides = serde_json::from_value(serde_json::json!({ "max_instances": 0 })).unwrap();
+        let refused = anyhow::Error::new(super::worker_settings(&install, &none, project).unwrap_err());
+        assert_eq!(GiveBack::of(&refused), GiveBack::Refused(RefusedBy::Settings));
+        assert!(refused.to_string().contains("workers.max_instances"), "{refused}");
     }
 }

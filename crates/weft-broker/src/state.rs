@@ -33,6 +33,9 @@ pub const BROKER_CHANNELS: &[&str] = &[
     weft_broker_client::line::ACCESS_CHANNEL,
     weft_broker_client::line::CANCEL_CHANNEL,
     weft_broker_client::line::TRIGGERS_CHANNEL,
+    // A stored file's expiry set sooner than the expiry loop's next look
+    // (`crate::runtime_store`).
+    crate::runtime_store::FILE_EXPIRY_CHANNEL,
 ];
 
 pub struct BrokerState {
@@ -96,6 +99,8 @@ pub struct BrokerState {
     /// relay and point straight at the bucket. A local install never
     /// sets it.
     pub object_store_public_internet: bool,
+    /// See [`BrokerSettings::supervisor_booking`].
+    pub supervisor_booking: Option<weft_task_store::drain::Booking>,
 }
 
 /// What the broker is built from, besides the pool and the signal watch
@@ -113,6 +118,14 @@ pub struct BrokerSettings {
     /// How long this process's platform lets one line live before cutting
     /// it, `None` when it never does (`crate::line::LineFanout::start`).
     pub line_max_age: Option<std::time::Duration>,
+    /// The platform's alarm when the dispatcher scales to zero, `None`
+    /// when it does not: a notice to it that could not be sent is handed
+    /// to the alarm as a ring of its tick (`crate::notices`).
+    pub dispatcher_alarm: Option<Arc<dyn weft_platform_traits::Alarm>>,
+    /// Books the supervisor's next pass (`role_loop_due` row
+    /// `('supervisor', SUPERVISOR_PASS_LOOP)`) as the broker answers its
+    /// ownership sync, on a supervisor that scales to zero.
+    pub supervisor_booking: Option<weft_task_store::drain::Booking>,
 }
 
 impl BrokerState {
@@ -138,7 +151,7 @@ impl BrokerState {
         for channel in BROKER_CHANNELS {
             signals.require(channel)?;
         }
-        let notices = crate::notices::Notices::start(pool.clone());
+        let notices = crate::notices::Notices::start(pool.clone(), settings.dispatcher_alarm);
         let verifiers = weft_task_store::held_copy::HeldCopy::follow(
             &signals,
             weft_broker_client::line::ACCESS_CHANNEL,
@@ -184,6 +197,7 @@ impl BrokerState {
             public_base_url: settings.public_base_url,
             internet_url: settings.internet_url,
             object_store_public_internet: settings.object_store_public_internet,
+            supervisor_booking: settings.supervisor_booking,
         }))
     }
 }

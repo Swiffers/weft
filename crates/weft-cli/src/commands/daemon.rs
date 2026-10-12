@@ -183,8 +183,14 @@ fn env_port(name: &str, default: u16) -> Result<u16> {
     }
 }
 
-fn free_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+/// `N` free ports, all different: each is held until every one is picked,
+/// since a port let go at once may be handed out again by the next ask
+/// (two of an install's ports once came back the same, and its runtime
+/// could not bind the second).
+fn free_ports<const N: usize>() -> Result<[u16; N]> {
+    let held = (0..N).map(|_| std::net::TcpListener::bind("127.0.0.1:0")).collect::<std::io::Result<Vec<_>>>()?;
+    let ports = held.iter().map(|listener| listener.local_addr().map(|addr| addr.port())).collect::<std::io::Result<Vec<_>>>()?;
+    Ok(ports.try_into().expect("one port per listener"))
 }
 
 /// One port the install is about to listen on, and what to tell the
@@ -314,7 +320,10 @@ fn ports(install: &Install) -> Result<Ports> {
     let seeded = match (saved, install.id.name()) {
         (Some(saved), _) => saved,
         (None, None) => Ports::DEFAULT,
-        (None, Some(_)) => Ports { public: free_port()?, internal: free_port()?, outside: free_port()?, postgres: free_port()? },
+        (None, Some(_)) => {
+            let [public, internal, outside, postgres] = free_ports()?;
+            Ports { public, internal, outside, postgres }
+        }
     };
     let chosen = match install.id.name() {
         Some(_) => seeded,
@@ -933,6 +942,7 @@ fn install_config(
             public_internet: false,
         }),
         source: None,
+        alert_after_minutes: weft_platform_traits::config::DEFAULT_ALERT_AFTER_MINUTES,
     };
     config.validate().map_err(|e| anyhow::anyhow!("the install config weft made is not valid: {e}"))?;
     Ok(config)

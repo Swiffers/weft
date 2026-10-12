@@ -18,6 +18,11 @@ Each emission is one item, checked against the element type. When your body
 returns, the port closes and that is the end of the stream. To end it early,
 `ctx.close_port("chunk")`. After a close, nothing can follow.
 
+If your node has to wait on a signal, wait before the first item. Once you
+yielded on or closed a stream output, `ctx.await_signal` is refused: a pause
+replays the body from the top, and items that already went out live cannot be
+sent again.
+
 `pulse_downstream` sends and carries on. If you are producing faster than the
 consumer reads, use `yield_downstream`, which waits until each item is taken.
 

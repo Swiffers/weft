@@ -6,7 +6,7 @@ what travels the wire is a small marker saying where it is.
 ```rust
 let storage = ctx.storage(StorageScope::Execution);
 let stored = storage.put(bytes, "image/png", "chart.png", None).await?;
-ctx.pulse_downstream(NodeOutput::stored_file(stored)).await
+ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&stored)?)).await
 ```
 
 ## The five scopes

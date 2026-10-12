@@ -202,7 +202,7 @@ const READ_RETRY_LONGEST: Duration = Duration::from_secs(5);
 /// every time), or an answer that does not parse, would say the same
 /// thing again, so it is not.
 // SYNC: 503 = ask again <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
-fn broker_unavailable(e: &anyhow::Error) -> bool {
+pub fn broker_unavailable(e: &anyhow::Error) -> bool {
     if let Some(refused) = e.downcast_ref::<BrokerRefused>() {
         return refused.status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
     }
@@ -293,7 +293,7 @@ impl RecordClient for BrokerRecordClient {
         let answer = self
             .http
             .link
-            .call_bytes(JOURNAL_RECORD_PATH, batch, DEFAULT_CALL_WAIT)
+            .call_bytes(JOURNAL_RECORD_PATH, &[(BATCH_FATES_HEADER, BATCH_FATES)], batch, DEFAULT_CALL_WAIT)
             .await
             .map_err(BatchError::Unanswered)?;
         if answer.status.is_success() {
@@ -422,6 +422,12 @@ impl BrokerSignalClient {
     /// [`SignalSetHoldsRequest`]).
     pub async fn set_holds(&self, token: &str, holds: bool) -> Result<()> {
         let _: Value = self.http.post("/v1/signal/set_holds", &SignalSetHoldsRequest { token: token.to_string(), holds }).await?;
+        Ok(())
+    }
+
+    /// Give up on a signal for good (see [`SignalGiveUpRequest`]).
+    pub async fn give_up(&self, req: &SignalGiveUpRequest) -> Result<()> {
+        let _: Value = self.http.post("/v1/signal/give_up", req).await?;
         Ok(())
     }
 
@@ -670,19 +676,13 @@ impl BrokerRunClient {
         Ok(resp.answers)
     }
 
-    /// What the broker pushes about the runs this worker drives: an answer
-    /// handed to one (`crate::line::PARKED_FIRE_CHANNEL`), and when the line
-    /// may have missed some (see [`BrokerLink::subscribe`]).
-    pub fn told(&self) -> weft_task_store::pg_signal::Subscription {
-        self.http.link.subscribe()
-    }
-
-    /// The cancels waiting for the runs this worker drives (`RunCancelsRequest`).
-    pub async fn cancels(&self) -> Result<Vec<RunCancel>> {
-        let path = "/v1/run/cancels";
-        let req = RunCancelsRequest::default();
-        let resp: RunCancelsResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
-        Ok(resp.cancels)
+    /// The cancels and the answers waiting for every run this worker
+    /// drives, in one read (`RunRecheckedRequest`): what it asks once its
+    /// line may have missed some.
+    pub async fn rechecked(&self) -> Result<RunRecheckedResponse> {
+        let path = "/v1/run/rechecked";
+        let req = RunRecheckedRequest::default();
+        read_until_answered(path, || self.http.post(path, &req)).await
     }
 }
 
@@ -776,13 +776,8 @@ impl BrokerSupervisorClient {
     /// `infra_owner` lease), and return the full set it now owns plus the
     /// ones this tick took on. The supervisor acts ONLY on the owned
     /// projects.
-    pub async fn sync_ownership(&self, replica: &str, held_projects: &[Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
-        let req = SupervisorSyncOwnershipRequest { replica: replica.to_string(), held_projects: held_projects.to_vec() };
-        let resp: SupervisorSyncOwnershipResponse = self
-            .http
-            .post("/v1/supervisor/sync_ownership", &req)
-            .await?;
-        Ok(resp)
+    pub async fn sync_ownership(&self, req: &SupervisorSyncOwnershipRequest) -> Result<SupervisorSyncOwnershipResponse> {
+        self.http.post("/v1/supervisor/sync_ownership", req).await
     }
 
     /// Pure read of the projects this process owns (no claim/renew). The work
@@ -825,33 +820,35 @@ impl BrokerSupervisorClient {
         Ok(resp.nodes)
     }
 
-    pub async fn health_protocols(
+    pub async fn health_protocols(&self, project_id: Uuid) -> Result<SupervisorHealthProtocolsResponse> {
+        self.http.post("/v1/supervisor/health_protocols", &SupervisorHealthProtocolsRequest { project_id }).await
+    }
+
+    /// Replace a project's health protocol state (see
+    /// [`SupervisorSetHealthStateRequest`]).
+    pub async fn set_health_state(
         &self,
-        project_id: Uuid,
-    ) -> Result<Option<serde_json::Value>> {
-        let req = SupervisorHealthProtocolsRequest {
-            project_id,
-        };
-        let resp: SupervisorHealthProtocolsResponse = self
-            .http
-            .post("/v1/supervisor/health_protocols", &req)
-            .await?;
-        Ok(resp.protocols)
+        req: &SupervisorSetHealthStateRequest,
+    ) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>> {
+        self.http.post_fenced("/v1/supervisor/set_health_state", req).await
     }
 
     /// The oldest waiting command of a project this supervisor owns that
     /// no older waiting command reaches a copy of, other than the ones it
     /// runs already (`busy_commands`), holding up to `wait` for one to be
-    /// issued when none is waiting.
+    /// issued when none is waiting, or for a cancel of a busy one it has
+    /// not heard yet (none of `cancelling`).
     pub async fn claim_command(
         &self,
         claimer_replica: &str,
         busy_commands: &[i64],
+        cancelling: &[i64],
         wait: Duration,
     ) -> Result<SupervisorClaim> {
         let req = SupervisorClaimCommandRequest {
             claimer_replica: claimer_replica.to_string(),
             busy_commands: busy_commands.to_vec(),
+            cancelling: cancelling.to_vec(),
             wait_ms: wait_ms(wait),
         };
         self.http.post_held("/v1/supervisor/claim_command", &req, wait).await
@@ -877,32 +874,8 @@ impl BrokerSupervisorClient {
         Ok(resp.id)
     }
 
-    pub async fn set_status(
-        &self,
-        replica: &str,
-        command_id: Option<i64>,
-        project_id: Uuid,
-        node_id: &str,
-        instance: Option<&weft_core::instance::InstanceId>,
-        unit: Option<&str>,
-        status: crate::protocol::InfraNodeStatus,
-        failure_stage: Option<crate::protocol::FailureStage>,
-        failure_message: Option<&str>,
-    ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
-        let req = SupervisorSetStatusRequest {
-            replica: replica.to_string(),
-            command_id,
-            project_id,
-            node_id: node_id.to_string(),
-            instance: instance.cloned(),
-            unit: unit.map(|s| s.to_string()),
-            status,
-            failure_stage,
-            failure_message: failure_message.map(|s| s.to_string()),
-        };
-        self.http
-            .post_fenced::<_, SupervisorSetStatusResponse>("/v1/supervisor/set_status", &req)
-            .await
+    pub async fn set_status(&self, req: &SupervisorSetStatusRequest) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
+        self.http.post_fenced("/v1/supervisor/set_status", req).await
     }
 
     /// Record what the command `command_id` (an apply, a stop, a
@@ -971,17 +944,6 @@ impl BrokerSupervisorClient {
                 &req,
             )
             .await
-    }
-
-    /// Whether the user requested cancellation of a claimed command.
-    /// Polled by the executing supervisor between platform calls.
-    pub async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
-        let req = crate::protocol::SupervisorCommandCancelRequestedRequest { command_id };
-        let resp: crate::protocol::SupervisorCommandCancelRequestedResponse = self
-            .http
-            .post("/v1/supervisor/command_cancel_requested", &req)
-            .await?;
-        Ok(resp.cancel_requested)
     }
 
     /// The project's uncompleted supervisor commands (apply / stop /

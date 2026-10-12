@@ -245,6 +245,9 @@ export interface Lookup {
   page?: PageSpec;
   /** The endpoint is public: called with no credential. */
   public?: boolean;
+  /** Keep only the items holding each value at its dotted path (per
+   *  item), compared as JSON; applied server-side. */
+  where?: Record<string, unknown>;
 }
 
 // SYNC: PageSpec <-> crates/weft-core/src/node.rs PageSpec

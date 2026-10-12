@@ -10,7 +10,7 @@ use sqlx::PgPool;
 
 use sha2::Digest;
 
-use weft_core::access::client::{authed_client, base_client, resolve_steps, run_connect_call};
+use weft_core::access::client::{authed_client, base_client, resolve_steps, RefusalKind};
 use weft_core::access::events::EventsSpec;
 use weft_core::access::spec::{
     lookup_path, percent_encode, AccessSpec, Acquisition, AppRegistration, Door, OAuthGrant,
@@ -492,6 +492,7 @@ pub async fn resolve_event_source(
         events,
         recipe_values,
         provider_account,
+        expires_at_unix: access.fresh_until.map(|at| at.timestamp()),
     })
 }
 
@@ -696,6 +697,13 @@ async fn refresh(
         service: spec.service.clone(),
         reason,
     };
+    // A token endpoint not reached, or busy or down, may come back with
+    // the grant fine, so that is tried again; any other refusal is of
+    // the grant itself.
+    let refused = |e: anyhow::Error| match e.downcast_ref::<AccessError>() {
+        Some(AccessError::Unreached(_) | AccessError::NeedsReconnect { .. }) => e,
+        _ => anyhow::Error::from(reconnect(format!("the refresh was refused ({e})"))),
+    };
     match &spec.acquisition {
         Acquisition::Static { .. } => Err(reconnect(
             "its pasted credential expired (a static credential has no refresh); paste a \
@@ -726,20 +734,13 @@ async fn refresh(
                 for (k, v) in reg {
                     inputs.entry(k).or_insert(v);
                 }
-                let resp = run_connect_call(call, &inputs).await.map_err(|e| match e {
-                    // Not reached: the account may be fine, so this is
-                    // retried rather than sent to a reconnect.
-                    weft_core::access::client::ConnectCallError::Unreached(why) => anyhow::Error::from(AccessError::Unreached(why)),
-                    weft_core::access::client::ConnectCallError::Unbuildable(why) | weft_core::access::client::ConnectCallError::Refused(why) => {
-                        anyhow::Error::from(reconnect(format!("the renewal was refused ({why})")))
-                    }
-                })?;
+                let resp = crate::run_connect_call(&spec.service, call, &inputs).await.map_err(refused)?;
                 apply_captures(&call.captures, &resp, values)?;
                 return Ok(expires_at_of(&resp));
             }
             match grant {
                 OAuthGrant::ClientCredentials => {
-                    client_credentials_token_with(token_url, spec, &reg, values).await
+                    client_credentials_token_with(token_url, spec, &reg, values).await.map_err(refused)
                 }
                 OAuthGrant::AuthorizationCode { .. } => {
                     let Some(refresh_token) = values.get("refresh_token").cloned() else {
@@ -756,12 +757,7 @@ async fn refresh(
                     ];
                     let basic =
                         crate::flows::place_client_auth(*token_auth, &reg, &mut params);
-                    let resp = token_request(token_url, &params, basic).await.map_err(|e| match e.downcast_ref::<AccessError>() {
-                        // Not reached: the account may be fine, so this is
-                        // retried rather than sent to a reconnect.
-                        Some(AccessError::Unreached(_)) => e,
-                        _ => anyhow::Error::from(reconnect(format!("the refresh was refused ({e})"))),
-                    })?;
+                    let resp = token_request(token_url, &params, basic).await.map_err(refused)?;
                     let token = resp
                         .get("access_token")
                         .and_then(Value::as_str)
@@ -882,13 +878,16 @@ pub(crate) async fn mint_and_exchange(
     let status = resp.status();
     let body: Value = crate::read_json_answer(resp, &exchange.url.0).await?;
     if !status.is_success() {
-        return Err(AccessError::NeedsReconnect {
+        let answered = format!(
+            "the token exchange at {} answered {status}: {}",
+            exchange.url.0,
+            body.get("message").and_then(Value::as_str).unwrap_or("no detail")
+        );
+        // Any refusal but a busy provider is of the credential itself.
+        return Err(crate::refusal(RefusalKind::of_answer(status, &body), answered, |reason| AccessError::NeedsReconnect {
             service: spec.service.clone(),
-            reason: format!(
-                "the token exchange answered {status}: {}",
-                body.get("message").and_then(Value::as_str).unwrap_or("no detail")
-            ),
-        }
+            reason,
+        })
         .into());
     }
     let token = lookup_path(&body, &exchange.token_path)
@@ -1053,17 +1052,26 @@ pub async fn lookup(
         })?;
     let status = resp.status();
     let body: Value = crate::read_json_answer(resp, url).await?;
-    if !status.is_success() {
-        return Err(AccessError::Invalid(format!(
-            "the service answered {status} to the lookup; the access may need reconnecting"
-        ))
-        .into());
-    }
-    if body.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err(AccessError::Invalid(format!(
-            "the service refused the lookup: {}",
-            body.get("error").and_then(Value::as_str).unwrap_or("unknown error")
-        ))
+    let refusal = if !status.is_success() {
+        let said: String = body.to_string().chars().take(300).collect();
+        Some((RefusalKind::of_answer(status, &body), format!("the service answered {status} to the lookup: {said}")))
+    } else if body.get("ok").and_then(Value::as_bool) == Some(false) {
+        let code = body.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+        Some((RefusalKind::of_answer(status, &body), format!("the service refused the lookup: {code}")))
+    } else {
+        None
+    };
+    if let Some((kind, why)) = refusal {
+        // A refused credential is the connection's to fix, by a
+        // reconnect, when it is a person's own; a runtime-supplied one
+        // (or none, for a public source) has nothing to reconnect, and
+        // any other refusal is about the lookup itself.
+        return Err(crate::refusal(kind, why, |why| match resolved {
+            Some(r) if kind == RefusalKind::Auth && !r.owner.is_platform() => {
+                AccessError::NeedsReconnect { service: r.service.clone(), reason: why }
+            }
+            _ => AccessError::Invalid(why),
+        })
         .into());
     }
 
@@ -1076,7 +1084,7 @@ pub async fn lookup(
             ))
         })?;
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    for item in items.iter().filter(|item| lookup_keeps(spec, item)) {
         let id = lookup_path(item, &spec.value).map(display_of).ok_or_else(|| {
             AccessError::Invalid(format!("a lookup item carries nothing at '{}'", spec.value))
         })?;
@@ -1087,10 +1095,19 @@ pub async fn lookup(
         .page
         .as_ref()
         .and_then(|p| lookup_path(&body, &p.cursor_path))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        // A cursor can be a number (a page index, an offset) as well as
+        // text; null or empty means no more pages.
+        .filter(|v| !v.is_null())
+        .map(display_of)
+        .filter(|s| !s.is_empty());
     Ok(LookupPage { items: out, next_cursor })
+}
+
+/// Whether one answered item passes the lookup's `where`: the item
+/// holds the given value at every path, compared as JSON. Nothing at a
+/// path fails it; an empty `where` passes everything.
+fn lookup_keeps(spec: &Lookup, item: &Value) -> bool {
+    spec.where_equals.iter().all(|(path, want)| lookup_path(item, path) == Some(want))
 }
 
 fn display_of(v: &Value) -> String {
@@ -1133,6 +1150,53 @@ mod tests {
         let unclosed =
             lookup_url(&spec("https://x.example/{query"), "", &BTreeMap::new()).unwrap_err();
         assert!(unclosed.to_string().contains("unclosed"), "{unclosed}");
+    }
+
+    /// A lookup's `where`: an item is kept only when it holds every
+    /// given value at its path (nested paths too), an item with nothing
+    /// at a path is dropped, and no `where` keeps everything.
+    #[test]
+    fn lookup_where_keeps_only_items_matching_every_entry() {
+        let spec = |filter: Option<Value>| -> Lookup {
+            let mut raw = serde_json::json!({
+                "get": "https://x.example/v1/models", "items": "", "label": "name", "value": "model_id"
+            });
+            if let Some(filter) = filter {
+                raw["where"] = filter;
+            }
+            serde_json::from_value(raw).unwrap()
+        };
+        let speech = serde_json::json!({
+            "model_id": "tts", "can_do_text_to_speech": true, "limits": { "tier": "free" }
+        });
+        let voice = serde_json::json!({
+            "model_id": "vc", "can_do_text_to_speech": false, "limits": { "tier": "paid" }
+        });
+        let bare = serde_json::json!({ "model_id": "bare" });
+
+        let tts = spec(Some(serde_json::json!({ "can_do_text_to_speech": true })));
+        assert!(lookup_keeps(&tts, &speech));
+        assert!(!lookup_keeps(&tts, &voice), "a different value drops the item");
+        assert!(!lookup_keeps(&tts, &bare), "nothing at the path drops the item");
+
+        let nested = spec(Some(serde_json::json!({ "limits.tier": "free" })));
+        assert!(lookup_keeps(&nested, &speech));
+        assert!(!lookup_keeps(&nested, &voice));
+
+        let both = spec(Some(serde_json::json!({ "can_do_text_to_speech": true, "limits.tier": "paid" })));
+        assert!(!lookup_keeps(&both, &speech), "every entry must match, not just one");
+        assert!(!lookup_keeps(&both, &voice));
+
+        for unfiltered in [spec(None), spec(Some(serde_json::json!({})))] {
+            assert!(unfiltered.where_equals.is_empty());
+            for item in [&speech, &voice, &bare] {
+                assert!(lookup_keeps(&unfiltered, item), "no `where` keeps {item}");
+            }
+        }
+        assert!(
+            serde_json::to_value(spec(Some(serde_json::json!({})))).unwrap().get("where").is_none(),
+            "an empty `where` is left off the wire"
+        );
     }
 
     /// The recipe hash is a stable content address: identical maps

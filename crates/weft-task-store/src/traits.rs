@@ -26,7 +26,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::pg_signal::PgSignalWatch;
-use crate::tasks::{DedupOutcome, NewTask, Task, TaskOutcome};
+use crate::tasks::{DedupOutcome, NewTask, TaskOutcome};
 
 #[async_trait]
 pub trait TaskStoreClient: Send + Sync {
@@ -57,13 +57,14 @@ impl PostgresTaskStoreClient {
         Ok(Self { pool, signals })
     }
 
-    /// Claim one pending or stale-claimed dispatcher task, `None` when
-    /// none is claimable (the dispatcher's picker is woken when one
-    /// becomes so, see [`crate::executor::DISPATCHER_READY`]). Only the
-    /// dispatcher claims these, from the database, so this is no part of
+    /// Claim one pending or stale-claimed dispatcher task, or say when the
+    /// earliest claim out lapses when none is claimable (the dispatcher's
+    /// picker is woken when one becomes so, see
+    /// [`crate::executor::DISPATCHER_READY`]). Only the dispatcher claims
+    /// these, from the database, so this is no part of
     /// [`TaskStoreClient`], which a worker reaches through the broker.
-    pub async fn claim_dispatcher_task(&self, replica: &str) -> Result<Option<Task>> {
-        crate::tasks::claim_one(&self.pool, replica).await
+    pub async fn claim_dispatcher_task(&self, replica: &str) -> Result<crate::tasks::Claim> {
+        crate::tasks::claim_next(&self.pool, replica).await
     }
 
     pub fn pool(&self) -> &PgPool {

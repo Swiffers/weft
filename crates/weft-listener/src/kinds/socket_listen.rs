@@ -2,12 +2,13 @@
 //! kind's config and drives the shared [`crate::socket_engine`]. The
 //! address is either static or minted per cycle by the declared
 //! `connect` call; the optional connection (`SignalSpec.access`)
-//! supplies the values the mint call and the frames interpolate,
-//! resolved freshly on every reconnect. The SERVICE protocol
+//! supplies the values the mint call and the frames interpolate, as the
+//! process keeps them (`crate::reach`). The SERVICE protocol
 //! (op-codes, envelopes) stays the author's concern, carried as the
 //! literal frames and reply rules in the spec.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -58,11 +59,25 @@ impl KindHandler for SocketListenHandler {
         let access = spec.access.clone();
         let fire = ctx.fire.clone();
         let prepare_ctx = ctx.clone();
+        // Every cycle after the first follows a connection that failed or
+        // dropped: where an infra endpoint is, is asked again.
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let prepare = Box::new(move || {
             let cfg = cfg.clone();
             let access = access.clone();
             let ctx = prepare_ctx.clone();
-            async move { prepare_cycle(&cfg, &access, &ctx).await }.boxed()
+            let again = !first.swap(false, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if again {
+                    crate::infra_address::unreached(&cfg.url, &ctx);
+                }
+                let plan = prepare_cycle(&cfg, &access, &ctx).await;
+                if let Err(PrepareError::Fatal(e)) = &plan {
+                    ctx.fire.give_up(&format!("{e:#}")).await;
+                }
+                plan
+            }
+            .boxed()
         });
         let on_event = Box::new(move |payload: Value| {
             let fire = fire.clone();
@@ -118,23 +133,22 @@ async fn prepare_cycle(
     access: &Option<AccessRef>,
     ctx: &SpawnCtx,
 ) -> Result<CyclePlan, PrepareError> {
-    // Resolving through the broker is transient territory (the broker
-    // may be briefly unreachable, a refresh may be mid-flight).
-    let values: BTreeMap<String, String> = match access {
-        None => BTreeMap::new(),
+    let (values, fresh): (BTreeMap<String, String>, bool) = match access {
+        None => (BTreeMap::new(), false),
         Some(access) => {
-            let source = crate::listener_access::resolve(access, ctx)
+            let resolved = crate::listener_access::resolve(access, ctx)
                 .await
-                .map_err(PrepareError::Transient)?;
-            let mut v = source.values;
-            v.extend(source.recipe_values);
-            v
+                .map_err(PrepareError::of_resolve)?;
+            let mut v = resolved.source.values;
+            v.extend(resolved.source.recipe_values);
+            (v, resolved.fresh)
         }
     };
 
-    let url = match &cfg.minted.connect {
-        None => crate::infra_address::for_listener(&cfg.url, ctx).await.map_err(PrepareError::Transient)?,
-        Some(_) => socket_engine::mint_socket_url(&cfg.minted, &values).await?,
+    let url = match (&cfg.minted.connect, access) {
+        (None, _) => crate::infra_address::for_listener(&cfg.url, ctx).await.map_err(PrepareError::Transient)?,
+        (Some(_), Some(_)) => socket_engine::mint_signed_in(&cfg.minted, &values, fresh, ctx).await?,
+        (Some(_), None) => socket_engine::mint_socket_url(&cfg.minted, &values).await?,
     };
 
     Ok(CyclePlan {

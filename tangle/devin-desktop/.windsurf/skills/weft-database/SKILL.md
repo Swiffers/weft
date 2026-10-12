@@ -83,16 +83,32 @@ are settings of the compute in the Neon console (**Branches**, the compute,
 Neon's free plan gives a project 100 CU-hours a month, which at 0.25 CU is
 about 400 hours awake. The database sleeps 5 minutes after the last thing that
 used it, and an idle install wakes nothing: weft books a wake-up only for a
-moment something is actually due (a hibernation ending, a queued event's
-retry), and its services hold no busy connection to the database once quiet.
-Infrastructure that runs fine keeps nothing awake either, because a machine
-reports only when its state changes.
+moment something is due (a hibernation ending, a queued event's retry),
+and its services hold no busy connection to the database once quiet.
+Infrastructure that runs fine lets it sleep too, because a machine reports
+only when its state changes, and so does a run waiting on a person or on a
+caller who says nothing (a run waiting on a silent caller still keeps its
+worker up, and that worker is billed). When the month's hours run out, the
+database stops until the next month or a paid plan, and the install stops
+with it.
 
-Two things do keep it awake. A trigger that keeps a connection open keeps it
-awake around the clock, because its holder checks in through weft every 10
-seconds; on the free plan that uses up the month's hours, and when they run
-out the database stops until the next month or a paid plan, and the install
-stops with it. A VS Code editor pointed at the install keeps it awake while
-the person uses it; once the window has been out of focus or untouched for 5
-minutes, the editor stops its live connection so the install can sleep, and
-picks back up when they return.
+A trigger that keeps a connection open lets the database sleep too. Its
+holder hears about changes over Pub/Sub (the install's `weft-holders`
+topic) and proves it is alive by pushing a Cloud Tasks check ahead of itself
+every 60 seconds, and none of that touches the database. It still costs its
+Cloud Run worker pool while it runs. The database wakes when an event
+arrives on that connection, or when the connection drops or comes back (a
+drop or a return is written once, not on every reconnect attempt).
+
+What wakes it is something happening: a run doing work (its worker reports
+every second), a timer or schedule the program set coming due, a poll
+that finds something new (a poll that finds nothing touches no database at
+all, and a poll that signs in reads its credentials when weft starts the
+part that runs polls, and again when they are about to expire, when the service refuses them, or
+when the connection changes), an outside event (a route
+called, a webhook, an event on a held connection), or a person's command.
+Two things keep it awake for as long as they are open, because each holds a
+live stream to the install: `weft follow` while it runs, and a VS Code editor
+pointed at the install while the person uses it. Once the editor's window
+has been out of focus or untouched for 5 minutes, it closes its live
+connection so the install can sleep, and picks back up when they return.

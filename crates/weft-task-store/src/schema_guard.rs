@@ -991,11 +991,12 @@ const THING_QUERIES: &[&str] = &[
      FROM pg_trigger t JOIN pg_class rel ON rel.oid = t.tgrelid \
      JOIN pg_namespace n ON n.oid = rel.relnamespace \
      WHERE n.nspname = $1 AND NOT t.tgisinternal",
-    // Named with the arguments that tell one overload from another, so a
-    // function whose arguments changed is the old one dropped and the new
-    // one made, never two of one name the plan cannot tell apart.
+    // Named with the argument TYPES that tell one overload from another, as
+    // Postgres itself does: a function whose types changed is the old one
+    // dropped and the new one made, and one whose types stayed (a parameter
+    // renamed, a result changed) is the same function changed.
     "SELECT 'function' AS kind, '' AS \"table\", \
-         p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS name, \
+         p.proname || '(' || oidvectortypes(p.proargtypes) || ')' AS name, \
          pg_get_functiondef(p.oid) AS body \
      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1",
     "SELECT 'type' AS kind, '' AS \"table\", t.typname AS name, \
@@ -1486,6 +1487,13 @@ fn added(thing: &Thing) -> String {
 #[cfg(feature = "db-tests")]
 fn changed(was: &Thing, now: &Thing) -> String {
     match now.kind.as_str() {
+        // CREATE OR REPLACE cannot change what a function returns nor rename
+        // its parameters: one whose signature changed is dropped first (no
+        // CASCADE, so a trigger still on it fails the migration loudly
+        // instead of going with it).
+        "function" if function_signature(&was.body) != function_signature(&now.body) => {
+            format!("DROP FUNCTION {};\n{};", now.name, now.body)
+        }
         "function" => format!("{};", now.body),
         "type" => {
             // Postgres only ever ADDS enum labels; a removed or
@@ -1576,6 +1584,15 @@ fn changed(was: &Thing, now: &Thing) -> String {
             out.join("\n")
         }
     }
+}
+
+/// A function's head as `pg_get_functiondef` prints it: its first line
+/// (name and named parameters) and its `RETURNS` line.
+#[cfg(feature = "db-tests")]
+fn function_signature(definition: &str) -> (Option<&str>, Option<&str>) {
+    let mut lines = definition.lines().map(str::trim);
+    let head = lines.next();
+    (head, lines.find(|line| line.starts_with("RETURNS ")))
 }
 
 #[cfg(feature = "db-tests")]
@@ -2213,6 +2230,25 @@ mod tests {
         let old = vec![thing("function", "", "check"), kept.clone(), thing("trigger", "exec_event", "check_on_insert")];
         let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, ["DROP TRIGGER check_on_insert ON exec_event;", "DROP FUNCTION check CASCADE;"]);
+    }
+    /// A function whose result changed is dropped before it is made again
+    /// (CREATE OR REPLACE refuses that); one whose body alone changed is
+    /// replaced in place.
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_plan_drops_a_function_whose_signature_changed() {
+        use super::{plan_migration, Thing};
+        let func = |body: &str| Thing { kind: "function".into(), table: String::new(), name: "f(integer)".into(), body: body.into() };
+        let was = func("CREATE OR REPLACE FUNCTION public.f(p integer)\n RETURNS integer\n LANGUAGE sql\nAS $$ SELECT 1 $$");
+        let wider = func("CREATE OR REPLACE FUNCTION public.f(p integer)\n RETURNS TABLE(a integer, b boolean)\n LANGUAGE sql\nAS $$ SELECT 1, true $$");
+        let plan: Vec<String> = plan_migration(std::slice::from_ref(&was), std::slice::from_ref(&wider), &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, [format!("DROP FUNCTION f(integer);\n{};", wider.body)]);
+        let rewritten = func("CREATE OR REPLACE FUNCTION public.f(p integer)\n RETURNS integer\n LANGUAGE sql\nAS $$ SELECT 2 $$");
+        let plan: Vec<String> = plan_migration(std::slice::from_ref(&was), std::slice::from_ref(&rewritten), &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, [format!("{};", rewritten.body)]);
+        let renamed = func("CREATE OR REPLACE FUNCTION public.f(q integer)\n RETURNS integer\n LANGUAGE sql\nAS $$ SELECT 1 $$");
+        let plan: Vec<String> = plan_migration(&[was], std::slice::from_ref(&renamed), &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, [format!("DROP FUNCTION f(integer);\n{};", renamed.body)]);
     }
     /// A trigger that fires on a column holds it: the trigger goes before the
     /// column, whatever order the old schema lists them in.

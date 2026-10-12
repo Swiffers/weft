@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::instance::{InstanceId, Owner};
-use crate::activation::{ActivationScope, ActivationTarget};
+use crate::activation::ActivationScope;
+use crate::builds::BuildHashes;
 use crate::running_policy::DeactivateSpec;
 
 /// Whose triggers a deactivate took down, in order, and which instances
@@ -37,16 +38,18 @@ pub struct DeactivateRequest {
     pub all_instances: bool,
 }
 
-/// `POST /projects/{id}/resync`: what the activate points at (the
-/// hashes, the reactivate choice), the trigger-deactivation answer,
-/// required because a resync only acts on triggers that are on (428
-/// without it), and which activations. The running-work answer is the
-/// picker's, so the body carries no `runningPolicy` of its own: one
-/// answer governs the trigger drain and the worker replacement alike.
+/// `POST /projects/{id}/resync`: the build it brings live (the hashes
+/// the caller built), the trigger-deactivation answer, required because
+/// a resync only acts on triggers that are on (428 without it), and which
+/// activations. The running-work answer is the picker's, so the body
+/// carries no `runningPolicy` of its own: one answer governs the trigger
+/// drain and the worker replacement alike. No reactivate choice either:
+/// what the take-down kept is carried over (the default
+/// `ReactivateChoice`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResyncRequest {
     #[serde(flatten)]
-    pub target: ActivationTarget,
+    pub build: BuildHashes,
     #[serde(default, rename = "triggerDeactivation", skip_serializing_if = "Option::is_none")]
     pub trigger_deactivation: Option<DeactivateSpec>,
     /// Which activations. Left out (no trigger, no instance): every
@@ -79,6 +82,22 @@ mod tests {
         let every = serde_json::to_value(DeactivateRequest { all_instances: true, ..plain }).unwrap();
         assert_eq!(every["allInstances"], true);
         assert!(serde_json::from_value::<DeactivateRequest>(every).unwrap().all_instances);
+    }
+
+    #[test]
+    fn a_resync_names_its_build_and_carries_no_reactivate_choice() {
+        let body = ResyncRequest {
+            build: BuildHashes { binary_hash: Some("b".into()), ..Default::default() },
+            trigger_deactivation: None,
+            scope: ActivationScope::default(),
+        };
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire["binaryHash"], "b");
+        assert!(wire.get("reactivateChoice").is_none(), "{wire}");
+        let mut sent = wire.clone();
+        sent["reactivateChoice"] = "wipe_all".into();
+        let back: ResyncRequest = serde_json::from_value(sent).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), wire, "a choice sent anyway is not read");
     }
 
     #[test]

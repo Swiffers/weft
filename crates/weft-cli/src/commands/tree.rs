@@ -146,6 +146,7 @@ fn render_version<'a>(
                 " (the caller went away)".to_string()
             }
             Some(weft_core::exec::CancelCause::Runtime { detail }) => format!(" ({detail})"),
+            Some(weft_core::exec::CancelCause::Limit { detail }) => format!(" (a time limit: {detail})"),
             None => String::new(),
         };
         let skipped = if r.skipped_nodes > 0 {

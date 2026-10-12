@@ -15,6 +15,7 @@ use std::time::Duration;
 use weft_broker_client::protocol::InfraNodeStatus as Status;
 use weft_infra_supervisor::broker_ops::{BrokerCall, BrokerSupervisorOps};
 use weft_infra_supervisor::testing::SupervisorTestRig;
+use weft_platform_traits::clock::Clock;
 use weft_platform_traits::{HostCall, UnitRunState};
 
 /// A one-unit roster (unit named `unit`, at `status`, default windows).
@@ -31,6 +32,8 @@ fn unit_map(
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
             image_refs: Default::default(),
+            not_ready_since_unix: None,
+            ready_since_unix: None,
         },
     );
     m
@@ -77,43 +80,41 @@ fn restarts(rig: &SupervisorTestRig) -> usize {
     rig.host.calls().iter().filter(|c| matches!(c, HostCall::Restart { .. })).count()
 }
 
-// ---------- when a supervisor that scales to zero looks again ----------
+// ---------- the window lives on the row ----------
 
-/// A supervisor that scales to zero looks on a clock only while time
-/// passing can change what it decides: a unit inside its flaky window (not
-/// ready after having been) or its recovery window (ready again after
-/// being flaky). A unit that runs fine is settled, and so is one broken and
-/// already declared flaky, once what that set off has run: neither changes
-/// until the unit does, which its machine says.
+/// A unit's window is written on its row at the look that starts it and
+/// cleared when it ends, so any process (and the broker, which books the
+/// next pass at the window's end) reads where it stands. A unit that runs
+/// fine carries none and costs no write.
 #[tokio::test]
-async fn health_is_unsettled_only_while_time_can_change_a_decision() {
+async fn the_window_lives_on_the_units_row() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    let unit = |rig: &SupervisorTestRig| rig.broker.infra_node(PROJECT, NODE).unwrap().units["bridge"].clone();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
-    assert!(!rig.tick_health().await.unwrap(), "every unit ready: nothing to look at again");
+    rig.tick_health().await.unwrap();
+    assert!(rig.broker.status_writes().is_empty(), "running fine: nothing to write");
 
+    let started = rig.clock.now_unix();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
-    assert!(rig.tick_health().await.unwrap(), "not ready inside its flaky window");
+    rig.tick_health().await.unwrap();
+    assert_eq!((unit(&rig).status, unit(&rig).not_ready_since_unix), (Status::Running, Some(started)));
+    rig.advance(Duration::from_secs(10));
     observe(&rig, PROJECT, &[]);
-    assert!(rig.tick_health().await.unwrap(), "no longer reported reads as not ready, still inside the window");
-
-    rig.advance(Duration::from_secs(31));
     rig.tick_health().await.unwrap();
-    let mut settled = false;
-    for _ in 0..5 {
-        if !rig.tick_health().await.unwrap() {
-            settled = true;
-            break;
-        }
-        rig.advance(Duration::from_secs(1));
-    }
-    assert!(settled, "declared flaky, once what that set off has run: nothing to look at again");
+    assert_eq!(unit(&rig).not_ready_since_unix, Some(started), "no longer reported: still not ready, same window");
 
+    rig.advance(Duration::from_secs(21));
+    rig.tick_health().await.unwrap();
+    assert_eq!((unit(&rig).status, unit(&rig).not_ready_since_unix), (Status::Flaky, None));
+
+    let back = rig.clock.now_unix();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
-    assert!(rig.tick_health().await.unwrap(), "ready again inside its recovery window");
-    rig.advance(Duration::from_secs(31));
     rig.tick_health().await.unwrap();
-    assert!(!rig.tick_health().await.unwrap(), "recovered: settled");
+    assert_eq!((unit(&rig).status, unit(&rig).ready_since_unix), (Status::Flaky, Some(back)));
+    rig.advance(Duration::from_secs(30));
+    rig.tick_health().await.unwrap();
+    assert_eq!((unit(&rig).status, unit(&rig).ready_since_unix), (Status::Running, None));
 }
 
 // ---------- false-flaky-on-fresh-provision ----------
@@ -354,11 +355,8 @@ async fn one_flaky_unit_does_not_drag_down_a_healthy_sibling() {
 
 #[tokio::test]
 async fn stop_clears_health_state_then_start_does_not_flake() {
-    // Bug we hit before extraction: when status leaves `running`,
-    // health state was retained, so the first re-observation of
-    // not-ready (which happens during provisioning) computed
-    // last_ready_at-from-the-stale-deployment, instantly flagging
-    // the node as flaky. Test: simulate stop→start and assert no
+    // A stopped unit is not looked at, so nothing from before its stop
+    // makes it flaky after its start: simulate stop→start and assert no
     // flaky event fires.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
@@ -373,19 +371,18 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
     // Stop: status flips to stopped. (Simulating what lifecycle's
     // stop verb would do; we just write directly here.)
     rig.broker
-        .set_status("test-replica", None, PROJECT, NODE, None, Some(NODE), Status::Stopped, None, None)
+        .set_status("test-replica", 1, PROJECT, NODE, None, Some(NODE), Status::Stopped, None, None)
         .await
         .unwrap();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
 
-    // Tick: should NOT evaluate health (status is stopped) AND
-    // should clear the state.
+    // Tick: should NOT evaluate health (status is stopped).
     rig.advance(Duration::from_secs(60));
     rig.tick_health().await.unwrap();
 
     // Start: status flips back to running, replicas come back.
     rig.broker
-        .set_status("test-replica", None, PROJECT, NODE, None, Some(NODE), Status::Running, None, None)
+        .set_status("test-replica", 1, PROJECT, NODE, None, Some(NODE), Status::Running, None, None)
         .await
         .unwrap();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
@@ -466,6 +463,7 @@ async fn flaky_emits_event_then_set_status() {
 
     rig.tick_health().await.unwrap();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
+    rig.tick_health().await.unwrap(); // first not-ready observation
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
 
@@ -476,17 +474,17 @@ async fn flaky_emits_event_then_set_status() {
             BrokerCall::EventRecord { kind, .. } if kind == "flaky" => {
                 saw_event = true;
             }
-            BrokerCall::SetStatus { status, .. } if *status == Status::Flaky => {
+            BrokerCall::SetUnitHealth { status, .. } if *status == Status::Flaky => {
                 assert!(
                     saw_event,
-                    "set_status(flaky) must come AFTER event_record(flaky)"
+                    "set_unit_health(flaky) must come AFTER event_record(flaky)"
                 );
                 return;
             }
             _ => {}
         }
     }
-    panic!("never saw set_status(flaky)");
+    panic!("never saw set_unit_health(flaky)");
 }
 
 // ---------- empty project ----------
@@ -572,22 +570,21 @@ async fn hung_action_times_out_frees_inflight_and_unlatches_fired() {
     // timeout mapped it to a failed action.
     assert_eq!(restarts(&rig), 1, "the action should have started before hanging");
 
-    let reg = rig.state.health.lock().await;
     // Mechanical free: slot released so the next tick can evaluate.
-    assert!(!reg.is_in_flight(PROJECT), "timed-out action must free in_flight");
-    // Retryability: the failed protocol is NOT latched in `fired`, so
-    // the next tick re-fires it (the wedge fix).
-    assert!(
-        !reg.is_fired(PROJECT, "restart-when-down"),
-        "timed-out action must un-latch from fired so it retries"
-    );
+    assert!(!rig.state.health.lock().await.is_in_flight(PROJECT), "timed-out action must free in_flight");
+    let row = protocol_state(&rig).expect("the failure is kept");
+    // Retryability: the failed protocol is NOT latched as fired, so
+    // a later tick fires it again (the wedge fix).
+    assert_eq!(row.acted, None, "timed-out action must not count as fired");
     // Backoff armed: one failure recorded, so the immediate next tick
     // is skipped (no re-fire storm) until the backoff window elapses.
-    assert_eq!(
-        reg.backoff_failures(PROJECT, "restart-when-down"),
-        1,
-        "a failed action must arm exponential backoff"
-    );
+    assert_eq!(row.consecutive_failures, 1, "a failed action must arm the backoff");
+    assert_eq!(row.next_retry_at_unix, Some(rig.clock.now_unix() + 5));
+}
+
+/// What the restart protocol did, as the broker keeps it.
+fn protocol_state(rig: &SupervisorTestRig) -> Option<weft_broker_client::protocol::HealthProtocolState> {
+    rig.broker.health_state(PROJECT).into_iter().find(|s| s.protocol == "restart-when-down")
 }
 
 #[tokio::test(start_paused = true)]
@@ -609,7 +606,7 @@ async fn failed_action_backs_off_then_retries_after_window() {
         .unwrap();
     let calls_after_1 = restarts(&rig);
     assert_eq!(calls_after_1, 1, "first tick fires the action");
-    assert_eq!(rig.state.health.lock().await.backoff_failures(PROJECT, "restart-when-down"), 1);
+    assert_eq!(protocol_state(&rig).unwrap().consecutive_failures, 1);
 
     // Tick 2 immediately (no clock advance): inside the backoff
     // window -> skipped, no new action.
@@ -627,11 +624,28 @@ async fn failed_action_backs_off_then_retries_after_window() {
         .expect("tick 3 hung")
         .unwrap();
     assert_eq!(restarts(&rig), 2, "tick past backoff window re-fires");
-    assert_eq!(
-        rig.state.health.lock().await.backoff_failures(PROJECT, "restart-when-down"),
-        2,
-        "second failure grows the backoff count"
-    );
+    assert_eq!(protocol_state(&rig).unwrap().consecutive_failures, 2, "second failure grows the backoff count");
+
+    // The third failure gives up, reported once by the next ownership
+    // sync (and never as a failure tried again on a clock), and no later
+    // look fires it again while what it saw stays the same.
+    rig.advance(Duration::from_secs(11));
+    tokio::time::timeout(Duration::from_secs(120), rig.tick_health()).await.expect("tick 4 hung").unwrap();
+    assert_eq!(restarts(&rig), 3);
+    let row = protocol_state(&rig).unwrap();
+    assert!(row.gave_up_at_unix.is_some() && row.next_retry_at_unix.is_none(), "given up: {row:?}");
+    rig.tick_ownership().await.unwrap();
+    rig.tick_ownership().await.unwrap();
+    assert_eq!(rig.broker.gave_up(), vec![PROJECT]);
+    assert!(rig.broker.failed().is_empty());
+    rig.advance(Duration::from_secs(5));
+    rig.tick_health().await.unwrap();
+    assert_eq!(restarts(&rig), 3, "given up: no retry while what it saw stays the same");
+
+    // Every unit healthy re-arms it.
+    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
+    rig.tick_health().await.unwrap();
+    assert_eq!(protocol_state(&rig), None, "healthy: nothing failed is kept");
 }
 
 #[tokio::test]
@@ -655,65 +669,9 @@ async fn completed_action_frees_in_flight() {
 
 // ---------- regression: set_applied lands mid-flaky ----------
 
-#[tokio::test]
-async fn set_applied_landing_mid_flaky_is_re_observed_next_tick() {
-    // Regression for round-4: `set_applied` is unconditional. If it
-    // lands while the supervisor's in-RAM flaky tracker still sees
-    // degraded replicas, the row briefly flips `flaky` → `running`.
-    // The next health tick must re-observe and re-write `flaky`
-    // because the in-RAM latch (`declared_flaky`, with its
-    // `last_not_ready_at`) persists across the row's rewrite.
-    //
-    // Without that property, the row sticks at `running` while the
-    // install is broken.
-    let rig = rig();
-    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
-    // Tick 1: healthy baseline.
-    rig.tick_health().await.unwrap();
-
-    // Replicas degrade and stay degraded.
-    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
-
-    // Tick 2 after the flaky window: emits flaky, writes Flaky status.
-    rig.advance(Duration::from_secs(35));
-    rig.tick_health().await.unwrap();
-    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Flaky);
-
-    // Simulate a parallel `set_applied` landing: external write
-    // flips status back to Running with no failure_stage. (In
-    // production this comes from the supervisor's own apply path;
-    // here we mutate the broker fake to mimic the race.)
-    rig.broker
-        .add_infra_node_with(
-            PROJECT,
-            NODE,
-            "inst1",
-            Status::Running,
-            Some("hash".into()),
-            std::collections::BTreeMap::new(),
-            unit_map(NODE, Status::Running),
-        );
-    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Running);
-
-    // Tick 3: replicas still degraded, the latch still declared flaky
-    // from before. The tick derives Flaky from the latch (no new edge,
-    // so no second `flaky` event) and writes Flaky status back.
-    rig.advance(Duration::from_secs(1));
-    rig.tick_health().await.unwrap();
-    assert_eq!(
-        rig.broker.infra_node(PROJECT, NODE).unwrap().status,
-        Status::Flaky,
-        "next tick must re-observe degraded replicas and rewrite Flaky"
-    );
-}
-
-/// A frozen unit the row calls `Flaky`, still at 0 ready, must stay
-/// `Flaky` on the first tick after its latch was cleared (a command in
-/// flight on the copy clears it): the fresh latch is seeded
-/// from the row, so the reconcile has nothing to rewrite. Before the
-/// seeding, the empty latch derived `Running` and rewrote the unit,
-/// and the node with it, while nothing was ready.
+/// A frozen unit the row calls `Flaky`, still at 0 ready, stays `Flaky`
+/// after a command in flight on the copy stood health down: the latch is
+/// the row, so there is nothing to rewrite.
 #[tokio::test]
 async fn frozen_flaky_unit_is_not_rewritten_running_after_latch_reset() {
     let rig = rig();
@@ -1039,22 +997,49 @@ async fn three_stage_recovery_deactivate_restart_reactivate() {
 
 // ---------- ownership ----------
 
-/// A lost project's health state is dropped at once (its latch with it),
-/// and a claimed one is looked at at once, without waiting for the tick.
+/// A claimed project is looked at at once, without waiting for the
+/// tick. What its protocols did lives with the project, not in this
+/// process: a restart already made is not made again.
 #[tokio::test]
 async fn ownership_changes_reach_the_health_loop_at_once() {
     use weft_infra_supervisor::ownership::OwnershipChange;
     let rig = rig_with_restart_protocol();
     rig.tick_health().await.unwrap();
     assert_eq!(restarts(&rig), 1);
-    assert!(rig.state.health.lock().await.is_fired(PROJECT, "restart-when-down"));
-
-    rig.health_ownership_change(&OwnershipChange { claimed: vec![], lost: vec![PROJECT] }).await.unwrap();
-    assert!(
-        !rig.state.health.lock().await.is_fired(PROJECT, "restart-when-down"),
-        "a lost project's latch is dropped"
-    );
+    let looks = |rig: &SupervisorTestRig| rig.broker.calls().iter().filter(|c| matches!(c, BrokerCall::OwnedProjects { .. })).count();
+    let before = looks(&rig);
 
     rig.health_ownership_change(&OwnershipChange { claimed: vec![PROJECT], lost: vec![] }).await.unwrap();
-    assert_eq!(restarts(&rig), 2, "a claimed project is looked at without waiting for the tick");
+    assert_eq!(looks(&rig), before + 1, "a claimed project is looked at without waiting for the tick");
+    assert_eq!(restarts(&rig), 1, "the restart it made is kept with the project");
 }
+
+weft_core::stress_test!(
+    name: a_pass_keeps_renewing_its_leases_while_a_protocol_acts,
+    runs: 8,
+    worker_threads: 4,
+    async fn body() {
+        // A protocol's restart can take the cloud minutes, longer than a
+        // lease: the pass renews while it acts, so no sibling takes the
+        // project over and restarts the unit a second time.
+        let syncs = |rig: &SupervisorTestRig| rig.broker.calls().iter().filter(|c| matches!(c, BrokerCall::SyncOwnership { .. })).count();
+        let rig = rig_with_restart_protocol();
+        rig.host.hang_restarts();
+        rig.advance(Duration::from_secs(35));
+        let pass = tokio::spawn({
+            let state = rig.state.clone();
+            async move { weft_infra_supervisor::tick(&state).await }
+        });
+        let bounded = tokio::time::timeout(Duration::from_secs(4), async {
+            while restarts(&rig) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let acting = syncs(&rig);
+            while syncs(&rig) < acting + 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        bounded.await.expect("the leases were not renewed while the restart hangs");
+        pass.abort();
+    }
+);

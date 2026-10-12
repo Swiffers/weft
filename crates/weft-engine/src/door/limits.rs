@@ -282,8 +282,10 @@ impl Counts {
 }
 
 /// The key a refused token from `address` is counted under. Its second
-/// part is no route's token, so no route reads it back at a tick; each copy
+/// part is `-`, which a tick leaves out of the other copies' counts it
+/// hears (`weft_task_store::worker_door`, `weft_door_tick`): each copy
 /// bounds what it saw itself.
+// SYNC: the `-` second part <-> crates/weft-task-store/src/worker_door.rs (weft_door_tick)
 fn invalid_tokens_key(address: &str) -> String {
     format!("t:-:{address}")
 }

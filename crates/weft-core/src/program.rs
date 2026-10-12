@@ -173,16 +173,21 @@ impl InfraCopy {
     }
 }
 
-/// Fires of one instance's trigger that wait, parked, because the instance
-/// has not given (or gave an invalid) value the fire needs. They are not
-/// retried on a timer: the instance's next change of values routes them
-/// again, and so does activating the trigger.
+/// Fires of one trigger that wait in its queue on something no clock
+/// brings ([`crate::door_fire::WaitsOn`]): a value its instance has not
+/// given (or gave an invalid one), infra the run reads, connections the
+/// install has not picked, or a hand-over that kept failing, which holds
+/// the trigger's queue. What they wait on hands them over again, and so
+/// does activating the trigger.
 // SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts ActivationEntry.waiting
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingFires {
     pub fires: u32,
-    /// Why, naming the field (`instance 'ada' at 'answer': 'key' is not
-    /// filled`): the refusal of the fire parked last.
+    /// What the fire parked or stopped last waits on.
+    pub on: crate::door_fire::UnclockedWait,
+    /// Why, as it was said: an instance's refusal names the field
+    /// (`instance 'ada' at 'answer': 'key' is not filled`), a failure is
+    /// its error.
     pub reason: String,
 }
 
@@ -666,7 +671,11 @@ mod tests {
         let waiting = InstanceTrigger {
             trigger: "inbox".into(),
             mode: crate::activation::ActivationMode::Active,
-            waiting: Some(WaitingFires { fires: 2, reason: "instance 'cyd' at 'answer': 'key' is not filled".into() }),
+            waiting: Some(WaitingFires {
+                fires: 2,
+                on: crate::door_fire::UnclockedWait::Instance,
+                reason: "instance 'cyd' at 'answer': 'key' is not filled".into(),
+            }),
         };
         let merged = InstanceHoldings::merge(
             vec![(instance("ada"), 3)],

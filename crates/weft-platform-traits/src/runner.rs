@@ -417,6 +417,31 @@ impl WorkerStarting {
     }
 }
 
+/// The answer [`Runner::endpoint`] gives when the platform refused weft's
+/// own call to bring up or find the project's workers (permission denied,
+/// a quota reached, a request it calls invalid): a definite no, unlike an
+/// API that timed out or never answered. `why` is the platform's answer in
+/// words. [`PlatformRefused::is`] recognizes it.
+#[derive(Debug)]
+pub struct PlatformRefused {
+    pub why: String,
+}
+
+impl std::fmt::Display for PlatformRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the platform refused weft's call: {}", self.why)
+    }
+}
+
+impl std::error::Error for PlatformRefused {}
+
+impl PlatformRefused {
+    /// Whether `e` is (or wraps) this answer.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<PlatformRefused>().is_some()
+    }
+}
+
 /// The port [`Runner::front`] was asked to publish is held by another
 /// program on the machine. [`PortTaken::of`] recognizes it.
 #[derive(Debug)]
@@ -488,7 +513,10 @@ pub trait Runner: Send + Sync {
     /// platform needs that done by hand. A platform whose workers take
     /// minutes to come up waits on it as `patience` says: a
     /// [`Patience::Brief`] caller hears [`WorkerStarting`] after a short
-    /// hold rather than being held through the whole bring-up.
+    /// hold rather than being held through the whole bring-up. The
+    /// platform refusing the call that brings them up or finds them is
+    /// [`PlatformRefused`]; any other error is the platform giving no
+    /// answer.
     async fn endpoint(&self, target: &WorkerTarget, patience: Patience) -> anyhow::Result<WorkerEndpoint>;
 
     /// How a call to the address [`Runner::endpoint`] gave for `target`

@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsDesignVoice",
   "label": "Design Voice",
-  "description": "Generate voice previews from a text description (age, accent, tone, character). Each preview carries its audio and a preview id; wire the one you like into Create Voice to mint it as a durable voice.",
+  "description": "Generate voice previews from a text description (age, accent, tone, character), and on eleven_ttv_v3 from a reference recording too. Each preview carries its audio and a preview id; wire the one you like into Create Voice to mint it as a durable voice.",
   "tags": [
     "ai",
     "audio",
@@ -10,9 +10,6 @@
   ],
   "icon": "Wand",
   "color": "#6b6b99",
-  "types": {
-    "VoicePreview": "{ voiceId: String, audio: Audio, durationSecs?: Number, language?: String }"
-  },
   "inputs": [
     {
       "name": "account",
@@ -28,14 +25,14 @@
       "type": "String",
       "widget": { "kind": "textarea" },
       "required": true,
-      "description": "What the voice should sound like.",
+      "description": "What the voice should sound like, in 20 to 1000 characters.",
       "placeholder": "A calm, deep male narrator with a slight British accent"
     },
     {
       "name": "text",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "description": "The preview line to speak. Absent = a fitting line is generated."
+      "description": "The line the previews speak, 100 to 1000 characters. Leave empty and ElevenLabs writes a line that suits the description; the `text` output carries the line either way."
     },
     {
       "name": "model",
@@ -49,14 +46,241 @@
           "eleven_ttv_v3"
         ]
       },
-      "label": "Model"
+      "label": "Model",
+      "description": "eleven_ttv_v3 is ElevenLabs's human-like, expressive voice design model, for 70+ languages, and the only one that takes `referenceAudio`. eleven_multilingual_ttv_v2 covers 29 languages."
+    },
+    {
+      "name": "outputFormat",
+      "type": "String",
+      "default": "mp3_44100_128",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "mp3_44100_128",
+          "mp3_44100_192",
+          "mp3_44100_96",
+          "mp3_44100_64",
+          "mp3_44100_32",
+          "mp3_24000_48",
+          "mp3_22050_32",
+          "pcm_44100",
+          "pcm_48000",
+          "pcm_32000",
+          "pcm_24000",
+          "pcm_22050",
+          "pcm_16000",
+          "pcm_8000",
+          "ulaw_8000",
+          "alaw_8000",
+          "opus_48000_32",
+          "opus_48000_64",
+          "opus_48000_96",
+          "opus_48000_128",
+          "opus_48000_192"
+        ]
+      },
+      "label": "Output format",
+      "description": "The format of the previews' audio. opus_48000_* is stored as Ogg Opus. ElevenLabs gives mp3_44100_192 only on its Creator plan and above, and pcm_44100 only on Pro and above."
+    },
+    {
+      "name": "guidanceScale",
+      "type": "Number",
+      "label": "Guidance scale",
+      "description": "How closely the voice follows the description: lower leaves ElevenLabs more freedom, higher sticks to the description and can sound artificial or robotic. ElevenLabs recommends a longer, more detailed description at a lower value. Leave empty for ElevenLabs's default, 5.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 100,
+        "step": 0.5
+      }
+    },
+    {
+      "name": "shouldEnhance",
+      "type": "Boolean",
+      "default": false,
+      "label": "Enhance description",
+      "description": "Turn on to have ElevenLabs expand a short description into a more detailed one before it designs the voice."
+    },
+    {
+      "name": "quality",
+      "type": "Number",
+      "description": "From -1 to 1: higher gives a better voice but less variety. Leave empty to let ElevenLabs decide.",
+      "widget": {
+        "kind": "number",
+        "min": -1,
+        "max": 1,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "loudness",
+      "type": "Number",
+      "description": "How loud the previews are, from -1 (quietest) to 1 (loudest); 0 is roughly -24 LUFS. Leave empty for ElevenLabs's default, 0.5.",
+      "widget": {
+        "kind": "number",
+        "min": -1,
+        "max": 1,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "description": "If you want the same voice again, set any whole number here, then run again with that number and the same settings: ElevenLabs says the same seed with the same inputs gives the same voice. Leave empty for a new random seed each run.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 2147483647,
+        "step": 1
+      }
+    },
+    {
+      "name": "referenceAudio",
+      "type": "Audio",
+      "label": "Reference audio",
+      "description": "A recording for ElevenLabs to use as a reference when it designs the voice; `promptStrength` sets how much it counts against the description. Only eleven_ttv_v3 takes it."
+    },
+    {
+      "name": "promptStrength",
+      "type": "Number",
+      "label": "Prompt strength",
+      "description": "How the description and `referenceAudio` are weighed: 0 lets the reference audio decide almost alone, 1 the description. Needs `referenceAudio`.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      }
     }
   ],
   "outputs": [
     {
       "name": "previews",
       "type": "List[VoicePreview]",
-      "description": "The generated previews: audio + the preview id Create Voice takes."
+      "description": "The generated previews, each with its audio and the `voiceId` Create Voice takes."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "description": "The line the previews speak: your `text`, or the one ElevenLabs wrote when it was empty."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "description",
+        "regex": "(?s)^.{0,19}$"
+      },
+      "then": {
+        "message": "ElevenLabsDesignVoice '{id}' has a `description` under 20 characters, and ElevenLabs takes 20 to 1000: describe the voice in more detail.",
+        "port": "description"
+      }
+    },
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "description",
+        "regex": "(?s)^.{1001}"
+      },
+      "then": {
+        "message": "ElevenLabsDesignVoice '{id}' has a `description` over 1000 characters, and ElevenLabs takes 20 to 1000: shorten it.",
+        "port": "description"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "\\S"
+          },
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "(?s)^.{1,99}$"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDesignVoice '{id}' has a `text` under 100 characters, and ElevenLabs speaks a line of 100 to 1000: write a longer line, or leave `text` empty and ElevenLabs writes one.",
+        "port": "text"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "\\S"
+          },
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "(?s)^.{1001}"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDesignVoice '{id}' has a `text` over 1000 characters, and ElevenLabs speaks a line of 100 to 1000: shorten it, or leave `text` empty and ElevenLabs writes one.",
+        "port": "text"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "referenceAudio"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "model"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "model",
+              "equals": "eleven_ttv_v3"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDesignVoice '{id}' gives `referenceAudio`, and ElevenLabs takes reference audio only on eleven_ttv_v3: set `model` to eleven_ttv_v3, or leave `referenceAudio` empty.",
+        "port": "referenceAudio"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "promptStrength"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "referenceAudio"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsDesignVoice '{id}' sets `promptStrength`, which weighs the description against `referenceAudio`, and no `referenceAudio` is given: wire one in, or leave `promptStrength` empty.",
+        "port": "promptStrength"
+      }
     }
   ],
   "features": {

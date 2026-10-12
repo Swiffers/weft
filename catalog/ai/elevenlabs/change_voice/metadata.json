@@ -48,14 +48,25 @@
       "type": "String",
       "default": "eleven_multilingual_sts_v2",
       "widget": {
-        "kind": "select",
+        "kind": "remote_select",
+        "access": "account",
         "free_text": true,
-        "options": [
-          "eleven_multilingual_sts_v2",
-          "eleven_english_sts_v2"
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/models",
+            "items": "",
+            "label": "name",
+            "value": "model_id",
+            "where": {
+              "can_do_voice_conversion": true
+            }
+          }
         ]
       },
-      "label": "Model"
+      "label": "Model",
+      "placeholder": "Pick a model, or paste its id",
+      "description": "ElevenLabs recommends eleven_multilingual_sts_v2 for changing a voice; eleven_english_sts_v2 is English only."
     },
     {
       "name": "outputFormat",
@@ -66,9 +77,27 @@
         "options": [
           "mp3_44100_128",
           "mp3_44100_192",
-          "pcm_16000",
+          "mp3_44100_96",
+          "mp3_44100_64",
+          "mp3_44100_32",
+          "mp3_24000_48",
+          "mp3_22050_32",
+          "wav_44100",
+          "wav_48000",
+          "wav_32000",
+          "wav_24000",
+          "wav_22050",
+          "wav_16000",
+          "wav_8000",
           "pcm_44100",
+          "pcm_48000",
+          "pcm_32000",
+          "pcm_24000",
+          "pcm_22050",
+          "pcm_16000",
+          "pcm_8000",
           "ulaw_8000",
+          "alaw_8000",
           "opus_48000_32",
           "opus_48000_64",
           "opus_48000_96",
@@ -77,7 +106,67 @@
         ]
       },
       "label": "Output format",
-      "description": "mp3 for anything that plays a file, pcm or ulaw for telephony, opus_48000_* for a WhatsApp voice note (stored as Ogg Opus)."
+      "description": "mp3 or wav for anything that plays a file, pcm, ulaw or alaw for telephony, opus_48000_* for a WhatsApp voice note (stored as Ogg Opus). ElevenLabs gives mp3_44100_192 only on its Creator plan and above, and pcm or wav at 44100 only on Pro and above."
+    },
+    {
+      "name": "stability",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "Voice stability (0 varied, 1 monotone). Absent = the voice's own setting."
+    },
+    {
+      "name": "similarityBoost",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "How closely the output sticks to the voice. Absent = the voice's own setting."
+    },
+    {
+      "name": "speed",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0.7,
+        "max": 1.2,
+        "step": 0.05
+      },
+      "description": "Speaking speed multiplier. Absent = the voice's own setting."
+    },
+    {
+      "name": "style",
+      "type": "Number",
+      "description": "How much the voice exaggerates its speaker's style: 0 leaves it as it is, and higher values amplify it, which ElevenLabs says can make the answer slower.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "speakerBoost",
+      "type": "Boolean",
+      "label": "Speaker boost",
+      "description": "Makes the audio sound more like the voice's original speaker, at the cost of a slightly slower answer."
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "description": "If you want to be able to make a similar take again, set any whole number here, then run again with that number and the same recording. ElevenLabs tries to give the same audio back but does not promise it. Leave empty for a new random seed each run.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 4294967295,
+        "step": 1
+      }
     },
     {
       "name": "removeBackgroundNoise",
@@ -85,6 +174,27 @@
       "default": false,
       "label": "Remove background noise",
       "description": "Clean the recording before re-voicing."
+    },
+    {
+      "name": "fileFormat",
+      "type": "String",
+      "default": "other",
+      "label": "Recording format",
+      "description": "If the recording is raw 16-bit PCM at 16 kHz, mono, little-endian, pick pcm_s16le_16: ElevenLabs answers sooner than for an encoded file. Leave `other` for anything else.",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "other",
+          "pcm_s16le_16"
+        ]
+      }
+    },
+    {
+      "name": "enableLogging",
+      "type": "Boolean",
+      "default": true,
+      "label": "Keep history",
+      "description": "Turn off for zero retention: ElevenLabs then keeps no history of the request. Only Enterprise accounts can turn it off."
     }
   ],
   "outputs": [

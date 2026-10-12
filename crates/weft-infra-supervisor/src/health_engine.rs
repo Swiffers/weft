@@ -7,11 +7,11 @@
 //!
 //!   inputs           pure fn                outputs
 //!   ─────────  ───────────────────────  ───────────────
-//!   prior NodeHealthState  +
+//!   the unit's row (latch, window) +
 //!   unit ready or not      ──> evaluate_node_health  ──> NodeDecision
-//!   "now" instant
+//!   now (unix seconds)
 //!
-//!   prior in_flight set    +
+//!   prior in_flight flag   +
 //!   prior fired scopes     +
 //!   seen units             ──> evaluate_protocols    ──> Option<ProtocolMatch>
 //!   protocol list
@@ -22,7 +22,7 @@
 //! resulting events.
 
 use std::collections::{BTreeSet, HashMap};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use weft_broker_client::protocol::InfraCopy;
 
@@ -36,112 +36,73 @@ use crate::protocol::{
 pub const FLAKY_AFTER: Duration = Duration::from_secs(30);
 pub const RECOVERY_AFTER: Duration = Duration::from_secs(30);
 
-/// In-memory tracking of one (project, node) pair's health window.
-/// Plain data; the engine reads and writes it via copy + return,
-/// the caller owns the map of `(project, node) -> state`.
+/// One unit's health latch and the window it is in, as its row carries it
+/// (`UnitRuntime`): the row is the only place it lives, so any process
+/// that looks next carries on from where the last look left it, and the
+/// broker knows from it when a window ends (the supervisor's next pass).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NodeHealthState {
-    /// Last observation in which this unit was ready. None until we've
-    /// ever seen it ready.
-    pub last_ready_at: Option<Instant>,
-    /// Last observation in which this node was NOT Ready. None
-    /// until we've ever seen it Not-Ready.
-    pub last_not_ready_at: Option<Instant>,
     /// Latched: true after we declared flaky, false after we
-    /// declared recovered. Flips via the windowed transitions.
+    /// declared recovered. Flips via the windowed transitions. The row's
+    /// `flaky` status is this latch.
     pub declared_flaky: bool,
+    /// Since when (unix seconds) a unit not declared flaky has been seen
+    /// not ready.
+    pub not_ready_since_unix: Option<i64>,
+    /// Since when (unix seconds) a unit declared flaky has been seen ready
+    /// again.
+    pub ready_since_unix: Option<i64>,
 }
 
 impl NodeHealthState {
-    /// A fresh latch for a unit whose row already says `status`, so the
-    /// first look after the latch is gone (a command on the copy, a
-    /// restart, the project moving to another process: the latch lives in
-    /// this process's memory only) argues from the durable row instead of
-    /// against it.
-    ///
-    /// A unit the row calls `Flaky` starts declared flaky with its
-    /// not-ready edge at `now`, so it recovers only through the full
-    /// recovery window; an empty latch would instead read as "never
-    /// seen ready, nothing declared", derive `Running`, and rewrite a
-    /// frozen, still-broken unit to `Running` for as long as it never
-    /// becomes ready.
-    ///
-    /// A unit the row calls `Running` whose copy was applied at least
-    /// `flaky_after` ago (`applied_at_unix`, wall clock) is KNOWN: its
-    /// apply finished and it has had its whole window to show up, so it
-    /// starts as seen ready at `now`. A unit the host then no longer
-    /// reports reads as not ready and turns flaky after the window,
-    /// instead of staying unknown (and counting as healthy) for ever.
-    /// One applied more recently starts empty: the host may not report
-    /// it yet. The caller never evaluates a unit outside {Running,
-    /// Flaky}.
-    pub fn seeded_from(
-        status: weft_broker_client::protocol::InfraNodeStatus,
-        applied_at_unix: Option<i64>,
-        flaky_after: Duration,
-        now: Instant,
-        now_unix: i64,
-    ) -> Self {
-        use weft_broker_client::protocol::InfraNodeStatus;
-        let flaky = status == InfraNodeStatus::Flaky;
-        let settled = status == InfraNodeStatus::Running
-            && applied_at_unix.is_some_and(|at| now_unix.saturating_sub(at) >= flaky_after.as_secs() as i64);
+    /// The latch a unit's row carries. The caller never evaluates a unit
+    /// outside {Running, Flaky}.
+    pub fn of(unit: &weft_broker_client::protocol::UnitRuntime) -> Self {
         Self {
-            last_ready_at: settled.then_some(now),
-            last_not_ready_at: flaky.then_some(now),
-            declared_flaky: flaky,
+            declared_flaky: unit.status == weft_broker_client::protocol::InfraNodeStatus::Flaky,
+            not_ready_since_unix: unit.not_ready_since_unix,
+            ready_since_unix: unit.ready_since_unix,
         }
     }
-}
 
-impl NodeHealthState {
-    /// Whether this latch has ever observed the unit's workload (or was
-    /// seeded from a row that says it is broken).
-    pub fn has_seen(&self) -> bool {
-        self.last_ready_at.is_some() || self.last_not_ready_at.is_some()
-    }
-
-    /// Whether time passing alone can change what this latch says, the unit
-    /// last seen `ready` or not: a unit seen ready before and not ready now
-    /// turns flaky once its window has passed, and a flaky one ready again
-    /// recovers once its window has passed. Anything else stays as it is
-    /// until the unit itself changes, which its machine says
-    /// (`weft_runtime::unit_agent`).
-    pub fn waits_on_time(&self, ready: bool) -> bool {
-        if ready {
-            self.declared_flaky
-        } else {
-            !self.declared_flaky && self.last_ready_at.is_some()
-        }
+    /// Whether this latch has seen the unit's workload: broken, or in a
+    /// window.
+    fn has_seen(&self) -> bool {
+        self.declared_flaky || self.not_ready_since_unix.is_some() || self.ready_since_unix.is_some()
     }
 }
 
 /// Pure: one unit's decision from what this look saw of it (`None`: the
-/// host does not report the unit). A unit never seen is UNKNOWN (`None`
-/// back, the latch untouched): a copy just applied that the host does not
-/// report yet is neither ready nor broken. One seen before and now absent
+/// host does not report the unit). A unit the host does not report is
+/// UNKNOWN (`None` back) while nothing says it should be there: a copy
+/// applied less than `flaky_after` ago (`applied_at_unix`) may not be
+/// reported yet. One seen broken or in a window before, or whose copy was
+/// applied longer ago than that (its apply waited for it to be ready),
 /// reads as not ready.
 pub fn observe_unit(
     prior: NodeHealthState,
     observed: Option<NodeObservation>,
-    now: Instant,
+    applied_at_unix: Option<i64>,
+    now_unix: i64,
     flaky_after: Duration,
     recovery_after: Duration,
 ) -> Option<NodeDecision> {
+    let settled = applied_at_unix.is_some_and(|at| now_unix.saturating_sub(at) >= secs(flaky_after));
     let observation = match observed {
         Some(observation) => observation,
-        None if prior.has_seen() => NodeObservation { ready: false },
+        None if prior.has_seen() || settled => NodeObservation { ready: false },
         None => return None,
     };
-    Some(evaluate_node_health(prior, observation, now, flaky_after, recovery_after))
+    Some(evaluate_node_health(prior, observation, now_unix, flaky_after, recovery_after))
 }
 
 /// What `evaluate_node_health` decided this tick.
 ///
 /// Three pieces:
-///   - `next`: the new tracker state.
+///   - `next`: the new latch and window, written to the unit's row when
+///     they differ from what it carries.
 ///   - `desired_status`: what the row SHOULD say, derived from the
-///     tracker. The I/O layer compares this to the observed row
+///     latch. The I/O layer compares this to the observed row
 ///     and writes only when they differ. Sibling writes (e.g.
 ///     `set_applied` flipping the row to Running while we think
 ///     it's Flaky) drift on a single tick; this carries the
@@ -174,56 +135,41 @@ pub struct NodeObservation {
     pub ready: bool,
 }
 
-/// Pure: given prior state + this tick's observation + the current
-/// instant, compute the next state and whether anything happened.
+/// Pure: given the unit's latch + this tick's observation + now (unix
+/// seconds), compute the next latch and whether anything happened.
 ///
-/// Caller invariants:
-///   - `prior` MUST be the previous tick's `next` (don't pass empty
-///     state if you've seen this node before, that's the bug we
-///     fixed in the stop→start dance).
-///   - `now` MUST be monotonic with the `prior.last_*` instants.
+/// A unit not declared flaky turns flaky once it has been seen not ready
+/// for `flaky_after`, counted from the first look that saw it not ready;
+/// a flaky one recovers once it has been seen ready for `recovery_after`,
+/// counted from the first look that saw it ready again. Any reading the
+/// other way restarts the window. A unit a look runs on is `running` or
+/// `flaky`, which its apply wrote only once it was ready.
 pub fn evaluate_node_health(
     prior: NodeHealthState,
     observation: NodeObservation,
-    now: Instant,
+    now_unix: i64,
     flaky_after: Duration,
     recovery_after: Duration,
 ) -> NodeDecision {
     use weft_broker_client::protocol::InfraNodeStatus;
-    let mut next = prior.clone();
-    let mut event: Option<NodeEdgeEvent> = None;
-
-    if observation.ready {
-        next.last_ready_at = Some(now);
-        if next.declared_flaky {
-            // Recovery window: ready continuously since the LAST
-            // time we saw non-ready. If that gap is bigger than the
-            // recovery window, flip the flag and record the edge.
-            let elapsed_since_not_ready = prior
-                .last_not_ready_at
-                .map(|t| now.duration_since(t))
-                .unwrap_or(Duration::MAX);
-            if elapsed_since_not_ready >= recovery_after {
-                next.declared_flaky = false;
-                event = Some(NodeEdgeEvent::Recovered);
-            }
-        }
-    } else {
-        next.last_not_ready_at = Some(now);
-        if !next.declared_flaky {
-            // Flaky window: not-ready continuously since the LAST
-            // time we saw ready. `last_ready_at.is_none()` means we
-            // haven't seen this node Ready yet (fresh provision).
-            // Do NOT call it flaky in that case : the apply path
-            // owns the status until first readiness.
-            if let Some(t) = prior.last_ready_at {
-                if now.duration_since(t) >= flaky_after {
-                    next.declared_flaky = true;
-                    event = Some(NodeEdgeEvent::BecameFlaky);
-                }
-            }
-        }
-    }
+    // The window this reading runs: since when the unit has read against
+    // its latch, and how long that must last for the latch to flip.
+    let (since, window) = match (prior.declared_flaky, observation.ready) {
+        (true, true) => (prior.ready_since_unix, recovery_after),
+        (false, false) => (prior.not_ready_since_unix, flaky_after),
+        // Reading as latched: no window runs.
+        _ => (None, Duration::ZERO),
+    };
+    let reads_against = prior.declared_flaky == observation.ready;
+    let since = since.unwrap_or(now_unix);
+    let flips = reads_against && now_unix.saturating_sub(since) >= secs(window);
+    let declared_flaky = prior.declared_flaky != flips;
+    let next = match (flips, reads_against, declared_flaky) {
+        (false, true, true) => NodeHealthState { declared_flaky, not_ready_since_unix: None, ready_since_unix: Some(since) },
+        (false, true, false) => NodeHealthState { declared_flaky, not_ready_since_unix: Some(since), ready_since_unix: None },
+        _ => NodeHealthState { declared_flaky, not_ready_since_unix: None, ready_since_unix: None },
+    };
+    let event = flips.then_some(if declared_flaky { NodeEdgeEvent::BecameFlaky } else { NodeEdgeEvent::Recovered });
 
     // Desired status derived from the LATCH, not from the
     // instantaneous observation. The latch only flips on a window
@@ -237,6 +183,10 @@ pub fn evaluate_node_health(
     };
 
     NodeDecision { next, desired_status, event }
+}
+
+fn secs(d: Duration) -> i64 {
+    i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
 
 /// What the protocols are evaluated on: every seen unit of every copy
@@ -419,250 +369,121 @@ mod tests {
     use crate::protocol::{HealthCondition, ProtocolAction};
     use weft_broker_client::protocol::InfraNodeStatus as Status;
 
-    fn t0() -> Instant {
-        Instant::now()
-    }
+    const T: i64 = 1_000_000;
 
     fn obs(ready: bool) -> NodeObservation {
         NodeObservation { ready }
     }
 
-    /// Only a latch inside one of its windows waits on time: a unit never
-    /// seen ready (its apply owns it), one running fine, and one declared
-    /// flaky and still down stay as they are until the unit changes.
-    #[test]
-    fn only_a_latch_inside_a_window_waits_on_time() {
-        let now = t0();
-        let fresh = NodeHealthState::default();
-        assert!(!fresh.waits_on_time(false), "never seen ready: the apply owns it");
-        let was_ready = NodeHealthState { last_ready_at: Some(now), ..NodeHealthState::default() };
-        assert!(!was_ready.waits_on_time(true), "running fine");
-        assert!(was_ready.waits_on_time(false), "inside the flaky window");
-        let flaky = NodeHealthState { declared_flaky: true, last_not_ready_at: Some(now), ..was_ready.clone() };
-        assert!(!flaky.waits_on_time(false), "flaky and still down");
-        assert!(flaky.waits_on_time(true), "inside the recovery window");
+    fn eval(prior: NodeHealthState, ready: bool, at: i64) -> NodeDecision {
+        evaluate_node_health(prior, obs(ready), at, FLAKY_AFTER, RECOVERY_AFTER)
     }
 
-    // ---------- latch seeding from the row ----------
+    fn flaky() -> NodeHealthState {
+        NodeHealthState { declared_flaky: true, ..NodeHealthState::default() }
+    }
 
-    /// A latch seeded from a `Flaky` row keeps saying Flaky while the
-    /// unit stays unready (no `Running` rewrite), and recovers only
-    /// after the recovery window of continuous readiness; a latch
-    /// seeded from `Running` is the empty latch.
+    // ---------- the latch read from the row ----------
+
+    /// The row's status is the latch and its stamps are the window, so a
+    /// process that never looked at the unit carries on where the last
+    /// look left it.
     #[test]
-    fn latch_seeded_from_row_status_argues_from_the_row() {
-        let now = t0();
-        let seeded = NodeHealthState::seeded_from(Status::Flaky, None, FLAKY_AFTER, now, 0);
-        let still_down =
-            evaluate_node_health(seeded.clone(), obs(false), now, FLAKY_AFTER, RECOVERY_AFTER);
-        assert_eq!(still_down.desired_status, Status::Flaky);
-        assert_eq!(still_down.event, None);
-        // Ready right away: not yet recovered (the window has not run).
-        let ready_now =
-            evaluate_node_health(seeded.clone(), obs(true), now, FLAKY_AFTER, RECOVERY_AFTER);
-        assert_eq!(ready_now.desired_status, Status::Flaky);
-        // Ready past the window since the seeded not-ready edge: recovered.
-        let ready_later = evaluate_node_health(
-            seeded,
-            obs(true),
-            now + RECOVERY_AFTER,
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert_eq!(ready_later.desired_status, Status::Running);
-        assert_eq!(ready_later.event, Some(NodeEdgeEvent::Recovered));
+    fn the_latch_is_read_from_the_row() {
+        let unit = weft_broker_client::protocol::UnitRuntime {
+            status: Status::Flaky,
+            stop_behavior: weft_core::StopBehavior::Stop,
+            flaky_after_seconds: 30,
+            recovery_after_seconds: 30,
+            image_refs: Default::default(),
+            not_ready_since_unix: None,
+            ready_since_unix: Some(T),
+        };
         assert_eq!(
-            NodeHealthState::seeded_from(Status::Running, Some(100), FLAKY_AFTER, now, 100 + 29),
-            NodeHealthState::default(),
-            "applied inside its window: the host may not report it yet"
+            NodeHealthState::of(&unit),
+            NodeHealthState { declared_flaky: true, not_ready_since_unix: None, ready_since_unix: Some(T) }
         );
+        // Ready since T: recovered once the window from T has passed,
+        // whoever looks.
+        assert_eq!(eval(NodeHealthState::of(&unit), true, T + 29).event, None);
+        assert_eq!(eval(NodeHealthState::of(&unit), true, T + 30).event, Some(NodeEdgeEvent::Recovered));
     }
 
-    /// A Running copy applied longer ago than its flaky window is known
-    /// from the row alone: after the latch is lost (a command, a restart,
-    /// a move to another supervisor) a unit the host no longer reports
-    /// still reads as not ready and turns flaky after the window, instead
-    /// of staying unknown for ever.
-    #[test]
-    fn a_settled_running_copy_is_known_without_the_latch() {
-        let now = t0();
-        let seeded = NodeHealthState::seeded_from(Status::Running, Some(100), FLAKY_AFTER, now, 100 + 30);
-        assert!(seeded.has_seen());
-        let gone = observe_unit(seeded, None, now, FLAKY_AFTER, RECOVERY_AFTER).expect("known, not unknown");
-        assert_eq!(gone.desired_status, Status::Running, "inside the window");
-        let later = observe_unit(gone.next, None, now + FLAKY_AFTER, FLAKY_AFTER, RECOVERY_AFTER).expect("known");
-        assert_eq!(later.event, Some(NodeEdgeEvent::BecameFlaky));
-        // Never applied: nothing says a unit should exist.
-        assert!(!NodeHealthState::seeded_from(Status::Running, None, FLAKY_AFTER, now, 1_000).has_seen());
-    }
-
-    // ---------- evaluate_node_health: NoChange paths ----------
+    // ---------- no edge ----------
 
     #[test]
-    fn fresh_node_first_observation_ready_no_change() {
-        let now = t0();
-        let result = evaluate_node_health(
-            NodeHealthState::default(),
-            obs(true),
-            now,
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
+    fn ready_and_running_needs_no_window() {
+        let result = eval(NodeHealthState::default(), true, T);
         assert!(result.event.is_none());
         assert_eq!(result.desired_status, Status::Running);
-        assert_eq!(result.next.last_ready_at, Some(now));
-        assert_eq!(result.next.last_not_ready_at, None);
-        assert!(!result.next.declared_flaky);
+        assert_eq!(result.next, NodeHealthState::default());
     }
 
+    /// The first look that sees it not ready starts the window; a look
+    /// inside it keeps the window's start; a ready look ends it.
     #[test]
-    fn fresh_node_first_observation_not_ready_no_flaky_yet() {
-        // The provisioning false-alarm scenario: a node we've never
-        // seen Ready shouldn't be declared flaky just because some
-        // other supervisor process saw a previous copy Ready.
-        let now = t0();
-        let result = evaluate_node_health(
-            NodeHealthState::default(),
-            obs(false),
-            now,
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert!(result.event.is_none());
-        assert_eq!(result.desired_status, Status::Running);
-        assert!(!result.next.declared_flaky);
-        assert_eq!(result.next.last_not_ready_at, Some(now));
-    }
-
-    #[test]
-    fn ready_then_briefly_not_ready_no_flaky() {
-        // Ready at t0; not ready at t0 + 5s. Flaky window 30s.
-        let t = t0();
-        let r1 = evaluate_node_health(
-            NodeHealthState::default(),
-            obs(true),
-            t,
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
+    fn briefly_not_ready_is_not_flaky() {
+        let r1 = eval(NodeHealthState::default(), false, T);
         assert!(r1.event.is_none());
-        let r2 = evaluate_node_health(
-            r1.next,
-            obs(false),
-            t + Duration::from_secs(5),
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert!(r2.event.is_none());
-        assert_eq!(r2.desired_status, Status::Running);
+        assert_eq!(r1.desired_status, Status::Running);
+        assert_eq!(r1.next.not_ready_since_unix, Some(T));
+        let r2 = eval(r1.next, false, T + 5);
+        assert_eq!(r2.next.not_ready_since_unix, Some(T), "the window keeps its start");
+        let r3 = eval(r2.next, true, T + 10);
+        assert_eq!(r3.next, NodeHealthState::default(), "ready again ends the window");
     }
 
     // ---------- BecameFlaky edge ----------
 
     #[test]
     fn not_ready_past_flaky_window_becomes_flaky() {
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            ..Default::default()
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(false),
-            t + Duration::from_secs(31),
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert_eq!(
-            result.event,
-            Some(NodeEdgeEvent::BecameFlaky)
-        );
-        assert!(result.next.declared_flaky);
+        let state = NodeHealthState { not_ready_since_unix: Some(T), ..NodeHealthState::default() };
+        let result = eval(state, false, T + 31);
+        assert_eq!(result.event, Some(NodeEdgeEvent::BecameFlaky));
+        assert_eq!(result.next, flaky());
         assert_eq!(result.desired_status, Status::Flaky);
     }
 
     #[test]
     fn already_flaky_does_not_re_fire_event_but_desired_stays_flaky() {
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            last_not_ready_at: Some(t + Duration::from_secs(31)),
-            declared_flaky: true,
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(false),
-            t + Duration::from_secs(41),
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
+        let result = eval(flaky(), false, T + 41);
         // No edge event : we're already past the transition.
         assert!(result.event.is_none());
         // But desired_status is Flaky (latch is still set). This is
         // what drives the I/O-layer reconciliation: even on
         // NoChange ticks, the row should stay (or return to) Flaky.
         assert_eq!(result.desired_status, Status::Flaky);
+        assert_eq!(result.next, flaky());
     }
 
     // ---------- Recovered edge ----------
 
     #[test]
     fn flaky_then_ready_past_recovery_window_recovers() {
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            last_not_ready_at: Some(t + Duration::from_secs(10)),
-            declared_flaky: true,
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(true),
-            t + Duration::from_secs(50),
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
+        let state = NodeHealthState { ready_since_unix: Some(T), ..flaky() };
+        let result = eval(state, true, T + 40);
         assert_eq!(result.event, Some(NodeEdgeEvent::Recovered));
-        assert!(!result.next.declared_flaky);
+        assert_eq!(result.next, NodeHealthState::default());
         assert_eq!(result.desired_status, Status::Running);
     }
 
+    /// A flaky unit briefly ready stays flaky, and a reading not ready
+    /// again restarts its recovery window.
     #[test]
     fn flaky_then_briefly_ready_does_not_recover() {
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            last_not_ready_at: Some(t + Duration::from_secs(30)),
-            declared_flaky: true,
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(true),
-            t + Duration::from_secs(35),
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert!(result.event.is_none());
-        assert!(result.next.declared_flaky);
+        let r1 = eval(flaky(), true, T);
+        assert!(r1.event.is_none());
+        assert_eq!(r1.next.ready_since_unix, Some(T));
         // Desired status stays Flaky: row should NOT flip back
         // until the full recovery window elapses.
-        assert_eq!(result.desired_status, Status::Flaky);
+        assert_eq!(r1.desired_status, Status::Flaky);
+        let r2 = eval(r1.next, false, T + 5);
+        assert_eq!(r2.next, flaky(), "not ready again: the window starts over");
     }
 
     #[test]
     fn recovery_window_zero_means_first_ready_recovers() {
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            last_not_ready_at: Some(t + Duration::from_secs(50)),
-            declared_flaky: true,
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(true),
-            t + Duration::from_secs(51),
-            FLAKY_AFTER,
-            Duration::from_secs(0),
-        );
+        let result = evaluate_node_health(flaky(), obs(true), T, FLAKY_AFTER, Duration::from_secs(0));
         assert_eq!(result.event, Some(NodeEdgeEvent::Recovered));
     }
 
@@ -670,77 +491,40 @@ mod tests {
 
     #[test]
     fn full_lifecycle_ready_flaky_recovered() {
-        let t = t0();
         let mut s = NodeHealthState::default();
-
-        // 1) ready at t0
-        let r1 = evaluate_node_health(s, obs(true), t, FLAKY_AFTER, RECOVERY_AFTER);
-        assert!(r1.event.is_none());
-        s = r1.next;
-        // 2) not ready at t+5s (no flip)
-        let r2 = evaluate_node_health(s, obs(false), t + Duration::from_secs(5), FLAKY_AFTER, RECOVERY_AFTER);
-        assert!(r2.event.is_none());
-        s = r2.next;
-        // 3) still not ready at t+40s (flaky edge fires)
-        let r3 = evaluate_node_health(s, obs(false), t + Duration::from_secs(40), FLAKY_AFTER, RECOVERY_AFTER);
-        assert!(matches!(r3.event, Some(NodeEdgeEvent::BecameFlaky)));
-        s = r3.next;
-        // 4) ready at t+45s (no flip, recovery window not elapsed)
-        let r4 = evaluate_node_health(s, obs(true), t + Duration::from_secs(45), FLAKY_AFTER, RECOVERY_AFTER);
-        assert!(r4.event.is_none());
-        s = r4.next;
-        // 5) ready at t+80s (recovered edge fires)
-        let r5 = evaluate_node_health(s, obs(true), t + Duration::from_secs(80), FLAKY_AFTER, RECOVERY_AFTER);
-        assert_eq!(r5.event, Some(NodeEdgeEvent::Recovered));
-    }
-
-    // ---------- reconciliation property ----------
-
-    #[test]
-    fn desired_status_follows_latch_not_observation() {
-        // Already-flaky state with an instantaneous ready
-        // observation INSIDE the recovery window: the latch stays
-        // set, so desired_status must stay Flaky. The I/O layer
-        // relies on this to reconcile a row that an external
-        // writer flipped to Running.
-        let t = t0();
-        let state = NodeHealthState {
-            last_ready_at: Some(t),
-            last_not_ready_at: Some(t + Duration::from_secs(40)),
-            declared_flaky: true,
-        };
-        let result = evaluate_node_health(
-            state,
-            obs(true),
-            t + Duration::from_secs(41), // 1s into recovery window
-            FLAKY_AFTER,
-            RECOVERY_AFTER,
-        );
-        assert!(result.event.is_none());
-        assert!(result.next.declared_flaky);
-        assert_eq!(result.desired_status, Status::Flaky);
+        // ready at T, not ready from T+5: flaky once that is 30 s old.
+        for (ready, at, edge) in [
+            (true, T, None),
+            (false, T + 5, None),
+            (false, T + 34, None),
+            (false, T + 35, Some(NodeEdgeEvent::BecameFlaky)),
+            (true, T + 45, None),
+            (true, T + 75, Some(NodeEdgeEvent::Recovered)),
+        ] {
+            let r = eval(s, ready, at);
+            assert_eq!(r.event, edge, "at T+{}", at - T);
+            s = r.next;
+        }
     }
 
     // ---------- observe_unit: unknown vs vanished ----------
 
-    /// A unit the host has never reported is unknown: no decision, the
-    /// latch untouched, whatever the windows. Once seen, its absence reads
-    /// as not ready and runs the flaky window like any not-ready.
+    /// A unit the host does not report is unknown while nothing says it
+    /// should be there: no decision. Once it was seen in a window or
+    /// broken, or its copy was applied longer ago than its flaky window,
+    /// its absence reads as not ready.
     #[test]
     fn an_unseen_unit_is_unknown_and_a_vanished_one_is_not_ready() {
-        let t = t0();
-        assert_eq!(
-            observe_unit(NodeHealthState::default(), None, t + Duration::from_secs(600), FLAKY_AFTER, RECOVERY_AFTER),
-            None
-        );
-        let seen = observe_unit(NodeHealthState::default(), Some(obs(true)), t, FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("seen");
-        let gone = observe_unit(seen.next, None, t + Duration::from_secs(31), FLAKY_AFTER, RECOVERY_AFTER)
-            .expect("vanished is known");
-        assert_eq!(gone.event, Some(NodeEdgeEvent::BecameFlaky));
-        // A row seeded Flaky has been seen broken: its absence keeps it so.
-        let seeded = NodeHealthState::seeded_from(Status::Flaky, None, FLAKY_AFTER, t, 0);
-        let still = observe_unit(seeded, None, t, FLAKY_AFTER, RECOVERY_AFTER).expect("seeded is known");
+        let observe = |prior: NodeHealthState, applied: Option<i64>, at: i64| {
+            observe_unit(prior, None, applied, at, FLAKY_AFTER, RECOVERY_AFTER)
+        };
+        assert_eq!(observe(NodeHealthState::default(), None, T), None, "never applied");
+        assert_eq!(observe(NodeHealthState::default(), Some(T), T + 29), None, "applied inside its window");
+        let gone = observe(NodeHealthState::default(), Some(T), T + 30).expect("applied long enough ago");
+        assert_eq!(gone.next.not_ready_since_unix, Some(T + 30));
+        let later = observe(gone.next, None, T + 60).expect("in a window");
+        assert_eq!(later.event, Some(NodeEdgeEvent::BecameFlaky));
+        let still = observe(flaky(), None, T).expect("broken is seen");
         assert_eq!(still.desired_status, Status::Flaky);
     }
 

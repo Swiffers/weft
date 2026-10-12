@@ -233,7 +233,7 @@ pub enum DispatcherEvent {
     ProjectDeactivated { project_id: uuid::Uuid },
     /// A project lifecycle axis flipped: entering/leaving a
     /// transitional state (activating, deactivating, building,
-    /// cancelling_build) or landing at rest. Carries both axes so a
+    /// cancelling_build, resyncing) or landing at rest. Carries both axes so a
     /// client can render the new state without a round-trip; clients
     /// that prefer one code path just refetch `/status` on receipt.
     /// This is what makes backend-owned transitional state observable

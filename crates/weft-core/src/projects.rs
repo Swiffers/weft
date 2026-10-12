@@ -45,32 +45,42 @@ crate::wire_enum! {
 }
 
 crate::wire_enum! {
-    /// The build transition axis of a project, orthogonal to its
+    /// The single-flight transition of a project, orthogonal to its
     /// [`ProjectStatus`]: `Building` while a verb's image build is in
     /// flight, `CancellingBuild` after the person asked to cancel and
-    /// before the driving process lands it back at `None`. While not
-    /// `None`, the only verb offered is `cancel_build`.
+    /// before the driving process lands it back at `None`, `Resyncing`
+    /// while a resync takes triggers down and brings them back on the new
+    /// build (no build may start under it). While a build is in flight the
+    /// only verb offered is `cancel_build`; while a resync is, only the
+    /// cancels of the trigger step it is at.
     /// SYNC: ProjectTransition <-> packages/weft-graph/src/protocol.ts ProjectTransition,
     ///       packages/weft-graph/src/status.ts VALID_TRANSITIONS
     pub enum ProjectTransition {
         None = "none",
         Building = "building",
         CancellingBuild = "cancelling_build",
+        Resyncing = "resyncing",
     }
 }
 
 impl ProjectTransition {
     /// True while a build transition is in flight (either phase).
+    // SYNC: is_building <-> packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (building)
     pub fn is_building(self) -> bool {
         matches!(self, Self::Building | Self::CancellingBuild)
     }
 
     /// What a verb refused because of this transition tells the person:
-    /// `None` when there is no build to wait on.
+    /// `None` when there is nothing to wait on.
     pub fn refusal(self) -> Option<&'static str> {
         match self {
             Self::Building => Some("the project is building; wait for the build to finish, or cancel it with `weft cancel-build`"),
             Self::CancellingBuild => Some("the project's build is being cancelled; try again once it has stopped"),
+            Self::Resyncing => Some(
+                "the project is resyncing; wait for it to finish (`weft resync --resume` takes one that stopped up again), \
+                 or give it up with `weft cancel-activate`, which leaves the triggers it has not brought back down \
+                 (`weft cancel-running` ends its wait on running work now)",
+            ),
             Self::None => None,
         }
     }
@@ -147,6 +157,12 @@ impl StatusQuery {
     }
 }
 
+/// What a person is told when something of a project is refused because
+/// `weft rm` marked it and has not finished removing it (`project.removing`):
+/// a run born for it, a verb on it, and what its status says of it.
+// SYNC: PROJECT_BEING_REMOVED <-> packages/weft-graph/src/status.ts PROJECT_BEING_REMOVED
+pub const PROJECT_BEING_REMOVED: &str = "the project is being removed; run `weft rm` again to finish removing it";
+
 /// `GET /projects/{id}/status`: everything a client renders about one
 /// project in one answer (registration, listener, infra, executions,
 /// drift, and the verbs the dispatcher accepts right now).
@@ -155,6 +171,11 @@ impl StatusQuery {
 pub struct ProjectStatusResponse {
     pub id: uuid::Uuid,
     pub name: String,
+    /// `weft rm` marked the project and has not finished removing it
+    /// ([`PROJECT_BEING_REMOVED`]): what is left of it reads below, and no
+    /// verb is offered.
+    #[serde(default)]
+    pub removing: bool,
     /// The aggregate status over the shared activations.
     pub status: ProjectStatus,
     /// The build transition axis, orthogonal to `status`.
@@ -232,22 +253,27 @@ pub struct ProjectStatusResponse {
     /// leaves when it goes well. Empty when no trigger started one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<TriggerRuns>,
-    /// weft's own calls the project's work waits on that keep failing.
-    /// Empty when every one goes through.
+    /// weft's own work the project's work waits on that keeps failing.
+    /// Empty when none does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unanswered: Vec<Unanswered>,
 }
 
-/// One of weft's own calls that keeps failing, so the work behind it
+/// Part of weft's own work that keeps failing, so the work behind it
 /// waits: a role woken to pick up work (the supervisor, which starts and
-/// stops infra), or the project's workers being handed a run. weft keeps
-/// trying on its own; this is what a person waiting is shown.
+/// stops infra), the project's workers being handed a run, one of weft's
+/// loops that gave up, the supervisor acting on the project's infra. This
+/// is what a person waiting is shown, until it is resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unanswered {
-    /// What does not answer, in a person's words, as the subject of a
-    /// sentence ("weft's supervisor, which starts and stops infra,").
-    pub callee: String,
-    /// The last try's error.
+    /// What fails, in a person's words, as a whole clause ("weft's
+    /// supervisor, which starts and stops infra, cannot be reached").
+    pub what: String,
+    /// What happens next, in a person's words: when weft tries again, or
+    /// what a person can do ("weft rings it again on the next change that
+    /// needs it").
+    pub then: String,
+    /// The last error written down.
     pub error: String,
     #[serde(rename = "sinceUnix")]
     pub since_unix: i64,
@@ -260,18 +286,21 @@ pub struct Unanswered {
 }
 
 impl Unanswered {
-    /// One line for a person: what is not answering, since when, and why.
+    /// One line for a person: what fails, since when, what happens next,
+    /// and why.
     pub fn describe(&self) -> String {
         let now_unix = self.as_of_unix;
         let span = |secs: i64| match secs.max(0) {
             secs @ 0..120 => format!("{secs}s"),
-            secs => format!("{} min", secs / 60),
+            secs @ 120..7200 => format!("{} min", secs / 60),
+            secs => format!("{} h", secs / 3600),
         };
         format!(
-            "{} cannot be reached (failing for {}, last tried {} ago; weft keeps trying): {}",
-            self.callee,
+            "{} (failing for {}, last tried {} ago; {}): {}",
+            self.what,
             span(now_unix - self.since_unix),
             span(now_unix - self.last_unix),
+            self.then,
             self.error,
         )
     }

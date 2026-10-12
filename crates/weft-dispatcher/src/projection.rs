@@ -529,7 +529,8 @@ impl ExecutionProjector {
                 }]
             }
             // LogLine / RunOutput / NodeKicked / PulsesConsumed /
-            // LoopStreamEnded:
+            // LoopStreamEnded / ChargeOpened (its cost is surfaced when
+            // a `CostReported` books it):
             // not surfaced through DispatcherEvent. SSE consumers don't
             // need them for live UI; they read the journal directly when
             // they want full detail. A kick can still fire a group
@@ -649,6 +650,7 @@ fn needs_program(ev: &ExecEvent) -> bool {
             | ExecEvent::ExecutionCancelled { .. }
             | ExecEvent::ExecutionTagged { .. }
             | ExecEvent::CostReported { .. }
+            | ExecEvent::ChargeOpened { .. }
             | ExecEvent::FileEdited { .. }
             | ExecEvent::LogLine { .. }
             | ExecEvent::BusJoined { .. }
@@ -875,6 +877,16 @@ pub async fn execution_program(
     let Some(owner) = state.journal.execution_owner(execution_id).await? else {
         return Ok(ProgramLookup::NoProgram);
     };
+    program_of_owner(state, execution_id, &owner).await
+}
+
+/// [`execution_program`] for a caller that read the run's row already
+/// (`owner`, `Journal::execution_owner`).
+pub async fn program_of_owner(
+    state: &crate::state::DispatcherState,
+    execution_id: weft_core::ExecutionId,
+    owner: &crate::journal::ExecutionOwner,
+) -> anyhow::Result<ProgramLookup> {
     let Some(hash) = owner.definition_hash.clone() else {
         return Ok(ProgramLookup::NoProgram);
     };
@@ -1073,7 +1085,7 @@ mod tests {
             rows.push(ExecEvent::CostReported {
                 execution_id: execution_id(), node_id: node.into(), frames: vec![], cost_id: node.into(),
                 service: "provider".into(), model: None, amount_usd: Some(0.25), billed: false,
-                origin: weft_core::CredentialOwner::Author, metadata: Value::Null, at_unix: 2,
+                origin: weft_core::CredentialOwner::Author, metadata: Value::Null, charge: None, at_unix: 2,
             });
         }
         rows.splice(3..3, [

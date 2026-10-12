@@ -59,15 +59,16 @@ pub enum Fired {
     Started { execution_id: crate::ExecutionId },
     /// Born already: the same event was handed over before.
     AlreadyBorn,
-    /// Put in the trigger's queue (`parked_fire`) to run later:
-    /// the trigger is parked, its runs at once are all going, what the
-    /// run reads is not ready, or it is armed on another version of the
-    /// program. `instance_gap` when it waits on a value its instance has
-    /// not given: the instance's next change of values routes it again.
+    /// Put in the trigger's queue (`parked_fire`) to run later, and
+    /// what it waits on there ([`WaitsOn`]): the trigger is parked, its
+    /// runs at once are all going, what the run reads is not ready, it is
+    /// armed on another version of the program, or the run could not be
+    /// recorded.
     Parked {
         reason: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        instance_gap: bool,
+        /// A worker that does not say waits on room.
+        #[serde(default)]
+        on: WaitsOn,
     },
     /// Not taken, and why: the trigger takes no work, the event is past
     /// its per-minute limit, the signal is gone.
@@ -78,6 +79,100 @@ pub enum Fired {
     /// A caller past the trigger's per-caller limit: refused, and when to
     /// come back.
     Refused { reason: String, retry_after_secs: u64 },
+}
+
+/// What an event waiting in its trigger's queue waits on, and so what
+/// hands it over again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitsOn {
+    /// Room to run: the runs it may have at once are all going, a limit
+    /// of its trigger is reached, or the worker it reached runs another
+    /// version of the program. Tried again after a backoff that grows.
+    #[default]
+    Room,
+    /// Its trigger to take work again (parked, hibernating, being set
+    /// up): the activation that brings it back hands it over, and while
+    /// its trigger is live it is tried after a backoff, as for room.
+    Trigger,
+    /// A value its instance has not given: the instance's next change of
+    /// values hands it over.
+    Instance,
+    /// Infra the run reads to run again: its coming back hands it over.
+    Infra,
+    /// Connections the install has not picked: picking them re-arms the
+    /// trigger, which hands it over.
+    Picks,
+    /// A hand-over that failed (the worker could not be reached, the run
+    /// could not be recorded): tried twice more shortly, then it stops
+    /// and holds its trigger's queue until the trigger is activated
+    /// again, a new version registers or the project's worker settings
+    /// change.
+    Failure,
+}
+
+impl WaitsOn {
+    /// The word for it, as `parked_fire.waits_for` and the wire spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WaitsOn::Room => "room",
+            WaitsOn::Trigger => "trigger",
+            WaitsOn::Instance => "instance",
+            WaitsOn::Infra => "infra",
+            WaitsOn::Picks => "picks",
+            WaitsOn::Failure => "failure",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        [WaitsOn::Room, WaitsOn::Trigger, WaitsOn::Instance, WaitsOn::Infra, WaitsOn::Picks, WaitsOn::Failure]
+            .into_iter()
+            .find(|on| on.as_str() == word)
+    }
+
+    /// What it waits on when no clock brings it, `None` for room and its
+    /// trigger, which a backoff tries again.
+    pub fn unclocked(self) -> Option<UnclockedWait> {
+        match self {
+            WaitsOn::Room | WaitsOn::Trigger => None,
+            WaitsOn::Instance => Some(UnclockedWait::Instance),
+            WaitsOn::Infra => Some(UnclockedWait::Infra),
+            WaitsOn::Picks => Some(UnclockedWait::Picks),
+            WaitsOn::Failure => Some(UnclockedWait::Failure),
+        }
+    }
+}
+
+/// What a queued event waits on that no clock brings ([`WaitsOn`] but
+/// room and its trigger): only that changing, or the trigger activated
+/// again, hands it over. What `weft status` and the editor show per
+/// trigger.
+// SYNC: the kinds <-> weft_task_store::parked_fires::WaitsFor (parked_fire.waits_for), packages/weft-graph/src/protocol.ts (ActivationEntry.waiting.on)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnclockedWait {
+    Instance,
+    Infra,
+    Picks,
+    Failure,
+}
+
+impl From<UnclockedWait> for WaitsOn {
+    fn from(wait: UnclockedWait) -> Self {
+        match wait {
+            UnclockedWait::Instance => WaitsOn::Instance,
+            UnclockedWait::Infra => WaitsOn::Infra,
+            UnclockedWait::Picks => WaitsOn::Picks,
+            UnclockedWait::Failure => WaitsOn::Failure,
+        }
+    }
+}
+
+impl UnclockedWait {
+    /// The word for it, as [`WaitsOn::as_str`] spells it.
+    pub fn as_str(self) -> &'static str {
+        WaitsOn::from(self).as_str()
+    }
 }
 
 /// The [`Fired`] on the first line of a worker's answer to a fire, and the
@@ -182,13 +277,30 @@ mod wire_tests {
         for answer in [
             Fired::Started { execution_id: uuid::Uuid::nil() },
             Fired::AlreadyBorn,
-            Fired::Parked { reason: "parked".into(), instance_gap: true },
+            Fired::Parked { reason: "parked".into(), on: WaitsOn::Instance },
             Fired::Dropped { reason: "gone".into() },
             Fired::NotHeld,
             Fired::Refused { reason: "too many".into(), retry_after_secs: 5 },
         ] {
             assert_eq!(serde_json::from_value::<Fired>(serde_json::to_value(&answer).unwrap()).unwrap(), answer);
         }
+        assert_eq!(
+            serde_json::from_value::<Fired>(serde_json::json!({ "fired": "parked", "reason": "full" })).unwrap(),
+            Fired::Parked { reason: "full".into(), on: WaitsOn::Room },
+            "a worker that does not say what a fire waits on parks it for room"
+        );
+        for on in [WaitsOn::Room, WaitsOn::Trigger, WaitsOn::Instance, WaitsOn::Infra, WaitsOn::Picks, WaitsOn::Failure] {
+            assert_eq!(WaitsOn::parse(on.as_str()), Some(on));
+            assert_eq!(serde_json::to_value(on).unwrap(), on.as_str());
+            // What no clock brings is spelled as its wait is, and turns back
+            // into it.
+            if let Some(unclocked) = on.unclocked() {
+                assert_eq!(serde_json::to_value(unclocked).unwrap(), on.as_str());
+                assert_eq!(WaitsOn::from(unclocked), on);
+            }
+        }
+        assert_eq!(WaitsOn::Room.unclocked(), None);
+        assert_eq!(WaitsOn::Trigger.unclocked(), None);
     }
 
     #[test]

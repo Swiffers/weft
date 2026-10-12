@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use weft_core::access::client::run_connect_call;
 use weft_core::access::spec::{lookup_path, MintedSocket, ReplyRule};
 
-use crate::kinds::event_source::Backoff;
+use crate::kinds::event_source::{Backoff, Said};
 use crate::kinds::ServingReport;
 
 /// One connect cycle's plan, answered by the caller's `prepare`.
@@ -44,13 +44,32 @@ pub struct CyclePlan {
 
 /// How `prepare` failed, which decides whether the engine retries.
 pub enum PrepareError {
-    /// Transient (the mint endpoint refused, the broker was
-    /// unreachable): wait on the ladder and try again.
+    /// Transient (the mint endpoint busy, down or refusing the
+    /// credential, the broker unreachable): wait on the ladder and try
+    /// again.
     Transient(anyhow::Error),
-    /// The configuration itself is broken (a malformed frame, a
-    /// template naming a value that does not exist): retrying spins
-    /// on the same bad config, so the engine logs loud and exits.
+    /// Asking again answers the same: the configuration itself is broken
+    /// (a malformed frame, a template naming a value that does not
+    /// exist), or the signal's connection is gone, refused or needs a
+    /// reconnect ([`PrepareError::of_resolve`]), which only a person
+    /// fixes. The signal is given up with why, and the engine logs loud
+    /// and exits.
     Fatal(anyhow::Error),
+}
+
+impl PrepareError {
+    /// A failure resolving the signal's connection:
+    /// [`PrepareError::Fatal`] when asking again repeats it
+    /// ([`crate::kinds::repeats`]), as a wake gives its signal up on it;
+    /// [`PrepareError::Transient`] otherwise (the broker not reached, a
+    /// provider busy for now).
+    pub fn of_resolve(e: anyhow::Error) -> Self {
+        if crate::kinds::repeats(&e) {
+            PrepareError::Fatal(e)
+        } else {
+            PrepareError::Transient(e)
+        }
+    }
 }
 
 /// Mint one cycle's socket address from a [`MintedSocket`]: run the
@@ -68,14 +87,7 @@ pub async fn mint_socket_url(
             "the socket recipe declares no connect call to mint the address"
         )));
     };
-    let resp = run_connect_call(call, values)
-        .await
-        .map_err(|e| match e {
-            weft_core::access::client::ConnectCallError::Unbuildable(_) => PrepareError::Fatal(e.into()),
-            weft_core::access::client::ConnectCallError::Unreached(_) | weft_core::access::client::ConnectCallError::Refused(_) => {
-                PrepareError::Transient(e.into())
-            }
-        })?;
+    let resp = run_connect_call(call, values).await.map_err(mint_failed)?;
     let capture = call
         .captures
         .iter()
@@ -97,14 +109,62 @@ pub async fn mint_socket_url(
         })
 }
 
+/// How a mint's connect call failing fails the cycle. A call that cannot
+/// be built, and a definite no to the request itself (a 400, a 404),
+/// answer the same to the same call: the signal is given up. A service
+/// not reached or busy is tried again, and so is a refused credential,
+/// which [`mint_signed_in`] sorts out.
+fn mint_failed(e: weft_core::access::client::ConnectCallError) -> PrepareError {
+    use weft_core::access::client::{ConnectCallError, RefusalKind};
+    match e {
+        ConnectCallError::Unbuildable(_) | ConnectCallError::Refused { kind: RefusalKind::Other, .. } => PrepareError::Fatal(e.into()),
+        ConnectCallError::Unreached(_) | ConnectCallError::Refused { kind: RefusalKind::Temporary | RefusalKind::Auth, .. } => {
+            PrepareError::Transient(e.into())
+        }
+    }
+}
+
+/// Whether a mint failed because the service refused the credential it
+/// was called with: a refusal of who is calling, never a provider busy
+/// or down, nor one refusing the request itself.
+fn refused(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref(),
+        Some(weft_core::access::client::ConnectCallError::Refused { kind: weft_core::access::client::RefusalKind::Auth, .. })
+    )
+}
+
+/// [`mint_socket_url`] with `values` resolved from the signal's
+/// connection (`fresh` when fetched just now). A refusal of credentials
+/// kept from before drops them, so the next cycle fetches them again; a
+/// refusal of ones fetched just now cannot heal by asking again, so it is
+/// fatal.
+pub async fn mint_signed_in(
+    minted: &MintedSocket,
+    values: &BTreeMap<String, String>,
+    fresh: bool,
+    ctx: &crate::kinds::SpawnCtx,
+) -> Result<String, PrepareError> {
+    mint_socket_url(minted, values).await.map_err(|e| match e {
+        PrepareError::Transient(e) if refused(&e) && fresh => {
+            PrepareError::Fatal(e.context("the connection's credential, fetched just now, was refused"))
+        }
+        PrepareError::Transient(e) if refused(&e) => {
+            crate::listener_access::refused(ctx);
+            PrepareError::Transient(e)
+        }
+        e => e,
+    })
+}
+
 type Prepare = Box<dyn FnMut() -> BoxFuture<'static, Result<CyclePlan, PrepareError>> + Send>;
 type OnEvent = Box<dyn FnMut(Value) -> BoxFuture<'static, ()> + Send>;
 
 /// Run the engine until aborted (or a fatal prepare error). `target`
 /// names the driving kind in every log line. `report` is where the
-/// node's display reads what the engine is doing: every turn of the
-/// connect loop reports there, so a person looking at a stuck trigger
-/// sees "connect failed; retrying: ..." and not a panel that says
+/// node's display reads what the engine is doing, said when it changes
+/// (`crate::kinds::event_source::Said`): a person looking at a stuck
+/// trigger sees since when it reconnects and why, not a panel that says
 /// nothing.
 pub fn spawn(
     mut prepare: Prepare,
@@ -112,22 +172,21 @@ pub fn spawn(
     target: &'static str,
     report: ServingReport,
 ) -> JoinHandle<()> {
-    let set_status = move |status: String| report(status);
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
+        let mut said = Said::new(report);
         loop {
-            set_status("connecting".to_string());
             let plan = match prepare().await {
                 Ok(p) => p,
                 Err(PrepareError::Transient(e)) => {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %format!("{e:#}"), "connect preparation failed; retrying");
-                    set_status(format!("connect preparation failed; retrying: {e:#}"));
+                    said.down(format!("connect preparation failed: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(PrepareError::Fatal(e)) => {
-                    warn!(target: "weft_listener::socket_engine", kind = target, error = %format!("{e:#}"), "connect preparation is misconfigured; giving up on this socket");
-                    set_status(format!("misconfigured, not retrying: {e:#}"));
+                    warn!(target: "weft_listener::socket_engine", kind = target, error = %format!("{e:#}"), "connect preparation fails the same every time; giving up on this socket");
+                    said.stopped(format!("{e:#}"));
                     return;
                 }
             };
@@ -135,12 +194,12 @@ pub fn spawn(
             let stream = match connect_async(&plan.url).await {
                 Ok((s, _resp)) => {
                     info!(target: "weft_listener::socket_engine", kind = target, "socket connected");
-                    set_status("connected".to_string());
+                    said.up("connected");
                     s
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "connect failed; retrying");
-                    set_status(format!("connect failed; retrying: {e}"));
+                    said.down(format!("connect failed: {e}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -151,7 +210,7 @@ pub fn spawn(
             if let Some(frame) = &plan.handshake {
                 if let Err(e) = write.send(frame.clone()).await {
                     warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "handshake send failed; reconnecting");
-                    set_status(format!("handshake send failed; reconnecting: {e}"));
+                    said.down(format!("handshake send failed: {e}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -169,7 +228,7 @@ pub fn spawn(
                         if let Some(m) = &plan.heartbeat {
                             if let Err(e) = write.send(m.clone()).await {
                                 warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "heartbeat send failed; reconnecting");
-                                set_status(format!("heartbeat send failed; reconnecting: {e}"));
+                                said.down(format!("heartbeat send failed: {e}"));
                                 break;
                             }
                         }
@@ -192,12 +251,12 @@ pub fn spawn(
                             }
                             Some(Err(e)) => {
                                 warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "socket error; reconnecting");
-                                set_status(format!("socket error; reconnecting: {e}"));
+                                said.down(format!("socket error: {e}"));
                                 break;
                             }
                             None => {
                                 info!(target: "weft_listener::socket_engine", kind = target, "socket closed; reconnecting");
-                                set_status("socket closed; reconnecting".to_string());
+                                said.down("socket closed");
                                 break;
                             }
                         }
@@ -223,5 +282,24 @@ pub fn inbound_payload(msg: Message) -> Option<Value> {
             base64::engine::general_purpose::STANDARD.encode(b),
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mint_failed, PrepareError};
+    use weft_core::access::client::{ConnectCallError, RefusalKind};
+
+    /// A mint the service said a definite no to gives the signal up; one
+    /// it was busy or down for, or whose credential it refused, is tried
+    /// again.
+    #[test]
+    fn only_a_definite_no_to_the_mint_gives_the_signal_up() {
+        let refused = |kind| ConnectCallError::Refused { kind, why: "no".into() };
+        assert!(matches!(mint_failed(refused(RefusalKind::Other)), PrepareError::Fatal(_)), "a 400 answers the same again");
+        assert!(matches!(mint_failed(ConnectCallError::Unbuildable("no url".into())), PrepareError::Fatal(_)));
+        assert!(matches!(mint_failed(refused(RefusalKind::Temporary)), PrepareError::Transient(_)), "a 429 or 5xx");
+        assert!(matches!(mint_failed(refused(RefusalKind::Auth)), PrepareError::Transient(_)), "mint_signed_in decides");
+        assert!(matches!(mint_failed(ConnectCallError::Unreached("timed out".into())), PrepareError::Transient(_)));
     }
 }

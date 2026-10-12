@@ -48,6 +48,9 @@ pub enum FireOutcome {
 pub struct FireContext {
     sink: FireSignalSink,
     token: String,
+    /// The registration served (`signal.generation`), the one a give-up
+    /// names.
+    generation: i64,
     /// The signal's tenant, stamped on every enqueued fire (the
     /// listener serves many tenants, so it travels per signal).
     tenant_id: String,
@@ -67,11 +70,24 @@ impl FireContext {
     pub fn new(
         sink: FireSignalSink,
         token: String,
+        generation: i64,
         tenant_id: String,
         for_instance: Option<weft_core::instance::InstanceScope>,
         predicates: Vec<Predicate>,
     ) -> Self {
-        Self { sink, token, tenant_id, for_instance, predicates, held_by: None }
+        Self { sink, token, generation, tenant_id, for_instance, predicates, held_by: None }
+    }
+
+    /// Give this signal up for good, with why (it can never be served as
+    /// registered): written once on its row, shown on its node, and
+    /// stopped here, until it is registered again. The signal stops here
+    /// even when the write fails, and its holder writes it again at its
+    /// next look ([`FireSignalSink::give_up`]).
+    pub async fn give_up(&self, reason: &str) {
+        tracing::error!(target: "weft_listener::event_context", token = %self.token, %reason, "giving up on a signal until it is registered again");
+        if let Err(e) = self.sink.give_up(&self.token, self.generation, reason).await {
+            warn!(target: "weft_listener::event_context", token = %self.token, error = %format!("{e:#}"), "could not record that a signal was given up; its holder records it at its next look");
+        }
     }
 
     /// The same context, firing under the claim of the holder `replica`.
@@ -81,6 +97,11 @@ impl FireContext {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// The registration served (`signal.generation`).
+    pub fn generation(&self) -> i64 {
+        self.generation
     }
 
     pub fn tenant_id(&self) -> &str {

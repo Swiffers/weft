@@ -126,22 +126,20 @@
         catalog(vec![("Db", Box::new(Db)), ("Sink", Box::new(Sink))])
     }
 
-    async fn drive_phase(phase: weft_core::context::Phase, copy: Arc<Copy>) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        let project = project();
-        let execution_id = uuid::Uuid::new_v4();
-        let journal = Arc::new(MemJournal::default());
-        let rows = [
+    /// The run's birth in `phase`, `db` kicked.
+    fn birth(project: &ProjectDefinition, execution_id: ExecutionId, phase: weft_core::context::Phase) -> [ExecEvent; 2] {
+        [
             ExecEvent::ExecutionStarted {
                 execution_id,
                 project_id: project.id,
                 entry_node: "db".into(),
                 phase,
-                definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
+                definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
                 binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                 // A setup names the nodes it brings up; any other run here runs the whole program.
                 selection: (phase == weft_core::context::Phase::InfraSetup).then(|| {
                     weft_core::project::selection::RecordedSelection::new(
-                        weft_core::project::selection::RunSelection::restricted(&project, ["db", "a", "b", "c"].iter().map(|n| weft_core::frames::Located::top(*n)).collect())
+                        weft_core::project::selection::RunSelection::restricted(project,["db", "a", "b", "c"].iter().map(|n| weft_core::frames::Located::top(*n)).collect())
                             .expect("valid test selection"),
                     )
                 }),
@@ -150,8 +148,14 @@
                 settings: Default::default(),
             },
             ExecEvent::NodeKicked { execution_id, node_id: "db".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
-        ];
-        for row in &rows {
+        ]
+    }
+
+    async fn drive_phase(phase: weft_core::context::Phase, copy: Arc<Copy>) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        let project = project();
+        let execution_id = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        for row in &birth(&project, execution_id, phase) {
             journal.record_event(row, None).await.unwrap();
         }
         let mut clients = clients(journal.clone());
@@ -205,5 +209,86 @@
             *copy.saves.lock().unwrap(),
             vec![("db".to_string(), BTreeMap::from([("addr".to_string(), json!("from-the-body"))]))],
             "only what went out: the broker merges it over what the copy holds, so a value pushed meanwhile stays"
+        );
+    }
+
+    /// Emits `addr` (what it sends tells its first body from the replay),
+    /// then waits for an answer and returns.
+    struct PausingDb {
+        bodies: std::sync::atomic::AtomicU32,
+    }
+    test_manifest!(PausingDb, "Db");
+    #[async_trait]
+    impl Node for PausingDb {
+        async fn provision_infra(&self, _ctx: weft_core::InfraProvisionContext, _input: weft_core::ValueBag) -> WeftResult<weft_core::infra::InfraSpec> {
+            Ok(weft_core::infra::InfraSpec::default())
+        }
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let life = match self.bodies.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => "first-life",
+                _ => "replayed",
+            };
+            ctx.pulse_downstream(NodeOutput::new().set("addr", json!(life))).await?;
+            ctx.await_signal(weft_core::signal::Form {
+                form_type: "human_query".into(),
+                schema: weft_core::signal::FormSchema { fields: Vec::new() },
+                title: None,
+                description: None,
+                consumer_kind: None,
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    /// An infra setup sends a baked output, pauses, and resumes on a
+    /// later worker: the replay sends nothing on that output, and the
+    /// bake saves the value downstream received, the first body's.
+    #[tokio::test]
+    async fn an_infra_setup_that_paused_bakes_what_went_out_before_the_pause() {
+        let project = Arc::new(project());
+        let execution_id = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        journal.seed(&birth(&project, execution_id, weft_core::context::Phase::InfraSetup));
+        let nodes = catalog(vec![
+            ("Db", Box::new(PausingDb { bodies: Default::default() })),
+            ("Sink", Box::new(Sink)),
+        ]);
+        let copy = Arc::new(Copy::default());
+        let tasks = super::engine_test_rig::AwaitTasks::new();
+        let with_fakes = || {
+            let mut c = clients(journal.clone());
+            c.infra = copy.clone();
+            c.infra_state = copy.clone();
+            c.tasks = tasks.clone();
+            c
+        };
+
+        let paused = drive_on(project.clone(), nodes.clone(), execution_id, journal.clone(), with_fakes(), CancellationFlag::new_arc(), None)
+            .await
+            .expect("the first drive runs")
+            .outcome;
+        assert!(matches!(paused, ExecutionOutcome::Stalled), "{paused:?}");
+        assert!(copy.saves.lock().unwrap().is_empty(), "a paused setup has saved nothing yet");
+
+        let token = tasks.minted().expect("the wait registered");
+        journal.seed(&[ExecEvent::wait_answered(execution_id, token, weft_core::primitive::WaitAnswer::Given { value: json!("go") }, 1)]);
+        let resumed = drive_on(project, nodes, execution_id, journal.clone(), with_fakes(), CancellationFlag::new_arc(), None)
+            .await
+            .expect("the second drive runs")
+            .outcome;
+        assert!(matches!(resumed, ExecutionOutcome::Completed), "{resumed:?}");
+
+        let events = journal.events_of(execution_id);
+        assert_eq!(emitted(&events, "addr"), Some(json!("first-life")), "{events:?}");
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, ExecEvent::PortEmitted { node_id, port, .. } if node_id == "db" && port == "addr")).count(),
+            1,
+            "the replay sent nothing on `addr`"
+        );
+        assert_eq!(
+            *copy.saves.lock().unwrap(),
+            vec![("db".to_string(), BTreeMap::from([("addr".to_string(), json!("first-life"))]))],
+            "the bake holds what downstream received"
         );
     }

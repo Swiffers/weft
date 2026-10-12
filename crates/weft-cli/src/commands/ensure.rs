@@ -116,8 +116,8 @@ impl ProjectHandle {
         &self.built.definition_hash
     }
 
-    /// This build as an activate or a resync names it (no reactivate
-    /// choice: the caller sets one when it has one).
+    /// This build as an activate names it (no reactivate choice: the
+    /// caller sets one when it has one).
     pub fn activation_target(&self) -> weft_core::activation::ActivationTarget {
         weft_core::activation::ActivationTarget { build: self.built.named(), reactivate_choice: None }
     }

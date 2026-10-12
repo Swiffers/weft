@@ -236,9 +236,13 @@ impl Host {
     /// again, an apply ended). The supervisor looks at infra that runs
     /// fine only when told to, so an install whose infra runs fine
     /// wakes nothing; the death of the whole machine is told by the cloud
-    /// itself. The first look after the agent starts always asks.
+    /// itself. The first look after the agent starts always asks. A
+    /// request that fails is asked again at the next looks, [`ASK_TRIES`]
+    /// times in all, and then not until the unit changes again: each try
+    /// wakes the broker's database.
     async fn watch(self, broker: std::sync::Arc<weft_broker_client::BrokerInfraClient>) {
         let mut told: Option<Vec<(String, String, String)>> = None;
+        let mut tries = 0;
         loop {
             match self.seen().await.map(|seen| Self::stands(&seen)) {
                 Ok(stands) if told.as_ref() == Some(&stands) => {}
@@ -247,8 +251,17 @@ impl Host {
                         let a = Self::assignment().await?;
                         broker.ask_for_a_look(a.node.node.project).await
                     };
+                    tries += 1;
                     match asked.await {
-                        Ok(()) => told = Some(stands),
+                        Ok(()) => {
+                            told = Some(stands);
+                            tries = 0;
+                        }
+                        Err(e) if tries >= ASK_TRIES => {
+                            tracing::error!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), tries, "could not ask for a look at the unit; giving up until it changes again");
+                            told = Some(stands);
+                            tries = 0;
+                        }
                         Err(e) => tracing::warn!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), "could not ask for a look at the unit; asking again at the next look"),
                     }
                 }
@@ -272,6 +285,10 @@ impl Host {
 /// call to the machine's own Docker and the unit's checks, and costs
 /// nothing off the machine.
 const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many looks in a row the agent asks for a look at one state of its
+/// unit before it gives up on that state (`Host::watch`).
+const ASK_TRIES: u32 = 3;
 
 /// Run the machine's unit and answer weft about it.
 pub async fn host() -> anyhow::Result<()> {

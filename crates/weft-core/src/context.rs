@@ -270,7 +270,10 @@ impl ExecutionContext {
     ///
     /// The body replays from the top when the fire arrives, so a side
     /// effect before this call (the submit that started the job) goes
-    /// through [`Self::run`].
+    /// through [`Self::run`]. An emission before it on an ordinary port
+    /// replays as a no-op (the first value stands); after a yield on or
+    /// a close of a stream output this call is refused, because a
+    /// stream's items cannot be sent again.
     ///
     /// This is the resume path; pair with `register_signal`
     /// (entry-trigger, persistent) for the other case. Lifecycle
@@ -945,9 +948,11 @@ impl ExecutionContext {
     /// run without one checks `is_api_call`/`is_websocket` first, or
     /// handles `None`.
     pub fn caller(&self) -> Option<crate::caller::CallerHandle> {
-        self.handle
-            .caller_connection()
-            .map(crate::caller::CallerHandle::from_connection)
+        let caller = crate::caller::CallerHandle::from_connection(self.handle.caller_connection()?);
+        Some(match self.handle.waits_here() {
+            Some((liveness, node)) => caller.waited_by(liveness, node),
+            None => caller,
+        })
     }
 
     /// The live HTTP caller, attached and connected, for nodes that only
@@ -1355,6 +1360,18 @@ impl ValueBag {
     /// uniform surface over all of them.
     pub fn custom(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
+    }
+
+    /// The input ports this instance created on top of its type's own
+    /// (`ExecPython(photo: Image)`'s `photo`), in the order they were
+    /// written, whether or not anything arrived on them this firing.
+    /// [`Self::custom`] only holds values that arrived; a node whose
+    /// inputs ARE the author's port list (Python variables, a template's
+    /// ports) needs every port, a silent one included. The language's
+    /// gate ports (`_should_flow`) are never on the list. Empty on a
+    /// wake or nested bag, which have no port list behind them.
+    pub fn created(&self) -> impl Iterator<Item = &String> {
+        self.order.iter().flatten().filter(|name| !self.spec_names.contains(name.as_str()))
     }
 
     /// Add a declared input port the bag was not built with. The
@@ -2031,10 +2048,12 @@ impl StorageHandle {
     ) -> WeftResult<crate::storage::StoredFile> {
         let status = resp.status();
         if !status.is_success() {
+            // The same words `checked_send` quotes: the provider's own
+            // message out of its error envelope, else the raw body.
             let body = resp.text().await.unwrap_or_default();
             return Err(crate::error::node_error(format!(
                 "the service answered {status} trying to {what}: {}",
-                crate::truncate_user_string(&body, 500)
+                crate::access::client::error_detail(&body)
             )));
         }
         // The header goes through the one normalizer every remote
@@ -2402,16 +2421,19 @@ impl StorageHandle {
 }
 
 /// THE error every tier answers when a body calls `await_signal`
-/// after it already touched an output port (emitted OR closed one): a
-/// durable suspension replays the body from the top, so the touch
-/// would fire twice. One definition so the engine and both node-test
-/// rigs refuse with the same words.
-pub fn emitted_then_await_signal_error(node_id: &str) -> String {
+/// after it yielded on or closed a stream (`Generator[T]`) output. A
+/// durable suspension replays the body from the top; an ordinary port
+/// the firing already sent replays as a no-op (its first value
+/// stands), but a stream's items went out live, one pulse each, and
+/// the replay cannot tell which of them it already sent. One
+/// definition so the engine and both node-test rigs refuse with the
+/// same words.
+pub fn streamed_then_await_signal_error(node_id: &str) -> String {
     format!(
-        "node '{node_id}' called await_signal after emitting or closing an output \
-         port; a node that touches a port then durably suspends would touch it again \
-         on replay. Emit and close after all awaits, or (for a co-alive node) stay \
-         warm with bus.recv() instead of await_signal."
+        "node '{node_id}' called await_signal after yielding on or closing a stream \
+         output; a pause replays the body from the top, and a stream's items went out \
+         live and cannot be sent again. Wait before the stream starts, or (for a \
+         co-alive node) stay warm with bus.recv() instead of await_signal."
     )
 }
 
@@ -2760,6 +2782,14 @@ pub trait ContextHandle: Send + Sync {
     /// connection (worker<->gateway socket) here when the caller attaches;
     /// tests wire a fake. Any node in the execution shares the one `Arc`.
     fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>>;
+
+    /// Whose in-process waits this firing's are: the run's liveness hook
+    /// and the firing itself, which its reads of its caller's next message
+    /// register with (`crate::caller::CallerConnection::receive`). `None`
+    /// outside a run's drive (a node test), where nothing watches its waits.
+    fn waits_here(&self) -> Option<(std::sync::Weak<dyn crate::liveness::WaitLiveness>, crate::liveness::FiringLocation)> {
+        None
+    }
 }
 
 /// Splitting an endpoint address: the one place that knows a default
@@ -2950,6 +2980,20 @@ mod value_bag_tests {
             one_branch.in_order().unwrap().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             vec!["quick"],
         );
+    }
+
+    /// `created` is every port the instance added, in written order,
+    /// the silent ones included, and never one of the type's own
+    /// settings, whether or not those carry a value.
+    #[test]
+    fn created_lists_every_added_port_in_written_order() {
+        let bag = ValueBag::inputs(
+            json!({ "code": "print(1)", "photo": "p" }).as_object().unwrap().clone(),
+            ["code".to_string(), "timeout".to_string()].into_iter().collect(),
+            vec!["code".into(), "timeout".into(), "photo".into(), "caption".into()],
+        );
+        assert_eq!(bag.created().map(String::as_str).collect::<Vec<_>>(), vec!["photo", "caption"]);
+        assert_eq!(ValueBag::wake(None).created().count(), 0, "a wake bag has no port list");
     }
 
     /// Wake and nested bags carry no port list, so asking them for

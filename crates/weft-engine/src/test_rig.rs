@@ -9,24 +9,30 @@
 //!   - emitted outputs are captured at the ctx seam instead of routed
 //!     (there is no downstream graph);
 //!   - each RUNNER is one run, so a test's spends attribute to it, however
-//!     many times its body fires the rig.
+//!     many times its body fires the rig;
+//!   - the run has no program, so it never pauses: a wait the node makes
+//!     (`ctx.await_signal`) holds in its call, the way a wait of a run that
+//!     cannot pause does, kept by the same pieces a drive keeps it with
+//!     (`crate::outside_waits::keep_held`), its answer heard on the same
+//!     line a worker hears it on (`crate::line_watch`).
 
 use std::sync::{Arc, Mutex};
 
 use weft_core::access::Access;
-use weft_core::cancellation::CancellationFlag;
 use weft_core::context::ContextHandle;
+use weft_core::liveness::FiringLocation;
 use weft_core::node_test::LiveHandleFactory;
 use weft_core::{ExecutionId, LiveRig};
 
 use crate::context::{BusCoordinator, EngineClients, RunRecord, RunnerHandle};
 use crate::journal_writer::{DriveJournal, Leaving, RunSpec};
+use crate::wait_tracker::WaitTracker;
 
 /// Composes live rigs over one broker-client bundle and settles their
-/// debts when the runs are over. One runner serves every live test of
-/// a session; call [`Self::settle`] before the process reports its
-/// results so no leased connection and no in-flight cost record is
-/// dropped.
+/// debts when the run is over. One runner is one live test's run
+/// (`crate::test_runner` starts one per test); call [`Self::settle`]
+/// before the process reports its results so no leased connection and
+/// no in-flight cost record is dropped.
 pub struct LiveTestRunner {
     clients: EngineClients,
     replica: String,
@@ -39,18 +45,53 @@ pub struct LiveTestRunner {
     /// The run's record: its birth, what it spends, its ending.
     record: RunRecord,
     journal: Arc<DriveJournal>,
+    /// How the run is kept, as its birth says: how long a wait holds.
+    settings: weft_core::run_settings::RunSettings,
+    /// The run's place among the runs this process drives: its cancel,
+    /// which every handle a rig mints shares, so a `weft stop` reaches
+    /// the test.
+    registered: crate::line_watch::Registered,
     /// Renews this process's lease while the run goes: a run whose
     /// driver holds no lease reads as lost.
     lease: tokio::task::JoinHandle<()>,
+    /// Hears the run's answers and its cancel on the line to the broker,
+    /// as a worker's line watch does for its runs.
+    line_watch: tokio::task::JoinHandle<()>,
+    /// Ends the run just before the platform's cap on the request it runs
+    /// inside, when the platform has one.
+    capped: Option<tokio::task::JoinHandle<()>>,
     /// Every handle a rig minted, so `settle` can release the
     /// runtime-owned connections their bodies opened.
     handles: Arc<Mutex<Vec<Arc<RunnerHandle>>>>,
+    /// The one numbering of the run's `await_signal` and `ctx.run`
+    /// calls, which every handle a rig mints counts on. Each `rig.run`
+    /// fires the node under the same execution and node id, so a
+    /// numbering of its own would give its first wait the identity, and
+    /// the already-given answer, of an earlier run's first wait.
+    call_numbering: Arc<std::sync::atomic::AtomicU32>,
     /// The package's catalog, so a node under test that publishes a
     /// connection resolves the service's recipe exactly as it does in
     /// a real run.
     catalog: &'static dyn weft_core::NodeCatalog,
-    /// Per-rig parked-body watchdogs (see `rig`), aborted at `settle`.
-    watchdogs: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// What each rig runs beside its node (see `rig`), ended at `settle`.
+    rigs: Mutex<Vec<RigKeeping>>,
+}
+
+/// What one rig runs beside its node until the run settles.
+struct RigKeeping {
+    /// The rig's waits: one its node still holds when the run settles is
+    /// given up, so its call ends.
+    waits: Arc<WaitTracker>,
+    /// The parked-body watchdog and the keeper of the held waits.
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl RigKeeping {
+    fn stop(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 /// The recipe a node under test publishes against, the same one the
@@ -90,6 +131,12 @@ impl LiveTestRunner {
     /// Bear the test's run, `execution_id` (`RunKind::NodeTest`), and keep
     /// this process's lease while it goes. `clients` come from
     /// `EngineClients::from_broker`. `entry` names the test on its record.
+    /// `run_cap` is the platform's cap on the one request the test runs
+    /// inside (`WEFT_RUN_CAP_SECS`), when it has one: the run is ended
+    /// [`crate::worker::RUN_CAP_MARGIN`] before it, so a wait still held
+    /// gives up and the test settles and reports before the platform cuts
+    /// the request.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         clients: EngineClients,
         catalog: &'static dyn weft_core::NodeCatalog,
@@ -98,10 +145,16 @@ impl LiveTestRunner {
         project_id: uuid::Uuid,
         execution_id: ExecutionId,
         entry: String,
+        run_cap: Option<std::time::Duration>,
     ) -> Result<Self, String> {
         // Kept like the runtime's own bookkeeping runs: what a test spent
-        // is on record before its report says it ran.
-        let settings = weft_core::run_settings::RunSettings::bookkeeping();
+        // is on record before its report says it ran. A wait the node holds
+        // lasts as long as the job behind it (a dub, a video), up to the
+        // platform's cap: the person running the test is there, and stops
+        // it when they want.
+        let settings = weft_core::run_settings::RunSettings::bookkeeping()
+            .holding_for(weft_core::run_settings::MAX_HOLD_SECS)
+            .expect("the longest hold is a hold");
         let journal = clients.writer.run(RunSpec {
             execution_id,
             settings,
@@ -139,18 +192,34 @@ impl LiveTestRunner {
             .map_err(|e| format!("the test's run could not be recorded: {e:#}"))?;
         journal.flush().await.map_err(|e| format!("the test's run could not be recorded: {e:#}"))?;
         let lease = tokio::spawn(keep_lease(clients.door_broker.clone()));
+        // The one run this process drives; nothing comes of its coming.
+        let cancels = crate::line_watch::Cancels::new(Box::new(|| {}));
+        let registered = cancels.claim(execution_id).expect("a fresh registry holds no run");
+        let line_watch = crate::line_watch::spawn_line_watch(crate::line_watch::LineWatch::new(project_id, &clients, cancels));
+        let capped = run_cap.map(|cap| {
+            let flag = registered.flag.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(cap.saturating_sub(crate::worker::RUN_CAP_MARGIN)).await;
+                crate::worker::Limit::NodeTestCap { cap }.end(&flag, execution_id);
+            })
+        });
         Ok(Self {
             record: RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() },
             journal,
+            settings,
+            registered,
             lease,
+            line_watch,
+            capped,
             clients,
             replica,
             tenant_id,
             project_id,
             execution_id,
             handles: Arc::new(Mutex::new(Vec::new())),
+            call_numbering: Default::default(),
             catalog,
-            watchdogs: Mutex::new(Vec::new()),
+            rigs: Mutex::new(Vec::new()),
         })
     }
 
@@ -169,14 +238,35 @@ impl LiveTestRunner {
         let tenant_id = self.tenant_id.clone();
         let project_id = self.project_id;
         let handles = self.handles.clone();
+        let call_numbering = self.call_numbering.clone();
         let execution_id = self.execution_id;
         let catalog = self.catalog;
+        let settings = self.settings;
+        let cancellation = self.registered.flag.clone();
         // ONE coordinator per rig, shared by every handle it mints:
         // the rig is one test, and a bus the test seeds (`rig.bus`)
         // must resolve from the handle `rig.run` mints, exactly like
         // two firings of one execution share the execution's registry.
-        let waits = crate::wait_tracker::WaitTracker::new();
+        let waits = WaitTracker::new();
         let bus_coordinator = BusCoordinator::new(waits.clone());
+        let under_test = FiringLocation::new(weft_core::node_test::NODE_UNDER_TEST_ID, weft_core::frames::LoopFrames::default());
+        // The node's waits hold in its call (the run cannot pause), kept
+        // the way a drive keeps the waits it holds.
+        let keeper = tokio::spawn({
+            let (clients, waits, cancellation, under_test) = (self.clients.clone(), waits.clone(), cancellation.clone(), under_test.clone());
+            async move {
+                crate::outside_waits::keep_held(
+                    &clients,
+                    execution_id,
+                    &waits,
+                    under_test,
+                    settings.hold_secs(),
+                    crate::held_waits::Unsuspendable::NoProgram,
+                    &cancellation,
+                )
+                .await
+            }
+        });
         // Parked-body watchdog: legibility only, NEVER resolution. In
         // an execution the drive loop can prove a deadlock because it
         // knows every actor; here the TEST CODE is a live actor the
@@ -189,28 +279,25 @@ impl LiveTestRunner {
         // wake: a genuine hang holds it forever and still gets named,
         // so a hung `weft test` reports its own cause instead of
         // sitting silent until Ctrl+C.
-        {
+        let watchdog = {
             let waits = waits.clone();
-            let watchdog = tokio::spawn(async move {
+            tokio::spawn(async move {
                 const GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-                let firing: std::collections::HashSet<_> =
-                    [weft_core::liveness::FiringLocation::new(
-                        weft_core::node_test::NODE_UNDER_TEST_ID,
-                        weft_core::frames::LoopFrames::default(),
-                    )]
-                    .into_iter()
-                    .collect();
+                let firing: std::collections::HashSet<_> = [under_test].into_iter().collect();
+                // A wait held in the node's call is the outside's to end,
+                // and the keeper gives it up after the hold: no hang.
+                let parked_on_a_bus = || waits.deadlock_provable(&firing) && !waits.held().pending();
                 loop {
                     let notified = waits.wait_notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    if waits.deadlock_provable(&firing) {
+                    if parked_on_a_bus() {
                         // Provably parked NOW; re-confirm after the
                         // grace window unless something wakes first.
                         if tokio::time::timeout(GRACE, notified.as_mut()).await.is_ok() {
                             continue;
                         }
-                        if waits.deadlock_provable(&firing) {
+                        if parked_on_a_bus() {
                             tracing::warn!(
                                 target: "weft_engine::test_rig",
                                 "the node under test has been parked on a wait (a bus \
@@ -225,9 +312,9 @@ impl LiveTestRunner {
                     }
                     notified.await;
                 }
-            });
-            self.watchdogs.lock().unwrap().push(watchdog);
-        }
+            })
+        };
+        self.rigs.lock().unwrap().push(RigKeeping { waits: waits.clone(), tasks: [watchdog, keeper] });
         let factory: LiveHandleFactory = Arc::new(move |role, declared, has_generator_input| {
             // The role decides the firing identity: the test code's
             // waits (a cursor it reads, a bus it seeds) must never be
@@ -245,7 +332,7 @@ impl LiveTestRunner {
             // into the constructor, and the recipe is looked up by it.
             let published = published_spec(catalog, &node_type)
                 .map_err(weft_core::WeftError::Config)?;
-            let handle = Arc::new(RunnerHandle::new(
+            let handle = RunnerHandle::new(
                 project_id,
                 execution_id,
                 node_id.to_string(),
@@ -257,7 +344,7 @@ impl LiveTestRunner {
                 published,
                 replica.clone(),
                 tenant_id.clone(),
-                Arc::new(CancellationFlag::new()),
+                cancellation.clone(),
                 waits.clone(),
                 bus_coordinator.clone(),
                 Arc::new(declared),
@@ -273,7 +360,9 @@ impl LiveTestRunner {
                 // in an execution (the rig DOES serve stream consumers:
                 // the input bag registers real feeds).
                 has_generator_input,
-            ));
+            );
+            let handle =
+                Arc::new(handle.with_settings(settings).without_program().with_call_numbering(call_numbering.clone()));
             handles.lock().unwrap().push(handle.clone());
             Ok(handle as Arc<dyn ContextHandle>)
         });
@@ -293,10 +382,18 @@ impl LiveTestRunner {
     /// when the run's record could not be finished; empty means everything
     /// was settled.
     pub async fn settle(&self) -> Vec<String> {
-        // Watchdogs are also reaped by Drop; aborting here too just
-        // stops them the moment the run is over.
-        for watchdog in self.watchdogs.lock().unwrap().drain(..) {
-            watchdog.abort();
+        // What the rigs run beside their nodes stops the moment the run is
+        // over (Drop reaps it too). A wait a node still holds is given up,
+        // so its call ends rather than hanging; the run's ending takes down
+        // the signal of every wait it registered that nobody answered (the
+        // dispatcher's `run_ends`), a wait whose call was dropped included.
+        for rig in self.rigs.lock().unwrap().drain(..) {
+            rig.stop();
+            rig.waits.held().give_up("the node test ended before its wait was answered");
+        }
+        self.line_watch.abort();
+        if let Some(capped) = &self.capped {
+            capped.abort();
         }
         let handles: Vec<Arc<RunnerHandle>> =
             std::mem::take(&mut *self.handles.lock().unwrap());
@@ -305,9 +402,24 @@ impl LiveTestRunner {
             failures.extend(handle.close_opened_accesses().await);
         }
         self.clients.open_charges
-            .close_execution_id(self.execution_id, &self.record.costs, "the node test ended before the job was read back")
+            .close_execution_id(
+                self.execution_id,
+                &self.record.costs,
+                crate::metering::Closing::Unknown("the node test ended before the job was read back".into()),
+            )
             .await;
-        let ending = weft_journal::ExecEvent::ExecutionCompleted { execution_id: self.execution_id, at_unix: crate::now_unix() };
+        // A run stopped (by a person, or at the platform's cap) ends on
+        // record as stopped, saying by what.
+        let at_unix = crate::now_unix();
+        let ending = match self.registered.flag.cause() {
+            Some(cause) => weft_journal::ExecEvent::ExecutionCancelled {
+                execution_id: self.execution_id,
+                reason: cause.to_string(),
+                cause: Some(cause),
+                at_unix,
+            },
+            None => weft_journal::ExecEvent::ExecutionCompleted { execution_id: self.execution_id, at_unix },
+        };
         let ended = match weft_journal::JournalClient::record_event(self.journal.as_ref(), &ending, Some(&self.replica)).await {
             Ok(()) => self.journal.leave(Leaving::Ended).await,
             Err(e) => Err(e),
@@ -323,12 +435,16 @@ impl LiveTestRunner {
 }
 
 impl Drop for LiveTestRunner {
-    /// Reap any watchdog `settle` did not drain, so a runner that is
-    /// dropped without settling (a panicking test, an aborted run)
-    /// never leaks a background task for the runtime's lifetime.
+    /// Reap any task `settle` did not, so a runner that is dropped
+    /// without settling (a panicking test, an aborted run) never leaks a
+    /// background task for the runtime's lifetime.
     fn drop(&mut self) {
-        for watchdog in self.watchdogs.lock().unwrap().drain(..) {
-            watchdog.abort();
+        for rig in self.rigs.lock().unwrap().drain(..) {
+            rig.stop();
+        }
+        self.line_watch.abort();
+        if let Some(capped) = &self.capped {
+            capped.abort();
         }
         self.lease.abort();
     }
@@ -347,11 +463,232 @@ async fn keep_lease(broker: Arc<dyn crate::door::DoorBroker>) {
             in_flight: Default::default(),
             window_start: weft_core::signal::limits::window(crate::now_unix() as i64).0,
             counts: Vec::new(),
-            tokens: Vec::new(),
             vouch_until: None,
+            shortens: false,
         };
         if let Err(e) = broker.tick(&tick).await {
             tracing::warn!(target: "weft_engine::test_rig", error = %format!("{e:#}"), "the test's lease could not be renewed; the next second tries again");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Layer 3: a live test's node that waits, through the production
+    //! rig, with the broker and its line faked.
+
+    use super::*;
+    use crate::execution_driver::engine_test_rig::{catalog, clients, Answers, AwaitTasks, MemJournal};
+    use serde_json::json;
+    use weft_core::error::WeftResult;
+    use weft_core::node::{Node, NodeOutput};
+    use weft_core::ExecutionContext;
+
+    /// Waits on a timer, then emits what the wait answered.
+    struct Waits;
+    impl weft_core::NodeManifest for Waits {
+        fn manifest(&self) -> &'static weft_core::node::NodeMetadata {
+            static M: std::sync::OnceLock<weft_core::node::NodeMetadata> = std::sync::OnceLock::new();
+            M.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "Waits", "label": "Waits", "description": "",
+                    "outputs": [{ "name": "value", "type": "String" }]
+                }))
+                .expect("the node's metadata")
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for Waits {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 600_000 } };
+            let value = ctx.await_signal(timer).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
+        }
+    }
+
+    /// One live test's run, its broker and its line faked.
+    struct Live {
+        runner: LiveTestRunner,
+        tasks: Arc<AwaitTasks>,
+        answers: Arc<Answers>,
+        line: Arc<crate::context::TestLine>,
+        journal: Arc<MemJournal>,
+        project_id: uuid::Uuid,
+    }
+
+    async fn live() -> Live {
+        live_capped(None).await
+    }
+
+    /// [`live`] on a platform whose cap on one request is `run_cap`.
+    async fn live_capped(run_cap: Option<std::time::Duration>) -> Live {
+        let (tasks, answers, line) = (AwaitTasks::new(), Arc::new(Answers::default()), crate::context::TestLine::new());
+        let journal = Arc::new(MemJournal::default());
+        let clients = EngineClients {
+            tasks: tasks.clone(),
+            told: answers.told.clone(),
+            runs: answers.clone(),
+            line: line.clone(),
+            ..clients(journal.clone())
+        };
+        // A catalog lives as long as the process, as the test binary's does.
+        let catalog: &'static Arc<dyn weft_core::NodeCatalog> = Box::leak(Box::new(catalog(vec![("Waits", Box::new(Waits) as Box<dyn Node>)])));
+        let project_id = uuid::Uuid::new_v4();
+        let runner = LiveTestRunner::start(
+            clients,
+            catalog.as_ref(),
+            "replica".into(),
+            "tenant".into(),
+            project_id,
+            weft_core::new_execution_id(),
+            "node-test:Waits::waits".into(),
+            run_cap,
+        )
+        .await
+        .expect("the test's run is born");
+        Live { runner, tasks, answers, line, journal, project_id }
+    }
+
+    impl Live {
+        /// The node waits, through a rig of the runner.
+        fn waiting(&self) -> tokio::task::JoinHandle<weft_core::node_test::RunOutcome> {
+            waiting_on(Arc::new(self.runner.rig("grant", "svc", Default::default())))
+        }
+
+        /// The wait's token, once the node registered it and its keeper
+        /// asked for its answers.
+        async fn asked(&self) -> String {
+            let token = self.tasks.await_token().await;
+            while self.answers.reads() == 0 {
+                tokio::task::yield_now().await;
+            }
+            token
+        }
+
+        /// The token of a wait registered after `earlier`, once its keeper
+        /// asked for its answers (a read past the `reads` there were).
+        async fn asked_after(&self, earlier: &str, reads: usize) -> String {
+            let token = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match self.tasks.minted() {
+                        Some(token) if token != earlier => return token,
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
+                    }
+                }
+            })
+            .await
+            .expect("the second run registered a wait of its own");
+            while self.answers.reads() <= reads {
+                tokio::task::yield_now().await;
+            }
+            token
+        }
+
+        /// Answer the wait `token`: the answer is kept for the run, and
+        /// its news comes on the line.
+        fn answer(&self, token: String, value: serde_json::Value) {
+            self.answers.keep(token, value);
+            self.line
+                .pushed
+                .send(weft_task_store::pg_signal::Heard::Signal {
+                    channel: weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
+                    payload: weft_task_store::runs::run_payload(self.project_id, self.runner.execution_id()).into(),
+                })
+                .unwrap();
+        }
+    }
+
+    /// The node waits, through `rig`.
+    fn waiting_on(rig: Arc<weft_core::LiveRig>) -> tokio::task::JoinHandle<weft_core::node_test::RunOutcome> {
+        tokio::spawn(async move { rig.run(&Waits, json!({})).await })
+    }
+
+    async fn outcome(waiting: tokio::task::JoinHandle<weft_core::node_test::RunOutcome>) -> weft_core::node_test::RunOutcome {
+        tokio::time::timeout(std::time::Duration::from_secs(10), waiting).await.expect("the node ended").unwrap()
+    }
+
+    // The node's wait takes the answer handed to its run once the line
+    // brings the news, the node carries on, and what it emits is captured.
+    weft_core::stress_test! {
+        name: a_live_tests_wait_takes_the_answer_its_line_brings,
+        runs: 20,
+        worker_threads: 4,
+        async fn body() {
+            let live = live().await;
+            let waiting = live.waiting();
+            let token = live.asked().await;
+            live.answer(token, json!("done"));
+            let outcome = outcome(waiting).await;
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+            assert_eq!(outcome.output("value").unwrap(), &json!("done"));
+            assert!(live.runner.settle().await.is_empty());
+            assert!(live.tasks.withdrawn.lock().unwrap().is_empty(), "an answered wait is not withdrawn");
+        }
+    }
+
+    // A live test that runs its node twice, each run parking on a wait,
+    // gets a wait of its own for each run: the second run's wait carries
+    // on from the first run's call numbering, so it is not the first
+    // run's wait again, and it takes its own answer.
+    weft_core::stress_test! {
+        name: each_run_of_a_live_test_takes_its_own_wait,
+        runs: 20,
+        worker_threads: 4,
+        async fn body() {
+            let live = live().await;
+            let rig = Arc::new(live.runner.rig("grant", "svc", Default::default()));
+            let waiting = waiting_on(rig.clone());
+            let first = live.asked().await;
+            live.answer(first.clone(), json!("first"));
+            let outcome_first = outcome(waiting).await;
+            assert_eq!(outcome_first.output("value").ok(), Some(&json!("first")), "{:?}", outcome_first.result);
+
+            let reads = live.answers.reads();
+            let waiting = waiting_on(rig);
+            let second = live.asked_after(&first, reads).await;
+            live.answer(second, json!("second"));
+            let outcome_second = outcome(waiting).await;
+            assert_eq!(outcome_second.output("value").ok(), Some(&json!("second")), "{:?}", outcome_second.result);
+            assert!(live.runner.settle().await.is_empty());
+        }
+    }
+
+    /// A test that settles while its node still holds a wait gives the
+    /// wait up: the node's call ends, naming why, rather than hanging.
+    #[tokio::test]
+    async fn settling_gives_up_a_wait_still_held() {
+        let live = live().await;
+        let waiting = live.waiting();
+        live.asked().await;
+        assert!(live.runner.settle().await.is_empty());
+        let outcome = outcome(waiting).await;
+        let error = outcome.result.unwrap_err().to_string();
+        assert!(error.contains("the node test ended before its wait was answered"), "{error}");
+    }
+
+    /// On a platform with a cap on one request, a test whose node still
+    /// waits is ended just before it: the wait gives up naming the cap,
+    /// and the test settles with its run ended on record as stopped at a
+    /// time limit, all before the platform would cut the request.
+    #[tokio::test]
+    async fn a_live_test_ends_before_the_platforms_cap() {
+        let cap = crate::worker::RUN_CAP_MARGIN + std::time::Duration::from_millis(500);
+        let live = live_capped(Some(cap)).await;
+        let waiting = live.waiting();
+        live.asked().await;
+        let outcome = outcome(waiting).await;
+        let error = outcome.result.unwrap_err().to_string();
+        assert!(error.contains("minute limit this platform puts on one request"), "{error}");
+        assert!(live.runner.settle().await.is_empty());
+        let events = live.journal.events_of(live.runner.execution_id());
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                weft_journal::ExecEvent::ExecutionCancelled { cause: Some(weft_core::exec::CancelCause::Limit { .. }), .. }
+            )),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(event, weft_journal::ExecEvent::ExecutionCompleted { .. })), "{events:?}");
     }
 }

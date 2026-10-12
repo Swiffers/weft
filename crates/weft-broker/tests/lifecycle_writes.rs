@@ -12,12 +12,13 @@
 use sqlx::PgPool;
 
 use weft_broker::lifecycle_writes::{
-    complete_command, issue_command, next_command, record_event, set_status, set_waiting, sync_ownership,
-    unowned_work_waiting, FencedWrite, IssuedCommand,
+    cancels_for, claim_next, complete_command, health_state, issue_command, record_event, set_health_state, set_status,
+    set_waiting, sync_ownership, unowned_work_waiting, FencedWrite, IssuedCommand,
 };
 use weft_broker_client::protocol::{
-    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, InfraNodeStatus as Status,
-    SupervisorCommandCompleteRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
+    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, HealthProtocolState, InfraNodeStatus as Status,
+    SupervisorCommandCompleteRequest, SupervisorSetHealthStateRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
+    SupervisorSyncOwnershipRequest,
 };
 
 const TENANT: &str = "t1";
@@ -137,6 +138,23 @@ fn stamp(replica: &str, command_id: Option<i64>, unit: Option<&str>, status: Sta
         failure_stage: None,
         failure_message: None,
         instance: None,
+        not_ready_since_unix: None,
+        ready_since_unix: None,
+    }
+}
+
+/// An ordinary ownership sync of `replica`: no copies on its host, nothing
+/// settled, not ending.
+fn syncing(replica: &str) -> SupervisorSyncOwnershipRequest {
+    SupervisorSyncOwnershipRequest {
+        replica: replica.into(),
+        held_projects: Some(vec![]),
+        looked: vec![],
+        settled: vec![],
+        failed: vec![],
+        gave_up: vec![],
+        all_failed: None,
+        ending: false,
     }
 }
 
@@ -438,7 +456,7 @@ async fn next_command_runs_copies_side_by_side_and_one_copy_in_order(pool: PgPoo
 
     let next = |busy: Vec<i64>| {
         let pool = pool.clone();
-        async move { next_command(&pool, OWNER, &busy).await.unwrap().map(|c| c.id) }
+        async move { claim_next(&pool, OWNER, &busy).await.unwrap().map(|c| c.id) }
     };
     assert_eq!(next(vec![]).await, Some(ada));
     // Running ada's command: bob's copy is another copy, so it goes now.
@@ -486,7 +504,7 @@ async fn a_command_on_every_copy_waits_for_and_holds_up_each_copy(pool: PgPool) 
 
     let next = |busy: Vec<i64>| {
         let pool = pool.clone();
-        async move { next_command(&pool, OWNER, &busy).await.unwrap().map(|c| c.id) }
+        async move { claim_next(&pool, OWNER, &busy).await.unwrap().map(|c| c.id) }
     };
     let done = |command_id: i64| {
         let pool = pool.clone();
@@ -536,7 +554,7 @@ async fn a_tick_reports_the_projects_it_took_on(pool: PgPool) {
     lease_of(&pool, foreign, OTHER).await;
     let claimed = || {
         let pool = pool.clone();
-        async move { sync_ownership(&pool, OWNER, &[]).await.unwrap().claimed }
+        async move { sync_ownership(&pool, &syncing(OWNER), None).await.unwrap().claimed }
     };
 
     assert_eq!(claimed().await, vec![PROJECT], "a free project is claimed");
@@ -549,37 +567,604 @@ async fn a_tick_reports_the_projects_it_took_on(pool: PgPool) {
     assert_eq!(claimed().await, vec![PROJECT], "a lapsed lease taken back is news");
 }
 
-/// A tick says when its supervisor next has something to do: never over a
-/// project of its own whose infra runs (a machine saying how its unit
-/// stands changed wakes it instead), at the lapse of a sibling's lease over
-/// one with infra copies expected to run (the word that one changed may
-/// have woken this replica, not the sibling; a stopped copy says nothing),
-/// and now once a command waits on one of its own.
+/// The database's clock, unix seconds.
+async fn db_now(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT").fetch_one(pool).await.unwrap()
+}
+
+/// A booking of the supervisor's passes over a fake alarm, and when it is
+/// booked (unix ms).
+fn supervisor_booking(pool: &PgPool) -> (weft_task_store::drain::Booking, std::sync::Arc<weft_platform_traits::alarm::fake::FakeAlarm>) {
+    let alarm = std::sync::Arc::new(weft_platform_traits::alarm::fake::FakeAlarm::default());
+    (weft_task_store::drain::Booking::new(pool.clone(), weft_platform_traits::CoreRole::Supervisor, alarm.clone()), alarm)
+}
+
+async fn booked_pass(pool: &PgPool) -> Option<i64> {
+    sqlx::query_scalar::<_, Option<i64>>("SELECT due_ms FROM role_loop_due WHERE role = 'supervisor' AND loop_name = 'pass'")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
+}
+
+/// A sync says when its supervisor next has something to look at that
+/// nothing announces, and books its next pass then: nothing over infra that
+/// runs well (a machine saying how its unit stands changed wakes it
+/// instead), a unit's health window when it ends, a sibling's lease over a
+/// project with running infra when it lapses, and now for a command
+/// waiting on a project no lease covers. A sync with nothing to look at
+/// clears the booking and cancels its wake.
 #[sqlx::test]
-async fn a_tick_says_when_there_is_next_something_to_look_at(pool: PgPool) {
+async fn sync_ownership_books_the_supervisors_pass_at_next_due_and_clears_it_when_none(pool: PgPool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
-    let declared = sync_ownership(&pool, OWNER, &[]).await.unwrap();
+    let (booking, alarm) = supervisor_booking(&pool);
+    let sync = |replica: &'static str| {
+        let (pool, booking) = (pool.clone(), &booking);
+        async move { sync_ownership(&pool, &syncing(replica), Some(booking)).await.unwrap() }
+    };
+    let declared = sync(OWNER).await;
     assert_eq!(declared.owned.len(), 1, "declared infra is ownable");
-    assert!(!declared.owns_work && declared.others_lapse_in_secs.is_none(), "but gives nothing to look at: {declared:?}");
+    assert_eq!(declared.next_due_unix, None, "but gives nothing to look at");
 
-    node_row(&pool, "running", serde_json::json!({})).await;
-    let running = sync_ownership(&pool, OWNER, &[]).await.unwrap();
-    assert!(!running.owns_work && running.others_lapse_in_secs.is_none(), "infra that runs needs no look on a clock: {running:?}");
+    let now = db_now(&pool).await;
+    let mut flaky = unit("running");
+    flaky["not_ready_since_unix"] = serde_json::json!(now - 10);
+    node_row(&pool, "running", serde_json::json!({ "web": flaky })).await;
+    let window = sync(OWNER).await;
+    assert_eq!(window.next_due_unix, Some(now + 20), "the window ends 30 s after the unit stopped being ready");
+    assert_eq!(booked_pass(&pool).await, Some((now + 20) * 1000));
+    assert_eq!(alarm.wakes().len(), 1, "one wake for the booking");
+
+    sqlx::query("UPDATE infra_node SET units_json = $1").bind(serde_json::json!({ "web": unit("running") })).execute(&pool).await.unwrap();
+    assert_eq!(sync(OWNER).await.next_due_unix, None, "a unit that is ready again leaves nothing to look at");
+    assert_eq!(booked_pass(&pool).await, None, "the booking is cleared");
+    assert_eq!(alarm.cancelled().len(), 1, "and its wake cancelled");
 
     lease(&pool, OTHER).await;
-    let sibling = sync_ownership(&pool, OWNER, &[]).await.unwrap();
-    assert!(sibling.owned.is_empty() && !sibling.owns_work, "a sibling holds the lease");
-    let lapse = sibling.others_lapse_in_secs.expect("its lease over a project with infra copies may lapse");
-    assert!((3590..=3600).contains(&lapse), "the sibling's lease lapses in an hour: {lapse}");
+    let sibling = sync(OWNER).await;
+    assert!(sibling.owned.is_empty(), "a sibling holds the lease");
+    let lapse = sibling.next_due_unix.expect("its lease over running infra may lapse");
+    assert!((now + 3600..=now + 3610).contains(&lapse), "looked at once the sibling's lease lapses: {lapse}");
     sqlx::query("UPDATE infra_node SET status = 'stopped'").execute(&pool).await.unwrap();
-    let stopped = sync_ownership(&pool, OWNER, &[]).await.unwrap();
-    assert!(stopped.others_lapse_in_secs.is_none(), "a stopped copy says nothing to wake for: {stopped:?}");
+    assert_eq!(sync(OWNER).await.next_due_unix, None, "a stopped copy says nothing to wake for");
 
-    command_of(&pool, PROJECT).await;
+    // A pass ending claims nothing, so a command on a project nobody
+    // leases is still waiting: the next pass is due at once.
+    sqlx::query("DELETE FROM infra_owner").execute(&pool).await.unwrap();
+    command(&pool).await;
+    let ending = SupervisorSyncOwnershipRequest { ending: true, ..syncing(OWNER) };
+    let waiting = sync_ownership(&pool, &ending, Some(&booking)).await.unwrap().next_due_unix.expect("due");
+    assert!((now..=now + 10).contains(&waiting), "due now: {waiting}");
+}
+
+/// A look whose time already came and failed (the supervisor wrote it
+/// down as given up, at or after that time) is not booked again: a
+/// person's look or the next real event retries it, never a clock.
+#[sqlx::test]
+async fn a_due_time_already_given_up_on_is_not_booked(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    let (booking, _alarm) = supervisor_booking(&pool);
+    let now = db_now(&pool).await;
+    let mut flaky = unit("running");
+    flaky["not_ready_since_unix"] = serde_json::json!(now - 100);
+    node_row(&pool, "running", serde_json::json!({ "web": flaky })).await;
+    let due = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap().next_due_unix;
+    assert_eq!(due, Some(now - 70), "a window that already ended is due");
+    weft_task_store::unanswered::failed(&pool, weft_task_store::unanswered::Callee::Infra(PROJECT), None, "the look failed")
+        .await
+        .unwrap()
+        .log();
+    assert_eq!(sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap().next_due_unix, None);
+}
+
+/// A pass that ends gives back every lease, and what it settled is no
+/// longer written down as given up.
+#[sqlx::test]
+async fn an_ending_sync_gives_back_every_lease_and_clears_settled(pool: PgPool) {
+    schema(&pool).await;
+    let other = uuid::Uuid::from_u128(2);
+    for project in [PROJECT, other] {
+        project_row(&pool, project, true).await;
+    }
+    assert_eq!(sync_ownership(&pool, &syncing(OWNER), None).await.unwrap().owned.len(), 2);
+    weft_task_store::unanswered::failed(&pool, weft_task_store::unanswered::Callee::Infra(PROJECT), None, "gave up").await.unwrap().log();
+    let ending = SupervisorSyncOwnershipRequest { settled: vec![PROJECT], ending: true, ..syncing(OWNER) };
+    let ended = sync_ownership(&pool, &ending, None).await.unwrap();
+    assert!(ended.owned.is_empty(), "no lease stays");
+    assert!(ended.claimed.is_empty(), "an ending sync claims nothing");
+    let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM unanswered_call").fetch_one(&pool).await.unwrap();
+    assert_eq!(written, 0, "the settled project's give-up is cleared");
+}
+
+/// The failure stretch written down for `PROJECT`, if any.
+async fn infra_failure(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT error FROM unanswered_call WHERE callee = $1")
+        .bind(format!("infra:{PROJECT}"))
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// A pass that failed over a project whose window already ended is
+/// written down and tried again 5 s, then 10 s later, booked as the
+/// supervisor's next pass even though the failure masks the window's own
+/// time; holding the project leaves the retry set, a look that failed
+/// again takes the retry and sets the next, the third failure in a row
+/// stops the retries, and a look that fails in nothing ends the count, so
+/// only failures in a row count. A project whose lease moved, or whose
+/// lease of this replica lapsed, writes nothing.
+#[sqlx::test]
+async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: PgPool) {
+    use weft_broker_client::protocol::ProjectTrouble;
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    let (booking, _alarm) = supervisor_booking(&pool);
+    let now = db_now(&pool).await;
+    let mut flaky = unit("running");
+    flaky["not_ready_since_unix"] = serde_json::json!(now - 100);
+    node_row(&pool, "running", serde_json::json!({ "web": flaky })).await;
+    let failing = || SupervisorSyncOwnershipRequest {
+        failed: vec![ProjectTrouble { project_id: PROJECT, error: "the host did not answer".into() }],
+        ending: true,
+        ..syncing(OWNER)
+    };
+    let pass_fails = || async {
+        sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
+        sync_ownership(&pool, &failing(), Some(&booking)).await.unwrap().next_due_unix
+    };
+
+    let first = pass_fails().await.expect("the retry is due");
+    assert!((now + 5..=now + 7).contains(&first), "tried again 5 s later: {first}");
+    assert!(infra_failure(&pool).await.unwrap().contains("failure 1 in a row; tried again in 5 s"));
+
+    let taken = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
+    assert_eq!(taken.owned.len(), 1);
+    sqlx::query("UPDATE infra_health_look SET retry_at_unix = retry_at_unix - 10").execute(&pool).await.unwrap();
+    let retry = || async {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT retry_at_unix FROM infra_health_look").fetch_one(&pool).await.unwrap()
+    };
+    sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
+    assert!(retry().await.is_some(), "holding the project is not looking at it");
+    let looked_and_failed = SupervisorSyncOwnershipRequest { looked: vec![PROJECT], ..failing() };
+    let second = sync_ownership(&pool, &looked_and_failed, Some(&booking)).await.unwrap().next_due_unix.expect("due");
+    assert!((now + 10..=now + 12).contains(&second), "then 10 s later: {second}");
+    let third = pass_fails().await;
+    assert_eq!(third, None, "the third failure in a row stops the retries, and masks the window");
+    assert!(infra_failure(&pool).await.unwrap().contains("`weft infra look` tries again"));
+
+    sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
+    let clean = SupervisorSyncOwnershipRequest { looked: vec![PROJECT], settled: vec![PROJECT], ending: true, ..syncing(OWNER) };
+    sync_ownership(&pool, &clean, None).await.unwrap();
+    let failures: i32 = sqlx::query_scalar("SELECT failures FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    assert_eq!(failures, 0, "a look that fails in nothing ends the count");
+    assert_eq!(infra_failure(&pool).await, None);
+    pass_fails().await.expect("a failure after one that went through is retried");
+    assert!(infra_failure(&pool).await.unwrap().contains("failure 1 in a row"), "only failures in a row count");
+
+    sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
+    let unsettled_clean = SupervisorSyncOwnershipRequest { looked: vec![PROJECT], ..syncing(OWNER) };
+    sync_ownership(&pool, &unsettled_clean, None).await.unwrap();
+    let failures: i32 = sqlx::query_scalar("SELECT failures FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    assert_eq!(failures, 0, "a clean look ends the count even when a protocol keeps it from settling");
+    assert_eq!(retry().await, None, "and takes the retry");
+
+    sqlx::query("UPDATE infra_owner SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT - 1").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM unanswered_call").execute(&pool).await.unwrap();
+    sync_ownership(&pool, &failing(), Some(&booking)).await.unwrap();
+    assert_eq!(infra_failure(&pool).await, None, "a lease of this replica that lapsed judges nothing");
+
+    lease(&pool, OTHER).await;
+    sync_ownership(&pool, &failing(), None).await.unwrap();
+    assert_eq!(infra_failure(&pool).await, None, "a project whose lease moved is the new owner's to judge");
+}
+
+/// A pass whose host listing failed fails over a project only the
+/// listing could make ownable whose retry was due: no lease covers it, so
+/// the pass counts the failed listing against it, sets its next retry,
+/// and keeps that retry booked though the project is not ownable without
+/// a listing. A sync whose listing went through and does not make the
+/// project ownable clears its retry, its failures and what was written
+/// down of it, so a later pass that cannot list the host charges it
+/// nothing.
+#[sqlx::test]
+async fn a_failed_listing_fails_the_pass_over_a_due_retry_it_could_not_claim(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, false).await;
+    let (booking, _alarm) = supervisor_booking(&pool);
+    let now = db_now(&pool).await;
+    sqlx::query("INSERT INTO infra_health_look (project_id, failures, retry_at_unix) VALUES ($1, 1, $2)")
+        .bind(PROJECT)
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let unlisted = || SupervisorSyncOwnershipRequest { held_projects: None, ..syncing(OWNER) };
+    let claim = sync_ownership(&pool, &unlisted(), Some(&booking)).await.unwrap();
+    assert!(claim.owned.is_empty(), "nothing makes the project ownable without the listing");
+    assert_eq!(claim.next_due_unix, Some(now - 1), "its due retry stays booked");
+
+    let ending = || SupervisorSyncOwnershipRequest { all_failed: Some("the host did not list".into()), ending: true, ..unlisted() };
+    let second = sync_ownership(&pool, &ending(), Some(&booking)).await.unwrap().next_due_unix.expect("the retry stays booked");
+    assert!((now + 10..=now + 12).contains(&second), "tried again 10 s later: {second}");
+    assert_eq!(infra_failure(&pool).await.as_deref(), Some("the host did not list (failure 2 in a row; tried again in 10 s)"));
+    let listed = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
+    assert_eq!(listed.next_due_unix, None, "a listing that went through without the project books no retry for it");
+    assert_eq!(infra_failure(&pool).await, None, "and clears what was written down of it");
+    let look: (i32, Option<i64>) =
+        sqlx::query_as("SELECT failures, retry_at_unix FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    assert_eq!(look, (0, None), "with its retry and its failures in a row");
+
+    let later = sync_ownership(&pool, &ending(), Some(&booking)).await.unwrap().next_due_unix;
+    assert_eq!(later, None, "so a later pass that cannot list the host finds nothing left to fail over");
+    assert_eq!(infra_failure(&pool).await, None);
+}
+
+/// A pass that failed as a whole (what it owns could not be read) fails
+/// over every project whose lease it holds as it ends, the ones it took
+/// on mid-pass included, once each with its own error joined; a project
+/// another replica holds is left to it.
+#[sqlx::test]
+async fn a_pass_that_failed_whole_fails_over_every_project_it_holds(pool: PgPool) {
+    use weft_broker_client::protocol::ProjectTrouble;
+    schema(&pool).await;
+    let (mid_pass, sibling) = (uuid::Uuid::from_u128(2), uuid::Uuid::from_u128(3));
+    for project in [PROJECT, mid_pass, sibling] {
+        project_row(&pool, project, true).await;
+    }
+    let (booking, _alarm) = supervisor_booking(&pool);
+    lease_of(&pool, sibling, OTHER).await;
     lease(&pool, OWNER).await;
-    let own = sync_ownership(&pool, OWNER, &[]).await.unwrap();
-    assert!(own.owns_work && own.others_lapse_in_secs.is_none(), "{own:?}");
+    lease_of(&pool, mid_pass, OWNER).await;
+    let ending = SupervisorSyncOwnershipRequest {
+        failed: vec![ProjectTrouble { project_id: PROJECT, error: "the sweep failed".into() }],
+        all_failed: Some("could not read what it owns".into()),
+        ending: true,
+        ..syncing(OWNER)
+    };
+    sync_ownership(&pool, &ending, Some(&booking)).await.unwrap();
+    let written: Vec<(String, String)> = sqlx::query_as("SELECT callee, error FROM unanswered_call ORDER BY callee")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        written,
+        vec![
+            (format!("infra:{PROJECT}"), "the sweep failed; could not read what it owns (failure 1 in a row; tried again in 5 s)".to_string()),
+            (format!("infra:{mid_pass}"), "could not read what it owns (failure 1 in a row; tried again in 5 s)".to_string()),
+        ]
+    );
+}
+
+/// A claim takes the projects with something due first: a retry due over
+/// a project past the first batch by id is claimed by the first sync, so
+/// the pass it books looks at it instead of booking itself again at once.
+#[sqlx::test]
+async fn a_claim_takes_the_projects_with_something_due_first(pool: PgPool) {
+    schema(&pool).await;
+    let batch = weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH as u128;
+    let projects: Vec<uuid::Uuid> = (1..=batch + 1).map(|i| uuid::Uuid::from_u128(100 + i)).collect();
+    for project in &projects {
+        project_row(&pool, *project, true).await;
+    }
+    let last = *projects.last().unwrap();
+    sqlx::query("INSERT INTO infra_health_look (project_id, failures, retry_at_unix) VALUES ($1, 1, EXTRACT(EPOCH FROM NOW())::BIGINT - 1)")
+        .bind(last)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claimed = sync_ownership(&pool, &syncing(OWNER), None).await.unwrap().claimed;
+    assert_eq!(claimed.len(), batch as usize, "one batch");
+    assert!(claimed.contains(&last), "the project with a retry due is in it: {claimed:?}");
+}
+
+/// A failed pass's retry over a project that stopped being ownable before
+/// it came due is not booked: nothing would claim the project and take
+/// the retry, so it would be due again at every pass. The sync that
+/// listed the host and found it not ownable cleared the retry, so the
+/// project ownable again (here through a copy on the host) starts afresh.
+#[sqlx::test]
+async fn a_retry_over_a_project_nobody_can_own_is_cleared(pool: PgPool) {
+    use weft_broker_client::protocol::ProjectTrouble;
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    let (booking, _alarm) = supervisor_booking(&pool);
+    let now = db_now(&pool).await;
+    sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
+    let failing = SupervisorSyncOwnershipRequest {
+        failed: vec![ProjectTrouble { project_id: PROJECT, error: "the host did not answer".into() }],
+        ending: true,
+        ..syncing(OWNER)
+    };
+    let due = sync_ownership(&pool, &failing, Some(&booking)).await.unwrap().next_due_unix.expect("the retry is due");
+    assert!((now + 5..=now + 7).contains(&due), "tried again 5 s later: {due}");
+
+    sqlx::query("UPDATE project SET has_infra = FALSE").execute(&pool).await.unwrap();
+    let idle = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
+    assert!(idle.owned.is_empty(), "nothing is left to own");
+    assert_eq!(idle.next_due_unix, None, "so its retry books nothing");
+    assert_eq!(booked_pass(&pool).await, None);
+    assert_eq!(infra_failure(&pool).await, None, "what was written down of it is cleared");
+
+    let holding = SupervisorSyncOwnershipRequest { held_projects: Some(vec![PROJECT]), ending: true, ..syncing(OWNER) };
+    let back = sync_ownership(&pool, &holding, Some(&booking)).await.unwrap().next_due_unix;
+    assert_eq!(back, None, "ownable again, it has no retry left over");
+}
+
+/// What a pass could not delete of a removed project (no row, so no
+/// lease) is counted like a project's failed pass and written down once
+/// for the whole install: tried again 5 s, then 10 s later (booked though
+/// nothing can own the project, a pass that cannot list the host counting
+/// as its retry), then given up and shown. It stays while a listing still
+/// holds the project, and goes with its count once one does not.
+#[sqlx::test]
+async fn a_removed_projects_leftovers_are_written_down_for_the_install_retried_then_cleared(pool: PgPool) {
+    use weft_broker_client::protocol::ProjectTrouble;
+    schema(&pool).await;
+    let removed = uuid::Uuid::from_u128(9);
+    let (booking, _alarm) = supervisor_booking(&pool);
+    let now = db_now(&pool).await;
+    let holding = || SupervisorSyncOwnershipRequest { held_projects: Some(vec![removed]), ..syncing(OWNER) };
+    let failing = || SupervisorSyncOwnershipRequest {
+        failed: vec![ProjectTrouble { project_id: removed, error: "the disk is busy".into() }],
+        ending: true,
+        ..holding()
+    };
+    let written = || async {
+        sqlx::query_as::<_, (String, String)>("SELECT callee, error FROM unanswered_call").fetch_all(&pool).await.unwrap()
+    };
+    let shift = |secs: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE infra_health_look SET retry_at_unix = retry_at_unix - $1").bind(secs).execute(&pool).await.unwrap();
+        }
+    };
+
+    let first = sync_ownership(&pool, &failing(), Some(&booking)).await.unwrap().next_due_unix.expect("the retry is due");
+    assert!((now + 5..=now + 7).contains(&first), "tried again 5 s later: {first}");
+    assert_eq!(
+        written().await,
+        vec![(
+            "gone-copies:".to_string(),
+            format!("removed project {removed}: the disk is busy (failure 1 in a row; tried again in 5 s)")
+        )]
+    );
+
+    shift(10).await;
+    let unlisted = SupervisorSyncOwnershipRequest { held_projects: None, ..syncing(OWNER) };
+    let due = sync_ownership(&pool, &unlisted, Some(&booking)).await.unwrap().next_due_unix.expect("still booked");
+    assert!(due <= now, "its retry is due though nothing can own the project: {due}");
+    let not_listed = SupervisorSyncOwnershipRequest { all_failed: Some("the host did not list".into()), ending: true, ..unlisted };
+    let second = sync_ownership(&pool, &not_listed, Some(&booking)).await.unwrap().next_due_unix.expect("due");
+    assert!((now + 10..=now + 12).contains(&second), "a pass that cannot list is its retry, tried again 10 s later: {second}");
+    assert!(written().await[0].1.contains(&format!("removed project {removed}: the host did not list (failure 2 in a row")));
+
+    shift(20).await;
+    let third = sync_ownership(&pool, &failing(), Some(&booking)).await.unwrap().next_due_unix;
+    assert_eq!(third, None, "the third failure in a row gives up");
+    assert!(written().await[0].1.contains("failed 3 times in a row, so the supervisor stopped trying; its next pass tries again"));
+
+    sync_ownership(&pool, &holding(), Some(&booking)).await.unwrap();
+    assert_eq!(written().await.len(), 1, "a listing that still holds the project keeps it shown");
+    sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
+    assert!(written().await.is_empty(), "a listing that holds none of it clears it");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, 0, "with its count");
+}
+
+/// A health protocol that gave up comes back armed once a person asks for
+/// a look after it gave up.
+#[sqlx::test]
+async fn a_persons_look_arms_a_protocol_that_gave_up(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let now = db_now(&pool).await;
+    let gave_up = HealthProtocolState {
+        protocol: "restart".into(),
+        acted: None,
+        consecutive_failures: 3,
+        next_retry_at_unix: None,
+        gave_up_at_unix: Some(now - 5),
+        gave_up_seen: Some(serde_json::json!([])),
+        last_error: Some("refused".into()),
+    };
+    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, protocols: vec![gave_up.clone()] };
+    assert!(matches!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied));
+    assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![gave_up]);
+    weft_dispatcher::infra_lifecycle_command::person_asks_for_look(&pool, PROJECT).await.unwrap();
+    let armed = health_state(&pool, PROJECT).await.unwrap();
+    assert_eq!(armed[0].gave_up_at_unix, None, "armed again: {armed:?}");
+    assert_eq!(armed[0].consecutive_failures, 0);
+}
+
+/// A claim marks the command as under way: a cancel then flags it rather
+/// than completing it, the held claim of the one running it answers the
+/// cancel, and it completes as cancelled when the supervisor says so.
+#[sqlx::test]
+async fn cancelling_a_claimed_supervisor_command_leaves_it_pending_until_the_supervisor_completes_it(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let cmd = command(&pool).await;
+    let claimed = claim_next(&pool, OWNER, &[]).await.unwrap().expect("claimed");
+    assert!(!claimed.cancel_requested);
+    let by: Option<String> = sqlx::query_scalar("SELECT claimed_by_replica FROM infra_lifecycle_command WHERE id = $1")
+        .bind(cmd)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(by.as_deref(), Some(OWNER), "the claim marks the row");
+    // The dispatcher's cancel: complete the unclaimed, flag the claimed.
+    sqlx::query("UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE id = $1 AND claimed_by_replica IS NOT NULL")
+        .bind(cmd)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pending: bool = sqlx::query_scalar("SELECT completed_at_unix IS NULL FROM infra_lifecycle_command WHERE id = $1")
+        .bind(cmd)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(pending, "flagged, not completed");
+    assert_eq!(cancels_for(&pool, &[cmd], &[]).await.unwrap(), vec![cmd], "the runner's claim hears the cancel");
+    assert!(cancels_for(&pool, &[cmd], &[cmd]).await.unwrap().is_empty(), "once");
+    let req = SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: Some("halted".into()), cancelled: true };
+    assert_eq!(complete_command(&pool, &req).await.unwrap(), FencedWrite::Applied);
+    let outcome: Option<String> = sqlx::query_scalar("SELECT outcome FROM infra_lifecycle_command WHERE id = $1")
+        .bind(cmd)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outcome.as_deref(), Some("cancelled"));
+}
+
+/// A command claimed three times never ended: the fourth claim gives it
+/// up with an outcome saying so and writes it down for `weft status` as
+/// given up, and hands out the younger command it held back. The ending of that one is
+/// written even with a NUL byte in its error, and clears the record.
+#[sqlx::test]
+async fn a_command_that_never_ends_is_given_up_after_three_runs(pool: PgPool) {
+    use weft_broker_client::protocol::SUPERVISOR_GIVE_UP_AFTER;
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    weft_task_store::unanswered::alert_after(&pool, Some(std::time::Duration::from_secs(3600))).await.unwrap();
+    let stuck = command(&pool).await;
+    let younger = command(&pool).await;
+    for run in 1..=SUPERVISOR_GIVE_UP_AFTER {
+        assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(stuck), "run {run}");
+    }
+    assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(younger), "no longer held back");
+    let (outcome, message): (String, String) =
+        sqlx::query_as("SELECT outcome, outcome_message FROM infra_lifecycle_command WHERE id = $1")
+            .bind(stuck)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "failed");
+    assert!(message.contains("took this command up 3 times"), "{message}");
+    let shown = || async {
+        sqlx::query_scalar::<_, String>("SELECT error FROM unanswered_call WHERE callee = $1")
+            .bind(format!("commands:{PROJECT}"))
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+    };
+    assert!(shown().await.expect("written down").starts_with(&format!("command {stuck}: ")));
+    let alerted: Option<i64> = sqlx::query_scalar("SELECT alerted_ms FROM unanswered_call WHERE callee = $1")
+        .bind(format!("commands:{PROJECT}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(alerted.is_some(), "written down as given up, which an install that alerts alerts on at once");
+
+    let req = SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: younger, error: Some("bad\0byte".into()), cancelled: false };
+    assert_eq!(complete_command(&pool, &req).await.unwrap(), FencedWrite::Applied);
+    let message: String = sqlx::query_scalar("SELECT outcome_message FROM infra_lifecycle_command WHERE id = $1")
+        .bind(younger)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(message, "badbyte");
+    assert_eq!(shown().await, None, "an ending written clears it");
+}
+
+/// A supervisor that does not scale to zero looks again on its own clock:
+/// its failed pass is written down as tried again at its next look, with
+/// nothing counted toward a give-up and no retry set.
+#[sqlx::test]
+async fn an_always_on_supervisors_failure_counts_nothing(pool: PgPool) {
+    use weft_broker_client::protocol::ProjectTrouble;
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
+    let failing = SupervisorSyncOwnershipRequest {
+        failed: vec![ProjectTrouble { project_id: PROJECT, error: "the host did not answer".into() }],
+        ..syncing(OWNER)
+    };
+    sync_ownership(&pool, &failing, None).await.unwrap();
+    sync_ownership(&pool, &failing, None).await.unwrap();
+    sync_ownership(&pool, &failing, None).await.unwrap();
+    assert_eq!(
+        infra_failure(&pool).await.as_deref(),
+        Some("the host did not answer (tried again at the supervisor's next look)")
+    );
+    let looks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    assert_eq!(looks, 0, "nothing counted, nothing booked");
+}
+
+/// A command claimed by a replica that lost the project is claimable again
+/// by the new owner; one claimed and held by a live owner is skipped by
+/// anybody else.
+#[sqlx::test]
+async fn a_claim_held_by_a_replica_that_lost_the_project_is_claimable_again(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OTHER).await;
+    let cmd = command(&pool).await;
+    assert_eq!(claim_next(&pool, OTHER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
+    lease(&pool, OWNER).await;
+    assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd), "OTHER no longer holds the project");
+}
+
+#[sqlx::test]
+async fn a_command_claimed_and_held_is_skipped_by_a_second_claimer(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let cmd = command(&pool).await;
+    assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
+    sqlx::query("UPDATE infra_lifecycle_command SET claimed_by_replica = $2 WHERE id = $1")
+        .bind(cmd)
+        .bind("supervisor-c")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // supervisor-c holds no lease: its claim does not hold.
+    assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
+    // OWNER runs it now (busy): a pass of the same owner never takes it again.
+    assert_eq!(claim_next(&pool, OWNER, &[cmd]).await.unwrap().map(|c| c.id), None);
+}
+
+/// A health protocol that gave up comes back armed once a person's infra
+/// command touched the project since, keeping what it acted on.
+#[sqlx::test]
+async fn a_given_up_protocol_comes_back_armed_after_a_persons_command(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let now = db_now(&pool).await;
+    let given_up = HealthProtocolState {
+        protocol: "restart".into(),
+        acted: Some(Default::default()),
+        consecutive_failures: 3,
+        next_retry_at_unix: None,
+        gave_up_at_unix: Some(now + 5),
+        gave_up_seen: Some(serde_json::json!({ "web": "flaky" })),
+        last_error: Some("refused".into()),
+    };
+    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, protocols: vec![given_up.clone()] };
+    assert_eq!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied);
+    let displaced = SupervisorSetHealthStateRequest { replica: OTHER.into(), ..req.clone() };
+    assert_eq!(set_health_state(&pool, &displaced).await.unwrap(), FencedWrite::Displaced, "only the lease holder writes");
+    assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![given_up.clone()], "given up, nothing touched it since");
+
+    command(&pool).await;
+    sqlx::query("UPDATE infra_lifecycle_command SET issued_at_unix = $1").bind(now + 10).execute(&pool).await.unwrap();
+    let armed = health_state(&pool, PROJECT).await.unwrap();
+    assert_eq!(
+        armed,
+        vec![HealthProtocolState {
+            consecutive_failures: 0,
+            gave_up_at_unix: None,
+            gave_up_seen: None,
+            last_error: None,
+            ..given_up
+        }],
+        "a person's command re-arms it, keeping what it acted on"
+    );
 }
 
 /// A project with no infra, no row and nothing on the host is owned only
@@ -592,7 +1177,7 @@ async fn a_pending_command_alone_makes_a_project_owned(pool: PgPool) {
     project_row(&pool, idle, false).await;
     let sync = || {
         let pool = pool.clone();
-        async move { sync_ownership(&pool, OWNER, &[]).await.unwrap() }
+        async move { sync_ownership(&pool, &syncing(OWNER), None).await.unwrap() }
     };
     assert!(sync().await.owned.is_empty(), "nothing to own, nothing claimed");
 
@@ -601,7 +1186,7 @@ async fn a_pending_command_alone_makes_a_project_owned(pool: PgPool) {
     let synced = sync().await;
     assert_eq!(synced.claimed, vec![idle]);
     assert_eq!(synced.owned.iter().map(|p| p.project_id).collect::<Vec<_>>(), vec![idle]);
-    assert_eq!(next_command(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
+    assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
 
     // Renewed while pending: expire it, and the tick takes it back.
     sqlx::query("UPDATE infra_owner SET leased_until_unix = 0").execute(&pool).await.unwrap();
@@ -731,7 +1316,7 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
     let id = issue_command(&pool, &apply).await.unwrap().expect("issued");
     let shared = IssuedCommand { copies: &Copies::Shared, ..apply };
     assert_ne!(issue_command(&pool, &shared).await.unwrap(), Some(id), "the shared copy's apply is another command");
-    let claimed = next_command(&pool, OWNER, &[]).await.unwrap().expect("a command");
+    let claimed = claim_next(&pool, OWNER, &[]).await.unwrap().expect("a command");
     assert_eq!((claimed.id, claimed.copies), (id, Copies::Instance(ada)));
 }
 
@@ -749,8 +1334,8 @@ async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: PgPool) 
         .execute(&pool)
         .await
         .unwrap();
-    assert!(next_command(&pool, OWNER, &[]).await.unwrap().is_none(), "draining, and the one behind it waits");
+    assert!(claim_next(&pool, OWNER, &[]).await.unwrap().is_none(), "draining, and the one behind it waits");
     sqlx::query("UPDATE infra_lifecycle_command SET drain_by_unix = NULL WHERE id = $1").bind(draining).execute(&pool).await.unwrap();
-    assert_eq!(next_command(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(draining));
-    assert_eq!(next_command(&pool, OWNER, &[draining]).await.unwrap().map(|c| c.id), None, "{behind} waits for it");
+    assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(draining));
+    assert_eq!(claim_next(&pool, OWNER, &[draining]).await.unwrap().map(|c| c.id), None, "{behind} waits for it");
 }

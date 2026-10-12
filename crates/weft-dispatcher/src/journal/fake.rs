@@ -212,6 +212,18 @@ fn born(g: &FakeState, birth: &ExecEvent, state: &'static str, owner: Option<Str
     })
 }
 
+/// End `execution_id`, a run nobody drives, cancelled for `cause`, with
+/// the real cancel's rows (`cancel_terminal_events`: its open charges
+/// booked unknown, then its ending), less the per-node ones (the fake
+/// folds no nodes).
+fn end_unowned(g: &mut FakeState, execution_id: ExecutionId, cause: &weft_core::exec::CancelCause) -> anyhow::Result<()> {
+    let record: Vec<ExecEvent> = g.events.iter().filter(|e| e.execution_id() == execution_id).cloned().collect();
+    let writes = crate::api::execution::cancel_terminal_events(execution_id, &record, None, cause, 0)?;
+    note(g.runs.get_mut(&execution_id).expect("the run's row"), &writes);
+    g.events.extend(writes);
+    Ok(())
+}
+
 /// What `events` say about their run's row: its skips, and its ending.
 fn note(row: &mut RunRow, events: &[ExecEvent]) {
     for event in events {
@@ -247,7 +259,16 @@ fn copy_refreshed(row: &mut SignalRegistration, from: &SignalRegistration) {
     row.auth_kind = from.auth_kind.clone();
     row.auth_config = from.auth_config.clone();
     row.kind_state = from.kind_state.clone();
+    row.holds = from.holds;
     row.kind_state_seq = from.kind_state_seq + 1;
+    row.generation = next_generation();
+}
+
+/// A registration number never handed out before, as the
+/// `signal_generation_seq` sequence draws them.
+fn next_generation() -> i64 {
+    static GENERATION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 #[async_trait]
@@ -344,16 +365,12 @@ impl Journal for FakeJournal {
         let keys: Vec<String> = g.signals.iter().filter(|(_, s)| s.execution_id == Some(execution_id)).map(|(k, _)| k.clone()).collect();
         let removed: Vec<SignalRegistration> = keys.into_iter().filter_map(|k| g.signals.remove(&k)).collect();
         let mut write = crate::journal::CancelWrite { removed, ..Default::default() };
-        let Some(row) = g.runs.get_mut(&execution_id) else { return Ok(write) };
-        match (row.state, &row.owner) {
+        let Some(row) = g.runs.get(&execution_id) else { return Ok(write) };
+        match (row.state, row.owner.is_some()) {
             ("ended", _) => {}
-            (_, Some(_)) => write.requested = true,
-            _ => {
-                // Same fidelity as the real cancel's ending, without the
-                // per-node rows (the fake folds no nodes).
-                let ending = ExecEvent::ExecutionCancelled { execution_id, reason: cause.to_string(), cause: Some(cause.clone()), at_unix: 0 };
-                note(row, std::slice::from_ref(&ending));
-                g.events.push(ending);
+            (_, true) => write.requested = true,
+            (_, false) => {
+                end_unowned(&mut g, execution_id, cause)?;
                 write.node_cancellations = Some(0);
             }
         }
@@ -378,10 +395,7 @@ impl Journal for FakeJournal {
             row.state = "queued";
             return Ok(Lost::Requeued);
         }
-        let cause = weft_core::exec::CancelCause::fast_run_lost();
-        let ending = ExecEvent::ExecutionCancelled { execution_id, reason: cause.to_string(), cause: Some(cause), at_unix: 0 };
-        note(row, std::slice::from_ref(&ending));
-        g.events.push(ending);
+        end_unowned(&mut g, execution_id, &weft_core::exec::CancelCause::fast_run_lost())?;
         Ok(Lost::Ended)
     }
 
@@ -470,14 +484,6 @@ impl Journal for FakeJournal {
         }))
     }
 
-    async fn definition_hashes_in_use(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>> {
-        let mut out: Vec<String> =
-            self.inner.lock().unwrap().runs.values().filter(|r| r.project_id == project_id).filter_map(|r| r.definition_hash.clone()).collect();
-        out.sort();
-        out.dedup();
-        Ok(out)
-    }
-
     async fn logs_for(&self, execution_id: ExecutionId, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
         // The same tail as Postgres, through the one `LogEntry::tail`.
         let entries: Vec<LogEntry> = self
@@ -533,10 +539,6 @@ impl Journal for FakeJournal {
     ) -> anyhow::Result<std::collections::HashMap<ExecutionId, ExecutionSummary>> {
         let g = self.inner.lock().unwrap();
         Ok(execution_ids.iter().filter_map(|execution_id| Self::summary(&g, *execution_id).map(|s| (*execution_id, s))).collect())
-    }
-
-    async fn execution_ids_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<ExecutionId>> {
-        Ok(self.inner.lock().unwrap().runs.iter().filter(|(_, row)| row.project_id == project_id).map(|(c, _)| *c).collect())
     }
 
     async fn execution_ids_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<ExecutionId>> {
@@ -597,25 +599,14 @@ impl Journal for FakeJournal {
         Ok(removed)
     }
 
-    async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64> {
-        let execution_ids: Vec<ExecutionId> = self.execution_ids_for_project(project_id).await?;
-        for execution_id in &execution_ids {
-            self.delete_execution(*execution_id).await?;
-        }
-        Ok(execution_ids.len() as u64)
-    }
-
     /// The fake keeps no end times: nothing expires.
     async fn erase_expired(&self, _now: i64, _limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)> {
         Ok((0, Vec::new()))
     }
 
-    async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
-        // The fake has no project table, so it cannot know which project
-        // rows are gone. Answering "none" under-reports, so a test can
-        // never see a sweep the real one would not do; anything that turns
-        // on this predicate belongs in a database test.
-        Ok(Vec::new())
+    async fn next_expiry(&self) -> anyhow::Result<Option<i64>> {
+        // The fake erases nothing (`erase_expired`), so nothing comes due.
+        Ok(None)
     }
 
     async fn live_tagged_executions(
@@ -687,6 +678,7 @@ impl Journal for FakeJournal {
             None => {
                 let mut written = sig.clone();
                 written.kind_state_seq += 1;
+                written.generation = next_generation();
                 inner.signals.insert(written.token.clone(), written);
             }
         }
@@ -848,6 +840,7 @@ pub(crate) mod tests {
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
             holds: false,
+            generation: 0,
         }
     }
 

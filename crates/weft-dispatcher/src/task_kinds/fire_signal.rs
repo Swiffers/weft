@@ -85,9 +85,14 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
 /// was let go of by whatever removed it.
 async fn let_go_of_it(state: &DispatcherState, token: &str) -> Result<()> {
     if let Some(signal) = state.journal.signal_get(token).await? {
-        // What it could not let go of is said where it failed; the next
-        // fire tries again.
-        if let Err(e) = crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, std::slice::from_ref(&signal)).await {
+        // What it could not let go of is marked on its row, and the
+        // hibernations loop tells the listener again; so does its next fire.
+        let signals = std::slice::from_ref(&signal);
+        let noted = match crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, signals).await {
+            Ok(kept) => crate::listener::note_let_go(&state.pg_pool, signals, &kept).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = noted {
             tracing::warn!(
                 target: "weft_dispatcher::fire_signal",
                 %token, error = %format!("{e:#}"),

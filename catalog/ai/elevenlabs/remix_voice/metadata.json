@@ -1,0 +1,231 @@
+{
+  "type": "ElevenLabsRemixVoice",
+  "label": "Remix Voice",
+  "description": "Generate voice previews from a voice you already have, changed the way you describe (another accent, a higher pitch, a slower pace). Each preview carries its audio and a preview id; wire the one you like into Create Voice to mint it as a new voice. The voice you started from stays as it is.",
+  "tags": [
+    "ai",
+    "audio",
+    "voice",
+    "remix"
+  ],
+  "icon": "Wand",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access", "accepts": ["wire"],
+      "required": true,
+      "requiresScopes": [
+        "voice_lab"
+      ],
+      "description": "Your own ElevenLabs account (the voice you remix comes from it, and remixed voices live in it; the shared credential cannot serve this)."
+    },
+    {
+      "name": "voice",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/voices",
+            "items": "voices",
+            "label": "name",
+            "value": "voice_id"
+          }
+        ]
+      },
+      "label": "Voice",
+      "placeholder": "Pick a voice, or paste a voice id",
+      "description": "The voice to start from. ElevenLabs remixes voices that were designed or cloned, and Voice Library voices with an infinite notice period."
+    },
+    {
+      "name": "description",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "required": true,
+      "description": "What to change about the voice (its gender, accent, speaking style, pace or audio quality), in 5 to 1000 characters.",
+      "placeholder": "Use a higher pitch and change to a Boston accent."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "description": "The line the previews speak, 100 to 1000 characters. Leave empty and ElevenLabs writes a line that suits the description; the `text` output carries the line either way."
+    },
+    {
+      "name": "outputFormat",
+      "type": "String",
+      "default": "mp3_44100_128",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "mp3_44100_128",
+          "mp3_44100_192",
+          "mp3_44100_96",
+          "mp3_44100_64",
+          "mp3_44100_32",
+          "mp3_24000_48",
+          "mp3_22050_32",
+          "pcm_44100",
+          "pcm_48000",
+          "pcm_32000",
+          "pcm_24000",
+          "pcm_22050",
+          "pcm_16000",
+          "pcm_8000",
+          "ulaw_8000",
+          "alaw_8000",
+          "opus_48000_32",
+          "opus_48000_64",
+          "opus_48000_96",
+          "opus_48000_128",
+          "opus_48000_192"
+        ]
+      },
+      "label": "Output format",
+      "description": "The format of the previews' audio. opus_48000_* is stored as Ogg Opus. ElevenLabs gives mp3_44100_192 only on its Creator plan and above, and pcm_44100 only on Pro and above."
+    },
+    {
+      "name": "guidanceScale",
+      "type": "Number",
+      "label": "Guidance scale",
+      "description": "How closely the voice follows the description: lower leaves ElevenLabs more freedom, higher sticks to the description and can sound artificial or robotic. ElevenLabs recommends a longer, more detailed description at a lower value. Leave empty for ElevenLabs's default, 2.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 100,
+        "step": 0.5
+      }
+    },
+    {
+      "name": "loudness",
+      "type": "Number",
+      "description": "How loud the previews are, from -1 (quietest) to 1 (loudest); 0 is roughly -24 LUFS. Leave empty for ElevenLabs's default, 0.5.",
+      "widget": {
+        "kind": "number",
+        "min": -1,
+        "max": 1,
+        "step": 0.05
+      }
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "description": "If you want the same voice again, set any whole number here, then run again with that number and the same settings: ElevenLabs says the same seed with the same inputs gives the same voice. Leave empty for a new random seed each run.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 2147483647,
+        "step": 1
+      }
+    },
+    {
+      "name": "promptStrength",
+      "type": "Number",
+      "label": "Prompt strength",
+      "description": "How far the previews move from the original voice, from 0 to 1: low keeps most of what makes it recognizable, high follows the description and can change the voice entirely. Leave empty to let ElevenLabs decide.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "previews",
+      "type": "List[VoicePreview]",
+      "description": "The generated previews, each with its audio and the `voiceId` Create Voice takes."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "description": "The line the previews speak: your `text`, or the one ElevenLabs wrote when it was empty."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "voice",
+        "regex": "^\\s*$"
+      },
+      "then": {
+        "message": "ElevenLabsRemixVoice '{id}' has an empty `voice`: pick the voice to remix, or paste its id.",
+        "port": "voice"
+      }
+    },
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "description",
+        "regex": "(?s)^.{0,4}$"
+      },
+      "then": {
+        "message": "ElevenLabsRemixVoice '{id}' has a `description` under 5 characters, and ElevenLabs takes 5 to 1000: say what to change in more detail.",
+        "port": "description"
+      }
+    },
+    {
+      "when": {
+        "kind": "config_matches",
+        "field": "description",
+        "regex": "(?s)^.{1001}"
+      },
+      "then": {
+        "message": "ElevenLabsRemixVoice '{id}' has a `description` over 1000 characters, and ElevenLabs takes 5 to 1000: shorten it.",
+        "port": "description"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "\\S"
+          },
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "(?s)^.{1,99}$"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsRemixVoice '{id}' has a `text` under 100 characters, and ElevenLabs speaks a line of 100 to 1000: write a longer line, or leave `text` empty and ElevenLabs writes one.",
+        "port": "text"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "\\S"
+          },
+          {
+            "kind": "config_matches",
+            "field": "text",
+            "regex": "(?s)^.{1001}"
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsRemixVoice '{id}' has a `text` over 1000 characters, and ElevenLabs speaks a line of 100 to 1000: shorten it, or leave `text` empty and ElevenLabs writes one.",
+        "port": "text"
+      }
+    }
+  ],
+  "features": {
+    "catchErrors": true
+  }
+}

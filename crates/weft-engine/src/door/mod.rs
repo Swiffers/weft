@@ -575,20 +575,25 @@ impl Door {
     /// what was last heard. `under_way` is what the worker says it has
     /// under way.
     ///
-    /// The first tick is made before this returns, so the worker is known
-    /// alive before it takes its first call: a worker that cannot make it
-    /// does not start, and says why.
-    pub async fn start_ticks(self: &Arc<Self>, under_way: WorkUnderWay) -> anyhow::Result<()> {
-        let vouch = under_way().vouch_until();
-        let nothing_in_flight = self.tick(vouch).await.map_err(|e| e.context("the worker's first word to the broker (its lease, and its door's counts)"))?;
+    /// A worker that just started has nothing under way, so it ticks only
+    /// once work comes: a run's claim, birth or admission wakes the tick
+    /// before the run goes on record, and the run counts as this worker's
+    /// for one lease length until that tick lands
+    /// (`weft_journal::record::delivered_until`).
+    pub fn start_ticks(self: &Arc<Self>, under_way: WorkUnderWay) {
         let door = Arc::downgrade(self);
         let ticking = self.ticking.clone();
         tokio::spawn(async move {
             let every_second = weft_core::time_scale::scaled(ticks::TICK_EVERY);
             let mut every = tokio::time::interval_at(tokio::time::Instant::now() + every_second, every_second);
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // What the last tick said, when it landed.
-            let mut landed = Some(ticks::Landed { nothing_in_flight, vouched_until: vouch });
+            // What the last tick said, when it landed: at the start, that
+            // nothing is in flight and nothing vouched for.
+            let mut landed = Some(ticks::Landed { nothing_in_flight: true, vouched_until: None });
+            // What the last tick that landed vouched for: the first tick of
+            // a stopping worker says its lease got shorter when one was out
+            // (`DoorTickRequest::shortens`).
+            let mut vouched: Option<i64> = None;
             // The loop slept since its last tick: the next one goes at once.
             let mut slept = false;
             loop {
@@ -619,9 +624,14 @@ impl Door {
                     every.tick().await;
                 }
                 let Some(door) = door.upgrade() else { return };
-                let vouch = under_way().vouch_until();
-                landed = match door.tick(vouch).await {
-                    Ok(nothing_in_flight) => Some(ticks::Landed { nothing_in_flight, vouched_until: vouch }),
+                let under_way = under_way();
+                let vouch = under_way.vouch_until();
+                let shortens = ticks::shortens(vouched, under_way);
+                landed = match door.tick(vouch, shortens).await {
+                    Ok(nothing_in_flight) => {
+                        vouched = vouch;
+                        Some(ticks::Landed { nothing_in_flight, vouched_until: vouch })
+                    }
                     Err(e) => {
                         tracing::warn!(target: "weft_engine::door", error = %format!("{e:#}"), "a tick of the door's counts failed; the next second tries again");
                         None
@@ -629,30 +639,26 @@ impl Door {
                 };
             }
         });
-        Ok(())
     }
 
     /// One tick, vouching for the worker until `vouch_until` when it is
-    /// about to sleep with only waiting runs: whether it reported nothing
-    /// in flight. Its counts are marked heard once it lands.
-    async fn tick(&self, vouch_until: Option<i64>) -> anyhow::Result<bool> {
+    /// about to sleep with only waiting runs, and saying when a stopping
+    /// worker's lease got shorter than it vouched for last (`shortens`):
+    /// whether it reported nothing in flight. Its counts are marked heard once it lands.
+    async fn tick(&self, vouch_until: Option<i64>, shortens: bool) -> anyhow::Result<bool> {
         let now = crate::now_unix() as i64;
         let (window_start, mine, mark) = self.limits.mine(now);
         let in_flight = self.limits.going();
         let quiet = in_flight.is_empty();
-        let heard = async {
-            let tokens = self.broker.triggers().await?.tokens().cloned().collect();
-            let request = DoorTickRequest {
-                binary_hash: Some(self.binary_hash.clone()),
-                in_flight,
-                window_start,
-                counts: mine.into_iter().map(|(key, hits)| DoorCount { key, hits }).collect(),
-                tokens,
-                vouch_until,
-            };
-            self.broker.tick(&request).await
-        }
-        .await?;
+        let request = DoorTickRequest {
+            binary_hash: Some(self.binary_hash.clone()),
+            in_flight,
+            window_start,
+            counts: mine.into_iter().map(|(key, hits)| DoorCount { key, hits }).collect(),
+            vouch_until,
+            shortens,
+        };
+        let heard = self.broker.tick(&request).await?;
         self.limits.reported(mark);
         self.limits.heard(window_start, heard.others.into_iter().map(|count| (count.key, count.hits)), heard.copies);
         Ok(quiet)

@@ -44,10 +44,14 @@ pub struct OutAttachment {
 
 /// What one outgoing message carries, before assembly.
 pub struct OutMessage<'a> {
-    /// The sender: the account's own address or one of its Send mail
-    /// as aliases (Gmail rewrites any other From to the account's own),
-    /// and an RFC 5322 message must name it.
-    pub from: &'a str,
+    /// The sender, with its display name when it has one: the account's
+    /// own address or one of its Send mail as aliases (Gmail rewrites any
+    /// other From to the account's own), and an RFC 5322 message must name
+    /// it.
+    pub from: &'a lettre::message::Mailbox,
+    /// Where replies go, when not to the sender (a Send mail as alias's
+    /// own reply-to address, as Gmail itself sets it).
+    pub reply_to: Option<&'a lettre::message::Mailbox>,
     pub to: &'a [String],
     pub cc: &'a [String],
     pub bcc: &'a [String],
@@ -78,9 +82,12 @@ pub fn build_mime(m: &OutMessage<'_>) -> WeftResult<Vec<u8>> {
     }
 
     let mut builder = lettre::Message::builder()
-        .from(mailbox(m.from, "the From address")?)
+        .from(m.from.clone())
         .subject(m.subject)
         .keep_bcc();
+    if let Some(reply_to) = m.reply_to {
+        builder = builder.reply_to(reply_to.clone());
+    }
     for addr in m.to {
         builder = builder.to(mailbox(addr, "a To address")?);
     }
@@ -319,6 +326,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn me() -> &'static lettre::message::Mailbox {
+        static ME: std::sync::OnceLock<lettre::message::Mailbox> = std::sync::OnceLock::new();
+        ME.get_or_init(|| "me@x.com".parse().unwrap())
+    }
+
     fn message<'a>(
         to: &'a [String],
         subject: &'a str,
@@ -327,7 +339,8 @@ mod tests {
         attachments: &'a [OutAttachment],
     ) -> OutMessage<'a> {
         OutMessage {
-            from: "me@x.com",
+            from: me(),
+            reply_to: None,
             to,
             cc: &[],
             bcc: &[],
@@ -351,6 +364,27 @@ mod tests {
         assert!(text.contains("In-Reply-To: <m1@x>\r\n"), "{text}");
         assert!(text.contains("References: <m1@x>\r\n"), "{text}");
         assert!(text.contains("hello"), "{text}");
+    }
+
+    /// A sender's display name rides the From line (encoded when it is
+    /// not ASCII), and a reply-to address becomes Reply-To.
+    #[test]
+    fn a_named_sender_and_its_reply_to_are_written() {
+        let to = ["a@x.com".to_string()];
+        let from: lettre::message::Mailbox = "Quentin Feuillade--Montixi <q@x.com>".parse().unwrap();
+        let replies: lettre::message::Mailbox = "replies@x.com".parse().unwrap();
+        let mut m = message(&to, "Hi", Some("hello"), None, &[]);
+        m.from = &from;
+        m.reply_to = Some(&replies);
+        let text = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        assert!(text.contains("From: \"Quentin Feuillade--Montixi\" <q@x.com>\r\n") || text.contains("From: Quentin Feuillade--Montixi <q@x.com>\r\n"), "{text}");
+        assert!(text.contains("Reply-To: replies@x.com\r\n"), "{text}");
+
+        let accented: lettre::message::Mailbox = "Ren\u{e9} <r@x.com>".parse().unwrap();
+        m.from = &accented;
+        let text = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        let from_line = text.lines().find(|l| l.starts_with("From:")).unwrap();
+        assert!(from_line.is_ascii() && from_line.contains("<r@x.com>"), "{from_line}");
     }
 
     /// A non-ASCII subject is RFC 2047 encoded, so no raw UTF-8 lands

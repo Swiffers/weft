@@ -1786,3 +1786,62 @@
         assert_eq!(after.len(), 1, "the closure reached past both groups: {after:?}");
         assert!(after[0].closed);
     }
+
+    /// A group whose In boundary FAILS (its port refuses the value that
+    /// reached it) never starts, and every member is told. A member fed
+    /// both by the In boundary and by another member gets one skip and
+    /// nothing left pending: the run ends Failed with every record
+    /// terminal, never Stuck on a closure nobody takes.
+    #[tokio::test]
+    async fn a_failed_in_boundary_settles_a_member_fed_from_inside_too() {
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                plain_node("source", "Source", json!([]), &[]),
+                {
+                    "id": "g__in", "nodeType": "Passthrough", "label": null,
+                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [{ "name": "a", "portType": "Number", "required": false }],
+                    "outputs": [{ "name": "a", "portType": "Number", "required": false }],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "g", "role": "In" }
+                },
+                plain_node("lone", "Source", json!(["g"]), &[]),
+                plain_node("both", "Recorder", json!(["g"]), &[("value", true), ("other", true)]),
+            ],
+            "edges": [
+                edge("e1", "source", "value", "g__in", "a"),
+                edge("e2", "g__in", "a", "both", "value"),
+                edge("e3", "lone", "value", "both", "other"),
+            ],
+            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+        }))
+        .expect("failing-group project");
+        let project_again = project.clone();
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Recorder", Box::new(Recorder { seen: Arc::new(StdMutex::new(Vec::new())), ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(project, cat, &["source"]).await;
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+        assert!(ran.lock().unwrap().is_empty(), "nothing inside a scope that never started runs");
+        let snap = fold(project_again, &events);
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Failed);
+        for member in ["lone", "both"] {
+            let records = &snap.executions[member];
+            assert_eq!(records.len(), 1, "{member} fires once: {records:?}");
+            assert_eq!(records[0].status, NodeExecutionStatus::Skipped, "{member}");
+        }
+        let in_flight: Vec<String> = snap
+            .pulses
+            .iter()
+            .flat_map(|(n, b)| b.iter().filter(|p| p.status.in_flight()).map(move |p| format!("{n}.{}", p.target_port)))
+            .collect();
+        assert!(in_flight.is_empty(), "nothing is left for a member to take: {in_flight:?}");
+        assert_eq!(
+            weft_core::exec::check_completion(&snap.pulses, &snap.executions),
+            Some(true),
+            "the fold reaches the live engine's conclusion: ended, failed"
+        );
+    }

@@ -49,6 +49,15 @@ impl MetadataTokens {
         }
     }
 
+    /// Tokens that hand out `token` as the access token, for a test that
+    /// talks to a fake of a Google API.
+    #[cfg(test)]
+    pub fn with_access_token(token: &str) -> Self {
+        let tokens = Self::new();
+        *tokens.access.lock() = Some((token.to_string(), Instant::now() + Duration::from_secs(3600)));
+        tokens
+    }
+
     /// An identity token for `audience` (the base URL being called).
     pub async fn id_token(&self, audience: &str) -> anyhow::Result<String> {
         if let Some((token, until)) = self.ids.lock().get(audience) {

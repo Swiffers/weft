@@ -37,6 +37,13 @@ pub enum CancelCause {
     /// run needed, an orphaned setup run swept away. `detail` says
     /// which, in words for the inspector.
     Runtime { detail: String },
+    /// A time limit ran out: the platform's cap on one stretch of a run,
+    /// the platform cutting the worker's line, the platform's cap on the
+    /// request a live node test runs inside, or the cap a live trigger
+    /// sets on its caller's session (`maxSessionSecs`). `detail` says
+    /// which, in words for the inspector. A caller still connected is
+    /// answered 504.
+    Limit { detail: String },
 }
 
 impl CancelCause {
@@ -61,7 +68,7 @@ impl std::fmt::Display for CancelCause {
                 write!(f, "Stopped by execution {by} (tag {tag})")
             }
             Self::CallerGone => write!(f, "Caller disconnected"),
-            Self::Runtime { detail } => write!(f, "{detail}"),
+            Self::Runtime { detail } | Self::Limit { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -86,6 +93,10 @@ mod tests {
             (
                 CancelCause::Runtime { detail: "worker instance shutting down".into() },
                 "worker instance shutting down".to_string(),
+            ),
+            (
+                CancelCause::Limit { detail: "the run reached its 59 minute cap".into() },
+                "the run reached its 59 minute cap".to_string(),
             ),
         ];
         for (cause, text) in cases {

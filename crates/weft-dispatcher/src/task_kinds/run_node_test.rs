@@ -18,7 +18,7 @@
 //! not happen (image missing, the server refusing the request).
 //!
 //! Idempotency under re-claim (a surrendered lease requeues the task; a
-//! lapsed one is rescued by `claim_one`): the run and the replica both
+//! lapsed one is rescued by `tasks::claim_next`): the run and the replica both
 //! derive from the task id. A report is persisted on the TASK row
 //! (`tasks::store_result_partial`) before anything else, so a re-claim
 //! reads it back and returns it with no call. A live test is called only

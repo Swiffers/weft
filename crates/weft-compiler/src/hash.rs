@@ -414,7 +414,8 @@ mod fs_hashes {
         catalog: &FsCatalog,
     ) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-node-test-v1\n");
+        // v2: the image starts its test server itself (`CMD ["serve"]`).
+        hasher.update(b"weft-node-test-v2\n");
         hash_image_recipe(&mut hasher, project)?;
         hash_package_roots(
             &mut hasher,

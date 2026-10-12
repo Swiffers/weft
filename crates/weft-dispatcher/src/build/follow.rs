@@ -118,7 +118,7 @@ async fn advance_build(pool: &PgPool, images: &dyn ImageBuilder, build: &ledger:
 /// at a time (`crate::reaper`'s install-wide lock), so the builder is asked
 /// once per look, not once per replica.
 pub fn drain_loop(state: &DispatcherState) -> DrainLoop {
-    crate::reaper::woken(state, WAKE_ON, "image_builds", |state| async move {
+    crate::reaper::woken(state, WAKE_ON, "image_builds", "follow the image builds running", |state| async move {
         let ran = look(&state.pg_pool, state.builder.images.as_ref()).await;
         // Advanced whatever the look answered: a build whose end was
         // recorded before another failed still lets its version register.

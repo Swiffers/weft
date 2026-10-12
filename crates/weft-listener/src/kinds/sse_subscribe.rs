@@ -171,18 +171,20 @@ fn spawn_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = Backoff::new();
+        // What it is doing, where the node's display reads it
+        // (`serving_item`), said when that changes.
+        let mut said = super::event_source::Said::new(super::serving_sink(&ctx));
         loop {
-            // Every turn of this loop writes what it is doing where the
-            // node's display reads it (`serving_item`).
-            super::set_serving_status(&ctx, "connecting");
-            // Signed-in streams resolve the connection PER CONNECT so
-            // a reconnect always subscribes with a fresh credential.
-            let client = match crate::listener_access::client_for(&access, &ctx).await {
+            // The connection and the address are kept between connects
+            // (`crate::reach`); a refusal fetches the credential again, a
+            // failed connect to an infra endpoint asks where it is again.
+            let (client, fresh) = match crate::listener_access::client_for(&access, &ctx).await {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "connection resolve failed; retrying");
-                    super::set_serving_status(&ctx, format!("connection resolve failed; retrying: {e:#}"));
-                    backoff.wait_then_climb().await;
+                    warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "connection resolve failed");
+                    if super::held_attempt_failed("connection resolve failed", e, &mut said, &mut backoff, &ctx.fire).await.is_break() {
+                        return;
+                    }
                     continue;
                 }
             };
@@ -190,7 +192,7 @@ fn spawn_loop(
                 Ok(t) => t,
                 Err(e) => {
                     warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "address resolve failed; retrying");
-                    super::set_serving_status(&ctx, format!("address resolve failed; retrying: {e:#}"));
+                    said.down(format!("address resolve failed: {e:#}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -203,18 +205,31 @@ fn spawn_loop(
             {
                 Ok(r) if r.status().is_success() => {
                     info!(target: "weft_listener::sse_subscribe", %url, token = %ctx.fire.token(), "SSE connected");
-                    super::set_serving_status(&ctx, "connected");
+                    said.up("connected");
                     r
                 }
                 Ok(r) => {
-                    warn!(target: "weft_listener::sse_subscribe", %url, status = %r.status(), "non-success; retrying");
-                    super::set_serving_status(&ctx, format!("the endpoint answered {}; retrying", r.status()));
+                    let status = r.status();
+                    // Only a connection's credential can be refused.
+                    let refused = access.is_some() && crate::listener_access::is_refusal(r).await;
+                    if refused && fresh {
+                        let why = format!("the endpoint refused the connection's credential, fetched just now ({status})");
+                        said.stopped(&why);
+                        ctx.fire.give_up(&why).await;
+                        return;
+                    }
+                    warn!(target: "weft_listener::sse_subscribe", %url, %status, "non-success; retrying");
+                    if refused {
+                        crate::listener_access::refused(&ctx);
+                    }
+                    said.down(format!("the endpoint answered {status}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::sse_subscribe", %url, error = %e, "connect failed; retrying");
-                    super::set_serving_status(&ctx, format!("connect failed; retrying: {e}"));
+                    crate::infra_address::unreached(&url, &ctx);
+                    said.down(format!("connect failed: {e}"));
                     backoff.wait_then_climb().await;
                     continue;
                 }
@@ -277,7 +292,7 @@ fn spawn_loop(
             // endpoint (accepts then immediately resets) doesn't get
             // hammered at a fixed 1/s. A connection that stayed up long
             // enough to be healthy resets the ladder.
-            super::set_serving_status(&ctx, "stream dropped; reconnecting");
+            said.down("the stream dropped");
             backoff.reset_if_healthy(connected_at.elapsed());
             backoff.wait_then_climb().await;
         }

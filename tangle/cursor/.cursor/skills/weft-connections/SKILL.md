@@ -114,4 +114,9 @@ claims them, a missing one passes with a warning, because refusing would
 block every pasted key on every service that reports nothing.
 
 A revoked or expired credential surfaces as a loud "needs reconnecting"
-error naming the fix, never a silent retry.
+error naming the fix, never a silent retry. A provider that is busy or
+down while weft refreshes a sign-in (it answers 408, 429 or a 5xx, or
+does not answer) is not a dead credential: the step fails with the
+provider's own answer (`token endpoint answered <status>: ...` or `token
+endpoint unreachable: ...`), never with "needs reconnecting", and the refresh is tried
+again the next time the connection is opened.

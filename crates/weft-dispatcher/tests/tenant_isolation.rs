@@ -214,79 +214,45 @@ async fn signal_tokens_are_scoped_to_the_caller_tenant() {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-/// A removed project's past runs keep the code they ran.
-///
-/// A run's journal holds what happened, not what it meant: every input
-/// and output is worked out by folding those rows against the program
-/// the run ran. Delete the program and the rows are still there and
-/// every value is underivable, so the graph paints a run with nothing
-/// in it and the person reading it goes looking for a bug in the
-/// viewer. That is what used to happen to every past run of every
-/// removed project, silently, because the program history was deleted
-/// along with the project row.
-///
-/// So retiring programs goes by what the journal still points at: a
-/// version a run was started against stays, a version nothing ran is
-/// dropped, and cleaning the last run that needed one takes it too,
-/// because a program nobody can reach is junk the user can neither see
-/// nor delete.
-///
-/// The project row is removed here to put the runs in the state the
-/// reaper actually finds them in: a removal erases a project's runs,
-/// but that erase is best-effort, so between a failed erase and the
-/// reaper's next sweep there are runs whose project is gone. They must
-/// still hold their programs, or what the sweep eventually reads is a
-/// run nobody can make sense of.
+/// `weft rm` erases a project's runs first, then takes its recorded
+/// programs with its row: no run is left to read them, and nothing else
+/// could reach them afterwards.
 #[tokio::test]
-async fn a_program_is_retired_only_when_no_run_still_names_it() {
+async fn removing_a_project_takes_its_recorded_programs() {
     let store = FakeProjectStore::new();
-    let journal = FakeJournal::new();
     let project = Uuid::new_v4();
-    let project_id = project;
     register(&store, project, "doomed", TENANT_A).await;
-    journal.set_project_tenant(project_id, TENANT_A);
-
-    // Two recorded versions; only one of them ever ran.
     store
         .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("ran"), None, None, None, None, None)
         .await
-        .expect("record the version that ran");
-    store
-        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("never-ran"), None, None, None, None, None)
+        .expect("record a version");
+    assert!(store.definition_for_hash(project, "ran").await.unwrap().is_some());
+    assert!(store.remove(project).await.expect("remove project").is_some());
+    assert_eq!(store.definition_for_hash(project, "ran").await.unwrap(), None, "the program went with the project");
+    assert!(store.remove(project).await.expect("remove again").is_none(), "nothing left to remove");
+}
+
+/// A project `weft rm` marked and did not finish removing reads as being
+/// removed, is not registered over, and every refusal says to run `weft
+/// rm` again.
+#[tokio::test]
+async fn a_project_being_removed_says_so_and_takes_no_registration() {
+    let store = FakeProjectStore::new();
+    let project = Uuid::new_v4();
+    register(&store, project, "doomed", TENANT_A).await;
+    assert!(store.mark_removing(project).await.unwrap());
+    let summary = store.get(project).await.unwrap().expect("still there");
+    assert!(summary.removing);
+    assert!(store.list(TENANT_A).await.unwrap().iter().all(|s| s.removing));
+    let (status, message) = summary.unless_removing().expect_err("refused");
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(message, weft_core::projects::PROJECT_BEING_REMOVED);
+    let registered = store
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("late"), None, None, None, None, None)
         .await
-        .expect("record a version nothing ran");
-    let execution_id = Uuid::new_v4();
-    let mut birth = started(execution_id, project_id);
-    if let weft_journal::ExecEvent::ExecutionStarted { definition_hash, .. } = &mut birth {
-        *definition_hash = Some("ran".to_string());
-    }
-    journal.record_event(&birth).await.unwrap();
-
-    store.remove(project).await.expect("remove project");
-    let in_use = journal.definition_hashes_in_use(project_id).await.unwrap();
-    assert_eq!(in_use, vec!["ran".to_string()], "the journal names the version its run used");
-    let dropped = store.retire_unused_definitions(project, &in_use).await.unwrap();
-    assert_eq!(dropped, 1, "the version nothing ran is dropped");
-    assert!(
-        store.definition_for_hash(project, "ran").await.unwrap().is_some(),
-        "the version the surviving run was started against stays readable"
-    );
-    assert_eq!(
-        store.definition_for_hash(project, "never-ran").await.unwrap(),
-        None,
-        "and the one nothing points at is gone"
-    );
-
-    // `weft clean` on that last run: now nothing needs the version.
-    journal.delete_execution(execution_id).await.unwrap();
-    let in_use = journal.definition_hashes_in_use(project_id).await.unwrap();
-    assert!(in_use.is_empty(), "no run left to need a version");
-    store.retire_unused_definitions(project, &in_use).await.unwrap();
-    assert_eq!(
-        store.definition_for_hash(project, "ran").await.unwrap(),
-        None,
-        "the last run gone takes its code with it"
-    );
+        .expect_err("a registration over a project being removed is refused");
+    assert!(weft_dispatcher::project_store::ProjectRemoving::is(&registered), "{registered:#}");
+    assert!(store.remove(project).await.unwrap().is_some());
 }
 
 fn started(execution_id: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEvent {

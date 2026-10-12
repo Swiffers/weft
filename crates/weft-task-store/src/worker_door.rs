@@ -30,14 +30,69 @@ pub fn lease_until(now: i64, lease_secs: i64, vouch_until: Option<i64>) -> i64 {
 }
 
 /// The one rule for a worker being alive: its lease (`worker_lease` under
-/// the alias `$lease`) is ahead of the database's clock. Every reader
-/// (whether a run is driven, the copies a door counts with, a run seed the
-/// broker takes) spells it through here.
+/// the alias `$lease`) is ahead of the database's clock. Every reader of a
+/// worker's own liveness (the copies a door counts with, a run seed the
+/// broker takes, what a drain counts) spells it through here; whether a
+/// run is driven is [`crate::in_flight_sql!`]'s.
 #[macro_export]
 macro_rules! worker_alive {
     ($lease:literal) => {
         concat!($lease, ".leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT")
     };
+}
+
+/// The channel a worker's lease coming alive is announced on: its row
+/// made, or renewed after it had lapsed (a worker that went idle taking
+/// work again). Once per stretch of a worker's work, never per tick: the
+/// dispatcher's `lapses` loop wakes on it, so a run born at that worker's
+/// door is noticed if the worker dies under it, though no dispatcher loop
+/// saw the run begin. (The dispatcher's delivery hears a lease coming
+/// alive only for a project with queued runs whose workers could not be
+/// reached, on a channel of its own, `worker_lease.alive_since` saying
+/// which runs it takes again.) It is also sent when a worker's tick shortens a lease it had
+/// vouched for (the look at lapsed leases was booked for the longer one);
+/// and by the broker when a worker bore a run before its lease was ever
+/// written, which it learns from the record's answer
+/// (`weft_journal::record::Recorded::unwatched`, `weft_broker::notices`).
+/// A `NOTIFY` of its own rather than the announcement
+/// outbox: the tick does not poke the outbox's flusher, and a notification
+/// this rare costs the commit order nothing.
+// SYNC: LEASE_ALIVE_CHANNEL <-> 'weft_lease_alive' in worker_lease_alive_notify and weft_door_tick (GROUP)
+pub const LEASE_ALIVE_CHANNEL: &str = "weft_lease_alive";
+
+/// How long a lease row is kept once it lapsed: long enough that every
+/// run its process owned was let go of first.
+pub const LEASES_KEPT_SECS: i64 = 3600;
+
+/// How long the counts of a minute are kept after it began: `weft status`
+/// reads the refusals of this minute and the one before.
+pub const COUNTS_KEPT_SECS: i64 = 180;
+
+/// How many rows of each table one [`prune`] deletes at most.
+const PRUNE_BATCH: i64 = 1000;
+
+/// Drop counts no limit reads any more and leases long lapsed, a bounded
+/// batch of each, skipping rows a tick holds right now. Both tables are
+/// written by the door tick, so this runs beside the dispatcher's look at
+/// lapsed leases, never on the tick.
+pub async fn prune(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM door_count WHERE ctid IN \
+         (SELECT ctid FROM door_count WHERE window_start < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    )
+    .bind(now - COUNTS_KEPT_SECS)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM worker_lease WHERE replica IN \
+         (SELECT replica FROM worker_lease WHERE leased_until_unix < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+    )
+    .bind(now - LEASES_KEPT_SECS)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
@@ -57,9 +112,37 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             binary_hash TEXT,
             -- How many runs it drives right now, per trigger token
             -- (`{"<token>": n}`): what a drain counts as work in flight.
-            in_flight JSONB NOT NULL DEFAULT '{}'::jsonb
+            in_flight JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- When its lease last came alive (made, or renewed after it
+            -- had lapsed), on the database's clock: a queued run its
+            -- project's workers could not be reached for is tried again
+            -- once a worker came alive after its tries stopped
+            -- (`weft_dispatcher::delivery`).
+            alive_since BIGINT NOT NULL DEFAULT 0
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_worker_lease_project ON worker_lease(project_id, leased_until_unix)"#,
+        // SYNC: 'weft_lease_alive' <-> LEASE_ALIVE_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION worker_lease_alive_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_lease_alive', NEW.replica);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        // Only a row really inserted: the tick's `ON CONFLICT` update fires
+        // the update trigger instead.
+        r#"DROP TRIGGER IF EXISTS worker_lease_alive_on_insert ON worker_lease"#,
+        r#"CREATE TRIGGER worker_lease_alive_on_insert
+            AFTER INSERT ON worker_lease
+            FOR EACH ROW
+            EXECUTE FUNCTION worker_lease_alive_notify()"#,
+        // A lapsed lease renewed: the worker went quiet and works again.
+        // SYNC: the WHEN <-> weft_dispatcher's journal group (worker_lease_workers_back_on_renewal)
+        r#"DROP TRIGGER IF EXISTS worker_lease_alive_on_renewal ON worker_lease"#,
+        r#"CREATE TRIGGER worker_lease_alive_on_renewal
+            AFTER UPDATE OF leased_until_unix ON worker_lease
+            FOR EACH ROW
+            WHEN (OLD.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT)
+            EXECUTE FUNCTION worker_lease_alive_notify()"#,
         // SYNC: door_count keys <-> crates/weft-core/src/signal/limits.rs (ran_key, failed_key)
         // What one worker counted at its door in one minute, per key
         // (`c:<token>:<caller>`, `e:<token>`, `refused:<token>:<limit>`,
@@ -79,25 +162,62 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_door_count_window ON door_count(window_start)"#,
         // One tick of a worker: its lease renewed with what it drives
         // now, its counts of the minute stored, and what the project's
-        // other copies counted for the routes it serves (keys are
-        // `<what>:<token>:...`), with how many copies are alive. One
-        // statement, one round trip.
+        // other copies counted (keys are `<what>:<token>:...`; every key
+        // but the refused-token ones, `t:-:<address>`, which each copy
+        // bounds alone), with how many copies are alive; and, on a tick
+        // that shortens a lease the worker vouched for, the look at lapsed
+        // leases rung.
+        // One statement, one round trip.
         // SYNC: the answer's shape <-> weft_broker_client::protocol::DoorTick
 concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                 p_replica TEXT, p_project UUID, p_tenant TEXT, p_binary_hash TEXT, p_leased_until BIGINT,
-                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_tokens TEXT[]
+                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_shortens BOOLEAN
             ) RETURNS JSONB AS $$
             BEGIN
-                INSERT INTO worker_lease (replica, project_id, tenant_id, binary_hash, leased_until_unix, in_flight)
-                    VALUES (p_replica, p_project, p_tenant, p_binary_hash, p_leased_until, p_in_flight)
+                INSERT INTO worker_lease (replica, project_id, tenant_id, binary_hash, leased_until_unix, in_flight, alive_since)
+                    VALUES (p_replica, p_project, p_tenant, p_binary_hash, p_leased_until, p_in_flight,
+                            EXTRACT(EPOCH FROM NOW())::BIGINT)
                     ON CONFLICT (replica) DO UPDATE
-                        SET leased_until_unix = EXCLUDED.leased_until_unix, in_flight = EXCLUDED.in_flight
+                        SET leased_until_unix = EXCLUDED.leased_until_unix, in_flight = EXCLUDED.in_flight,
+                            alive_since = CASE WHEN "#, worker_alive!("worker_lease"), r#"
+                                               THEN worker_lease.alive_since ELSE EXCLUDED.alive_since END
                     WHERE worker_lease.project_id = EXCLUDED.project_id;
                 INSERT INTO door_count (key, window_start, replica, project_id, hits)
                     SELECT k, p_window, p_replica, p_project, h FROM unnest(p_keys, p_hits) AS t(k, h)
                     ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = EXCLUDED.hits
                     WHERE door_count.project_id = EXCLUDED.project_id;
+                -- This tick's lease ends before the one the worker vouched
+                -- for last: the look at lapsed leases, booked for the
+                -- longer one, is rung again.
+                -- SYNC: 'weft_lease_alive' <-> LEASE_ALIVE_CHANNEL
+                IF p_shortens THEN
+                    PERFORM pg_notify('weft_lease_alive', p_replica);
+                END IF;
                 RETURN jsonb_build_object(
+                    'others', COALESCE((
+                        SELECT jsonb_agg(jsonb_build_object('key', o.key, 'hits', o.hits))
+                        FROM (SELECT key, SUM(hits)::bigint AS hits FROM door_count
+                              WHERE window_start = p_window AND replica <> p_replica
+                                AND project_id = p_project
+                                -- SYNC: '-' <-> crates/weft-engine/src/door/limits.rs (invalid_tokens_key)
+                                AND split_part(key, ':', 2) <> '-' 
+                              GROUP BY key) o), '[]'::jsonb),
+                    'copies', (SELECT COUNT(*) FROM worker_lease l
+                               WHERE l.project_id = p_project
+                                 AND "#, worker_alive!("l"), r#"));
+            END;
+            $$ LANGUAGE plpgsql"#),
+        // The tick as the previous release's brokers call it, which they
+        // do while an upgrade rolls out: the lease and the counts written
+        // as the tick above writes them, no lease shortened, and the other
+        // copies' counts of exactly the tokens they name (`p_tokens`,
+        // refused ones included), as that release answered. The release
+        // after this one drops it.
+        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
+                p_replica TEXT, p_project UUID, p_tenant TEXT, p_binary_hash TEXT, p_leased_until BIGINT,
+                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_tokens TEXT[]
+            ) RETURNS JSONB AS $$
+                SELECT jsonb_build_object(
                     'others', COALESCE((
                         SELECT jsonb_agg(jsonb_build_object('key', o.key, 'hits', o.hits))
                         FROM (SELECT key, SUM(hits)::bigint AS hits FROM door_count
@@ -105,11 +225,10 @@ concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                                 AND project_id = p_project
                                 AND split_part(key, ':', 2) = ANY(p_tokens)
                               GROUP BY key) o), '[]'::jsonb),
-                    'copies', (SELECT COUNT(*) FROM worker_lease l
-                               WHERE l.project_id = p_project
-                                 AND "#, worker_alive!("l"), r#"));
-            END;
-            $$ LANGUAGE plpgsql"#),
+                    'copies', t.tick->'copies')
+                FROM (SELECT weft_door_tick(p_replica, p_project, p_tenant, p_binary_hash, p_leased_until,
+                                            p_in_flight, p_window, p_keys, p_hits, FALSE) AS tick) t
+            $$ LANGUAGE sql"#,
     ],
     seed: &[],
 };

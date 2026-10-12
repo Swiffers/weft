@@ -99,11 +99,12 @@ async fn listener_resolve(
 }
 
 /// POST /v1/infra/listener-address: where the listener reaches an
-/// address a trigger was given (`ListenerInfraAddressRequest`). Asked at
-/// every connect, since a local unit's port on the machine moves when
-/// the unit is made again. Listener role only, and only for a signal it
-/// holds: the project comes off that signal's row, so only that
-/// project's infra is looked at.
+/// address a trigger was given (`ListenerInfraAddressRequest`), and
+/// whether it is an infra endpoint, whose address can move (a local
+/// unit's port on the machine moves when the unit is made again), so the
+/// listener asks again after a connect to it fails. Listener role only,
+/// and only for a signal it holds: the project comes off that signal's
+/// row, so only that project's infra is looked at.
 async fn listener_infra_address(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -120,8 +121,10 @@ async fn listener_infra_address(
             .fetch_all(&state.pool)
             .await
             .map_err(|e| internal(anyhow::anyhow!("read the project's infra endpoints: {e}")))?;
-    let authority = install_authority(&req.authority, &rows).unwrap_or(req.authority);
-    Ok(Json(ListenerInfraAddress { authority }))
+    Ok(Json(match install_authority(&req.authority, &rows) {
+        Some(authority) => ListenerInfraAddress { authority, is_infra: true },
+        None => ListenerInfraAddress { authority: req.authority, is_infra: false },
+    }))
 }
 
 /// The `host:port` weft's roles reach an endpoint at, for the one the

@@ -10,13 +10,14 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 
 use weft_broker_client::protocol::{
-    RecordOfRequest, RecordOfResponse, RunAnswer, RunAnswersRequest, RunAnswersResponse, RunCancel, RunCancelsRequest, RunCancelsResponse,
-    RunClaimRequest, RunClaimResponse, RunGiveUpRequest, RunGiveUpResponse, JOURNAL_RECORD_BODY_LIMIT, JOURNAL_RECORD_PATH,
+    RecordOfRequest, RecordOfResponse, RunAnswer, RunAnswerOf, RunAnswersRequest, RunAnswersResponse, RunCancel, RunClaimRequest,
+    RunClaimResponse, RunGiveUpRequest, RunGiveUpResponse, RunRecheckedRequest, RunRecheckedResponse, JOURNAL_RECORD_BODY_LIMIT,
+    BATCH_FATES, BATCH_FATES_HEADER, JOURNAL_RECORD_PATH,
 };
 use weft_journal::frame::BatchAnswer;
 use weft_journal::record::Fate;
@@ -34,18 +35,47 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/journal/record_of", post(record_of))
         .route("/v1/run/claim", post(run_claim))
         .route("/v1/run/answers", post(run_answers))
-        .route("/v1/run/cancels", post(run_cancels))
+        .route("/v1/run/rechecked", post(run_rechecked))
+        .route(PREVIOUS_RELEASE_CANCELS_PATH, post(previous_release_run_cancels))
         .route("/v1/run/give_up", post(run_give_up))
 }
 
-/// `POST /v1/journal/record`: one batch of the calling worker's writer
-/// lane, written in one statement (`weft_journal::record::record_batch`),
-/// on the record pool so a burst of records never starves the broker's
-/// other work. Once it commits, the dispatcher is told what changed
-/// ([`crate::notices`]).
-async fn record_batch(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, body: Bytes) -> Resp<BatchAnswer> {
-    let (tenant, project, replica) = worker(&caller)?;
-    let batch = weft_journal::frame::decode(&body).map_err(|e| (StatusCode::BAD_REQUEST, format!("a batch of records does not read: {e:#}")))?;
+/// `POST /v1/journal/record` ([`JOURNAL_RECORD_PATH`]): see
+/// [`write_batch`]. A worker of the previous release, which still sends
+/// batches while an upgrade rolls out (its program keeps running until it
+/// is built again), says nothing of the fates it reads
+/// ([`BATCH_FATES_HEADER`]) and is answered as it reads them
+/// ([`previous_release_answer`]).
+async fn record_batch(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, headers: HeaderMap, body: Bytes) -> Resp<BatchAnswer> {
+    let answer = write_batch(&state, &caller, &body).await?;
+    let reads_every_fate = headers.get(BATCH_FATES_HEADER).is_some_and(|fates| fates.as_bytes() == BATCH_FATES.as_bytes());
+    Ok(Json(if reads_every_fate { answer } else { previous_release_answer(answer) }))
+}
+
+/// `answer` as the previous release's worker reads it: a birth for a
+/// project being removed answered as refused, the one fate it reads for
+/// it (an answer holding a fate it does not know fails its whole batch,
+/// the runs accepted included). The release after this one drops it.
+pub fn previous_release_answer(answer: BatchAnswer) -> BatchAnswer {
+    BatchAnswer {
+        fates: answer
+            .fates
+            .into_iter()
+            .map(|fate| match fate {
+                Fate::ProjectRemoving => Fate::Refused,
+                fate => fate,
+            })
+            .collect(),
+    }
+}
+
+/// One batch of the calling worker's writer lane, written in one
+/// statement (`weft_journal::record::record_batch`), on the record pool so
+/// a burst of records never starves the broker's other work. Once it
+/// commits, the dispatcher is told what changed ([`crate::notices`]).
+async fn write_batch(state: &BrokerState, caller: &CallerIdentity, body: &Bytes) -> Result<BatchAnswer, (StatusCode, String)> {
+    let (tenant, project, replica) = worker(caller)?;
+    let batch = weft_journal::frame::decode(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("a batch of records does not read: {e:#}")))?;
     if let Some(stray) = batch.head.runs.iter().filter_map(|run| run.born.as_ref()).find(|born| born.project_id != project) {
         tracing::warn!(target: "weft_broker::scope", caller_project = %project, born_in = %stray.project_id, "broker refused a birth in another project");
         return Err((StatusCode::FORBIDDEN, "a worker bears runs of its own project only".into()));
@@ -63,13 +93,15 @@ async fn record_batch(State(state): State<Arc<BrokerState>>, AuthedCaller(caller
     state.notices.tell(
         recorded.iter().filter(|run| run.fate == Fate::Accepted).filter_map(|run| run.project_id.map(|project| (project, run.execution_id))),
         recorded.iter().filter(|run| run.tell_end).map(|run| run.execution_id),
+        recorded.iter().filter_map(|run| run.keep_until),
+        recorded.iter().any(|run| run.unwatched).then_some(replica),
     );
     // A run that ended having stored files queued its sweep through the
     // announcement outbox, which goes out once poked.
     if batch.head.runs.iter().enumerate().any(|(at, run)| accepted(at) && run.wrote_files && run.written.ended.is_some()) {
         weft_task_store::announce::committed(&state.pool);
     }
-    Ok(Json(BatchAnswer { fates: recorded.into_iter().map(|run| run.fate).collect() }))
+    Ok(BatchAnswer { fates: recorded.into_iter().map(|run| run.fate).collect() })
 }
 
 /// The calling worker's run `execution_id`, as its scope says: refused when
@@ -134,17 +166,107 @@ async fn run_give_up(State(state): State<Arc<BrokerState>>, AuthedCaller(caller)
     Ok(Json(RunGiveUpResponse { ended_at_seq: seq }))
 }
 
-/// `POST /v1/run/cancels`: see [`RunCancelsRequest`].
-async fn run_cancels(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(_): Json<RunCancelsRequest>) -> Resp<RunCancelsResponse> {
+/// `POST /v1/run/rechecked`: see [`RunRecheckedRequest`] and [`rechecked`].
+async fn run_rechecked(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(_): Json<RunRecheckedRequest>) -> Resp<RunRecheckedResponse> {
     let (_, project, replica) = worker(&caller)?;
+    let rechecked = rechecked(&state.pool, replica, project)
+        .await
+        .map_err(|e| unavailable_or_internal(e.context("read the cancels and answers of a worker's runs")))?;
+    Ok(Json(rechecked))
+}
+
+/// The cancels and the answers of every run `replica` drives in `project`,
+/// answers oldest first, in one statement. The runs are the worker's own
+/// by the read itself (`owner`), so no run is checked one by one.
+pub async fn rechecked(pool: &sqlx::PgPool, replica: &str, project: uuid::Uuid) -> anyhow::Result<RunRecheckedResponse> {
+    type Row = (weft_core::ExecutionId, Option<sqlx::types::Json<weft_core::exec::CancelCause>>, Option<String>, Option<serde_json::Value>, bool);
+    let rows: Vec<Row> = sqlx::query_as(&format!(
+        "WITH mine AS ( \
+             SELECT execution_id, cancel_requested FROM run \
+             WHERE owner = $1 AND project_id = $2 AND state = 'running' \
+         ) \
+         SELECT m.execution_id, m.cancel_requested, NULL::text AS token, NULL::jsonb AS payload, FALSE AS skipped, 0::bigint AS seq \
+             FROM mine m WHERE m.cancel_requested IS NOT NULL \
+         UNION ALL \
+         SELECT a.execution_id, NULL, a.token, a.payload, a.skipped, a.seq \
+             FROM ({answers}) a \
+         ORDER BY seq",
+        answers = weft_task_store::parked_fires::handed_answers_sql("SELECT execution_id FROM mine"),
+    ))
+    .bind(replica)
+    .bind(project)
+    .fetch_all(pool)
+    .await?;
+    let mut rechecked = RunRecheckedResponse::default();
+    for (execution_id, cause, token, payload, skipped) in rows {
+        match (cause, token, payload) {
+            (Some(cause), None, None) => rechecked.cancels.push(RunCancel { execution_id, cause: cause.0 }),
+            (None, Some(token), Some(payload)) => rechecked.answers.push(RunAnswerOf {
+                execution_id,
+                token,
+                answer: weft_task_store::parked_fires::stored_answer(payload, skipped),
+            }),
+            (cause, token, payload) => {
+                anyhow::bail!("a recheck row of {execution_id} is neither a cancel nor an answer: {cause:?} {token:?} {payload:?}")
+            }
+        }
+    }
+    Ok(rechecked)
+}
+
+/// The route a worker of the previous release reads its runs' cancels
+/// from once its line came back, which it still calls while an upgrade
+/// rolls out (its program keeps running until it is built again). The
+/// release after this one drops it, with [`previous_release_run_cancels`],
+/// [`previous_release_cancels`] and [`PreviousReleaseCancels`].
+pub const PREVIOUS_RELEASE_CANCELS_PATH: &str = "/v1/run/cancels";
+
+/// What [`PREVIOUS_RELEASE_CANCELS_PATH`] answers, in the shape the
+/// previous release's worker reads: the cancels only.
+#[derive(Debug, serde::Serialize)]
+pub struct PreviousReleaseCancels {
+    pub cancels: Vec<RunCancel>,
+}
+
+/// `POST /v1/run/cancels`: see [`PREVIOUS_RELEASE_CANCELS_PATH`]. Its
+/// request was an empty object, so the body is not read.
+async fn previous_release_run_cancels(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller) -> Resp<PreviousReleaseCancels> {
+    let (_, project, replica) = worker(&caller)?;
+    let cancels = previous_release_cancels(&state.pool, replica, project)
+        .await
+        .map_err(|e| unavailable_or_internal(e.context("read the cancels of a worker's runs")))?;
+    Ok(Json(cancels))
+}
+
+/// The cancels waiting for every run `replica` drives in `project`, as the
+/// previous release answered them.
+pub async fn previous_release_cancels(pool: &sqlx::PgPool, replica: &str, project: uuid::Uuid) -> anyhow::Result<PreviousReleaseCancels> {
     let rows: Vec<(weft_core::ExecutionId, sqlx::types::Json<weft_core::exec::CancelCause>)> = sqlx::query_as(
         "SELECT execution_id, cancel_requested FROM run \
-         WHERE owner = $1 AND state = 'running' AND project_id = $2 AND cancel_requested IS NOT NULL",
+         WHERE owner = $1 AND project_id = $2 AND state = 'running' AND cancel_requested IS NOT NULL",
     )
     .bind(replica)
     .bind(project)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the cancels of a worker's runs")))?;
-    Ok(Json(RunCancelsResponse { cancels: rows.into_iter().map(|(execution_id, cause)| RunCancel { execution_id, cause: cause.0 }).collect() }))
+    .fetch_all(pool)
+    .await?;
+    Ok(PreviousReleaseCancels { cancels: rows.into_iter().map(|(execution_id, cause)| RunCancel { execution_id, cause: cause.0 }).collect() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worker of the previous release reads every fate it is answered
+    /// with: a birth for a project being removed reaches it as refused,
+    /// and every other fate as it is.
+    #[test]
+    fn the_previous_release_reads_its_answer() {
+        let answer = BatchAnswer {
+            fates: vec![Fate::Accepted, Fate::AlreadyApplied, Fate::BornElsewhere, Fate::ProjectRemoving, Fate::Refused],
+        };
+        let old = previous_release_answer(answer);
+        assert_eq!(old.fates, [Fate::Accepted, Fate::AlreadyApplied, Fate::BornElsewhere, Fate::Refused, Fate::Refused]);
+        let wire = serde_json::to_string(&old).unwrap();
+        assert_eq!(wire, r#"{"fates":["accepted","already_applied","born_elsewhere","refused","refused"]}"#);
+    }
 }

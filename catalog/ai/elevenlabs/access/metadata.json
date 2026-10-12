@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsAccess",
   "label": "ElevenLabs Access",
-  "description": "Connect ElevenLabs for the project's audio AI calls, with the built-in connection or your own API key; wire the access output into every ElevenLabs node.",
+  "description": "Connect ElevenLabs for the project's audio, image and video calls, with the built-in connection or your own API key (voice creation, voice agents, images, video and Flows templates need your own). Wire its access output into every ElevenLabs node.",
   "tags": [
     "ai",
     "audio",
@@ -47,13 +47,13 @@
       {
         "id": "voice_lab",
         "label": "Voice creation",
-        "description": "Clone or design voices. A minted voice lives in the connected account and counts against its voice slots.",
+        "description": "Clone, design or remix voices. A minted voice lives in the connected account and counts against its voice slots.",
         "own_only": true,
         "guide": {
           "link": "https://elevenlabs.io/app/voice-lab",
           "steps": [
-            "Voices you clone or design land in the connected ElevenLabs account, so these nodes need your own account (any paid tier adds voice slots).",
-            "Nothing to pre-create: connect your own API key and the Clone Voice / Design Voice nodes mint voices straight into your Voice Lab.",
+            "Voices you clone, design or remix land in the connected ElevenLabs account, so these nodes need your own account (any paid tier adds voice slots).",
+            "Nothing to pre-create: connect your own API key and the Clone Voice, Design Voice and Remix Voice nodes mint voices straight into your Voice Lab.",
             "Manage or delete minted voices at elevenlabs.io/app/voice-lab."
           ]
         }
@@ -70,6 +70,21 @@
             "Create an agent at elevenlabs.io/app/agents (or with the Create Agent node) and give it a voice, a prompt, and a first message.",
             "For phone calls, import a number under Agents > Phone Numbers (Twilio or a SIP trunk) and assign it to the agent.",
             "Optional: design or clone a custom voice first (Voice creation above) and pick it as the agent's voice."
+          ]
+        }
+      },
+      {
+        "id": "image_video",
+        "label": "Images and video",
+        "description": "Generate images and videos, and run Flows templates, paid from the connected account's credits.",
+        "own_only": true,
+        "guide": {
+          "link": "https://elevenlabs.io/app/settings/api-keys",
+          "steps": [
+            "Check that your ElevenLabs plan is Pro or above: the API refuses image and video calls below it.",
+            "Under Settings > API Keys, create a key with the Image & Video permission, or add that permission to the key you use.",
+            "On an Enterprise workspace, every image and video model starts switched off: an admin turns on each one you use under Workspace settings > Model Approvals.",
+            "The ByteDance models (Seedance, Seedream) are refused until ElevenLabs approves your workspace; ask ElevenLabs support for access. Seedance is not offered in the United States."
           ]
         }
       }

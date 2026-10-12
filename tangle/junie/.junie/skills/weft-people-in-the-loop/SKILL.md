@@ -34,3 +34,20 @@ another extension), read the `weft-consumers` skill.
 While a question waits, the node sits in its cyan waiting state in the
 graph, the worker has exited, and the wait costs one row in a table. The
 answer resumes the run from where it stopped, seconds or weeks later.
+
+A run waiting on its caller's next message (a socket, or a held route whose
+caller is connected and says nothing) stays on its worker. On a cloud
+install it costs the database nothing while the caller is silent, though
+the worker holding the caller stays up: the worker stops reporting to weft,
+so the database can sleep, and it tells weft the run is alive until the
+run's hour or the trigger's `maxSessionSecs` runs out, whichever comes
+first. A silent caller is never cut for being silent. Cloud Run also cuts a
+worker's connection to weft an hour after that connection opened. A worker
+whose runs all only wait (on a silent caller, or on a person while the run
+cannot pause) opens no new connection, since that would read the database.
+A minute before the cut it stops: the runs that can pause let go of the
+worker and keep waiting, and the others end naming the limit (a caller
+still connected gets `504`, a socket closes `1011`). On your machine there is no hour and no cut: a
+run waiting on a silent caller keeps its worker reporting every second,
+unless the route or socket sets `maxSessionSecs`, in which case the worker
+goes quiet until that runs out.

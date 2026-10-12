@@ -19,9 +19,10 @@ pub struct SupervisorTestRig {
     pub host: Arc<FakeInfraHost>,
     pub clock: Arc<FakeClock>,
     pub state: SupervisorState,
-    /// What this supervisor owned after the last `tick_ownership`, kept
-    /// across steps as the running ownership loop keeps it.
-    pub owned: Mutex<std::collections::HashSet<uuid::Uuid>>,
+    /// What this supervisor owned after the last `tick_ownership`, and
+    /// its host's latest listing, kept across steps as the running
+    /// ownership loop keeps them.
+    pub ownership: Mutex<ownership::Ownership>,
 }
 
 impl SupervisorTestRig {
@@ -48,18 +49,23 @@ impl SupervisorTestRig {
             project_locks: Arc::default(),
             pass: Arc::default(),
         };
-        Self { broker, host, clock, state, owned: Mutex::new(std::collections::HashSet::new()) }
+        Self { broker, host, clock, state, ownership: Mutex::default() }
     }
 
-    /// Step the ownership loop once (renew + claim owned projects) and
-    /// hand back what changed, as the running loop sends it to the
+    /// Step the ownership loop once (renew + claim owned projects, then
+    /// sweep the gone copies to their end, when the host could be listed)
+    /// and hand back what changed, as the running loop sends it to the
     /// lifecycle loop.
     pub async fn tick_ownership(&self) -> Result<Option<ownership::OwnershipChange>> {
-        Ok(ownership::tick(&self.state, &mut *self.owned.lock().await).await?.change)
+        let (change, held) = ownership::claim(&self.state, &mut *self.ownership.lock().await).await?;
+        if let Ok(copies) = held {
+            ownership::sweep_gone_copies(&self.state, copies).await;
+        }
+        Ok(change)
     }
 
-    /// Step the health loop once; whether anything it saw is unsettled.
-    pub async fn tick_health(&self) -> Result<bool> {
+    /// Step the health loop once.
+    pub async fn tick_health(&self) -> Result<()> {
         health::tick(&self.state).await
     }
 

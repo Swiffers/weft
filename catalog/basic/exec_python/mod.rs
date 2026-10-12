@@ -110,21 +110,15 @@ impl Node for ExecPythonNode {
         // `error` is wired.
         let code: String = ctx.inputs.get("code")?;
 
-        // Bind every DECLARED data input under its name in the Python
-        // namespace. The declared set is the user's inline port list
-        // (the node's own settings, `code`, never bind as variables);
-        // a port with nothing in the bag (a skipped upstream, an
-        // optional input nobody wired) binds as `None`, so the script
-        // never meets an undefined name. Stored files bind unwrapped.
-        let settings: std::collections::HashSet<&str> = ctx.inputs.declared().map(|(k, _)| k.as_str()).collect();
-        let names: std::collections::BTreeSet<&String> = ctx
-            .declared_inputs()
-            .keys()
-            .filter(|name| !settings.contains(name.as_str()))
-            .chain(ctx.inputs.custom().map(|(name, _)| name))
-            .collect();
-        let inputs: Vec<(String, Value)> = names
-            .into_iter()
+        // Bind every input port the program created under its name in
+        // the Python namespace (the node's own settings, `code`, never
+        // bind as variables, nor do the language's gate ports); a port
+        // with nothing in the bag (a skipped upstream, an optional input
+        // nobody wired) binds as `None`, so the script never meets an
+        // undefined name. Stored files bind unwrapped.
+        let inputs: Vec<(String, Value)> = ctx
+            .inputs
+            .created()
             .map(|name| {
                 let ty = ctx.declared_inputs().get(name);
                 let value = ctx.inputs.raw(name).map(|v| unwrap_files(v, ty)).unwrap_or(Value::Null);

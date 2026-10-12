@@ -573,7 +573,7 @@ written "to be safe" is a node that does nothing.
 
 If you have a file and the port wants one kind of file, that is a cast too:
 a node that fetches whatever a message held emits `File` (any stored file),
-a transcriber takes only `Audio`, and `File` into `Audio` is
+a transcriber takes only `Audio` or `Video`, and `File` into `Audio` is
 `type-mismatch`, because the kind is only known once the bytes are there. Say
 which kind you are claiming, and the run checks the claim:
 

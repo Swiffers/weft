@@ -1,8 +1,8 @@
 //! Raw-pipe handler: parses the kind's config and drives the shared
 //! [`crate::stream_engine`]. The optional connection
 //! (`SignalSpec.access`) supplies the values the address and frames
-//! interpolate, resolved freshly on every reconnect, so credentials
-//! ride the dialogue without ever sitting in the spec. The SERVICE
+//! interpolate, as the process keeps them (`crate::reach`), so
+//! credentials ride the dialogue without ever sitting in the spec. The SERVICE
 //! protocol (what the frames mean) stays the author's concern.
 
 use std::collections::BTreeMap;
@@ -56,11 +56,22 @@ impl KindHandler for StreamListenHandler {
         let access = spec.access.clone();
         let fire = ctx.fire.clone();
         let prepare_ctx = ctx.clone();
+        // Every cycle after the first follows a pipe that failed or
+        // dropped: where an infra endpoint is, is asked again.
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let prepare = Box::new(move || {
             let cfg = cfg.clone();
             let access = access.clone();
             let ctx = prepare_ctx.clone();
-            async move { prepare_cycle(&cfg, &access, &ctx).await }.boxed()
+            let again = !first.swap(false, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                let plan = prepare_cycle(&cfg, &access, &ctx, again).await;
+                if let Err(PrepareError::Fatal(e)) = &plan {
+                    ctx.fire.give_up(&format!("{e:#}")).await;
+                }
+                plan
+            }
+            .boxed()
         });
         let on_event = Box::new(move |payload: Value| {
             let fire = fire.clone();
@@ -106,25 +117,30 @@ impl KindHandler for StreamListenHandler {
 /// is set), interpolate the address and every frame, compile every
 /// pattern. Pattern compilation failing here is fatal (validation
 /// already vouched for them; a spec reaching here broken would spin).
+/// `again` is a cycle after a pipe that failed or dropped.
 async fn prepare_cycle(
     cfg: &StreamListen,
     access: &Option<AccessRef>,
     ctx: &SpawnCtx,
+    again: bool,
 ) -> Result<StreamPlan, PrepareError> {
     let values: BTreeMap<String, String> = match access {
         None => BTreeMap::new(),
         Some(access) => {
-            let source = crate::listener_access::resolve(access, ctx)
+            let resolved = crate::listener_access::resolve(access, ctx)
                 .await
-                .map_err(PrepareError::Transient)?;
-            let mut v = source.values;
-            v.extend(source.recipe_values);
+                .map_err(PrepareError::of_resolve)?;
+            let mut v = resolved.source.values;
+            v.extend(resolved.source.recipe_values);
             v
         }
     };
 
     let address = interpolate_frame(&cfg.address, &values)
         .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?;
+    if again {
+        crate::infra_address::unreached(&address, ctx);
+    }
     let address = crate::infra_address::for_listener(&address, ctx).await.map_err(PrepareError::Transient)?;
     let script = cfg
         .script

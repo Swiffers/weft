@@ -21,13 +21,27 @@
       "type": "Audio",
       "required": true,
       "description": "The recording to clean."
+    },
+    {
+      "name": "fileFormat",
+      "type": "String",
+      "default": "other",
+      "label": "Recording format",
+      "description": "If the recording is raw 16-bit PCM at 16 kHz, mono, little-endian, pick pcm_s16le_16: ElevenLabs answers sooner than for an encoded file. Leave `other` for anything else.",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "other",
+          "pcm_s16le_16"
+        ]
+      }
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "Audio",
-      "description": "The voice with the background removed."
+      "description": "The voice with the background removed, stored as the type ElevenLabs answers with (its reference gives mp3), whatever type the recording was."
     },
     {
       "name": "filename",

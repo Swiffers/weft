@@ -39,53 +39,72 @@ use axum::{routing::post, Router};
 pub use auth::AuthConfig;
 pub use state::BrokerState;
 
-/// The broker's background loops: the expiry of kept runtime files and of
-/// abandoned connect rows. Neither is announced by any write (they are
-/// about time passing), so each runs on its interval alone. Both are
-/// stateless and idempotent, so every copy of the broker may run them.
-/// The runtime runs them where the broker is placed
-/// (`weft_task_store::drain`).
-pub fn drain_loops(state: Arc<BrokerState>) -> Vec<weft_task_store::drain::DrainLoop> {
-    use weft_task_store::drain::{DrainLoop, DrainStep};
-    let files = state.clone();
-    let connects = state;
-    vec![
-        // Kept files are access-bumped, so only idle survivors expire; a
-        // minute's granularity is plenty.
-        DrainLoop::new("runtime_file_expiry", &[], std::time::Duration::from_secs(60), move || {
-            let store = files.runtime_store.clone();
-            async move {
-                let n = store.sweep_expired().await?;
-                if n > 0 {
-                    tracing::info!(target: "weft_broker::runtime_store", swept = n, "expired kept runtime files");
-                }
-                Ok(DrainStep::Done)
-            }
-        }),
-        // Their TTL was only ever checked on read, so without this they
-        // live forever. The rows go stale after 15 minutes; a five-minute
-        // cadence keeps the backlog at most a handful of rows.
-        DrainLoop::new("connect_expiry", &[], std::time::Duration::from_secs(300), move || {
-            let pool = connects.pool.clone();
-            async move {
-                let n = weft_access_store::sweep_expired_connects(&pool).await?;
-                if n > 0 {
-                    tracing::info!(target: "weft_broker::access_admin", swept = n, "abandoned connect rows deleted");
-                }
-                Ok(DrainStep::Done)
-            }
-        }),
-    ]
+/// The broker's background loops: the expiry of stored files. It removes
+/// what expired and books its next look at the next expiry; a write that
+/// sets an expiry sooner than any this copy rang for rings it
+/// (`runtime_store::FILE_EXPIRY_CHANNEL`). Stateless and idempotent, so
+/// every copy of the broker may run it. The runtime runs it where the
+/// broker is placed (`weft_task_store::drain`). Refuses to boot when the
+/// loops and [`loop_wakes`] disagree: a broker at zero is woken by name
+/// for what that list says.
+pub fn drain_loops(state: Arc<BrokerState>) -> anyhow::Result<Vec<weft_task_store::drain::DrainLoop>> {
+    loops_over(state.runtime_store.clone())
+}
+
+fn loops_over(store: Arc<runtime_store::RuntimeStore>) -> anyhow::Result<Vec<weft_task_store::drain::DrainLoop>> {
+    use weft_task_store::drain::DrainLoop;
+    let loops = vec![DrainLoop::new(
+        runtime_store::FILE_EXPIRY_LOOP,
+        runtime_store::FILE_EXPIRY_LABEL,
+        runtime_store::FILE_EXPIRY_WAKE,
+        std::time::Duration::from_secs(60),
+        move || {
+            let store = store.clone();
+            async move { store.expire().await }
+        },
+    )];
+    let listed = loop_wakes();
+    for l in loops.iter().filter(|l| !l.wake_on.is_empty()) {
+        anyhow::ensure!(
+            listed.iter().any(|(name, wake_on)| *name == l.name && std::ptr::eq(*wake_on, l.wake_on)),
+            "the broker's loop '{}' wakes by rules `loop_wakes` does not name",
+            l.name
+        );
+    }
+    for (name, _) in &listed {
+        anyhow::ensure!(loops.iter().any(|l| l.name == *name), "`loop_wakes` names '{name}', which is no loop of the broker");
+    }
+    Ok(loops)
+}
+
+/// What wakes each of the broker's loops that a write wakes, by name: what
+/// a writer reads to wake a broker at zero for exactly the loops a write
+/// concerns (`weft_runtime::role_waker`). Read at run time from each
+/// loop's own static, so a rule here IS the loop's.
+pub fn loop_wakes() -> Vec<(&'static str, &'static [weft_task_store::drain::WakeOn])> {
+    vec![(runtime_store::FILE_EXPIRY_LOOP, runtime_store::FILE_EXPIRY_WAKE)]
 }
 
 pub fn router(state: Arc<BrokerState>) -> Router {
     line::routes(api(state.clone()), state)
 }
 
+/// The holders' check (`weft_platform_traits::HELD_CHECK_PATH`), for the
+/// runtime to mount behind the guard that lets only weft itself in: the
+/// alarm calls it with weft's own account, never a role's. It holds the
+/// database's listening while it is answered, so the notification its
+/// release fires is heard and rings the dispatcher's `holders` loop.
+pub fn held_check_route(state: Arc<BrokerState>) -> Router {
+    let signals = state.signals.clone();
+    Router::new()
+        .route(weft_platform_traits::HELD_CHECK_PATH, post(handlers::held_check))
+        .layer(axum::middleware::from_fn_with_state(signals, weft_task_store::pg_signal::keep_listening))
+        .with_state(state)
+}
+
 /// Every call the broker answers, as a request and on a line alike.
 fn api(state: Arc<BrokerState>) -> Router {
     Router::new()
-        .route("/health", axum::routing::get(handlers::health))
         // Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`)
         .route("/v1/execution/tag", post(handlers::execution_tag))
         .route(
@@ -131,6 +150,7 @@ fn api(state: Arc<BrokerState>) -> Router {
         .route("/v1/signal/fire_target", post(handlers::signal_fire_target))
         .route("/v1/signal/hold", post(handlers::signal_hold))
         .route("/v1/signal/let_go", post(handlers::signal_let_go))
+        .route("/v1/signal/give_up", post(handlers::signal_give_up))
         .route("/v1/signal/set_holds", post(handlers::signal_set_holds))
         .route("/v1/signal/write_kind_state", post(handlers::signal_write_kind_state))
         // Supervisor surface (pooled, trusted control-plane;
@@ -178,10 +198,7 @@ fn api(state: Arc<BrokerState>) -> Router {
             "/v1/supervisor/command_complete",
             post(handlers::supervisor_command_complete),
         )
-        .route(
-            "/v1/supervisor/command_cancel_requested",
-            post(handlers::supervisor_command_cancel_requested),
-        )
+        .route("/v1/supervisor/set_health_state", post(handlers::supervisor_set_health_state))
         .route(
             "/v1/supervisor/infra_command_in_flight",
             post(handlers::supervisor_infra_command_in_flight),
@@ -234,4 +251,24 @@ fn api(state: Arc<BrokerState>) -> Router {
         // A worker's records, and the runs it drives.
         .merge(records::routes())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A broker that scales to zero boots: every one of its loops is woken
+    /// by a write (`weft_task_store::drain::check_woken`, which the runtime
+    /// runs at boot), and the loops agree with `loop_wakes`.
+    #[tokio::test]
+    async fn the_brokers_loops_boot_scaled_to_zero() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("a lazy pool");
+        let store = Arc::new(runtime_store::RuntimeStore::new(
+            pool,
+            Arc::new(weft_platform_traits::object_store::fake::FakeObjectStore::new()),
+            Arc::new(weft_platform_traits::clock::SystemClock),
+        ));
+        let loops = loops_over(store).expect("the loops agree with loop_wakes");
+        weft_task_store::drain::check_woken(weft_platform_traits::CoreRole::Broker, &loops).expect("every loop is woken");
+    }
 }

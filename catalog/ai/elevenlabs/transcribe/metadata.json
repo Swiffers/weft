@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsTranscribe",
   "label": "ElevenLabs Transcribe (Realtime)",
-  "description": "Realtime speech-to-text over a live audio bus (Scribe v2 realtime): 16-bit PCM in, each committed segment out on a text bus as it is spoken, the full transcript at the end. A failure after the stream has opened fails the run, so a cut-off stream is never mistaken for a finished one.",
+  "description": "Realtime speech-to-text over a live audio bus (Scribe v2 realtime): 16-bit PCM or 8 kHz μ-law in, each committed segment out on a text bus as it is spoken, the full transcript as a JSON file at the end. When you ask for them, each segment also comes with its word timings, its language, the names, numbers and other entities found in it, and a rewritten version. A failure after the stream has opened fails the run, so a cut-off stream is never mistaken for a finished one.",
   "tags": [
     "ai",
     "audio",
@@ -17,7 +17,7 @@
       "name": "audio",
       "type": "Bus",
       "required": true,
-      "description": "The live audio stream: a bytes Bus of raw 16-bit PCM frames whose metadata declares the sample rate (an Audio Stream node produces exactly this)."
+      "description": "The live audio stream: a bytes Bus whose metadata declares the format, either raw 16-bit PCM (`{ sample_rate, encoding: \"pcm_s16le\" }`, at 8000, 16000, 22050, 24000, 44100 or 48000 Hz; an Audio Stream node produces this) or 8-bit μ-law at 8000 Hz (`{ sample_rate: 8000, encoding: \"ulaw\" }`, a phone line)."
     },
     {
       "name": "account",
@@ -30,19 +30,220 @@
       "type": "String",
       "label": "Language",
       "placeholder": "(auto-detect)",
-      "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."
+      "description": "The spoken language as an ISO 639-1 or 639-3 code (en, fra, ...). Leave empty to let the model detect it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "default": "scribe_v2_realtime",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "scribe_v2_realtime"
+        ]
+      },
+      "label": "Model",
+      "description": "ElevenLabs's realtime speech recognition model, at $0.39 an hour of audio."
+    },
+    {
+      "name": "commitStrategy",
+      "type": "String",
+      "default": "vad",
+      "label": "Commit",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "vad",
+          "turn_prediction",
+          "manual"
+        ]
+      },
+      "description": "When a segment is committed, which makes it final and sends it on `segments`. `vad` commits after a stretch of silence. `turn_prediction` also commits as soon as the model predicts the speaker has finished their turn, on the models that predict turns. `manual` commits only when the audio ends, and ElevenLabs commits on its own after about 36 seconds of audio."
+    },
+    {
+      "name": "vadSilenceThresholdSecs",
+      "type": "Number",
+      "label": "Silence before commit",
+      "widget": {
+        "kind": "number",
+        "min": 0.3,
+        "max": 3,
+        "step": 0.1
+      },
+      "description": "How many seconds of silence commit a segment, from 0.3 to 3. Only with `vad` or `turn_prediction`. Leave empty for ElevenLabs's default."
+    },
+    {
+      "name": "vadThreshold",
+      "type": "Number",
+      "label": "Voice sensitivity",
+      "widget": {
+        "kind": "number",
+        "min": 0.1,
+        "max": 0.9,
+        "step": 0.05
+      },
+      "description": "How sensitive the voice detection is, from 0.1 to 0.9: lower is more sensitive. Only with `vad` or `turn_prediction`. Leave empty for ElevenLabs's default."
+    },
+    {
+      "name": "minSpeechDurationMs",
+      "type": "Number",
+      "label": "Shortest speech",
+      "widget": {
+        "kind": "number",
+        "min": 50,
+        "max": 2000,
+        "step": 1
+      },
+      "description": "How long speech has to last, in milliseconds from 50 to 2000, before the voice detection counts it. Only with `vad` or `turn_prediction`. Leave empty for ElevenLabs's default."
+    },
+    {
+      "name": "minSilenceDurationMs",
+      "type": "Number",
+      "label": "Shortest silence",
+      "widget": {
+        "kind": "number",
+        "min": 50,
+        "max": 2000,
+        "step": 1
+      },
+      "description": "How long silence has to last, in milliseconds from 50 to 2000, before the voice detection counts it. Only with `vad` or `turn_prediction`. Leave empty for ElevenLabs's default."
+    },
+    {
+      "name": "secondaryLanguages",
+      "type": "List[String]",
+      "label": "Other languages",
+      "description": "Other languages the audio may hold, as ISO 639-1 or 639-3 codes. Naming them makes the language detection more reliable, since it then only weighs those languages."
+    },
+    {
+      "name": "includeTimestamps",
+      "type": "Boolean",
+      "default": false,
+      "label": "Word timings",
+      "description": "Turn on to get every segment's words with their start and end times, as a `words` message on `segments`. Does not work with `filterBackgroundAudio`."
+    },
+    {
+      "name": "includeLanguageDetection",
+      "type": "Boolean",
+      "default": false,
+      "label": "Detect language",
+      "description": "Turn on to get the language detected in each segment, in a `words` message on `segments` and on `language`."
+    },
+    {
+      "name": "keyterms",
+      "type": "List[String]",
+      "description": "Words or phrases the model should get right, like names or product terms. Up to 50, each at most 20 characters. They add $0.08 an hour of audio to the price."
+    },
+    {
+      "name": "noVerbatim",
+      "type": "Boolean",
+      "default": false,
+      "label": "Clean up",
+      "description": "Turn on to leave out filler words, false starts and disfluencies."
+    },
+    {
+      "name": "entityDetection",
+      "type": "List[String]",
+      "label": "Find entities",
+      "description": "If you want names, card numbers, health details and the like found as they are spoken: `all`, a category (`pii`, `phi`, `pci`, `other`, `offensive_language`), or entity types like `email_address`. They come out on `segments` segment by segment, and all together in the `transcript` file's `entities` at the end. Does not work with `transcriptEdit`."
+    },
+    {
+      "name": "transcriptEdit",
+      "type": "String",
+      "label": "Rewrite",
+      "widget": {
+        "kind": "textarea"
+      },
+      "description": "An instruction in plain words for rewriting each committed segment, like \"Write all dates in ISO 8601 format (YYYY-MM-DD)\", at most 2,000 characters. Each rewrite comes out as an `edited` message on `segments`, and the whole rewritten transcript in the `transcript` file's `editedText`. ElevenLabs calls this experimental. It adds 30% to the price ($0.12 an hour of audio), billed for at least 10 seconds of audio per segment, and it does not work with `entityDetection`."
+    },
+    {
+      "name": "filterBackgroundAudio",
+      "type": "Boolean",
+      "default": false,
+      "label": "Filter background",
+      "description": "Turn on so nearby conversations and ambient noise are less often taken for speech. Does not work with `includeTimestamps`."
+    },
+    {
+      "name": "previousText",
+      "type": "String",
+      "label": "Context",
+      "widget": {
+        "kind": "textarea"
+      },
+      "description": "Text the speech follows on from, like what an agent just said, to give the model context. It goes with the first audio, and ElevenLabs says it works best under 50 characters."
+    },
+    {
+      "name": "enableLogging",
+      "type": "Boolean",
+      "default": true,
+      "label": "Keep history",
+      "description": "Turn off for zero retention: ElevenLabs then keeps no history of the session. Only Enterprise accounts can turn it off."
     }
   ],
   "outputs": [
     {
-      "name": "transcript",
+      "name": "segments",
       "type": "Bus",
-      "description": "The live transcript: one Bus message of kind 'text' per committed speech segment, closed when the audio ends."
+      "description": "The live transcript, closed when the audio ends: one message of kind `text` (`{ text }`) per committed segment, as it is spoken. With `includeTimestamps` or `includeLanguageDetection`, a `words` message follows each segment (`{ text, words, language }`); with `entityDetection`, an `entities` message (`{ text, entities }`, positions within that segment); with `transcriptEdit`, an `edited` message (`{ text, editedText }`), which can arrive after later segments."
     },
     {
-      "name": "text",
+      "name": "transcript",
+      "type": "Blob",
+      "description": "A JSON file holding the full transcript, once the audio stream has ended. `text` is what was said. With `entityDetection`, `entities` lists every entity found as `{ text, entityType, startChar, endChar }`: its type (like `credit_card` or `name`) and the character positions where it starts and ends in `text`. With `transcriptEdit`, `editedText` is the whole transcript as rewritten, segment by segment; a segment ElevenLabs sent no rewrite for stays as spoken, and the node's log says so. It is a file because a long session's transcript is more than a wire can carry."
+    },
+    {
+      "name": "language",
       "type": "String",
-      "description": "The full transcript, once the audio stream has ended."
+      "description": "With `includeLanguageDetection` or `includeTimestamps`: the language ElevenLabs gave for the last segment it gave one for."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "commitStrategy", "equals": "manual" },
+          {
+            "kind": "any",
+            "of": [
+              { "kind": "input_satisfied", "port": "vadSilenceThresholdSecs" },
+              { "kind": "input_satisfied", "port": "vadThreshold" },
+              { "kind": "input_satisfied", "port": "minSpeechDurationMs" },
+              { "kind": "input_satisfied", "port": "minSilenceDurationMs" }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribe '{id}' tunes the voice detection that commits segments, and `commitStrategy` manual turns it off: pick `vad` or `turn_prediction`, or leave the voice detection settings empty.",
+        "port": "commitStrategy"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "filterBackgroundAudio", "equals": true },
+          { "kind": "config_equals", "field": "includeTimestamps", "equals": true }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribe '{id}' turns on both `filterBackgroundAudio` and `includeTimestamps`, and ElevenLabs does not combine them: turn one of them off.",
+        "port": "filterBackgroundAudio"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "transcriptEdit" },
+          { "kind": "input_satisfied", "port": "entityDetection" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribe '{id}' sets both `transcriptEdit` and `entityDetection`, and ElevenLabs refuses a session that asks for both: keep one of them.",
+        "port": "transcriptEdit"
+      }
     }
   ]
 }

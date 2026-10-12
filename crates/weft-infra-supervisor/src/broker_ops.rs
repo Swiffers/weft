@@ -15,8 +15,11 @@ use async_trait::async_trait;
 
 use weft_broker_client::client::BrokerSupervisorClient;
 use weft_broker_client::protocol::{
-    SupervisorClaim, SupervisorInfraNode, SupervisorProject, SupervisorSyncOwnershipResponse,
+    SupervisorClaim, SupervisorHealthProtocolsResponse, SupervisorInfraNode, SupervisorProject,
+    SupervisorSetHealthStateRequest, SupervisorSetHealthStateResponse, SupervisorSetStatusRequest,
+    SupervisorSetStatusResponse, SupervisorSyncOwnershipRequest, SupervisorSyncOwnershipResponse,
 };
+use weft_broker_client::WriteOutcome;
 
 #[async_trait]
 pub trait BrokerSupervisorOps: Send + Sync {
@@ -25,10 +28,14 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// projects' infra, and return the full owned set plus the projects
     /// this tick took on. The work loops act ONLY on the owned projects,
     /// so two supervisors never reconcile the same project.
-    /// `held_projects` (every project the host holds a copy of) are
-    /// claimed and renewed too, so the gone-copy sweep can judge them
-    /// under their lease (see `SupervisorSyncOwnershipRequest`).
-    async fn sync_ownership(&self, replica: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse>;
+    /// The request's `held_projects` (every project the host holds a
+    /// copy of) are claimed and renewed too, so the gone-copy sweep can
+    /// judge them under their lease; it also reports what this process
+    /// settled and could not get through, and gives the leases back when
+    /// a pass ends (see
+    /// `SupervisorSyncOwnershipRequest`). The broker books the next pass
+    /// of a supervisor that scales to zero as it answers.
+    async fn sync_ownership(&self, req: &SupervisorSyncOwnershipRequest) -> Result<SupervisorSyncOwnershipResponse>;
     /// Pure read of the projects this supervisor owns (no claim/renew).
     /// The work loops iterate this; ownership breadth changes only via
     /// `sync_ownership` (the ownership tick).
@@ -44,18 +51,21 @@ pub trait BrokerSupervisorOps: Send + Sync {
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>>;
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>>;
-    async fn health_protocols(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> Result<Option<serde_json::Value>>;
+    /// The project's health protocols (`None`: the defaults) and what
+    /// each did so far.
+    async fn health_protocols(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthProtocolsResponse>;
+    /// Replace what the project's health protocols did, under its lease.
+    async fn set_health_state(&self, req: &SupervisorSetHealthStateRequest) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>>;
     /// The oldest waiting command of a project this supervisor owns that no
     /// older waiting command reaches a copy of, other than the ones it runs
     /// already (`busy_commands`), holding up to `wait` for one to be issued
-    /// when none is waiting.
+    /// when none is waiting; or the busy commands a person asked to cancel
+    /// (none of `cancelling`, whose cancel it heard already).
     async fn claim_command(
         &self,
         claimer: &str,
         busy_commands: &[i64],
+        cancelling: &[i64],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim>;
     /// Record one typed infra_event. The kind + payload pair comes
@@ -68,20 +78,18 @@ pub trait BrokerSupervisorOps: Send + Sync {
         instance: Option<&weft_core::instance::InstanceId>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64>;
-    /// Set the `infra_node.status` row.
-    /// `command_id = Some(id)` for lifecycle-driven writes. The broker
-    /// refuses the UPDATE when the caller no longer owns the
+    /// Set the `infra_node.status` row, as the command `command_id`
+    /// moves it along. The broker refuses the UPDATE when the caller no
+    /// longer owns the
     /// project (its `infra_owner` lease moved), answering
     /// `WriteOutcome::Displaced`.
-    /// `command_id = None` for the health loop's autonomous
-    /// Flaky/Running reconciliation (tenant scope still applies).
     /// `unit = Some` sets that unit's status (and recomputes the node
     /// rollup); `None` sets the node + all units (a lifecycle-driven
     /// uniform transition).
     async fn set_status(
         &self,
         replica: &str,
-        command_id: Option<i64>,
+        command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
@@ -89,7 +97,22 @@ pub trait BrokerSupervisorOps: Send + Sync {
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
-    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>>;
+    ) -> Result<WriteOutcome<SupervisorSetStatusResponse>>;
+    /// The health loop's write of one unit: its latched status and the
+    /// window it is in (`UnitRuntime`), fenced on ownership, on no
+    /// command reaching the copy, and on the unit being in the roster.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_unit_health(
+        &self,
+        replica: &str,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        unit: &str,
+        status: weft_broker_client::protocol::InfraNodeStatus,
+        not_ready_since_unix: Option<i64>,
+        ready_since_unix: Option<i64>,
+    ) -> Result<WriteOutcome<SupervisorSetStatusResponse>>;
     /// Record what the command `command_id` (an apply, a stop, a
     /// terminate) waits on for this copy, for `weft status`.
     async fn set_waiting(
@@ -122,9 +145,6 @@ pub trait BrokerSupervisorOps: Send + Sync {
         error: Option<&str>,
         cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>>;
-    /// Whether the user requested cancellation of a claimed command.
-    /// Polled between platform steps and inside the readiness wait.
-    async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
     /// The project's uncompleted supervisor commands (apply / stop /
     /// terminate), each as the copies it acts on. The health loop stands
     /// down for those copies so it never races a user action.
@@ -185,8 +205,8 @@ pub trait BrokerSupervisorOps: Send + Sync {
 
 #[async_trait]
 impl BrokerSupervisorOps for BrokerSupervisorClient {
-    async fn sync_ownership(&self, replica: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
-        BrokerSupervisorClient::sync_ownership(self, replica, held_projects).await
+    async fn sync_ownership(&self, req: &SupervisorSyncOwnershipRequest) -> Result<SupervisorSyncOwnershipResponse> {
+        BrokerSupervisorClient::sync_ownership(self, req).await
     }
     async fn owned_projects(&self, replica: &str) -> Result<Vec<SupervisorProject>> {
         BrokerSupervisorClient::owned_projects(self, replica).await
@@ -202,19 +222,20 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>> {
         BrokerSupervisorClient::infra_nodes(self, project_id).await
     }
-    async fn health_protocols(
-        &self,
-        project_id: uuid::Uuid,
-    ) -> Result<Option<serde_json::Value>> {
+    async fn health_protocols(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthProtocolsResponse> {
         BrokerSupervisorClient::health_protocols(self, project_id).await
+    }
+    async fn set_health_state(&self, req: &SupervisorSetHealthStateRequest) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>> {
+        BrokerSupervisorClient::set_health_state(self, req).await
     }
     async fn claim_command(
         &self,
         claimer: &str,
         busy_commands: &[i64],
+        cancelling: &[i64],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim> {
-        BrokerSupervisorClient::claim_command(self, claimer, busy_commands, wait).await
+        BrokerSupervisorClient::claim_command(self, claimer, busy_commands, cancelling, wait).await
     }
     async fn event_record(
         &self,
@@ -228,7 +249,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn set_status(
         &self,
         replica: &str,
-        command_id: Option<i64>,
+        command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
@@ -236,18 +257,51 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
-    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>> {
+    ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
         BrokerSupervisorClient::set_status(
             self,
-            replica,
-            command_id,
-            project_id,
-            node_id,
-            instance,
-            unit,
-            status,
-            failure_stage,
-            failure_message,
+            &SupervisorSetStatusRequest {
+                replica: replica.to_string(),
+                command_id: Some(command_id),
+                project_id,
+                node_id: node_id.to_string(),
+                instance: instance.cloned(),
+                unit: unit.map(str::to_string),
+                status,
+                failure_stage,
+                failure_message: failure_message.map(str::to_string),
+                not_ready_since_unix: None,
+                ready_since_unix: None,
+            },
+        )
+        .await
+    }
+    async fn set_unit_health(
+        &self,
+        replica: &str,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        unit: &str,
+        status: weft_broker_client::protocol::InfraNodeStatus,
+        not_ready_since_unix: Option<i64>,
+        ready_since_unix: Option<i64>,
+    ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
+        BrokerSupervisorClient::set_status(
+            self,
+            &SupervisorSetStatusRequest {
+                replica: replica.to_string(),
+                command_id: None,
+                project_id,
+                node_id: node_id.to_string(),
+                instance: instance.cloned(),
+                unit: Some(unit.to_string()),
+                status,
+                failure_stage: None,
+                failure_message: None,
+                not_ready_since_unix,
+                ready_since_unix,
+            },
         )
         .await
     }
@@ -283,9 +337,6 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             .await
     }
 
-    async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
-        BrokerSupervisorClient::command_cancel_requested(self, command_id).await
-    }
     async fn infra_commands_in_flight(
         &self,
         project_id: uuid::Uuid,

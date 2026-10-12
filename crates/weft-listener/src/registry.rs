@@ -72,6 +72,9 @@ pub struct RegisteredSignal {
     /// status updates land where the kind's `live` reads them. Dies
     /// with the entry.
     pub serving: Arc<Mutex<ServingState>>,
+    /// Why the signal was given up on for good (`signal.held_failed`),
+    /// shown on its node until it is registered again.
+    pub gave_up: Option<String>,
 }
 
 /// Wrapper so dropping a `RegisteredSignal` aborts its loop
@@ -105,6 +108,11 @@ pub struct Registry {
     down: DashMap<String, Down>,
     /// Source of [`Down::owner`] values.
     down_loops: std::sync::atomic::AtomicU64,
+    /// Held signals given up on here whose give-up could not be written,
+    /// by token. Each stays this process's claim, so its row is never
+    /// taken back and brought up only to give up again, and the holder's
+    /// next look writes the give-up again (`crate::hold`).
+    unrecorded: DashMap<String, GaveUp>,
     /// Retry loops alive now, so a test can see one loop per token.
     retry_loops_running: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -132,6 +140,17 @@ impl Drop for RunningLoop {
 struct Down {
     reason: String,
     owner: u64,
+    /// Whether its row holds a connection, so that a holder counts it
+    /// among its claims (`crate::hold`).
+    holds: bool,
+}
+
+/// A give-up still to be written: the registration it gives up on, and
+/// why.
+#[derive(Debug, Clone)]
+pub struct GaveUp {
+    pub generation: i64,
+    pub reason: String,
 }
 
 impl Registry {
@@ -163,15 +182,37 @@ impl Registry {
         self.down.get(token).map(|r| r.reason.clone())
     }
 
-    /// Every held row that is down now.
-    pub fn down_tokens(&self) -> Vec<String> {
-        self.down.iter().map(|e| e.key().clone()).collect()
+    /// Every row down now that holds a connection: a holder's claims.
+    pub fn down_connections(&self) -> Vec<String> {
+        self.down.iter().filter(|e| e.value().holds).map(|e| e.key().clone()).collect()
     }
 
     /// Stop counting `token` as down: it came up, or its row is gone.
-    /// Its retry loop sees this at its next turn and ends.
-    pub fn clear_down(&self, token: &str) {
-        self.down.remove(token);
+    /// Its retry loop sees this at its next turn and ends. When it was
+    /// down, whether its row holds a connection.
+    pub fn clear_down(&self, token: &str) -> Option<bool> {
+        self.down.remove(token).map(|(_, down)| down.holds)
+    }
+
+    /// Every held signal given up on here whose give-up is still to be
+    /// written.
+    pub fn unrecorded(&self) -> Vec<(String, GaveUp)> {
+        self.unrecorded.iter().map(|e| (e.key().clone(), e.value().clone())).collect()
+    }
+
+    /// The give-up still to be written for `token`, while there is one.
+    pub fn unrecorded_of(&self, token: &str) -> Option<GaveUp> {
+        self.unrecorded.get(token).map(|g| g.clone())
+    }
+
+    pub(crate) fn keep_unrecorded(&self, token: &str, gave_up: GaveUp) {
+        self.unrecorded.insert(token.to_string(), gave_up);
+    }
+
+    /// `token`'s give-up was written, or the signal is no longer this
+    /// process's to give up on (it ended, or changed hands).
+    pub(crate) fn drop_unrecorded(&self, token: &str) {
+        self.unrecorded.remove(token);
     }
 
     /// Whether the retry loop `owner` still owns `token`'s down entry.
@@ -238,6 +279,7 @@ pub async fn held_in(registry: &Registry, signals: &weft_broker_client::BrokerSi
         kind_state: (!row.holds).then(|| row.kind_state.clone()),
         routing,
         serving: Arc::new(Mutex::new(serving)),
+        gave_up: row.held_failed.clone(),
     }))
 }
 
@@ -249,10 +291,10 @@ fn decided_holds(row: &weft_broker_client::protocol::SignalRowWire) -> Option<bo
     Some(handler.between_fires(&spec, &row.kind_state).ok()? == crate::kinds::BetweenFires::Holds)
 }
 
-/// How long the retry of a down row waits before its first attempt,
-/// doubled after each failure up to [`DOWN_RETRY_MAX`].
-const DOWN_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
-const DOWN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long the retry of a down row waits before each attempt: about a
+/// minute in all, then it is given up on.
+const DOWN_RETRIES: [std::time::Duration; 3] =
+    [std::time::Duration::from_secs(5), std::time::Duration::from_secs(15), std::time::Duration::from_secs(40)];
 /// How often a row just brought up is read again before the answer
 /// counts as unknown, and the wait before the first re-read (doubled
 /// after each).
@@ -276,10 +318,11 @@ const REREAD_FIRST: std::time::Duration = std::time::Duration::from_millis(200);
 /// and an unregister that comes later still finds the registry entry.
 ///
 /// A restore or put-back that fails marks the row down: it is logged,
-/// shown on the node's display, and retried with backoff until it comes
-/// up or its row is gone. A `StartMode::New` failure is the dispatcher's
-/// to handle (it answers the registration with it), so it is only
-/// returned.
+/// shown on the node's display, and retried from the row as it reads a few
+/// times over about a minute, then given up on (written once on the row,
+/// which its node shows) until it is registered again. A
+/// `StartMode::New` failure is the dispatcher's to handle (it answers the
+/// registration with it), so it is only returned.
 pub async fn hold(
     state: &crate::ListenerState,
     row: weft_broker_client::protocol::SignalRowWire,
@@ -289,13 +332,13 @@ pub async fn hold(
     let guard = state.registry.bring_up_guard(&token);
     let result = {
         let _held = guard.lock().await;
-        hold_once(state, row, mode).await
+        hold_once(state, row.clone(), mode).await
     };
     drop(guard);
     state.registry.release_bring_up_guard(&token);
     if let Err(e) = &result {
         if mode.retried() {
-            mark_down(state, &token, format!("{e:#}"));
+            mark_down(state, row, format!("{e:#}"));
         }
     }
     result
@@ -368,66 +411,81 @@ pub async fn start(
     }
 }
 
-/// Count `token` as down with `reason`, starting its retry loop unless
-/// one already owns the entry (then only the reason is updated, and that
-/// loop stays the owner).
-fn mark_down(state: &crate::ListenerState, token: &str, reason: String) {
-    tracing::error!(target: "weft_listener", token = %token, reason = %reason, "a held signal is down; retrying it");
-    match state.registry.down.entry(token.to_string()) {
+/// Count `row`'s signal as down with `reason`, starting its retry loop
+/// unless one already owns the entry (then only the reason is updated, and
+/// that loop stays the owner).
+fn mark_down(state: &crate::ListenerState, row: weft_broker_client::protocol::SignalRowWire, reason: String) {
+    tracing::error!(target: "weft_listener", token = %row.token, reason = %reason, "a signal is down; retrying it");
+    match state.registry.down.entry(row.token.clone()) {
         dashmap::Entry::Occupied(mut e) => {
             e.get_mut().reason = reason;
         }
         dashmap::Entry::Vacant(e) => {
             let owner = state.registry.down_loops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            e.insert(Down { reason, owner });
+            e.insert(Down { reason, owner, holds: row.holds });
             let running = RunningLoop::start(&state.registry.retry_loops_running);
-            tokio::spawn(retry_down(state.clone(), token.to_string(), owner, running));
+            tokio::spawn(retry_down(state.clone(), row, owner, running));
         }
     }
 }
 
-/// Bring a down row back, waiting longer after each failure, until it is
-/// up, its row is gone, or the down entry is no longer this loop's
-/// (`owner`): something else brought it up, or forgot it, or it was
-/// cleared and marked again, which started the loop that owns it now.
-async fn retry_down(state: crate::ListenerState, token: String, owner: u64, _running: RunningLoop) {
-    let mut wait = weft_core::time_scale::scaled(DOWN_RETRY_FIRST);
-    loop {
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(DOWN_RETRY_MAX);
+/// Bring a down row back ([`DOWN_RETRIES`]), each try from the row as it
+/// reads then, until it is up or no longer this loop's to bring up: the
+/// down entry is not this loop's (`owner`: something else brought it up,
+/// or forgot it, or it was cleared and marked again, which started the
+/// loop that owns it now), or the row is gone, registered again, or given
+/// up on (another process may have unregistered it, which this one never
+/// hears). One that never comes up is given up on: written once on its
+/// row, which its node shows, until it is registered again.
+async fn retry_down(state: crate::ListenerState, row: weft_broker_client::protocol::SignalRowWire, owner: u64, _running: RunningLoop) {
+    let token = row.token.clone();
+    for wait in DOWN_RETRIES {
+        tokio::time::sleep(weft_core::time_scale::scaled(wait)).await;
         if !state.registry.owns_down(&token, owner) {
             return;
         }
-        match state.signals.get_held(&token).await {
-            Ok(None) => {
+        let row = match state.signals.get_held(&token).await {
+            Ok(Some(now)) if now.generation == row.generation && now.held_failed.is_none() => now,
+            Ok(_) => {
                 state.registry.down.remove_if(&token, |_, d| d.owner == owner);
-                tracing::info!(target: "weft_listener", token = %token, "a down signal's row is gone; no longer retrying it");
+                tracing::info!(target: "weft_listener", token = %token, "a down signal is gone, registered again or given up on; no longer retrying it");
                 return;
             }
-            Ok(Some(row)) => {
-                let holds = row.holds;
-                match start(&state, row, StartMode::Restore).await {
-                    // A held connection is up once this process took it.
-                    Ok(()) if !holds || state.registry.get(&token).is_some() => {
-                        tracing::info!(target: "weft_listener", token = %token, "a down signal is back up");
-                        return;
-                    }
-                    Ok(()) => {
-                        state.registry.down.remove_if(&token, |_, d| d.owner == owner);
-                        tracing::info!(target: "weft_listener", token = %token, "a down signal is another holder's now; no longer retrying it here");
-                        return;
-                    }
-                    // A failure to come up is also recorded by `hold`, which
-                    // shows it on the node.
-                    Err(e) => {
-                        tracing::warn!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a down signal could not be brought back; retrying it");
-                    }
-                }
-            }
             Err(e) => {
-                tracing::error!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a down signal's row could not be read; retrying it");
+                tracing::warn!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a down signal's row could not be read; trying again");
+                continue;
             }
+        };
+        match start(&state, row.clone(), StartMode::Restore).await {
+            // A held connection is up once this process took it.
+            Ok(()) if !row.holds || state.registry.get(&token).is_some() => {
+                tracing::info!(target: "weft_listener", token = %token, "a down signal is back up");
+                return;
+            }
+            Ok(()) => {
+                state.registry.down.remove_if(&token, |_, d| d.owner == owner);
+                tracing::info!(target: "weft_listener", token = %token, "a down signal is another holder's now, or gone; no longer retrying it here");
+                return;
+            }
+            // A failure to come up is also recorded by `hold`, which
+            // shows it on the node.
+            Err(e) => tracing::warn!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a down signal could not be brought back"),
         }
+    }
+    let Some(reason) = state.registry.down.get(&token).filter(|d| d.owner == owner).map(|d| d.reason.clone()) else { return };
+    let why = format!("it could not come up: {reason}");
+    // A held connection's give-up that is not written stays its holder's
+    // claim, and its next look writes it (`crate::hold`); nothing else
+    // writes another signal's, so it is tried again here a few times.
+    let mut waits = DOWN_RETRIES.iter().filter(|_| !row.holds);
+    loop {
+        let Err(e) = crate::kinds::give_up(&state, &token, row.generation, &why).await else { return };
+        let Some(wait) = waits.next() else {
+            tracing::error!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a signal given up on could not say so on its row; it stays so until it is brought up again");
+            return;
+        };
+        tracing::warn!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a signal given up on could not say so on its row yet; trying again");
+        tokio::time::sleep(weft_core::time_scale::scaled(*wait)).await;
     }
 }
 
@@ -446,8 +504,9 @@ async fn retry_down(state: crate::ListenerState, token: String, owner: u64, _run
 /// Every row that can come up does: one that cannot (a malformed spec, a
 /// kind that refuses) does not stop the rest, so one bad row never keeps
 /// the others down (at boot, every project's). It is marked down, which
-/// logs it, shows it on its node, and retries it until it comes up or its
-/// row is gone. The answer also names each row that stayed down: the
+/// logs it, shows it on its node, and retries it a few times before giving
+/// it up. A row given up on waits to be registered again. The answer
+/// also names each row that stayed down: the
 /// activate fails on its own project's, the boot carries on. Rows whose
 /// token is in `skip` are never brought up: they are on their way out
 /// (see `RehydrateRequest`). Failing to read the rows at all is an error.
@@ -459,7 +518,8 @@ pub async fn rehydrate(
     let mut failed = Vec::new();
     let mut held = Vec::new();
     for mut row in state.signals.list_held(project).await? {
-        if skip.contains(&row.token) || state.registry.get(&row.token).is_some() {
+        // A row given up on waits to be registered again.
+        if skip.contains(&row.token) || row.held_failed.is_some() || state.registry.get(&row.token).is_some() {
             continue;
         }
         // The row says what its kind decided when it was registered; a

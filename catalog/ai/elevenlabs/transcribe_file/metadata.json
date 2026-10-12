@@ -1,14 +1,15 @@
 {
   "type": "ElevenLabsTranscribeFile",
   "label": "ElevenLabs Transcribe File",
-  "description": "Speech-to-text for a stored audio file (Scribe): a voice note, a recording, a call. Audio file in, the transcript out as text, with the language the model heard. For a live audio stream use ElevenLabsTranscribe instead.",
+  "description": "Speech-to-text for a recording that already exists (Scribe): a voice note, a call, a meeting, a video. A file or a public link in, the transcript out as a JSON file, with the language the model heard, and when you ask for them: who spoke when, word timings, subtitle and document files, the names, numbers and other entities it found, and a rewritten version. For a live audio stream use ElevenLabsTranscribe instead.",
   "tags": [
     "ai",
     "audio",
     "speech",
     "transcription",
     "stt",
-    "file"
+    "file",
+    "subtitles"
   ],
   "icon": "FileAudio",
   "color": "#7c6f9f",
@@ -21,45 +22,486 @@
     },
     {
       "name": "audio",
-      "type": "Audio",
-      "required": true,
-      "description": "The recording to transcribe (any common audio format; a WhatsApp voice note is Ogg Opus)."
+      "type": "Audio | Video",
+      "description": "The recording to transcribe: any common audio or video file with at least 100 ms of sound (a WhatsApp voice note is Ogg Opus). Give this or `sourceUrl`."
+    },
+    {
+      "name": "sourceUrl",
+      "type": "String",
+      "label": "Source link",
+      "placeholder": "https://",
+      "description": "If the recording is online, its link instead of `audio`: ElevenLabs fetches it itself, so the file never passes through weft. A direct link to an audio or video file works, and so does a YouTube or TikTok video page. Give this or `audio`."
     },
     {
       "name": "language",
       "type": "String",
       "label": "Language",
       "placeholder": "(auto-detect)",
-      "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."
+      "description": "The spoken language as an ISO 639-1 or 639-3 code (en, fra, ...), which can help the transcription. Leave empty to let the model detect it."
     },
     {
       "name": "model",
       "type": "String",
-      "default": "scribe_v1",
+      "default": "scribe_v2",
       "widget": {
         "kind": "select",
         "free_text": true,
         "options": [
-          "scribe_v1",
-          "scribe_v1_experimental"
+          "scribe_v2",
+          "scribe_v2_medical"
         ]
       },
-      "label": "Model"
+      "label": "Model",
+      "description": "scribe_v2 is ElevenLabs's speech recognition model, at $0.22 an hour of audio. scribe_v2_medical is a version of it tuned for clinical audio, with 35% fewer errors there by ElevenLabs's count, at the same price and with the same settings."
+    },
+    {
+      "name": "diarize",
+      "type": "Boolean",
+      "default": false,
+      "label": "Who spoke when",
+      "description": "Turn on to label every word with its speaker (speaker_0, speaker_1, ...), up to 32 speakers. The labels are on the words in the `transcript` file."
+    },
+    {
+      "name": "numSpeakers",
+      "type": "Number",
+      "label": "Most speakers",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 32,
+        "step": 1
+      },
+      "description": "The most speakers the recording can hold, from 1 to 32, which can help the model work out who speaks when. Leave empty for the most the model supports."
+    },
+    {
+      "name": "diarizationThreshold",
+      "type": "Number",
+      "label": "Speaker split threshold",
+      "widget": {
+        "kind": "number",
+        "min": 0.1,
+        "max": 0.4,
+        "step": 0.01
+      },
+      "description": "How readily the speaker labelling tells voices apart, from 0.1 to 0.4. Higher makes it less likely to split one speaker in two, and more likely to merge two speakers into one; lower does the reverse. Needs `diarize`, and works only without `numSpeakers`. Leave empty for the model's own choice (usually 0.22)."
+    },
+    {
+      "name": "detectSpeakerRoles",
+      "type": "Boolean",
+      "default": false,
+      "label": "Agent and customer",
+      "description": "For a support call: turn on to label the two sides `agent` and `customer` instead of speaker_0 and speaker_1. Needs `diarize`, does not work with `useMultiChannel`, and adds 10% to the price."
+    },
+    {
+      "name": "useSpeakerLibrary",
+      "type": "Boolean",
+      "default": false,
+      "label": "Known speakers",
+      "description": "Turn on to match the speakers against the ones registered in your ElevenLabs workspace's speaker library, so known people are recognised. Needs `diarize`."
+    },
+    {
+      "name": "timestampsGranularity",
+      "type": "String",
+      "label": "Timings",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "word",
+          "character",
+          "none"
+        ]
+      },
+      "description": "How finely the words in the `transcript` file are timed: `word` gives each word its start and end, `character` also times each letter of it, and `none` leaves the timings out. Leave empty for `word`."
+    },
+    {
+      "name": "tagAudioEvents",
+      "type": "Boolean",
+      "default": true,
+      "label": "Mark sounds",
+      "description": "Marks sounds like (laughter) or (footsteps) in the transcript. Turn off to leave them out."
+    },
+    {
+      "name": "noVerbatim",
+      "type": "Boolean",
+      "default": false,
+      "label": "Clean up",
+      "description": "Turn on to leave out filler words, false starts and sounds that are not speech, for a transcript that reads cleanly."
+    },
+    {
+      "name": "keyterms",
+      "type": "List[String]",
+      "description": "Words or phrases the model should get right, like names or product terms. Up to 1,000, each under 50 characters and at most 5 words, with none of the characters `<>{}[]\\`. They add 20% to the price, and with more than 100 of them a request is billed for at least 20 seconds of audio."
+    },
+    {
+      "name": "additionalFormats",
+      "type": "List[String | { format: String, includeSpeakers?: Boolean, includeTimestamps?: Boolean, segmentOnSilenceLongerThanS?: Number, maxSegmentDurationS?: Number, maxSegmentChars?: Number, maxCharactersPerLine?: Number }]",
+      "label": "Also as files",
+      "description": "If you want the transcript as subtitle or document files too, up to 10 of them: `srt`, `txt`, `segmented_json`, `docx`, `pdf` or `html`. Give a format's name, or `{ format, ... }` to change its layout with `includeSpeakers`, `includeTimestamps`, `segmentOnSilenceLongerThanS`, `maxSegmentDurationS`, `maxSegmentChars`, and on `srt` and `txt` also `maxCharactersPerLine`. The files come out on `formatFiles`."
+    },
+    {
+      "name": "entityDetection",
+      "type": "List[String]",
+      "label": "Find entities",
+      "description": "If you want names, card numbers, health details and the like found in the transcript: `all`, a category (`pii`, `phi`, `pci`, `other`, `offensive_language`), or entity types like `email_address`. What is found comes out in the `transcript` file's `entities`, with where it sits in its `text`."
+    },
+    {
+      "name": "entityRedaction",
+      "type": "List[String]",
+      "label": "Redact entities",
+      "description": "If you want some of those entities blanked out of the transcript and its words: the same kind of list as `entityDetection`, covering only what it finds. With redaction on, ElevenLabs answers no `entities`."
+    },
+    {
+      "name": "entityRedactionMode",
+      "type": "String",
+      "label": "Redacted as",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "enumerated_entity_type",
+          "entity_type",
+          "redacted"
+        ]
+      },
+      "description": "What a blanked-out entity reads as: `enumerated_entity_type` gives `{NAME_0}`, `{NAME_1}` and so on, `entity_type` gives `{NAME}`, and `redacted` gives `{REDACTED}`. Needs `entityRedaction`. Leave empty for `enumerated_entity_type`."
+    },
+    {
+      "name": "transcriptEdit",
+      "type": "String",
+      "label": "Rewrite",
+      "widget": {
+        "kind": "textarea"
+      },
+      "description": "An instruction in plain words for rewriting the finished transcript, like \"Write all dates in ISO 8601 format (YYYY-MM-DD)\", at most 2,000 characters. The rewrite comes out in the `transcript` file's `editedText`, and its `text` stays as spoken. ElevenLabs calls this experimental. It adds 30% to the price, billed for at least 10 seconds of audio, and it does not work with `entityDetection`, `entityRedaction` or `useMultiChannel`."
+    },
+    {
+      "name": "useMultiChannel",
+      "type": "Boolean",
+      "default": false,
+      "label": "One speaker per channel",
+      "description": "For a recording with each speaker on a channel of their own (an interview with one voice per side, a call with the agent and the customer recorded apart): turn on to transcribe each channel on its own, up to 5. Each channel is billed for the full length of the recording. It does not work with `diarize` or `numSpeakers`, since the channels already say who speaks. A mono file comes back as one transcript anyway."
+    },
+    {
+      "name": "multichannelOutputStyle",
+      "type": "String",
+      "label": "Channels come out",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "separate",
+          "combined"
+        ]
+      },
+      "description": "With `useMultiChannel`: `separate` gives one transcript per channel in the `transcript` file's `channels`, and `combined` merges them into one transcript in its `text`, its words in time order, each saying its channel. `combined` needs timings (`timestampsGranularity` other than `none`) and does not work with `entityDetection` or `entityRedaction`. Leave empty for `separate`."
+    },
+    {
+      "name": "temperature",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 2,
+        "step": 0.1
+      },
+      "description": "How much the transcript may vary, from 0 to 2: higher gives more diverse, less predictable results. Leave empty for the model's own (usually 0)."
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 2147483647,
+        "step": 1
+      },
+      "description": "If you want the same result again for the same recording and settings, set any whole number here and use it again. ElevenLabs tries to repeat itself but does not promise it."
+    },
+    {
+      "name": "fileFormat",
+      "type": "String",
+      "label": "Raw audio",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "other",
+          "pcm_s16le_16"
+        ]
+      },
+      "description": "If `audio` is raw 16-bit little-endian PCM at 16 kHz in mono, pick `pcm_s16le_16`, which ElevenLabs answers faster. Leave empty for any other file."
+    },
+    {
+      "name": "enableLogging",
+      "type": "Boolean",
+      "default": true,
+      "label": "Keep history",
+      "description": "Turn off for zero retention: ElevenLabs then keeps no log and no transcript of the request. Only Enterprise accounts can turn it off."
     }
   ],
   "outputs": [
     {
-      "name": "text",
-      "type": "String",
-      "description": "The transcript."
+      "name": "transcript",
+      "type": "Blob",
+      "description": "A JSON file holding the transcript. `text` is what was said. `words` lists every word, space and sound in order, the way ElevenLabs gives them: `text`, `start` and `end` in seconds, `type` (`word`, `spacing` or `audio_event`), `logprob` (the model's confidence), plus `speaker_id` with `diarize`, `characters` with character timings, and `channel_index` with `useMultiChannel`. With `entityDetection`, `entities` lists each entity found as `{ text, entityType, startChar, endChar }`: its type (like `credit_card` or `name`) and the character positions where it starts and ends in `text`. With `transcriptEdit`, `editedText` is the transcript rewritten as the instruction says (if ElevenLabs could not produce it, it is left out and the node's log says why). With `useMultiChannel` and the `separate` style, on a recording that has several channels, `channels` takes the place of `text` and `entities`: one `{ channel, text, language, languageProbability, entities }` per channel. It is a file because hours of speech are more than a wire can carry."
     },
     {
       "name": "language",
       "type": "String",
-      "description": "The language the model heard (ISO code)."
+      "description": "The language the model heard (ISO code, like `eng`). With `useMultiChannel` and the `separate` style, each channel's language is in the `transcript` file instead."
+    },
+    {
+      "name": "languageProbability",
+      "type": "Number",
+      "description": "How sure the model is of `language`, from 0 to 1."
+    },
+    {
+      "name": "formatFiles",
+      "type": "List[{ format: String, file: File, channel?: Number }]",
+      "description": "With `additionalFormats`: one stored file per format, with the format's name (`srt`, `pdf`, ...), and with `useMultiChannel` and the `separate` style, the channel it transcribes."
+    },
+    {
+      "name": "transcriptionId",
+      "type": "String",
+      "description": "The id ElevenLabs gave this transcription."
+    },
+    {
+      "name": "audioDurationSecs",
+      "type": "Number",
+      "description": "How long the transcribed audio is, in seconds (all channels together with `useMultiChannel`)."
     }
   ],
   "features": {
-    "catchErrors": true
-  }
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "audio",
+        "sourceUrl"
+      ]
+    ]
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "audio" },
+          { "kind": "input_satisfied", "port": "sourceUrl" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' is given both `audio` and `sourceUrl`: give the recording one way.",
+        "port": "sourceUrl"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "diarizationThreshold" },
+          { "kind": "not", "of": { "kind": "config_equals", "field": "diarize", "equals": true } },
+          { "kind": "not", "of": { "kind": "input_wired", "port": "diarize" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets `diarizationThreshold`, which tunes the speaker labelling that only `diarize` turns on: turn `diarize` on, or leave `diarizationThreshold` empty.",
+        "port": "diarizationThreshold"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "diarizationThreshold" },
+          { "kind": "input_satisfied", "port": "numSpeakers" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets both `diarizationThreshold` and `numSpeakers`, and ElevenLabs takes the threshold only without a number of speakers: keep one of them.",
+        "port": "diarizationThreshold"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "detectSpeakerRoles", "equals": true },
+          { "kind": "not", "of": { "kind": "config_equals", "field": "diarize", "equals": true } },
+          { "kind": "not", "of": { "kind": "input_wired", "port": "diarize" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' turns on `detectSpeakerRoles`, which names the speakers that `diarize` finds, and `diarize` is off: turn `diarize` on, or `detectSpeakerRoles` off.",
+        "port": "detectSpeakerRoles"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "detectSpeakerRoles", "equals": true },
+          { "kind": "config_equals", "field": "useMultiChannel", "equals": true }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' turns on both `detectSpeakerRoles` and `useMultiChannel`, and ElevenLabs does not detect speaker roles on a recording split by channel: turn one of them off.",
+        "port": "detectSpeakerRoles"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "useSpeakerLibrary", "equals": true },
+          { "kind": "not", "of": { "kind": "config_equals", "field": "diarize", "equals": true } },
+          { "kind": "not", "of": { "kind": "input_wired", "port": "diarize" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' turns on `useSpeakerLibrary`, which matches the speakers that `diarize` finds, and `diarize` is off: turn `diarize` on, or `useSpeakerLibrary` off.",
+        "port": "useSpeakerLibrary"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "useMultiChannel", "equals": true },
+          { "kind": "config_equals", "field": "diarize", "equals": true }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' turns on both `useMultiChannel` and `diarize`, and ElevenLabs needs `diarize` off when each channel is one speaker: turn one of them off.",
+        "port": "diarize"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "useMultiChannel", "equals": true },
+          { "kind": "input_satisfied", "port": "numSpeakers" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets `numSpeakers` with `useMultiChannel`, where the channels already set the number of speakers and ElevenLabs refuses one: leave `numSpeakers` empty, or turn `useMultiChannel` off.",
+        "port": "numSpeakers"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "multichannelOutputStyle" },
+          { "kind": "not", "of": { "kind": "config_equals", "field": "useMultiChannel", "equals": true } },
+          { "kind": "not", "of": { "kind": "input_wired", "port": "useMultiChannel" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets `multichannelOutputStyle`, which shapes what `useMultiChannel` answers, and `useMultiChannel` is off: turn `useMultiChannel` on, or leave `multichannelOutputStyle` empty.",
+        "port": "multichannelOutputStyle"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "multichannelOutputStyle", "equals": "combined" },
+          { "kind": "config_equals", "field": "timestampsGranularity", "equals": "none" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' merges the channels by time (`combined`) and turns the timings off, and ElevenLabs needs the timings to merge: set `timestampsGranularity` to word or character, or pick the `separate` style.",
+        "port": "timestampsGranularity"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "multichannelOutputStyle", "equals": "combined" },
+          {
+            "kind": "any",
+            "of": [
+              { "kind": "input_satisfied", "port": "entityDetection" },
+              { "kind": "input_satisfied", "port": "entityRedaction" }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' looks for entities in the `combined` style, and ElevenLabs does not detect or redact entities there: pick the `separate` style, or leave `entityDetection` and `entityRedaction` empty.",
+        "port": "multichannelOutputStyle"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "transcriptEdit" },
+          {
+            "kind": "any",
+            "of": [
+              { "kind": "input_satisfied", "port": "entityDetection" },
+              { "kind": "input_satisfied", "port": "entityRedaction" },
+              { "kind": "config_equals", "field": "useMultiChannel", "equals": true }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets `transcriptEdit` together with entity detection, redaction or `useMultiChannel`, and ElevenLabs does not rewrite a transcript with any of those: leave `transcriptEdit` empty, or turn them off.",
+        "port": "transcriptEdit"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "entityRedaction" },
+          { "kind": "not", "of": { "kind": "input_satisfied", "port": "entityDetection" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets `entityRedaction`, which blanks out entities that `entityDetection` finds, and `entityDetection` is empty: set `entityDetection` to cover what you redact.",
+        "port": "entityRedaction"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "entityRedactionMode" },
+          { "kind": "not", "of": { "kind": "input_satisfied", "port": "entityRedaction" } }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' sets `entityRedactionMode`, which says how redacted entities read, and `entityRedaction` redacts nothing: set `entityRedaction`, or leave `entityRedactionMode` empty.",
+        "port": "entityRedactionMode"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "noVerbatim", "equals": true },
+          { "kind": "config_matches", "field": "model", "regex": "^scribe_v1" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' turns on `noVerbatim` on a scribe_v1 model, and ElevenLabs offers it on scribe_v2 and scribe_v2_medical only: pick one of those, or turn `noVerbatim` off.",
+        "port": "noVerbatim"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "input_satisfied", "port": "keyterms" },
+          { "kind": "config_matches", "field": "model", "regex": "^scribe_v1" }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsTranscribeFile '{id}' gives `keyterms` to a scribe_v1 model, and ElevenLabs offers keyterms on scribe_v2 and scribe_v2_medical only: pick one of those, or leave `keyterms` empty.",
+        "port": "keyterms"
+      }
+    }
+  ]
 }

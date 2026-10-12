@@ -16,9 +16,9 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use weft_task_store::pg_signal::{Heard, Subscription};
-use weft_task_store::tasks::{self, claim_one, TASK_READY_CHANNEL};
+use weft_task_store::tasks::{self, TASK_READY_CHANNEL};
 
-use support::{setup, signals};
+use support::{claimed_task, setup, signals};
 
 /// Long enough for a notification that was sent to arrive on a loaded
 /// machine, so "nothing arrived" means nothing was sent.
@@ -146,6 +146,118 @@ async fn a_quiet_watch_listens_again_only_when_work_arrives(pool: PgPool) {
     drop(busy);
 }
 
+/// A TCP proxy in front of the test database that counts the connections
+/// made through it, and refuses them (closes at once) while `refusing`.
+struct CountingProxy {
+    port: u16,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn counting_proxy(pool: &PgPool) -> CountingProxy {
+    use std::sync::atomic::Ordering;
+    let options = pool.connect_options();
+    let target = format!("{}:{}", options.get_host(), options.get_port());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = CountingProxy { port, accepted: Default::default(), refusing: Default::default() };
+    let (accepted, refusing) = (proxy.accepted.clone(), proxy.refusing.clone());
+    tokio::spawn(async move {
+        loop {
+            let (mut inbound, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            if refusing.load(Ordering::SeqCst) {
+                continue;
+            }
+            let target = target.clone();
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    proxy
+}
+
+/// A watch listening through `proxy`.
+async fn watch_through(pool: &PgPool, proxy: &CountingProxy) -> std::sync::Arc<weft_task_store::pg_signal::PgSignalWatch> {
+    let options = (*pool.connect_options()).clone().host("127.0.0.1").port(proxy.port);
+    weft_task_store::pg_signal::PgSignalWatch::start(&options, support::CHANNELS, weft_task_store::pg_signal::Listening::WhileBusy).await.unwrap()
+}
+
+/// A connection the database closes while nothing is busy is not made
+/// again behind weft's back: the listener does not reconnect on its own,
+/// so a sleeping database is not woken by it.
+#[sqlx::test]
+async fn a_quiet_watch_opens_no_connection_when_its_own_drops(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+    setup(&pool).await;
+    let proxy = counting_proxy(&pool).await;
+    let watch = watch_through(&pool, &proxy).await;
+    let mut heard = watch.subscribe();
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    cut_the_listener(&pool).await;
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1, "no connection made while nothing is busy");
+}
+
+/// A watch that cannot listen again while something is busy keeps trying,
+/// and stops once nothing is busy any more, so an unreachable or sleeping
+/// database is not tried every second for nothing; work arriving later
+/// makes it listen again, and, since the connection was lost while this
+/// process was busy writing, every waiter rechecks.
+#[sqlx::test]
+async fn a_watch_stops_retrying_once_its_work_ends(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+    setup(&pool).await;
+    let proxy = counting_proxy(&pool).await;
+    let watch = watch_through(&pool, &proxy).await;
+    let mut heard = watch.subscribe();
+    let busy = watch.busy().await;
+    proxy.refusing.store(true, Ordering::SeqCst);
+    cut_the_listener(&pool).await;
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(proxy.accepted.load(Ordering::SeqCst) > 2, "busy: trying again");
+    drop(busy);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let tried = proxy.accepted.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), tried, "nothing busy: no more tries");
+    proxy.refusing.store(false, Ordering::SeqCst);
+    let _busy = watch.busy().await;
+    assert!(heard.listening(), "work makes it listen again");
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Recheck, "its own writes while it could not listen went unheard");
+}
+
+/// Work that went ahead while a quiet watch could not listen again wrote
+/// unheard, so the watch, once it listens, has every waiter recheck.
+#[sqlx::test]
+async fn work_that_went_ahead_unheard_makes_the_watch_recheck(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+    setup(&pool).await;
+    let proxy = counting_proxy(&pool).await;
+    let watch = watch_through(&pool, &proxy).await;
+    let mut heard = watch.subscribe();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    proxy.refusing.store(true, Ordering::SeqCst);
+    cut_the_listener(&pool).await;
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    let busy = watch.busy().await;
+    assert!(!heard.listening(), "the work went ahead without it");
+    proxy.refusing.store(false, Ordering::SeqCst);
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Recheck);
+    drop(busy);
+}
+
 /// A task announces itself when it becomes claimable, and only then:
 /// claims, heartbeats and completions are the hot path and stay silent,
 /// while a requeue is loud.
@@ -158,14 +270,14 @@ async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
     let work = tasks::enqueue(&pool, task("d")).await.unwrap();
     assert!(!on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "new work wakes the pickers");
 
-    assert_eq!(claim_one(&pool, "disp-1").await.unwrap().expect("claimed").id, work);
+    assert_eq!(claimed_task(&pool, "disp-1").await.unwrap().expect("claimed").id, work);
     tasks::heartbeat(&pool, work, "disp-1").await.unwrap();
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "claim and heartbeat are silent");
 
     assert!(tasks::surrender(&pool, work, "disp-1").await.unwrap());
     assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec![String::new()]);
 
-    assert_eq!(claim_one(&pool, "disp-1").await.unwrap().expect("claimed").id, work);
+    assert_eq!(claimed_task(&pool, "disp-1").await.unwrap().expect("claimed").id, work);
     tasks::complete(&pool, work, "disp-1", json!(1)).await.unwrap();
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "completing is silent");
 }
@@ -214,11 +326,8 @@ async fn what_is_told_another_way_reaches_waiters_while_the_watch_is_quiet(pool:
     assert_eq!(next.unwrap(), Heard::Lost);
     let told = watch.also_told();
     assert!(told.signal(TASK_READY_CHANNEL, "x").unwrap());
-    assert!(told.recheck());
     let next = tokio::time::timeout(Duration::from_secs(5), heard.next()).await.expect("heard in time");
     assert_eq!(next.unwrap(), Heard::Signal { channel: TASK_READY_CHANNEL, payload: "x".into() });
-    let next = tokio::time::timeout(Duration::from_secs(5), heard.next()).await.expect("heard in time");
-    assert_eq!(next.unwrap(), Heard::Recheck);
     assert!(!heard.listening(), "the watch stayed quiet");
 }
 
@@ -257,8 +366,7 @@ async fn a_request_that_let_go_of_its_listening_holds_the_watch_no_longer(pool: 
         let request = axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap();
         let call = tokio::spawn(app.clone().oneshot(request));
         waiting.notified().await;
-        let now = tokio::time::Instant::now();
-        assert_eq!(watch.worked_since(now), holds, "{path}");
+        assert_eq!(watch.holds(), holds, "{path}");
         release.notify_one();
         let answer = call.await.unwrap().unwrap();
         axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap();

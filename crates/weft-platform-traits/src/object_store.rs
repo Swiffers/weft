@@ -816,9 +816,9 @@ pub mod fake {
         uploads: Mutex<BTreeMap<String, FakeUpload>>,
         upload_seq: Mutex<u64>,
         calls: Mutex<Vec<FakeCall>>,
-        /// Keys whose NEXT `delete` fails (one-shot, then cleared), for
+        /// Keys whose next `delete`s fail, with how many still fail, for
         /// exercising callers' reap-retry paths. Dumb injection, no logic.
-        fail_delete_once: Mutex<std::collections::BTreeSet<String>>,
+        fail_deletes: Mutex<BTreeMap<String, u32>>,
         /// Make the next `complete_multipart` fail with the upload left
         /// open (one-shot), like a bucket that was briefly unreachable.
         fail_complete_once: Mutex<bool>,
@@ -833,9 +833,10 @@ pub mod fake {
             Self::default()
         }
 
-        /// Make the next `delete(key)` fail once (subsequent deletes succeed).
-        pub fn fail_next_delete(&self, key: &str) {
-            self.fail_delete_once.lock().insert(key.to_string());
+        /// Make the next `times` calls of `delete(key)` fail (later deletes
+        /// succeed).
+        pub fn fail_next_deletes(&self, key: &str, times: u32) {
+            self.fail_deletes.lock().insert(key.to_string(), times);
         }
 
         /// Pause the next `complete_multipart` once its object holds the new
@@ -1020,7 +1021,8 @@ pub mod fake {
 
         async fn delete(&self, key: &str) -> Result<()> {
             self.calls.lock().push(FakeCall::Delete { key: key.to_string() });
-            if self.fail_delete_once.lock().remove(key) {
+            if let Some(left) = self.fail_deletes.lock().get_mut(key).filter(|left| **left > 0) {
+                *left -= 1;
                 bail!("injected delete failure for {key}");
             }
             self.objects.lock().remove(key);

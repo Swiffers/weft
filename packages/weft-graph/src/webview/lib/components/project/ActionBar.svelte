@@ -12,7 +12,7 @@
 	} from '../../../../protocol';
 	import ActionDetailsModal from './ActionDetailsModal.svelte';
 	import { runLabel } from '../../run-targets';
-	import { isVerbOffered, sourceInfraReady, type VerbInputs } from '../../verb-gates';
+	import { isVerbOffered, resyncStopped, sourceInfraReady, type VerbInputs } from '../../verb-gates';
 
 	let specMenuOpen = $state(false);
 
@@ -35,6 +35,7 @@
 		onCancelRunning,
 		onResumeActive,
 		onResync,
+		onResumeResync,
 		onStartInfra,
 		onStopInfra,
 		onTerminateInfra,
@@ -102,6 +103,8 @@
 		// during the transient drains immediately.
 		onResumeActive?: () => void;
 		onResync?: () => void;
+		// A resync that stopped: take it up again where it stopped.
+		onResumeResync?: () => void;
 		onStartInfra?: () => void;
 		onStopInfra?: () => void;
 		onTerminateInfra?: () => void;
@@ -176,11 +179,13 @@
 	/// `verb-gates.ts`, where they are one pure function with its own
 	/// tests instead of a pile of conditions spread across the slots.
 	const verbInputs = $derived<VerbInputs>({
+		removing: backend.removing,
 		available: backend.available,
 		hasInfra,
 		hasTriggers,
 		infraRollup: backend.infraRollup,
 		status: backend.status,
+		transition: backend.transition,
 		infraBusy: backend.infraBusy,
 	});
 	const infraReady = $derived(sourceInfraReady(verbInputs));
@@ -199,11 +204,15 @@
 		return `${which} An infra stop takes down the triggers reading it. Turn them back on.`;
 	}
 
-	// The build-transition axis. While not 'none', the whole bar is in
-	// the unified transitional pattern: the slot that owns the verb
+	// The build-transition axis. While a build is in flight, the whole bar
+	// is in the unified transitional pattern: the slot that owns the verb
 	// shows "Building... (cancel)" and every other verb is gated (the
-	// backend rejects them anyway; greying is the courtesy).
+	// backend rejects them anyway; greying is the courtesy). A resync is
+	// not a build: its triggers show the step it is at, and the verbs it
+	// leaves offered (that step's cancel) come from the backend's list.
 	const buildTransition = $derived(backend.transition);
+	// SYNC: building <-> crates/weft-core/src/projects.rs (ProjectTransition::is_building)
+	const building = $derived(buildTransition === 'building' || buildTransition === 'cancelling_build');
 
 	// ─── Overlay accessors ───────────────────────────────────────
 	const cliVerb = $derived(overlay.kind === 'cli_running' ? overlay.verb : undefined);
@@ -368,6 +377,9 @@
 		// stop took down the ones reading it), and this verb turns them on.
 		| { kind: 'active'; canDeactivate: boolean; showDrift: boolean; turnOn?: 'activate' | 'reactivate' }
 		| { kind: 'activating'; canCancel: boolean }
+		// A resync stopped with the triggers it took down still down: take
+		// it up again where it stopped, or give it up and leave them down.
+		| { kind: 'resync_stopped'; enabled: boolean }
 		| { kind: 'deactivating'; runningCount: number; canCancel: boolean; canResume: boolean }
 		| { kind: 'reactivate'; mode: string; enabled: boolean }
 		// An HTTP trigger verb POST in flight, before /status catches up: a
@@ -381,7 +393,7 @@
 	const verbsBlocked = $derived(
 		overlay.kind === 'cli_running'
 			|| overlay.kind === 'pending'
-			|| buildTransition !== 'none',
+			|| building,
 	);
 
 	const infraSlot = $derived.by((): InfraSlotState => {
@@ -444,7 +456,7 @@
 		// Backend-reported build. Owned by the trigger slot
 		// when that slot is visible (an activate launched it there);
 		// otherwise the run button owns it.
-		if (buildTransition !== 'none' && !triggerSlotVisible) {
+		if (building && !triggerSlotVisible) {
 			return { kind: 'building', cancelling: buildTransition === 'cancelling_build' };
 		}
 		// HTTP-driven action awaiting backend confirmation: only when the pending
@@ -523,8 +535,11 @@
 		}
 		// Backend-reported build launched from this slot
 		// (an activate on a not-yet-built project).
-		if (buildTransition !== 'none') {
+		if (building) {
 			return { kind: 'building', cancelling: buildTransition === 'cancelling_build' };
+		}
+		if (resyncStopped(verbInputs)) {
+			return { kind: 'resync_stopped', enabled: !verbsBlocked };
 		}
 		switch (backend.status) {
 			case 'active':
@@ -970,6 +985,26 @@
 			'Activating...',
 			slot.canCancel ? onCancelActivate : undefined,
 		)}
+	{:else if slot.kind === 'resync_stopped'}
+		<div class="flex items-center gap-1.5">
+			<span class="text-[10px] font-medium text-red-600 uppercase tracking-wider whitespace-nowrap">Resync stopped</span>
+			<button
+				class="{btn} {btnDisabled} bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100"
+				onclick={onResumeResync}
+				disabled={!slot.enabled}
+				title="A resync stopped with the triggers it took down still down. Try it again where it stopped."
+			>
+				<span class={labelCss}>Resync</span>
+			</button>
+			<button
+				class="{btn} {btnDisabled} bg-white text-zinc-700 border border-zinc-300 hover:bg-zinc-50"
+				onclick={onCancelActivate}
+				disabled={!slot.enabled}
+				title="Give the resync up and leave the triggers it took down off."
+			>
+				<span class={labelCss}>Give up</span>
+			</button>
+		</div>
 	{:else if slot.kind === 'deactivating'}
 		<div class="flex items-center gap-1.5">
 			{@render workingButton(

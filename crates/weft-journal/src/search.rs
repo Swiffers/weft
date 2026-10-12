@@ -1,7 +1,8 @@
 //! The words a finished run is found by: every string and number its
 //! record holds (never a field's name), in the order recorded, each value
-//! cut to [`MAX_VALUE`] characters, up to [`MAX_TEXT`] in all. Built behind
-//! the writes, by the dispatcher's search loop, from the run's record.
+//! cut to [`MAX_VALUE`] characters, up to [`MAX_TEXT`] in all. Built from
+//! the run's record by the first search after the run ended
+//! (`weft_dispatcher::search_index`).
 
 use crate::events::ExecEvent;
 

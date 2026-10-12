@@ -39,6 +39,7 @@ pub mod infra_door;
 pub mod infra_node;
 pub mod infra_owner;
 pub mod journal;
+pub mod lapses;
 pub mod lease;
 pub mod lifecycle_claimer;
 pub mod listener;

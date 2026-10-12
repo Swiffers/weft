@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use sqlx::PgPool;
 
-use weft_task_store::tasks::{self, claim_one};
+use weft_task_store::tasks;
 use weft_task_store::{PostgresTaskStoreClient, TaskStatus, TaskStoreClient};
 
-use support::{setup, signals};
+use support::{claimed_task, setup, signals};
 
 /// Far below the 30s the waits are given, far above any wake-up: a wait
 /// that ends before this was woken, not timed out.
@@ -47,7 +47,7 @@ async fn a_wait_ends_the_moment_the_task_completes(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
+            claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
             tasks::complete(&pool, id, "disp-1", json!({"token": "t"})).await.expect("complete");
         })
     };
@@ -74,7 +74,7 @@ async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let first = claim_one(&pool, "disp-1").await.expect("claim").expect("a task");
+            let first = claimed_task(&pool, "disp-1").await.expect("claim").expect("a task");
             tasks::fail(&pool, first.id, "disp-1", "boom".into()).await.expect("fail");
             let other = if first.id == claimed { pending } else { claimed };
             // Whichever is left: failed where it stands if pending, or
@@ -102,7 +102,7 @@ async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: 
     setup(&pool).await;
     let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let done = tasks::enqueue(&pool, task("done")).await.expect("enqueue");
-    claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
+    claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
     tasks::complete(&pool, done, "disp-1", json!(1)).await.expect("complete");
     assert_eq!(client.wait_for_terminal(done, Duration::from_secs(30)).await.unwrap().status, TaskStatus::Complete);
 
@@ -135,7 +135,7 @@ async fn a_project_scoped_wait_sees_only_its_own_projects_task(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
+            claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
             tasks::complete(&pool, id, "disp-1", json!(1)).await.expect("complete");
         })
     };

@@ -8,6 +8,15 @@
 //! only while one is connected, and once per node however many editors
 //! show it. A look that finds what the last one found sends nothing.
 //!
+//! Where to look (a container's address, the token the listener holds a
+//! trigger by) is read from the database once per feed and kept: a look
+//! asks only the container or the listener. What could move it is
+//! announced (an infra copy's status or address on
+//! `crate::held::INFRA_STATUS_CHANNEL`, a trigger's signal or activation on
+//! `crate::holders::HELD_SIGNALS_CHANNEL` and `crate::held::ROUTES_CHANNEL`),
+//! and each drops what the feeds it concerns kept, as does a watch that
+//! may have missed something (`Heard::Recheck`, `Heard::Resumed`).
+//!
 //! RAM on this process is the right home for it: a feed exists only for the
 //! editors connected to this process, and dies with their connections. A
 //! sibling process serving another editor runs its own. So a press that
@@ -16,6 +25,7 @@
 //! runs that node's feed.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -76,10 +86,26 @@ pub struct NodeDisplay {
     pub feed: NodeFeed,
 }
 
+/// Where a node's display is asked for, as [`DisplayReader::find`] read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisplayAt {
+    /// Nothing serves it yet (no copy running, no signal registered).
+    Nowhere,
+    /// An infra node's container, at its `live_endpoint`.
+    Container { endpoint_url: String },
+    /// The listener, holding the trigger's signal.
+    Listener(crate::api::signal::SignalLiveAt),
+}
+
 /// Looks at one node's display.
 #[async_trait]
 pub trait DisplayReader: Send + Sync + 'static {
-    async fn read(&self, key: &DisplayKey) -> NodeFeed;
+    /// Where `key`'s display is asked for: reads the database. `Err`
+    /// when that could not be told now (shown, and asked again at the
+    /// next look).
+    async fn find(&self, key: &DisplayKey) -> Result<DisplayAt, String>;
+    /// What it shows at `at`: asks only the container or the listener.
+    async fn read(&self, key: &DisplayKey, at: &DisplayAt) -> NodeFeed;
 }
 
 /// The feeds this process is running, one per node some connection watches.
@@ -94,6 +120,9 @@ pub struct Feed {
     key: DisplayKey,
     shown: watch::Receiver<Option<NodeFeed>>,
     look_now: Arc<Notify>,
+    /// Set when where it looks may have moved: the next look finds it
+    /// again.
+    moved: Arc<AtomicBool>,
     looker: tokio::task::JoinHandle<()>,
 }
 
@@ -116,10 +145,13 @@ impl Feed {
 }
 
 impl DisplayFeeds {
-    /// The feeds of a process that hears every process's presses on `signals`
-    /// (which must listen on [`LOOK_NOW_CHANNEL`]).
+    /// The feeds of a process that hears every process's presses, and
+    /// what moves a display, on `signals` (which must listen on
+    /// [`HEARD_ON`]).
     pub fn with_look_now(signals: &PgSignalWatch) -> anyhow::Result<Arc<Self>> {
-        signals.require(LOOK_NOW_CHANNEL)?;
+        for channel in HEARD_ON {
+            signals.require(channel)?;
+        }
         let feeds = Arc::new(Self::default());
         crate::app::spawn_supervised("display_look_now", relay_look_now(signals.subscribe(), feeds.clone()));
         Ok(feeds)
@@ -150,8 +182,9 @@ impl DisplayFeeds {
         }
         let (tx, shown) = watch::channel(None);
         let look_now = Arc::new(Notify::new());
-        let looker = tokio::spawn(look(key.clone(), reader, tx, look_now.clone()));
-        let feed = Arc::new(Feed { key: key.clone(), shown, look_now, looker });
+        let moved = Arc::new(AtomicBool::new(false));
+        let looker = tokio::spawn(look(key.clone(), reader, tx, look_now.clone(), moved.clone()));
+        let feed = Arc::new(Feed { key: key.clone(), shown, look_now, moved, looker });
         feeds.retain(|_, feed| feed.strong_count() > 0);
         feeds.insert(key, Arc::downgrade(&feed));
         feed
@@ -166,12 +199,28 @@ impl DisplayFeeds {
             feed.look_now.notify_one();
         }
     }
+
+    /// Where the feeds `moved` names look may have moved: each finds it
+    /// again, and looks now.
+    pub fn moved(&self, moved: impl Fn(&DisplayKey) -> bool) {
+        let feeds = self.feeds.lock().expect("the feed map is never poisoned");
+        for feed in feeds.values().filter_map(Weak::upgrade).filter(|feed| moved(&feed.key)) {
+            feed.moved.store(true, Ordering::SeqCst);
+            feed.look_now.notify_one();
+        }
+    }
 }
 
-/// Look again at every display a process announced a press on. A recheck
-/// (notifications possibly lost) looks at nothing: each feed's own tick
-/// catches up within [`LOOK_EVERY`]. Returns only when the signal watch
-/// stops, which crashes the process through its supervisor.
+/// What the feeds hear: presses, and what moves where a display is.
+const HEARD_ON: [&str; 4] =
+    [LOOK_NOW_CHANNEL, crate::held::INFRA_STATUS_CHANNEL, crate::holders::HELD_SIGNALS_CHANNEL, crate::held::ROUTES_CHANNEL];
+
+/// Look again at every display a process announced a press on, and find
+/// again where the displays something moved are: an infra copy of a
+/// project (its id the payload), any trigger's signal or activation, or
+/// anything at all when the watch may have missed it. Returns only when
+/// the signal watch stops, which crashes the process through its
+/// supervisor.
 async fn relay_look_now(mut heard: Subscription, feeds: Arc<DisplayFeeds>) {
     loop {
         match heard.next().await {
@@ -185,7 +234,15 @@ async fn relay_look_now(mut heard: Subscription, feeds: Arc<DisplayFeeds>) {
                     ),
                 }
             }
-            Ok(_) => {}
+            Ok(Heard::Signal { channel, payload }) if channel == crate::held::INFRA_STATUS_CHANNEL => {
+                let project = payload.parse::<uuid::Uuid>().ok();
+                feeds.moved(|key| key.source == DisplaySource::Infra && project.is_none_or(|project| key.project == project));
+            }
+            Ok(Heard::Signal { channel, .. }) if channel == crate::holders::HELD_SIGNALS_CHANNEL || channel == crate::held::ROUTES_CHANNEL => {
+                feeds.moved(|key| key.source == DisplaySource::Signal);
+            }
+            Ok(Heard::Signal { .. }) => {}
+            Ok(Heard::Recheck | Heard::Resumed | Heard::Lost) => feeds.moved(|_| true),
             Err(e) => {
                 tracing::error!(target: "weft_dispatcher::display_feeds", error = %e, "cross-instance look-now stopped");
                 return;
@@ -199,9 +256,24 @@ async fn look(
     reader: Arc<dyn DisplayReader>,
     shown: watch::Sender<Option<NodeFeed>>,
     look_now: Arc<Notify>,
+    moved: Arc<AtomicBool>,
 ) {
+    let mut found: Option<DisplayAt> = None;
     loop {
-        let feed = reader.read(&key).await;
+        if moved.swap(false, Ordering::SeqCst) {
+            found = None;
+        }
+        let feed = match &found {
+            Some(at) => reader.read(&key, at).await,
+            None => match reader.find(&key).await {
+                Ok(at) => {
+                    let feed = reader.read(&key, &at).await;
+                    found = Some(at);
+                    feed
+                }
+                Err(error) => NodeFeed::Error { error },
+            },
+        };
         shown.send_if_modified(|current| worth_sending(current, feed));
         tokio::select! {
             _ = tokio::time::sleep(LOOK_EVERY) => {}
@@ -226,10 +298,26 @@ pub struct StateReader(pub crate::state::DispatcherState);
 
 #[async_trait]
 impl DisplayReader for StateReader {
-    async fn read(&self, key: &DisplayKey) -> NodeFeed {
-        let read = match key.source {
-            DisplaySource::Infra => crate::api::infra::read_live(&self.0, key.project, &key.node, key.instance.as_ref()).await,
-            DisplaySource::Signal => crate::api::signal::read_signal_live(&self.0, key.project, &key.node, key.instance.as_ref()).await,
+    async fn find(&self, key: &DisplayKey) -> Result<DisplayAt, String> {
+        let (state, instance) = (&self.0, key.instance.as_ref());
+        let found = match key.source {
+            DisplaySource::Infra => crate::api::infra::live_endpoint_url(state, key.project, &key.node, instance)
+                .await
+                .map(|endpoint_url| DisplayAt::Container { endpoint_url }),
+            DisplaySource::Signal => crate::api::signal::signal_live_at(state, key.project, &key.node, instance).await.map(DisplayAt::Listener),
+        };
+        match found {
+            Ok(at) => Ok(at),
+            Err((axum::http::StatusCode::NOT_FOUND, _)) => Ok(DisplayAt::Nowhere),
+            Err((_, error)) => Err(error),
+        }
+    }
+
+    async fn read(&self, key: &DisplayKey, at: &DisplayAt) -> NodeFeed {
+        let read = match at {
+            DisplayAt::Nowhere => return NodeFeed::Absent,
+            DisplayAt::Container { endpoint_url } => crate::api::infra::fetch_live(&self.0, endpoint_url).await,
+            DisplayAt::Listener(at) => crate::api::signal::fetch_signal_live(&self.0, &key.node, at).await,
         };
         match read {
             Ok(feed) => NodeFeed::Ok { items: feed.items },
@@ -270,18 +358,54 @@ mod tests {
         assert_eq!(serde_json::to_value(&error).unwrap()["error"], "x");
     }
 
-    /// Counts its looks and always finds the same thing.
+    /// Counts its finds (each a database read) and its looks, and always
+    /// finds the same thing.
     #[derive(Default)]
     struct CountingReader {
+        finds: AtomicUsize,
         looks: AtomicUsize,
     }
 
     #[async_trait]
     impl DisplayReader for CountingReader {
-        async fn read(&self, _key: &DisplayKey) -> NodeFeed {
+        async fn find(&self, _key: &DisplayKey) -> Result<DisplayAt, String> {
+            self.finds.fetch_add(1, Ordering::SeqCst);
+            Ok(DisplayAt::Container { endpoint_url: "http://db".into() })
+        }
+
+        async fn read(&self, _key: &DisplayKey, _at: &DisplayAt) -> NodeFeed {
             self.looks.fetch_add(1, Ordering::SeqCst);
             NodeFeed::Absent
         }
+    }
+
+    /// A feed reads where to look once, then only looks there; what moves
+    /// its node's display (its infra changing, a recheck) makes it find it
+    /// again, at once, and what moves another project's leaves it be.
+    #[tokio::test(start_paused = true)]
+    async fn a_feed_finds_its_display_once_until_something_moves_it() {
+        let feeds = Arc::new(DisplayFeeds::default());
+        let reader = Arc::new(CountingReader::default());
+        let _feed = feeds.watch(key("db"), reader.clone());
+        tokio::time::sleep(LOOK_EVERY * 3 + Duration::from_millis(1)).await;
+        assert_eq!((reader.finds.load(Ordering::SeqCst), reader.looks.load(Ordering::SeqCst)), (1, 4), "no read after the first");
+
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let relay = tokio::spawn(relay_look_now(rx.into(), feeds.clone()));
+        let other = uuid::Uuid::from_u128(9).to_string();
+        tx.send(Heard::Signal { channel: crate::held::INFRA_STATUS_CHANNEL, payload: other.into() }).unwrap();
+        tx.send(Heard::Signal { channel: crate::holders::HELD_SIGNALS_CHANNEL, payload: "".into() }).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(reader.finds.load(Ordering::SeqCst), 1, "another project's infra, or a trigger, moves no infra display here");
+
+        tx.send(Heard::Signal { channel: crate::held::INFRA_STATUS_CHANNEL, payload: uuid::Uuid::nil().to_string().into() }).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!((reader.finds.load(Ordering::SeqCst), reader.looks.load(Ordering::SeqCst)), (2, 5), "found again, and looked at at once");
+
+        tx.send(Heard::Resumed).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(reader.finds.load(Ordering::SeqCst), 3, "a watch that may have missed something finds it again");
+        relay.abort();
     }
 
     fn key(node: &str) -> DisplayKey {
@@ -347,7 +471,11 @@ mod tests {
         struct Flip(AtomicUsize);
         #[async_trait]
         impl DisplayReader for Flip {
-            async fn read(&self, _key: &DisplayKey) -> NodeFeed {
+            async fn find(&self, _key: &DisplayKey) -> Result<DisplayAt, String> {
+                Ok(DisplayAt::Nowhere)
+            }
+
+            async fn read(&self, _key: &DisplayKey, _at: &DisplayAt) -> NodeFeed {
                 // Absent, Absent, then Ok for good.
                 if self.0.fetch_add(1, Ordering::SeqCst) < 2 { NodeFeed::Absent } else { NodeFeed::Ok { items: vec![] } }
             }

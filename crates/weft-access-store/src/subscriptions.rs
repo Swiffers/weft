@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use sqlx::PgPool;
 
-use weft_core::access::client::run_connect_call as core_run_connect_call;
+use weft_core::access::client::{run_connect_call as core_run_connect_call, ConnectCallError, RefusalKind};
 use weft_core::access::events::{
     SubscriptionCalls, EXPIRES_AT, MINTED_ID, MINTED_TOKEN, MINTED_VALUE_NAMES, RECEIVER_URL,
 };
@@ -156,7 +156,7 @@ pub async fn ensure_subscription(
         values.insert(MINTED_TOKEN.to_string(), minted_token.clone());
         values.insert(RECEIVER_URL.to_string(), receiver_url.to_string());
 
-        let resp = run_connect_call(&calls.subscribe, &values).await?;
+        let resp = run_connect_call(&req.service, &calls.subscribe, &values).await?;
         apply_captures(&calls.subscribe.captures, &resp, &mut values)?;
         let expires_at = match calls.renew_margin_secs {
             None => None,
@@ -329,7 +329,7 @@ async fn stop_subscription(
         for (k, v) in &sub.captures {
             values.insert(k.clone(), v.clone());
         }
-        run_connect_call(unsub, &values).await?;
+        run_connect_call(&sub.service, unsub, &values).await?;
     }
     delete_row(pool, &sub.id).await
 }
@@ -404,18 +404,22 @@ fn row_to_subscription(
     })
 }
 
-/// The activation error a dial-in trigger meets on a weft the
-/// internet cannot reach: states the need, the risk-accepting fix,
-/// and the door to the full explanation. The doc path is stable on
-/// purpose; the editor renders it as a link.
+/// The error a dial-in trigger meets on a weft the internet cannot
+/// reach, as it is switched on or, on, as its subscription is made
+/// again (the signal then stops until it is registered again): states
+/// the need, the risk-accepting fix and the way back for either case,
+/// and the door to the full explanation. A trigger already on refuses
+/// `weft activate`; `weft resync` registers its signals again. The doc
+/// path is stable on purpose; the editor renders it as a link.
 // SYNC: no_public_url_error <-> docs/src/connections/events.md (the section
 //       '"This trigger needs your weft to be reachable..."')
 pub fn no_public_url_error(service: &str) -> String {
     format!(
         "this trigger needs '{service}' to deliver events TO your weft, which requires \
          your weft to be reachable from the internet, and it is not. If you accept \
-         making its public trigger surface reachable, rerun `./setup.sh --public-url` \
-         and re-activate; or use a connection that supports dialing out (your own \
+         making its public trigger surface reachable, rerun `./setup.sh --public-url`, \
+         then `weft activate` (or `weft resync`, when the trigger is already on); \
+         or use a connection that supports dialing out (your own \
          provider app), where the service offers one. \
          See https://weavemindai.github.io/weft/connections/events.html"
     )
@@ -439,19 +443,29 @@ pub fn needs_renewal(
     }
 }
 
-/// One declared authenticated call, executed through the shared core
-/// executor, with its failure carried as the store's error class: a
-/// provider not reached is one to retry, and its refusal is the
-/// caller's to read.
+/// One declared authenticated call for a `service` connection, executed
+/// through the shared core executor, with its failure carried as the
+/// store's error class: a credential the provider refused needs a
+/// reconnect, a provider not reached or not answering now is one to try
+/// again, and any other refusal is the caller's to read.
 pub async fn run_connect_call(
+    service: &str,
     call: &ConnectCall,
     values: &BTreeMap<String, String>,
 ) -> anyhow::Result<Value> {
-    core_run_connect_call(call, values).await.map_err(|e| match e {
-        weft_core::access::client::ConnectCallError::Unreached(why) => AccessError::Unreached(why).into(),
-        weft_core::access::client::ConnectCallError::Unbuildable(why) | weft_core::access::client::ConnectCallError::Refused(why) => {
-            AccessError::Invalid(why).into()
+    core_run_connect_call(call, values).await.map_err(|e| {
+        match e {
+            ConnectCallError::Refused { kind, why } => crate::refusal(kind, why, |reason| {
+                if kind == RefusalKind::Auth {
+                    AccessError::NeedsReconnect { service: service.to_string(), reason }
+                } else {
+                    AccessError::Invalid(reason)
+                }
+            }),
+            ConnectCallError::Unreached(why) => AccessError::Unreached(why),
+            ConnectCallError::Unbuildable(why) => AccessError::Invalid(why),
         }
+        .into()
     })
 }
 

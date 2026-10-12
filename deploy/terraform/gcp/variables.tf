@@ -1,4 +1,4 @@
-# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
+# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
 
 variable "project_id" {
   description = "The GCP project the install lives in."
@@ -101,4 +101,50 @@ variable "access_apps_json" {
   type        = string
   default     = ""
   sensitive   = true
+}
+
+variable "wakes_retry_window" {
+  description = "How long the wakes queue keeps retrying a wake its receiver fails (a user's timer, cron, poll or provider renewal, and a holder's liveness check). \"0s\" is no limit short of Cloud Tasks' own task retention: each of these wakes sets the next, so one dropped ends its chain for good. The listener itself stops after var.wake_attempts deliveries of a trigger's wake, giving the trigger up where its user sees it."
+  type        = string
+  default     = "0s"
+}
+
+variable "wake_attempts" {
+  description = "How many deliveries of one trigger's wake (a timer, cron, poll or provider renewal) the listener answers while it keeps failing; a delivery that never reached it (the machine down, a 5xx from in front of it) is not counted. A failure on the last gives the trigger up, shown on its node, until a resync of its project (weft resync) registers it again, or, for one that signs in through a connection, that connection is reconnected. The holder's liveness check on the same queue is not bounded by it. With the default backoff, 20 is about an hour of failing tries."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.wake_attempts >= 1
+    error_message = "wake_attempts must be 1 or more: every wake is delivered at least once."
+  }
+}
+
+variable "wakes_longest_backoff" {
+  description = "The longest pause between two tries of a wake the wakes queue keeps retrying. It is also how late a cron, a poll or a holder's liveness check can resume once its receiver is back after an outage."
+  type        = string
+  default     = "300s"
+}
+
+variable "alerts_enabled" {
+  description = "Whether weft emails you when its own work is stuck (what `weft status` lists under `waiting on weft:`): one Cloud Monitoring alert policy on the line weft logs then, and an email channel. false makes neither, and weft logs no such line."
+  type        = bool
+  default     = true
+}
+
+variable "alert_after_minutes" {
+  description = "How many minutes weft's own work may keep failing while weft still retries it before it counts as stuck and alerts. Work weft gave up retrying alerts at once."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.alert_after_minutes >= 0 && floor(var.alert_after_minutes) == var.alert_after_minutes
+    error_message = "alert_after_minutes is a whole number of minutes, 0 or more."
+  }
+}
+
+variable "alert_email" {
+  description = "Where the alerts are emailed. The install workflow sets it from the repository secret WEFT_ALERT_EMAIL, or else to the first person (by address) holding the Owner role directly on the project, usually the Google account that made it. Needed when alerts_enabled is true."
+  type        = string
+  default     = ""
 }

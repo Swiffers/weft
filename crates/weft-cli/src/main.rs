@@ -1813,7 +1813,7 @@ fn main() -> std::process::ExitCode {
 /// Everything that has to happen before the flags are read, on the one
 /// thread this process has so far. Answers the install the command acts
 /// on, and what picked it.
-fn prelude() -> anyhow::Result<weft_core::infra::Wanted> {
+fn prelude() -> anyhow::Result<Result<weft_core::infra::Wanted, String>> {
     // The front door, before anything else: a binary of one install hands
     // a command for another install to that install's own `weft`
     // (`startup::front_door`). Before the `.env` too, so the file the
@@ -1821,19 +1821,32 @@ fn prelude() -> anyhow::Result<weft_core::infra::Wanted> {
     // install, because the variable is set below before it loads.
     let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cannot read the working directory: {e}"))?;
     let env_value = std::env::var(weft_core::infra::INSTALL_ENV).ok();
-    let (wanted, bin) = startup::wanted_here(env_value.as_deref(), &cwd)?;
-    let mine = weft_core::infra::Install::of_current_exe();
-    match startup::front_door(mine.as_ref(), &wanted, &bin, invoked_as_daemon_which()) {
-        startup::Door::Here => {}
-        startup::Door::Exec(path) => return Err(startup::exec(&path)),
-        startup::Door::Refuse(why) => anyhow::bail!("{why}"),
-    }
-    // From here every `Install::from_env` in this process, and every
-    // process it starts, names the same install; nothing derives it from
-    // a working directory again. No other thread runs yet (`main` starts
-    // the async runtime after this), which is what makes writing the
-    // environment sound.
-    std::env::set_var(weft_core::infra::INSTALL_ENV, wanted.install.env_value());
+    // Where no install can be picked (a checkout on no branch, as CI's
+    // is), there is nothing to hand the command to: this binary runs it,
+    // and only a command that acts on an install fails, with the reason
+    // (`weft_core::infra::mark_unresolved`). Validating a project there
+    // works.
+    let wanted = match startup::wanted_here(env_value.as_deref(), &cwd) {
+        Err(why) => {
+            weft_core::infra::mark_unresolved(format!("{why:#}"));
+            Err(format!("{why:#}"))
+        }
+        Ok((wanted, bin)) => {
+            let mine = weft_core::infra::Install::of_current_exe();
+            match startup::front_door(mine.as_ref(), &wanted, &bin, invoked_as_daemon_which()) {
+                startup::Door::Here => {}
+                startup::Door::Exec(path) => return Err(startup::exec(&path)),
+                startup::Door::Refuse(why) => anyhow::bail!("{why}"),
+            }
+            // From here every `Install::from_env` in this process, and
+            // every process it starts, names the same install; nothing
+            // derives it from a working directory again. No other thread
+            // runs yet (`main` starts the async runtime after this), which
+            // is what makes writing the environment sound.
+            std::env::set_var(weft_core::infra::INSTALL_ENV, wanted.install.env_value());
+            Ok(wanted)
+        }
+    };
 
     weft_core::net::install_crypto_provider();
     // Local overrides (the sealing key, ports, paths) come from the
@@ -1867,7 +1880,7 @@ fn invoked_as_daemon_which() -> bool {
     )
 }
 
-async fn run(cli: Cli, wanted: weft_core::infra::Wanted) -> anyhow::Result<()> {
+async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyhow::Result<()> {
     let ctx = commands::Ctx::new(commands::Dispatcher::from_flag_or_env(cli.dispatcher), cli.on, cli.json)?;
 
     match cli.command {
@@ -1991,7 +2004,7 @@ async fn run(cli: Cli, wanted: weft_core::infra::Wanted) -> anyhow::Result<()> {
         }
         Cmd::Logs { target, limit } => commands::logs::run(ctx, target, limit).await,
         Cmd::Status => commands::status::run(ctx).await,
-        Cmd::Daemon { action } => commands::daemon::run(ctx, action.into(), wanted).await,
+        Cmd::Daemon { action } => commands::daemon::run(ctx, action.into(), wanted.map_err(anyhow::Error::msg)?).await,
         Cmd::Infra { action } => action.run(ctx).await,
         Cmd::DescribeNodes { list, stdlib, node, compact } => {
             commands::describe_nodes::run(ctx, stdlib, node, compact, list).await

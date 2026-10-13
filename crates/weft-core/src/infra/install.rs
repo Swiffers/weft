@@ -50,8 +50,17 @@ impl Install {
     /// [`Install::wanted`], which the CLI's front door asks once before
     /// setting the variable, so every later read in the process, and every
     /// process it starts, agrees.
+    ///
+    /// When the front door could not tell which install a command acts on
+    /// (a checkout on no branch, [`mark_unresolved`]) and the variable is
+    /// unset, this is that reason: a command that needs an install fails
+    /// with it, and one that needs none (validating a project) never asks.
     pub fn from_env() -> Result<Self, String> {
-        Self::from_env_value(std::env::var(INSTALL_ENV).ok().as_deref())
+        let value = std::env::var(INSTALL_ENV).ok();
+        if let (None, Some(why)) = (value.as_deref().filter(|v| !v.trim().is_empty()), UNRESOLVED.get()) {
+            return Err(why.clone());
+        }
+        Self::from_env_value(value.as_deref())
     }
 
     /// The install a value of [`INSTALL_ENV`] names: `None` or blank is
@@ -238,6 +247,18 @@ impl Install {
         };
         (!tag.contains('/') && tag.contains(':')).then_some(tag)
     }
+}
+
+/// Why the install this process acts on could not be told, when it could
+/// not ([`mark_unresolved`]).
+static UNRESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record that this process could not tell which install it acts on, and
+/// why: from then on [`Install::from_env`] answers that reason, unless
+/// [`INSTALL_ENV`] names one. The CLI's front door calls it, so a command
+/// that needs no install still runs where none can be picked.
+pub fn mark_unresolved(why: String) {
+    let _ = UNRESOLVED.set(why);
 }
 
 /// Why the checkout at `root` picks no install: it is on no branch.
@@ -496,6 +517,20 @@ mod tests {
         assert_eq!(secret_in(&path, "cell1", "TWICE").unwrap(), "last", "the last line naming it wins");
         assert!(secret_in(&path, "cell1", "EMPTY").unwrap_err().contains("names no EMPTY"));
         assert!(secret_in(&path, "cell1", "MISSING").unwrap_err().contains("./setup.sh --daemon"));
+    }
+
+    /// Where the front door could tell no install, a command that asks
+    /// for one hears why, unless the variable names one. Sets the process
+    /// environment: nextest runs each test in its own process.
+    #[test]
+    fn an_install_that_could_not_be_told_answers_why() {
+        std::env::remove_var(INSTALL_ENV);
+        assert_eq!(Install::from_env(), Ok(Install::default_install()));
+        mark_unresolved("on no branch".into());
+        assert_eq!(Install::from_env(), Err("on no branch".to_string()));
+        std::env::set_var(INSTALL_ENV, "cell1");
+        assert_eq!(Install::from_env(), Ok(Install::named("cell1").unwrap()));
+        std::env::remove_var(INSTALL_ENV);
     }
 
     #[test]

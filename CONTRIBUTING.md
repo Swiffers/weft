@@ -37,8 +37,9 @@ checkout, it is your default install; on any other branch, it is that branch's
 own. If the branch's install is not set up yet, weft tells you to run
 `./setup.sh` in that checkout; it never falls back to your default install. If
 you want a particular install from anywhere, set `WEFT_INSTALL`
-(`WEFT_INSTALL=default` is your default install); on a detached HEAD you have
-to, because there is no branch to pick from. If you are not sure which install
+(`WEFT_INSTALL=default` is your default install). On a detached HEAD there is
+no branch to pick from, so a command that acts on an install asks you to set it;
+one that needs no install, like `weft validate`, just runs. If you are not sure which install
 a command will use, `weft daemon which` tells you.
 
 On a branch, `./setup.sh` installs neither the VS Code extension nor the

@@ -62,13 +62,16 @@ pub struct InstallPorts {
     pub postgres: u16,
 }
 
+/// The file an install keeps its ports in, in its dir.
+const PORTS_FILE: &str = "ports.json";
+
 impl InstallPorts {
     /// The block's ports: what the default install starts on.
     pub const DEFAULT: Self = Self { public: PUBLIC, internal: INTERNAL, outside: OUTSIDE, postgres: POSTGRES };
 
     /// Where an install whose files live in `dir` keeps its ports.
     pub fn path(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join("ports.json")
+        dir.join(PORTS_FILE)
     }
 
     /// The ports saved in `dir`, `None` when the install was never
@@ -83,21 +86,10 @@ impl InstallPorts {
         }
     }
 
-    /// Written whole to a file beside it, then renamed over it: the
-    /// editor's watcher, the CLI and setup.sh read this file while an
-    /// install starts, and a rename on one filesystem means they see the
-    /// old ports or the new ones, never a half-written file.
+    /// Written whole ([`crate::infra::write_whole`]): the editor's watcher,
+    /// the CLI and setup.sh read this file while an install starts.
     pub fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let path = Self::path(dir);
-        let partial = dir.join(format!("ports.json.{}.tmp", std::process::id()));
-        let written = std::fs::write(&partial, serde_json::to_vec(self)?).and_then(|()| std::fs::rename(&partial, &path));
-        if written.is_err() {
-            // The save failed either way; this only keeps a stray file out
-            // of the install's folder.
-            let _ = std::fs::remove_file(&partial);
-        }
-        written
+        crate::infra::write_whole(dir, PORTS_FILE, &serde_json::to_vec(self)?)
     }
 
     /// The address the API and dashboard answer on.
@@ -115,8 +107,13 @@ impl InstallPorts {
 ///
 /// [`Install::from_env`]: crate::infra::Install::from_env
 pub fn local_public_url() -> Result<String, String> {
-    let install = crate::infra::Install::from_env()?;
-    local_public_url_in(&install, &install.dir())
+    local_public_url_of(&crate::infra::Install::from_env()?)
+}
+
+/// Where `install` answers on this machine, the way [`local_public_url`]
+/// reads it for the install this process acts on.
+pub fn local_public_url_of(install: &crate::infra::Install) -> Result<String, String> {
+    local_public_url_in(install, &install.dir())
 }
 
 fn local_public_url_in(install: &crate::infra::Install, dir: &std::path::Path) -> Result<String, String> {

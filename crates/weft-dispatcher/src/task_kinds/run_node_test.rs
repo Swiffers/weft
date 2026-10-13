@@ -29,40 +29,14 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
+use weft_task_store::RunNodeTestPayload;
 
 use crate::state::DispatcherState;
-
-/// Wire tag of this kind on the task table. String-keyed (the
-/// `TaskKind` enum holds only the dispatcher's own core kinds; extra
-/// kinds register by string).
-pub const RUN_NODE_TEST_KIND: &str = "run_node_test";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunNodeTestPayload {
-    pub project_id: uuid::Uuid,
-    pub tenant: String,
-    /// The per-package node-test image to run (content-addressed).
-    /// Minted by the enqueuer, run verbatim.
-    pub image_ref: String,
-    /// Node type under test.
-    pub node: String,
-    /// Declared test name.
-    pub test: String,
-    /// Live tier: the connection (grant) id resolving the test's
-    /// declared service. Absent for basic/fake runs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_connection: Option<String>,
-    /// Live-test fixture variables (`WEFT_NODE_TEST_*` only; a test reads
-    /// them through `LiveRig::fixture`). Values a test cannot
-    /// self-provision, like a chat id the tester's bot may message.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub fixtures: std::collections::BTreeMap<String, String>,
-}
 
 /// The test server's request, as `weft_engine::test_runner` reads it.
 /// The dispatcher does not link the engine, so the shape is restated.

@@ -20,7 +20,7 @@
 //! ## The toolkit (this library)
 //!
 //! - [`client`] : HTTP client over the dispatcher API + `weft` CLI shell-out.
-//! - [`ensure`] : reach the default install (the runner brought it up).
+//! - [`ensure`] : reach the install under test (the runner brought it up).
 //! - [`cell`]   : a whole install of a test's own, with its own pace.
 //! - [`event`]  : the execution replay event stream, typed-accessor over JSON.
 //! - [`project`]: fixture -> isolated project lifecycle (prepare/build/run/rm).

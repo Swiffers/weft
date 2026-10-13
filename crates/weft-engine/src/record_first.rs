@@ -272,7 +272,7 @@ mod tests {
             weft_journal::JournalClient::record_events(drive.as_ref(), &[birth, event], Some("w")).await.unwrap();
             tasks
                 .enqueue_dedup(weft_task_store::tasks::NewTask {
-                    kind: weft_task_store::kinds::TaskKind::RegisterSignal.as_str().into(),
+                    kind: weft_task_store::kinds::TaskKind::RegisterSignal,
                     project_id: None,
                     dedup_key: None,
                     execution_id: Some(run),

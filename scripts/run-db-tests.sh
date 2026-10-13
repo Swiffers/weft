@@ -22,10 +22,18 @@
 #
 # Set DATABASE_URL yourself and the script uses that server instead of
 # starting a container, which is what CI does.
+#
+# The nextest run (it builds every crate below, then runs) takes its turn
+# in the machine's build slot, one heavy cargo build at a time shared with
+# setup.sh and the e2e and node-test runners: a run that finds another
+# build going says which, and waits.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.." || exit 1
+# shellcheck source=lib/machine-lock.sh
+. "$SCRIPT_DIR/lib/machine-lock.sh"
+trap machine_lock_release_mine EXIT
 
 # Every crate whose tests need a database. A new one goes here.
 ALL_CRATES=(weft-dispatcher weft-broker weft-access-store weft-task-store weft-platform-local weft-runtime)
@@ -60,7 +68,7 @@ if [ -z "${DATABASE_URL:-}" ]; then
   # Trap installed BEFORE the start: the helper exports the container
   # name before running it, so a Ctrl-C during the pull or the
   # readiness wait still removes it.
-  trap 'docker rm -f -v "${THROWAWAY_PG_CONTAINER:-}" >/dev/null 2>&1 || true' EXIT
+  trap 'docker rm -f -v "${THROWAWAY_PG_CONTAINER:-}" >/dev/null 2>&1 || true; machine_lock_release_mine' EXIT
   start_throwaway_postgres weft-db-tests || exit 1
   export DATABASE_URL="$THROWAWAY_DATABASE_URL"
 fi
@@ -90,4 +98,4 @@ selection="($selection)"
 # instead of reporting green on a suite where nothing executed.
 [ -n "$filter" ] && selection="$selection & test(~$filter)"
 nextest_args+=(-E "$selection")
-cargo nextest run --no-fail-fast "${nextest_args[@]}"
+with_build_slot cargo nextest run --no-fail-fast "${nextest_args[@]}"

@@ -17,7 +17,9 @@ path = "src/main.rs"
 
 [features]
 default = []
-# The tests that need a real Postgres (`tests/db_*.rs`).
+# The tests that need a real Postgres (`tests/db_*.rs`, the schema
+# agreement test) and the migration generator they share their machinery
+# with.
 db-tests = ["weft-task-store/db-tests"]
 
 [dependencies]
@@ -54,6 +56,14 @@ tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 # `#[sqlx::test]`: a fresh database per test against $DATABASE_URL.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+
+# The one migration generator, over every table group the install holds
+# (`schema::groups`).
+# SYNC: the example name <-> setup.sh (--migration's `--example`)
+[[example]]
+name = "schema_migration"
+path = "examples/schema_migration.rs"
+required-features = ["db-tests"]
 
 [lints]
 workspace = true

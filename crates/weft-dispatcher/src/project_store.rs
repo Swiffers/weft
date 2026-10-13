@@ -446,9 +446,9 @@ impl ProjectRemoving {
 }
 
 impl PostgresProjectStore {
-    /// Plain wrap; the schema is the boot's job (`apply_core_schema`
-    /// applies [`GROUP`] with every other core group, so a stale
-    /// `project` table fails the SAME boot error as its siblings).
+    /// Plain wrap; the schema is the boot's job (its one pass applies
+    /// [`GROUP`] with every other group, so a stale `project` table fails
+    /// the SAME boot error as its siblings).
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
@@ -458,7 +458,7 @@ impl PostgresProjectStore {
 /// live here, edited in place; an existing database is carried to them
 /// by a migration written with `./setup.sh --migration <name>` (the
 /// whole contract is `weft_task_store::schema_guard`'s header). The
-/// boot's `apply_core_schema` applies this group via the schema guard.
+/// boot applies this group with every other (`crate::app::DISPATCHER_GROUPS`).
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "project",
     tables: &["project", "project_definition", "project_code"],
@@ -1151,7 +1151,7 @@ impl ProjectStoreOps for PostgresProjectStore {
              FROM project p WHERE p.id = $1 AND p.transition = 'resyncing' AND p.resync IS NOT NULL",
         )
         .bind(id)
-        .bind(crate::task_kinds::resync::RESYNC_KIND)
+        .bind(weft_task_store::TaskKind::Resync.as_str())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(plan, driven)| crate::task_kinds::resync::ResyncState { plan: plan.0, driven }))

@@ -63,6 +63,25 @@ pub struct WorkerDockerfile {
     /// rendered Dockerfile never FROMs it (the from-scratch template,
     /// or a custom template that builds its own toolchain).
     pub builder_base: Option<String>,
+    /// The key of the BuildKit compile cache the rendered Dockerfile
+    /// mounts (`{{worker_cache_key}}`), `None` for a custom template that
+    /// mounts none.
+    pub worker_cache_key: Option<String>,
+}
+
+impl WorkerDockerfile {
+    /// The builder base this build is FROM and the compile cache it mounts
+    /// (the key computed from the live checkout, so it moves when the
+    /// checkout does). Whoever runs the build on a machine adds them to its
+    /// install's image record before it starts
+    /// (`weft_core::images::ImageRefs::add_build`), so a sweep elsewhere
+    /// keeps them while it runs and after.
+    pub fn uses(&self) -> weft_core::images::BuildUses {
+        weft_core::images::BuildUses {
+            builder_base: self.builder_base.clone(),
+            compile_cache_key: self.worker_cache_key.clone(),
+        }
+    }
 }
 
 /// Parsed base-image metadata. `manager` drives the install
@@ -284,6 +303,7 @@ pub fn emit(
         runtime_packages,
         build_env,
         builder_base: builder_base_out,
+        worker_cache_key: template.contains("{{worker_cache_key}}").then_some(worker_cache_key),
     })
 }
 

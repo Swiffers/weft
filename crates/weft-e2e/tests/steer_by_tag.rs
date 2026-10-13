@@ -47,7 +47,7 @@ struct Rig {
 }
 
 impl Rig {
-    /// One rig on the default install. A test that needs two rigs on one
+    /// One rig on the install under test. A test that needs two rigs on one
     /// dispatcher calls [`Self::up_on`] for each.
     async fn up() -> anyhow::Result<Self> {
         Self::up_on(ensure::up().await?).await

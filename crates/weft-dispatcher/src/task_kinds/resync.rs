@@ -55,9 +55,6 @@ use weft_task_store::tasks::Task;
 
 use crate::state::DispatcherState;
 
-/// The task kind, dispatched by string (`crate::app::core_task_registry_builder`).
-pub const RESYNC_KIND: &str = "resync";
-
 /// How long a resync waits before it tries a step that failed again, after
 /// each failure but the last, which stops it.
 const RETRY_WAITS: [u64; 2] = [5, 20];
@@ -224,20 +221,15 @@ impl ResyncState {
 /// time per drive.
 pub fn task(tenant: &str, project_id: uuid::Uuid, driver: uuid::Uuid) -> weft_task_store::tasks::NewTask {
     weft_task_store::tasks::NewTask {
-        kind: RESYNC_KIND.to_string(),
+        kind: weft_task_store::TaskKind::Resync,
         project_id: Some(project_id),
         dedup_key: Some(driver.to_string()),
         execution_id: None,
         tenant_id: tenant.to_string(),
-        payload: serde_json::json!({ "driver": driver }),
+        payload: serde_json::to_value(weft_task_store::ResyncPayload { driver }).expect("a resync payload serializes"),
     }
 }
 
-/// The drive a resync task carries ([`task`]).
-fn driver_of(task: &Task) -> Result<uuid::Uuid> {
-    let driver = task.payload.get("driver").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("a resync task names no driver"))?;
-    Ok(driver.parse()?)
-}
 
 pub struct ResyncExecutor;
 
@@ -245,7 +237,7 @@ pub struct ResyncExecutor;
 impl TaskExecutor<DispatcherState> for ResyncExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let id = task.project_id.ok_or_else(|| anyhow::anyhow!("a resync task names no project"))?;
-        let driver = driver_of(task)?;
+        let weft_task_store::ResyncPayload { driver } = serde_json::from_value(task.payload.clone())?;
         let mut tries = RETRY_WAITS.iter();
         loop {
             match advance(state, id, driver).await {

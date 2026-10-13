@@ -85,9 +85,9 @@ axum = { workspace = true }
 # which worker owns an execution and what a run stored.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"], optional = true }
 
-# Optional: only under `e2e`. Loads the repo-root `.env` (the same file the
-# daemon's setup reads OPENROUTER_API_KEY from) so a test that spends on a
-# real key finds it without the operator re-exporting it into the test shell.
+# Optional: only under `e2e`. Loads the repo root's `.env.local` and `.env`
+# (the files the CLI reads too) so a test that spends on a real key finds it
+# without the operator re-exporting it into the test shell.
 dotenvy = { version = "0.15", optional = true }
 
 [lints]

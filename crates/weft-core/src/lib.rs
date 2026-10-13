@@ -10,6 +10,7 @@ mod wire_enum;
 pub mod bus;
 #[cfg(feature = "runtime")]
 pub mod caller;
+pub mod checkout;
 #[cfg(feature = "runtime")]
 pub mod content_cache;
 pub mod access;
@@ -30,6 +31,8 @@ pub mod deactivation;
 pub mod deref;
 pub mod error;
 pub mod exec;
+#[cfg(feature = "runtime")]
+pub mod file_lock;
 pub mod frames;
 pub mod frontend;
 #[cfg(feature = "runtime")]

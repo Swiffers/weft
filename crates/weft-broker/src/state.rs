@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
 use sqlx::postgres::PgPool;
 
 use weft_task_store::pg_signal::PgSignalWatch;
@@ -139,9 +138,10 @@ impl BrokerState {
             .or_else(|| Some(self.public_base_url.as_str()).filter(|b| !weft_core::net::is_loopback_url(b)))
     }
 
-    /// Build the broker state over the process's pool and signal watch,
-    /// applying the broker's own schema group (the runtime-file table).
-    pub async fn new(
+    /// Build the broker state over the process's pool and signal watch.
+    /// The schema (the runtime-file plane's group included) is already
+    /// applied: the boot's one pass runs before any role is built.
+    pub fn new(
         pool: PgPool,
         lock_pool: PgPool,
         record_pool: PgPool,
@@ -166,9 +166,6 @@ impl BrokerState {
         // open internet reaches, never the local one.
         let front_door = settings.internet_url.clone().unwrap_or_else(|| settings.public_base_url.clone());
         let infra = Arc::new(PostgresInfraReader::new(pool.clone(), Some(front_door)));
-        weft_task_store::apply_groups(&pool, &[&crate::runtime_store::GROUP])
-            .await
-            .context("apply runtime_file schema group")?;
         let runtime_store = Arc::new(RuntimeStore::new(
             pool.clone(),
             settings.object_store.clone(),

@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use weft_dispatcher::entry_limits::{self, EdgeConfig, Limited};
 
 async fn setup(pool: &PgPool) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
 fn edge(invalid_tokens_per_minute: Option<u32>) -> EdgeConfig {

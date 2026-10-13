@@ -51,22 +51,12 @@ pub struct Platform {
 }
 
 
-/// One line of the install's `secrets.env`.
-fn secret(install: &weft_core::infra::Install, name: &str) -> Result<String> {
-    let path = crate::ensure::install_dir(install).join("secrets.env");
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {} (is the install up?)", path.display()))?;
-    raw.lines()
-        .find_map(|l| l.strip_prefix(&format!("{name}=")))
-        .map(str::to_string)
-        .with_context(|| format!("{} has no {name}", path.display()))
-}
-
 impl Platform {
     /// Connect to `disp`'s install's Postgres, at the address its runtime
     /// uses.
     pub async fn connect(disp: &Dispatcher) -> Result<Self> {
         let install = disp.install().clone();
-        let url = secret(&install, "WEFT_DATABASE_URL")?;
+        let url = install.secret("WEFT_DATABASE_URL").map_err(anyhow::Error::msg)?;
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .acquire_timeout(Duration::from_secs(10))
@@ -214,7 +204,7 @@ impl Platform {
 
     /// The last lines weft's runtime wrote.
     pub fn runtime_log(&self) -> Result<String> {
-        let path = crate::ensure::install_dir(&self.install).join("runtime.log");
+        let path = self.install.dir().join("runtime.log");
         let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         Ok(crate::client::tail(&raw, 200_000).to_string())
     }

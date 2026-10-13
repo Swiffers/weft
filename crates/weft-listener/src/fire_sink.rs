@@ -220,7 +220,7 @@ impl FireSignalSink {
     ) -> Result<Delivered> {
         self.tasks
             .enqueue_dedup(NewTask {
-                kind: TaskKind::FireSignal.into(),
+                kind: TaskKind::FireSignal,
                 project_id: None,
                 dedup_key: Some(format!("fire:{fire_id}")),
                 execution_id: Some(execution_id),

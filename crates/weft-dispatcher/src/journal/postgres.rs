@@ -3,8 +3,8 @@
 //! are the durable state. Postgres is the source of truth, every
 //! dispatcher process is a stateless reader/writer.
 //!
-//! Applies no schema of its own: the boot's `app::apply_core_schema`
-//! runs every group (this crate's [`GROUP`] included) in one pass.
+//! Applies no schema of its own: the boot runs every group (this
+//! module's [`GROUP`] included) in one pass.
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -104,8 +104,8 @@ impl SummaryRow {
 
 impl PostgresJournal {
     /// Wrap an EXISTING pool. Pure: the schema (this crate's [`GROUP`]
-    /// included) is applied once, before construction, by
-    /// [`crate::app::apply_core_schema`].
+    /// included) is applied once, before construction, by the boot's one
+    /// schema pass.
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
     }
@@ -214,10 +214,10 @@ async fn cancel_unowned_in(
     }
 }
 
-/// The journal's schema. Early in `app::ALL_GROUPS` (other groups'
-/// triggers attach to its tables), after the access store, whose
-/// `access_grant` one of its triggers attaches to; applied by the
-/// boot's one `apply_core_schema` pass, never here.
+/// The journal's schema. Early in `app::DISPATCHER_GROUPS` (other
+/// groups' triggers attach to its tables), after the access store, whose
+/// `access_grant` one of its triggers attaches to; applied by the boot's
+/// one schema pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     // Named for the table it first held; it is the run record's group.
     name: "exec_event",

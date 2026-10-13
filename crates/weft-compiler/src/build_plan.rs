@@ -50,6 +50,10 @@ pub struct PlannedImage {
     /// The image's local name (infra images only); the `Image::Local { name }` the
     /// infra spec references.
     pub image_name: Option<String>,
+    /// What the build uses of what an install keeps on the machine that
+    /// runs it (the worker's builder base and compile cache; nothing for an
+    /// infra image).
+    pub uses: weft_core::images::BuildUses,
 }
 
 /// The full set of artifacts a compiled project version needs, plus the three
@@ -130,6 +134,7 @@ pub fn plan_build_from(
         context_dir: staged.build_context,
         node_id: None,
         image_name: None,
+        uses: staged.uses,
     }];
 
     // Every infra image, via the shared enumerator (same set, same content hashes as
@@ -144,6 +149,7 @@ pub fn plan_build_from(
             context_dir: source_dir,
             node_id: Some(node_id),
             image_name: Some(image_name),
+            uses: Default::default(),
         });
     }
 

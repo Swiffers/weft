@@ -15,10 +15,11 @@
 // webview reads fields the old server never emits), so a binary change kills
 // the child and the next request respawns on the new one.
 
-import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as nodePath from 'node:path';
 import * as readline from 'node:readline';
-import { WeftCliError } from './cli';
+import { spawnWeft, WeftCliError, weftCli, weftNotFound } from './cli';
 import type { EditOp, RunSpec, TextEdit } from '../../packages/weft-graph/src/protocol';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 
@@ -127,7 +128,13 @@ export class ParseServer {
     if (signal?.aborted) {
       return Promise.reject(new WeftCliError(['parse-server'], null, 'request aborted'));
     }
-    const child = this.ensureChild();
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = this.ensureChild();
+    } catch (err) {
+      // No `weft` to run in this window: the reason is the answer.
+      return Promise.reject(err);
+    }
     const id = this.nextId++;
     const line = JSON.stringify({ id, ...req }) + '\n';
     return new Promise<T>((resolve, reject) => {
@@ -177,7 +184,7 @@ export class ParseServer {
   private ensureChild(): ChildProcessWithoutNullStreams {
     if (this.child) return this.child;
 
-    const child = spawn('weft', ['parse-server'], { cwd: this.cwd, env: process.env });
+    const child = spawnWeft(['parse-server'], { cwd: this.cwd });
     this.child = child;
     this.watchBinary(child);
 
@@ -195,11 +202,8 @@ export class ParseServer {
 
     const fail = (err: Error) => this.onChildGone(child, err);
     child.on('error', (err: NodeJS.ErrnoException) => {
-      // ENOENT: `weft` not on PATH. Name the actual fix, same as runWeftJson.
-      const reason =
-        err.code === 'ENOENT'
-          ? 'weft CLI not found on PATH. Install it or add it to your PATH.'
-          : err.message;
+      // ENOENT: no `weft` there. Name the actual fix, same as runWeftJson.
+      const reason = err.code === 'ENOENT' ? weftNotFound(['parse-server']) : err.message;
       fail(new WeftCliError(['parse-server'], null, reason));
     });
     child.on('exit', (code, signal) => {
@@ -253,8 +257,11 @@ export class ParseServer {
     this.binaryWatcher?.close();
     this.binaryWatcher = undefined;
     try {
+      const { command } = weftCli(['parse-server']);
       const resolver = process.platform === 'win32' ? 'where' : 'which';
-      const path = execFileSync(resolver, ['weft'], { encoding: 'utf8' }).split('\n')[0].trim();
+      const path = nodePath.isAbsolute(command)
+        ? command
+        : execFileSync(resolver, [command], { encoding: 'utf8' }).split('\n')[0].trim();
       if (!path) return;
       this.binaryWatcher = fs.watch(path, () => {
         console.error('[weft parse-server] weft binary changed; restarting the parse server');

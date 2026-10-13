@@ -23,7 +23,7 @@ use tokio::process::Command;
 /// Registry the prebuilt shared images are published to (by the
 /// release workflow, on every push to the release branch). Override
 /// with `WEFT_IMAGE_REGISTRY`; set it to the empty string to name
-/// images bare (`weft-dispatcher:<hash>`), which also disables the
+/// images bare (`weft-runtime:<hash>`), which also disables the
 /// pull step.
 const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/weavemindai";
 
@@ -192,6 +192,15 @@ pub fn builder_base_ref() -> Result<String> {
     Ok(qualified_ref(weft_compiler::worker_image::BUILDER_BASE_REPO, &short))
 }
 
+/// The key of the BuildKit compile cache the worker builds of the weft
+/// checkout at `weft_root` mount when they build FROM the builder base,
+/// the one a start records. A build after the checkout moved adds its own
+/// key as it starts ([`record_build_uses`], and the runtime's builder
+/// through `weft_core::images::ImageRefs::add_build`).
+pub fn worker_compile_cache_key(weft_root: &Path) -> Result<String> {
+    weft_compiler::hash::compute_worker_cache_key(weft_root, "builder-base")
+}
+
 /// Ensure the shared pre-built worker builder base image exists.
 /// Returns its content-addressed ref. An engine / toolchain bump
 /// produces a fresh tag and per-project worker Dockerfiles
@@ -203,10 +212,28 @@ pub fn builder_base_ref() -> Result<String> {
 /// worker builds FROM this image and skip the apt + rustup install
 /// cycle, paying only per-project costs (per-node apt packages,
 /// cargo fetch + compile inside the shared BuildKit cache mounts).
+///
+/// The base follows the live checkout, which can have moved since the
+/// install started, so it goes into the install's image record before
+/// it is pulled or built: a sweep elsewhere keeps it from then on.
 pub async fn ensure_worker_builder_base() -> Result<String> {
     let image_ref = builder_base_ref()?;
+    record_build_uses(&weft_core::images::BuildUses { builder_base: Some(image_ref.clone()), compile_cache_key: None }).await?;
     ensure_builder_base_at(&image_ref, false).await?;
     Ok(image_ref)
+}
+
+/// Add what a build this CLI runs on the machine's docker uses to the
+/// image record of the install it acts on, before the build starts, so a
+/// sweep elsewhere keeps it. A cleanup holding the record makes this wait
+/// for one removal, on the blocking pool, saying so.
+pub async fn record_build_uses(uses: &weft_core::images::BuildUses) -> Result<()> {
+    let dir = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?.dir();
+    let uses = uses.clone();
+    tokio::task::spawn_blocking(move || {
+        weft_core::images::ImageRefs::add_build(&dir, &uses, || eprintln!("waiting for a cleanup to let go of this install's image record"))
+    })
+    .await?
 }
 
 /// Materialize the builder base under `image_ref` (present -> pull ->
@@ -234,23 +261,14 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
         if let Some(parent) = ctx_dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let lock_path = ctx_dir.with_extension("lock");
-        let _lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-            let lock = std::fs::File::create(&lock_path)?;
-            // A held lock means another weft process is building the
-            // base (minutes on a clean machine); say so before
-            // blocking, or this process sits silent the whole time.
-            if lock.try_lock().is_err() {
-                eprintln!(
-                    "another weft process is building the shared builder base; \
-                     waiting for it to finish"
-                );
-                lock.lock()
-                    .map_err(|e| anyhow::anyhow!("lock the builder-base staging dir: {e}"))?;
-            }
-            Ok(lock)
-        })
-        .await??;
+        // A held lock means another weft process is building the base
+        // (minutes on a clean machine); say so before blocking, or this
+        // process sits silent the whole time.
+        let _lock = hold_file_lock(
+            ctx_dir.with_extension("lock"),
+            "another weft process is building the shared builder base; waiting for it to finish",
+        )
+        .await?;
         if rebuild || (!image_present(image_ref).await? && !docker_pull(image_ref).await?) {
             // Stage the base build context: the worker-linked workspace
             // slice + toolchain pin + generated warm-up crate + the
@@ -407,6 +425,12 @@ pub struct SharedImages {
 }
 
 impl SharedImages {
+    /// The refs the current checkout's content hashes to, touching no
+    /// image.
+    pub fn current() -> Result<Self> {
+        Ok(Self { runtime: runtime_image_ref()?, builder_base: builder_base_ref()?, worker: standard_worker_ref()? })
+    }
+
     /// Every bare (unsuffixed) ref, one per shared image.
     /// SYNC: `weft build-images` stdout = one registry-qualified bare
     ///       ref per line, in this order <-> .github/workflows/release.yml
@@ -429,23 +453,25 @@ pub fn suffixed_ref(bare: &str, ref_suffix: Option<&str>) -> String {
     }
 }
 
-/// Make both shared images exist locally, side by side. Returns the bare
-/// content-addressed refs. With `ref_suffix`, each image is materialized
-/// under `<ref><suffix>` instead of its bare name: the release workflow's
+/// Make the shared images `wanted` names exist locally, the runtime and
+/// the builder base side by side, then the standard worker FROM that
+/// base. With `ref_suffix`, each image is materialized under
+/// `<ref><suffix>` instead of its bare name: the release workflow's
 /// per-architecture halves, checked and pulled by their OWN names.
-/// `prebuilt_runtime` is [`ensure_runtime_image`]'s `prebuilt`.
+/// `prebuilt_runtime` is [`ensure_runtime_image`]'s `prebuilt`. The refs
+/// come in rather than being worked out here, so a start records exactly
+/// what it then builds.
 ///
 /// `tokio::join!`, NOT `try_join!`: an early bail would drop the sibling
 /// future while its `docker build` child keeps running detached; join!
 /// lets both finish, then every error is reported together.
 pub async fn ensure_all_shared_images(
+    wanted: &SharedImages,
     rebuild: bool,
     ref_suffix: Option<&str>,
     prebuilt_runtime: Option<&Path>,
-) -> Result<SharedImages> {
-    let runtime = runtime_image_ref()?;
-    let base = builder_base_ref()?;
-    let (runtime_target, base_target) = (suffixed_ref(&runtime, ref_suffix), suffixed_ref(&base, ref_suffix));
+) -> Result<()> {
+    let (runtime_target, base_target) = (suffixed_ref(&wanted.runtime, ref_suffix), suffixed_ref(&wanted.builder_base, ref_suffix));
     let (r, b) = tokio::join!(
         ensure_runtime_image(&runtime_target, rebuild, prebuilt_runtime),
         ensure_builder_base_at(&base_target, rebuild),
@@ -456,8 +482,9 @@ pub async fn ensure_all_shared_images(
         .collect();
     anyhow::ensure!(failures.is_empty(), "shared image build failed:\n  {}", failures.join("\n  "));
     // After the base: the standard worker is built FROM it.
-    let worker = ensure_standard_worker(&base, rebuild, ref_suffix).await.map_err(|e| anyhow::anyhow!("standard worker: {e:#}"))?;
-    Ok(SharedImages { runtime, builder_base: base, worker })
+    ensure_standard_worker(&wanted.worker, &wanted.builder_base, rebuild, ref_suffix)
+        .await
+        .map_err(|e| anyhow::anyhow!("standard worker: {e:#}"))
 }
 
 /// The standard worker's ref for this checkout:
@@ -467,12 +494,11 @@ pub fn standard_worker_ref() -> Result<String> {
     Ok(qualified_ref(weft_compiler::build::WORKER_IMAGE_REPO, &hash))
 }
 
-/// Make the standard worker exist under its ref (present, else pulled,
+/// Make the standard worker exist under `image` (present, else pulled,
 /// else built FROM `base`, the builder base this process just ensured).
 /// An install holds it under a name of its own ([`hold_standard_worker`]).
-async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>) -> Result<String> {
-    let image = standard_worker_ref()?;
-    let target = suffixed_ref(&image, suffix);
+async fn ensure_standard_worker(image: &str, base: &str, rebuild: bool, suffix: Option<&str>) -> Result<()> {
+    let target = suffixed_ref(image, suffix);
     if rebuild || (!image_present(&target).await? && !docker_pull(&target).await?) {
         let stock = weft_compiler::build::StockProject::materialize()?;
         let bases = weft_compiler::worker_image::BaseImages {
@@ -486,9 +512,10 @@ async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>)
             &bases,
             weft_core::builds::NodeSet::Full,
         )?;
+        record_build_uses(&build.uses).await?;
         docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;
     }
-    Ok(image)
+    Ok(())
 }
 
 /// Give `install` its own name for the standard worker `image`
@@ -675,9 +702,10 @@ const COMPILE_LANES_ENV: &str = "WEFT_COMPILE_LANES";
 
 /// One of this host's compile lanes, held (an exclusive lock on its file
 /// under the weft data dir) until dropped. Every weft process on the host
-/// picks from the same lock files, so no two builds hold one lane.
-struct CompileLane {
-    number: u32,
+/// picks from the same lock files, so no two builds hold one lane, and the
+/// compile-cache sweep leaves a held lane's caches alone.
+pub(crate) struct CompileLane {
+    pub(crate) number: u32,
     _lock: std::fs::File,
 }
 
@@ -685,30 +713,11 @@ impl CompileLane {
     /// The first free lane, waiting for one to free up when all are held.
     async fn hold() -> Result<Self> {
         let lanes = compile_lanes()?;
-        let dir = crate::commands::daemon::data_dir().join("compile-lanes");
-        std::fs::create_dir_all(&dir)?;
-        let files = (0..lanes)
-            .map(|n| {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(dir.join(format!("{n}.lock")))?;
-                Ok((n, file))
-            })
-            .collect::<Result<Vec<_>>>()?;
         let mut said = false;
         loop {
-            for (number, file) in &files {
-                match file.try_lock() {
-                    Ok(()) => {
-                        let _lock = file.try_clone()?;
-                        return Ok(Self { number: *number, _lock });
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => {}
-                    Err(std::fs::TryLockError::Error(e)) => {
-                        return Err(anyhow::anyhow!("lock compile lane {number}: {e}"));
-                    }
+            for number in 0..lanes {
+                if let Some(lane) = Self::try_take(number)? {
+                    return Ok(lane);
                 }
             }
             if !said {
@@ -721,6 +730,23 @@ impl CompileLane {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
+
+    /// Lane `number` if no build holds it right now, `None` when one does.
+    pub(crate) fn try_take(number: u32) -> Result<Option<Self>> {
+        let path = crate::commands::daemon::data_dir().join("compile-lanes").join(format!("{number}.lock"));
+        let lock = weft_core::file_lock::try_hold(&path).map_err(|e| anyhow::anyhow!("lock compile lane {number}: {e}"))?;
+        Ok(lock.map(|_lock| Self { number, _lock }))
+    }
+}
+
+/// Hold the machine-wide lock on the file at `path`, waiting (on the
+/// blocking pool, so this thread's other futures keep going) while
+/// another weft process holds it, after saying `waiting` once.
+pub(crate) async fn hold_file_lock(path: PathBuf, waiting: &'static str) -> Result<std::fs::File> {
+    tokio::task::spawn_blocking(move || {
+        weft_core::file_lock::hold(&path, || eprintln!("{waiting}")).map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))
+    })
+    .await?
 }
 
 /// How many compile lanes there are: [`COMPILE_LANES_ENV`], or
@@ -783,42 +809,81 @@ pub async fn image_present(image_ref: &str) -> Result<bool> {
     }
 }
 
-/// The predicate a "current ref" sweep condemns with: every tag of
-/// `current_ref`'s repo except the current one, under any registry
-/// spelling. Owning the ref split here means no caller hand-rolls it,
-/// and a `current_ref` that cannot be split is a loud error, never an
-/// everything-condemned sweep. Compose it with a referenced-set hold
-/// where one applies.
-pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool + '_> {
-    let (repo, current) = ref_repo_tag(current_ref)?;
-    Ok(move |r: &str, t: &str| r == repo && t != current)
+/// The predicate a sweep of `repo` condemns with: every tag of `repo`
+/// but those of the `kept` refs, under any registry spelling (an
+/// install's local name `localhost/weft-<name>/<repo>:<tag>` included).
+/// Owning the ref split here means no caller hand-rolls it, and a kept
+/// ref that cannot be split, or names another repo, is a loud error,
+/// never an everything-condemned sweep. Compose it with a
+/// referenced-set hold where one applies.
+pub fn outside_kept(repo: &str, kept: &[&str]) -> Result<impl Fn(&str, &str) -> bool> {
+    let mut tags = std::collections::BTreeSet::new();
+    for &kept_ref in kept {
+        let (kept_repo, tag) = ref_repo_tag(kept_ref)?;
+        anyhow::ensure!(kept_repo == repo, "the kept image '{kept_ref}' is not a {repo} image");
+        tags.insert(tag.to_string());
+    }
+    let repo = repo.to_string();
+    Ok(move |r: &str, t: &str| r == repo && !tags.contains(t))
 }
 
-/// The standard workers in `listing` other than the current one
-/// (`current_ref`). The standard worker is the one worker this host pulls
-/// or builds under a registry name, and each weft version names a new one,
-/// so every older one is dead. Only weft's own registry names go: the
-/// current ref's registry and the one the release publishes to (the copy
-/// it may have been tagged from), never another repository that happens to
-/// be called `weft-worker`. The current hash is current under any suffix
-/// (`<hash>-amd64`, the release's per-architecture halves): content hashes
-/// have one length, so no other hash starts with it. An install's own name
-/// for a worker (`Install::local_image_ref`) carries no registry, and that
-/// install reclaims it.
-pub fn stale_standard_workers(listing: &str, current_ref: &str) -> Result<Vec<String>> {
-    let (_, current) = ref_repo_tag(current_ref)?;
-    // With the registry disabled the current ref is bare, the default
-    // install's own name, and only the published registry is left to sweep.
-    let registry = current_ref.rsplit_once('/').map_or(DEFAULT_IMAGE_REGISTRY, |(registry, _)| registry);
-    let repos = [registry, DEFAULT_IMAGE_REGISTRY].map(|r| format!("{r}/{}:", weft_compiler::build::WORKER_IMAGE_REPO));
+/// [`outside_kept`] keeping only `current_ref`.
+pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool> {
+    let (repo, _) = ref_repo_tag(current_ref)?;
+    outside_kept(repo, &[current_ref])
+}
+
+/// The standard workers in `listing` other than the `kept` ones. The
+/// standard worker is the one worker this host pulls or builds under a
+/// registry name, and each weft version names a new one, so every one no
+/// install uses is dead. Only weft's own registry names go: the kept
+/// refs' registries and the one the release publishes to (the copy one
+/// may have been tagged from), never another repository that happens to
+/// be called `weft-worker`. A kept hash is kept under any suffix
+/// (`<hash>-amd64`, the release's per-architecture halves): content
+/// hashes have one length, so no other hash starts with it. An install's
+/// own name for a worker (`Install::local_image_ref`) carries no
+/// registry, and that install reclaims it.
+pub fn stale_standard_workers<'a>(listing: &str, kept: impl IntoIterator<Item = &'a str>) -> Result<Vec<String>> {
+    let mut registries = std::collections::BTreeSet::from([DEFAULT_IMAGE_REGISTRY]);
+    let mut tags = Vec::new();
+    for kept_ref in kept {
+        tags.push(ref_repo_tag(kept_ref)?.1);
+        // A bare ref (the registry disabled) is an install's own name,
+        // and adds no registry to sweep.
+        if let Some((registry, _)) = kept_ref.rsplit_once('/') {
+            registries.insert(registry);
+        }
+    }
+    let repos: Vec<String> = registries.iter().map(|r| format!("{r}/{}:", weft_compiler::build::WORKER_IMAGE_REPO)).collect();
     Ok(listing
         .lines()
         .map(str::trim)
         .filter(|full| {
-            repos.iter().any(|repo| full.strip_prefix(repo.as_str()).is_some_and(|tag| !tag.is_empty() && !tag.starts_with(current)))
+            repos.iter().any(|repo| {
+                full.strip_prefix(repo.as_str()).is_some_and(|tag| !tag.is_empty() && !tags.iter().any(|kept| tag.starts_with(kept)))
+            })
         })
         .map(str::to_string)
         .collect())
+}
+
+/// The label a node-test image carries naming the TAG of the builder
+/// base it was built on, which is how a sweep keeps the node-test images
+/// of every builder base an install uses and drops the rest.
+// SYNC: the label <-> crates/weft-cli/src/commands/test_node/mod.rs (ensure_test_image)
+pub const NODE_TEST_BASE_LABEL: &str = "weft.dev/builder-base";
+
+/// The node-test images in `listing` that are not in `kept` (the ones
+/// built on a builder base an install uses, listed through
+/// [`NODE_TEST_BASE_LABEL`]): one built on a base no install uses, or
+/// before images carried the label, is dead.
+pub fn stale_node_test_images(listing: &str, kept: &str) -> Vec<String> {
+    let kept: std::collections::BTreeSet<&str> = kept.lines().map(str::trim).collect();
+    host_images_matching(listing, |r, _| r == weft_compiler::build::NODE_TEST_IMAGE_REPO)
+        .into_iter()
+        .filter(|image| !kept.contains(image.as_str()))
+        .collect()
 }
 
 /// Host `docker images` lines (one `repo:tag` per line) that a sweep
@@ -926,22 +991,22 @@ mod tests {
         assert!(ref_repo_tag("ghcr.io/weavemindai/weft-dispatcher@sha256:0011").is_err());
     }
 
-    /// Only weft's registry names of older standard workers go: never the
-    /// current one under any suffix, never an install's own name, never
-    /// another repository called `weft-worker`.
+    /// Only weft's registry names of standard workers no install uses
+    /// go: never a kept one under any suffix, never an install's own
+    /// name, never another repository called `weft-worker`.
     #[test]
-    fn only_older_standard_workers_are_stale() {
+    fn only_standard_workers_no_install_uses_are_stale() {
         let listing = "ghcr.io/weavemindai/weft-worker:now\nghcr.io/weavemindai/weft-worker:now-amd64\n\
                        ghcr.io/weavemindai/weft-worker:old\nghcr.io/weavemindai/weft-worker:old-arm64\n\
                        eu.gcr.io/p/weft-worker:older\neu.gcr.io/p/weft-worker:now\nweft-worker:project\n\
                        localhost/weft-cell7/weft-worker:old\nsomeone/weft-worker:old\nghcr.io/other/weft-worker:old\n\
                        ghcr.io/weavemindai/weft-runtime:old\n<none>:<none>\n";
         assert_eq!(
-            stale_standard_workers(listing, "ghcr.io/weavemindai/weft-worker:now").unwrap(),
+            stale_standard_workers(listing, ["ghcr.io/weavemindai/weft-worker:now"]).unwrap(),
             vec!["ghcr.io/weavemindai/weft-worker:old".to_string(), "ghcr.io/weavemindai/weft-worker:old-arm64".to_string()]
         );
         assert_eq!(
-            stale_standard_workers(listing, "eu.gcr.io/p/weft-worker:now").unwrap(),
+            stale_standard_workers(listing, ["eu.gcr.io/p/weft-worker:now"]).unwrap(),
             vec![
                 "ghcr.io/weavemindai/weft-worker:old".to_string(),
                 "ghcr.io/weavemindai/weft-worker:old-arm64".to_string(),
@@ -949,50 +1014,76 @@ mod tests {
             ]
         );
         assert_eq!(
-            stale_standard_workers(listing, "weft-worker:now").unwrap(),
+            stale_standard_workers(listing, ["weft-worker:now"]).unwrap(),
             vec!["ghcr.io/weavemindai/weft-worker:old".to_string(), "ghcr.io/weavemindai/weft-worker:old-arm64".to_string()],
             "with the registry disabled, the published registry is the only one swept"
         );
+        // Two installs on two versions keep both.
+        assert_eq!(
+            stale_standard_workers(listing, ["ghcr.io/weavemindai/weft-worker:now", "ghcr.io/weavemindai/weft-worker:old"]).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            stale_standard_workers(listing, Vec::<&str>::new()).unwrap().len(),
+            4,
+            "no install uses any: every one in the published registry goes"
+        );
     }
 
-    /// The host sweep must remove every other tag of a system repo
-    /// (the pre-registry `:local` spelling included), keep the tag the
-    /// install runs under EITHER spelling, skip untagged/dangling
-    /// lines, and never touch foreign repos (`weft-infra-supervisor`
-    /// vs a `weft-infra-<node>` image included).
+    /// A shared-image sweep removes every tag of its repo that no install
+    /// uses, under any name (a registry's, a bare one, an install's local
+    /// one), keeps every tag one does, skips untagged lines, and never
+    /// touches another repo (`weft-runtime` beside `weft-runtime-x`).
     #[test]
-    fn host_sweep_condemns_only_stale_system_tags() {
+    fn a_shared_image_sweep_keeps_every_tag_an_install_uses() {
         let listing = "\
-ghcr.io/weavemindai/weft-dispatcher:abc123
-weft-dispatcher:abc123
-weft-dispatcher:local
-ghcr.io/weavemindai/weft-dispatcher:0ld0ld
-weft-worker:abc123
-weft-infra-supervisor:abc123
-weft-infra-postgres:zzz999
+ghcr.io/weavemindai/weft-runtime:mainhash
+weft-runtime:mainhash
+localhost/weft-deploy/weft-runtime:deployhash
+ghcr.io/weavemindai/weft-runtime:deployhash
+weft-runtime:local
+ghcr.io/weavemindai/weft-runtime:0ld0ld
+localhost/weft-deploy/weft-runtime:0ld0ld
+weft-runtime-x:0ld0ld
+weft-builder-base:0ld0ld
 <none>:<none>
 ";
-        let stale = host_images_matching(
-            listing,
-            outside_current("ghcr.io/weavemindai/weft-dispatcher:abc123").unwrap(),
-        );
+        let kept = ["ghcr.io/weavemindai/weft-runtime:mainhash", "weft-runtime:deployhash"];
+        let stale = host_images_matching(listing, outside_kept(RUNTIME_REPO, &kept).unwrap());
         assert_eq!(
             stale,
             vec![
-                "weft-dispatcher:local".to_string(),
-                "ghcr.io/weavemindai/weft-dispatcher:0ld0ld".to_string(),
+                "weft-runtime:local".to_string(),
+                "ghcr.io/weavemindai/weft-runtime:0ld0ld".to_string(),
+                "localhost/weft-deploy/weft-runtime:0ld0ld".to_string(),
             ]
         );
-        let infra =
-            host_images_matching(listing, outside_current("weft-infra-supervisor:abc123").unwrap());
-        assert!(infra.is_empty(), "{infra:?}");
-        // Composed with another hold: a non-current tag it protects
-        // survives.
-        let current = outside_current("weft-dispatcher:abc123").unwrap();
-        let held = host_images_matching(listing, |r, t| current(r, t) && t != "0ld0ld");
-        assert_eq!(held, vec!["weft-dispatcher:local".to_string()]);
-        // A current ref that cannot be split is a loud error, never an
-        // everything-condemned sweep.
-        assert!(outside_current("weft-dispatcher").is_err());
+        // Composed with another hold: a tag it protects survives.
+        let outside = outside_current("weft-runtime:mainhash").unwrap();
+        let held = host_images_matching(listing, |r, t| outside(r, t) && t != "0ld0ld");
+        assert_eq!(
+            held,
+            vec![
+                "localhost/weft-deploy/weft-runtime:deployhash".to_string(),
+                "ghcr.io/weavemindai/weft-runtime:deployhash".to_string(),
+                "weft-runtime:local".to_string(),
+            ]
+        );
+        // No install uses any: the whole repo goes.
+        assert_eq!(host_images_matching(listing, outside_kept(RUNTIME_REPO, &[]).unwrap()).len(), 7);
+        // A kept ref that cannot be split, or is another repo's, is a
+        // loud error, never an everything-condemned sweep.
+        assert!(outside_current("weft-runtime").is_err());
+        assert!(outside_kept(RUNTIME_REPO, &["weft-builder-base:x"]).is_err());
+    }
+
+    /// The node-test images built on a builder base no install uses go,
+    /// and so do those from before the images carried their base.
+    #[test]
+    fn node_test_images_of_a_base_no_install_uses_are_stale() {
+        let listing = "weft-node-tests:a1\nweft-node-tests:b2\nweft-node-tests:c3\nweft-builder-base:old\n<none>:<none>\n";
+        let kept = "weft-node-tests:a1\nweft-node-tests:c3\n";
+        assert_eq!(stale_node_test_images(listing, kept), vec!["weft-node-tests:b2".to_string()]);
+        assert_eq!(stale_node_test_images(listing, "").len(), 3);
     }
 }

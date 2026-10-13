@@ -24,7 +24,7 @@ pub mod types;
 pub mod wire;
 
 pub use handle::{InfraHandle, INFRA_MARKER_KEY};
-pub use install::{data_dir, Install, INSTALL_ENV, INSTALL_LABEL, MAX_INSTALL_NAME};
+pub use install::{data_dir, mark_unresolved, env_file_values, secrets_file, write_whole, SECRETS_FILE, Install, Wanted, WantedFrom, E2E_CELL_PREFIX, INSTALL_ENV, INSTALL_LABEL, MAX_INSTALL_NAME};
 pub use resolve::{
     public_path, public_url, resolve, resolve_image, unit_image_refs, NodeRef, ResolveError, ResolvedNode,
     ResolvedUnit, VALUES_URL_ENV,

@@ -41,7 +41,7 @@ use weft_core::ExecutionId;
 /// The `project_version` + `version_runs` tables. Canonical DDL edited in
 /// place; an existing database is carried forward by `./setup.sh
 /// --migration <name>` (the contract is `weft_task_store::schema_guard`'s
-/// header). Applied by the boot's `apply_core_schema` after
+/// header). Applied by the boot's one schema pass after
 /// `project_store::GROUP`, which owns the `project` row both tables
 /// hang off (and the head columns).
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {

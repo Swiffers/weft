@@ -22,6 +22,9 @@ pub struct DockerImageBuilder {
     /// The install whose names the images go under
     /// (`Install::local_image_ref`).
     install: weft_core::infra::Install,
+    /// The install's folder, whose image record a build adds what it uses
+    /// to (`weft_core::images::ImageRefs::add_build`).
+    install_dir: std::path::PathBuf,
     builds: Arc<parking_lot::Mutex<HashMap<String, Build>>>,
 }
 
@@ -31,8 +34,8 @@ enum Build {
 }
 
 impl DockerImageBuilder {
-    pub fn new(docker: Arc<dyn Docker>, install: weft_core::infra::Install) -> Self {
-        Self { docker, install, builds: Arc::default() }
+    pub fn new(docker: Arc<dyn Docker>, install: weft_core::infra::Install, install_dir: std::path::PathBuf) -> Self {
+        Self { docker, install, install_dir, builds: Arc::default() }
     }
 }
 
@@ -97,6 +100,20 @@ impl ImageBuilder for DockerImageBuilder {
     /// the same tag when there is one (a name added, nothing built), and
     /// runs `docker build` otherwise.
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
+        // Before anything is built or adopted: from here on a machine-wide
+        // sweep elsewhere keeps what this build uses (one already running
+        // holds the record, so this waits until it is done). The compile
+        // cache key follows the live checkout, so it can differ from the one
+        // the install's start recorded; the builder base is the one the
+        // start chose, added again at no cost.
+        let (dir, uses) = (self.install_dir.clone(), req.uses.clone());
+        tokio::task::spawn_blocking(move || {
+            weft_core::images::ImageRefs::add_build(&dir, &uses, || {
+                tracing::info!(target: "weft_platform_local::images", "a build waits for a cleanup to let go of the install's image record")
+            })
+        })
+            .await
+            .map_err(|e| anyhow::anyhow!("record the images a build uses: {e}"))??;
         let name = req.name.clone();
         let image_ref = req.image_ref.clone();
         let docker = self.docker.clone();
@@ -229,6 +246,7 @@ mod tests {
             staging: Staging::new(Staged(dir)),
             image_ref: "weft-worker:abc".into(),
             build_args: vec![("WEFT_COMPILE_LANE".into(), "2".into())],
+            uses: Default::default(),
         }
     }
 
@@ -275,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn a_build_runs_docker_build_on_the_staging_it_keeps() {
         let docker = Arc::new(HeldBuilds { docker: FakeDocker::new(), ends: tokio::sync::Semaphore::new(0) });
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install());
+        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
         let first = req("b1");
         let dir = first.context_dir.clone();
         let h = b.start(first).await.unwrap();
@@ -308,11 +326,35 @@ mod tests {
         assert_eq!(b.poll(&BuildHandle::named("never")).await.unwrap(), BuildStatus::Gone);
     }
 
+    /// A build adds the builder base and compile cache it uses to its
+    /// install's image record before it starts, so a sweep keeps them.
+    #[tokio::test]
+    async fn a_build_records_what_it_uses_in_its_install() {
+        let install = std::env::temp_dir().join(format!("weft-install-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&install).unwrap();
+        let record = weft_core::images::ImageRefs {
+            runtime: "weft-runtime:r".into(),
+            standard_worker: "weft-worker:w".into(),
+            builder_bases: ["weft-builder-base:b1".to_string()].into(),
+            compile_cache_keys: ["k1".to_string()].into(),
+        };
+        record.save(&install).unwrap();
+        let docker = Arc::new(HeldBuilds { docker: FakeDocker::new(), ends: tokio::sync::Semaphore::new(1) });
+        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), install.clone());
+        let mut r = req("b1");
+        r.uses = weft_core::images::BuildUses { builder_base: Some("weft-builder-base:b2".into()), compile_cache_key: Some("k2".into()) };
+        b.start(r).await.unwrap();
+        let now = weft_core::images::ImageRefs::load(&install).unwrap().unwrap();
+        assert_eq!(now.builder_bases, ["weft-builder-base:b1".to_string(), "weft-builder-base:b2".to_string()].into());
+        assert_eq!(now.compile_cache_keys, ["k1".to_string(), "k2".to_string()].into());
+        std::fs::remove_dir_all(&install).unwrap();
+    }
+
     /// A build stopped while it runs lets go of its staging with it.
     #[tokio::test]
     async fn a_stopped_build_lets_go_of_its_staging() {
         let docker = Arc::new(HeldBuilds { docker: FakeDocker::new(), ends: tokio::sync::Semaphore::new(0) });
-        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install());
+        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
         let r = req("b1");
         let dir = r.context_dir.clone();
         let h = b.start(r).await.unwrap();
@@ -329,7 +371,7 @@ mod tests {
     async fn a_content_another_install_holds_is_named_not_built() {
         let docker = Arc::new(FakeDocker::new());
         docker.answer(&["image", "ls"], "evil/weft-worker:abc\nweft-worker:abc\n");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap());
+        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap(), std::env::temp_dir().join("weft-no-install"));
         let mut r = req("b1");
         r.image_ref = b.image_ref("weft-worker:abc");
         assert_eq!(r.image_ref, "localhost/weft-cell7/weft-worker:abc");
@@ -342,7 +384,7 @@ mod tests {
 
         let docker = Arc::new(FakeDocker::new());
         docker.answer(&["image", "ls"], "evil/weft-worker:abc\n");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap());
+        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap(), std::env::temp_dir().join("weft-no-install"));
         let h = b.start(r).await.unwrap();
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded);
         assert!(docker.calls_to("tag").is_empty(), "an image no install holds is never taken");
@@ -363,7 +405,7 @@ mod tests {
     async fn deleting_an_image_already_gone_is_fine() {
         let docker = Arc::new(FakeDocker::new());
         docker.fail(&["image", "rm"], "Error: No such image: x");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install());
+        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
         assert_eq!(b.delete_image("x").await.unwrap(), ImageDeleted::Absent);
         docker.fail(&["image", "inspect"], "Error: No such image: x");
         assert!(!b.image_exists("x").await.unwrap());
@@ -373,7 +415,7 @@ mod tests {
     async fn an_image_a_container_still_runs_from_is_kept() {
         let docker = Arc::new(FakeDocker::new());
         docker.fail(&["image", "rm"], "Error response from daemon: conflict: unable to delete x (must be forced) - container 9bcd46ba4da9 is using its referenced image 0e8952e178ee");
-        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install());
+        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
         assert_eq!(b.delete_image("x").await.unwrap(), ImageDeleted::InUse);
     }
 }

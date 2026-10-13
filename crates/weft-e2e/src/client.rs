@@ -2,9 +2,9 @@
 //! real user / outside party would:
 //!
 //!   - [`Dispatcher`]: a thin HTTP client over the dispatcher's public API
-//!     (`weft_core::ports::PUBLIC` by default). Used for reads (execution status / replay,
-//!     storage, infra status) and outside-world pokes (firing signals, the
-//!     live-caller handshake). This is the same contract the CLI and the
+//!     (where the install under test, or a test's cell, answers). Used for
+//!     reads (execution status / replay, storage, infra status) and
+//!     outside-world pokes (firing signals, the live-caller handshake). This is the same contract the CLI and the
 //!     VS Code extension speak.
 //!   - [`cli`]: shells out to the installed `weft` binary in a project
 //!     directory. Used for the lifecycle that must go through the real build
@@ -23,11 +23,6 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-
-/// Default dispatcher API base: where the default install answers. Override
-/// with `WEFT_DISPATCHER_URL` to match an install on another
-/// `WEFT_PUBLIC_PORT`.
-pub const DEFAULT_DISPATCHER_URL: &str = weft_core::ports::LOCAL_PUBLIC_URL;
 
 /// Mints the bearer a request authenticates with. With no auth, the default is
 /// `None` (no `Authorization` header). A harness that needs a token injects a
@@ -51,22 +46,25 @@ pub struct Dispatcher {
     /// harness signs a token per call.
     auth: Option<std::sync::Arc<dyn AuthProvider>>,
     /// Which install on this machine this dispatcher belongs to: the
-    /// default one, or a test cell ([`crate::cell::Cell`]). What reaches
+    /// install under test, or a test cell ([`crate::cell::Cell`]). What reaches
     /// behind the API (the platform layer, the `weft` CLI) follows it to
     /// the right files and database.
     install: weft_core::infra::Install,
 }
 
 impl Dispatcher {
-    /// Build an UNAUTHENTICATED client against `WEFT_DISPATCHER_URL` or the
-    /// default (no login). The inner reqwest client carries no global request
-    /// timeout: live-caller and long-running operations are driven through here
-    /// and a deadline belongs on the specific call (the rig's wait loops), not on
-    /// every request.
-    pub fn from_env() -> Result<Self> {
-        let base = std::env::var("WEFT_DISPATCHER_URL")
-            .unwrap_or_else(|_| DEFAULT_DISPATCHER_URL.to_string());
-        Self::for_install(&base, weft_core::infra::Install::default_install())
+    /// Build an UNAUTHENTICATED client for the install under test
+    /// ([`crate::ensure::install_under_test`]), at the address its
+    /// `ports.json` gives (the CLI's own resolution). The address always
+    /// comes from that install, so one test never drives two installs. The
+    /// inner reqwest client carries no global request timeout: live-caller
+    /// and long-running operations are driven through here and a deadline
+    /// belongs on the specific call (the rig's wait loops), not on every
+    /// request.
+    pub fn under_test() -> Result<Self> {
+        let install = crate::ensure::install_under_test()?;
+        let base = weft_core::ports::local_public_url_of(&install).map_err(anyhow::Error::msg)?;
+        Self::for_install(&base, install)
     }
 
     /// An UNAUTHENTICATED client for the dispatcher of `install`, answering
@@ -89,7 +87,7 @@ impl Dispatcher {
     }
 
     /// A clone of this client that authenticates every request via `auth`. A
-    /// harness that needs tokens builds the base from env, then attaches a
+    /// harness that needs tokens builds the base client, then attaches a
     /// per-tenant signer; unauthenticated tests never call this.
     pub fn with_auth(mut self, auth: std::sync::Arc<dyn AuthProvider>) -> Self {
         self.auth = Some(auth);
@@ -301,21 +299,41 @@ async fn read_ok(resp: reqwest::Response, verb: &str, url: &str) -> Result<Strin
     }
 }
 
-/// Run the installed `weft` CLI in `dir` against `disp`'s install, returning
-/// the captured output. The CLI inherits the rig's environment, with the
-/// dispatcher address and the install name set to `disp`'s, so a test on a
-/// cell never reaches the default install by accident. Fails loud if the
-/// binary cannot be spawned; the EXIT STATUS is left to the caller (some
-/// verbs are expected to fail in negative tests).
+/// A `weft` command acting on `install`: the install under test's own
+/// binary, by its path, with `WEFT_INSTALL` naming `install`. Both are
+/// explicit because the rig runs `weft` from temp folders, where the CLI
+/// would otherwise pick the install from where it stands (outside any
+/// checkout: the default install). A cell has no binary of its own: the
+/// install under test's starts it, and its runtime is the one next to that
+/// binary.
+pub fn weft_command(install: &weft_core::infra::Install) -> Result<tokio::process::Command> {
+    let under_test = crate::ensure::install_under_test()?;
+    let bin = under_test.bin_dir().join("weft");
+    if !bin.is_file() {
+        bail!(
+            "{} does not exist: the install under test ({}) is not set up; run ./setup.sh in {}",
+            bin.display(),
+            under_test.env_value(),
+            crate::ensure::repo_root()?.display()
+        );
+    }
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env(weft_core::infra::INSTALL_ENV, install.env_value());
+    Ok(cmd)
+}
+
+/// Run the install under test's `weft` CLI in `dir` against `disp`'s
+/// install ([`weft_command`]), returning the captured output. The CLI
+/// inherits the rig's environment, with the dispatcher address and the
+/// install set to `disp`'s, so a test on a cell never reaches another
+/// install by accident. Fails loud if the binary cannot be spawned; the
+/// EXIT STATUS is left to the caller (some verbs are expected to fail in
+/// negative tests).
 pub async fn cli(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<CliOutput> {
-    let mut cmd = tokio::process::Command::new("weft");
+    let mut cmd = weft_command(disp.install())?;
     cmd.current_dir(dir);
     cmd.args(args);
     cmd.env("WEFT_DISPATCHER_URL", disp.base());
-    match disp.install().name() {
-        Some(name) => cmd.env(weft_core::infra::INSTALL_ENV, name),
-        None => cmd.env_remove(weft_core::infra::INSTALL_ENV),
-    };
     // The rig is non-interactive by construction: a verb that wants a
     // prompt must receive its answer via flags. With an inherited stdin
     // (the developer's terminal) a prompt would READ from the terminal

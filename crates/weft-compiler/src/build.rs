@@ -37,6 +37,9 @@ pub struct StagedImageBuild {
     /// hash for a test build
     /// ([`crate::hash::compute_node_test_hash`]).
     pub content_hash: String,
+    /// What the build uses of what an install keeps on the machine that
+    /// runs it (`WorkerDockerfile::uses`).
+    pub uses: weft_core::images::BuildUses,
 }
 
 /// The cargo crate name of every generated worker. One constant for every
@@ -199,7 +202,7 @@ pub fn build_project(
         crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
             .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
 
-    Ok(StagedImageBuild { build_context, content_hash })
+    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
 }
 
 /// Stage the docker build context under
@@ -406,7 +409,7 @@ pub fn build_test_artifact(
 
     let content_hash = node_test_content_hash(project, catalog, package_name)?;
 
-    Ok(StagedImageBuild { build_context, content_hash })
+    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
 }
 
 /// The node-test image's Dockerfile: the worker recipe, started as the

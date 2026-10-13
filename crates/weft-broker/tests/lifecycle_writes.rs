@@ -28,7 +28,7 @@ const OWNER: &str = "supervisor-a";
 const OTHER: &str = "supervisor-b";
 
 async fn schema(pool: &PgPool) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
 /// `process` holds the project's `infra_owner` lease for the next hour.

@@ -181,12 +181,12 @@
     impl weft_task_store::TaskStoreClient for AwaitTasks {
         async fn enqueue_dedup(&self, t: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
             let id = uuid::Uuid::new_v4();
-            if t.kind == weft_task_store::TaskKind::WithdrawSignal.as_str() {
+            if t.kind == weft_task_store::TaskKind::WithdrawSignal {
                 let withdraw: weft_task_store::WithdrawSignalPayload = serde_json::from_value(t.payload)?;
                 self.withdrawn.lock().unwrap().push(withdraw.token);
                 return Ok(weft_task_store::tasks::DedupOutcome::Inserted(id));
             }
-            assert_eq!(t.kind, weft_task_store::TaskKind::RegisterSignal.as_str(), "await tests only register and withdraw waits");
+            assert_eq!(t.kind, weft_task_store::TaskKind::RegisterSignal, "await tests only register and withdraw waits");
             // The token derives from the wait's identity, as the
             // dispatcher's resume token does (`task_kinds::register_signal`):
             // two registrations of one (execution, node, frames, call

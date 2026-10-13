@@ -25,8 +25,9 @@ pub trait TaskExecutor<Ctx: Send + Sync>: Send + Sync {
     async fn execute(&self, ctx: &Ctx, task: &Task) -> Result<Value>;
 }
 
+/// The executor of every task kind.
 pub struct TaskRegistry<Ctx: Send + Sync> {
-    inner: HashMap<String, Arc<dyn TaskExecutor<Ctx>>>,
+    inner: HashMap<crate::kinds::TaskKind, Arc<dyn TaskExecutor<Ctx>>>,
     _phantom: PhantomData<Ctx>,
 }
 
@@ -39,53 +40,21 @@ impl<Ctx: Send + Sync> Clone for TaskRegistry<Ctx> {
     }
 }
 
-impl<Ctx: Send + Sync> Default for TaskRegistry<Ctx> {
-    fn default() -> Self {
-        Self {
-            inner: HashMap::new(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
 impl<Ctx: Send + Sync> TaskRegistry<Ctx> {
-    pub fn builder() -> TaskRegistryBuilder<Ctx> {
-        TaskRegistryBuilder { map: HashMap::new() }
-    }
-
-    pub fn get(&self, kind: &str) -> Option<Arc<dyn TaskExecutor<Ctx>>> {
-        self.inner.get(kind).cloned()
-    }
-}
-
-pub struct TaskRegistryBuilder<Ctx: Send + Sync> {
-    map: HashMap<String, Arc<dyn TaskExecutor<Ctx>>>,
-}
-
-impl<Ctx: Send + Sync> TaskRegistryBuilder<Ctx> {
-    pub fn register(
-        mut self,
-        kind: crate::kinds::TaskKind,
-        exec: Arc<dyn TaskExecutor<Ctx>>,
-    ) -> Self {
-        self.map.insert(kind.as_str().to_string(), exec);
-        self
-    }
-
-    /// Register an executor by its raw kind STRING. For task kinds that live
-    /// OUTSIDE the built-in `TaskKind` enum, dispatch is string-keyed on
-    /// `Task.kind`, so an added executor slots in
-    /// without widening the built-in enum.
-    pub fn register_str(mut self, kind: impl Into<String>, exec: Arc<dyn TaskExecutor<Ctx>>) -> Self {
-        self.map.insert(kind.into(), exec);
-        self
-    }
-
-    pub fn build(self) -> TaskRegistry<Ctx> {
-        TaskRegistry {
-            inner: self.map,
+    /// The registry holding `executor_for(kind)` for every kind. Give it a
+    /// function with an exhaustive `match`: a kind added with no executor
+    /// is then a compile error, never a task failed at run time.
+    pub fn every_kind(executor_for: impl Fn(crate::kinds::TaskKind) -> Arc<dyn TaskExecutor<Ctx>>) -> Self {
+        Self {
+            inner: crate::kinds::TaskKind::VARIANTS.iter().map(|&kind| (kind, executor_for(kind))).collect(),
             _phantom: PhantomData,
         }
+    }
+
+    /// The executor of the kind stored as `kind` on a row, `None` for a tag
+    /// this build does not know (a row another weft version wrote).
+    pub fn get(&self, kind: &str) -> Option<Arc<dyn TaskExecutor<Ctx>>> {
+        self.inner.get(&crate::kinds::TaskKind::parse(kind)?).cloned()
     }
 }
 

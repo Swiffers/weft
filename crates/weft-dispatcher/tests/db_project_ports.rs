@@ -29,7 +29,7 @@ async fn free_port() -> u16 {
 
 #[sqlx::test]
 async fn a_named_port_is_refused_while_taken_and_kept_once_given(pool: PgPool) {
-    weft_dispatcher::app::apply_core_schema(&pool).await.expect("core schema");
+    weft_task_store::apply_groups(&pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let projects: weft_dispatcher::ProjectStore = std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     let (a, b) = (project(&projects).await, project(&projects).await);
     let ports = ProjectPorts::new(SocketAddr::from(([127, 0, 0, 1], 0)), None);

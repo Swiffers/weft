@@ -7,6 +7,8 @@ use clap::{Parser, Subcommand};
 mod client;
 mod credentials;
 mod commands;
+mod image_refs;
+mod startup;
 pub mod images;
 pub mod progress;
 pub mod prompt;
@@ -86,9 +88,9 @@ enum Cmd {
         #[arg(long)]
         referenced: bool,
     },
-    /// Make every shared image exist locally: the four system images
-    /// (dispatcher, listener, broker, infra-supervisor) plus the worker
-    /// builder-base and full-library worker, each under its content-addressed registry ref
+    /// Make every shared image exist locally: the runtime image (every
+    /// role weft has, in one), the worker builder base and the
+    /// full-library worker, each under its content-addressed registry ref
     /// (present -> pull -> build). `--push` then pushes every ref to
     /// its registry; the release workflow runs this on each push to the
     /// release branch, which is what lets every install pull instead of
@@ -558,9 +560,12 @@ enum Cmd {
     /// Print a summary of the cwd project's current state.
     /// Registration, listener, infra per-node, recent executions.
     Status,
-    /// Manage this machine's install (start, stop, status, restart,
-    /// logs): the runtime that owns projects, executions, and infra;
-    /// `weft run` and the VS Code extension talk to it over HTTP.
+    /// Manage a local install (start, stop, status, restart, logs,
+    /// remove, which): the runtime that owns projects, executions, and
+    /// infra; `weft run` and the VS Code extension talk to it over HTTP.
+    /// Which install is where you stand: the branch of the weft checkout
+    /// you are in (`main` is the default install), the default install
+    /// outside any, or the one WEFT_INSTALL names.
     #[command(visible_alias = "d")]
     Daemon {
         #[command(subcommand)]
@@ -807,6 +812,9 @@ enum Cmd {
     ///   <UUID>            one execution
     ///   --images          unreferenced worker images for the cwd project
     ///                     (use --all to span every project)
+    ///   --images --build-plane
+    ///                     the builder bases and node-test images no
+    ///                     install on this machine uses
     ///   --build-cache     drop the docker buildkit cache and the node-test cache
     ///   --all             with the journal subject: nuke every execution
     ///                     with --images: every project's images
@@ -847,10 +855,19 @@ enum Cmd {
         #[arg(long)]
         cancel_running: bool,
         /// Reclaim unreferenced worker images. Cwd-scoped unless
-        /// --all, which spans every project AND drops old builder-base
-        /// images (~1.4GB each; the next build re-makes the base).
+        /// --all, which spans every project AND drops the builder bases,
+        /// node-test images, runtime images, standard workers and worker
+        /// compile caches that no install on this machine uses (each
+        /// install records its own at `weft daemon start`; while one has
+        /// not, that kind is kept whole).
         #[arg(long, default_value_t = false)]
         images: bool,
+        /// With --images: only the build plane, the builder bases and
+        /// node-test images no install on this machine uses (kept whole
+        /// while an install has not recorded its own). Needs no running
+        /// install; setup.sh runs it after every start.
+        #[arg(long, requires = "images", conflicts_with_all = ["all", "build_cache", "execution_id"])]
+        build_plane: bool,
         /// Drop every build cache: the docker BuildKit cache and the
         /// host's node-test cache (heavy: the next build and the next
         /// `weft test-node` compile the engine and every dependency again).
@@ -1375,19 +1392,28 @@ enum DaemonAction {
     /// Stop weft's runtime and the workers it started. The database and
     /// the infra keep running.
     Stop,
-    /// Take a NAMED install (`WEFT_INSTALL`) off this machine, leaving
-    /// nothing of it: its projects, its workers and infra, its database,
-    /// its bucket. A named install lives beside the default one with
-    /// ports and files of its own, like a test cell;
-    /// `WEFT_INSTALL=<name> weft daemon start` brings one up (add
+    /// Take a NAMED install off this machine, leaving nothing of it: its
+    /// projects, its workers and infra, its database, its bucket, its
+    /// binaries. A named install lives beside the default one with ports
+    /// and files of its own: a branch checkout's (run this from that
+    /// checkout), or one `WEFT_INSTALL=<name>` names, like a test cell
+    /// (`WEFT_INSTALL=<name> weft daemon start` brings one up; add
     /// `WEFT_TIME_SCALE` to run its own timers faster). Refused for the
     /// default install, which `./setup.sh --uninstall` removes.
     Remove,
-    /// Report whether this machine's runtime is reachable (the install
-    /// WEFT_INSTALL names). `--on` and `--dispatcher` are refused;
-    /// WEFT_DISPATCHER_URL is ignored, it does not change which install
-    /// this reports on.
+    /// Report whether the runtime of the install this command acts on is
+    /// reachable, and its public address. `--on` and `--dispatcher` are
+    /// refused; WEFT_DISPATCHER_URL is ignored, it does not change which
+    /// install this reports on.
     Status,
+    /// Print which install a command run here acts on, and why: the one
+    /// WEFT_INSTALL names, else the one of the branch of the weft checkout
+    /// you stand in (`main` is the default install), else the default
+    /// install. Answers even when that install is not set up, and never
+    /// touches it. `--json` prints one object: name (null for the default
+    /// install), env (its WEFT_INSTALL value), dir, bin (its binaries'
+    /// folder), branch (when the checkout picked it), installed.
+    Which,
     /// Tail the runtime's log.
     Logs {
         /// Number of lines to print.
@@ -1679,6 +1705,7 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
             DaemonAction::Remove => commands::daemon::DaemonAction::Remove,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
+            DaemonAction::Which => commands::daemon::DaemonAction::Which,
             DaemonAction::Logs { tail, follow } => {
                 commands::daemon::DaemonAction::Logs { tail, follow }
             }
@@ -1743,8 +1770,7 @@ fn parse_phase(text: &str) -> Result<weft_core::context::Phase, String> {
     })
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     // Tab completion. The shell's completion script runs `weft` again
     // with `COMPLETE=<shell>` set and the words typed so far; this
     // answers with the candidates and exits, before anything else
@@ -1754,13 +1780,25 @@ async fn main() -> std::process::ExitCode {
     // The flags are parsed out here so a failure anywhere below can be
     // reported the way the caller asked for it: `--json` gets one
     // error event on stdout, a terminal gets one `error:` line.
-    if let Err(e) = prelude() {
-        progress::report_plain_error(false, &e);
-        return std::process::ExitCode::FAILURE;
-    }
+    let wanted = match prelude() {
+        Ok(wanted) => wanted,
+        Err(e) => {
+            progress::report_plain_error(false, &e);
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let cli = Cli::parse();
     let json = cli.json;
-    match run(cli).await {
+    // Started only now: the prelude writes this process's environment,
+    // which is sound only while no other thread can be reading it.
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            progress::report_plain_error(json, &anyhow::anyhow!("could not start the async runtime: {e}"));
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(cli, wanted)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         // A verb's progress channel already reported this one; a
         // second report would be the same message again.
@@ -1772,18 +1810,50 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-/// Everything that has to happen before the flags are read: the
-/// `.env` feeds the flags that read the environment.
-fn prelude() -> anyhow::Result<()> {
+/// Everything that has to happen before the flags are read, on the one
+/// thread this process has so far. Answers the install the command acts
+/// on, and what picked it.
+fn prelude() -> anyhow::Result<Result<weft_core::infra::Wanted, String>> {
+    // The front door, before anything else: a binary of one install hands
+    // a command for another install to that install's own `weft`
+    // (`startup::front_door`). Before the `.env` too, so the file the
+    // other binary reads is read once, by it; and a `.env` never picks the
+    // install, because the variable is set below before it loads.
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cannot read the working directory: {e}"))?;
+    let env_value = std::env::var(weft_core::infra::INSTALL_ENV).ok();
+    // Where no install can be picked (a checkout on no branch, as CI's
+    // is), there is nothing to hand the command to: this binary runs it,
+    // and only a command that acts on an install fails, with the reason
+    // (`weft_core::infra::mark_unresolved`). Validating a project there
+    // works.
+    let wanted = match startup::wanted_here(env_value.as_deref(), &cwd) {
+        Err(why) => {
+            weft_core::infra::mark_unresolved(format!("{why:#}"));
+            Err(format!("{why:#}"))
+        }
+        Ok((wanted, bin)) => {
+            let mine = weft_core::infra::Install::of_current_exe();
+            match startup::front_door(mine.as_ref(), &wanted, &bin, invoked_as_daemon_which()) {
+                startup::Door::Here => {}
+                startup::Door::Exec(path) => return Err(startup::exec(&path)),
+                startup::Door::Refuse(why) => anyhow::bail!("{why}"),
+            }
+            // From here every `Install::from_env` in this process, and
+            // every process it starts, names the same install; nothing
+            // derives it from a working directory again. No other thread
+            // runs yet (`main` starts the async runtime after this), which
+            // is what makes writing the environment sound.
+            std::env::set_var(weft_core::infra::INSTALL_ENV, wanted.install.env_value());
+            Ok(wanted)
+        }
+    };
+
     weft_core::net::install_crypto_provider();
     // Local overrides (the sealing key, ports, paths) come from the
-    // nearest `.env` up from the invoking directory. Real env vars win
-    // over the file; no file is normal; a malformed file fails loud.
-    match dotenvy::dotenv() {
-        Ok(_) => {}
-        Err(e) if e.not_found() => {}
-        Err(e) => anyhow::bail!("failed to load .env: {e}"),
-    }
+    // nearest `.env.local` and `.env` up from the invoking directory
+    // (`startup::env_files`). Real env vars win over the files; no file is
+    // normal; a malformed file fails loud.
+    startup::load_env_files(&startup::env_files(&cwd))?;
 
     // Logs go to stderr so stdout stays a clean channel for
     // machine-readable output (notably `--json`). The extension
@@ -1793,10 +1863,24 @@ fn prelude() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
         .init();
-    Ok(())
+    Ok(wanted)
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Whether this process was asked `weft daemon which`, which the front
+/// door lets any binary answer. Asked of clap itself, on the same
+/// arguments the real parse reads after it, so every spelling it accepts
+/// (the `d` alias, a global flag before the verb) is recognised the same
+/// way; a hand-rolled look at `argv` would drift from the grammar. Any
+/// parse failure is "no": the command is then whatever the real parse
+/// makes of it, after the front door.
+fn invoked_as_daemon_which() -> bool {
+    matches!(
+        Cli::try_parse_from(std::env::args_os()),
+        Ok(Cli { command: Cmd::Daemon { action: DaemonAction::Which }, .. })
+    )
+}
+
+async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyhow::Result<()> {
     let ctx = commands::Ctx::new(commands::Dispatcher::from_flag_or_env(cli.dispatcher), cli.on, cli.json)?;
 
     match cli.command {
@@ -1920,7 +2004,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Logs { target, limit } => commands::logs::run(ctx, target, limit).await,
         Cmd::Status => commands::status::run(ctx).await,
-        Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
+        Cmd::Daemon { action } => commands::daemon::run(ctx, action.into(), wanted.map_err(anyhow::Error::msg)?).await,
         Cmd::Infra { action } => action.run(ctx).await,
         Cmd::DescribeNodes { list, stdlib, node, compact } => {
             commands::describe_nodes::run(ctx, stdlib, node, compact, list).await
@@ -1984,8 +2068,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
         Cmd::Clean {
-            execution_id, keep_days, all, images, build_cache, project, instance, status, node, tag, cancel_running, yes,
+            execution_id, keep_days, all, images, build_plane, build_cache, project, instance, status, node, tag, cancel_running, yes,
         } => {
+            if build_plane {
+                return commands::executions::clean_build_plane().await;
+            }
             let narrow = commands::executions::CleanNarrowing { instance, status, node, tag, cancel_running };
             commands::executions::clean(
                 ctx, execution_id, keep_days, all, images, build_cache, project, narrow, yes,

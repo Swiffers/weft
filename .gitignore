@@ -1,7 +1,15 @@
 target/
 .env
+# This checkout's own settings, never shared between worktrees; they win
+# over .env (see .env.example).
+.env.local
 .env.dashboard
 .env.extension
+# The weft install ./setup.sh set up for this checkout (its folder), read
+# by the scripts and by the VS Code extension run from source.
+# SYNC: .weft-install <-> extension-vscode/src/localInstall.ts (CHECKOUT_INSTALL_FILE),
+#       scripts/lib/checkout-install.sh (weft_install_record), scripts/dev-editor.sh
+.weft-install
 # The deployment's OAuth apps (client ids + secrets). Copy
 # `access-apps.example.json` to this and fill it in.
 access-apps.json

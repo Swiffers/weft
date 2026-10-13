@@ -3,7 +3,9 @@
 #
 #   one.hold / two.hold   two waits in one run; `weft wake` resolves one at a time
 #   one.tick / two.tick   two registered triggers, each with its own display
-#   one.key  / two.key    the two names of the file's one access node
+#   one.key  / two.key    the two names of the file's one access node, each
+#                         holding the connection picked for it (first_key and
+#                         second_key show which)
 #
 # The compiler's own key for a node of the file (`@src:lib:part.hold`) is
 # refused everywhere a person types a name.
@@ -21,3 +23,9 @@ first.data = one.out
 
 second = Debug
 second.data = two.out
+
+first_key = Debug
+first_key.data = one.access
+
+second_key = Debug
+second_key.data = two.access

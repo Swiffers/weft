@@ -32,7 +32,7 @@ use crate::teardown::Teardown;
 
 /// Root of the committed fixtures directory, resolved from this crate's
 /// manifest dir so it is correct regardless of the test binary's cwd.
-fn fixtures_root() -> PathBuf {
+pub fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
@@ -444,10 +444,20 @@ impl Project {
     }
 }
 
-/// Create a fresh temp directory for a fixture copy. Uses the system temp dir
-/// plus a unique suffix so concurrent tests never share a path.
+/// Where this install's runs copy fixtures: a folder of the system temp
+/// dir per install under test, so the sweep ([`crate::cleanup`]) removes
+/// this install's copies and never those of a project another branch's
+/// run kept.
+pub(crate) fn fixture_copies_dir() -> Result<PathBuf> {
+    let install = crate::ensure::install_under_test()?;
+    Ok(std::env::temp_dir().join(format!("weft-e2e-copies-{}", install.env_value())))
+}
+
+/// Create a fresh temp directory for a fixture copy, in
+/// [`fixture_copies_dir`] with a unique suffix so concurrent tests never
+/// share a path.
 fn unique_tempdir(fixture: &str) -> Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!("weft-e2e-{fixture}-{}", Uuid::new_v4()));
+    let base = fixture_copies_dir()?.join(format!("{fixture}-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base)
         .with_context(|| format!("create temp dir {}", base.display()))?;
     Ok(base)

@@ -16,7 +16,7 @@
 
 import * as vscode from 'vscode';
 import * as nodePath from 'node:path';
-import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 
 import { DispatcherClient, HttpError } from './dispatcher';
 import { GraphViewController } from './graphView';
@@ -32,14 +32,14 @@ import { fetchRunningSource, installAccess, listTargets, onArgs, type InstallTar
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
 import { ExecutionsProvider, ExecutionNode, RunNode, VersionNode, type ExecutionSummary } from './sidebar/executions';
 import { parseRunSearch } from './sidebar/runSearch';
-import { runWeftJson, WeftCliError } from './cli';
+import { chooseCli, runWeftJson, spawnWeft, WeftCliError } from './cli';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
 import { Presence } from './presence';
 import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation, TriggerChoiceIntent } from '../../packages/weft-graph/src/protocol';
 import { LOCAL_INSTALL } from '../../packages/weft-graph/src/protocol';
-import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint } from './localInstall';
+import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint, whichCli, type WhichCli } from './localInstall';
 import { isTriggerChoiceRefusal, triggerChoiceIntent } from './triggerChoice';
 import {
   emptyActionAvailability,
@@ -50,12 +50,18 @@ import {
 import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
+  // Which `weft` this window runs, and so which install it talks to:
+  // settled before anything spawns the CLI or reads the address.
+  const cli = whichCli(context.extensionMode === vscode.ExtensionMode.Development, context.extensionPath);
+  chooseCli(cli);
+  if ('error' in cli) void vscode.window.showErrorMessage(`weft: ${cli.error}`);
+
   const dispatcher = new DispatcherClient();
   // Before any provider asks it anything. With no address (a named
   // install never started) the extension still activates: requests fail
   // with the reason, and the ports.json watcher below points it again
   // once the install starts.
-  pointAtLocal(dispatcher);
+  pointAtLocal(dispatcher, cli);
 
   // One warm `weft parse-server` for the whole extension. Both the graph
   // view (live graph) and diagnostics (Problems panel) parse/validate
@@ -365,7 +371,7 @@ export function activate(context: vscode.ExtensionContext) {
   function backToLocal(projectId: string): void {
     install = { projectId, name: LOCAL_INSTALL, version: null, diskVersion: null, root: null };
     installError = null;
-    pointAtLocal(dispatcher);
+    pointAtLocal(dispatcher, cli);
   }
 
   /// The install `projectId` is looked at on: every read and verb for it
@@ -941,7 +947,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   const cliTracking = new Map<
     string,
-    { child: ReturnType<typeof spawn>; userKilled: boolean }
+    { child: ChildProcess; userKilled: boolean }
   >();
 
   function killCliFor(projectId: string): void {
@@ -1153,7 +1159,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// runWeftCliJson instead.
   async function runWeftCliCapture(args: string[], cwd: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      const child = spawn('weft', args, { cwd, env: process.env });
+      const child = spawnWeft(args, { cwd });
       let stdout = '';
       const channel = getWeftOutputChannel();
       child.stdout?.on('data', (b: Buffer) => { stdout += b.toString(); });
@@ -1203,9 +1209,8 @@ export function activate(context: vscode.ExtensionContext) {
     };
     say(`> ${command}  (${cwd})\n`);
     return new Promise((resolve, reject) => {
-      const child = spawn('weft', fullArgs, {
+      const child = spawnWeft(fullArgs, {
         cwd,
-        env: process.env,
         detached: process.platform !== 'win32',
       });
       cliTracking.set(projectId, { child, userKilled: false });
@@ -1747,7 +1752,7 @@ export function activate(context: vscode.ExtensionContext) {
   // target's is its project's.
   const followLocalAddress = () => {
     if (pinnedProject && installOf(pinnedProject.id) !== LOCAL_INSTALL) return;
-    pointAtLocal(dispatcher);
+    pointAtLocal(dispatcher, cli);
   };
 
   context.subscriptions.push(
@@ -1758,17 +1763,18 @@ export function activate(context: vscode.ExtensionContext) {
       // its project's.
       if (e.affectsConfiguration('weft.dispatcherUrl')) followLocalAddress();
     }),
-    // A `weft daemon start` on another port while VS Code is open moves
-    // the local install; follow it without a reload.
-    (() => {
-      const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(vscode.Uri.file(installDir()), 'ports.json'),
-      );
-      watcher.onDidCreate(followLocalAddress);
-      watcher.onDidChange(followLocalAddress);
-      return watcher;
-    })(),
   );
+  // A `weft daemon start` on another port while VS Code is open moves
+  // the local install; follow it without a reload. With no CLI there is
+  // no install to follow (the reason was shown).
+  if (!('error' in cli)) {
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(installDir(cli.env)), 'ports.json'),
+    );
+    watcher.onDidCreate(followLocalAddress);
+    watcher.onDidChange(followLocalAddress);
+    context.subscriptions.push(watcher);
+  }
 
   // Kick off first refreshes in the background.
   void projectsProvider.refresh();
@@ -1785,10 +1791,15 @@ let lastUnavailableShown: string | undefined;
 // it, else the port the install saved. The setting has no default in
 // package.json so that an unset one reads as undefined here. With no
 // address, the client is left unavailable with the reason and the
-// person is told, never pointed somewhere else.
-function pointAtLocal(dispatcher: DispatcherClient): void {
+// person is told, never pointed somewhere else. The install is the one
+// this window's `weft` acts on (`cli.env`); with no CLI there is none.
+function pointAtLocal(dispatcher: DispatcherClient, cli: WhichCli): void {
+  if ('error' in cli) {
+    dispatcher.setUnavailable(`weft: ${cli.error}`);
+    return;
+  }
   const setting = vscode.workspace.getConfiguration('weft').get<string>('dispatcherUrl');
-  const address = localAddress(setting);
+  const address = localAddress(setting, cli.env);
   if (address.ignoredSetting && !retiredSettingNoticed) {
     retiredSettingNoticed = true;
     void noticeRetiredSetting();
@@ -1805,7 +1816,7 @@ function pointAtLocal(dispatcher: DispatcherClient): void {
     return;
   }
   lastUnavailableShown = undefined;
-  dispatcher.setInstall(address.url, undefined, unreachableHint(setting));
+  dispatcher.setInstall(address.url, undefined, unreachableHint(setting, cli.env));
 }
 
 // The setting holds the old default, which no install answers on: it is

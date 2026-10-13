@@ -3,18 +3,30 @@
 # machine.
 #
 # By default, runs the install pipeline for the everyday loop:
-#   - CLI                  (cargo build, symlink into ~/.local/bin)
+#   - CLI                  (cargo build, copied into the install's bin
+#                          folder; on main, also linked into ~/.local/bin)
 #   - Daemon               (bring the local install up, or refresh it:
 #                          Postgres, the object store, and weft's
 #                          runtime restarted on the new binary)
 #   - VS Code extension    (compile, package .vsix, install into VS Code)
 #
+# Which install: the branch this checkout is on decides. On `main` it is
+# the default install, the one `weft` on your PATH drives. On any other
+# branch it is that branch's own install, beside the default one with its
+# own database, ports and binaries (in ~/.local/share/weft/installs/<name>),
+# so you can build and test a branch without touching main's. A branch
+# always builds from source (the published build is main's), and skips
+# the VS Code and browser extensions: to try the editor on a branch, run
+# scripts/dev-editor.sh. Inside the checkout, `weft` hands over to the
+# branch's own binary by itself. The install this run set up is recorded
+# in .weft-install, which the other scripts read.
+#
 # The browser extension is OPT-IN via `--browser` since rebuilding
 # it signs Firefox and builds every target, which is heavier than
 # most rebuild loops need.
 #
-# Prebuilt artifacts: on a CLEAN checkout of a commit CI has already
-# built (the rolling `latest` release), the CLI and runtime binaries
+# Prebuilt artifacts: on a CLEAN checkout of main at a commit CI has
+# already built (the rolling `latest` release), the CLI and runtime binaries
 # and the .vsix are downloaded instead of compiled and the shared
 # images are pulled from the registry, so a fresh install needs no Rust or Node
 # toolchain and takes minutes, not tens of minutes. Any local change
@@ -30,7 +42,10 @@
 #     build caches: the BuildKit cache to 20GB (LRU) and the workspace
 #     target/ (WEFT_TARGET_CAP_GB, default 15G; under the cap the
 #     incremental cache is untouched),
-#   - after the daemon refresh, `weft clean --images --all` reclaims
+#   - after the daemon refresh, `weft clean --images --build-plane`
+#     drops the builder bases and node-test images no install on this
+#     machine still records using, and `weft clean --images --all`
+#     reclaims
 #     every weft image nothing runs any more (unreferenced worker
 #     images, stale weft-infra-* tags, old builder bases and
 #     runtimes, and the worker compile cache this checkout used before
@@ -92,7 +107,9 @@
 #                   routes, the OAuth callback) through an outbound
 #                   tunnel, so provider event pushes reach this local
 #                   install. The management API is never on it.
-#                   Persisted across runs.
+#                   Persisted across runs, per install: a branch's
+#                   install opens its own (its own named tunnel when the
+#                   checkout's .env.local names one, else a quick one).
 #   --no-public-url close it again.
 #
 # Browser-target flags (default: every browser):
@@ -124,7 +141,8 @@
 #                     table.
 #   --release         With --migration: write the one released migration,
 #                     the one that goes in the PR, and bring your database
-#                     along: if it ran drafts, it is told the release is
+#                     (this checkout's install's) along: if it ran
+#                     drafts, it is told the release is
 #                     already in it; if it never saw one, the release runs
 #                     on it now. One command either way, nothing is lost.
 #   --rename SPEC     With --migration: a rename, which no diff can tell
@@ -137,8 +155,10 @@
 #                     are separate things.
 #
 # Removal:
-#   --uninstall   Remove user-facing pieces but preserve work. Stops
-#                 weft's runtime and takes it off the service manager,
+#   --uninstall   Remove the default install's user-facing pieces but
+#                 preserve work (a branch's install goes with
+#                 scripts/remove-worktree.sh instead). Stops every
+#                 install's runtime and takes it off the service manager,
 #                 uninstalls the VS Code extension, drops the CLI and
 #                 the runtime binary. PRESERVES: the Postgres container
 #                 and its files, the object-store container + its data
@@ -154,7 +174,9 @@
 #                 seaweedfs image, the BuildKit cache, the workspace
 #                 target/ cargo cache, ~/.local/share/weft (THE
 #                 DATABASE'S FILES under postgres-data/, the install's
-#                 config and keys, prebuilt binaries), and the
+#                 config and keys, prebuilt binaries, and every branch's
+#                 install under installs/), this checkout's
+#                 .weft-install, and the
 #                 untracked extension build artifacts. Also deletes the
 #                 Kubernetes cluster an older weft ran, if this machine
 #                 still has it. The next install pays a full
@@ -190,15 +212,16 @@ orig_args="$*"
 # Single source so install, version-probe, and uninstall can never drift (a
 # stale `weavemindai.` typo made --uninstall silently match nothing).
 ext_id="weavemind.weft-vscode"
-# Where the default install answers (its API and dashboard): the public
-# port it saved in ports.json when it started, so a port moved once stays
-# found. Before its first start, the port that start will take.
+# Where this run's install answers (its API and dashboard): the public
+# port it saved in its ports.json when it started, so a port moved once
+# stays found. Before its first start, the port that start will take.
+# Only called once the install is known (install_dir, below).
 # SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC, InstallPorts),
 # extension-vscode/src/localInstall.ts,
 # extension-browser/src/entrypoints/popup/App.svelte
 weft_local_url() {
   local saved
-  saved="$(sed -n 's/.*"public":\([0-9]*\).*/\1/p' "${HOME}/.local/share/weft/ports.json" 2>/dev/null || true)"
+  saved="$(sed -n 's/.*"public":\([0-9]*\).*/\1/p' "${install_dir}/ports.json" 2>/dev/null || true)"
   printf 'http://127.0.0.1:%s' "${saved:-${WEFT_PUBLIC_PORT:-14111}}"
 }
 
@@ -335,6 +358,18 @@ sha256() {
 # what --uninstall / --purge remove, shared with scripts/scrub-old-install.sh.
 # shellcheck source=scripts/lib/weft-cleanup.sh
 . "${here}/scripts/lib/weft-cleanup.sh"
+# with_build_slot (one heavy cargo build at a time on this machine), and
+# machine_lock_release_mine for the exit.
+# shellcheck source=scripts/lib/machine-lock.sh
+. "${here}/scripts/lib/machine-lock.sh"
+# weft_which (which install a weft binary acts on from this checkout)
+# and weft_record_checkout_install (.weft-install).
+# shellcheck source=scripts/lib/checkout-install.sh
+. "${here}/scripts/lib/checkout-install.sh"
+# weft_vscode_link_borrowers and weft_vscode_compile, shared with
+# scripts/dev-editor.sh.
+# shellcheck source=scripts/lib/vscode-build.sh
+. "${here}/scripts/lib/vscode-build.sh"
 
 # One docker-daemon reachability probe, the same shape everywhere it
 # gates a best-effort action. (The --purge refusal keeps its own
@@ -354,14 +389,6 @@ docker_server_major() {
   { docker version --format '{{.Server.Version}}' 2>/dev/null || true; } | cut -d. -f1
 }
 
-# The images an ENGINE change strands: the builder base and the
-# node-test image bake the engine crates in. Worker images bake it in
-# too, but a running project still USES its old-engine image until the
-# user resyncs it, so workers are NOT swept here: `weft clean --images
-# --all` (run after the daemon refresh) reclaims exactly the ones the
-# dispatcher's referenced set no longer covers and keeps the rest.
-build_plane_repos_re='^(weft-builder-base|weft-node-tests)$'
-
 # Remove a directory tree and report: ok exactly when it is gone,
 # warn when something survived. ONE shape for every best-effort tree
 # removal, so partial removals never print as success.
@@ -379,9 +406,16 @@ remove_dir_reporting() { # path label [ok_note] [fail_note]
   fi
 }
 
-# Drop everything an engine change strands: the tagged build-plane
-# images (builder base + node-test image) on host docker, and the
-# node-test cargo cache under target/tmp.
+# Drop the node-test cargo cache under target/tmp, which an engine change
+# strands (it bakes the engine crates in). The images an engine change
+# strands (the builder base and the node-test image) are NOT this
+# function's: they are shared by every install on the machine, so only
+# `weft clean --images --build-plane`, which keeps every image any
+# install still records using, removes them (after the daemon refresh,
+# below). Worker images bake the engine too, but a running project keeps
+# using its old-engine image until the user resyncs it, so those go
+# through `weft clean --images --all`, which keeps everything the
+# dispatcher's referenced set still covers.
 #
 # NOT the BuildKit cache. This used to run an unbounded
 # `docker builder prune --force` here, on the theory that every cargo
@@ -397,38 +431,7 @@ remove_dir_reporting() { # path label [ok_note] [fail_note]
 # real work in it. The 20 GB LRU bound the CLI section applies is what
 # keeps the dead layers from accumulating, and being least recently
 # used is exactly what makes them the ones it drops.
-#
-# Worker images are deliberately NOT this sweep's to take:
-# a running project keeps using its old-engine image until the user
-# resyncs it, so those go through `weft clean --images --all` (the
-# daemon-refresh step below), which keeps everything the dispatcher's
-# referenced set still covers. Best effort throughout: a --cli install
-# must finish even with the docker daemon down; the loud bounded prune
-# earlier in the CLI section is the one that fails visibly. Best-effort
-# still SPEAKS: a removal that could not happen warns instead of
-# printing success over it.
-sweep_stale_build_plane() {
-  # One probe up front: with docker down, every docker step below
-  # would either lie ("no X to remove" over an unanswerable daemon) or
-  # repeat the same warn. Say it once and keep the non-docker cleanup.
-  local docker_up=1
-  docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || docker_up=0
-  if [[ ${docker_up} -eq 0 ]]; then
-    warn "docker unreachable; the stale build-plane images and the BuildKit cache stay until the next install with docker up"
-    remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
-      " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
-    return 0
-  fi
-  local ids
-  if ids="$(weft_image_ids "${build_plane_repos_re}")"; then
-    remove_docker_images_by_id "stale build-plane images" "${ids}" \
-      " ${C_DIM}(weft-builder-base / weft-node-tests, host docker)${C_RESET}" \
-      "still referenced by a container? they go on a later install"
-  else
-    # The daemon answered the probe above but not this listing: never
-    # turn that into "nothing to remove".
-    warn "could not list the stale build-plane images; they go on a later install"
-  fi
+sweep_stale_node_test_cache() {
   remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
     " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
 }
@@ -589,7 +592,7 @@ targets_flip() {
 # Installed BEFORE argument parsing so even a bad-flag exit is
 # recorded; the EXIT trap logs the exit code and the LAST section
 # entered, so a partial run names where it stopped.
-run_log_dir="${HOME}/.local/share/weft"
+run_log_dir="${weft_state_dir}"
 run_log="${run_log_dir}/setup-runs.log"
 # Best-effort at both ends: the journal is a diagnostic aid, and a
 # root-owned ~/.local/share/weft (docker can auto-create such entries)
@@ -615,6 +618,9 @@ current_section="(argument parsing)"
 bump_pending_notes=()
 log_run_exit() {
   local code="${1:-$?}"
+  # A build slot this run still holds (it died mid-build) goes back
+  # first, so a waiting run elsewhere does not sit on it.
+  machine_lock_release_mine
   if [[ ${code} -eq 0 ]]; then
     printf '%s DONE  ok\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${run_log}"
   else
@@ -754,14 +760,14 @@ else
   fi
 fi
 
-# The full default install (CLI + daemon + VS Code, no browser), the
-# one shape that gets the post-install summary. Computed ONCE, here,
+# The full install (CLI + daemon + VS Code, no browser), the one shape
+# that gets the post-install summary. Computed ONCE, here,
 # where every component flag is final; an uninstall/purge run is never
 # an install, whatever the component defaults say.
-is_default_install=0
+is_full_install=0
 if [[ $do_uninstall -eq 0 && $do_purge -eq 0 \
   && $build_cli -eq 1 && $refresh_daemon -eq 1 && $build_vscode -eq 1 && $build_browser -eq 0 ]]; then
-  is_default_install=1
+  is_full_install=1
 fi
 
 # The journal's START line, after parsing so a --help read never
@@ -792,16 +798,10 @@ hint "installing from ${C_BOLD}${here}${C_RESET}"
 #       values, the vsix `mv` target, the release job's manifest
 #       generation, release-macos), scripts/release-cli.sh
 release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/latest"
-prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
-# THE home of the `weft` binary on PATH, whichever path produced it:
-# downloaded prebuilt, or copied here out of target/ after a local
-# build. One home means `weft_bin` is always a link to one stable
-# place, so no build cache is ever load-bearing.
-installed_bin_dir="${HOME}/.local/share/weft/bin"
-installed_bin="${installed_bin_dir}/weft"
-# weft's runtime, which `weft daemon start` runs from beside the CLI.
-# SYNC: the runtime's home <-> crates/weft-cli/src/commands/daemon.rs (runtime_binary)
-installed_runtime="${installed_bin_dir}/weft-runtime"
+# Where downloads land before they are installed: shared by every
+# checkout, and only ever main's release, which only the default install
+# runs.
+prebuilt_dir="${weft_state_dir}/prebuilt"
 prebuilt_commit=""
 prebuilt_vscode_version=""
 use_prebuilt_cli=0
@@ -833,6 +833,12 @@ manifest_value() {
 # plus the shas + version the install sections consume; every path that
 # declines says why.
 decide_prebuilt_use() {
+  if [[ -n "${write_migration}" ]]; then
+    # The migration lands in the source this run, and the runtime
+    # carries every migration in its binary: the published one cannot.
+    hint "--migration adds a migration to the source; building locally"
+    return 0
+  fi
   if ! git -C "${here}" rev-parse HEAD >/dev/null 2>&1; then
     hint "not a git checkout, so no published build can be matched; building locally"
     return 0
@@ -961,50 +967,14 @@ acquire_prebuilt() {
   return 1
 }
 
-# ---- run history in a shape this version cannot read --------------------
-#
-# Runs are stored as a row each (`run`) and their records (`run_log`); the
-# shape before it (`exec_event`) is not carried over: the migration that
-# brings the database forward drops it. So an install whose database still
-# holds it says what goes and asks first, then wipes it before anything
-# else changes (a release of a migration runs it on that database too).
-if [[ $refresh_daemon -eq 1 || -n "${write_migration}" ]] && command -v docker >/dev/null 2>&1; then
-  if ! old_run_history="$(weft_old_run_history)"; then
-    fail "could not reach the install's Postgres (the weft-postgres container) to check how it stores runs; see: docker logs weft-postgres"
-    exit 1
-  fi
-  if [[ "${old_run_history}" == "yes" ]]; then
-    section "Run history"
-    warn "This upgrade changes how weft stores past runs, and the runs already"
-    warn "stored cannot be carried over. Upgrading wipes:"
-    warn "  - every past run, its events, logs and search entries"
-    warn "  - events waiting for a parked trigger"
-    warn "It keeps everything else: your projects and their code, their settings,"
-    warn "connections, installs, infra and its data."
-    if [[ $assume_yes -eq 0 ]]; then
-      if [[ ! -t 0 ]]; then
-        fail "no terminal to ask on; run ./setup.sh --yes to wipe the run history and upgrade"
-        exit 1
-      fi
-      # End of input (Ctrl-D) is a no: under set -e a failed read would
-      # otherwise end the run without a word.
-      read -r -p "  Wipe the run history and upgrade? [y/N] " answer || answer=n
-      if [[ "${answer}" != "y" && "${answer}" != "Y" ]]; then
-        hint "nothing changed; run ./setup.sh again when you are ready (--yes answers this for you)"
-        exit 1
-      fi
-    fi
-    weft_wipe_old_run_history || { fail "the run history could not be wiped; nothing changed (it is one transaction); see above"; exit 1; }
-    ok "the run history is wiped; upgrading"
-  fi
-fi
-
 # ---- --migration: write the migration, then carry on installing -------
 #
 # Writing it needs a Postgres to build two schemas in and compare them, which
 # must not be the one weft runs, so this runs a throwaway container and takes
-# it away again. Releasing also needs to reach the real one (the local
-# install's), to swap its drafts for the released file.
+# it away again. Releasing also needs to reach the real one (this checkout's
+# install's), to swap its drafts for the released file; the generator finds
+# that one itself, the same way `weft` picks the install from where it runs,
+# which is why it runs from this checkout.
 if [[ ${#migration_renames[@]} -gt 0 && -z "${write_migration}" ]]; then
   fail "--rename and --unrelated only mean something with --migration <name>"
   exit 1
@@ -1017,8 +987,8 @@ fi
 if [[ -n "${write_migration}" ]]; then
   section "migration"
   # Everything this run's shape needs, named up front instead of a
-  # bare command-not-found mid-run: cargo (the schema generators
-  # compile even when the CLI came prebuilt) and docker (the throwaway
+  # bare command-not-found mid-run: cargo (the schema generator
+  # compiles from source) and docker (the throwaway
   # scratch postgres).
   migration_missing=""
   command -v cargo >/dev/null 2>&1 || migration_missing="cargo (install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)"
@@ -1048,30 +1018,21 @@ if [[ -n "${write_migration}" ]]; then
   release_flag=""
   if [[ $do_release -eq 1 ]]; then
     release_flag="--release"
-    # The local install's own database, as its runtime reaches it.
-    # SYNC: secrets.env <-> crates/weft-cli/src/commands/daemon.rs (Install::secrets_path,
-    #       the WEFT_DATABASE_URL line), the Postgres container's name (weft-postgres)
-    live_url="$(sed -n 's/^WEFT_DATABASE_URL=//p' "${HOME}/.local/share/weft/secrets.env" 2>/dev/null || true)"
-    if [[ -z "${live_url}" ]] \
-      || [[ "$(docker inspect -f '{{.State.Running}}' weft-postgres 2>/dev/null)" != "true" ]]; then
-      fail "releasing has to reach the database you have been working against, and the local install's Postgres is not up (./setup.sh --daemon starts it)"
-      exit 1
-    fi
-    export WEFT_LIVE_DATABASE_URL="${live_url}"
   fi
-
-  # A failure in one crate leaves the other's release intact and this
-  # command re-runnable: the generator only deletes a crate's drafts
-  # after its released file is recorded on the live database, and a
-  # released crate answers "nothing changed" on the re-run.
-  for pkg in weft-dispatcher weft-broker; do
-    # SYNC: the example name <-> crates/weft-dispatcher/Cargo.toml, crates/weft-broker/Cargo.toml
-    if ! cargo run -q -p "${pkg}" --features db-tests --example "${pkg#weft-}_schema_migration" \
-        -- "${write_migration}" ${release_flag} ${migration_renames[@]+"${migration_renames[@]}"}; then
-      fail "writing the migration failed in ${pkg}; fix the cause and re-run the same command"
-      exit 1
-    fi
-  done
+  # One generator for every table the install's database holds. A
+  # failure leaves this command re-runnable: the generator only deletes
+  # the drafts after the released file is recorded on the live
+  # database, and a released change answers "nothing changed" on the
+  # re-run.
+  # SYNC: the example name <-> crates/weft-runtime/Cargo.toml ([[example]] schema_migration)
+  run_schema_migration() {
+    (cd "${here}" && cargo run -q -p weft-runtime --features db-tests --example schema_migration \
+      -- "${write_migration}" ${release_flag} ${migration_renames[@]+"${migration_renames[@]}"})
+  }
+  if ! with_build_slot run_schema_migration; then
+    fail "writing the migration failed; fix the cause and re-run the same command"
+    exit 1
+  fi
   migration_cleanup
   trap 'log_run_exit $?' EXIT
   hint "carrying on with the install, which applies it"
@@ -1095,6 +1056,158 @@ remove_completion_block() { # <rc file>
   kept="$(awk -v b="${completion_block_begin}" -v e="${completion_block_end}" \
     '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$1")" || return 1
   printf '%s\n' "${kept}" > "$1"
+}
+
+# The install this run acts on, as `weft daemon which` answers it from
+# this checkout (WEFT_INSTALL if set, else the checkout's branch: `main`
+# is the default install, any other branch its own), so nothing here
+# works it out a second time. Sets install_env / install_dir /
+# install_picked_by (what chose it, for messages), the two binaries'
+# homes in the install's bin folder, and on_default_install.
+# `too_old_fix` is what to tell the user when `weft` predates installs
+# per branch and cannot answer.
+# SYNC: WEFT_INSTALL <-> crates/weft-core/src/infra/install.rs (INSTALL_ENV)
+resolve_install() { # weft too_old_fix
+  local rc=0
+  weft_which "${here}" "$1" || rc=$?
+  if [[ $rc -eq 2 ]]; then
+    fail "$2"
+    exit 1
+  elif [[ $rc -ne 0 ]]; then
+    fail "could not ask $1 which install this checkout uses (its answer is above)"
+    exit 1
+  fi
+  install_env="${WHICH_ENV}"
+  install_dir="${WHICH_DIR}"
+  if [[ -n "${WHICH_BRANCH}" ]]; then
+    install_picked_by="this checkout's branch, ${WHICH_BRANCH}"
+  else
+    install_picked_by="WEFT_INSTALL=${WEFT_INSTALL:-}"
+  fi
+  # SYNC: the runtime's home <-> crates/weft-cli/src/commands/daemon.rs (runtime_binary)
+  installed_bin="${WHICH_BIN}/weft"
+  installed_runtime="${WHICH_BIN}/weft-runtime"
+  on_default_install=0
+  if [[ "${install_env}" == "default" ]]; then
+    on_default_install=1
+  fi
+  hint "install: ${C_BOLD}${install_env}${C_RESET}${C_DIM} (${install_dir})${C_RESET}"
+}
+
+# Put a binary at `dest`: copied to a temp beside it and renamed over
+# it, the same way download_verified lands a download. A `weft` that is
+# still running (the extension in another VS Code window, a `weft run`
+# in a terminal) holds the old file open, and overwriting it in place
+# fails with "Text file busy"; a rename swaps the path while every
+# running process keeps its old inode until it exits.
+install_binary() { # src dest
+  local src="$1" dest="$2" tmp err
+  mkdir -p "$(dirname "${dest}")"
+  tmp="${dest}.$$.build"
+  err="$(cp "${src}" "${tmp}" 2>&1 >/dev/null && chmod 0755 "${tmp}" && mv -f "${tmp}" "${dest}" 2>&1 >/dev/null)" || {
+    rm -f "${tmp}"
+    fail "could not install ${src} to ${dest}"
+    printf '%s\n' "${err}" >&2
+    exit 1
+  }
+}
+
+# Build the CLI and the runtime from this checkout into target/<profile>
+# (sets target_dir). Sources can change WHILE this script runs (an AI
+# session editing in parallel with a reinstall is the everyday case
+# here). cargo builds what existed when it started, so a source edit
+# landing mid-build ships a binary that is ALREADY stale, silently.
+# Build, then check whether any workspace source is newer than the
+# produced binary; if so, build again (once more is always enough: the
+# recheck is instant), and if it STILL moves, say so loudly instead of
+# pretending the install is current. Returns non-zero on a failed build.
+build_cli_from_source() {
+  local build_pass recheck_out
+  # A bare word, not an array: expanding an EMPTY array under `set -u`
+  # is fatal on bash 3.2 (macOS's /bin/bash), same idiom as
+  # ${rebuild_flag} elsewhere.
+  local release_flag=""
+  if [[ "${profile}" == "release" ]]; then
+    target_dir="${here}/target/release"
+    release_flag="--release"
+  else
+    target_dir="${here}/target/debug"
+  fi
+  for build_pass in 1 2 3; do
+    # Explicit, never left to `set -e`: the build slot runs this
+    # function as a condition, where errexit is off, and a failed build
+    # would otherwise go on to install whatever an earlier one left.
+    spin_passthrough "cargo build ${release_flag:+${release_flag} }-p weft-cli -p weft-runtime" \
+      cargo build ${release_flag} --manifest-path "${here}/Cargo.toml" -p weft-cli -p weft-runtime \
+      || return 1
+    if [[ ! -x "${target_dir}/weft" || ! -x "${target_dir}/weft-runtime" ]]; then
+      fail "build output missing: ${target_dir}/weft or ${target_dir}/weft-runtime"
+      exit 1
+    fi
+    # cargo's own freshness check is the authority on whether the
+    # binary matches the sources (mtime scans over the tree false-alarm
+    # on files that are not build inputs). A repeated build doing zero
+    # work == current; it doing work == a source edit landed mid-build
+    # and the first binary shipped stale, so loop. The `||` keeps a
+    # recheck FAILURE from dying silently under `set -e` (the
+    # assignment's status is cargo's), with the captured output shown
+    # instead of discarded.
+    recheck_out="$(cargo build ${release_flag} --manifest-path "${here}/Cargo.toml" -p weft-cli -p weft-runtime 2>&1)" || {
+      fail "the freshness recheck build failed (a source edit landed mid-build?)"
+      printf '%s\n' "${recheck_out}" >&2
+      exit 1
+    }
+    # [[:space:]], never \s: BSD grep (macOS) has no \s and would
+    # read the pattern as a literal, silently disabling this check.
+    if ! grep -q '^[[:space:]]*Compiling' <<<"${recheck_out}"; then
+      return 0
+    fi
+    if [[ "${build_pass}" -eq 3 ]]; then
+      fail "sources are still changing under the build; the installed binary does NOT include them. Re-run setup.sh once the edits settle."
+      exit 1
+    fi
+    hint "source changed during the build; building again"
+  done
+}
+
+# Fail listing every tool in `missing` (with its line in
+# `install_hints`), deduplicated, so one round trip installs them all.
+# Returns when nothing is missing.
+fail_on_missing_tools() { # section
+  [[ ${#missing[@]} -gt 0 ]] || return 0
+  local item s already
+  local seen=() unique_missing=() seen_hints=() unique_hints=()
+  # Dedupe (node + pnpm may be requested by multiple components).
+  for item in "${missing[@]}"; do
+    already=0
+    for s in "${seen[@]:-}"; do [[ "$s" == "$item" ]] && already=1; done
+    if [[ $already -eq 0 ]]; then
+      unique_missing+=("$item")
+      seen+=("$item")
+    fi
+  done
+  for item in "${install_hints[@]}"; do
+    already=0
+    for s in "${seen_hints[@]:-}"; do [[ "$s" == "$item" ]] && already=1; done
+    if [[ $already -eq 0 ]]; then
+      unique_hints+=("$item")
+      seen_hints+=("$item")
+    fi
+  done
+
+  section "$1"
+  fail "missing required tools:"
+  for item in "${unique_missing[@]}"; do
+    printf '    %s%s%s %s\n' "${C_RED}" "${SYM_ARROW}" "${C_RESET}" "${item}" >&2
+  done
+  printf '\n'
+  hint "install:"
+  for item in "${unique_hints[@]}"; do
+    printf '    %s%s%s\n' "${C_DIM}" "${item#  }" "${C_RESET}" >&2
+  done
+  printf '\n'
+  hint "re-run ${C_BOLD}./setup.sh${C_RESET}${C_DIM} once everything above is on PATH${C_RESET}"
+  exit 1
 }
 
 # ---- pre-flight: required binaries ----------------------------------
@@ -1123,87 +1236,62 @@ if [[ $do_uninstall -eq 0 && $do_purge -eq 0 ]]; then
     fi
   fi
 
-  # Prebuilt .vsix: no Node toolchain needed; the package is downloaded.
-  if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
-    node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
-    if [[ "${node_major}" -lt 20 ]]; then
-      missing+=("node 20+")
-      install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 20')")
-    fi
-    if ! command -v pnpm >/dev/null 2>&1; then
-      missing+=("pnpm")
-      install_hints+=("  pnpm:    npm i -g pnpm")
-    fi
-    if ! command -v code >/dev/null 2>&1; then
-      # Not fatal: we can still build the .vsix; the user just
-      # needs to install it manually. Surface as a soft warning
-      # later in the VS Code section, not a pre-flight failure.
-      :
-    fi
-  fi
-
-  if [[ $build_browser -eq 1 ]]; then
-    if ! command -v node >/dev/null 2>&1; then
-      missing+=("node 20+ (browser extension)")
-      install_hints+=("  Node:    https://nodejs.org/en/download")
-    fi
-    if ! command -v pnpm >/dev/null 2>&1; then
-      missing+=("pnpm (browser extension)")
-      install_hints+=("  pnpm:    npm i -g pnpm")
-    fi
-  fi
-
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    # Dedupe (node + pnpm may be requested by multiple components).
-    seen=()
-    unique_missing=()
-    for item in "${missing[@]}"; do
-      already=0
-      for s in "${seen[@]:-}"; do [[ "$s" == "$item" ]] && already=1; done
-      if [[ $already -eq 0 ]]; then
-        unique_missing+=("$item")
-        seen+=("$item")
-      fi
-    done
-    seen_hints=()
-    unique_hints=()
-    for item in "${install_hints[@]}"; do
-      already=0
-      for s in "${seen_hints[@]:-}"; do [[ "$s" == "$item" ]] && already=1; done
-      if [[ $already -eq 0 ]]; then
-        unique_hints+=("$item")
-        seen_hints+=("$item")
-      fi
-    done
-
-    section "Pre-flight"
-    fail "missing required tools:"
-    for m in "${unique_missing[@]}"; do
-      printf '    %s%s%s %s\n' "${C_RED}" "${SYM_ARROW}" "${C_RESET}" "${m}" >&2
-    done
-    printf '\n'
-    hint "install:"
-    for h in "${unique_hints[@]}"; do
-      printf '    %s%s%s\n' "${C_DIM}" "${h#  }" "${C_RESET}" >&2
-    done
-    printf '\n'
-    hint "re-run ${C_BOLD}./setup.sh${C_RESET}${C_DIM} once everything above is on PATH${C_RESET}"
-    exit 1
-  fi
+  # node and pnpm, for the extensions, are checked once the install is
+  # known: only the default install builds them.
+  fail_on_missing_tools "Pre-flight"
 fi
 
 # ---- uninstall / purge ----------------------------------------------
 
 if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
+  # --uninstall takes the DEFAULT install's pieces, and --purge every
+  # install on the machine, so both are refused from a checkout whose
+  # own install is another one (a branch's) rather than reaching past
+  # it. The default weft answers which install that is, or else the one
+  # this checkout recorded; WEFT_INSTALL=default says it is the default
+  # install you mean, with nothing to ask. With neither weft there (an
+  # uninstall finishing what an earlier one started), this checkout set
+  # up no install of its own.
+  uninstall_asker=""
+  if [[ -x "${weft_bin}" ]]; then
+    uninstall_asker="${weft_bin}"
+  elif [[ -f "${here}/${weft_install_record}" ]]; then
+    uninstall_asker="$(head -n1 "${here}/${weft_install_record}" | tr -d '\r')/bin/weft"
+    [[ -x "${uninstall_asker}" ]] || uninstall_asker=""
+  fi
+  if [[ "${WEFT_INSTALL:-}" == "default" ]]; then
+    uninstall_asker=""
+  elif [[ -z "${uninstall_asker}" && -n "${WEFT_INSTALL:-}" ]]; then
+    fail "WEFT_INSTALL=${WEFT_INSTALL} names another install than the default one, which --uninstall and --purge take; unset it, or remove that install with ${C_BOLD}weft daemon remove${C_RESET}"
+    exit 1
+  fi
+  if [[ -n "${uninstall_asker}" ]]; then
+    resolve_install "${uninstall_asker}" "${uninstall_asker} is older than installs per branch, so it cannot say whether this checkout uses the default install. If it is the default install you mean to take off, say so: ${C_BOLD}WEFT_INSTALL=default ./setup.sh ${orig_args}${C_RESET}"
+    if [[ $on_default_install -eq 0 ]]; then
+      if [[ $do_purge -eq 1 ]]; then
+        fail "this run's install is ${install_env} (picked by ${install_picked_by}), and --purge wipes every install on this machine, the default one and every branch's, with all their data. To take only this install off, run ${C_BOLD}scripts/remove-worktree.sh ${here}${C_RESET} (or ${C_BOLD}weft daemon remove${C_RESET} in this checkout to keep the worktree); to purge everything, run it from your main checkout"
+      else
+        fail "this run's install is ${install_env} (picked by ${install_picked_by}); --uninstall removes the default install. To take this install off, run ${C_BOLD}scripts/remove-worktree.sh ${here}${C_RESET} (or ${C_BOLD}weft daemon remove${C_RESET} in this checkout to keep the worktree)"
+      fi
+      exit 1
+    fi
+  else
+    # SYNC: the default install's bin folder <-> crates/weft-core/src/infra/install.rs (Install::bin_dir)
+    installed_bin="${weft_state_dir}/bin/weft"
+    installed_runtime="${weft_state_dir}/bin/weft-runtime"
+  fi
+
   if [[ $do_uninstall -eq 1 ]]; then
     section "Uninstall"
     hint "${C_DIM}preserving data; pass --purge to wipe everything${C_RESET}"
 
     # 1. Stop weft's runtime, then take it off the service manager so
     #    it does not come back at the next login. Best-effort: a
-    #    missing CLI or an already-stopped runtime doesn't fail.
+    #    missing CLI or an already-stopped runtime doesn't fail. Named
+    #    as the default install and run from this checkout, so the front
+    #    door never hands over to another install.
     if command -v "${weft_bin}" >/dev/null 2>&1 || [[ -L "${weft_bin}" ]]; then
-      if "${weft_bin}" daemon stop >/dev/null 2>&1; then
+      if (cd "${here}" && WEFT_INSTALL=default "${weft_bin}" daemon stop) >/dev/null 2>&1; then
         ok "weft's runtime stopped (data kept)"
       else
         hint "weft's runtime: already stopped; nothing to stop"
@@ -1227,13 +1315,13 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         # is nothing there.
         if code_ipc "${live_sock}" 180 --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
           ok "VS Code extension uninstalled"
-          rm -f "${HOME}/.local/share/weft/vscode-hashes/installed.sha"
+          rm -f "${weft_state_dir}/vscode-hashes/installed.sha"
         else
           hint "VS Code extension: not installed, or the window was busy; if it is still there: code --uninstall-extension ${ext_id}"
         fi
       elif with_deadline 180 code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
         ok "VS Code extension uninstalled"
-        rm -f "${HOME}/.local/share/weft/vscode-hashes/installed.sha"
+        rm -f "${weft_state_dir}/vscode-hashes/installed.sha"
       else
         # With no live window this path also fires for "not
         # installed"; the hedge is honest here.
@@ -1380,6 +1468,9 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     remove_dir_reporting "${here}/.weft-base-context" "${C_DIM}.weft-base-context/${C_RESET}" \
       " ${C_DIM}(builder-base staging context)${C_RESET}" "; remove it by hand: rm -rf ${here}/.weft-base-context"
     remove_dir_reporting "${here}/.weft-base-context.lock" "${C_DIM}.weft-base-context.lock${C_RESET}"
+    # The record of which install this checkout set up: every install
+    # goes below.
+    remove_dir_reporting "${here}/${weft_install_record}" "${C_DIM}${weft_install_record}${C_RESET}"
 
     # 4. Daemon-local state, every install's database among it.
     if [[ -d "${weft_state_dir}" ]]; then
@@ -1538,7 +1629,6 @@ fi
 
 if [[ $build_cli -eq 1 ]]; then
   section "CLI"
-  mkdir -p "${bin_dir}"
 
   # ---- disk hygiene, BEFORE the build -------------------------------
   #
@@ -1619,17 +1709,14 @@ if [[ $build_cli -eq 1 ]]; then
   fi
 
   # Prebuilt path: this checkout matches the commit CI built, so the
-  # published binary IS this source compiled. A failed download drops
-  # to the local build when a toolchain is there (the same
-  # present -> pull -> build ladder the daemon images use).
+  # published binary IS this source compiled. It lands in the shared
+  # prebuilt folder first: the published build is main's, and only the
+  # binary's own answer below says whether this checkout is on main. A
+  # failed download drops to the local build when a toolchain is there
+  # (the same present -> pull -> build ladder the daemon images use).
   if [[ $use_prebuilt_cli -eq 1 ]]; then
-    # Byte-identity lives in `acquire_prebuilt` (keyed on the PREBUILT
-    # FILE, not on what the symlink points at: the link and the
-    # recorded repo location must refresh even when the bytes are
-    # already right, since this checkout may be a different clone than
-    # the one that downloaded them).
-    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${installed_bin}" 0755 \
-      || ! acquire_prebuilt "${runtime_asset}" "${runtime_sha256}" "${installed_runtime}" 0755; then
+    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${prebuilt_dir}/${cli_asset}" 0755 \
+      || ! acquire_prebuilt "${runtime_asset}" "${runtime_sha256}" "${prebuilt_dir}/${runtime_asset}" 0755; then
       use_prebuilt_cli=0
       if command -v cargo >/dev/null 2>&1; then
         warn "prebuilt CLI download failed; building locally instead"
@@ -1640,174 +1727,205 @@ if [[ $build_cli -eq 1 ]]; then
       fi
     fi
   fi
+  # The binary this run installs is the one that says where it goes:
+  # the download, unless it answers with an install other than the
+  # default one, which always builds from source (the published build
+  # is the default install's); then the build, asked again.
   if [[ $use_prebuilt_cli -eq 1 ]]; then
-    # A prebuilt binary bakes its BUILDER's checkout path as its
-    # compile-time repo location, which does not exist here; record
-    # where the repo actually lives (THIS tree, every run, so a moved
-    # or re-cloned checkout re-points it) so the binary can find its
-    # own catalog / manifests / build context. Written BEFORE the
-    # symlink lands on PATH: the other order could publish a weft that
-    # cannot find its checkout. Loud on failure WITH the recovery.
-    # SYNC: repo-root file <-> crates/weft-catalog/src/lib.rs (weft_repo_root), crates/weft-cli/src/commands/daemon.rs (record_repo_root)
-    repo_root_file="${HOME}/.local/share/weft/repo-root"
+    resolve_install "${prebuilt_dir}/${cli_asset}" "the published weft (${prebuilt_dir}/${cli_asset}) has no ${C_BOLD}weft daemon which${C_RESET}, though it was built from this very source; re-run with ${C_BOLD}--from-source${C_RESET} and report it"
+    if [[ $on_default_install -eq 1 ]]; then
+      new_cli="${prebuilt_dir}/${cli_asset}"
+      new_runtime="${prebuilt_dir}/${runtime_asset}"
+    else
+      use_prebuilt_cli=0
+      if ! command -v cargo >/dev/null 2>&1; then
+        fail "this run's install is ${install_env} (picked by ${install_picked_by}), which always builds from source (the published build is the default install's), and no Rust toolchain is on PATH"
+        exit 1
+      fi
+      hint "this run's install is ${install_env} (picked by ${install_picked_by}), which always builds from source (the published build is the default install's)"
+    fi
+  fi
+
+  if [[ $use_prebuilt_cli -eq 0 ]]; then
+    hint "${C_DIM}cargo's incremental cache makes re-runs near-instant${C_RESET}"
+    # One heavy build at a time on this machine (parallel worktrees
+    # once ran it out of memory): a run that finds another building
+    # says so and waits its turn.
+    with_build_slot build_cli_from_source
+    new_cli="${target_dir}/weft"
+    new_runtime="${target_dir}/weft-runtime"
+    # An unplaced binary (one in target/) answers for the checkout it
+    # runs in, which is how this run learns where to install before
+    # anything is installed.
+    resolve_install "${new_cli}" "${new_cli}, just built from this checkout, has no ${C_BOLD}weft daemon which${C_RESET}; is this checkout older than installs per branch? Then use the setup.sh that came with it"
+  fi
+else
+  # This run builds no CLI, so the install's own weft, through the
+  # default install's front door, says which install this checkout uses.
+  if [[ ! -x "${weft_bin}" ]]; then
+    fail "no weft at ${weft_bin} to ask which install this checkout uses; run ./setup.sh with --cli (or no component flags) first"
+    exit 1
+  fi
+  resolve_install "${weft_bin}" "${weft_bin} is older than installs per branch, so it cannot say which install this checkout uses. Run a full ${C_BOLD}./setup.sh${C_RESET} in your main checkout to install a weft that can, or run this one with ${C_BOLD}--cli${C_RESET} so it builds its own"
+fi
+
+# ---- what this install takes ------------------------------------------
+#
+# Decided now that the install is known and before anything is copied
+# into it, so a refused run has touched nothing installed. Only the
+# default install gets the extensions: a branch's editor is
+# scripts/dev-editor.sh, and every editor keeps the default install's.
+if [[ $on_default_install -eq 0 ]]; then
+  if [[ $do_bump -eq 1 ]]; then
+    fail "--bump builds the extensions to release them, and install ${install_env} (picked by ${install_picked_by}) builds no extension; bump in the package folder instead: ${C_BOLD}pnpm version patch --no-git-tag-version${C_RESET}"
+    exit 1
+  fi
+  if [[ $build_vscode -eq 1 || $build_browser -eq 1 ]]; then
+    hint "install ${install_env} (picked by ${install_picked_by}) gets no VS Code or browser extension (your editor keeps the default install's); to try this checkout's editor, run ${C_BOLD}scripts/dev-editor.sh${C_RESET}"
+    build_vscode=0
+    build_browser=0
+  fi
+fi
+# What the extension builds need, now that it is known they run.
+missing=()
+install_hints=()
+if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
+  node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
+  if [[ "${node_major}" -lt 20 ]]; then
+    missing+=("node 20+")
+    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 20')")
+  fi
+  if ! command -v pnpm >/dev/null 2>&1; then
+    missing+=("pnpm")
+    install_hints+=("  pnpm:    npm i -g pnpm")
+  fi
+fi
+if [[ $build_browser -eq 1 ]]; then
+  if ! command -v node >/dev/null 2>&1; then
+    missing+=("node 20+ (browser extension)")
+    install_hints+=("  Node:    https://nodejs.org/en/download")
+  fi
+  if ! command -v pnpm >/dev/null 2>&1; then
+    missing+=("pnpm (browser extension)")
+    install_hints+=("  pnpm:    npm i -g pnpm")
+  fi
+fi
+fail_on_missing_tools "Extensions"
+
+# What the other scripts and the development editor read to find this
+# checkout's install, once it is in place: after the daemon start when
+# this run refreshes it, else as soon as the binaries are.
+record_checkout_install() {
+  if ! weft_record_checkout_install "${here}" "${install_dir}"; then
+    fail "could not write ${here}/${weft_install_record}, which the scripts and the development editor read to find this checkout's install"
+    exit 1
+  fi
+}
+
+if [[ $build_cli -eq 1 ]]; then
+
+  # A prebuilt binary bakes its BUILDER's checkout path as its
+  # compile-time repo location, which does not exist here; record where
+  # the repo actually lives (THIS tree, every run, so a moved or
+  # re-cloned checkout re-points it) so the binary can find its own
+  # catalog / manifests / build context. Written BEFORE the binary lands
+  # on PATH: the other order could publish a weft that cannot find its
+  # checkout. Loud on failure WITH the recovery. Only the prebuilt path
+  # writes it, and that path is main's, so the default install's.
+  # SYNC: repo-root file <-> crates/weft-catalog/src/lib.rs (weft_repo_root, rung 4)
+  if [[ $use_prebuilt_cli -eq 1 ]]; then
+    repo_root_file="${weft_state_dir}/repo-root"
     if ! { mkdir -p "$(dirname "${repo_root_file}")" \
         && printf '%s' "${here}" > "${repo_root_file}"; } 2>/dev/null; then
       fail "the prebuilt CLI needs ${repo_root_file} to find this checkout, and that path is not writable"
       hint "fix the ownership (docker can leave root-owned entries there): ${C_BOLD}sudo chown -R \"\$(id -u):\$(id -g)\" ~/.local/share/weft${C_RESET}${C_DIM}, then re-run${C_RESET}"
       exit 1
     fi
-    chmod 0755 "${installed_bin}" "${installed_runtime}"
-    ln -sfn "${installed_bin}" "${weft_bin}"
-    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
   fi
 
-  if [[ $use_prebuilt_cli -eq 0 ]]; then
-    hint "${C_DIM}cargo's incremental cache makes re-runs near-instant${C_RESET}"
-    if [[ "${profile}" == "release" ]]; then
-      target_dir="${here}/target/release"
-    else
-      target_dir="${here}/target/debug"
-    fi
-    src="${target_dir}/weft"
-    # Sources can change WHILE this script runs (an AI session editing in
-    # parallel with a reinstall is the everyday case here). cargo builds
-    # what existed when it started, so a source edit landing mid-build
-    # ships a binary that is ALREADY stale, silently. Build, then check
-    # whether any workspace source is newer than the produced binary; if
-    # so, build again (once more is always enough: the recheck is
-    # instant), and if it STILL moves, say so loudly instead of
-    # pretending the install is current.
-    for build_pass in 1 2 3; do
-      if [[ "${profile}" == "release" ]]; then
-        spin_passthrough "cargo build --release -p weft-cli -p weft-runtime" \
-          cargo build --release -p weft-cli -p weft-runtime
+  # Copy the binaries OUT of target/ (or the download folder) into the
+  # install's own bin folder, which is where `weft daemon start` runs the
+  # runtime from and where the default install's PATH link points.
+  # Linking straight into target/ made the build cache load-bearing:
+  # `rm -rf target` (or the size cap above firing) left `weft` as a
+  # dangling symlink with nothing saying why. The copy costs ~25MB and
+  # makes target/ pure cache, safe to delete at any moment.
+  install_binary "${new_cli}" "${installed_bin}"
+  install_binary "${new_runtime}" "${installed_runtime}"
+  ok "installed ${C_DIM}${installed_bin}${C_RESET} and its runtime ${C_DIM}(install ${install_env})${C_RESET}"
+
+  # Only the default install owns the `weft` on PATH and the shell's tab
+  # completion; a branch's weft is reached through it (inside the
+  # checkout, `weft` hands over to the branch's own binary).
+  if [[ $on_default_install -eq 1 ]]; then
+    mkdir -p "${bin_dir}"
+    ln -sfn "${installed_bin}" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
+
+    # Tab completion. The shell's side only knows how to ask `weft` for
+    # the candidates (`COMPLETE=<shell> weft` prints it), so the commands
+    # and flags always come from the installed binary. The startup-file
+    # block regenerates that script in every new shell, so it always
+    # matches the binary; the fish file is rewritten on every install for
+    # the same reason. A shell that cannot be set up only loses tab
+    # completion, so a failure warns and the install carries on.
+    #
+    # Every zsh and bash startup file that exists gets its block, plus the
+    # login shell's even when it does not exist yet (a fresh Mac has no
+    # ~/.zshrc). `$SHELL` alone is not enough: it names the LOGIN shell,
+    # and a bashrc that ends in `exec zsh` makes every terminal a zsh. A
+    # block only ever runs in its own shell, so an extra one costs nothing.
+    for completion_shell in zsh bash; do
+      if [[ "${completion_shell}" == zsh ]]; then
+        completion_rc="${completion_rc_files[0]}"
       else
-        spin_passthrough "cargo build -p weft-cli -p weft-runtime" cargo build -p weft-cli -p weft-runtime
+        completion_rc="${completion_rc_files[1]}"
       fi
-      if [[ ! -x "${src}" || ! -x "${target_dir}/weft-runtime" ]]; then
-        fail "build output missing: ${src} or ${target_dir}/weft-runtime"
-        exit 1
+      [[ -f "${completion_rc}" || "$(basename "${SHELL:-}")" == "${completion_shell}" ]] || continue
+      if err="$( {
+          remove_completion_block "${completion_rc}" \
+          && { [[ ! -s "${completion_rc}" || -z "$(tail -c 1 "${completion_rc}")" ]] || printf '\n' >> "${completion_rc}"; } \
+          && {
+            printf '%s\n' "${completion_block_begin}"
+            # zsh registers completions through `compdef`, which only
+            # exists once the completion system is loaded; a bare zshrc
+            # (the macOS default) never loads it.
+            if [[ "${completion_shell}" == zsh ]]; then
+              printf '%s\n' '(( $+functions[compdef] )) || { autoload -Uz compinit && compinit; }'
+            fi
+            printf 'if [ -x "%s" ]; then eval "$(COMPLETE=%s "%s")"; fi\n' "${weft_bin}" "${completion_shell}" "${weft_bin}"
+            printf '%s\n' "${completion_block_end}"
+          } >> "${completion_rc}"
+        } 2>&1 )"; then
+        ok "${completion_shell} tab completion ${SYM_ARROW} ${C_DIM}${completion_rc}${C_RESET} (new terminals)"
+      else
+        warn "${completion_shell} tab completion not set up in ${completion_rc}: ${err}"
       fi
-      # cargo's own freshness check is the authority on whether the
-      # binary matches the sources (mtime scans over the tree false-alarm
-      # on files that are not build inputs). A repeated build doing zero
-      # work == current; it doing work == a source edit landed mid-build
-      # and the first binary shipped stale, so loop.
-      # A bare word, not an array: expanding an EMPTY array under
-      # `set -u` is fatal on bash 3.2 (macOS's /bin/bash), same idiom
-      # as ${rebuild_flag} elsewhere. The `||` keeps a recheck FAILURE
-      # from dying silently under `set -e` (the assignment's status is
-      # cargo's), with the captured output shown instead of discarded.
-      recheck_release_flag=""
-      [[ "${profile}" == "release" ]] && recheck_release_flag="--release"
-      recheck_out="$(cargo build ${recheck_release_flag} -p weft-cli -p weft-runtime 2>&1)" || {
-        fail "the freshness recheck build failed (a source edit landed mid-build?)"
-        printf '%s\n' "${recheck_out}" >&2
-        exit 1
-      }
-      # [[:space:]], never \s: BSD grep (macOS) has no \s and would
-      # read the pattern as a literal, silently disabling this check.
-      if ! grep -q '^[[:space:]]*Compiling' <<<"${recheck_out}"; then
-        break
-      fi
-      if [[ "${build_pass}" -eq 3 ]]; then
-        fail "sources are still changing under the build; the installed binary does NOT include them. Re-run setup.sh once the edits settle."
-        exit 1
-      fi
-      hint "source changed during the build; building again"
     done
-    # Copy the binary OUT of target/, then link PATH at the copy, the
-    # same shape the prebuilt path above uses. Linking straight into
-    # target/ made the build cache load-bearing: `rm -rf target` (or
-    # the size cap above firing) left `weft` as a dangling symlink
-    # with nothing saying why. The copy costs ~25MB and makes target/
-    # pure cache, safe to delete at any moment.
-    # Copy to a temp beside the target and rename over it, the same
-    # way download_verified lands the prebuilt. A `weft` that is still
-    # running (the extension in another VS Code window, a `weft run`
-    # in a terminal) holds the old file open, and overwriting it in
-    # place fails with "Text file busy"; a rename swaps the path while
-    # every running process keeps its old inode until it exits.
-    mkdir -p "${installed_bin_dir}"
-    installed_tmp="${installed_bin}.$$.build"
-    cp_err="$(cp "${src}" "${installed_tmp}" 2>&1 >/dev/null && chmod 0755 "${installed_tmp}" && mv -f "${installed_tmp}" "${installed_bin}" 2>&1 >/dev/null)" || {
-      rm -f "${installed_tmp}"
-      fail "could not install the built binary to ${installed_bin}"
-      printf '%s\n' "${cp_err}" >&2
-      exit 1
-    }
-    runtime_tmp="${installed_runtime}.$$.build"
-    cp_err="$(cp "${target_dir}/weft-runtime" "${runtime_tmp}" 2>&1 >/dev/null && chmod 0755 "${runtime_tmp}" && mv -f "${runtime_tmp}" "${installed_runtime}" 2>&1 >/dev/null)" || {
-      rm -f "${runtime_tmp}"
-      fail "could not install the built runtime to ${installed_runtime}"
-      printf '%s\n' "${cp_err}" >&2
-      exit 1
-    }
-    ln -sfn "${installed_bin}" "${weft_bin}"
-    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
+    if command -v fish >/dev/null 2>&1; then
+      if err="$( { mkdir -p "$(dirname "${fish_completion_file}")" && COMPLETE=fish "${weft_bin}" >"${fish_completion_file}"; } 2>&1 )"; then
+        ok "fish tab completion ${SYM_ARROW} ${C_DIM}${fish_completion_file}${C_RESET}"
+      else
+        rm -f "${fish_completion_file}"
+        warn "fish tab completion not installed: ${err}"
+      fi
+    fi
+  else
+    hint "this branch's weft is ${C_BOLD}${installed_bin}${C_RESET}${C_DIM}; inside this checkout, the ${C_RESET}${C_BOLD}weft${C_RESET}${C_DIM} on your PATH hands over to it${C_RESET}"
   fi
 
-  # Tab completion. The shell's side only knows how to ask `weft` for
-  # the candidates (`COMPLETE=<shell> weft` prints it), so the commands
-  # and flags always come from the installed binary. The startup-file
-  # block regenerates that script in every new shell, so it always
-  # matches the binary; the fish file is rewritten on every install for
-  # the same reason. A shell that cannot be set up only loses tab
-  # completion, so a failure warns and the install carries on.
-  #
-  # Every zsh and bash startup file that exists gets its block, plus the
-  # login shell's even when it does not exist yet (a fresh Mac has no
-  # ~/.zshrc). `$SHELL` alone is not enough: it names the LOGIN shell,
-  # and a bashrc that ends in `exec zsh` makes every terminal a zsh. A
-  # block only ever runs in its own shell, so an extra one costs nothing.
-  for completion_shell in zsh bash; do
-    if [[ "${completion_shell}" == zsh ]]; then
-      completion_rc="${completion_rc_files[0]}"
-    else
-      completion_rc="${completion_rc_files[1]}"
-    fi
-    [[ -f "${completion_rc}" || "$(basename "${SHELL:-}")" == "${completion_shell}" ]] || continue
-    if err="$( {
-        remove_completion_block "${completion_rc}" \
-        && { [[ ! -s "${completion_rc}" || -z "$(tail -c 1 "${completion_rc}")" ]] || printf '\n' >> "${completion_rc}"; } \
-        && {
-          printf '%s\n' "${completion_block_begin}"
-          # zsh registers completions through `compdef`, which only
-          # exists once the completion system is loaded; a bare zshrc
-          # (the macOS default) never loads it.
-          if [[ "${completion_shell}" == zsh ]]; then
-            printf '%s\n' '(( $+functions[compdef] )) || { autoload -Uz compinit && compinit; }'
-          fi
-          printf 'if [ -x "%s" ]; then eval "$(COMPLETE=%s "%s")"; fi\n' "${weft_bin}" "${completion_shell}" "${weft_bin}"
-          printf '%s\n' "${completion_block_end}"
-        } >> "${completion_rc}"
-      } 2>&1 )"; then
-      ok "${completion_shell} tab completion ${SYM_ARROW} ${C_DIM}${completion_rc}${C_RESET} (new terminals)"
-    else
-      warn "${completion_shell} tab completion not set up in ${completion_rc}: ${err}"
-    fi
-  done
-  if command -v fish >/dev/null 2>&1; then
-    if err="$( { mkdir -p "$(dirname "${fish_completion_file}")" && COMPLETE=fish "${weft_bin}" >"${fish_completion_file}"; } 2>&1 )"; then
-      ok "fish tab completion ${SYM_ARROW} ${C_DIM}${fish_completion_file}${C_RESET}"
-    else
-      rm -f "${fish_completion_file}"
-      warn "fish tab completion not installed: ${err}"
-    fi
-  fi
-
-  # Engine-change sweep, on either path: the builder base and the
-  # node-test image bake the engine crates in, so an engine change
-  # strands them (host docker + kind containerd), the BuildKit cache
-  # and the node-test cargo cache. Worker images bake the engine too,
-  # but they are NOT swept here (see `build_plane_repos_re` above for
-  # why: running projects keep theirs until they resync).
-  # Keyed on the ENGINE'S OWN identity (the builder-base ref the
-  # freshly installed CLI computes from source content), which is the
-  # same on the prebuilt and the compiled path and does not move when
-  # only the binary does (a --debug/--release switch, a prebuilt/local
-  # switch), so those never cost a sweep.
-  engine_ref_file="${HOME}/.local/share/weft/builder-base-ref"
+  # Engine-change sweep, on either path: the node-test cargo cache under
+  # target/tmp bakes the engine crates in, so an engine change strands
+  # it. (The images an engine change strands are shared by every
+  # install, so `weft clean --images --build-plane` takes those, after
+  # the daemon refresh.) Keyed on the ENGINE'S OWN identity (the
+  # builder-base ref the freshly installed CLI computes from source
+  # content), which is the same on the prebuilt and the compiled path
+  # and does not move when only the binary does (a --debug/--release
+  # switch, a prebuilt/local switch), so those never cost a sweep. The
+  # last one swept for is kept in target/ itself: the cache it guards is
+  # this checkout's, and a wiped target/ has nothing left to sweep.
+  engine_ref_file="${here}/target/weft-engine-ref"
   # Only the TAG (the content hash) is the identity; the registry
   # prefix is naming, and keying on it would fire a full sweep on a
   # WEFT_IMAGE_REGISTRY change with the engine untouched. Streams kept
@@ -1818,22 +1936,66 @@ if [[ $build_cli -eq 1 ]]; then
   # "could not compute".
   new_engine_ref=""
   engine_err="$(mktemp -t weft-engineref.XXXXXX)"
-  if engine_print_out="$(env WEFT_REPO_ROOT="${here}" "${weft_bin}" build-images --print 2>"${engine_err}")"; then
+  if engine_print_out="$(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${installed_bin}" build-images --print 2>"${engine_err}")"; then
     new_engine_ref="$(grep -E '(^|/)weft-builder-base:' <<<"${engine_print_out}" || true)"
     new_engine_ref="${new_engine_ref##*:}"
   fi
   if [[ -z "${new_engine_ref}" ]]; then
-    warn "could not compute the engine identity (weft build-images --print); skipping the stale-image sweep this run"
+    warn "could not compute the engine identity (weft build-images --print); skipping the node-test cache sweep this run"
     [[ -s "${engine_err}" ]] && cat "${engine_err}" >&2
   elif [[ "${new_engine_ref}" != "$(cat "${engine_ref_file}" 2>/dev/null || true)" ]]; then
-    sweep_stale_build_plane
+    sweep_stale_node_test_cache
     # Braced so a redirect failure is silenced too (a bare 2>/dev/null
     # does not cover the redirect itself) and only the warn speaks.
-    if ! { printf '%s' "${new_engine_ref}" > "${engine_ref_file}"; } 2>/dev/null; then
+    if ! { mkdir -p "$(dirname "${engine_ref_file}")" && printf '%s' "${new_engine_ref}" > "${engine_ref_file}"; } 2>/dev/null; then
       warn "could not record the engine identity at ${engine_ref_file}; the sweep re-runs next install"
     fi
   fi
   rm -f "${engine_err}"
+fi
+if [[ $refresh_daemon -eq 0 && -x "${installed_bin}" ]]; then
+  record_checkout_install
+fi
+
+# ---- run history in a shape this version cannot read --------------------
+#
+# Runs are stored as a row each (`run`) and their records (`run_log`); the
+# shape before it (`exec_event`) is not carried over: the migration that
+# brings the database forward drops it. So an install whose database still
+# holds it says what goes and asks first, then wipes it before the daemon
+# refresh runs that migration. Only the default install can be that old:
+# a branch's install is made by this version. (A `--migration --release`
+# earlier in this run cannot run it either: the generator refuses a live
+# database in neither the shape before its release nor the shape after.)
+if [[ $refresh_daemon -eq 1 && $on_default_install -eq 1 ]] && command -v docker >/dev/null 2>&1; then
+  if ! old_run_history="$(weft_old_run_history)"; then
+    fail "could not reach the install's Postgres (the weft-postgres container) to check how it stores runs; see: docker logs weft-postgres"
+    exit 1
+  fi
+  if [[ "${old_run_history}" == "yes" ]]; then
+    section "Run history"
+    warn "This upgrade changes how weft stores past runs, and the runs already"
+    warn "stored cannot be carried over. Upgrading wipes:"
+    warn "  - every past run, its events, logs and search entries"
+    warn "  - events waiting for a parked trigger"
+    warn "It keeps everything else: your projects and their code, their settings,"
+    warn "connections, installs, infra and its data."
+    if [[ $assume_yes -eq 0 ]]; then
+      if [[ ! -t 0 ]]; then
+        fail "no terminal to ask on; run ./setup.sh --yes to wipe the run history and upgrade"
+        exit 1
+      fi
+      # End of input (Ctrl-D) is a no: under set -e a failed read would
+      # otherwise end the run without a word.
+      read -r -p "  Wipe the run history and upgrade? [y/N] " answer || answer=n
+      if [[ "${answer}" != "y" && "${answer}" != "Y" ]]; then
+        hint "nothing changed; run ./setup.sh again when you are ready (--yes answers this for you)"
+        exit 1
+      fi
+    fi
+    weft_wipe_old_run_history || { fail "the run history could not be wiped; nothing changed (it is one transaction); see above"; exit 1; }
+    ok "the run history is wiped; upgrading"
+  fi
 fi
 
 # ---- daemon refresh / start ------------------------------------------
@@ -1844,13 +2006,35 @@ fi
 
 if [[ $refresh_daemon -eq 1 ]]; then
   section "Daemon"
-  if [[ ! -x "${weft_bin}" && ! -L "${weft_bin}" ]]; then
-    warn "no weft binary at ${weft_bin}; skipping"
+  if [[ ! -x "${installed_bin}" ]]; then
+    fail "install ${install_env} has no weft at ${installed_bin} to start it with; run ./setup.sh with --cli (or no component flags)"
+    exit 1
   elif ! command -v docker >/dev/null 2>&1; then
     warn "docker not on PATH; skipping"
+    record_checkout_install
   else
+    # The install's own weft, told which install it is: it would pick
+    # the same one from this checkout, and saying so keeps every child
+    # it starts on it too.
+    install_env_cmd=(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${installed_bin}")
+    # In the build slot: a start whose runtime or builder-base image
+    # moved compiles it (cargo, inside docker), as heavy as the CLI build.
     spin_passthrough "weft daemon start" \
-      env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${public_url_flag}
+      with_build_slot "${install_env_cmd[@]}" daemon start ${rebuild_flag} ${public_url_flag}
+    record_checkout_install
+
+    # Drop the images an engine change strands (the builder base and the
+    # node-test image), now that the start above has recorded which ones
+    # this install uses: the CLI keeps every one that any install on this
+    # machine records, and removes nothing of a kind while an install has
+    # not recorded yet (it names that install). Warn-only: hygiene must
+    # not fail the install.
+    if spin_passthrough "weft clean --images --build-plane" \
+      "${install_env_cmd[@]}" clean --images --build-plane; then
+      :
+    else
+      warn "the build-plane image sweep failed; re-run ${C_BOLD}weft clean --images --build-plane${C_RESET} by hand"
+    fi
 
     # Reclaim what the update stranded, now that the refreshed daemon
     # can answer for what is still in use: `weft clean --images --all`
@@ -1881,7 +2065,7 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # saved in ports.json (a WEFT_DISPATCHER_URL the user exported still
     # reaches it through the environment).
     if spin_passthrough "weft clean --images --all" \
-      env WEFT_REPO_ROOT="${here}" "${weft_bin}" clean --images --all; then
+      "${install_env_cmd[@]}" clean --images --all; then
       :
     else
       warn "the image reclaim failed; re-run ${C_BOLD}weft clean --images --all${C_RESET} by hand once the daemon is settled"
@@ -1899,16 +2083,18 @@ elif [[ $build_cli -eq 1 ]]; then
   hint "daemon refresh skipped, so no image reclaim this install; run ${C_BOLD}weft clean --images --all${C_RESET} with the daemon up to reclaim stale worker/infra images"
 fi
 
-# The address the daemon recorded for the public trigger surface, when
-# it is open. Read from the daemon's own state file so setup.sh never
-# re-derives it (one authority, and `weft daemon status` reads the same).
+# The address the daemon recorded for the install's public trigger
+# surface, when it is open. Read from the install's own state file so
+# setup.sh never re-derives it (one authority, and `weft daemon status`
+# reads the same).
+# SYNC: public-url-enabled, public-url <-> crates/weft-cli/src/commands/daemon.rs (public_url_marker, public_url_file)
 public_url=""
-if [[ -r "${HOME}/.local/share/weft/public-url-enabled" \
-   && -r "${HOME}/.local/share/weft/public-url" ]]; then
-  public_url="$(tr -d '[:space:]' < "${HOME}/.local/share/weft/public-url")"
+if [[ -r "${install_dir}/public-url-enabled" \
+   && -r "${install_dir}/public-url" ]]; then
+  public_url="$(tr -d '[:space:]' < "${install_dir}/public-url")"
 fi
-if [[ -n "${public_url}" && $is_default_install -eq 0 ]]; then
-  # Non-default installs print no summary block, so say it here.
+if [[ -n "${public_url}" && ( $is_full_install -eq 0 || $on_default_install -eq 0 ) ]]; then
+  # Only a full install on main prints the summary block, so say it here.
   hint "public surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes, signal fire links, file share links, OAuth callback)"
 fi
 
@@ -1932,15 +2118,15 @@ if [[ $build_vscode -eq 1 ]]; then
   # a downloaded extension on top of a stale local binary keeps the
   # stale behavior exactly the same way a built one would. Checked
   # BEFORE the --bump below, so a refused run has touched nothing.
-  if [[ $build_cli -eq 0 && -x "${weft_bin}" ]]; then
+  if [[ $build_cli -eq 0 && -x "${installed_bin}" ]]; then
     # The reference is the BINARY's own mtime, carried onto a temp
     # file with `touch -r` (which dereferences the symlink; GNU
     # `find -newer <symlink>` does NOT, it reads the link's own mtime,
     # which every install refreshes whether or not the binary moved).
     bin_ref="$(mktemp -t weft-binref.XXXXXX)"
-    if ! touch -r "${weft_bin}" "${bin_ref}"; then
+    if ! touch -r "${installed_bin}" "${bin_ref}"; then
       rm -f "${bin_ref}"
-      warn "cannot read ${weft_bin}'s timestamp; skipping the stale-binary check"
+      warn "cannot read ${installed_bin}'s timestamp; skipping the stale-binary check"
     else
       # Streams kept apart: a scan can BOTH find a stale source and
       # exit non-zero (an unreadable directory on the way), and the
@@ -1960,7 +2146,7 @@ if [[ $build_vscode -eq 1 ]]; then
       if [[ ${find_rc} -ne 0 ]]; then
         # A failed scan must not read as "binary is current": that is
         # exactly the silent pass this guard exists to prevent.
-        fail "cannot scan for sources newer than ${weft_bin}: $(cat "${find_err}")"
+        fail "cannot scan for sources newer than ${installed_bin}: $(cat "${find_err}")"
         rm -f "${find_err}"
         exit 1
       fi
@@ -2025,31 +2211,15 @@ if [[ $build_vscode -eq 1 ]]; then
 
   pushd "${ext_dir}" >/dev/null
 
-  # The shared graph webview lives in the sibling `../packages/weft-graph` package,
-  # consumed FROM SOURCE (one renderer for the extension + the website). It has no
-  # install of its own; the extension bundles it through vite's `resolve.dedupe`
-  # (its bare deps resolve to THIS app's node_modules). svelte-check
-  # (check:webview) needs the same redirect, so point the package's node_modules at
-  # the extension's install. Created up-front (not inside the rebuild branch) so a
-  # bare `pnpm run check:webview` resolves too. One symlink, no dep-list dup.
-  # A real directory there (a `pnpm install` run inside the package) is
-  # replaced: `ln -sfn` onto a directory would nest the link INSIDE it
-  # and leave the package resolving against the wrong install.
-  # Same borrow for the grammars package (its only dependency is the
-  # highlight.js the extension already installs, for its own tests) and
-  # the connect library the graph's connection picker is built on.
-  for borrower in ../packages/weft-graph ../packages/weft-syntax ../packages/weft-connect; do
-    if [[ -d "${borrower}/node_modules" && ! -L "${borrower}/node_modules" ]]; then
-      rm -rf "${borrower}/node_modules"
-    fi
-    ln -sfn ../../extension-vscode/node_modules "${borrower}/node_modules"
-  done
+  # Up front, not inside the rebuild branch, so a bare
+  # `pnpm run check:webview` resolves too (scripts/lib/vscode-build.sh).
+  weft_vscode_link_borrowers "${ext_dir}"
 
   # Skip rebuild if nothing under src/ + config + package.json has
   # changed since the last successful build. We hash inputs and
   # compare to a stamp file. The .vsix from the last run is reused
   # for the install step.
-  hash_dir="${HOME}/.local/share/weft/vscode-hashes"
+  hash_dir="${weft_state_dir}/vscode-hashes"
   hash_file="${hash_dir}/extension.hash"
   # The fingerprint is EVERYTHING the package can ship: every tracked
   # file of the extension and its source-consumed sibling packages
@@ -2136,10 +2306,7 @@ if [[ $build_vscode -eq 1 ]]; then
   if [[ -f "${vsix}" && "${current_hash}" == "${prior_hash}" ]]; then
     ok "no source changes (compiled ${C_DIM}v${current_ver}${C_RESET})"
   else
-    spin "pnpm install" pnpm install --prefer-offline
-    spin "tsc compile" pnpm run compile
-    spin "vite bundle webview" pnpm run bundle:webview
-    spin "vite bundle markdown preview" pnpm run bundle:markdown-preview
+    weft_vscode_compile "${ext_dir}" spin
     rm -f weft-vscode-*.vsix
     # The repo LICENSE rides inside the .vsix (the stores refuse a
     # licenseless extension; the local package matches CI's).
@@ -2188,7 +2355,7 @@ if [[ $build_vscode -eq 1 ]]; then
   # while nothing is installed, and the fix is the line printed below.
   # That is worth minutes of everybody's time on every other run.
   vsix_sha="$(sha256 "${vsix_path}" | cut -d' ' -f1)"
-  installed_vsix_stamp="${HOME}/.local/share/weft/vscode-hashes/installed.sha"
+  installed_vsix_stamp="${weft_state_dir}/vscode-hashes/installed.sha"
   if ! command -v code >/dev/null 2>&1; then
     warn "'code' not on PATH"
     hint "install manually: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
@@ -2352,9 +2519,11 @@ fi
 
 # ---- post-install summary --------------------------------------------
 #
-# Print this once per default install (CLI + daemon + VS Code). It's
-# the first thing a fresh user sees that tells them what to actually
-# DO with the install they just ran.
+# Print this once per full install (CLI + daemon + VS Code) of the
+# default install. It's the first thing a fresh user sees that tells
+# them what to actually DO with the install they just ran. The PATH
+# check runs on a branch too: the branch's weft is reached through the
+# default install's link.
 
 if [[ $build_cli -eq 1 ]]; then
   case ":${PATH}:" in
@@ -2366,7 +2535,7 @@ if [[ $build_cli -eq 1 ]]; then
       ;;
   esac
 
-  if [[ $is_default_install -eq 1 ]]; then
+  if [[ $is_full_install -eq 1 && $on_default_install -eq 1 ]]; then
     rule="$(printf '%.0s─' $(seq 1 64))"
     printf '\n%s%s%s\n' "${C_DIM}" "${rule}" "${C_RESET}"
     printf '%s%s%s %s%sSetup complete.%s\n\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
@@ -2376,8 +2545,8 @@ if [[ $build_cli -eq 1 ]]; then
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" \
       "${C_DIM}" "$(weft_local_url)" "${C_RESET}" \
       "${C_DIM}" "${C_RESET}"
-    printf '  %s%s%s postgres    %sthe weft-postgres container, its files in ~/.local/share/weft/postgres-data%s\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+    printf '  %s%s%s postgres    %sthe weft-postgres container, its files in %s/postgres-data%s\n' \
+      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${install_dir}" "${C_RESET}"
     printf '  %s%s%s VS Code     %sinstalled (reload your window if it is open)%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
     if [[ -n "${public_url}" ]]; then

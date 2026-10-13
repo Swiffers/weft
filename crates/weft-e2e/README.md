@@ -14,21 +14,26 @@ scripts/run-e2e.sh                          # every test
 scripts/run-e2e.sh live_chat plain          # every test in these files
 scripts/run-e2e.sh accesses::some_test      # one test
 scripts/run-e2e.sh --failed                 # the tests that did not pass last time
-scripts/run-e2e.sh -j 8                     # 8 tests at once instead of 16
+scripts/run-e2e.sh -j 8                     # 8 tests at once instead of 4
 scripts/run-e2e.sh --keep-going             # keep going after a failure, to see them all
 scripts/run-e2e.sh --clean                  # only remove what failed runs kept
 ```
 
-The runner brings the install to current code once (`setup.sh --cli --daemon`),
-builds every test binary once, then runs every TEST on its own, side by side,
-longest first (by how long each took last time). Each test's output lands in
-`~/.local/share/weft/e2e/run/<file>::<test>.log`, and the summary prints one
-line per test with how long it took.
+The runner tests the install of the checkout you run it from: the default
+install on `main`, the branch's own install anywhere else (what `weft daemon
+which` names). It brings that install to current code once (`setup.sh --cli
+--daemon`), builds every test binary once, then runs every TEST on its own,
+side by side, longest first (by how long each took last time). Everything a
+run keeps lives in the install's own folder, under `e2e/` (for the default
+install, `~/.local/share/weft/e2e/`): each test's output lands in
+`e2e/run/<file>::<test>.log`, and the summary prints one line per test with
+how long it took.
 
 If you want more tests at once, raise `-j`. Everything runs on your machine,
 so past a point that only makes each test slower: watch the
-per-test times in the summary grow when you raise it. On a 24-core machine the
-whole suite takes under three minutes at the default of 16.
+per-test times in the summary grow when you raise it. The default is 4,
+because tests started failing under load at more, and other worktrees may be
+building beside you.
 
 If you want to know where a slow test spends its time, read its log: every
 `weft` command it ran and every wait it sat through is a line of its own
@@ -42,23 +47,27 @@ log (`<file>::<test>.post-mortem/`: every container of the install, the runtime'
 log, and the logs of the containers of every project the test kept). The
 install is left as it was, so you can poke at it. What
 the failure kept stays until the next run starts: every run begins by removing
-what earlier failed runs kept (cells, projects and connections the suite
-made, marked as e2e), then runs `weft clean --images --all`. That last step is
-machine-wide and reaches past the suite: it removes every worker image no
-project on the default install references (yours too, once nothing runs them),
-infra images no project references, every builder base, runtime image and
-standard worker image but the current one, the worker compile cache this checkout
-moved off (every lane, at once), and compile caches of another retired key that
-sat unused. `--clean` does only this, without bringing the install to
+what earlier failed runs on the same install kept (cells, projects and
+connections the suite made, and the fixture copies), then runs `weft clean
+--images --all`. Projects are told apart by their `e2e_` name; cells and
+connections by the ledger every test writes them into while they live
+(`e2e/kept/` in the install's folder), so a run on one branch never removes
+what a run on another kept. The `weft clean` step reaches past the suite: it removes
+every worker image no project of the install references (yours too, once
+nothing runs them), and drops every builder base, node-test image, runtime
+image, standard worker and worker compile cache that no install on the
+machine records using. While some install has no record yet, it removes
+nothing of that kind, and it never removes a cache a build is using right
+now. `--clean` does only this, without bringing the install to
 current code first, so a failure's runtime is still the one that failed.
 `--failed` re-runs just the tests that did not pass: the ones that failed, the
 ones the stop kept from starting, and, if you pressed Ctrl-C, the ones it cut
 short. Ctrl-C stops every running test (and what each one started) before the
 runner lets go of the install, so nothing keeps running into the next run.
 
-The runner needs bash 5.1 or newer, and only one run (or `--clean`) at a time
-on a machine, from any checkout: a second one is refused while the first is
-alive.
+The runner needs bash 5.1 or newer. Only one run (or `--clean`) holds the
+machine at a time, from any checkout: a second one says which run it is
+waiting for, then starts when that one ends.
 
 Every run ends with the same `weft clean --images --all`, pass or fail. When a
 whole run passes, nothing is left behind: every test removed its own projects,
@@ -69,13 +78,15 @@ keeps every image a project still points at) and the rest goes.
 
 Everything a local machine can serve, the runner provisions itself: the store's
 Postgres (the install's own, at the address in its `secrets.env`), and an S3
-endpoint (the install's object store container, whose bucket stays across runs
-because it belongs to the install rather than to the suite). You set
-nothing for those.
+endpoint (the machine's object store container, with a bucket per install:
+`weft-e2e` for the default one, `weft-e2e-<name>` for a branch's, which stays
+across runs because it belongs to the install rather than to the suite). You
+set nothing for those.
 
 What is left is the external services, which come from the
-environment. The runner reads the repo-root `.env`, which is gitignored, and
-anything you already exported wins over what it would provision.
+environment. The tests read the repo root's `.env.local` (this checkout only),
+then its `.env` (shared by every worktree), both gitignored; `.env.local` wins
+over `.env`, and anything you already exported wins over both.
 
 They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 
@@ -86,12 +97,14 @@ They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 | Telegram | `WEFT_E2E_TELEGRAM_TOKEN`, `_CHAT_ID` |
 | Email | `WEFT_E2E_EMAIL_USER`, `_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT`, `_SMTP_HOST`, `_SMTP_PORT` |
 | ElevenLabs | `WEFT_E2E_ELEVENLABS_API_KEY` |
+| OpenRouter, your own key (`openrouter`'s own-key test, `openrouter_custom`, `llm_stream_tool`; spends money) | `OPENROUTER_API_KEY` |
 | JWT issuer (Auth0 or any OAuth issuer with a client-credentials grant) | `WEFT_E2E_JWT_ISSUER` (with its trailing slash, as the `iss` claim spells it), `_AUDIENCE`, `_CLIENT_ID`, `_CLIENT_SECRET`; the test mints its own token on every run, so nothing expires |
 | A GCP install (`gcp_install`, spends money on your cloud) | `WEFT_E2E_GCP_URL`, `_OPERATOR_KEY`, `_PROJECT`, `_REGION`; and, on this machine, a project whose `weft.toml` has a target at that address, with `weft login <that target>` done, because the CLI the test drives finds its key there |
 
 A test whose variables are absent **skips** rather than fails, through
 `env_or_skip` / `env_group_or_skip`, so a partial `.env` still gets you a
-useful run. It also means a green suite does not prove the skipped ones
+useful run. A test never reads the environment itself (one of the crate's own
+tests fails if one does), so every credential goes through those two. It also means a green suite does not prove the skipped ones
 work: check the output for what skipped before you trust it.
 
 This is a different mechanism from the node self-tests, which read
@@ -130,7 +143,7 @@ use weft_e2e::{ensure, project::Project, run};
 
 #[tokio::test]
 async fn my_scenario() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;                                // the default install
+    let disp = ensure::up().await?;                                // the install under test
     let mut project = Project::prepare("my_fixture", disp).await?; // fixtures/my_fixture -> isolated project
     let settled = run::run_and_settle(&mut project).await?;        // drive it
     settled.completed()?;                                          // assert (folds the replay log)
@@ -230,13 +243,13 @@ starting that worker used up most of what was left, so `api_ticket` runs at
 `0.25`.
 
 A cell costs its own startup, so a test that does not watch anything
-install-wide stays on the default install.
+install-wide stays on the install under test.
 
 ## Toolkit
 
 | Module | What it does |
 | --- | --- |
-| `ensure` | Reach the default install (the runner brought it up); wait for health. |
+| `ensure` | Reach the install under test (the runner brought it up); wait for health; read a credential or skip. |
 | `cell::Cell` | A whole install of a test's own, with its own pace; see above. |
 | `project::Project` | Fixture -> isolated project: `prepare`, `build`, `activate`, `weft(args)`, `substitute_in_main`, `finish`. |
 | `run` | `run_and_settle`, `start`, `wait_for_triggered_execution`, `SettledRun::observe`. |

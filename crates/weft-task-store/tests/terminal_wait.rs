@@ -24,7 +24,7 @@ const WOKEN: Duration = Duration::from_secs(10);
 
 fn task(dedup: &str) -> tasks::NewTask {
     tasks::NewTask {
-        kind: "register_signal".to_string(),
+        kind: weft_task_store::TaskKind::RegisterSignal,
         project_id: None,
         dedup_key: Some(dedup.to_string()),
         execution_id: None,

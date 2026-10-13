@@ -18,7 +18,7 @@ const TENANT: &str = "t1";
 
 /// The schema, and the project the runs belong to.
 async fn schema(pool: &PgPool) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     sqlx::query(
         "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at) \
          VALUES ($1, 'p', $2, 'registered', '{}', 0)",

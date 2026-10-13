@@ -3,6 +3,47 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## 2026-10-13 (0.2.269)
+
+**Each branch of a checkout can now run its own install. If your checkout is
+not on `main`, or you keep a public tunnel's token in `.env`, there is
+something to do.**
+
+If you run weft from a checkout on a branch other than `main`, it now uses
+that branch's own install. weft stops with an error until you run
+`./setup.sh` there, and the install it sets up starts empty. Your projects
+stay on your default install. If you want to keep working with them, check
+out `main` or set `WEFT_INSTALL=default`.
+
+If you keep `WEFT_PUBLIC_TUNNEL_TOKEN` and `WEFT_PUBLIC_TUNNEL_HOSTNAME` in
+`.env`, move both lines into a `.env.local` beside it, then run `./setup.sh`
+again. Every checkout made with `scripts/add-worktree.sh` links to that same
+`.env`, so a branch you run `./setup.sh --public-url` on would try to open the
+same tunnel, and weft refuses to start a second install on a token
+another install already uses. `.env.local` belongs to that checkout alone, and
+what it sets wins over `.env`.
+
+What you will notice:
+
+- A branch's install lives under `~/.local/share/weft/installs/`, with its
+  own runtime, database and files. For how weft picks the install, go and read
+  [Working on several branches at once](CONTRIBUTING.md#working-on-several-branches-at-once).
+- If you want to know which install a command would act on, run
+  `weft daemon which`.
+- When you are done with a branch, `scripts/remove-worktree.sh` removes its
+  worktree and its install.
+- On a branch, `./setup.sh` installs neither the VS Code extension nor the
+  browser extension. If you want to try a branch's VS Code extension,
+  `scripts/dev-editor.sh` opens a VS Code window running it from source. If
+  the branch's extension is 0.2.269 or newer, that window uses the CLI of that
+  checkout's install.
+- If you want a public address for a branch, run `./setup.sh --public-url`
+  there: it opens the tunnel that branch's `.env.local` names, or else a
+  random address that changes each time the tunnel restarts.
+- `scripts/run-e2e.sh` runs 4 tests at once by default (it was 16).
+- A second `scripts/run-e2e.sh` on the same machine now waits for the first
+  instead of refusing.
+
 ## 2026-10-12 (0.2.268)
 
 **On Google Cloud, an install nobody is using now lets its database sleep,

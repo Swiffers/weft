@@ -24,10 +24,16 @@
 //! delegate. They never know about specific kinds.
 //!
 //! Conventions enforced by the dispatch helpers below:
-//!   - Kinds that raise their own fires (a timer's tick, an SSE event)
-//!     enqueue a `FireSignal` task via the broker; the dispatcher picker
-//!     runs it back through `/process`, where the kind's
-//!     `process_entry` routes it to `ProcessTarget::Entry`.
+//!   - Fires a kind raises itself (a timer's tick, an SSE event) are
+//!     processed here, in the listener: `fire_sink` calls
+//!     [`process_in`], which runs an entry's event through the kind's
+//!     `process_entry`; the sink then hands it straight to its project's
+//!     worker door, or parks it in its trigger's queue when that worker
+//!     cannot be reached. Only an answer to a waiting run goes out as a
+//!     `FireSignal` task. The dispatcher calls `/process` for an event
+//!     that reaches it instead: a call at a public entry's own path or at
+//!     `/signal/{token}`, a provider's push at `/events/...`, a wait
+//!     woken by hand.
 //!   - Resume signals (`is_resume = true`) always route to
 //!     `ProcessTarget::Resume`; the kind's `process` impl is only
 //!     consulted for entry-mode (`is_resume = false`).

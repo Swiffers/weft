@@ -34,7 +34,7 @@ fn row<'a>(project_id: Uuid, instance: &'a InstanceId) -> InstanceTokenRow<'a> {
 /// token writes nothing.
 #[sqlx::test]
 async fn a_replayed_program_mint_replaces_its_token(pool: PgPool) {
-    weft_dispatcher::app::apply_core_schema(&pool).await.expect("core schema");
+    weft_task_store::apply_groups(&pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let journal = PostgresJournal::from_pool(pool.clone());
     let project = Uuid::new_v4();
     let ada = InstanceId::new("ada").unwrap();

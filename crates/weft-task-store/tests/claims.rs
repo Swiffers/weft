@@ -19,7 +19,7 @@ use support::{claimed_task, setup};
 
 fn dispatcher_task(dedup: &str) -> tasks::NewTask {
     tasks::NewTask {
-        kind: "run_node_test".to_string(),
+        kind: weft_task_store::TaskKind::RunNodeTest,
         project_id: Some(Uuid::from_u128(0x1)),
         dedup_key: Some(dedup.to_string()),
         execution_id: None,
@@ -81,7 +81,16 @@ async fn a_dry_picker_prunes_and_looks_at_its_earliest_claim_lapse(pool: PgPool)
     use weft_task_store::drain::DrainStep;
     setup(&pool).await;
     let store = Arc::new(weft_task_store::PostgresTaskStoreClient::new(pool.clone(), support::signals(&pool).await).unwrap());
-    let picker = weft_task_store::dispatcher_picker_loop(store, (), weft_task_store::TaskRegistry::<()>::default(), "disp-1".into());
+    // This picker only ever finds nothing to claim: no executor runs.
+    struct Unused;
+    #[async_trait::async_trait]
+    impl weft_task_store::TaskExecutor<()> for Unused {
+        async fn execute(&self, _: &(), task: &tasks::Task) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("this test claims no task, yet {} ran", task.id)
+        }
+    }
+    let registry = weft_task_store::TaskRegistry::<()>::every_kind(|_| Arc::new(Unused));
+    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-1".into());
     assert_eq!((picker.drain)().await.unwrap(), DrainStep::Done, "no claim out");
 
     let old = tasks::enqueue(&pool, dispatcher_task("old")).await.unwrap();

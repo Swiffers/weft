@@ -1902,10 +1902,10 @@ pub fn diff_things(a: &[Thing], only_a: &str, b: &[Thing], only_b: &str) -> Opti
 }
 
 
-/// Prove one crate's canonical DDL and migration history agree: build a
+/// Prove the canonical DDL and the migration history agree: build a
 /// database each way and compare what Postgres ended up holding. The
-/// body of every crate's `schema_agreement` test, so the crates cannot
-/// drift on what "agrees" means.
+/// body of the `schema_agreement` test (in `weft-runtime`, over every
+/// group the install's database holds).
 ///
 /// Also the enforcement point for origins: a group with no committed
 /// `origin.sql` gets one WRITTEN here and the test fails naming it, so
@@ -1952,8 +1952,8 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
 /// Prove every group's canonical DDL is scratch-buildable by the
 /// boot's shape check: build the schema, move every stamp, and boot
 /// again. The re-boot rebuilds the DDL in the scratch schema, compares
-/// it against the live one, and restamps. The shared body of each
-/// crate's second `schema_agreement` test, so the first place a
+/// it against the live one, and restamps. The body of the second
+/// `schema_agreement` test, so the first place a
 /// non-scratch-buildable statement (a hardcoded `public.`, a reference
 /// outside the group set) surfaces is CI, never a production boot.
 #[cfg(feature = "db-tests")]
@@ -1976,8 +1976,30 @@ pub async fn assert_shape_check_restamps(pool: &PgPool, groups: &[&SchemaGroup])
     );
 }
 
-/// The whole `--migration` generator, shared by every crate's
-/// `schema_migration` example: freeze missing origins, build the schema
+/// The database a release runs on and records itself in: the one you
+/// have been working against, which is the database of the install this
+/// command acts on from where it runs (`WEFT_INSTALL` when set, else the
+/// install of the weft checkout it runs in, `weft_core::infra::Install::wanted`).
+/// Its address is the `WEFT_DATABASE_URL` line `weft daemon start` writes
+/// into the install's `secrets.env`, the address its runtime reaches it
+/// at. Returns a description of the install for messages, and the address.
+#[cfg(feature = "db-tests")]
+fn live_database_url() -> anyhow::Result<(String, String)> {
+    use weft_core::infra::{Install, WantedFrom, INSTALL_ENV};
+    let cwd = std::env::current_dir()?;
+    let wanted = Install::wanted(std::env::var(INSTALL_ENV).ok().as_deref(), &cwd).map_err(anyhow::Error::msg)?;
+    let install = match &wanted.from {
+        WantedFrom::Checkout { branch, .. } => format!("install '{}' (branch '{branch}')", wanted.install.env_value()),
+        WantedFrom::Env => format!("install '{}' ({INSTALL_ENV})", wanted.install.env_value()),
+        WantedFrom::Outside => "the default install".to_string(),
+    };
+    let url = wanted.install.secret("WEFT_DATABASE_URL").map_err(|e| anyhow::anyhow!("releasing runs on {install}'s database: {e}"))?;
+    Ok((install, url))
+}
+
+/// The whole `--migration` generator, the body of `weft-runtime`'s
+/// `schema_migration` example (over every group the install's database
+/// holds): freeze missing origins, build the schema
 /// the databases out there hold (origins + released migrations + this
 /// machine's drafts), build the schema the code declares, diff them,
 /// file the difference, and on `--release` collapse the drafts and
@@ -1986,8 +2008,10 @@ pub async fn assert_shape_check_restamps(pool: &PgPool, groups: &[&SchemaGroup])
 ///
 /// Reads the same env contract `./setup.sh --migration` provides:
 /// `DATABASE_URL` (a throwaway Postgres to build schemas in), the
-/// change name in argv, `--release`, every `--rename <spec>`,
-/// `--unrelated`, and `WEFT_LIVE_DATABASE_URL` when releasing.
+/// change name in argv, `--release`, every `--rename <spec>`, and
+/// `--unrelated`. A release finds the database you have been working
+/// against itself ([`live_database_url`]): the one of the install the
+/// command acts on from where it runs.
 #[cfg(feature = "db-tests")]
 pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -2036,20 +2060,19 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
         .windows(2)
         .filter(|w| w[0] == "--rename")
         .map(|w| w[1].parse::<Rename>())
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        // Each crate's generator sees only its own groups; a rename of
-        // another crate's table is that crate's run's to carry. One that
-        // matches no crate at all leaves its drop and add unnamed, which
-        // the check below refuses.
-        .filter(|r| {
-            let table = match r {
-                Rename::Table { to, .. } => to,
-                Rename::Column { table, .. } => table,
-            };
-            groups.iter().any(|g| g.tables.contains(&table.as_str()))
-        })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // Every group is here, so a rename naming a table that no group
+    // declares (or that a table rename in the list moves away from) is a
+    // typo, never another generator's to carry.
+    for rename in &renames {
+        let table = match rename {
+            Rename::Table { to, .. } => to,
+            Rename::Column { table, .. } => table,
+        };
+        let known = groups.iter().any(|g| g.tables.contains(&table.as_str()))
+            || renames.iter().any(|r| matches!(r, Rename::Table { from, .. } if from == table));
+        anyhow::ensure!(known, "--rename names the table '{table}', which no CREATE TABLE declares");
+    }
     let unrelated = args.iter().any(|a| a == "--unrelated");
     let unnamed = unnamed_renames(&before, &after, &renames)?;
     anyhow::ensure!(
@@ -2097,11 +2120,13 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     // carry that database anywhere). The running and recording then
     // land in one transaction.
     if release {
-        let live_url = std::env::var("WEFT_LIVE_DATABASE_URL").context(
-            "releasing needs WEFT_LIVE_DATABASE_URL, the database you have been \
-             working against, so its drafts can be swapped for the released file",
-        )?;
-        let live = PgPool::connect(&live_url).await?;
+        let (install, live_url) = live_database_url()?;
+        let live = PgPool::connect(&live_url).await.with_context(|| {
+            format!(
+                "releasing runs on {install}'s database, and it cannot be reached; start the \
+                 install with ./setup.sh --daemon from its checkout and run the same command again"
+            )
+        })?;
         let mut conn = live.acquire().await?;
         // A release records itself on the database and THEN writes
         // its file; a release cut between the two (Ctrl-C) leaves a

@@ -17,6 +17,7 @@
 //! - `guard`: the identity check on every internal route.
 //! - `role_waker`: waking the roles that scale to zero when work is
 //!   written for them.
+//! - `schema`: every table group the install's database holds.
 //! - `log_file`: a local install's bounded log file.
 //! - `unit_agent`: the agent beside every infra unit.
 
@@ -24,6 +25,7 @@ pub mod guard;
 pub mod log_file;
 pub mod platform;
 pub mod role_waker;
+pub mod schema;
 pub mod server;
 pub mod unit_agent;
 
@@ -131,7 +133,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let pool = if needs_db {
         let url = secret("WEFT_DATABASE_URL")?;
         let pool = weft_task_store::db::connect(&url, WORK_POOL.0, WORK_POOL.1).await.context("connect to the database")?;
-        weft_dispatcher::app::apply_core_schema(&pool).await?;
+        schema::apply(&pool).await?;
         weft_task_store::unanswered::alert_after(&pool, config.alert_after())
             .await
             .context("write down whether the install alerts on its stuck failures")?;
@@ -245,8 +247,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 supervisor_booking: (config.roles.of(CoreRole::Supervisor) == Placement::Serverless)
                     .then(|| weft_task_store::drain::Booking::new(pool.clone(), CoreRole::Supervisor, parts.alarm.clone())),
             },
-        )
-        .await?;
+        )?;
         let heard = news.as_ref().expect("the broker's process hears news").listen();
         weft_dispatcher::app::spawn_supervised("news", weft_broker::news::pass_on(heard, state.signals.also_told(), state.lines.clone()));
         loops.push((CoreRole::Broker, Loops::Drain(weft_broker::drain_loops(state.clone())?)));
@@ -284,7 +285,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         if config.auth == AuthMode::OperatorKeys {
             weft_dispatcher::app::seed_bootstrap_operator_key(&state, &secret("WEFT_BOOTSTRAP_OPERATOR_KEY")?).await?;
         }
-        let registry = weft_dispatcher::app::core_task_registry_builder().build();
+        let registry = weft_dispatcher::app::task_registry();
         loops.push((CoreRole::Dispatcher, Loops::Drain(weft_dispatcher::app::drain_loops(&state, registry)?)));
         weft_dispatcher::app::spawn_relays(&state);
         if let PlatformConfig::Local(local) = &config.platform {

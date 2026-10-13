@@ -16,8 +16,9 @@
 //! Driven on the user's own key only: a project-defined service offers no
 //! shared door (define your own provider, bring your own key), so the own
 //! connection is the path that exercises it. Spends real money (fractions of a cent). Needs
-//! `OPENROUTER_API_KEY` (repo-root `.env` or the shell), the real key the
-//! custom provider's call rides.
+//! `OPENROUTER_API_KEY` (the shell, or the repo root's `.env.local` or
+//! `.env`), the real key the custom provider's call rides, and skips
+//! without it.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::access::{connect_direct, service_spec_of, set_account};
@@ -27,13 +28,9 @@ use weft_e2e::{ensure, project::Project, run};
 /// is set on the node, so the call rides it and the project's meter prices it.
 #[tokio::test]
 async fn a_project_defined_provider_meters_a_real_call() -> anyhow::Result<()> {
+    // The custom provider's call rides the user's own key.
+    let Some(key) = ensure::env_or_skip("OPENROUTER_API_KEY") else { return Ok(()) };
     let disp = ensure::up().await?;
-    let key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-        anyhow::anyhow!(
-            "OPENROUTER_API_KEY must be set (repo-root .env or the shell): the custom provider's \
-             call rides the user's own key"
-        )
-    })?;
     let mut project = Project::prepare("openrouter_custom", disp.clone()).await?;
     // Connect the user's own key as a connection for the PROJECT-DEFINED
     // service, exactly as the editor's "Your own" page does; the spec is

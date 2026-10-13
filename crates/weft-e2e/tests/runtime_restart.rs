@@ -2,8 +2,8 @@
 //! and starts again (a reboot, an upgrade), and the work it was holding
 //! carries on as if nothing happened.
 //!
-//! Every test here restarts the runtime, which the default install's other
-//! tests would feel, so each runs in a cell at real time: the timers under
+//! Every test here restarts the runtime, which the install under test's
+//! other tests would feel, so each runs in a cell at real time: the timers under
 //! test are ones a person configured, which keep their real length at any
 //! pace.
 #![cfg(feature = "e2e")]

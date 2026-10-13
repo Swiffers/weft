@@ -11,57 +11,46 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskKind {
-    /// Register a wake signal with the listener and return its mint info
-    /// to the worker that asked.
-    RegisterSignal,
-    /// Withdraw a wait a run gave up (`WithdrawSignalPayload`): its signal
-    /// goes, and the listener lets go of it, so nobody is still asked to
-    /// answer it. Producer = worker (via broker).
-    WithdrawSignal,
-    /// An answer to a waiting run that a listener picked up (a timer's
-    /// tick, an event on a connection it holds), already processed by its
-    /// kind. Producer = listener (via broker), which never opens an HTTP
-    /// connection to the dispatcher, so the trust seam stays at the
-    /// broker.
-    FireSignal,
-    /// Stop every live execution of a project carrying a tag, on behalf
-    /// of one of its executions (`ctx.stop_tagged`). Producer = the
-    /// broker's `/v1/execution/stop_tagged` handler, which resolves the
-    /// ordering anchor at enqueue time; consumer = the dispatcher's
-    /// executor, which cancels each match through the one cancel path.
-    /// Rides the task table so the stop survives the asking worker dying
-    /// right after it asked.
-    StopTagged,
-    /// One call a program makes on its own project
-    /// (`weft_core::program::ProgramCall`: an infra copy, triggers, a
-    /// instance's connections, costs, a clean, instance tokens). Producer =
-    /// worker (via broker, which pins the project and the asker to the
-    /// run); the worker waits on the task's result.
-    ProgramCall,
-}
-
-// This enum holds only the kinds the dispatcher itself ships. A runtime that
-// adds its own task kinds registers + enqueues them by string via the
-// string-keyed task dispatch, without widening this enum.
-
-impl TaskKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RegisterSignal => "register_signal",
-            Self::WithdrawSignal => "withdraw_signal",
-            Self::FireSignal => "fire_signal",
-            Self::StopTagged => "stop_tagged",
-            Self::ProgramCall => "program_call",
-        }
-    }
-}
-
-impl From<TaskKind> for String {
-    fn from(k: TaskKind) -> String {
-        k.as_str().to_string()
+weft_core::wire_enum! {
+    /// What a task asks for, stored as its tag on `task.kind`: the tag is
+    /// written once, on the variant, and the wire, the column and the
+    /// executor registry all read it from there.
+    pub enum TaskKind {
+        /// Register a wake signal with the listener and return its mint info
+        /// to the worker that asked.
+        RegisterSignal = "register_signal",
+        /// Withdraw a wait a run gave up (`WithdrawSignalPayload`): its signal
+        /// goes, and the listener lets go of it, so nobody is still asked to
+        /// answer it. Producer = worker (via broker).
+        WithdrawSignal = "withdraw_signal",
+        /// An answer to a waiting run that a listener picked up (a timer's
+        /// tick, an event on a connection it holds), already processed by its
+        /// kind. Producer = listener (via broker), which never opens an HTTP
+        /// connection to the dispatcher, so the trust seam stays at the
+        /// broker.
+        FireSignal = "fire_signal",
+        /// Stop every live execution of a project carrying a tag, on behalf
+        /// of one of its executions (`ctx.stop_tagged`). Producer = the
+        /// broker's `/v1/execution/stop_tagged` handler, which resolves the
+        /// ordering anchor at enqueue time; consumer = the dispatcher's
+        /// executor, which cancels each match through the one cancel path.
+        /// Rides the task table so the stop survives the asking worker dying
+        /// right after it asked.
+        StopTagged = "stop_tagged",
+        /// One call a program makes on its own project
+        /// (`weft_core::program::ProgramCall`: an infra copy, triggers, a
+        /// instance's connections, costs, a clean, instance tokens). Producer =
+        /// worker (via broker, which pins the project and the asker to the
+        /// run); the worker waits on the task's result.
+        ProgramCall = "program_call",
+        /// Run one node self-test on the project's test server and complete
+        /// with its report (`RunNodeTestPayload`). Producer = the dispatcher's
+        /// own node-test API; no caller of the broker may enqueue it.
+        RunNodeTest = "run_node_test",
+        /// Drive one resync's take-down and bring-back (`ResyncPayload`).
+        /// Producer = the dispatcher's own resync request, in the transaction
+        /// that writes the plan down; no caller of the broker may enqueue it.
+        Resync = "resync",
     }
 }
 
@@ -90,6 +79,38 @@ pub struct FireSignalPayload {
 pub struct WithdrawSignalPayload {
     pub execution_id: weft_core::ExecutionId,
     pub token: String,
+}
+
+/// Payload for `TaskKind::RunNodeTest`: which test of which node, run on
+/// which image, for which project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunNodeTestPayload {
+    pub project_id: uuid::Uuid,
+    pub tenant: String,
+    /// The per-package node-test image to run (content-addressed).
+    /// Minted by the enqueuer, run verbatim.
+    pub image_ref: String,
+    /// Node type under test.
+    pub node: String,
+    /// Declared test name.
+    pub test: String,
+    /// Live tier: the connection (grant) id resolving the test's
+    /// declared service. Absent for basic/fake runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_connection: Option<String>,
+    /// Live-test fixture variables (`WEFT_NODE_TEST_*` only; a test reads
+    /// them through `LiveRig::fixture`). Values a test cannot
+    /// self-provision, like a chat id the tester's bot may message.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fixtures: std::collections::BTreeMap<String, String>,
+}
+
+/// Payload for `TaskKind::Resync`: the drive of the project's resync plan
+/// the task carries. Every write of the plan is fenced on it, so a task of
+/// an earlier drive writes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResyncPayload {
+    pub driver: uuid::Uuid,
 }
 
 /// Payload for `TaskKind::StopTagged`: "stop every live execution of
@@ -136,9 +157,25 @@ mod tests {
             assert_eq!(back.stop_self, stop_self, "{json}");
             assert_eq!(back.tag, "user_7");
         }
-        assert_eq!(TaskKind::StopTagged.as_str(), "stop_tagged");
-        assert_eq!(TaskKind::WithdrawSignal.as_str(), "withdraw_signal");
-        assert_eq!(TaskKind::ProgramCall.as_str(), "program_call");
+    }
+
+    weft_core::wire_enum_roundtrip_tests!(TaskKind);
+
+    /// The two kinds that were plain strings before they joined the enum
+    /// keep the strings rows already carry.
+    #[test]
+    fn the_kinds_that_were_strings_keep_their_stored_tags() {
+        assert_eq!(TaskKind::RunNodeTest.as_str(), "run_node_test");
+        assert_eq!(TaskKind::Resync.as_str(), "resync");
+    }
+
+    /// A resync task's payload is the shape rows already queued carry.
+    #[test]
+    fn a_resync_payload_reads_the_stored_shape() {
+        let driver = uuid::Uuid::from_u128(3);
+        let stored = serde_json::json!({ "driver": driver });
+        assert_eq!(serde_json::from_value::<ResyncPayload>(stored.clone()).unwrap(), ResyncPayload { driver });
+        assert_eq!(serde_json::to_value(ResyncPayload { driver }).unwrap(), stored);
     }
 
     /// An answer a listener picked up reaches the dispatcher with its run

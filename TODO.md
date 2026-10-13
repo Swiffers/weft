@@ -387,33 +387,6 @@ sits beside it (a run is reachable through both today); how much of a
 long history to load before the view goes lazy; and whether a version's
 diff should open the file diff in the editor rather than a tooltip.
 
-## Cloud installs: what is still open
-
-Weft installs on GCP (`deploy/terraform/gcp/`, `.github/workflows/install-gcp.yml`):
-one machine running `weft-runtime` and Postgres, project workers on Cloud
-Run, builds on Cloud Build, wakes on Cloud Tasks, infra nodes on Compute
-Engine, and a front door on the machine's own address with Let's
-Encrypt certificates. What is left:
-
-- **Nobody has run it on a real GCP project yet.** The Terraform, the
-  machine's boot, the Cloud Run, Cloud Build, Cloud Tasks and Compute
-  Engine clients, and the certificate issuance are covered by unit tests
-  on their request bodies only.
-- **The machine's memory.** An e2-micro has 1 GB for Postgres and every
-  role; nobody has measured weft's resident size there. If it does not
-  fit, the default machine becomes e2-small, which is not free.
-- **A connection whose provider refuses a bare IP as its callback**
-  (Google) needs the install to have a domain; nothing yet checks with a
-  real Slack app whether Slack's request URL verification accepts one.
-- **AWS and Azure**, on the same shape: Terraform per cloud and a
-  platform crate each.
-- **A frontend's database address in CI, on its own.** The deploy workflow
-  hands the frontend whatever the `WEFT_FRONT_ENV` secret holds, so the
-  program's database door reaches it once someone writes it there
-  (`weft infra env --on <target> --into <file>`, then `weft target export
-  --front-env <file>`). Nothing fills it in automatically when the program's
-  infrastructure comes up.
-
 ## To consider: `@install_filled`, a value filled once per install
 
 A connection a program's own node uses is picked per install, in the

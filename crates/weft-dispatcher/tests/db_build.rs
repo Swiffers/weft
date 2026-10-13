@@ -24,7 +24,7 @@ use weft_platform_traits::{BuildStatus, FakeImageBuilder, ImageBuilder, Staging}
 const TENANT: &str = "local";
 
 async fn setup(pool: &PgPool) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
 fn builder(pool: &PgPool, images: Arc<FakeImageBuilder>) -> VersionBuilder {
@@ -52,6 +52,7 @@ fn image(kind: ImageKind, image_ref: &str) -> PlannedImage {
         context_dir: "/tmp/ctx".into(),
         node_id: None,
         image_name: None,
+        uses: Default::default(),
     }
 }
 

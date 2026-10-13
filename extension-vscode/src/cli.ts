@@ -6,9 +6,42 @@
 // through the CLI, which reads `nodes/` directly. This mirrors how the
 // extension already shells out for lifecycle verbs.
 
-import { spawn } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import * as path from 'node:path';
 import type * as vscode from 'vscode';
+
+import type { WeftCli, WhichCli } from './localInstall';
+
+// The `weft` this window runs, chosen once when the extension activates.
+let chosenCli: WhichCli | undefined;
+
+/// Settle which `weft` every spawn in this window runs (`whichCli`).
+export function chooseCli(which: WhichCli): void {
+  chosenCli = which;
+}
+
+/// The `weft` this window runs. Throws the reason when there is none, so
+/// every verb fails with it rather than running some other install's CLI.
+export function weftCli(args: string[]): WeftCli {
+  if (chosenCli === undefined) throw new WeftCliError(args, null, 'the extension ran weft before choosing which one');
+  if ('error' in chosenCli) throw new WeftCliError(args, null, chosenCli.error);
+  return chosenCli;
+}
+
+/// Start `weft <args>`: THE way this extension runs its CLI, so every
+/// verb goes to the same install.
+export function spawnWeft(args: string[], opts: { cwd: string; detached?: boolean }): ChildProcessWithoutNullStreams {
+  const cli = weftCli(args);
+  return spawn(cli.command, args, { ...opts, env: cli.env });
+}
+
+/// What to tell somebody when the `weft` this window runs does not exist.
+export function weftNotFound(args: string[]): string {
+  const { command } = weftCli(args);
+  return path.isAbsolute(command)
+    ? `${command} does not exist; run ./setup.sh in the checkout that installed it`
+    : 'weft CLI not found on PATH. Install it or add it to your PATH.';
+}
 
 /** The message of a CLI `phase: "error"` event, when `value` is one. */
 /// The error event a failing `--json` verb prints, as the fields this
@@ -96,7 +129,7 @@ export function runWeftJson<T>(
   } = {},
 ): Promise<T> {
   return new Promise((resolve, reject) => {
-    const child = spawn('weft', args, { cwd, env: process.env });
+    const child = spawnWeft(args, { cwd });
     let stdout = '';
     let stderr = '';
     child.stdout?.on('data', (b: Buffer) => {
@@ -108,7 +141,7 @@ export function runWeftJson<T>(
       opts.onStderr?.(s);
     });
     child.on('error', (err: NodeJS.ErrnoException) => {
-      // ENOENT means `weft` isn't on PATH: the single most likely
+      // ENOENT means `weft` isn't there: the single most likely
       // real-world failure (fresh machine, CLI not installed). The raw
       // `spawn weft ENOENT` is useless, so name the actual fix.
       if (err.code === 'ENOENT') {
@@ -116,7 +149,7 @@ export function runWeftJson<T>(
           new WeftCliError(
             args,
             null,
-            'weft CLI not found on PATH. Install it or add it to your PATH.',
+            weftNotFound(args),
             // Nothing answered, for the same reason from the caller's
             // side: weft is not on this machine, so no verb can work.
             true,

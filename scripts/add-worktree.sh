@@ -2,14 +2,17 @@
 # Create a new git worktree for parallel feature work.
 #
 # Branches off whatever branch you're currently on, into a new branch with
-# the name you give. The worktree lives as a sibling of the repo at
-# ../weft-trees/<branch>.
+# the name you give. The worktree lives as a sibling of the main checkout at
+# ../weft-trees/<branch>, wherever you run this from.
 #
 # The gitignored local-config files (.env, .env.extension, access-apps.json)
 # are SYMLINKED to the main worktree's copies rather than duplicated: setup.sh
 # reads them but never creates them, and one set of credentials editable from
-# any worktree beats N copies that drift. Everything else (node deps, builds,
-# daemon) is handled by running ./setup.sh inside the worktree afterwards.
+# any worktree beats N copies that drift. A setting that must differ per
+# checkout (a public tunnel's token, say) goes in the worktree's own
+# .env.local instead, which wins over .env and is never linked or created
+# here. Everything else (node deps, builds, the branch's own weft install) is
+# handled by running ./setup.sh inside the worktree afterwards.
 #
 # Usage:
 #   scripts/add-worktree.sh <new-branch-name>
@@ -18,7 +21,9 @@
 #   scripts/add-worktree.sh feat/storage-plane
 #     -> branch feat/storage-plane off the current branch
 #     -> worktree at ../weft-trees/feat-storage-plane
-#     -> then: cd ../weft-trees/feat-storage-plane && ./setup.sh <flags>
+#     -> then: cd ../weft-trees/feat-storage-plane && ./setup.sh
+#        (sets up that branch's own install; main's is never touched)
+#     -> when done: scripts/remove-worktree.sh feat/storage-plane
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
@@ -45,7 +50,7 @@ base_branch="$(git rev-parse --abbrev-ref HEAD)"
 # Slashes are legal in branch names but make nested dirs; flatten for the
 # folder name while keeping the real branch name intact in git.
 dir_name="${new_branch//\//-}"
-worktree_path="$repo_root/../weft-trees/$dir_name"
+worktree_path="$main_root/../weft-trees/$dir_name"
 
 if git show-ref --verify --quiet "refs/heads/$new_branch"; then
   echo "error: branch '$new_branch' already exists" >&2
@@ -64,7 +69,8 @@ worktree_path="$(cd "$worktree_path" && pwd)"
 
 # Link the gitignored local-config the worktree needs to run. Symlinks, not
 # copies: editing any one of these from any worktree edits the single real
-# file, so credentials and tunnel settings never drift between trees.
+# file, so the credentials in them never drift between trees. Tunnel
+# settings are per checkout, in the unlinked .env.local.
 for cfg_file in .env .env.extension access-apps.json; do
   if [ -f "$main_root/$cfg_file" ]; then
     ln -sfn "$main_root/$cfg_file" "$worktree_path/$cfg_file"
@@ -79,5 +85,6 @@ echo "worktree ready:"
 echo "  $worktree_path"
 echo "  branch: $new_branch (off $base_branch)"
 echo ""
-echo "next:   cd $worktree_path && ./setup.sh <flags>   # builds + installs deps"
-echo "remove: git worktree remove $worktree_path"
+echo "next:   cd $worktree_path && ./setup.sh   # sets up this branch's own install"
+echo "editor: scripts/dev-editor.sh                # this branch's VS Code extension, from source"
+echo "remove: scripts/remove-worktree.sh $new_branch   # its install, then the worktree (the branch stays)"

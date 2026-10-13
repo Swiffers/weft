@@ -7,9 +7,10 @@
 //! wire correctness is node-tested in ai/llm, never here.
 //!
 //! Spends real money (fractions of a cent on the cheapest model).
-//! Needs OPENROUTER_API_KEY in the environment the tests read
-//! (repo-root `.env` or the shell), connected through the own-key door
-//! exactly as the editor's "Your own" page does.
+//! Needs OPENROUTER_API_KEY in the environment the tests read (the
+//! shell, or the repo root's `.env.local` or `.env`), and skips without
+//! it; the key is connected through the own-key door exactly as the
+//! editor's "Your own" page does.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::access::{catalog_spec, connect_direct, set_account};
@@ -26,9 +27,8 @@ fn answer_of(settled: &run::SettledRun, node: &str) -> String {
 
 #[tokio::test]
 async fn llm_stream_and_tool_loop_close_in_the_graph() -> anyhow::Result<()> {
+    let Some(key) = ensure::env_or_skip("OPENROUTER_API_KEY") else { return Ok(()) };
     let disp = ensure::up().await?;
-    let key = std::env::var("OPENROUTER_API_KEY")
-        .map_err(|_| anyhow::anyhow!("OPENROUTER_API_KEY must be set (repo-root .env or the shell)"))?;
     let conn = connect_direct(
         &disp,
         catalog_spec("ai/llm", "openrouter")?,

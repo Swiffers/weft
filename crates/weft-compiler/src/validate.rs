@@ -174,16 +174,18 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     }
 }
 
-/// route-overlap: two nodes of this program claim public addresses a
+/// route-overlap: two places of this program claim public addresses a
 /// single call could reach, and neither is the more specific, so which
 /// one answers has no answer. A pair where one IS more specific is
 /// fine and common (`cards/count` beside `cards/{id}`): the literal
-/// takes the call it spells out, the capture takes the rest.
+/// takes the call it spells out, the capture takes the rest. A node in
+/// a file included twice is at two places, so a path written in that
+/// file is claimed twice.
 ///
 /// The same question is asked again at activation, across every project
 /// of the account, because only the dispatcher's table knows what the
 /// author's OTHER programs already serve. What is answerable here is
-/// the half inside one file, and answering it here is worth it: the
+/// the half inside one program, and answering it here is worth it: the
 /// editor underlines it while you type instead of a deploy failing
 /// minutes later on `cards/{id}` against `cards/{slug}`.
 ///
@@ -198,7 +200,7 @@ fn check_route_claims(
 ) {
     use weft_core::route::{compare_patterns, methods_overlap, PatternOrder, RoutePattern};
 
-    // Every claim this program makes, in source order.
+    // Every claim this program makes.
     //
     // A path that is WIRED is skipped: it is computed when the trigger
     // sets up, so there is no address here to read or to compare. A path
@@ -213,7 +215,7 @@ fn check_route_claims(
     // `weft activate`, and a bad method is worse than late: an empty
     // method list reads as "any method", so a typo would silently widen
     // what the node claims.
-    let mut claims: Vec<(&NodeDefinition, &str, RoutePattern, Vec<String>)> = Vec::new();
+    let mut claims: Vec<Claim> = Vec::new();
     for node in &project.nodes {
         let Some(spec) = catalog
             .lookup(&node.node_type)
@@ -322,43 +324,159 @@ fn check_route_claims(
                 }
             }
         }
-        claims.push((node, spec.path_field.as_str(), pattern, methods));
+        claims.push(Claim { node, field: spec.path_field.as_str(), pattern, methods, places: Vec::new() });
     }
 
-    // Each colliding pair reported once, on the SECOND of the two: the
-    // first claim is the one that was already there, so the finding
-    // sits where the author just typed.
-    for (index, (node, field, pattern, methods)) in claims.iter().enumerate() {
-        for (earlier, _, earlier_pattern, earlier_methods) in &claims[..index] {
-            // Two patterns a call can reach are fine when one of them
-            // is the more specific: that one takes the calls it spells
-            // out and the other takes the rest. Only the pair where
-            // neither wins leaves a call with no answer.
-            if compare_patterns(pattern, earlier_pattern) != PatternOrder::Ambiguous
-                || !methods_overlap(methods, earlier_methods)
-            {
-                continue;
-            }
+    // A node inside an included file is one definition in the compiled
+    // program, but every site that includes the file (through however
+    // many files) serves its own copy of it. So a claim is made once per
+    // place, and a file with a written path included twice claims that
+    // path twice.
+    //
+    // A node in an included body that no site calls has no place at
+    // all: it serves nothing, so it claims nothing and is left out of
+    // the comparison. Its path was still checked above for being well
+    // formed, because that is source the author wrote.
+    let mut claims = placed(project, claims);
+    claims.retain(|claim| !claim.places.is_empty());
+
+    // Two patterns a call can reach are fine when one of them is the
+    // more specific: that one takes the calls it spells out and the
+    // other takes the rest. Only the pair where neither wins leaves a
+    // call with no answer.
+    let collide = |a: &Claim, b: &Claim| {
+        compare_patterns(&a.pattern, &b.pattern) == PatternOrder::Ambiguous && methods_overlap(&a.methods, &b.methods)
+    };
+    let addresses = |claim: &Claim| -> Vec<String> {
+        claim.places.iter().map(|place| weft_core::project::address_of(project, &claim.node.id, &place.path)).collect()
+    };
+
+    // One node at several places: the file it is written in is included
+    // more than once, so its one written path is served at each, and a
+    // claim always collides with itself (same pattern, same methods).
+    // One finding for the node, naming every place. The line to change
+    // is the include where the second place parts from the first
+    // (`two = @include(...)`), not the shared file both read.
+    for claim in claims.iter().filter(|claim| claim.places.len() > 1) {
+        let (first, second) = (&claim.places[0].path, &claim.places[1].path);
+        let parted = second
+            .iter()
+            .zip(first.iter())
+            .position(|(a, b)| a != b)
+            .expect("two places of one node part somewhere: a file cannot include itself, so neither path is a prefix of the other");
+        let site = project
+            .groups
+            .iter()
+            .find(|group| group.id == second[parted])
+            .expect("every site on a place's path is a call site group");
+        push(
+            d,
+            site.source_file.as_deref(),
+            site.header_span.or(site.span).unwrap_or_default(),
+            Severity::Error,
+            "route-overlap",
+            format!(
+                "{} each serve '{}': they are the same node, in a file included at each of \
+                 those places, so a call has no way to pick one. Include the file once, or \
+                 wire the node's `{}` from an input of the file so each include gives its own",
+                weft_core::comma_list::spell_list(&addresses(claim)),
+                claim.pattern.as_str(),
+                claim.field,
+            ),
+        );
+    }
+
+    // Each pair of different nodes reported once, on the one written
+    // later (by its first place): the other was already there, so the
+    // finding sits where the author just typed.
+    claims.sort_by(|a, b| a.places[0].order.cmp(&b.places[0].order));
+    for (index, claim) in claims.iter().enumerate() {
+        for earlier in claims[..index].iter().filter(|earlier| collide(claim, earlier)) {
             cfg_push(
                 d,
-                node,
-                field,
+                claim.node,
+                claim.field,
                 Severity::Error,
                 "route-overlap",
                 format!(
-                    "'{}' serves '{}' and '{}' serves '{}'. A call can reach either, and \
+                    "'{}' is served by {}, and '{}' by {}. A call can reach either, and \
                      neither is the more specific, so there is no answer to give. One of \
                      them has to spell out what the other captures (a literal segment \
                      where the other has '{{name}}'), or they need different paths or \
                      different methods",
-                    author_name(node),
-                    pattern.as_str(),
-                    author_name(earlier),
-                    earlier_pattern.as_str(),
+                    claim.pattern.as_str(),
+                    weft_core::comma_list::spell_list(&addresses(claim)),
+                    earlier.pattern.as_str(),
+                    weft_core::comma_list::spell_list(&addresses(earlier)),
                 ),
             );
         }
     }
+}
+
+/// One route claim a node makes: what `check_route_claims` compares.
+struct Claim<'a> {
+    node: &'a NodeDefinition,
+    field: &'a str,
+    pattern: weft_core::route::RoutePattern,
+    methods: Vec<String>,
+    /// Every place the node is at, in source order ([`placed`]).
+    places: Vec<ClaimPlace>,
+}
+
+/// One place a claiming node is at.
+struct ClaimPlace {
+    /// The call path: empty outside every included file, else the sites
+    /// that reach the node, outermost first.
+    path: Vec<String>,
+    /// Where the place is written: the start of each site on the path
+    /// and then of the node itself, each in the file it is written in.
+    /// Two places are equal up to the first site where they part, and
+    /// from there on both entries sit in the same file, so comparing
+    /// these compares the order the author wrote them in. A program
+    /// built without source has no spans, and its places keep the order
+    /// the graph lists them in.
+    order: Vec<(usize, usize)>,
+}
+
+/// `claims` with the places each node is at filled in, each claim's
+/// places in source order. A program with no claims never indexes its
+/// graph.
+fn placed<'p>(project: &'p ProjectDefinition, mut claims: Vec<Claim<'p>>) -> Vec<Claim<'p>> {
+    if claims.is_empty() {
+        return claims;
+    }
+    let mut at: std::collections::HashMap<&str, Vec<Vec<String>>> =
+        claims.iter().map(|claim| (claim.node.id.as_str(), Vec::new())).collect();
+    for place in weft_core::project::selection::every_place(project) {
+        if let Some(paths) = at.get_mut(place.id.as_str()) {
+            paths.push(place.path);
+        }
+    }
+    let groups: std::collections::HashMap<&str, &weft_core::project::GroupDefinition> =
+        project.groups.iter().map(|group| (group.id.as_str(), group)).collect();
+    let start = |span: Option<Span>| span.map(|s| (s.start_line, s.start_column)).unwrap_or_default();
+    for claim in &mut claims {
+        let node = claim.node;
+        claim.places = at
+            .remove(node.id.as_str())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| {
+                let order = path
+                    .iter()
+                    .map(|site| {
+                        let site = groups.get(site.as_str()).expect("every site on a place's path is a group");
+                        start(site.header_span.or(site.span))
+                    })
+                    .chain(std::iter::once(start(node.header_span.or(node.span))))
+                    .collect();
+                ClaimPlace { path, order }
+            })
+            .collect();
+        claim.places.sort_by(|a, b| a.order.cmp(&b.order));
+    }
+    claims
 }
 
 /// named-type-conflict: nominal compatibility compares the NAME alone

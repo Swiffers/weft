@@ -77,7 +77,7 @@ mod node_trait {
 
         /// The node's normal body. `ctx` provides language primitives
         /// (`pulse_downstream`, `create_bus`, `bus`, `await_signal`,
-        /// `metered_access`, `log`, `endpoint`). The ONLY way to fire
+        /// `log`, `endpoint`). The ONLY way to fire
         /// downstream is `ctx.pulse_downstream(output)`. For a plain
         /// (non-trigger) node the engine calls this in every lifecycle
         /// phase (a value feeding a trigger's config must be produced at

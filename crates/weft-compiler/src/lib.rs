@@ -6,10 +6,11 @@
 //! 1. `Project::load` reads `weft.toml` (and refuses a program still at
 //!    the project root instead of `src/`).
 //! 2. `weft_compiler::compile` parses `src/main.weft` into the lossless
-//!    CST and lowers it, resolves `@include` (the build inlines the
-//!    included group's body; the editor's `Interface` mode leaves one
-//!    opaque node), then flattens: a group becomes two `Passthrough`
-//!    boundary nodes and a loop a `LoopIn` / `LoopOut` pair, so what
+//!    CST and lowers it, resolves `@include` (the build compiles each
+//!    included file once, as one shared body group, and each use of it
+//!    is a call site group naming that body; the editor's `Interface`
+//!    mode leaves one opaque node), then flattens: a group becomes two
+//!    `Passthrough` boundary nodes and a loop a `LoopIn` / `LoopOut` pair, so what
 //!    comes out is one flat `ProjectDefinition` of nodes and edges.
 //!    `@file` / `@asset` values resolve last, on that flat graph; a
 //!    file-typed `@asset` stays a marker for the build's asset sync.

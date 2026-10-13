@@ -470,6 +470,7 @@ impl VersionBuilder {
             staging: staging.clone(),
             image_ref: image.image_ref.clone(),
             build_args,
+            uses: image.uses.clone(),
         };
         let handle = match self.images.start(request).await {
             Ok(handle) => handle,

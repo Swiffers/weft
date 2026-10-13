@@ -239,7 +239,8 @@ all take `--instance <id>`.
 | `weft daemon stop` | Stops the runtime and the workers it started. The database, your infrastructure and your data stay |
 | `weft daemon status` | Whether it is reachable, and the public address if one is open |
 | `weft daemon logs` | The runtime's log. `--tail` (100), `-f` |
-| `weft daemon remove` | Takes a named install (`WEFT_INSTALL`) off this machine, everything of it included. The default install is removed by `./setup.sh --uninstall` |
+| `weft daemon remove` | Takes a named install off this machine, everything of it included: the install of the branch you run it from, or the one `WEFT_INSTALL` names. The default install is removed by `./setup.sh --uninstall` |
+| `weft daemon which` | Which install a command run here acts on, and where its files are. `--json` for scripts |
 
 Flags on `weft daemon start`: `--rebuild` forces every shared image to rebuild.
 `--public-url` and `--no-public-url` open and close

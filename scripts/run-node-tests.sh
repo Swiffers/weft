@@ -30,7 +30,12 @@
 #
 # The suite runs inside a scratch project (target/node-tests, created on
 # first use) whose base catalog is re-synced from THIS checkout on every
-# run, so the tests always exercise the checkout's nodes.
+# run, so the tests always exercise the checkout's nodes, with the weft of
+# the install ./setup.sh set up for this checkout (on a branch, the
+# branch's own). Each `weft test-node` compiles its packages first, so it
+# takes its turn in the machine's build slot (one heavy cargo build at a
+# time, shared with setup.sh and the e2e runner): sequentially one
+# package at a time, with --parallel one batch at a time.
 #
 # Live-tier credentials come from the environment / the repo-root .env
 # (uncommitted; the weft CLI loads it itself). For a pasted-key
@@ -49,14 +54,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-if ! command -v weft >/dev/null 2>&1; then
-  echo "weft is not on PATH; install it from this checkout first (./setup.sh)" >&2
-  exit 1
-fi
+# shellcheck source=scripts/lib/machine-lock.sh
+. "$SCRIPT_DIR/lib/machine-lock.sh"
+# shellcheck source=scripts/lib/checkout-install.sh
+. "$SCRIPT_DIR/lib/checkout-install.sh"
+trap machine_lock_release_mine EXIT
+
+# This checkout's install, its own weft first on PATH and named for every
+# weft this script starts.
+# SYNC: WEFT_INSTALL <-> crates/weft-core/src/infra/install.rs (INSTALL_ENV)
+weft_checkout_install "$REPO_ROOT" || exit 1
+export WEFT_INSTALL="$WHICH_ENV"
+export PATH="$WHICH_BIN:$PATH"
 # A stale binary without the test-node verb would fail confusingly
 # mid-suite; refuse up front naming the fix.
 if ! weft test-node --help >/dev/null 2>&1; then
-  echo "the weft on PATH ($(command -v weft)) is too old (no test-node verb); rebuild it from this checkout (./setup.sh)" >&2
+  echo "the weft of this checkout's install ($WHICH_BIN/weft) is too old (no test-node verb); rebuild it (./setup.sh)" >&2
   exit 1
 fi
 
@@ -207,14 +220,17 @@ fi
 if [ "$LIVE" = 1 ]; then
   # Live tests run on the install's workers; bring it up if it does not
   # answer.
+  # A start may compile the runtime's image, so it takes the build slot.
   if ! weft daemon status 2>/dev/null | grep -q '^weft: running'; then
     echo "weft is not running; running weft daemon start first"
-    weft daemon start || exit 1
+    with_build_slot weft daemon start || exit 1
   fi
   # The dispatcher only runs node tests for a registered project; a
   # first `weft run` registers it (and proves the build pipeline).
-  # Content-addressed images make this cheap after the first time.
-  (cd "$PROJECT_DIR" && weft run) || exit 1
+  # Content-addressed images make this cheap after the first time; the
+  # first time compiles the worker, so it takes the build slot too.
+  register_project() { (cd "$PROJECT_DIR" && weft run); }
+  with_build_slot register_project || exit 1
 fi
 
 # ---------- The live-pass cache ----------
@@ -274,6 +290,11 @@ run_pkg() {
   (cd "$PROJECT_DIR" && "${CMD[@]}")
 }
 
+# One package in the build slot, for the sequential run.
+run_pkg_in_slot() {
+  with_build_slot run_pkg "$1"
+}
+
 fail_banner() {
   echo ""
   echo "########################################################################"
@@ -308,7 +329,7 @@ if [ -z "$PARALLEL" ]; then
     echo "========================================================================"
     echo "  node tests: $pkg  ($n/$TOTAL)"
     echo "========================================================================"
-    if ! run_pkg "$pkg"; then
+    if ! run_pkg_in_slot "$pkg"; then
       fail_banner "$pkg"
       exit 1
     fi
@@ -324,16 +345,21 @@ else
   BATCH_SIZE="$PARALLEL"
   [ "$BATCH_SIZE" = 0 ] && BATCH_SIZE=$TOTAL
   LOG_DIR="$(mktemp -d)"
-  trap 'rm -rf "$LOG_DIR"' EXIT
+  trap 'rm -rf "$LOG_DIR"; machine_lock_release_mine' EXIT
   i=0
   done_count=0
   while [ "$i" -lt "$TOTAL" ]; do
     BATCH=("${RUN_LIST[@]:$i:$BATCH_SIZE}")
+    # The whole batch compiles at once, so it holds the build slot until
+    # its last package is done.
+    build_slot_take || exit 1
     declare -A PID_PKG=()
     for pkg in "${BATCH[@]}"; do
       # A package name may contain '/', which would nest the log path;
       # the log file uses a flattened name, display keeps the real one.
-      run_pkg "$pkg" >"$LOG_DIR/${pkg//\//_}.log" 2>&1 &
+      # Its own subshell drops the build slot's descriptor: the slot is
+      # this script's to hand back, whatever the package leaves running.
+      ( close_machine_locks_here; run_pkg "$pkg" ) >"$LOG_DIR/${pkg//\//_}.log" 2>&1 &
       PID_PKG["$!"]="$pkg"
       echo "→ $pkg started"
     done
@@ -353,6 +379,7 @@ else
         BATCH_FAILED+=("$pkg")
       fi
     done
+    build_slot_release
     for pkg in "${BATCH[@]}"; do
       echo ""
       echo "========================================================================"

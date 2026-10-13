@@ -13,10 +13,9 @@
 # SYNC: the install label <-> crates/weft-core/src/infra/install.rs (INSTALL_LABEL)
 weft_install_label=weft-install
 
-# The data directory every install lives under: the default install at
-# its root, a named one under installs/<name>.
-# SYNC: <-> crates/weft-cli/src/commands/daemon.rs (data_dir, Install::from_env)
-weft_state_dir="${HOME}/.local/share/weft"
+# weft_state_dir: the data directory every install lives under.
+# shellcheck source=scripts/lib/data-dir.sh
+. "$(dirname "${BASH_SOURCE[0]}")/data-dir.sh"
 
 # Repositories of the images weft builds or runs, matched with any
 # registry prefix stripped. The system images (weft-dispatcher and the
@@ -142,7 +141,9 @@ weft_old_install_present() {
 # `exec_event` table. A Postgres container that is stopped is started to
 # look (the install starts it next anyway); no container, no history.
 # Prints `yes` or `no`; fails when the database cannot be asked, which
-# the caller must not read as "nothing to wipe".
+# the caller must not read as "nothing to wipe". The default install's
+# database only: a branch's install is made by a version that never
+# stored runs that way.
 # SYNC: weft-postgres, weft, weft <-> crates/weft-cli/src/commands/daemon.rs (postgres_container, PG_USER, PG_DB)
 weft_old_run_history() {
   if ! docker container inspect weft-postgres >/dev/null 2>&1; then
@@ -182,7 +183,7 @@ COMMIT;
 SQL
 }
 
-# The named installs on this machine (test cells, say), comma separated,
+# The named installs on this machine (branches' installs, test cells), comma separated,
 # empty when there are none. A wipe takes them too, so its question
 # names them.
 # SYNC: installs/<name> <-> crates/weft-core/src/infra/install.rs (Install::dir)

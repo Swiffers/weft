@@ -681,11 +681,12 @@ pub async fn clean(
 ///      built (`weft test-node`), which the install never saw: those
 ///      carrying the cwd project's `weft.dev/project` label, or any value
 ///      with `--all`.
-///   3. With `--all` only: builder-base, runtime and registry-named
-///      standard worker tags other than the current ones (each engine change mints fresh ones, and both are
-///      shared across every project). Needs the weft repo root to compute
-///      the current refs.
-///   4. With `--all` only: compile caches under a retired key.
+///   3. With `--all` only: the shared images no install on this machine
+///      uses (builder bases, node-test images, runtimes, registry-named
+///      standard workers): each engine change mints fresh ones, and every
+///      install on the machine may run a different version
+///      ([`crate::image_refs`]).
+///   4. With `--all` only: the worker compile caches no install uses.
 async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     // The scope, settled BEFORE any layer runs: a scoped clean that cannot
     // name its project must delete nothing, not run the global layers and
@@ -714,10 +715,11 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     layer("built images", registry_prune(ctx, &scope).await);
     layer("dangling node-test leftovers", dangling_prune(&scope).await);
     if all {
-        layer("builder-base images", current_only_sweep(crate::images::builder_base_ref()?, "builder-base").await);
-        layer("runtime images", current_only_sweep(crate::images::runtime_image_ref()?, "runtime").await);
-        layer("standard worker images", stale_standard_worker_sweep().await);
-        layer("retired compile caches", retired_compile_cache_sweep().await);
+        let data = super::daemon::data_dir();
+        for kind in SharedImages::ALL {
+            layer(kind.layer(), unused_image_sweep(&data, kind).await);
+        }
+        layer("unused compile caches", unused_compile_cache_sweep(&data).await);
     }
     // The compile cache every worker build shares is not an image, but it
     // is disk, so it is never invisible. Reading its size is not a reclaim:
@@ -789,39 +791,123 @@ async fn dangling_prune(scope: &Scope) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Layer 3: old builder bases and runtime images. Each engine or
-/// toolchain change mints a fresh `weft-builder-base:<hash>` (about
-/// 1.4GB) and `weft-runtime:<hash>`, and nothing evicts the previous one
-/// implicitly (an implicit sweep would race a build FROMing it or a unit
-/// agent running it), so this explicit clean is where they go. Everything
-/// but `current` (the ref this checkout uses) is dead.
-async fn current_only_sweep(current: String, what: &str) -> anyhow::Result<()> {
-    let stale = crate::images::host_images_matching(&host_image_listing().await?, crate::images::outside_current(&current)?);
-    if stale.is_empty() {
-        println!("no stale {what} images");
-        return Ok(());
+/// `weft clean --images --build-plane`: the builder bases and node-test
+/// images no install on this machine uses, the part of layer 3 that
+/// needs no running install (setup.sh runs it after every start, so an
+/// engine change leaves nothing of the version it replaced). Fails only
+/// when docker cannot be asked.
+pub async fn clean_build_plane() -> anyhow::Result<()> {
+    let data = super::daemon::data_dir();
+    for kind in SharedImages::BUILD_PLANE {
+        unused_image_sweep(&data, kind).await?;
     }
-    println!("{}", reclaim_host_images(&stale).await?.report(&format!("stale {what} image(s)")));
     Ok(())
 }
 
-/// Layer 3 too: the standard workers of earlier weft versions, which are
-/// tagged under a registry name and so are not in the install's ledger.
-async fn stale_standard_worker_sweep() -> anyhow::Result<()> {
-    let stale = crate::images::stale_standard_workers(&host_image_listing().await?, &crate::images::standard_worker_ref()?)?;
+/// The kinds of shared image a machine-wide sweep reclaims: the refs each
+/// install records ([`crate::image_refs`]: its start writes one of each,
+/// and its builds add the builder bases they pick), and
+/// nothing evicts the previous one implicitly (an implicit sweep would
+/// race a build FROMing it or a unit agent running it), so an explicit
+/// clean is where they go. Whatever no install's record names is dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedImages {
+    /// `weft-builder-base:<hash>`, about 1.4GB each.
+    BuilderBase,
+    /// `weft-node-tests:<hash>`, kept by the builder base they were
+    /// built on.
+    NodeTests,
+    Runtime,
+    /// The registry-named standard workers; an install's own name for
+    /// one is in its ledger, and layer 1 reclaims it.
+    StandardWorker,
+}
+
+impl SharedImages {
+    /// Every kind, the order `--all` sweeps them in.
+    const ALL: [Self; 4] = [Self::BuilderBase, Self::NodeTests, Self::Runtime, Self::StandardWorker];
+    /// The kinds `--build-plane` sweeps.
+    const BUILD_PLANE: [Self; 2] = [Self::BuilderBase, Self::NodeTests];
+
+    /// What a person calls one of them.
+    fn what(self) -> &'static str {
+        match self {
+            Self::BuilderBase => "builder-base image",
+            Self::NodeTests => "node-test image",
+            Self::Runtime => "runtime image",
+            Self::StandardWorker => "standard worker image",
+        }
+    }
+
+    /// The layer's name in a failure report.
+    fn layer(self) -> &'static str {
+        match self {
+            Self::BuilderBase => "builder-base images",
+            Self::NodeTests => "node-test images",
+            Self::Runtime => "runtime images",
+            Self::StandardWorker => "standard worker images",
+        }
+    }
+
+    /// The refs of an install's record that keep images of this kind.
+    fn recorded(self) -> fn(&weft_core::images::ImageRefs) -> Vec<&str> {
+        match self {
+            Self::BuilderBase | Self::NodeTests => |r| r.builder_bases.iter().map(String::as_str).collect(),
+            Self::Runtime => |r| vec![r.runtime.as_str()],
+            Self::StandardWorker => |r| vec![r.standard_worker.as_str()],
+        }
+    }
+}
+
+/// Remove the images of `kind` no install in `records` uses, or nothing
+/// at all while one has not recorded what it uses (saying which).
+async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> anyhow::Result<()> {
+    // Held from the look at the records through the removal it decides
+    // (`crate::image_refs::Records`).
+    let records = crate::image_refs::every_install(data_dir).await?;
+    let kept = match crate::image_refs::kept(&records.installs, kind.recorded(), kind.what()) {
+        crate::image_refs::Kept::Unknown(why) => {
+            println!("{why}");
+            return Ok(());
+        }
+        crate::image_refs::Kept::Only(kept) => kept,
+    };
+    let listing = host_image_listing(&[]).await?;
+    let kept_refs: Vec<&str> = kept.iter().map(String::as_str).collect();
+    let stale = match kind {
+        SharedImages::BuilderBase => crate::images::host_images_matching(
+            &listing,
+            crate::images::outside_kept(weft_compiler::worker_image::BUILDER_BASE_REPO, &kept_refs)?,
+        ),
+        SharedImages::Runtime => crate::images::host_images_matching(&listing, crate::images::outside_kept(crate::images::RUNTIME_REPO, &kept_refs)?),
+        SharedImages::StandardWorker => crate::images::stale_standard_workers(&listing, kept_refs)?,
+        SharedImages::NodeTests => {
+            let mut built_on_kept = String::new();
+            for base in kept_refs {
+                let (_, tag) = crate::images::ref_repo_tag(base)?;
+                built_on_kept.push_str(&host_image_listing(&[format!("label={}={tag}", crate::images::NODE_TEST_BASE_LABEL)]).await?);
+            }
+            crate::images::stale_node_test_images(&listing, &built_on_kept)
+        }
+    };
     if stale.is_empty() {
-        println!("no stale standard worker images");
+        println!("no unused {}s", kind.what());
         return Ok(());
     }
-    println!("{}", reclaim_host_images(&stale).await?.report("stale standard worker image(s)"));
+    println!("{}", reclaim_host_images(&stale).await?.report(&format!("unused {}(s)", kind.what())));
     Ok(())
 }
 
-/// Every host image as one `repo:tag` line, the listing the host-side
-/// matcher reads.
-async fn host_image_listing() -> anyhow::Result<String> {
-    let listing = crate::images::docker()
-        .args(["images"])
+/// Every host image (narrowed by docker's `filters`, `label=k=v` and
+/// the like) as one `repo:tag` line, the listing the host-side matcher
+/// reads.
+async fn host_image_listing(filters: &[String]) -> anyhow::Result<String> {
+    let mut images = crate::images::docker();
+    images.arg("images");
+    for filter in filters {
+        images.args(["--filter", filter]);
+    }
+    let listing = images
         .args(["--format", "{{.Repository}}:{{.Tag}}"])
         .output()
         .await?;
@@ -923,18 +1009,15 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     }
     let sizes: Vec<String> = caches.iter().map(|cache| {
         let mut line = if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) };
-        match cache.unreadable_lane.as_deref() {
-            Some("") => line.push_str(&format!(" (record {} has no lane number)", cache.id)),
-            Some(suffix) => line.push_str(&format!(" (record {} has lane '{suffix}', not a number)", cache.id)),
-            None => {}
+        if cache.lane.is_none() {
+            line.push_str(&format!(" ({})", compile_cache_lane(cache)));
         }
         line
     }).collect();
     println!(
         "worker compile cache: {} across {} cache(s) (one per key and compile lane); a build drops the per-project crates no build on this host \
-         has linked for {} days, `weft clean --images --all` (the last step of `setup.sh`) drops at once the key this checkout \
-         moved off, and another key's spare lanes once unused for a day and its first lane once unused that long, \
-         `weft clean --build-cache` drops everything now",
+         has linked for {} days, `weft clean --images --all` (the last step of `setup.sh`) drops every key no install on this machine \
+         uses, `weft clean --build-cache` drops everything now",
         sizes.join(" + "),
         caches.len(),
         weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS
@@ -942,139 +1025,68 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Layer (`--all` only): compile caches under a RETIRED key. The key
-/// changes with the build environment or the builder, and nothing mounts
-/// the old one again unless a checkout goes back to it (a branch switch),
-/// so its own sweep never runs; this is the only thing that reclaims it.
+/// Layer 4 (`--all` only): the worker compile caches no install uses.
+/// The key changes with the build environment or the builder, and
+/// nothing mounts an old one again unless an install goes back to it, so
+/// its own sweep never runs; this is the only thing that reclaims it.
+/// Every lane of a key an install records stays (its start recorded it,
+/// or one of its builds picked it); every lane of any other key goes, at
+/// once. While an install has not recorded its keys, nothing goes.
 ///
-/// A key THIS checkout moved off is junk at once: it is dropped whole,
-/// every lane, unless another checkout on this machine still names it as
-/// its own. Each checkout records the key it last swept with (in
-/// [`CACHE_KEYS_DIR`], one file per checkout), which is how an update
-/// through `setup.sh` (whose last step is this sweep) leaves nothing of
-/// the version it replaced. A key no checkout here recorded may still be
-/// another worktree's that never swept, so it goes only once no build
-/// has used it for a while: a spare lane after [`SPARE_LANE_IDLE_DAYS`],
-/// the first lane after the retention period. The current key is never
-/// dropped: it is the one the next build wants.
-async fn retired_compile_cache_sweep() -> anyhow::Result<()> {
-    let retention = u64::from(weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS);
-    let weft_root = weft_compiler::build::resolve_weft_root()?;
-    let current = weft_compiler::hash::compute_worker_cache_key(&weft_root, "builder-base")?;
-    let registry = super::daemon::data_dir().join(CACHE_KEYS_DIR);
-    let mine = registry.join(checkout_record_name(&weft_root));
-    let keys = CheckoutKeys::read(&registry, &mine)?;
+/// A lane a build on this machine holds right now (its lock file under
+/// the data dir) is skipped whatever its key, and the sweep holds each
+/// lane it drops from, so no CLI build (a node test, the standard worker)
+/// starts on it mid-drop. An install's own builds pick their lanes in its
+/// database, out of this sweep's sight; what keeps their caches is the
+/// key each build adds to its install's record before it starts.
+async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    fn keys(r: &weft_core::images::ImageRefs) -> Vec<&str> {
+        r.compile_cache_keys.iter().map(String::as_str).collect()
+    }
+    let mut lanes: std::collections::BTreeMap<u32, Option<crate::images::CompileLane>> = std::collections::BTreeMap::new();
     let mut failures = Vec::new();
-    for cache in crate::images::worker_compile_caches().await? {
-        let Some(why) = retired_cache_drop(&cache, &current, &keys, retention) else { continue };
-        match why {
-            RetiredDrop::MovedOff => println!(
-                "dropping the worker compile cache this checkout moved off (lane {}, {})",
-                cache.lane.unwrap_or_default(),
-                cache.size
-            ),
-            RetiredDrop::SpareLane => println!(
-                "dropping a retired worker compile cache's spare lane {} ({})",
-                cache.lane.unwrap_or_default(),
-                cache.size
-            ),
-            RetiredDrop::Unused => {
-                println!("dropping a retired worker compile cache unused for {} days ({})", cache.idle_days, cache.size)
+    for cache in crate::images::worker_compile_caches().await?.iter() {
+        // The records are looked at again for each cache, and held through
+        // its prune: a build that records its key meanwhile either got in
+        // first (the cache stays) or waits for this one prune.
+        let records = crate::image_refs::every_install(data_dir).await?;
+        let kept = match crate::image_refs::kept(&records.installs, keys, "worker compile cache") {
+            crate::image_refs::Kept::Unknown(why) => {
+                println!("{why}");
+                return Ok(());
+            }
+            crate::image_refs::Kept::Only(kept) => kept,
+        };
+        if kept.contains(&cache.key) {
+            continue;
+        }
+        let lane = compile_cache_lane(cache);
+        if let Some(number) = cache.lane {
+            let taken = match lanes.entry(number) {
+                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::btree_map::Entry::Vacant(e) => e.insert(crate::images::CompileLane::try_take(number)?),
+            };
+            if taken.is_none() {
+                println!("keeping a worker compile cache no install uses (key {}, {lane}, {}): a build holds that lane right now", cache.key, cache.size);
+                continue;
             }
         }
+        println!("dropping a worker compile cache no install uses (key {}, {lane}, {})", cache.key, cache.size);
         if let Err(error) = crate::images::prune_build_record(&cache.id).await {
             failures.push(format!("{error:#}"));
         }
-    }
-    // Recorded after the drops, so a sweep that failed part way still
-    // knows the key it has to finish dropping next time.
-    if failures.is_empty() {
-        std::fs::create_dir_all(&registry).with_context(|| format!("create {}", registry.display()))?;
-        std::fs::write(&mine, &current).with_context(|| format!("record this checkout's compile cache key in {}", mine.display()))?;
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
-/// Under the weft data dir: one file per checkout, named by a hash of its
-/// path, holding the compile cache key that checkout last swept with.
-const CACHE_KEYS_DIR: &str = "compile-cache-keys";
-
-/// The record file name for the checkout at `root`.
-fn checkout_record_name(root: &std::path::Path) -> String {
-    use sha2::{Digest, Sha256};
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
-}
-
-/// What the checkouts on this machine recorded: the key this one moved
-/// off, and the keys the others still call their own.
-#[derive(Debug, Default)]
-struct CheckoutKeys {
-    moved_off: Option<String>,
-    others: std::collections::BTreeSet<String>,
-}
-
-impl CheckoutKeys {
-    fn read(registry: &std::path::Path, mine: &std::path::Path) -> anyhow::Result<Self> {
-        let mut keys = CheckoutKeys::default();
-        let Ok(entries) = std::fs::read_dir(registry) else { return Ok(keys) };
-        for entry in entries {
-            let path = entry?.path();
-            let key = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?.trim().to_string();
-            if key.is_empty() {
-                continue;
-            }
-            if path == mine {
-                keys.moved_off = Some(key);
-            } else {
-                keys.others.insert(key);
-            }
-        }
-        Ok(keys)
-    }
-}
-
-/// A spare lane of another key goes once unused this long. Lanes only
-/// pay off while builds under their key run side by side, so a key
-/// nobody built with for a day keeps its first lane alone; a key being
-/// built with (another worktree's, say) touches its lanes every build.
-const SPARE_LANE_IDLE_DAYS: u64 = 1;
-
-/// Why [`retired_compile_cache_sweep`] drops a cache.
-#[derive(Debug, PartialEq, Eq)]
-enum RetiredDrop {
-    /// Under the key this checkout moved off, which no other checkout
-    /// here names: junk now, whatever its age.
-    MovedOff,
-    /// Another key's lane other than its first, unused for
-    /// [`SPARE_LANE_IDLE_DAYS`].
-    SpareLane,
-    /// A retired key's first lane, unused for the retention period.
-    Unused,
-}
-
-/// Whether a compile cache goes, and why: never under the `current` key
-/// or one another checkout here names; at once under the key this
-/// checkout moved off; under any other, a spare lane once unused for
-/// [`SPARE_LANE_IDLE_DAYS`] and the first lane once unused for
-/// `retention` days (it may be a worktree's that never swept, so how
-/// recently a lane was used is the only sign it is retired).
-fn retired_cache_drop(
-    cache: &crate::images::CompileCacheRecord,
-    current: &str,
-    keys: &CheckoutKeys,
-    retention: u64,
-) -> Option<RetiredDrop> {
-    if cache.key == current || keys.others.contains(&cache.key) {
-        None
-    } else if keys.moved_off.as_deref() == Some(cache.key.as_str()) {
-        Some(RetiredDrop::MovedOff)
-    } else if cache.lane.is_some_and(|lane| lane > 0) {
-        (cache.idle_days >= SPARE_LANE_IDLE_DAYS).then_some(RetiredDrop::SpareLane)
-    } else {
-        (cache.idle_days >= retention).then_some(RetiredDrop::Unused)
+/// Which lane a compile cache's record names, in words: its number, or
+/// that the record has none or names something else.
+fn compile_cache_lane(cache: &crate::images::CompileCacheRecord) -> String {
+    match (cache.lane, cache.unreadable_lane.as_deref()) {
+        (Some(lane), _) => format!("lane {lane}"),
+        (None, Some("") | None) => format!("record {} has no lane number", cache.id),
+        (None, Some(suffix)) => format!("record {} has lane '{suffix}', not a number", cache.id),
     }
 }
 
@@ -1100,66 +1112,6 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Another key's spare lanes go once unused for a day and its first
-    /// lane once unused for the retention period (a lane used today may be
-    /// another worktree's); the current key keeps everything, however idle.
-    #[test]
-    fn a_retired_key_keeps_one_compile_cache() {
-        use super::{retired_cache_drop, RetiredDrop};
-        let cache = |key: &str, lane: Option<u32>, idle_days: u64| crate::images::CompileCacheRecord {
-            id: "x".into(),
-            key: key.into(),
-            lane,
-            unreadable_lane: None,
-            size: "1GB".into(),
-            idle_days,
-        };
-        let none = super::CheckoutKeys::default();
-        assert_eq!(retired_cache_drop(&cache("now", Some(3), 99), "now", &none, 30), None);
-        assert_eq!(retired_cache_drop(&cache("old", Some(2), 0), "now", &none, 30), None);
-        assert_eq!(retired_cache_drop(&cache("old", Some(2), 1), "now", &none, 30), Some(RetiredDrop::SpareLane));
-        assert_eq!(retired_cache_drop(&cache("old", Some(0), 0), "now", &none, 30), None);
-        assert_eq!(retired_cache_drop(&cache("old", Some(0), 30), "now", &none, 30), Some(RetiredDrop::Unused));
-        assert_eq!(retired_cache_drop(&cache("old", None, 5), "now", &none, 30), None);
-    }
-
-    /// The key this checkout moved off goes at once, every lane, unless
-    /// another checkout here still names it as its own.
-    #[test]
-    fn the_key_this_checkout_moved_off_goes_at_once() {
-        use super::{retired_cache_drop, CheckoutKeys, RetiredDrop};
-        let cache = |key: &str, lane: Option<u32>| crate::images::CompileCacheRecord {
-            id: "x".into(),
-            key: key.into(),
-            lane,
-            unreadable_lane: None,
-            size: "1GB".into(),
-            idle_days: 0,
-        };
-        let keys = CheckoutKeys { moved_off: Some("prev".into()), others: ["theirs".to_string()].into() };
-        assert_eq!(retired_cache_drop(&cache("prev", Some(0)), "now", &keys, 30), Some(RetiredDrop::MovedOff));
-        assert_eq!(retired_cache_drop(&cache("prev", Some(3)), "now", &keys, 30), Some(RetiredDrop::MovedOff));
-        assert_eq!(retired_cache_drop(&cache("theirs", Some(3)), "now", &keys, 30), None, "another checkout's");
-        assert_eq!(retired_cache_drop(&cache("now", Some(0)), "now", &keys, 30), None);
-        let shared = CheckoutKeys { moved_off: Some("prev".into()), others: ["prev".to_string()].into() };
-        assert_eq!(retired_cache_drop(&cache("prev", Some(0)), "now", &shared, 30), None, "still another checkout's own");
-    }
-
-    /// Each checkout reads its own record as the key it moved off, and
-    /// every other checkout's as a key in use.
-    #[test]
-    fn checkout_records_split_mine_from_theirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let mine = dir.path().join("aaaa");
-        std::fs::write(&mine, "prev\n").unwrap();
-        std::fs::write(dir.path().join("bbbb"), "theirs").unwrap();
-        let keys = super::CheckoutKeys::read(dir.path(), &mine).unwrap();
-        assert_eq!(keys.moved_off.as_deref(), Some("prev"));
-        assert_eq!(keys.others.into_iter().collect::<Vec<_>>(), vec!["theirs".to_string()]);
-        let missing = super::CheckoutKeys::read(&dir.path().join("nowhere"), &mine).unwrap();
-        assert!(missing.moved_off.is_none() && missing.others.is_empty());
-    }
-
     use super::{event_line, EventsFilter, Reclaimed};
     use serde_json::json;
 

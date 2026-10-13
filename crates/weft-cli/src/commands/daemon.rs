@@ -1,4 +1,10 @@
-//! `weft daemon start|stop|status|logs|remove`: a local install.
+//! `weft daemon start|stop|status|logs|remove|which`: a local install.
+//!
+//! A machine holds the default install and any number of named ones
+//! beside it, each with names, ports and files of its own: one per weft
+//! branch a person works on, and the e2e runner's test cells. Which one a
+//! command acts on is settled before it gets here (`weft daemon which`
+//! says): the CLI's front door sets `WEFT_INSTALL` for the whole process.
 //!
 //! A local install is plain processes and Docker. Three containers hold
 //! state (Postgres, the object store, and when the public address is open
@@ -29,9 +35,7 @@ use weft_platform_traits::config::{
 use super::Ctx;
 use crate::images;
 
-/// Names a NAMED install: one that sits beside the default install on the
-/// same machine, with names, ports and files of its own (a test cell).
-use weft_core::infra::INSTALL_ENV;
+use weft_core::infra::{Wanted, WantedFrom};
 use weft_core::ports;
 
 /// The Postgres every local install runs.
@@ -73,18 +77,18 @@ pub enum DaemonAction {
     Remove,
     Status,
     Logs { tail: usize, follow: bool },
+    /// Say which install this command acts on, touching nothing.
+    Which,
 }
 
-pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
-    let install = Install::from_env()?;
+/// `wanted` is the install the command acts on, as the front door chose
+/// it (`main.rs` `prelude`).
+pub async fn run(ctx: Ctx, action: DaemonAction, wanted: Wanted) -> Result<()> {
+    let install = Install::of(wanted.install.clone());
     match action {
         DaemonAction::Start { rebuild, public_url } => {
             if let Some(choice) = public_url {
-                anyhow::ensure!(
-                    install.id.name().is_none(),
-                    "--public-url / --no-public-url open or close the default install's public address; a named install has none"
-                );
-                set_public_url_choice(choice)?;
+                set_public_url_choice(&install, choice)?;
             }
             start(&install, rebuild).await
         }
@@ -92,6 +96,7 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
         DaemonAction::Remove => remove(&install).await,
         DaemonAction::Status => status(&ctx, &install).await,
         DaemonAction::Logs { tail, follow } => logs(&install, tail, follow).await,
+        DaemonAction::Which => which(&ctx, &wanted),
     }
 }
 
@@ -100,34 +105,65 @@ pub fn data_dir() -> PathBuf {
     weft_core::infra::data_dir()
 }
 
-/// Where the default install's database files live.
-pub fn postgres_data_dir() -> PathBuf {
-    data_dir().join("postgres-data")
-}
-
 /// One install on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Install {
-    /// Which install: the default one, or one named by `WEFT_INSTALL`.
+    /// Which install: the default one, or a named one.
     pub id: weft_core::infra::Install,
     /// Its files: `config.json`, `secrets.env`, the runtime's log, its
-    /// database files for a named install.
+    /// database files, its binaries (`bin/`).
     pub dir: PathBuf,
 }
 
+/// What every start writes into an install's dir: the default install
+/// is on the machine when its dir holds this or its image record.
+const CONFIG_FILE: &str = "config.json";
+
 impl Install {
-    pub fn from_env() -> Result<Self> {
-        let id = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
+    pub fn of(id: weft_core::infra::Install) -> Self {
         let dir = id.dir();
-        Ok(Self { id, dir })
+        Self { id, dir }
+    }
+
+    /// Every install on the machine whose weft files are under
+    /// `data_dir` (`data_dir()` outside tests): the default one when
+    /// `data_dir` holds its config or its image record, then every folder
+    /// of `installs/` named like an install, in name order. A named
+    /// install counts from the moment its folder exists, before its first
+    /// start writes anything there: a sweep that missed it then would
+    /// drop what that start is about to use.
+    pub fn every_on(data_dir: &Path) -> Result<Vec<Self>> {
+        let mut found = Vec::new();
+        if [CONFIG_FILE, weft_core::images::IMAGE_REFS_FILE].iter().any(|f| data_dir.join(f).is_file()) {
+            found.push(Self { id: weft_core::infra::Install::default_install(), dir: data_dir.to_path_buf() });
+        }
+        let named = data_dir.join("installs");
+        let entries = match std::fs::read_dir(&named) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => return Err(e).with_context(|| format!("list {}", named.display())),
+        };
+        let mut named_installs = Vec::new();
+        for entry in entries {
+            let dir = entry.with_context(|| format!("list {}", named.display()))?.path();
+            let Some(id) = dir.file_name().and_then(|n| n.to_str()).and_then(|n| weft_core::infra::Install::named(n).ok()) else {
+                continue;
+            };
+            if dir.is_dir() {
+                named_installs.push(Self { id, dir });
+            }
+        }
+        named_installs.sort_by(|a, b| a.id.name().cmp(&b.id.name()));
+        found.extend(named_installs);
+        Ok(found)
     }
 
     fn config_path(&self) -> PathBuf {
-        self.dir.join("config.json")
+        self.dir.join(CONFIG_FILE)
     }
 
-    // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
     fn secrets_path(&self) -> PathBuf {
-        self.dir.join("secrets.env")
+        weft_core::infra::secrets_file(&self.dir)
     }
 
     fn log_path(&self) -> PathBuf {
@@ -135,10 +171,7 @@ impl Install {
     }
 
     fn postgres_dir(&self) -> PathBuf {
-        match self.id.name() {
-            None => postgres_data_dir(),
-            Some(_) => self.dir.join("postgres-data"),
-        }
+        self.dir.join("postgres-data")
     }
 
     /// Where the install's Postgres puts its socket, shared with the host
@@ -153,7 +186,6 @@ impl Install {
         self.id.resource_prefix()
     }
 
-    // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
     fn postgres_container(&self) -> String {
         format!("{}-postgres", self.prefix())
     }
@@ -357,37 +389,138 @@ fn object_store_port() -> Result<u16> {
 
 // ----- the public address ---------------------------------------------
 
-fn public_url_marker() -> PathBuf {
-    data_dir().join("public-url-enabled")
+/// Present while the install's public address is open: the choice a
+/// `--public-url` made, kept until `--no-public-url`.
+// SYNC: public-url-enabled <-> setup.sh (reopens the address on reinstall)
+fn public_url_marker(install: &Install) -> PathBuf {
+    install.dir.join("public-url-enabled")
 }
 
-fn public_url_file() -> PathBuf {
-    data_dir().join("public-url")
+/// The address the open tunnel answers at, once proven to reach weft.
+fn public_url_file(install: &Install) -> PathBuf {
+    install.dir.join("public-url")
 }
 
-/// The public address the default install answers at, or `None` when it
-/// is closed.
-pub fn current_public_url() -> Option<String> {
-    if !public_url_marker().exists() {
+/// The file holding the token of the install's named tunnel, the one its
+/// tunnel container reads. A start writes it when it opens a named tunnel
+/// and removes it when it closes one; a tunnel that went away otherwise
+/// (its container removed by hand, its install's folder left behind)
+/// leaves it, so [`refuse_a_shared_tunnel`] trusts it only beside a
+/// tunnel container.
+fn tunnel_env_file(install: &Install) -> PathBuf {
+    install.dir.join("tunnel.env")
+}
+
+/// The public address `install` answers at, or `None` when it is closed.
+fn current_public_url(install: &Install) -> Option<String> {
+    if !public_url_marker(install).exists() {
         return None;
     }
-    std::fs::read_to_string(public_url_file()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(public_url_file(install)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-fn set_public_url_choice(open: bool) -> Result<()> {
+fn set_public_url_choice(install: &Install, open: bool) -> Result<()> {
     if open {
-        std::fs::create_dir_all(data_dir())?;
-        std::fs::write(public_url_marker(), b"")?;
+        std::fs::create_dir_all(&install.dir)?;
+        std::fs::write(public_url_marker(install), b"")?;
         return Ok(());
     }
-    for path in [public_url_marker(), public_url_file()] {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+    for path in [public_url_marker(install), public_url_file(install)] {
+        remove_if_present(&path)?;
     }
     Ok(())
+}
+
+/// Remove the file at `path`; one already gone is fine.
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// The line of a tunnel's env file carrying its token.
+fn tunnel_env_line(token: &str) -> String {
+    format!("TUNNEL_TOKEN={token}\n")
+}
+
+/// Refuse to start `install`'s named tunnel on `token` while another
+/// install on this machine runs a tunnel on the same one: two connectors
+/// on one tunnel share its traffic, so callers of the address would land
+/// on either install at random. Another install runs one when its
+/// `tunnel.env` holds the token AND its tunnel container exists; a file
+/// whose container is gone (a crash, a container removed by hand) is
+/// left from a tunnel that no longer runs, so it is named in a warning
+/// and blocks nothing. The caller holds the machine's tunnel lock
+/// ([`reconcile_tunnel`]) from this check until its own container runs.
+async fn refuse_a_shared_tunnel(install: &Install, token: &str) -> Result<()> {
+    let mut others = Vec::new();
+    for other in Install::every_on(&data_dir())? {
+        if other.dir == install.dir {
+            continue;
+        }
+        let file = tunnel_env_file(&other);
+        let env = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
+        };
+        let container = container_state(&other.tunnel_container()).await?.is_some();
+        others.push(OtherTunnel { install: other, env, container });
+    }
+    let holders = tunnel_token_holders(token, &others);
+    for stale in holders.stale {
+        eprintln!(
+            "warning: {} holds the same WEFT_PUBLIC_TUNNEL_TOKEN, but install '{}' has no tunnel container ({}), so \
+             nothing runs on it; ignoring the file (a start of that install rewrites or removes it)",
+            tunnel_env_file(stale).display(),
+            stale.id.label_value(),
+            stale.tunnel_container()
+        );
+    }
+    match holders.running {
+        None => Ok(()),
+        Some(holder) => anyhow::bail!(
+            "install '{}' cannot open its named tunnel: install '{}' already runs a tunnel on the same \
+             WEFT_PUBLIC_TUNNEL_TOKEN (container {}, token in {}), and two installs on one tunnel would each get a \
+             random share of its callers. Give this checkout a tunnel of its own (its own WEFT_PUBLIC_TUNNEL_TOKEN and \
+             WEFT_PUBLIC_TUNNEL_HOSTNAME in its .env.local), or set neither there for a quick tunnel; the token \
+             may also come from the shared .env, where the two lines do not belong",
+            install.id.label_value(),
+            holder.id.label_value(),
+            holder.tunnel_container(),
+            tunnel_env_file(holder).display()
+        ),
+    }
+}
+
+/// Another install's tunnel as [`refuse_a_shared_tunnel`] finds it: its
+/// `tunnel.env`'s text, and whether its tunnel container exists.
+struct OtherTunnel {
+    install: Install,
+    env: String,
+    container: bool,
+}
+
+/// The installs among `others` whose `tunnel.env` holds `token`: the one
+/// whose tunnel container exists, and those whose container is gone.
+#[derive(Debug, PartialEq, Eq)]
+struct TokenHolders<'a> {
+    running: Option<&'a Install>,
+    stale: Vec<&'a Install>,
+}
+
+fn tunnel_token_holders<'a>(token: &str, others: &'a [OtherTunnel]) -> TokenHolders<'a> {
+    let line = tunnel_env_line(token);
+    let mut holders = TokenHolders { running: None, stale: Vec::new() };
+    for other in others.iter().filter(|o| o.env.lines().any(|l| l.trim() == line.trim())) {
+        match other.container {
+            true => holders.running = holders.running.or(Some(&other.install)),
+            false => holders.stale.push(&other.install),
+        }
+    }
+    holders
 }
 
 /// The operator's named tunnel (a stable hostname): its Cloudflare token
@@ -721,12 +854,7 @@ fn random_hex_32() -> String {
 }
 
 fn read_env_file(path: &Path) -> std::collections::BTreeMap<String, String> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
+    weft_core::infra::env_file_values(&std::fs::read_to_string(path).unwrap_or_default())
 }
 
 fn write_private(path: &Path, content: &str) -> Result<()> {
@@ -762,7 +890,8 @@ fn secrets(
     let old = read_env_file(&install.secrets_path());
     let keep_or = |name: &str, make: &mut dyn FnMut() -> String| old.get(name).filter(|v| !v.is_empty()).cloned().unwrap_or_else(make);
     let mut env = std::collections::BTreeMap::new();
-    // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
+    // Read back by `weft_core::infra::Install::secret` (a migration's
+    // release, the e2e harness) and scripts/run-e2e.sh.
     env.insert("WEFT_DATABASE_URL".to_string(), database_url(install, ports.postgres));
     env.insert("WEFT_IDENTITY_KEY".to_string(), keep_or("WEFT_IDENTITY_KEY", &mut random_hex_32));
     env.insert("WEFT_CALLER_TOKEN_SECRET".to_string(), keep_or("WEFT_CALLER_TOKEN_SECRET", &mut random_hex_32));
@@ -963,9 +1092,10 @@ fn listen_of(config: &InstallConfig) -> &Listen {
 /// port: the doors outside callers use, never the management API.
 async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<(String, bool)>> {
     let name = install.tunnel_container();
-    if install.id.name().is_some() || !public_url_marker().exists() {
+    if !public_url_marker(install).exists() {
         remove_container(&name).await?;
-        let _ = std::fs::remove_file(public_url_file());
+        remove_if_present(&public_url_file(install))?;
+        remove_if_present(&tunnel_env_file(install))?;
         return Ok(None);
     }
     let named = named_tunnel_config()?;
@@ -975,15 +1105,34 @@ async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<(Str
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let env_file = install.dir.join("tunnel.env");
-    if let Some((token, _)) = &named {
-        write_private(&env_file, &format!("TUNNEL_TOKEN={token}\n"))?;
-        args.extend(["--env-file".into(), env_file.display().to_string()]);
-    }
-    args.extend([TUNNEL_IMAGE.to_string(), "tunnel".into(), "--no-autoupdate".into()]);
+    let env_file = tunnel_env_file(install);
+    // Machine-wide, from the check that no other install runs this token
+    // until this install's connector runs on it: two starts at once
+    // would otherwise both pass the check. Held to the end of this call.
+    let _turn = match &named {
+        Some(_) => Some(
+            images::hold_file_lock(data_dir().join("tunnels.lock"), "another weft daemon start is opening its tunnel; waiting for it")
+                .await?,
+        ),
+        None => None,
+    };
     match &named {
-        Some(_) => args.push("run".into()),
-        None => args.extend(["--url".into(), origin]),
+        Some((token, _)) => {
+            refuse_a_shared_tunnel(install, token).await?;
+            write_private(&env_file, &tunnel_env_line(token))?;
+            args.extend(["--env-file".into(), env_file.display().to_string()]);
+        }
+        // A quick tunnel holds no token; a file left from a named one
+        // would claim this install still runs it.
+        None => remove_if_present(&env_file)?,
+    }
+    // The origin goes to a named tunnel too: one made with `cloudflared
+    // tunnel create` (how a branch's install gets its own address) has no
+    // routing stored at Cloudflare and forwards to `--url`, while one set
+    // up in the dashboard gets its routing from there, which replaces it.
+    args.extend([TUNNEL_IMAGE.to_string(), "tunnel".into(), "--no-autoupdate".into(), "--url".into(), origin]);
+    if named.is_some() {
+        args.push("run".into());
     }
     ensure_container(&name, &args, &install.dir, None).await?;
     let url = match named {
@@ -1022,7 +1171,8 @@ async fn quick_tunnel_url(container: &str) -> Result<String> {
 }
 
 /// Prove the address reaches the outside doors, then record it.
-async fn announce_tunnel(url: &str, named: bool, container: &str, ports: Ports) -> Result<()> {
+async fn announce_tunnel(install: &Install, url: &str, named: bool, ports: Ports) -> Result<()> {
+    let container = install.tunnel_container();
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     loop {
@@ -1047,8 +1197,8 @@ async fn announce_tunnel(url: &str, named: bool, container: &str, ports: Ports) 
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    std::fs::create_dir_all(data_dir())?;
-    std::fs::write(public_url_file(), url)?;
+    std::fs::create_dir_all(&install.dir)?;
+    std::fs::write(public_url_file(install), url)?;
     println!("public address: {url}");
     println!("  it carries only the doors outside callers use: /events/... (provider event pushes), /signal/... (fire links), /signal-token/..., /public/files/... (shared file links), /connect/... (live routes), /infra/... (public infra endpoints) and the OAuth callback. Rerun with --no-public-url to close it.");
     if !named {
@@ -1296,6 +1446,8 @@ async fn wait_for_runtime(install: &Install, public: u16) -> Result<()> {
 /// Refuse to start beside the Kubernetes install an older weft ran here:
 /// its database cannot be carried forward, and its cluster would keep
 /// running for nothing. Nothing to do on a machine that never had one.
+/// Only the default install asks: that cluster held the default install's
+/// projects, and a named install shares neither its data nor its ports.
 /// The cluster is looked for by its node container, so a machine whose
 /// `kind` binary is gone is still caught.
 // SYNC: <-> scripts/lib/weft-cleanup.sh (weft_old_install_present)
@@ -1328,7 +1480,19 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     refuse_an_older_install(install).await?;
     let ports = ports(install)?;
 
-    let shared = images::ensure_all_shared_images(rebuild, None, None).await?;
+    // This install runs and builds on these from now on, so they are
+    // recorded before anything is pulled or built: a machine-wide sweep
+    // (`weft clean --images --all`, `--build-plane`) from another
+    // checkout keeps them, while this start makes them too.
+    let shared = images::SharedImages::current()?;
+    weft_core::images::ImageRefs {
+        runtime: shared.runtime.clone(),
+        standard_worker: shared.worker.clone(),
+        builder_bases: [shared.builder_base.clone()].into(),
+        compile_cache_keys: [images::worker_compile_cache_key(&repo_root)?].into(),
+    }
+    .save(&install.dir)?;
+    images::ensure_all_shared_images(&shared, rebuild, None, None).await?;
     images::hold_standard_worker(&install.id, &shared.worker).await?;
     ensure_network().await?;
     ensure_postgres(install, ports.postgres).await?;
@@ -1342,6 +1506,8 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     let config = install_config(install, ports, shared.runtime, shared.builder_base, tunnel.as_ref().map(|(u, _)| u.clone()), previous)?;
     std::fs::write(install.config_path(), serde_json::to_vec_pretty(&config)?)?;
     let env = secrets(install, ports, &repo_root)?;
+    // SYNC: secrets.env lines <-> crates/weft-core/src/infra/install.rs (SECRETS_FILE,
+    //       env_file_values: the parser), scripts/run-e2e.sh (WEFT_E2E_DATABASE_URL)
     let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     write_private(&install.secrets_path(), &body)?;
 
@@ -1365,30 +1531,27 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
         .await
         .context("store the standard library in this install's assets")?;
     if let Some((url, named)) = tunnel {
-        announce_tunnel(&url, named, &install.tunnel_container(), ports).await?;
+        announce_tunnel(install, &url, named, ports).await?;
     }
     println!("weft is running at http://127.0.0.1:{} (install '{}')", ports.public, install.id.label_value());
     Ok(())
 }
 
-/// The containers the runtime started for an install: its workers, and
-/// with `with_infra` its infra units too.
-async fn install_containers(install: &Install, with_infra: bool) -> Result<Vec<String>> {
+/// Every container of `install` (everything carrying its install label),
+/// with its `weft.role`: `worker` and `long` for the workers its runtime
+/// starts, `infra` for its infra units, none for the ones a start makes
+/// itself (its database and its tunnel).
+async fn install_containers(install: &Install) -> Result<Vec<(String, String)>> {
     let label = format!("label={}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value());
     let listing = docker_ok(&["ps", "-a", "--filter", &label, "--format", "{{.Names}}\t{{.Label \"weft.role\"}}"], "docker ps").await?;
-    Ok(listing
-        .lines()
-        .filter_map(|l| l.split_once('\t'))
-        .filter(|(_, role)| matches!(*role, "worker" | "long") || (with_infra && *role == "infra"))
-        .map(|(name, _)| name.to_string())
-        .collect())
+    Ok(listing.lines().filter_map(|l| l.split_once('\t')).map(|(name, role)| (name.to_string(), role.to_string())).collect())
 }
 
 async fn stop(install: &Install) -> Result<()> {
     stop_runtime(install).await?;
     // Workers serve only the runtime; infra keeps running, as it would
     // across a runtime restart.
-    for name in install_containers(install, false).await? {
+    for (name, _) in install_containers(install).await?.into_iter().filter(|(_, role)| matches!(role.as_str(), "worker" | "long")) {
         remove_container(&name).await?;
     }
     println!("weft's runtime stopped (install '{}'); the database and infra keep running", install.id.label_value());
@@ -1398,45 +1561,49 @@ async fn stop(install: &Install) -> Result<()> {
 async fn remove(install: &Install) -> Result<()> {
     let Some(name) = install.id.name() else {
         anyhow::bail!(
-            "`weft daemon remove` takes a named install ({INSTALL_ENV}) off this machine, and none is set, which means the \
-             default install. That one holds every project on this machine; `./setup.sh --uninstall` is how it goes."
+            "`weft daemon remove` takes a named install off this machine (a branch checkout's, or one WEFT_INSTALL names), \
+             and this command acts on the default install. That one holds the projects of everyone using weft on this \
+             machine; `./setup.sh --uninstall` is how it goes."
         );
     };
     stop_runtime(install).await?;
     for path in [systemd_unit_path(install), launchd_plist_path(install)] {
         let _ = std::fs::remove_file(path);
     }
-    for c in install_containers(install, true).await? {
-        remove_container(&c).await?;
+    // Everything it runs: workers, infra units, its database, its tunnel
+    // (which restarts by itself, and would keep serving its address).
+    for (name, _) in install_containers(install).await? {
+        remove_container(&name).await?;
     }
     let label = format!("label={}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value());
     let volumes = docker_ok(&["volume", "ls", "-q", "--filter", &label], "docker volume ls").await?;
     for v in volumes.lines().filter(|l| !l.trim().is_empty()) {
         docker_ok(&["volume", "rm", "-f", v.trim()], "docker volume rm").await?;
     }
-    remove_container(&install.postgres_container()).await?;
     delete_bucket(&install.bucket()).await?;
     // Postgres owned its files as its own user.
     if install.postgres_dir().exists() {
         let out = run_in_alpine(&install.dir, "/d", "rm -rf /d/postgres-data").await?;
         anyhow::ensure!(out.status.success(), "removing the database files failed: {}", String::from_utf8_lossy(&out.stderr));
     }
+    // Its binaries go with the rest, the CLI running this command
+    // included when it is the install's own: on Unix a running program
+    // keeps its file until it exits, whatever happens to the name.
     std::fs::remove_dir_all(&install.dir).with_context(|| format!("remove {}", install.dir.display()))?;
     println!("install '{name}' removed");
     Ok(())
 }
 
-/// Reports on the install this machine's `WEFT_INSTALL` names (the one
-/// its label, log path and public address describe), so its address comes
-/// from that install's own ports, never from `--on`/`--dispatcher`, which
-/// are refused rather than ignored. `WEFT_DISPATCHER_URL` is ambient
+/// Reports on the install this command acts on (the one its label, log
+/// path and public address describe), so its address comes from that
+/// install's own ports, never from `--on`/`--dispatcher`, which are
+/// refused rather than ignored. `WEFT_DISPATCHER_URL` is ambient
 /// (setup.sh exports it) and is not consulted.
 async fn status(ctx: &Ctx, install: &Install) -> Result<()> {
     ctx.refuse_other_install("weft daemon status")?;
     // A named install that never started has no address at all: saying
-    // so is this command's answer, not an error. `local_public_url` reads
-    // the same `WEFT_INSTALL` that built `install`.
-    match weft_core::ports::local_public_url() {
+    // so is this command's answer, not an error.
+    match weft_core::ports::local_public_url_of(&install.id) {
         Err(e) => println!("weft: no address to reach: {e}"),
         Ok(url) => {
             // An unreadable credentials file is its own error, not "no address".
@@ -1444,11 +1611,7 @@ async fn status(ctx: &Ctx, install: &Install) -> Result<()> {
             report_reachable(&crate::client::DispatcherClient::new(url, key), install).await;
         }
     }
-    if install.id.name().is_some() {
-        println!("public address: none (a named install has none)");
-        return Ok(());
-    }
-    match current_public_url() {
+    match current_public_url(install) {
         Some(url) => println!("public address: {url} (./setup.sh --no-public-url closes it)"),
         None => println!("public address: closed"),
     }
@@ -1479,6 +1642,75 @@ async fn logs(install: &Install, tail: usize, follow: bool) -> Result<()> {
     }
     let status = cmd.arg(&log).status().await?;
     anyhow::ensure!(status.success(), "tail {} exited {status}", log.display());
+    Ok(())
+}
+
+/// What `weft daemon which` answers, `--json` printing it as one object.
+// SYNC: Which <-> setup.sh, scripts/run-e2e.sh, scripts/lib (read with `weft daemon which --json`)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Which {
+    /// `None` for the default install.
+    pub name: Option<String>,
+    /// What `WEFT_INSTALL` holds for it: `default`, or the name.
+    pub env: String,
+    /// Its files.
+    pub dir: PathBuf,
+    /// The folder of its own `weft` and `weft-runtime`.
+    pub bin: PathBuf,
+    /// The branch of the checkout that picked it, `None` when
+    /// `WEFT_INSTALL` did or it was asked outside any checkout.
+    pub branch: Option<String>,
+    /// Whether its `weft` is in `bin`.
+    pub installed: bool,
+}
+
+impl Which {
+    fn of(wanted: &Wanted) -> Self {
+        let install = &wanted.install;
+        Self {
+            name: install.name().map(str::to_string),
+            env: install.env_value().to_string(),
+            dir: install.dir(),
+            bin: install.bin_dir(),
+            branch: match &wanted.from {
+                WantedFrom::Checkout { branch, .. } => Some(branch.clone()),
+                WantedFrom::Env | WantedFrom::Outside => None,
+            },
+            installed: crate::startup::cli_of(install).is_file(),
+        }
+    }
+
+    /// The human answer: which install, what picked it, where it lives.
+    fn lines(&self, from: &WantedFrom) -> Vec<String> {
+        let picked = match from {
+            WantedFrom::Env => format!("WEFT_INSTALL={}", self.env),
+            WantedFrom::Checkout { root, branch } => format!("the branch {branch} of the checkout {}", root.display()),
+            WantedFrom::Outside => "standing outside every weft checkout".to_string(),
+        };
+        let state = match (self.installed, from) {
+            (true, _) => "set up".to_string(),
+            (false, WantedFrom::Checkout { root, .. }) => format!("not set up: run ./setup.sh in {}", root.display()),
+            (false, _) => "not set up".to_string(),
+        };
+        vec![
+            format!("install: {} (WEFT_INSTALL={})", self.name.as_deref().unwrap_or("the default install"), self.env),
+            format!("picked by: {picked}"),
+            format!("files: {}", self.dir.display()),
+            format!("binaries: {} ({state})", self.bin.display()),
+        ]
+    }
+}
+
+/// `weft daemon which`: the install this command acts on, as the front
+/// door chose it.
+fn which(ctx: &Ctx, wanted: &Wanted) -> Result<()> {
+    let answer = Which::of(wanted);
+    if ctx.json_out(&answer)? {
+        return Ok(());
+    }
+    for line in answer.lines(&wanted.from) {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -1605,6 +1837,85 @@ mod tests {
     #[test]
     fn the_postgres_major_is_read_off_the_image() {
         assert_eq!(postgres_major(), "18");
+    }
+
+    /// The answer scripts read: the field names and shapes of the
+    /// contract, and back again.
+    #[test]
+    fn which_answers_one_object_scripts_read() {
+        let deploy = Which {
+            name: Some("deploy".into()),
+            env: "deploy".into(),
+            dir: "/h/.local/share/weft/installs/deploy".into(),
+            bin: "/h/.local/share/weft/installs/deploy/bin".into(),
+            branch: Some("deploy".into()),
+            installed: false,
+        };
+        let wire = serde_json::to_value(&deploy).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "name": "deploy", "env": "deploy", "dir": "/h/.local/share/weft/installs/deploy",
+                "bin": "/h/.local/share/weft/installs/deploy/bin", "branch": "deploy", "installed": false,
+            })
+        );
+        assert_eq!(serde_json::from_value::<Which>(wire).unwrap(), deploy);
+        let default = Which::of(&Wanted { install: weft_core::infra::Install::default_install(), from: WantedFrom::Outside });
+        let wire = serde_json::to_value(&default).unwrap();
+        assert_eq!((wire["name"].clone(), wire["env"].clone(), wire["branch"].clone()), (serde_json::Value::Null, "default".into(), serde_json::Value::Null));
+        assert_eq!(default.bin, default.dir.join("bin"));
+
+        let from = WantedFrom::Checkout { root: "/w/deploy".into(), branch: "deploy".into() };
+        let lines = deploy.lines(&from);
+        assert!(lines[1].contains("branch deploy") && lines[3].contains("run ./setup.sh in /w/deploy"), "{lines:?}");
+    }
+
+    #[test]
+    fn every_install_is_a_folder_under_installs_or_the_default_one_once_it_wrote_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        assert!(Install::every_on(data).unwrap().is_empty(), "a machine with no weft has no install");
+        for folder in ["installs/zeta", "installs/alpha", "installs/Bad"] {
+            std::fs::create_dir_all(data.join(folder)).unwrap();
+        }
+        std::fs::write(data.join("installs/zeta").join(CONFIG_FILE), "{}").unwrap();
+        std::fs::write(data.join("installs/beta"), "a file, not a folder").unwrap();
+        let names = |found: Vec<Install>| found.into_iter().map(|i| (i.id.label_value().to_string(), i.dir)).collect::<Vec<_>>();
+        assert_eq!(
+            names(Install::every_on(data).unwrap()),
+            vec![("alpha".into(), data.join("installs/alpha")), ("zeta".into(), data.join("installs/zeta"))],
+            "a folder whose first start has not written anything yet is an install already"
+        );
+        std::fs::write(data.join(weft_core::images::IMAGE_REFS_FILE), "{}").unwrap();
+        assert_eq!(names(Install::every_on(data).unwrap())[0], ("default".into(), data.to_path_buf()), "the default install, by its record");
+        std::fs::remove_file(data.join(weft_core::images::IMAGE_REFS_FILE)).unwrap();
+        std::fs::write(data.join(CONFIG_FILE), "{}").unwrap();
+        assert_eq!(names(Install::every_on(data).unwrap())[0], ("default".into(), data.to_path_buf()), "the default install, by its config");
+    }
+
+    /// The protection against two installs on one tunnel: another
+    /// install whose `tunnel.env` carries the same token and whose tunnel
+    /// container exists names it; one whose container is gone is stale
+    /// and blocks nothing; another token, or a token that only starts the
+    /// same, matches nothing.
+    #[test]
+    fn another_install_running_the_same_tunnel_token_is_found() {
+        let other = |name: Option<&str>, env: String, container: bool| OtherTunnel { install: install(name), env, container };
+        let others = [
+            other(Some("deploy"), tunnel_env_line("tok-b"), true),
+            other(None, format!("# kept by weft\n{}", tunnel_env_line("tok-a")), true),
+            other(Some("gone"), tunnel_env_line("tok-a"), false),
+            other(Some("old"), tunnel_env_line("tok-c"), false),
+        ];
+        let label = |i: Option<&Install>| i.map(|i| i.id.label_value().to_string());
+        let labels = |v: Vec<&Install>| v.into_iter().map(|i| i.id.label_value().to_string()).collect::<Vec<_>>();
+        let a = tunnel_token_holders("tok-a", &others);
+        assert_eq!((label(a.running), labels(a.stale)), (Some("default".into()), vec!["gone".to_string()]));
+        assert_eq!(label(tunnel_token_holders("tok-b", &others).running), Some("deploy".into()));
+        let c = tunnel_token_holders("tok-c", &others);
+        assert_eq!((label(c.running), labels(c.stale)), (None, vec!["old".to_string()]), "a file whose container is gone blocks nothing");
+        assert_eq!(tunnel_token_holders("tok", &others), TokenHolders { running: None, stale: vec![] });
+        assert_eq!(tunnel_token_holders("tok-a", &[]), TokenHolders { running: None, stale: vec![] });
     }
 
     #[test]

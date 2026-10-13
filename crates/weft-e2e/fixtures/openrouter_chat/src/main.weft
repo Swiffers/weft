@@ -6,8 +6,10 @@
 # keeps media as stored-file values (the test asserts no URL or base64
 # ever lands in it).
 #
-# Needs OPENROUTER_API_KEY like the openrouter fixture; the cheapest
-# vision-capable model keeps the run nearly free.
+# Rides the shared door, so it needs an `api_key` entry for openrouter in
+# the shared-credentials file the daemon ships to the broker, not a key in
+# the test's environment. The cheapest vision-capable model keeps the run
+# nearly free.
 
 prov = OpenRouterProvider {
   # A cheap Gemini: strong vision for pennies. (gpt-4.1-nano reliably

@@ -24,28 +24,13 @@ use crate::reclaim::{default_reclaimer, ProjectReclaimer};
 use crate::tenant;
 use crate::DispatcherState;
 
-/// Apply every schema group the dispatcher owns against `pool`, the ONE
-/// schema entry point: one guarded pass over [`ALL_GROUPS`] in dependency
-/// order, so every pending migration across every group runs in one
-/// global id order (the same order the agreement test replays).
-/// Serialization across racing copies is the guard's own job:
-/// `apply_groups` runs everything in one transaction under its advisory
-/// lock. Runs BEFORE the journal or any store is constructed; none of them
-/// applies schema on its own.
-pub async fn apply_core_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    // The guard refuses to run any group whose stamped fingerprint no
-    // longer matches its DDL, naming the tables to drop.
-    weft_task_store::apply_groups(pool, ALL_GROUPS)
-        .await
-        .context("apply core schema groups")
-}
-
 /// Every schema group the dispatcher owns, in dependency order: each group
 /// after the ones whose tables its DDL names (the groups the journal's
-/// triggers sit on come before it). One list answers "what is the dispatcher's schema": the boot
-/// applies it whole, the migration generator writes its origins from it,
-/// and the agreement test builds from it.
-pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
+/// triggers sit on come before it). Its part of the install's one schema
+/// list (`weft_runtime::schema::groups()`), which the boot applies in one
+/// guarded pass and the migration generator and the agreement test build
+/// from; a test of the dispatcher's own SQL applies just this part.
+pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // What the writes a run makes announce, sent in batches: every
     // trigger on a run's path writes to it.
     &weft_task_store::announce::GROUP,
@@ -325,22 +310,18 @@ pub fn install_info(config: &InstallConfig) -> weft_core::install::InstallInfo {
     }
 }
 
-/// A task-registry builder pre-loaded with the dispatcher's core task
-/// executors. Extra task kinds chain `.register_str` on the returned
-/// builder before `.build()`.
-pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder {
+/// The executor of every task kind (`weft_task_store::TaskKind`).
+pub fn task_registry() -> crate::task_executor::TaskRegistry {
     use weft_task_store::TaskKind;
-    crate::task_executor::TaskRegistry::builder()
-        .register(TaskKind::RegisterSignal, Arc::new(crate::task_kinds::RegisterSignalExecutor))
-        .register(TaskKind::WithdrawSignal, Arc::new(crate::task_kinds::WithdrawSignalExecutor))
-        .register(TaskKind::FireSignal, Arc::new(crate::task_kinds::FireSignalExecutor))
-        .register(TaskKind::StopTagged, Arc::new(crate::task_kinds::StopTaggedExecutor))
-        .register(TaskKind::ProgramCall, Arc::new(crate::task_kinds::ProgramCallExecutor))
-        .register_str(
-            crate::task_kinds::run_node_test::RUN_NODE_TEST_KIND,
-            Arc::new(crate::task_kinds::RunNodeTestExecutor),
-        )
-        .register_str(crate::task_kinds::resync::RESYNC_KIND, Arc::new(crate::task_kinds::ResyncExecutor))
+    crate::task_executor::TaskRegistry::every_kind(|kind| match kind {
+        TaskKind::RegisterSignal => Arc::new(crate::task_kinds::RegisterSignalExecutor),
+        TaskKind::WithdrawSignal => Arc::new(crate::task_kinds::WithdrawSignalExecutor),
+        TaskKind::FireSignal => Arc::new(crate::task_kinds::FireSignalExecutor),
+        TaskKind::StopTagged => Arc::new(crate::task_kinds::StopTaggedExecutor),
+        TaskKind::ProgramCall => Arc::new(crate::task_kinds::ProgramCallExecutor),
+        TaskKind::RunNodeTest => Arc::new(crate::task_kinds::RunNodeTestExecutor),
+        TaskKind::Resync => Arc::new(crate::task_kinds::ResyncExecutor),
+    })
 }
 
 /// The dispatcher's background loops: its task picker, the delivery of

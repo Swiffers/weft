@@ -66,22 +66,14 @@ pub async fn run_build_images(
     if print {
         // The SAME list the ensure path prints (`bare_refs` carries
         // the stdout contract), never a second construction of it.
-        let shared = crate::images::SharedImages {
-            runtime: crate::images::runtime_image_ref()?,
-            builder_base: crate::images::builder_base_ref()?,
-            worker: crate::images::standard_worker_ref()?,
-        };
+        let shared = crate::images::SharedImages::current()?;
         for image_ref in shared.bare_refs() {
             println!("{image_ref}");
         }
         return Ok(());
     }
-    let shared = crate::images::ensure_all_shared_images(
-        false,
-        push_suffix.as_deref(),
-        runtime_binary,
-    )
-    .await?;
+    let shared = crate::images::SharedImages::current()?;
+    crate::images::ensure_all_shared_images(&shared, false, push_suffix.as_deref(), runtime_binary).await?;
     if push || push_suffix.is_some() {
         for image_ref in shared.bare_refs() {
             // The suffixed name is exactly what the ensure materialized

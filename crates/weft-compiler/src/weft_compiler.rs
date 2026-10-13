@@ -327,10 +327,13 @@ pub fn compile(
     compile_with_mode(source, project_id, fs, IncludeMode::Full, None)
 }
 
-/// How `@include` is resolved. `Full` inlines the referenced group's whole
-/// body (build: one binary). `Interface` emits a single opaque node carrying
-/// only the group's ports (interactive parse: the editor renders an opaque
-/// block and navigates into the file to edit the body).
+/// How `@include` is resolved. `Full` compiles each included file once, as
+/// a shared [`GroupKind::Body`] group, and makes every use of it a
+/// [`GroupKind::Call`] group naming that body (build: one binary, one copy
+/// of the body however many sites call it). `Interface` emits a single
+/// opaque node carrying only the group's ports (interactive parse: the
+/// editor renders an opaque block and navigates into the file to edit the
+/// body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncludeMode {
     Full,
@@ -487,11 +490,6 @@ fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -
     format!("{} ({suffix})", crate::source_name::display_name(group_id))
 }
 
-/// Resolve every `@include("path")` in `state`. `Full` inlines each
-/// referenced file's single top-level Group (rescoped under the alias) into
-/// `state.groups`; `Interface` emits one opaque node per include carrying the
-/// group's ports. `in_progress` is the cycle-detection stack of canonical
-/// file paths currently being resolved.
 /// Every included file the compile has read, compiled ONCE each. A
 /// file's body is one group, id'd by the file's name (`auth.weft` is
 /// `Auth`), whatever site calls it and however many do; each site is a
@@ -505,6 +503,12 @@ struct Bodies {
     paths: std::collections::BTreeMap<String, std::path::PathBuf>,
 }
 
+/// Resolve every `@include("path")` in `state`, at the top level and inside
+/// every group. `Full` registers each file's body once in `bodies` and puts
+/// one [`GroupKind::Call`] group per include where the include was written;
+/// `Interface` puts one opaque node per include carrying the file's ports.
+/// `in_progress` is the cycle-detection stack of canonical file paths
+/// currently being resolved.
 fn resolve_includes(
     state: &mut ParseState,
     fs: &CompileFs,

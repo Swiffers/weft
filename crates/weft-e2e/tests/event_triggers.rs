@@ -175,10 +175,9 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
         }
     })
     .to_string();
-    let base = std::env::var("WEFT_DISPATCHER_URL")
-        .unwrap_or_else(|_| weft_core::ports::LOCAL_PUBLIC_URL.to_string());
+    let base = disp.base();
     let http = reqwest::Client::new();
-    let events_url = format!("{}/events/slack/messages", base.trim_end_matches('/'));
+    let events_url = format!("{base}/events/slack/messages");
     let status = post_signed(&http, &events_url, &signing_secret, &body).await?;
     anyhow::ensure!(status.is_success(), "the signed push was refused: {status}");
 
@@ -323,10 +322,9 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     let body: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("payload", &serde_json::to_string(&payload)?)
         .finish();
-    let base = std::env::var("WEFT_DISPATCHER_URL")
-        .unwrap_or_else(|_| weft_core::ports::LOCAL_PUBLIC_URL.to_string());
+    let base = disp.base();
     let http = reqwest::Client::new();
-    let events_url = format!("{}/events/slack/interactions", base.trim_end_matches('/'));
+    let events_url = format!("{base}/events/slack/interactions");
     let timestamp = chrono::Utc::now().timestamp();
     let signature = slack_signature(&signing_secret, timestamp, &body);
     let resp = http

@@ -978,7 +978,7 @@ pub fn refuse_instanceless(project: &ProjectDefinition, selection: &RunSelection
         "{} {} once per instance, so this run needs to know which instance it is for. Name one with \
          --instance <id>; a trigger firing through an instance's copy, an instance token, or the Weft-Instance \
          header on a gated route name it for you",
-        spell_list(&places),
+        crate::comma_list::spell_list(&places),
         if places.len() == 1 { "exists" } else { "exist" },
     )))
 }
@@ -1147,16 +1147,6 @@ pub fn check_instance_values(
         refusal.errors.extend(crate::instance::rule_gaps(&rules, node, &partly, step, instance));
     }
     if refusal.is_empty() { Ok(checked) } else { Err(refusal) }
-}
-
-/// `a`, `a and b`, `a, b and c`, each quoted.
-fn spell_list(items: &[String]) -> String {
-    let quoted: Vec<String> = items.iter().map(|item| format!("'{item}'")).collect();
-    match quoted.as_slice() {
-        [] => String::new(),
-        [one] => one.clone(),
-        [init @ .., last] => format!("{} and {last}", init.join(", ")),
-    }
 }
 
 /// The flag a value for the start spelled `node` is handed with: the

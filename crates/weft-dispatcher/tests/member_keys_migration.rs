@@ -85,7 +85,7 @@ fn assert_grant(grant: &GrantSummary) {
 
 #[sqlx::test]
 async fn rows_written_before_the_rename_read_after_it(pool: PgPool) {
-    let groups = weft_dispatcher::app::ALL_GROUPS;
+    let groups = weft_dispatcher::app::DISPATCHER_GROUPS;
     replay_origins(&pool, groups).await.expect("origins");
     replay_migrations(&pool, groups, |m| !m.draft && m.id < RENAME).await.expect("history before the rename");
 

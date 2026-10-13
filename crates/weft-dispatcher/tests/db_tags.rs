@@ -30,7 +30,7 @@ use weft_journal::ExecEvent;
 const TENANT: &str = "tenant-1";
 
 async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let journal = PostgresJournal::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
         std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));

@@ -106,5 +106,8 @@ runtime = [
 # layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.
 test-helpers = []
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

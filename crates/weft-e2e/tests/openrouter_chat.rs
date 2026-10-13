@@ -16,7 +16,10 @@
 //! - every one of the three calls landed its own resolved cost record.
 //!
 //! Spends real money (three calls on the cheapest vision-capable
-//! model). Needs `OPENROUTER_API_KEY` like the openrouter test.
+//! model). Rides the shared door, so it needs what the openrouter test's
+//! runtime scenario needs: an `api_key` entry for openrouter in the
+//! shared-credentials file (`access-apps.json`), not a key in this
+//! test's environment.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::access::{catalog_spec, connect_direct, set_account};

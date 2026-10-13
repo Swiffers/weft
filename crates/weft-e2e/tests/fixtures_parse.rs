@@ -12,11 +12,11 @@
 //! feature flag. It is deliberately NOT behind `e2e`, because its whole
 //! value is catching the mistake before the slow suite runs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Every directory under `fixtures/` that declares a project.
 fn fixtures() -> anyhow::Result<Vec<PathBuf>> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let root = weft_e2e::project::fixtures_root();
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&root)? {
         let path = entry?.path();

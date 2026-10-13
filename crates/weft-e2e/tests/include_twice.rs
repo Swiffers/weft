@@ -5,7 +5,8 @@
 //! surface that keys, lists or takes a node does so per place: a wait is
 //! woken one call at a time, a trigger registers and shows its display
 //! once per call, a display grant for one call opens that call alone,
-//! and `weft connect` names the access node once per call. The
+//! `weft connect` names the access node once per call, and each call's
+//! access node runs on the connection picked for that call. The
 //! compiler's own key for a node of the file is refused wherever a
 //! person types a name.
 #![cfg(feature = "e2e")]
@@ -158,6 +159,44 @@ async fn each_call_registers_its_own_trigger_with_its_own_display() -> anyhow::R
     );
 
     key.finish().await?;
+    project.finish().await
+}
+
+/// Each call's access node is its own place to pick a connection, and a
+/// run hands each call the connection picked for it: two different
+/// connections, one per call, come out of the run each on its own call.
+#[tokio::test]
+async fn each_call_runs_on_the_connection_picked_for_it() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let project = Project::prepare("include_twice", disp.clone()).await?;
+    let spec = catalog_spec("api", "api_key_auth")?;
+    let one = connect_direct(&disp, spec.clone(), "own", json!({ "keys": "k-include-one" })).await?;
+    let two = connect_direct(&disp, spec, "own", json!({ "keys": "k-include-two" })).await?;
+    set_account(&project, "one.key", one.handle()).await?;
+    set_account(&project, "two.key", two.handle()).await?;
+
+    let stdout = project.weft(&["run", "--json", "--target", "first_key", "--target", "second_key"]).await?;
+    let settled = project.settled(execution_id_of(&stdout)?).await?;
+    settled.completed()?;
+    // The connection a Debug was handed, by its id.
+    let id_at = format!("/data/{}/accessId", weft_core::access::ACCESS_MARKER_KEY);
+    let connection_of = |debug: &str| {
+        settled
+            .input_of(debug)
+            .and_then(|input| input.pointer(&id_at).cloned())
+            .unwrap_or(Value::Null)
+    };
+    for (debug, picked) in [("first_key", &one), ("second_key", &two)] {
+        let expected = &picked.handle()["id"];
+        anyhow::ensure!(
+            &connection_of(debug) == expected,
+            "{debug} must hold the connection picked for its call ({expected}), got {}",
+            settled.input_of(debug).unwrap_or(Value::Null)
+        );
+    }
+
+    one.finish().await?;
+    two.finish().await?;
     project.finish().await
 }
 

@@ -7,20 +7,25 @@
 //! tests are running (the runner holds a lock for that), because a test in
 //! flight holds exactly the same kind of state.
 //!
-//! What counts as kept, and how it is told apart from yours:
-//!   - cells: named installs whose name starts with
-//!     [`crate::cell::CELL_NAME_PREFIX`];
-//!   - projects on the default install whose name starts with
+//! What counts as kept, and how it is told apart from yours, all of it on
+//! the install under test ([`crate::ensure::install_under_test`]) and none
+//! of it on any other, so a run on one branch never removes what another
+//! branch's run kept:
+//!   - cells the ledger still lists ([`crate::kept`]): every cell's name
+//!     starts with `e2e`, but so does every other install's runs' cells;
+//!   - projects whose name starts with
 //!     [`crate::project::E2E_PROJECT_PREFIX`], which every fixture's is;
-//!   - connections on the default install the ledger still lists
-//!     ([`crate::kept`]);
-//!   - the fixture copies under the temp directory (`weft-e2e-*`);
+//!   - connections the ledger still lists;
+//!   - this install's fixture copies under the temp directory
+//!     ([`crate::project::fixture_copies_dir`]);
 //!   - and, once those are gone, `weft clean --images --all`, which is NOT
-//!     limited to e2e: on this machine it removes every worker image no
-//!     project on the default install references (yours included, once
-//!     nothing runs them), dangling worker leftovers, infra images no
-//!     project references, every builder base and runtime but the current
-//!     one, and the worker compile caches of a retired key that sat unused.
+//!     limited to e2e: it removes every worker image no project of the
+//!     install references (yours included, once nothing runs them), and
+//!     the builder bases, node-test images, runtime images, standard
+//!     workers and worker compile caches that no install on the machine
+//!     records using. While some install has no record yet, it removes
+//!     nothing of that kind, and it never removes a cache a build is using
+//!     right now.
 
 use anyhow::{Context, Result};
 
@@ -29,20 +34,12 @@ use crate::client::cli_ok;
 /// Remove everything e2e runs kept. See the module docs.
 pub async fn clean_kept() -> Result<()> {
     let root = crate::ensure::repo_root()?;
-    for cell in kept_cells().await? {
+    for cell in crate::kept::kept_cells()? {
         println!("removing cell {cell}");
-        let out = tokio::process::Command::new("weft")
-            .args(["daemon", "remove"])
-            .env(weft_core::infra::INSTALL_ENV, &cell)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .context("spawn `weft daemon remove`")?;
-        anyhow::ensure!(
-            out.status.success(),
-            "removing the cell {cell} failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let install = weft_core::infra::Install::named(&cell).map_err(anyhow::Error::msg)?;
+        // Real time: removing a cell runs none of its timers.
+        crate::cell::daemon(&install, "remove", 1.0).await?;
+        crate::kept::cell_gone(&cell)?;
     }
 
     let disp = crate::ensure::up().await?;
@@ -80,50 +77,13 @@ pub async fn clean_kept() -> Result<()> {
     Ok(())
 }
 
-/// The names of every cell on this machine, read off the named installs'
-/// directories.
-async fn kept_cells() -> Result<Vec<String>> {
-    let dir = crate::ensure::install_dir(&weft_core::infra::Install::default_install()).join("installs");
-    let names = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(anyhow::Error::from(e).context(format!("read {}", dir.display()))),
-    };
-    Ok(cells_in(names))
-}
-
-/// Pure half of [`kept_cells`].
-fn cells_in(names: Vec<String>) -> Vec<String> {
-    names
-        .into_iter()
-        .filter(|name| name.starts_with(crate::cell::CELL_NAME_PREFIX))
-        .filter(|name| weft_core::infra::Install::named(name).is_ok())
-        .collect()
-}
-
-/// The fixture copies tests made under the temp directory
-/// (`project::unique_tempdir`).
+/// The fixture copies this install's tests made
+/// ([`crate::project::fixture_copies_dir`]).
 fn remove_fixture_copies() -> Result<()> {
-    let tmp = std::env::temp_dir();
-    for entry in std::fs::read_dir(&tmp).with_context(|| format!("read {}", tmp.display()))? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with("weft-e2e-") && entry.path().is_dir() {
-            std::fs::remove_dir_all(entry.path())
-                .with_context(|| format!("remove {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn only_cells_are_taken_for_cells() {
-        let names = ["e2e1234abcd", "mine", "e2eshort", "e2e-bad"].map(String::from).to_vec();
-        assert_eq!(super::cells_in(names), vec!["e2e1234abcd", "e2eshort"]);
+    let dir = crate::project::fixture_copies_dir()?;
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", dir.display())),
     }
 }

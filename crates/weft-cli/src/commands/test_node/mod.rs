@@ -1285,6 +1285,10 @@ async fn ensure_test_image(
         // scope to "this package's older test images": every package's
         // test image shares the one scratch project id, so the project
         // label alone would make packages evict each other's images.
+        // The builder base's tag is how a machine-wide sweep keeps the
+        // test images of every base an install still uses.
+        let (_, base_tag) = crate::images::ref_repo_tag(&builder_base)?;
+        crate::images::record_build_uses(&artifact.uses).await?;
         crate::images::docker_build_worker(
             &tag,
             &artifact.build_context.join("Dockerfile"),
@@ -1293,6 +1297,7 @@ async fn ensure_test_image(
             &[
                 format!("weft.dev/project={}", project.id()),
                 format!("weft.dev/node-test-package={package}"),
+                format!("{}={base_tag}", crate::images::NODE_TEST_BASE_LABEL),
             ],
         )
         .await?;

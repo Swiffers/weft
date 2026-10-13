@@ -78,6 +78,10 @@ pub struct BuildRequest {
     pub image_ref: String,
     /// `ARG`s the Dockerfile declares (the worker's compile lane).
     pub build_args: Vec<(String, String)>,
+    /// What the build uses of what an install keeps on the machine that
+    /// runs it: a builder on a machine adds it to its install's image
+    /// record before it builds, a cloud builder keeps nothing there.
+    pub uses: weft_core::images::BuildUses,
 }
 
 /// What keeps a staged build context on disk: the context exists while
@@ -308,6 +312,7 @@ mod tests {
                 staging: Staging::new(()),
                 image_ref: "reg/weft-worker:x".into(),
                 build_args: Vec::new(),
+                uses: Default::default(),
             })
             .await
             .unwrap();

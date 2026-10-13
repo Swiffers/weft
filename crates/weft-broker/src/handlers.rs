@@ -154,7 +154,7 @@ pub async fn execution_stop_tagged(
     // the same run is a new decision with a new anchor, never a
     // duplicate to collapse, so it has no dedup key.
     let task = weft_task_store::tasks::NewTask {
-        kind: TaskKind::StopTagged.into(),
+        kind: TaskKind::StopTagged,
         project_id: Some(execution_id_scope.project),
         dedup_key: None,
         execution_id: Some(execution_id),
@@ -212,7 +212,7 @@ pub async fn task_enqueue_dedup(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<TaskEnqueueDedupRequest>,
 ) -> Resp<TaskEnqueueDedupResponse> {
-    let kind = req.spec.kind.clone();
+    let kind = req.spec.kind;
 
     // Per-role allow list of kinds. Anything else is a 403.
     match caller.role {
@@ -220,9 +220,7 @@ pub async fn task_enqueue_dedup(
             // Workers enqueue control-plane work for the dispatcher to
             // handle: register a wake signal, withdraw one it gave up, or a
             // call a program makes on its own project.
-            if ![TaskKind::RegisterSignal.as_str(), TaskKind::WithdrawSignal.as_str(), TaskKind::ProgramCall.as_str()]
-                .contains(&kind.as_str())
-            {
+            if !matches!(kind, TaskKind::RegisterSignal | TaskKind::WithdrawSignal | TaskKind::ProgramCall) {
                 return Err((
                     StatusCode::FORBIDDEN,
                     format!("worker may not enqueue task kind {kind}"),
@@ -233,7 +231,7 @@ pub async fn task_enqueue_dedup(
             // Listeners enqueue exactly one kind: an answer to a waiting
             // run (an entry's event goes to its worker, or waits in its
             // trigger's queue).
-            if kind != TaskKind::FireSignal.as_str() {
+            if kind != TaskKind::FireSignal {
                 return Err((
                     StatusCode::FORBIDDEN,
                     format!("listener may not enqueue task kind {kind}"),
@@ -276,7 +274,7 @@ pub async fn task_enqueue_dedup(
         };
         merge_anchor_tenant(&mut anchor_tenant, scope.tenant)?;
     }
-    if kind == TaskKind::FireSignal.as_str() {
+    if kind == TaskKind::FireSignal {
         // A listener's answer to a waiting run: the signal token is the
         // tenant anchor, and the signal must be the wait of the run the
         // answer names.
@@ -323,7 +321,7 @@ pub async fn task_enqueue_dedup(
     // tenant and project from that run), so the payload's run must be the
     // one the task names and the scope check above just proved is the
     // worker's own.
-    if caller.role == Role::Worker && kind == TaskKind::RegisterSignal.as_str() {
+    if caller.role == Role::Worker && kind == TaskKind::RegisterSignal {
         let named = req.spec.execution_id.ok_or((
             StatusCode::BAD_REQUEST,
             format!("a {kind} task names the run it is for (execution_id)"),
@@ -338,7 +336,7 @@ pub async fn task_enqueue_dedup(
 
     // A wait a worker withdraws is one of the run the task names, which
     // the scope check above proved is the worker's own.
-    if kind == TaskKind::WithdrawSignal.as_str() {
+    if kind == TaskKind::WithdrawSignal {
         let named = req.spec.execution_id.ok_or((
             StatusCode::BAD_REQUEST,
             format!("a {kind} task names the run it is for (execution_id)"),
@@ -367,7 +365,7 @@ pub async fn task_enqueue_dedup(
     // the task names the run (its execution), the project the run belongs to,
     // and the payload's asker is that same run. Nothing else is taken on
     // the worker's word.
-    if kind == TaskKind::ProgramCall.as_str() {
+    if kind == TaskKind::ProgramCall {
         let execution_id = req.spec.execution_id.ok_or((
             StatusCode::BAD_REQUEST,
             "a program call names the asking run (execution)".to_string(),

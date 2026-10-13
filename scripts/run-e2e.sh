@@ -6,16 +6,27 @@
 #   scripts/run-e2e.sh plain live_chat        # every test in these files
 #   scripts/run-e2e.sh accesses::some_test    # just this test
 #   scripts/run-e2e.sh --failed               # the tests that did not pass last run
-#   scripts/run-e2e.sh -j 8 ...               # how many tests run at once (16)
+#   scripts/run-e2e.sh -j 8 ...               # how many tests run at once (4)
 #   scripts/run-e2e.sh --keep-going           # keep starting tests after a failure
 #   scripts/run-e2e.sh --clean                # only remove what failed runs kept
 #
-# What a run does, once: brings the install to current code (setup.sh),
+# What a run does, once: brings this checkout's install to current code
+# (setup.sh, which on a branch is the branch's own install, never main's),
 # removes whatever earlier failed runs kept, builds every test binary, then
 # runs the tests one by one, as many at once as -j says, longest first (by
 # how long each took last time) so a slow one never starts last and holds
 # the run open. Each test's output goes to
-# ~/.local/share/weft/e2e/run/<file>::<test>.log.
+# <install dir>/e2e/run/<file>::<test>.log, which on main is
+# ~/.local/share/weft/e2e/run/ (`weft daemon which` names the install dir).
+#
+# One run at a time on the machine, whichever checkout it comes from: a
+# run that finds another one going says which, and waits for its turn.
+# Everything the run starts that may outlive it (setup.sh's runtime, the
+# tests and the cells they start) runs with the lock's descriptor closed,
+# so the next run never waits on what this one left behind.
+# The tests crash under load, so several at once would only fail each
+# other. The heavy cargo builds also take turns with every other build on
+# the machine (setup.sh's, the node tests').
 #
 # When a test passes it removes everything it made. When one fails, it keeps
 # it (its projects, its cell if it had one) so you can look, and the runner
@@ -42,62 +53,16 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
+# shellcheck source=scripts/lib/machine-lock.sh
+. "$SCRIPT_DIR/lib/machine-lock.sh"
+# shellcheck source=scripts/lib/checkout-install.sh
+. "$SCRIPT_DIR/lib/checkout-install.sh"
 
-# Outside target/, which setup.sh empties when it grows past its cap, and
-# per machine rather than per checkout: every worktree drives the same
-# install, so one run at a time is a rule for the machine.
-# SYNC: the weft data dir <-> crates/weft-cli/src/commands/daemon.rs (data_dir)
-E2E_DIR="$HOME/.local/share/weft/e2e"
-RUN_DIR="$E2E_DIR/run"
-DURATIONS="$E2E_DIR/durations"
-FAILED_LIST="$E2E_DIR/failed"
-LOCK="$E2E_DIR/run.lock"
-# The ledger of what tests made that has no name to find it by later (a
-# connection); what a failed test leaves in it is what --clean removes.
-# SYNC: WEFT_E2E_KEPT_DIR <-> crates/weft-e2e/src/kept.rs (KEPT_DIR_ENV)
-export WEFT_E2E_KEPT_DIR="$E2E_DIR/kept"
-mkdir -p "$E2E_DIR"
-
-# ---------- One run (or clean) at a time ----------
-# A clean during a run would remove what a running test is using, and two
-# runs (from any checkout: they share the install) would redeploy it under
-# each other. The lock is a symlink whose target is the holder's pid:
-# creating it both takes the lock and names the holder in one atomic step
-# (portable, unlike flock, which macOS lacks), so no run ever sees a lock
-# with no holder in it. A lock whose holder is dead is taken over by
-# renaming it aside, which only one run can do; the run that did checks it
-# moved the stale lock it read, and puts it back otherwise.
-take_lock() {
-  local holder aside="$LOCK.stale.$$"
-  while ! ln -s "$$" "$LOCK" 2>/dev/null; do
-    holder="$(readlink "$LOCK" 2>/dev/null)" || continue   # released meanwhile: try again
-    if ! [[ "$holder" =~ ^[0-9]+$ ]] || kill -0 "$holder" 2>/dev/null; then
-      echo "another e2e run (pid ${holder:-unknown}) is in progress; wait for it, or stop it first" >&2
-      echo "(if nothing is running, remove $LOCK)" >&2
-      exit 1
-    fi
-    if mv "$LOCK" "$aside" 2>/dev/null; then
-      if [ "$(readlink "$aside" 2>/dev/null)" = "$holder" ]; then
-        rm -f "$aside"
-      else
-        # Another run took over between our read and our rename: that
-        # lock is live, give it back and refuse.
-        mv "$aside" "$LOCK" 2>/dev/null || rm -f "$aside"
-        echo "another e2e run took the lock at $LOCK first" >&2
-        exit 1
-      fi
-    fi
-  done
-}
-release_lock() {
-  [ "$(readlink "$LOCK" 2>/dev/null)" = "$$" ] && rm -f "$LOCK"
-}
-CLEANUP=("release_lock")
+CLEANUP=("machine_lock_release_mine")
 cleanup() {
   for c in "${CLEANUP[@]}"; do eval "$c"; done
 }
 trap cleanup EXIT
-take_lock
 
 usage() {
   echo "usage: scripts/run-e2e.sh [-j <n>] [--keep-going] [--failed | <file|file::test> ...] | --clean" >&2
@@ -105,12 +70,12 @@ usage() {
   echo "  <file>         every test in crates/weft-e2e/tests/<file>.rs" >&2
   echo "  <file>::<test> one test" >&2
   echo "  --failed       the tests that did not pass in the last run (failed or never started)" >&2
-  echo "  -j <n>         how many tests run at once (default 16)" >&2
+  echo "  -j <n>         how many tests run at once (default 4)" >&2
   echo "  --keep-going   keep starting tests after one fails, to see every failure" >&2
   echo "  --clean        only remove everything failed runs kept, run nothing" >&2
 }
 
-JOBS=16
+JOBS=4
 SELECTED=()
 FROM_FAILED=0
 CLEAN=0
@@ -139,27 +104,68 @@ if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# ---------- One run (or clean) at a time on the machine ----------
+# A clean during a run would remove what a running test is using, and
+# two runs at once crash each other's tests under the load.
+machine_lock_take "$weft_e2e_run_lock" "the e2e run lock (one e2e run at a time on this machine)" || exit 1
+
 # ---------- The install, on current code ----------
 # setup.sh is idempotent: on unchanged code it rebuilds nothing and
 # restarts nothing. Once per run, never per test. --clean skips it: on
 # changed code it would restart the runtime a failure kept for inspection,
 # and removing what was kept only needs the install as it is (the clean
-# fails loudly if no runtime answers).
+# fails loudly if no runtime answers). Its log goes beside this install's
+# other e2e files once the install is known; until then, in a temp file.
 if [ "$CLEAN" -eq 0 ]; then
-  echo "bringing the install to current code (setup.sh --cli --daemon)"
-  if ! ./setup.sh --cli --daemon >"$E2E_DIR/setup.log" 2>&1; then
-    echo "setup.sh failed; its output is in $E2E_DIR/setup.log" >&2
+  echo "bringing this checkout's install to current code (setup.sh --cli --daemon)"
+  SETUP_LOG="$(mktemp -t weft-e2e-setup.XXXXXX)"
+  if ! without_machine_locks ./setup.sh --cli --daemon >"$SETUP_LOG" 2>&1; then
+    echo "setup.sh failed; its output is in $SETUP_LOG" >&2
     exit 1
   fi
 fi
+
+# ---------- Which install the tests run against ----------
+# The one setup.sh just set up for this checkout, with its own weft first
+# on PATH and named in WEFT_INSTALL for everything this runner starts: the
+# harness spawns `weft` from temp folders, where "where you stand" would
+# otherwise mean the default install.
+# SYNC: WEFT_INSTALL <-> crates/weft-core/src/infra/install.rs (INSTALL_ENV)
+# SYNC: WEFT_E2E_KEPT_DIR <-> crates/weft-e2e/src/kept.rs (KEPT_DIR_ENV)
+weft_checkout_install "$REPO_ROOT" || exit 1
+INSTALL_DIR="$WHICH_DIR"
+INSTALL_WEFT="$WHICH_BIN/weft"
+export WEFT_INSTALL="$WHICH_ENV"
+export PATH="$WHICH_BIN:$PATH"
+echo "testing install $WHICH_ENV ($INSTALL_DIR)"
+
+# Outside target/, which setup.sh empties when it grows past its cap.
+E2E_DIR="$INSTALL_DIR/e2e"
+RUN_DIR="$E2E_DIR/run"
+DURATIONS="$E2E_DIR/durations"
+FAILED_LIST="$E2E_DIR/failed"
+# The ledger of what tests made that has no name to find it by later (a
+# connection, a cell); what a failed test leaves in it is what --clean
+# removes.
+export WEFT_E2E_KEPT_DIR="$E2E_DIR/kept"
+mkdir -p "$E2E_DIR"
+[ "$CLEAN" -eq 0 ] && mv -f "$SETUP_LOG" "$E2E_DIR/setup.log"
+
+# Run one command with its output in a log, for a step whose waiting
+# line (the build slot's) must still reach the terminal.
+logged() { # log cmd...
+  local log="$1"
+  shift
+  "$@" >"$log" 2>&1
+}
 
 # ---------- What earlier failed runs kept ----------
 # Kept so a failure could be looked at; starting a new run means that is
 # done. Removed before anything new is made, so it never mixes with this
 # run's state.
 echo "removing what earlier failed runs kept"
-if ! cargo build -q -p weft-e2e --features e2e --bin weft-e2e-clean >"$E2E_DIR/clean.log" 2>&1 \
-  || ! "$REPO_ROOT/target/debug/weft-e2e-clean" >>"$E2E_DIR/clean.log" 2>&1; then
+if ! with_build_slot logged "$E2E_DIR/clean.log" cargo build -q -p weft-e2e --features e2e --bin weft-e2e-clean \
+  || ! without_machine_locks "$REPO_ROOT/target/debug/weft-e2e-clean" >>"$E2E_DIR/clean.log" 2>&1; then
   echo "removing what earlier runs kept failed; its output is in $E2E_DIR/clean.log" >&2
   exit 1
 fi
@@ -172,30 +178,45 @@ fi
 
 # ---------- Auto-provisioned dependencies ----------
 # Everything a test needs that a local machine can serve comes from the
-# install already running here: its Postgres, and a `weft-e2e` bucket in
-# its object store (made the first time, then reused by every run, so
-# nothing here needs tearing down). Only genuinely external services
+# install under test: its Postgres, and its own e2e bucket in the
+# machine's object store (made the first time, then reused by every run,
+# so nothing here needs tearing down). Only genuinely external services
 # (Slack, GitHub, Google, Telegram, a real mailbox, an OpenRouter key) come
 # from the operator's env / repo-root .env. Any WEFT_E2E_* var already set
 # wins.
 
-# The default install's Postgres, for the tests that seed rows directly:
-# the address its runtime uses, from the secrets its start wrote.
-# SYNC: secrets.env <-> crates/weft-cli/src/commands/daemon.rs (secrets),
-#       crates/weft-e2e/src/platform.rs (secret)
+# The install's Postgres, for the tests that seed rows directly: the
+# address its runtime uses, from the secrets its start wrote, read the way
+# the runtime reads that file (split at the first `=`, both sides trimmed,
+# the last line for a name wins).
+# SYNC: secrets.env <-> crates/weft-core/src/infra/install.rs (SECRETS_FILE, Install::secret,
+#       env_file_values: the parser of record), crates/weft-cli/src/commands/daemon.rs (secrets:
+#       the writer)
 if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
-  SECRETS="$HOME/.local/share/weft/secrets.env"
-  WEFT_E2E_DATABASE_URL="$(sed -n 's/^WEFT_DATABASE_URL=//p' "$SECRETS" 2>/dev/null | head -1)"
+  SECRETS="$INSTALL_DIR/secrets.env"
+  if [ ! -f "$SECRETS" ]; then
+    echo "$SECRETS does not exist; is the install up? (./setup.sh --daemon)" >&2
+    exit 1
+  fi
+  WEFT_E2E_DATABASE_URL="$(awk '
+    { eq = index($0, "=") }
+    eq > 0 {
+      key = substr($0, 1, eq - 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key == "WEFT_DATABASE_URL") { value = substr($0, eq + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value) }
+    }
+    END { print value }' "$SECRETS")"
   if [ -z "$WEFT_E2E_DATABASE_URL" ]; then
-    echo "$SECRETS names no WEFT_DATABASE_URL; is the install up?" >&2
+    echo "$SECRETS names no WEFT_DATABASE_URL; is the install up? (./setup.sh --daemon)" >&2
     exit 1
   fi
   export WEFT_E2E_DATABASE_URL
 fi
 
-# An S3 store: the install already runs one ('weft-object-store', on the
-# install's Docker network, local-dev identities); a dedicated e2e bucket
-# in it serves the S3 tests. The endpoint is dialled by the WORKER running
+# An S3 store: the machine already runs one ('weft-object-store', on
+# weft's Docker network, local-dev identities, shared by every install); a
+# bucket of the install's own in it serves the S3 tests, so two installs'
+# runs never share one: `weft-e2e` for the default install,
+# `weft-e2e-<name>` for a branch's. The endpoint is dialled by the WORKER running
 # the node under test, a container on that same network, so it names the
 # store by its address there: a private IP, which a stored connection base
 # may reach over plain http (a container name is not one).
@@ -210,11 +231,12 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
   # "created" even for an existing bucket and exits 0 on errors), so the
   # create is fire-and-forget and the LIST afterwards is the one source of
   # truth.
+  BUCKET="$(weft_e2e_bucket "$WHICH_NAME")"
   docker exec weft-object-store sh -c \
-    'echo "s3.bucket.create -name weft-e2e" | weed shell' >/dev/null 2>&1
+    "echo \"s3.bucket.create -name $BUCKET\" | weed shell" >/dev/null 2>&1
   BUCKET_OUT="$(docker exec weft-object-store sh -c 'echo "s3.bucket.list" | weed shell' 2>&1)"
-  if ! printf '%s\n' "$BUCKET_OUT" | grep -q 'weft-e2e'; then
-    echo "could not create the weft-e2e bucket in the install's object store. weed shell said:" >&2
+  if ! printf '%s\n' "$BUCKET_OUT" | grep -Eq "(^|[[:space:]])$BUCKET([[:space:]]|$)"; then
+    echo "could not create the $BUCKET bucket in the machine's object store. weed shell said:" >&2
     printf '%s\n' "$BUCKET_OUT" >&2
     exit 1
   fi
@@ -223,7 +245,7 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
   export WEFT_E2E_S3_REGION="us-east-1"
   export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
   export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
-  export WEFT_E2E_S3_BUCKET="weft-e2e"
+  export WEFT_E2E_S3_BUCKET="$BUCKET"
 fi
 
 # ---------- Build every test binary once ----------
@@ -231,7 +253,7 @@ fi
 # would only queue on cargo's build lock.
 echo "building the e2e test binaries"
 BUILD_OUT="$E2E_DIR/build.log"
-if ! cargo test -p weft-e2e --features e2e --no-run >"$BUILD_OUT" 2>&1; then
+if ! with_build_slot logged "$BUILD_OUT" cargo test -p weft-e2e --features e2e --no-run; then
   echo "building the e2e tests failed:" >&2
   tail -60 "$BUILD_OUT" >&2
   exit 1
@@ -293,25 +315,30 @@ mapfile -t TESTS < <(
 # ---------- Run ----------
 mkdir -p "$RUN_DIR"
 : > "$FAILED_LIST"
-export WEFT_E2E_RUN_DIR="$RUN_DIR"
 
 # What the install looked like when a test failed, next to its log: every
-# container, the runtime's log of the default install and of any cell the
-# failed test kept, and the logs of the kept projects' containers.
+# container, the runtime's log of the install under test and of any cell
+# the failed test kept, and the logs of the kept projects' containers.
 # SYNC: labels weft-install, weft.project <-> crates/weft-platform-local/src/docker.rs
 post_mortem() {
-  local t="$1" dir="$RUN_DIR/$1.post-mortem" root="$HOME/.local/share/weft"
+  local t="$1" dir="$RUN_DIR/$1.post-mortem"
   mkdir -p "$dir"
   docker ps -a --filter label=weft-install \
     --format '{{.Names}}\t{{.Status}}\t{{.Label "weft.role"}}\t{{.Label "weft.project"}}' >"$dir/containers.txt" 2>&1
-  tail -n 5000 "$root/runtime.log" >"$dir/runtime.log" 2>&1
-  local cell
+  tail -n 5000 "$INSTALL_DIR/runtime.log" >"$dir/runtime.log" 2>&1
+  local cell cell_dir
   # Every cell and project the test made, as it says the moment it makes
   # one: a test stopped for running too long never reaches the lines its
   # guards print when they drop.
   # SYNC: the "made" lines <-> crates/weft-e2e/src/cell.rs, crates/weft-e2e/src/teardown.rs
   for cell in $(sed -n "s/^weft-e2e: made cell '\(e2e[a-z0-9]*\)'.*/\1/p" "$RUN_DIR/$t.log" | sort -u); do
-    tail -n 5000 "$root/installs/$cell/runtime.log" >"$dir/runtime-$cell.log" 2>&1
+    # The cell's folder, as the CLI places it (a subshell, so the
+    # install under test's WHICH_* stay as they are).
+    if cell_dir="$(weft_which "$REPO_ROOT" "$INSTALL_WEFT" "$cell" && printf '%s' "$WHICH_DIR")"; then
+      tail -n 5000 "$cell_dir/runtime.log" >"$dir/runtime-$cell.log" 2>&1
+    else
+      echo "could not ask weft where cell $cell lives" >"$dir/runtime-$cell.log"
+    fi
   done
   # The containers of every project the test kept, while they still run
   # (an idle worker is removed, taking its log with it).
@@ -457,11 +484,12 @@ for t in "${TESTS[@]}"; do
   STARTED["$t"]=$(date +%s)
   # In its own process group (setsid), so an interrupt can stop the test
   # and everything it started (weft, docker) in one kill.
-  ( cd "$REPO_ROOT/crates/weft-e2e" && exec "${SETSID[@]}" "$bin" --exact "${t#*::}" --test-threads=1 --nocapture ) \
+  ( close_machine_locks_here; cd "$REPO_ROOT/crates/weft-e2e" && exec "${SETSID[@]}" "$bin" --exact "${t#*::}" --test-threads=1 --nocapture ) \
     >"$RUN_DIR/$t.log" 2>&1 &
   RUNNING[$!]="$t"
   pid=$!
   (
+    close_machine_locks_here
     sleep "$TEST_LIMIT"
     touch "$RUN_DIR/$t.timed-out"
     echo "[run-e2e] stopped: over the ${TEST_LIMIT}s every test must finish in" >>"$RUN_DIR/$t.log"
@@ -490,9 +518,9 @@ printf 'the tests ran in %dm%02ds\n' $(( ELAPSED / 60 )) $(( ELAPSED % 60 ))
 # checkout moved off, which a long session of rebuilds otherwise piles up
 # by the tens of gigabytes.
 RECLAIMED=1
-weft clean --images --all >"$E2E_DIR/reclaim.log" 2>&1 || RECLAIMED=0
+without_machine_locks "$INSTALL_WEFT" clean --images --all >"$E2E_DIR/reclaim.log" 2>&1 || RECLAIMED=0
 if [ $RECLAIMED -eq 0 ]; then
-  echo "The final reclaim failed; its output is in $E2E_DIR/reclaim.log. Re-run 'weft clean --images --all' by hand." >&2
+  echo "The final reclaim failed; its output is in $E2E_DIR/reclaim.log. Re-run '$INSTALL_WEFT clean --images --all' by hand (WEFT_INSTALL=$WEFT_INSTALL)." >&2
 fi
 if [ ${#FAILED[@]} -gt 0 ]; then
   echo "${#FAILED[@]} failed, ${#PASSED[@]} passed, $NOT_RUN not started."

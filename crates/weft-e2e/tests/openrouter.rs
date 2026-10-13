@@ -22,10 +22,11 @@
 //! Spends real money (fractions of a cent on the cheapest model). Needs an
 //! OpenRouter key twice over: an `api_key` entry for openrouter in the
 //! shared-credentials file the daemon ships to the broker (the runtime
-//! path), and `OPENROUTER_API_KEY` in this test's environment (read
-//! directly for the BYOK path). Without the former the runtime scenario
-//! fails loudly at connect time, naming the missing `api_key` entry and
-//! the file it belongs in, which is exactly what this test then reports.
+//! path), and `OPENROUTER_API_KEY` in this test's environment (the BYOK
+//! path, which skips without it, like every test on a key of yours).
+//! Without the former the runtime scenario fails loudly at connect time,
+//! naming the missing `api_key` entry and the file it belongs in, which is
+//! exactly what this test then reports.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::access::{catalog_spec, connect_direct, set_account};
@@ -80,15 +81,8 @@ async fn openrouter_node_measures_a_call_on_the_runtime_key() -> anyhow::Result<
 /// "Your own" door, so the call rides it instead of the runtime's.
 #[tokio::test]
 async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Result<()> {
-    // `up` loads the repo-root `.env` (uncommitted), so OPENROUTER_API_KEY is
-    // available here the same way the daemon's setup got it.
+    let Some(key) = ensure::env_or_skip("OPENROUTER_API_KEY") else { return Ok(()) };
     let disp = ensure::up().await?;
-    let key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-        anyhow::anyhow!(
-            "OPENROUTER_API_KEY must be set (repo-root .env or the shell) to exercise the \
-             BYOK path"
-        )
-    })?;
     // Connect the user's own key as its own connection, exactly as the
     // editor's "Your own" page does; the provider node's config stores
     // only the handle, never the key itself. The inference node

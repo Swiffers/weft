@@ -309,9 +309,8 @@ const FILE_ROW_COLUMNS: &str =
     "key, mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, created_at_unix, version";
 
 /// The runtime-file plane's schema. The broker owns it (it is the only
-/// reader/writer) and applies this group at its own boot via
-/// `weft_task_store::schema_guard::apply_groups` (which serializes concurrent
-/// boots behind the shared schema advisory lock). The canonical CREATE
+/// reader/writer); the boot applies it with every other group, in one pass
+/// over the install's one list (`weft_runtime::schema`). The canonical CREATE
 /// lives here, edited in place; an existing database is carried to it by
 /// a migration written with `./setup.sh --migration <name>` (the whole
 /// contract is `weft_task_store::schema_guard`'s header).

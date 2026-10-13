@@ -86,7 +86,9 @@ own. You need a Cloudflare account with that domain on it.
 2. Add a public hostname to that tunnel, say `weft.example.com`, and set its
    service to the port weft serves those paths on: on Linux,
    `http://127.0.0.1:14112`, because the tunnel shares your machine's
-   network; on macOS, `http://host.docker.internal:14112`.
+   network; on macOS, `http://host.docker.internal:14112`. 14112 is the
+   main install's port. A branch's install has its own: the `outside` value
+   in `ports.json`, in the folder `weft daemon which` prints.
 3. Install with both set:
 
    ```bash

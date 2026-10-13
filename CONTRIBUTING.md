@@ -20,12 +20,42 @@ As a contributor you additionally need [Node 20 or
 newer](https://nodejs.org/en/download) and [pnpm](https://pnpm.io/installation)
 (`npm i -g pnpm`) to build the extensions from source and running the tests.
 
-If you want two branches open at once, `scripts/add-worktree.sh <branch>`
-branches off the one you are on into `../weft-trees/`, in a folder named after
-the branch with any slashes flattened to dashes. It gets its own `target/`, so
-the two builds shouldn't fight. Your `.env`, `.env.extension` and
-`access-apps.json` are symlinked in, so both trees have the same ones. Run
-`./setup.sh` inside it before you use it.
+## Working on several branches at once
+
+If you want two branches open at once,
+[`scripts/add-worktree.sh <new-branch>`](scripts/add-worktree.sh) branches off
+the one you are on into `../weft-trees/`, in a folder named after the branch
+with any slashes flattened to dashes. It gets its own `target/`, so the two
+builds shouldn't fight. Run `./setup.sh` inside it before you use it. That
+builds the branch and gives it its own install: a separate weft runtime,
+database and files under `~/.local/share/weft/installs/`, so nothing you do on
+the branch touches your default install.
+
+Which install a command uses depends on where you run it. That goes for weft
+itself, `./setup.sh` and the test runners. On `main`, or outside any weft
+checkout, it is your default install; on any other branch, it is that branch's
+own. If the branch's install is not set up yet, weft tells you to run
+`./setup.sh` in that checkout; it never falls back to your default install. If
+you want a particular install from anywhere, set `WEFT_INSTALL`
+(`WEFT_INSTALL=default` is your default install); on a detached HEAD you have
+to, because there is no branch to pick from. If you are not sure which install
+a command will use, `weft daemon which` tells you.
+
+On a branch, `./setup.sh` installs neither the VS Code extension nor the
+browser extension, so your editor keeps the one from your default install.
+If you want to try the branch's VS Code extension,
+[`scripts/dev-editor.sh`](scripts/dev-editor.sh) opens one extra window
+running it from source.
+
+When you are done with a branch,
+[`scripts/remove-worktree.sh`](scripts/remove-worktree.sh) removes the
+worktree and the branch's install. The git branch itself stays.
+
+Your `.env`, `.env.extension` and `access-apps.json` in every worktree are
+links to the main checkout's copies, so an edit in one is an edit in all. If a
+setting has to be different in one checkout (its own public tunnel, say), put
+it in that checkout's `.env.local`, which is never linked anywhere else and
+wins over `.env`.
 
 ## Tests
 
@@ -43,11 +73,11 @@ pnpm -C extension-browser exec tsc --noEmit                    # the browser ext
 pnpm -C extension-browser check                                # and its Svelte check
 ```
 
-CI runs all of those, plus the Postgres ones further down. The graph, syntax
-and VS Code suites share the VS Code extension's install, so `./setup.sh` (or
-at least `./setup.sh --vscode`) has to have run at least once before they
-work. The browser extension has its own install: `pnpm -C extension-browser
-install`.
+CI runs all of those, plus the Postgres ones further down. If you want to run
+the graph, syntax and VS Code suites, run `./setup.sh` (or just
+`./setup.sh --vscode`) once on `main`, or `scripts/dev-editor.sh` once on a
+branch: those suites use the VS Code extension's installed npm packages. The
+browser extension needs its own: `pnpm -C extension-browser install`.
 
 ### Which layer a test belongs at
 
@@ -78,10 +108,17 @@ scripts/run-node-tests.sh [package]     # node tests, over everything in catalog
 scripts/run-e2e.sh [name]               # the end-to-end suite
 ```
 
-The node and end-to-end ones stop at the first failure, the end-to-end one test
-by test and the node one package by package. Both take `--from <name>` to pick
-up where they stopped. The node one takes `--parallel` when you want every
-package at once, or `--parallel N` for batches of N.
+The node one goes package by package and stops at the first failure. If you
+want to pick up where it stopped, `--from <name>` starts the suite at that
+package. If you want every package at once, pass `--parallel`, or
+`--parallel N` for batches of N.
+
+If another end-to-end run is already going on this machine, from any
+checkout, yours waits for it to finish.
+
+For the end-to-end runner's flags (including `--failed`, which reruns only
+what did not pass last time) and how to read a failure, go and read
+[the e2e README](crates/weft-e2e/README.md).
 
 The database one has its own section further down.
 
@@ -257,8 +294,8 @@ the drafts into the one migration that goes in the PR:
 ./setup.sh --migration add_owner --release
 ```
 
-Releasing also needs your install up, since it has to reach the database you
-have been developing against.
+Releasing also needs your checkout's install up, since it runs against that
+install's database, the one you have been developing against.
 
 That collapses every draft into one released migration per table group. For
 each group it then looks at your database: if it ran the drafts, it is told
@@ -292,16 +329,17 @@ scripts/run-db-tests.sh                    # every crate that has them
 scripts/run-db-tests.sh weft-broker        # just one
 ```
 
-It starts a throwaway Postgres in Docker, runs the four crates whose tests need
+It starts a throwaway Postgres in Docker, runs every crate whose tests need
 one, and takes the container away afterwards. If an earlier run was killed
 before it could clean up, the next run removes that run's container too. Point it at a server of your own
 by setting `DATABASE_URL`, which is what CI does. Not the one your weft runs
 on, though: these tests create and drop databases on whatever server they are
 given.
 
-The one whose output to read is `schema_agreement`, in the dispatcher and
-broker runs. It builds one database from the `CREATE TABLE`s and another by
-replaying the released migrations, then names whatever differs.
+If a migration is wrong, `schema_agreement` in `weft-runtime` is the test that
+tells you. It builds one database from every table group's `CREATE TABLE`s
+and another by replaying the released migrations, then names whatever
+differs.
 
 These tests are behind the `db-tests` feature, off by default, so a plain
 `cargo test` never builds them.
@@ -340,6 +378,14 @@ projects, their infrastructure and data, your stored connections, and every
 image weft built, so the next install builds everything again.
 
 Before you submit a PR you must install the previous version of weft that you are merging into and make sure that running your `./setup.sh` correctly upgrades the version without any issues.
+
+If you work in a worktree, its install starts empty, so put the old version
+in it first. `weft daemon which` in your worktree prints its install's name.
+Make a throwaway checkout of the branch you merge into
+(`git worktree add --detach ../weft-trees/base main`), run
+`WEFT_INSTALL=<that name> ./setup.sh` there, remove it with
+`git worktree remove ../weft-trees/base`, then run `./setup.sh` in your
+worktree.
 
 ## Documentation
 

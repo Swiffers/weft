@@ -16,7 +16,7 @@ use weft_broker::held_signals::{
 use weft_broker_client::protocol::{HeldNow, HeldServing, ProjectStatus};
 
 async fn schema(pool: &PgPool) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
 async fn project(pool: &PgPool, id: uuid::Uuid) {

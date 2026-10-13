@@ -167,10 +167,14 @@ pub enum SignalSurface {
     /// where each fire is a one-shot reply to a specific suspended
     /// firing and the URL is internal to the consumer flow.
     TaskCallback,
-    /// Internal: no external HTTP surface at all. The signal fires
-    /// from inside the listener (timer expires, SSE event arrives)
-    /// and routes via a FireSignal broker task that a dispatcher
-    /// process picks up. Used by Timer and SSE.
+    /// Internal: no mount path of its own. The signal fires from
+    /// inside the listener (a timer expires, an SSE event arrives),
+    /// and `weft_listener::fire_sink` hands it to its project's worker,
+    /// or, if it answers a waiting run, enqueues a `FireSignal` task.
+    /// Used by the kinds that watch or hold something: timer, poll, SSE,
+    /// stream listen, socket listen, and provider events (whose webhook
+    /// pushes arrive at the dispatcher's `/events/...` instead, and the
+    /// dispatcher asks the listener to match them).
     Internal,
 }
 

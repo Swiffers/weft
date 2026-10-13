@@ -579,18 +579,6 @@ pub fn stdlib_root() -> Result<PathBuf, String> {
     weft_repo_root().map(|root| root.join("catalog"))
 }
 
-/// Whether `p` is a weft checkout, judged by what the consumers of the
-/// root actually read: this workspace's manifests + lockfile (staged
-/// into every worker build context) and the stdlib catalog. One
-/// predicate for every rung of `weft_repo_root`, so the rungs cannot
-/// drift on what "valid" means.
-fn looks_like_weft_root(p: &Path) -> bool {
-    p.join("crates/weft-catalog").is_dir()
-        && p.join("Cargo.toml").is_file()
-        && p.join("Cargo.lock").is_file()
-        && p.join("catalog").is_dir()
-}
-
 /// What one repo-root resolution had to work with, gathered by
 /// `weft_repo_root` and resolved by the pure(-ish) `resolve_weft_root_from`
 /// so the ladder order and its error wording are unit-testable without
@@ -627,11 +615,11 @@ enum RecordedInstallRoot {
 /// 4. The root the installer recorded. A PREBUILT binary (downloaded
 ///    by setup.sh from the rolling release) bakes its BUILDER's
 ///    checkout path into (3), which does not exist on this machine;
-///    setup.sh records where the repo actually lives, one line in a
-///    file, and every successful `weft daemon start` records the
-///    checkout it installed from, so a later start from a project
-///    folder finds the same manifests and shared-credentials file.
-///    SYNC: repo-root file <-> setup.sh (prebuilt CLI install: repo-root write), crates/weft-cli/src/commands/daemon.rs (record_repo_root)
+///    setup.sh, when it installs a prebuilt binary, records where the
+///    repo actually lives, one line in a file, so a later start from a
+///    project folder finds the same manifests and shared-credentials
+///    file. A binary built from source never needs it: (3) answers.
+///    SYNC: repo-root file <-> setup.sh (prebuilt CLI install: repo-root write)
 ///
 /// THE single resolver; `weft_compiler::build::resolve_weft_root`
 /// delegates here so the two can't drift (they must return the same
@@ -668,7 +656,7 @@ pub fn weft_repo_root() -> Result<PathBuf, String> {
 
 fn resolve_weft_root_from(sources: &RootSources) -> Result<PathBuf, String> {
     if let Some(root) = &sources.env_root {
-        if looks_like_weft_root(root) {
+        if weft_core::checkout::is_weft_checkout(root) {
             return Ok(root.clone());
         }
         return Err(format!(
@@ -678,25 +666,17 @@ fn resolve_weft_root_from(sources: &RootSources) -> Result<PathBuf, String> {
             root.display()
         ));
     }
-    if let Some(cwd) = &sources.cwd {
-        let mut dir = cwd.clone();
-        loop {
-            if looks_like_weft_root(&dir) {
-                return Ok(dir);
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
+    if let Some(root) = sources.cwd.as_deref().and_then(weft_core::checkout::enclosing) {
+        return Ok(root);
     }
     if let Some(built_from) = &sources.built_from {
-        if looks_like_weft_root(built_from) {
+        if weft_core::checkout::is_weft_checkout(built_from) {
             return Ok(built_from.clone());
         }
     }
     match &sources.recorded {
         RecordedInstallRoot::Recorded { file, root } => {
-            if looks_like_weft_root(root) {
+            if weft_core::checkout::is_weft_checkout(root) {
                 return Ok(root.clone());
             }
             Err(format!(
@@ -1476,7 +1456,7 @@ fn list_paths(paths: &[PathBuf]) -> String {
 mod root_tests {
     use super::*;
 
-    /// A directory shaped like a weft checkout, per `looks_like_weft_root`.
+    /// A directory shaped like a weft checkout, per `weft_core::checkout::is_weft_checkout`.
     fn fake_checkout() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("crates/weft-catalog")).expect("mkdir");
@@ -1504,26 +1484,6 @@ mod root_tests {
         assert!(is_node_tree_excluded("helper.cpython-312.pyc"));
         assert!(!is_node_tree_excluded("helper.py"));
         assert!(!is_node_tree_excluded("pycache"));
-    }
-
-    /// The predicate demands everything the consumers read: the crate
-    /// dir, the workspace manifests, and the catalog. Any one missing
-    /// means "not a checkout", or a deeper consumer would fail with a
-    /// worse message later.
-    #[test]
-    fn a_checkout_needs_crates_manifests_and_catalog() {
-        let dir = fake_checkout();
-        assert!(looks_like_weft_root(dir.path()));
-        for missing in ["crates/weft-catalog", "Cargo.toml", "Cargo.lock", "catalog"] {
-            let dir = fake_checkout();
-            let p = dir.path().join(missing);
-            if p.is_dir() {
-                std::fs::remove_dir_all(&p).expect("rm");
-            } else {
-                std::fs::remove_file(&p).expect("rm");
-            }
-            assert!(!looks_like_weft_root(dir.path()), "should fail without {missing}");
-        }
     }
 
     /// Rung 1: an explicit WEFT_REPO_ROOT wins, and one that is not a

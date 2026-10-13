@@ -19,7 +19,6 @@ use weft_core::node_test::{NodeTestRunStatus, RunNodeTestRequest, RunNodeTestRes
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
-use crate::task_kinds::run_node_test::{RunNodeTestPayload, RUN_NODE_TEST_KIND};
 
 pub async fn run(
     State(state): State<DispatcherState>,
@@ -29,7 +28,7 @@ pub async fn run(
 ) -> Result<Json<RunNodeTestResponse>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
 
-    let payload = RunNodeTestPayload {
+    let payload = weft_task_store::RunNodeTestPayload {
         project_id: id,
         tenant: caller.0 .0.clone(),
         image_ref: body.image_ref,
@@ -41,7 +40,7 @@ pub async fn run(
     let task_id = weft_task_store::tasks::enqueue(
         &state.pg_pool,
         weft_task_store::NewTask {
-            kind: RUN_NODE_TEST_KIND.to_string(),
+            kind: weft_task_store::TaskKind::RunNodeTest,
             project_id: Some(id),
             dedup_key: None,
             execution_id: None,

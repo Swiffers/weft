@@ -52,8 +52,9 @@ tempfile = { workspace = true }
 test-helpers = []
 # Layer-3 tests that hit a REAL Postgres via `#[sqlx::test]` + $DATABASE_URL
 # (the dispatcher's own SQL: births, lifecycle writes, the ledger). OFF by
-# default so a plain `cargo test --workspace` needs no Postgres; CI runs
-# `cargo test -p weft-dispatcher --features db-tests` with a Postgres up.
+# default so a plain `cargo test --workspace` needs no Postgres;
+# `scripts/run-db-tests.sh` runs them (CI's `db` job runs that same script
+# against a Postgres service).
 db-tests = ["weft-task-store/db-tests"]
 
 [dev-dependencies]
@@ -67,14 +68,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid
 # `test-util`: the paused virtual clock the wake-loop tests (`pg_wake`)
 # run on, so their safety ticks pass without real waiting.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
-
-# Named after its crate: two examples of one name collide in the
-# shared target directory when both crates build together.
-# SYNC: the example name <-> setup.sh (--migration's `--example`)
-[[example]]
-name = "dispatcher_schema_migration"
-path = "examples/schema_migration.rs"
-required-features = ["db-tests"]
 
 [lints]
 workspace = true

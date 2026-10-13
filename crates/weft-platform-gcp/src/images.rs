@@ -275,6 +275,7 @@ mod tests {
             staging: weft_platform_traits::Staging::new(()),
             image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
             build_args: vec![("WEFT_COMPILE_LANE".into(), "0".into())],
+            uses: Default::default(),
         };
         let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
         assert_eq!(body["images"][0], req.image_ref);

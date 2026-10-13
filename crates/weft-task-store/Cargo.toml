@@ -8,8 +8,9 @@ repository.workspace = true
 [features]
 # Gates the Layer-3 DB tests (tests/*.rs) that need a real
 # Postgres via `#[sqlx::test]` + $DATABASE_URL. OFF by default so
-# `cargo test --workspace` is green on any machine without Postgres; CI runs
-# `cargo test -p weft-task-store --features db-tests` with a Postgres up.
+# `cargo test --workspace` is green on any machine without Postgres;
+# `scripts/run-db-tests.sh` runs them (CI's `db` job runs that same script
+# against a Postgres service).
 db-tests = ["dep:chrono", "serve"]
 # The middleware that keeps a process's watch listening while it answers
 # a request (`pg_signal::keep_listening`), for the processes that serve.

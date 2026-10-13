@@ -166,10 +166,10 @@ pub struct SeededGrant {
 
 #[cfg(feature = "e2e")]
 impl SeededGrant {
-    /// Adopt a row the test just INSERTed under `grant_id` into the default
-    /// install's store.
+    /// Adopt a row the test just INSERTed under `grant_id` into the
+    /// install under test's store.
     pub fn new(pool: sqlx::PgPool, grant_id: uuid::Uuid) -> Result<Self> {
-        crate::kept::default_install_grant_made(&grant_id.to_string())?;
+        crate::kept::grant_seeded(&grant_id.to_string())?;
         Ok(Self { grant_id, pool, finished: false })
     }
 

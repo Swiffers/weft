@@ -77,8 +77,6 @@ pub mod task_executor {
     use crate::state::DispatcherState;
 
     pub type TaskRegistry = weft_task_store::executor::TaskRegistry<DispatcherState>;
-    pub type TaskRegistryBuilder =
-        weft_task_store::executor::TaskRegistryBuilder<DispatcherState>;
 }
 
 pub use events::{DispatcherEvent, EventBus};

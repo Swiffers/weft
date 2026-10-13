@@ -8,13 +8,13 @@
 //! `$DATABASE_URL`, creates a random DB, drops it after). When
 //! `DATABASE_URL` is unset the macro skips the test, so a dev box without
 //! Postgres still builds. The schema is the REAL migration path in
-//! production order: `app::apply_core_schema` (one pass over every
-//! group), then the journal and store wrap the pool, exactly what a
-//! booting dispatcher runs.
+//! production order: one pass over the dispatcher's groups
+//! (`app::DISPATCHER_GROUPS`), then the journal and store wrap the pool,
+//! the way a booting dispatcher does.
 //!
 //! Gated behind the `db-tests` feature (off by default) so a plain
-//! `cargo test --workspace` needs no Postgres; run with
-//! `cargo test -p weft-dispatcher --features db-tests` and `$DATABASE_URL` set.
+//! `cargo test --workspace` needs no Postgres; `scripts/run-db-tests.sh`
+//! runs it against a throwaway Postgres.
 #![cfg(feature = "db-tests")]
 
 use serde_json::json;
@@ -40,12 +40,11 @@ use weft_dispatcher::versions::VersionStoreOps;
 
 const TENANT: &str = "tenant-1";
 
-/// The real boot-time migration path: journal schema first (production
-/// runs it at journal connect), then every core table in dependency
-/// order. Returns the journal + the project store, the two handles the
+/// The real boot-time migration path: the dispatcher's groups in
+/// dependency order, in one pass. Returns the journal + the project store, the two handles the
 /// SQL under test goes through.
 async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore) {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let journal = PostgresJournal::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
         std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
@@ -1800,7 +1799,7 @@ async fn removing_a_project_takes_everything_kept_under_it(pool: PgPool) {
             weft_task_store::tasks::enqueue_dedup(
                 &pool,
                 weft_task_store::tasks::NewTask {
-                    kind: weft_task_store::TaskKind::RegisterSignal.into(),
+                    kind: weft_task_store::TaskKind::RegisterSignal,
                     project_id: Some(project),
                     dedup_key: Some(key.into()),
                     execution_id: None,
@@ -2608,7 +2607,7 @@ async fn a_resting_task_claim_lapses_only_after_its_run_ended(pool: PgPool) {
     let task = weft_task_store::tasks::enqueue(
         &pool,
         weft_task_store::tasks::NewTask {
-            kind: weft_task_store::TaskKind::ProgramCall.into(),
+            kind: weft_task_store::TaskKind::ProgramCall,
             project_id: Some(id),
             dedup_key: None,
             execution_id: None,
@@ -3026,7 +3025,7 @@ async fn retention_looks_next_at_the_earliest_erasable_keep(pool: PgPool) {
 #[sqlx::test]
 async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: PgPool) {
     use weft_dispatcher::activation_store::ClaimRefused;
-    use weft_dispatcher::task_kinds::resync::{task, ResyncOwner, ResyncPlan, Stopped, RESYNC_KIND};
+    use weft_dispatcher::task_kinds::resync::{task, ResyncOwner, ResyncPlan, Stopped};
     let (_journal, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
@@ -3062,7 +3061,7 @@ async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: 
     let driver = projects.try_begin_resyncing(id, &plan, task(TENANT, id, plan.driver)).await.unwrap().expect("entered");
     assert_eq!(transition(projects.clone()).await, "resyncing");
     let kind: String = sqlx::query_scalar("SELECT kind FROM task WHERE id = $1").bind(driver).fetch_one(&pool).await.unwrap();
-    assert_eq!(kind, RESYNC_KIND, "its task is enqueued with it");
+    assert_eq!(kind, weft_task_store::TaskKind::Resync.as_str(), "its task is enqueued with it");
     let held = projects.resync(id).await.unwrap().expect("its plan is written down");
     assert_eq!((held.plan.clone(), held.driven, held.standing_still()), (plan.clone(), true, None));
     let other = ResyncPlan { driver: Uuid::new_v4(), ..plan.clone() };

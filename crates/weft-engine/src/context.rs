@@ -2228,7 +2228,7 @@ impl RunnerHandle {
         self.clients
             .tasks
             .enqueue_dedup(task_store::NewTask {
-                kind: TaskKind::WithdrawSignal.into(),
+                kind: TaskKind::WithdrawSignal,
                 project_id: None,
                 dedup_key: Some(format!("withdraw/{token}")),
                 execution_id: Some(self.execution_id),
@@ -3255,7 +3255,7 @@ impl ContextHandle for RunnerHandle {
             .clients
             .tasks
             .enqueue_dedup(task_store::NewTask {
-                kind: TaskKind::ProgramCall.into(),
+                kind: TaskKind::ProgramCall,
                 project_id: Some(self.project_id),
                 dedup_key: Some(format!("program_call/{}/{}/{frames}/{call_index}", self.execution_id, self.node_id)),
                 execution_id: Some(self.execution_id),
@@ -3552,7 +3552,7 @@ async fn enqueue_register_signal_task(
     });
     let id = tasks
         .enqueue_dedup(task_store::NewTask {
-            kind: TaskKind::RegisterSignal.into(),
+            kind: TaskKind::RegisterSignal,
             project_id: None,
             dedup_key: Some(dedup_key),
             execution_id: Some(execution_id),

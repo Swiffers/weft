@@ -13,7 +13,7 @@ use weft_core::install::{Domain, DomainServes};
 use weft_dispatcher::ProjectStoreOps as _;
 
 async fn project(pool: &PgPool) -> Uuid {
-    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let store = weft_dispatcher::PostgresProjectStore::new(pool.clone());
     let id = Uuid::new_v4();
     let definition = serde_json::from_value(serde_json::json!({ "id": id, "nodes": [], "edges": [] })).expect("a definition");

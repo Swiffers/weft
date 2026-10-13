@@ -4347,6 +4347,171 @@ fn a_socket_and_a_route_claiming_one_path_collide() {
     );
 }
 
+/// `main` compiled as the program of a fresh project directory that
+/// holds `files` (name, contents), then enriched and validated.
+fn validate_with_files(main: &str, files: &[(&str, &str)]) -> Vec<Diagnostic> {
+    validate(&compile_with_files(main, files), &catalog())
+}
+
+/// `main` compiled as the program of a fresh project directory that
+/// holds `files` (name, contents), then enriched.
+fn compile_with_files(main: &str, files: &[(&str, &str)]) -> weft_core::ProjectDefinition {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let mut project = compile(main, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    project
+}
+
+/// An included file that serves the address it spells out.
+const DOOR_WRITTEN: &str = "Group() -> (out: String) {\n  door = Route { path: \"hooks/in\", method: \"POST\" }\n  self.out = door.method\n}\n";
+
+/// An included file whose address each site gives through its input.
+const DOOR_WIRED: &str = "Group(path: String) -> (out: String) {\n  door = Route { method: \"POST\" }\n  door.path = self.path\n  self.out = door.method\n}\n";
+
+fn overlaps(d: &[Diagnostic]) -> Vec<&Diagnostic> {
+    d.iter().filter(|x| x.code.as_deref() == Some("route-overlap")).collect()
+}
+
+/// A file with a written address, included once, serves it once.
+#[test]
+fn a_route_in_a_file_included_once_compiles() {
+    let d = validate_with_files("one = @include(\"door.weft\")\n", &[("door.weft", DOOR_WRITTEN)]);
+    assert!(overlaps(&d).is_empty(), "one include, one claim: {d:?}");
+}
+
+/// The compiled program holds the file's Route once, but each include
+/// serves its own copy, so two includes claim `hooks/in` twice and a
+/// call to it has no answer. The finding sits on the second include
+/// line, which is the line that made the second claim, and says both
+/// ways out.
+#[test]
+fn a_route_in_a_file_included_twice_is_refused_on_the_second_include() {
+    let d = validate_with_files(
+        "one = @include(\"door.weft\")\ntwo = @include(\"door.weft\")\n",
+        &[("door.weft", DOOR_WRITTEN)],
+    );
+    let found = overlaps(&d);
+    assert_eq!(found.len(), 1, "one pair, one finding: {d:?}");
+    let said = &found[0].message;
+    assert!(said.contains("one.door") && said.contains("two.door"), "it names both places: {said}");
+    assert!(said.contains("hooks/in"), "it names the address: {said}");
+    assert!(
+        said.contains("Include the file once") && said.contains("from an input of the file"),
+        "it says how to fix it: {said}"
+    );
+    assert_eq!((found[0].line, found[0].file.as_deref()), (2, None), "on the second include line: {:?}", found[0]);
+}
+
+/// Each include gives its own address through the file's input, so the
+/// two copies claim different paths and nothing is compared here.
+#[test]
+fn a_route_in_a_file_included_twice_with_a_wired_path_compiles() {
+    let d = validate_with_files(
+        "one = @include(\"door.weft\")\none.path = \"hooks/one\"\ntwo = @include(\"door.weft\")\ntwo.path = \"hooks/two\"\n",
+        &[("door.weft", DOOR_WIRED)],
+    );
+    assert!(overlaps(&d).is_empty(), "each include gives its own path: {d:?}");
+}
+
+/// The Route is one file further down: `mid.weft` includes it once, and
+/// the program includes `mid.weft` twice. That is still two copies of
+/// the Route, and the line to change is the second include of `mid`.
+#[test]
+fn a_route_reached_twice_through_a_nested_include_is_refused() {
+    let mid = "Group() -> (out: String) {\n  inner = @include(\"door.weft\")\n  self.out = inner.out\n}\n";
+    let d = validate_with_files(
+        "a = @include(\"mid.weft\")\nb = @include(\"mid.weft\")\n",
+        &[("door.weft", DOOR_WRITTEN), ("mid.weft", mid)],
+    );
+    let found = overlaps(&d);
+    assert_eq!(found.len(), 1, "one pair, one finding: {d:?}");
+    let said = &found[0].message;
+    assert!(said.contains("a.inner.door") && said.contains("b.inner.door"), "it names both places: {said}");
+    assert_eq!((found[0].line, found[0].file.as_deref()), (2, None), "on the second include of mid: {:?}", found[0]);
+}
+
+/// The two places part inside an included file: `mid.weft` includes the
+/// Route's file twice, and the program includes `mid.weft` once. The
+/// line to change is the second include in `mid.weft`, so that is where
+/// the finding sits.
+#[test]
+fn a_route_included_twice_inside_an_included_file_is_refused_there() {
+    let mid = "Group() -> (out: String) {\n  one = @include(\"door.weft\")\n  two = @include(\"door.weft\")\n  self.out = one.out\n}\n";
+    let d = validate_with_files("m = @include(\"mid.weft\")\n", &[("door.weft", DOOR_WRITTEN), ("mid.weft", mid)]);
+    let found = overlaps(&d);
+    assert_eq!(found.len(), 1, "one pair, one finding: {d:?}");
+    let said = &found[0].message;
+    assert!(said.contains("m.one.door") && said.contains("m.two.door"), "it names both places: {said}");
+    assert_eq!(found[0].line, 3, "on the second include line in mid.weft: {:?}", found[0]);
+    assert!(found[0].file.as_deref().is_some_and(|file| file.ends_with("mid.weft")), "in mid.weft: {:?}", found[0]);
+}
+
+/// Two different Routes that fight each other, in a file included twice.
+/// That is three mistakes, each named once: each Route is served twice
+/// (one finding per Route, on the second include), and the two Routes
+/// collide (one finding, on the one written later, naming every place
+/// of both).
+#[test]
+fn two_colliding_routes_in_a_file_included_twice_are_each_named_once() {
+    let pair = "Group() -> (out: String) {\n  a = Route { path: \"cards/{id}\", method: \"GET\" }\n  b = Route { path: \"cards/{slug}\", method: \"GET\" }\n  self.out = a.method\n}\n";
+    let d = validate_with_files(
+        "one = @include(\"pair.weft\")\ntwo = @include(\"pair.weft\")\n",
+        &[("pair.weft", pair)],
+    );
+    let found = overlaps(&d);
+    assert_eq!(found.len(), 3, "each Route served twice, and the pair, each once: {d:?}");
+    let on_the_include: Vec<&&Diagnostic> =
+        found.iter().filter(|x| (x.line, x.file.as_deref()) == (2, None)).collect();
+    assert_eq!(on_the_include.len(), 2, "both Routes' own duplicates sit on the second include: {d:?}");
+    assert!(on_the_include.iter().any(|x| x.message.contains("one.a") && x.message.contains("two.a")), "{d:?}");
+    assert!(on_the_include.iter().any(|x| x.message.contains("one.b") && x.message.contains("two.b")), "{d:?}");
+    let pair_finding = found
+        .iter()
+        .find(|x| x.line == 3 && x.file.as_deref().is_some_and(|file| file.ends_with("pair.weft")))
+        .unwrap_or_else(|| panic!("the pair sits on b, the one written later: {d:?}"));
+    let said = &pair_finding.message;
+    assert!(
+        ["one.a", "two.a", "one.b", "two.b", "cards/{id}", "cards/{slug}"].iter().all(|part| said.contains(part)),
+        "it names every place of both: {said}"
+    );
+}
+
+/// A path each instance provides is compared at activation, where the
+/// instance's value is known, so two includes of it are not refused here.
+#[test]
+fn an_instance_filled_route_in_a_file_included_twice_compiles() {
+    let door = "Group() -> (out: String) {\n  door = Route { path: @instance_filled, method: \"POST\" }\n  self.out = door.method\n}\n";
+    let d = validate_with_files(
+        "one = @include(\"door.weft\")\ntwo = @include(\"door.weft\")\n",
+        &[("door.weft", door)],
+    );
+    assert!(overlaps(&d).is_empty(), "each instance gives its own path: {d:?}");
+}
+
+/// A body no site calls serves nothing, so its Route claims nothing and
+/// cannot collide with the program's own; a path in it that does not
+/// parse is still reported, because the author wrote it.
+#[test]
+fn a_route_in_a_body_nothing_calls_claims_nothing_but_is_still_checked() {
+    let lib = "Group() -> (out: String) {\n  same = Route { path: \"hooks/in\", method: \"POST\" }\n  bad = Route { path: \"a//b\", method: \"POST\" }\n  self.out = same.method\n}\n";
+    let mut project = compile_with_files(
+        "lib = @include(\"lib.weft\")\nmine = Route { path: \"hooks/in\", method: \"POST\" }\n",
+        &[("lib.weft", lib)],
+    );
+    // Drop the only site, leaving its body uncalled.
+    project.groups.retain(|group| !matches!(group.kind, weft_core::project::GroupKind::Call { .. }));
+    let d = validate(&project, &catalog());
+    assert!(overlaps(&d).is_empty(), "an uncalled body claims nothing: {d:?}");
+    let invalid = d
+        .iter()
+        .find(|x| x.code.as_deref() == Some("route-path-invalid"))
+        .unwrap_or_else(|| panic!("the uncalled body's bad path is still named: {d:?}"));
+    assert!(invalid.file.as_deref().is_some_and(|file| file.ends_with("lib.weft")), "{invalid:?}");
+}
+
 /// The one that reached production: `select count(*) as count` asks
 /// for a port the node already answers with the number of rows, so an
 /// API served `1` for a page of nine cards with nothing saying so. The

@@ -55,3 +55,6 @@ The architecture was reworked to be lean and fast, and it stays that way. A bug 
 
 ## Every change keeps the install able to scale to zero
 weft is serverless: an install nobody uses runs nothing and its database sleeps. Every change is checked against that, including what calls in from outside (the editor, the CLI, a frontend, a holder): no timer, poll, held connection, self-wake or background loop may keep a part up, or the database awake, for good while nothing real is happening. Something reasonable that stays up while a person is actually using it is fine (an open editor, a running run), as long as it ends on its own once they stop. If a change could keep something up indefinitely, ask the [user] first.
+
+## Use weft's own names, never synonyms
+When talking about weft, use the names weft itself uses (node, bus, port, run, signal, listener, trigger, infra, group, include, scope, gate, the node and flag names as written), never a synonym of your own ("step" for node, "pipe" or "channel" for bus...). A renamed concept reads as a different system the [user] does not know, and every one costs a round of "is this the same thing?". If weft has no name for something, say so and describe it plainly instead of coining one.

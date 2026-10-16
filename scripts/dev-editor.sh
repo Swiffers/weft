@@ -46,5 +46,20 @@ step() { # label cmd...
 weft_vscode_link_borrowers "${ext_dir}"
 weft_vscode_compile "${ext_dir}" step
 
+# In a remote session (SSH, WSL) `code` is VS Code's remote command, which
+# drops --extensionDevelopmentPath and opens a plain window running the
+# installed extension. VS Code opens a remote development window only
+# from a window, so point at the launch config that does. That window
+# starts with its extension host paused for a debugger that does not
+# attach through the remote (Ctrl+F5 too), so nothing in it loads until it
+# reloads; a reload starts the host without the debugger.
+if [[ "$(command -v code)" == */remote-cli/* ]]; then
+  echo "==> built. VS Code is remote here, and its \`code\` command cannot open a development window."
+  echo "    In a VS Code window on ${checkout}, press F5 (\"weft: this checkout's extension\")."
+  echo "    The window that opens hangs until it reloads: Ctrl+Shift+P, \"Developer: Reload Window\"."
+  echo "    Then open the project in it${1:+: $1}."
+  exit 0
+fi
+
 echo "==> opening a development window (install ${WHICH_ENV})"
 code --extensionDevelopmentPath="${ext_dir}" ${1:+"$1"}

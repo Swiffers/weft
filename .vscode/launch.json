@@ -1,0 +1,18 @@
+{
+  // Run this checkout's VS Code extension in a development window: the
+  // route `scripts/dev-editor.sh` points at when VS Code is remote (SSH,
+  // WSL), where its `code` command cannot open one. Build first with
+  // `scripts/dev-editor.sh`, start it with F5, and reload the window that
+  // opens once (Developer: Reload Window): through the remote its extension
+  // host first waits for a debugger that never attaches, and the reload
+  // starts it without one. Then open the weft project from that window.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "weft: this checkout's extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/extension-vscode"]
+    }
+  ]
+}

@@ -20,6 +20,28 @@ export interface LayoutEntry {
   configOpen?: boolean;
 }
 
+/** Whether a node draws open: the `expanded|collapsed` its layout entry
+ *  holds (so a person's toggle sticks), else its default. Every
+ *  node and group starts closed except an included file's own top-level
+ *  group (`anonymous`, the one group the language lets go unnamed): a
+ *  person looking at that file came to see what is inside it. Nested
+ *  groups and the groups of the entry file are named, so they start
+ *  closed. `undefined` is closed with nothing written. */
+export function expandedOf(written: boolean | undefined, node: { anonymous?: boolean }): boolean | undefined {
+  if (written !== undefined) return written;
+  return node.anonymous ? true : undefined;
+}
+
+/** What the layout entry should hold for a node drawn `drawn`, in
+ *  `updateLayoutEntry`'s terms: `null` clears the flag when `drawn` is just
+ *  the node's default (an included file's group drawn open), so a drag or
+ *  an organize never writes the default down as if a person had chosen it;
+ *  anything else is written as is (`undefined` keeps what is there). */
+export function expandedToWrite(drawn: boolean | undefined, node: { anonymous?: boolean }): boolean | null | undefined {
+  const byDefault = expandedOf(undefined, node);
+  return byDefault !== undefined && drawn === byDefault ? null : drawn;
+}
+
 // ── Per-project view mode ────────────────────────────────────────────────
 //
 // The graph can render in two view modes: the full builder view (every port,

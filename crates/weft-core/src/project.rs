@@ -183,8 +183,9 @@ pub struct GroupDefinition {
     #[serde(rename = "nodeIds", default)]
     pub node_ids: Vec<String>,
     /// True for the anonymous top-level group of an included `.weft` file
-    /// (no `name =`). The editor labels it from the filename and validates it
-    /// as a component (no project-level output requirement).
+    /// (no `name =`). The editor labels it from the filename, validates it
+    /// as a component (no project-level output requirement), and draws it
+    /// open until a person closes it.
     #[serde(default)]
     pub anonymous: bool,
     #[serde(default)]

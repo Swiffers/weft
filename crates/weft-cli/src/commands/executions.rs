@@ -687,6 +687,8 @@ pub async fn clean(
 ///      install on the machine may run a different version
 ///      ([`crate::image_refs`]).
 ///   4. With `--all` only: the worker compile caches no install uses.
+///   5. With `--all` only: the caches that compiled weft's own crates for
+///      an install no longer on this machine.
 async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     // The scope, settled BEFORE any layer runs: a scoped clean that cannot
     // name its project must delete nothing, not run the global layers and
@@ -720,6 +722,7 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
             layer(kind.layer(), unused_image_sweep(&data, kind).await);
         }
         layer("unused compile caches", unused_compile_cache_sweep(&data).await);
+        layer("compile caches of removed installs", removed_install_cache_sweep(&data).await);
     }
     // The compile cache every worker build shares is not an image, but it
     // is disk, so it is never invisible. Reading its size is not a reclaim:
@@ -1072,6 +1075,34 @@ async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Resul
             }
         }
         println!("dropping a worker compile cache no install uses (key {}, {lane}, {})", cache.key, cache.size);
+        if let Err(error) = crate::images::prune_build_record(&cache.id).await {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+/// Layer 5 (`--all` only): the caches that compiled weft's own crates (the
+/// runtime image's, the builder base's) for an install no longer on this
+/// machine, and those from before each install had its own, which no
+/// install builds in any more. `weft daemon remove` drops an install's as
+/// it goes; this takes what an install removed otherwise left (by an older
+/// weft, or by hand). A cache a build mounts right now is kept and said.
+async fn removed_install_cache_sweep(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let installs: Vec<String> = super::daemon::Install::every_on(data_dir)?.iter().map(|i| i.id.label_value().to_string()).collect();
+    let mut failures = Vec::new();
+    for cache in crate::images::install_build_caches().await? {
+        let whose = match &cache.install {
+            Some(install) if installs.contains(install) => continue,
+            Some(install) => format!("of install '{install}', which is no longer on this machine"),
+            None => "from before each install had its own".to_string(),
+        };
+        if !cache.reclaimable {
+            println!("keeping a compile cache {whose} ({}): a build mounts it right now", cache.size);
+            continue;
+        }
+        println!("dropping a compile cache {whose} ({})", cache.size);
         if let Err(error) = crate::images::prune_build_record(&cache.id).await {
             failures.push(format!("{error:#}"));
         }

@@ -171,6 +171,8 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     outputs: g.outPorts.map(copyPort),
     features: {},
     scope: parentId ? [parentId] : [],
+    // The included file's own group, which the editor opens by default.
+    ...(g.anonymous ? { anonymous: true } : {}),
   };
 }
 

@@ -7,6 +7,8 @@ import {
 	applyLayoutOps,
 	diffLayoutOps,
 	computeContainmentFloors,
+	expandedOf,
+	expandedToWrite,
 	parseViewMode,
 	setViewMode,
 	removeLayoutEntry,
@@ -313,5 +315,48 @@ describe('updateLayoutEntry size invariant', () => {
 		expect(() => updateLayoutEntry('a @layout 0 0', 'a', 0, 0, undefined, 348)).toThrow(
 			'set or cleared together',
 		);
+	});
+});
+
+describe('expandedOf: whether a node draws open', () => {
+	it("opens an included file's own group when nothing is written", () => {
+		expect(expandedOf(undefined, { anonymous: true })).toBe(true);
+	});
+
+	it('leaves every named group closed, nested or in the entry file', () => {
+		// Only an included file's top-level group can be anonymous; a nested
+		// group and every group of the entry file carry a name.
+		expect(expandedOf(undefined, { anonymous: false })).toBeUndefined();
+		expect(expandedOf(undefined, {})).toBeUndefined();
+	});
+
+	it('keeps the written choice over the default, either way', () => {
+		expect(expandedOf(false, { anonymous: true })).toBe(false);
+		expect(expandedOf(true, { anonymous: true })).toBe(true);
+		expect(expandedOf(true, {})).toBe(true);
+		expect(expandedOf(false, {})).toBe(false);
+	});
+});
+
+describe('expandedToWrite: what the layout entry keeps', () => {
+	it("clears the flag when an included file's group is drawn open by default", () => {
+		expect(expandedToWrite(true, { anonymous: true })).toBeNull();
+	});
+
+	it('writes a choice that differs from the default', () => {
+		expect(expandedToWrite(false, { anonymous: true })).toBe(false);
+		expect(expandedToWrite(true, {})).toBe(true);
+		expect(expandedToWrite(false, {})).toBe(false);
+	});
+
+	it('leaves a never-toggled node alone', () => {
+		expect(expandedToWrite(undefined, {})).toBeUndefined();
+	});
+
+	it('round-trips: a cleared default reads back open, a written choice reads back as itself', () => {
+		const written = updateLayoutEntry('g @layout 0 0 collapsed', 'g', 0, 0, undefined, undefined, expandedToWrite(true, { anonymous: true }));
+		const entry = parseLayoutCode(written).g;
+		expect(entry.expanded).toBeUndefined();
+		expect(expandedOf(entry.expanded, { anonymous: true })).toBe(true);
 	});
 });

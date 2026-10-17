@@ -2354,26 +2354,44 @@ async fn the_holders_count_the_held_rows_of_live_activations(pool: PgPool) {
 }
 
 /// The holders run as many copies as the held signals need, none for none,
-/// and look again only when the count is announced to have changed.
+/// and look again only when the count is announced to have changed. A
+/// process that has set the pool asks it to change only when the count it
+/// needs differs from the one last set, by whichever replica set it; one
+/// that has not set it yet (a replica just started) sets it whatever was
+/// written, since the pool may have changed behind weft's back. The
+/// holders are told of every change of the held set all the same.
 #[sqlx::test]
 async fn the_holders_are_sized_to_the_held_signals(pool: PgPool) {
+    use std::sync::atomic::AtomicBool;
+    use weft_dispatcher::holders::size;
     use weft_task_store::drain::DrainStep;
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let holders = weft_platform_traits::FakeHolderPool::default();
+    let (holders, here) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
     let news = weft_platform_traits::FakeHolderNews::default();
-    assert_eq!(weft_dispatcher::holders::size(&pool, &holders, &news, 2).await.unwrap(), DrainStep::Done);
+    assert_eq!(size(&pool, &holders, &news, 2, &here).await.unwrap(), DrainStep::Done);
+    assert_eq!(*holders.sizes.lock(), vec![0], "never set: the pool is set even to none");
+    size(&pool, &holders, &news, 2, &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![0], "set to none already: not asked again");
     for t in ["a", "b", "c"] {
         journal.signal_insert(&held_signal(t, id, 0)).await.unwrap();
     }
-    assert_eq!(weft_dispatcher::holders::size(&pool, &holders, &news, 2).await.unwrap(), DrainStep::Done);
-    journal.signal_remove_many(&["a".to_string(), "b".to_string(), "c".to_string()]).await.unwrap();
-    weft_dispatcher::holders::size(&pool, &holders, &news, 2).await.unwrap();
+    assert_eq!(size(&pool, &holders, &news, 2, &here).await.unwrap(), DrainStep::Done);
+    journal.signal_insert(&held_signal("d", id, 0)).await.unwrap();
+    let (sibling, there) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
+    size(&pool, &sibling, &news, 2, &there).await.unwrap();
+    assert_eq!(*sibling.sizes.lock(), vec![2], "a replica just started sets the pool to the count written, as it may have drifted");
+    size(&pool, &sibling, &news, 2, &there).await.unwrap();
+    assert_eq!(*sibling.sizes.lock(), vec![2], "and then trusts it");
+    size(&pool, &holders, &news, 2, &here).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![0, 2], "four signals still need the two holders the other replica set");
+    journal.signal_remove_many(&["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]).await.unwrap();
+    size(&pool, &holders, &news, 2, &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0, 2, 0]);
     assert_eq!(
         *news.told.lock(),
-        vec![weft_platform_traits::HolderNote::HeldSetChanged; 3],
+        vec![weft_platform_traits::HolderNote::HeldSetChanged; 7],
         "each sizing tells the holders, after the pool is sized for it"
     );
 }

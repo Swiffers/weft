@@ -1581,6 +1581,9 @@ async fn remove(install: &Install) -> Result<()> {
         docker_ok(&["volume", "rm", "-f", v.trim()], "docker volume rm").await?;
     }
     delete_bucket(&install.bucket()).await?;
+    // The caches its images compiled weft's crates in, which no other
+    // install builds in (`weft_compiler::build::install_cache_key`).
+    crate::images::drop_install_build_caches(&install.id).await?;
     // Postgres owned its files as its own user.
     if install.postgres_dir().exists() {
         let out = run_in_alpine(&install.dir, "/d", "rm -rf /d/postgres-data").await?;

@@ -107,6 +107,15 @@ const ACCOUNT_SPREAD: Patience =
 pub const GRANT_APPLIES: Patience =
     Patience { first: Duration::from_secs(5), longest: Duration::from_secs(30), budget: Duration::from_secs(600) };
 
+/// [`GRANT_APPLIES`] for a call a process makes as it boots, before it
+/// listens: Cloud Run stops a container that has not opened its port
+/// within its startup probe's four minutes (the default the install's
+/// services keep, `deploy/terraform/gcp/serverless.tf`), so the waits stop
+/// well inside that, and a grant slower than this fails the boot, saying
+/// which.
+pub const GRANT_APPLIES_AT_BOOT: Patience =
+    Patience { first: Duration::from_secs(5), longest: Duration::from_secs(30), budget: Duration::from_secs(180) };
+
 /// Whether `e` is Google refusing an account it has not heard of yet. A
 /// new account, or a new grant to it, takes a while to reach every API,
 /// and until then a call naming it fails in one of three known ways: the
@@ -318,7 +327,7 @@ mod tests {
     fn only_an_account_not_known_yet_is_waited_out() {
         assert!(account_not_spread(&api(400, "Service account wp-x@acme.iam.gserviceaccount.com does not exist.")));
         assert!(account_not_spread(&api(403, "Permission 'iam.serviceaccounts.actAs' denied on service account wp-x@acme.iam.gserviceaccount.com (or it may not exist).")));
-        assert!(account_not_spread(&anyhow::anyhow!("the operation failed: {{\"message\": \"Permission denied on secret: projects/acme/secrets/s/versions/latest\"}}")));
+        assert!(account_not_spread(&anyhow::anyhow!("the operation failed: Permission denied on secret: projects/acme/secrets/s/versions/latest")));
         assert!(!account_not_spread(&api(403, "The caller does not have permission")));
         assert!(!account_not_spread(&api(403, "Permission 'run.services.update' denied on resource")));
         assert!(!account_not_spread(&api(400, "invalid machine type")));

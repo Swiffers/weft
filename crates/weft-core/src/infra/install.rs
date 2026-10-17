@@ -384,7 +384,8 @@ pub fn data_dir() -> std::path::PathBuf {
 // spell it out:
 // SYNC: INSTALL_ENV <-> extension-vscode/src/localInstall.ts (installName), setup.sh,
 //       scripts/run-e2e.sh, scripts/run-node-tests.sh, scripts/lib/checkout-install.sh
-//       (weft_which), scripts/remove-worktree.sh
+//       (weft_which), scripts/remove-worktree.sh, .github/workflows/install-gcp.yml
+//       (build the runtime's images)
 pub const INSTALL_ENV: &str = "WEFT_INSTALL";
 
 /// The label key naming the install a resource belongs to.

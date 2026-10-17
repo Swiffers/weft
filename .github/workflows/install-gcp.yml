@@ -133,6 +133,11 @@ jobs:
       - name: build the runtime's images
         env:
           BUILT_HERE: ${{ steps.release.outputs.found != 'yes' }}
+          # A build names the install whose compile caches it fills
+          # (`weft_compiler::build::install_cache_key`), and a tag checks out
+          # on no branch, which picks none. This runner's caches go with it.
+          # SYNC: WEFT_INSTALL <-> crates/weft-core/src/infra/install.rs (INSTALL_ENV)
+          WEFT_INSTALL: default
         run: |
           registry=$(terraform -chdir=deploy/terraform/gcp output -raw registry)
           gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet

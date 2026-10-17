@@ -246,12 +246,38 @@ resource "google_cloud_run_v2_service" "role" {
     }
   }
 
+  # A role calls Google as the core account the moment it is up (the
+  # broker reaches the object store as it boots, and the first pass of the
+  # broker and the dispatcher sets wakes and, on the dispatcher, sizes the
+  # holders' pool), so it comes up only once the holders' pool and every
+  # grant of that account exist, but the right to call the roles
+  # (`core_calls_roles`, made from them, after). The install config names
+  # the pool by its name alone, which orders nothing. Google still takes a
+  # minute or two to apply a new grant; a loop that gave up in that window
+  # is tried again as its role next starts, and a call to a role that
+  # Cloud Run refused is retried by its Cloud Tasks queue.
   depends_on = [
+    google_cloud_run_v2_worker_pool.holder,
     google_secret_manager_secret_version.install,
     google_secret_manager_secret_version.config,
     google_secret_manager_secret_iam_member.core_reads,
     google_secret_manager_secret_iam_member.core_reads_config,
     google_secret_manager_secret_iam_member.core_reads_access_apps,
+    google_project_iam_member.core,
+    google_project_iam_member.core_grants_log_writers,
+    google_project_iam_member.core_project_accounts,
+    google_project_iam_member.core_news_subscriptions,
+    google_artifact_registry_repository_iam_member.core_registry,
+    google_service_account_iam_member.core_signs_as_itself,
+    google_service_account_iam_member.core_lets_repositories_deploy,
+    google_storage_bucket_iam_member.core_stages_builds,
+    google_storage_bucket_iam_member.core_files,
+    google_storage_bucket_iam_member.core_files_bucket_read,
+    google_cloud_tasks_queue_iam_member.core_deletes_wakes,
+    google_pubsub_topic_iam_member.core_announces_news,
+    google_pubsub_topic_iam_member.core_attaches_to_news,
+    google_pubsub_topic_iam_member.core_announces_to_holders,
+    google_pubsub_topic_iam_member.core_attaches_to_holders,
   ]
 }
 
@@ -345,10 +371,15 @@ resource "google_cloud_run_v2_worker_pool" "holder" {
     ignore_changes = [scaling[0].manual_instance_count]
   }
 
+  # A holder, once one runs, subscribes to the holders topic and writes its
+  # logs as the core account.
   depends_on = [
     google_secret_manager_secret_version.config,
     google_secret_manager_secret_iam_member.core_reads_config,
     google_secret_manager_secret_version.install,
     google_secret_manager_secret_iam_member.core_reads,
+    google_project_iam_member.core,
+    google_project_iam_member.core_news_subscriptions,
+    google_pubsub_topic_iam_member.core_attaches_to_holders,
   ]
 }

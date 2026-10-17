@@ -23,8 +23,12 @@ use axum::routing::post;
 use axum::Router;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{Alarm, CoreRole, WakeCall};
-use weft_task_store::drain::{PassFailed, TickBody};
+use weft_task_store::drain::{Pass, PassFailed, TickBody};
 use weft_task_store::unanswered::{self, Callee};
+
+/// One pass of a role's loops ([`Tick::run`]): what the tick was called
+/// with, and which pass of its process it is.
+pub type PassRun = Arc<dyn Fn(TickBody, Pass) -> futures::future::BoxFuture<'static, Result<(), PassFailed>> + Send + Sync>;
 
 /// A role's own tick, for a role that scales to zero: run the loops the
 /// call names. `run` takes what the tick was called with: the loops a
@@ -41,7 +45,7 @@ use weft_task_store::unanswered::{self, Callee};
 #[derive(Clone)]
 pub struct Tick {
     pub role: CoreRole,
-    pub run: Arc<dyn Fn(TickBody) -> futures::future::BoxFuture<'static, Result<(), PassFailed>> + Send + Sync>,
+    pub run: PassRun,
     pub alarm: Arc<dyn Alarm>,
     /// Where a ring carried by the alarm is answered, once its pass went
     /// through, and where a booked wake set again for its moment is
@@ -55,12 +59,13 @@ pub struct Tick {
 
 impl Tick {
     /// One pass: run what `call` says and the loops already due. The tick
-    /// route calls it, and so does a process of the role as it starts, for
-    /// what came due while no process of it was up. A ring the alarm
-    /// carried is answered only once its pass went through.
-    pub async fn pass(&self, call: TickBody) -> Result<(), PassFailed> {
+    /// route calls it ([`Pass::Tick`]), and so does a process of the role
+    /// as it starts ([`Pass::Start`]), for what came due while no process
+    /// of it was up and for one more try of each loop that gave up. A ring
+    /// the alarm carried is answered only once its pass went through.
+    pub async fn pass(&self, call: TickBody, pass: Pass) -> Result<(), PassFailed> {
         let answered_ring = call.after_failed_ring;
-        (self.run)(call).await?;
+        (self.run)(call, pass).await?;
         if let (true, Some(pool)) = (answered_ring, &self.pool) {
             if let Err(e) = unanswered::answered(pool, Callee::Role(self.role.as_str())).await {
                 tracing::warn!(target: "weft_runtime::server", role = %self.role, error = %format!("{e:#}"), "could not clear a ring that failed before");
@@ -117,7 +122,7 @@ async fn tick(State(t): State<Tick>, axum::extract::RawQuery(query): axum::extra
             };
         }
     }
-    match t.pass(call).await {
+    match t.pass(call, Pass::Tick).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(failed) => {
             tracing::error!(target: "weft_runtime::server", role = %t.role, error = %failed, "a tick's pass could not write down how it went; the platform calls it again");
@@ -222,7 +227,7 @@ mod tests {
         let counter = ran.clone();
         let t = Tick {
             role: CoreRole::Dispatcher,
-            run: Arc::new(move |_| {
+            run: Arc::new(move |_, _| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             }),
@@ -263,7 +268,7 @@ mod tests {
         let answered = failed.clone();
         let t = Tick {
             role: CoreRole::Dispatcher,
-            run: Arc::new(move |_| {
+            run: Arc::new(move |_, _| {
                 let failed = answered.clone();
                 Box::pin(async move { Err(failed) })
             }),

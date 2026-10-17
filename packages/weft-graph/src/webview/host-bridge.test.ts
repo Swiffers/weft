@@ -86,6 +86,7 @@ describe('translateProject', () => {
       parentGroupId,
       childGroupIds: [],
       nodeIds: [],
+      anonymous: false,
     });
     const host = {
       id: 'p1',
@@ -113,6 +114,7 @@ describe('translateProject', () => {
       parentGroupId,
       childGroupIds: [],
       nodeIds: [],
+      anonymous: false,
     });
     const host = {
       id: 'p1',
@@ -127,6 +129,33 @@ describe('translateProject', () => {
     expect(labels.get('@src:cards:read_cards.rows')).toBe('rows');
   });
 
+  it("marks an included file's own group, and no other", () => {
+    // The file's top-level group is the one the editor opens by default
+    // (`expandedOf`), so the flag has to survive the translation.
+    const group = (id: string, parentGroupId: string | null, anonymous: boolean) => ({
+      id,
+      kind: 'group' as const,
+      label: null,
+      inPorts: [],
+      outPorts: [],
+      parentGroupId,
+      childGroupIds: [],
+      nodeIds: [],
+      anonymous,
+    });
+    const host = {
+      id: 'p1',
+      nodes: [],
+      edges: [],
+      groups: [group('@src:cards:read_cards', null, true), group('@src:cards:read_cards.rows', '@src:cards:read_cards', false)],
+    } as unknown as HostProject;
+
+    const v1 = translateProject(host, 'src', '');
+    const anonymous = new Map(v1.nodes.map((n) => [n.id, n.anonymous]));
+    expect(anonymous.get('@src:cards:read_cards')).toBe(true);
+    expect(anonymous.get('@src:cards:read_cards.rows')).toBeUndefined();
+  });
+
   it("carries a group's `_should_flow` literal across as a port literal", () => {
     const host = {
       id: 'p1',
@@ -136,13 +165,13 @@ describe('translateProject', () => {
         {
           id: 'off', kind: 'group' as const, label: null,
           inPorts: [], outPorts: [],
-          parentGroupId: null, childGroupIds: [], nodeIds: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
           portLiterals: { _should_flow: false },
         },
         {
           id: 'on', kind: 'group' as const, label: null,
           inPorts: [], outPorts: [],
-          parentGroupId: null, childGroupIds: [], nodeIds: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
         },
       ],
     } as unknown as HostProject;

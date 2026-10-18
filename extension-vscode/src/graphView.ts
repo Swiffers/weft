@@ -24,6 +24,8 @@ import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem } from '../../packages/weft-graph/src/live-data';
+import type { LiveRun } from './runFollower';
+import { displayedNodeOf, displayRoutesOf, displayStreamPath, infraNodeIdsOf, ownDisplaysLost, type DisplayRoute } from './displayRoutes';
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, readProjectNameFromToml, findProjectRoot } from './sidebar/projects';
 import { NODE_GLOBS } from './diagnostics';
@@ -31,20 +33,11 @@ import { NODE_GLOBS } from './diagnostics';
 /// What a parse answers for a project the dispatcher has never seen.
 const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
 
-/// Where one node's display is served from, and the node as the
-/// display stream names it: its place, spelled the way a person writes
-/// it (`one.door`).
-// SYNC: DisplayRoute.source <-> crates/weft-dispatcher/src/display_feeds.rs (DisplaySource)
 /// Another install whose program the graph shows: its name, and the
 /// folder its program was downloaded into.
 export interface RemoteInstall {
   name: string;
   root: string;
-}
-
-interface DisplayRoute {
-  source: 'infra' | 'signal';
-  node: string;
 }
 
 /// One node's display as the dispatcher pushes it: the node, and what
@@ -171,10 +164,10 @@ export class GraphViewController {
   /// race the webview's listener registration and get dropped on
   /// VS Code restart with a .weft already open.
   private readyHandler: (() => void) | undefined;
-  /// Every node on screen that shows a display, keyed by node id, with
-  /// where it is served from. Reconciled against every parse, emptied
-  /// when the view stops being a place, when the document changes, and
-  /// on dispose.
+  /// Every node on screen that can show a display, keyed by node id,
+  /// with where it is served from. Reconciled against every parse,
+  /// emptied when the view stops being a place, when the document
+  /// changes, and on dispose.
   ///
   /// The dispatcher pushes what these nodes show over one stream
   /// (`/events/project/{id}/displays`), looking at them only while the
@@ -185,6 +178,15 @@ export class GraphViewController {
   private displayRoutes: Map<string, DisplayRoute> = new Map();
   /// The project the routes belong to.
   private displayProject: string | undefined;
+  /// The followed run while it has not ended (`RunFollower.onLiveRun`):
+  /// the stream also carries the displays of its waits when it belongs
+  /// to `displayProject`.
+  private liveRun: LiveRun | undefined;
+  /// The nodes showing a wait's display now. The stream says `absent`
+  /// only for a wait it showed on the same connection, so when the run
+  /// changes or the stream reconnects, these are cleared here, or a
+  /// wait that ended meanwhile would keep its panel.
+  private waitDisplays: Set<string> = new Set();
   /// The path the display stream is pointed at now (undefined: closed).
   private displayPath: string | undefined;
   private readonly displayStream: ReconnectingStream<DisplayFeedMessage>;
@@ -207,6 +209,18 @@ export class GraphViewController {
   ) {
     this.displayStream = new ReconnectingStream<DisplayFeedMessage>(client, 'displays', livePause);
     this.displayStream.onMessage((msg) => this.showDisplay(msg));
+    // Whatever the new connection carries, it says from scratch.
+    this.displayStream.onConnect(() => this.clearWaitDisplays());
+  }
+
+  /** The followed run that has not ended, or undefined: the display
+   *  stream asks for that run's waits while it is set and belongs to
+   *  the project on screen. */
+  setLiveRun(run: LiveRun | undefined): void {
+    if (run?.runId === this.liveRun?.runId) return;
+    this.liveRun = run;
+    this.clearWaitDisplays();
+    this.pointDisplayStream();
   }
 
   /** Called by extension.ts so sidebar-initiated runs and action-bar
@@ -974,11 +988,8 @@ export class GraphViewController {
   /** Compare the latest parse to the nodes whose display is on screen,
    *  and point the display stream at the new set when it changed.
    *
-   *  Two kinds of node show one. An infra node's container serves it,
-   *  and only when the node's metadata names the endpoint; one that
-   *  speaks only TCP has nothing to serve it on. A trigger's listener
-   *  kind always serves one. The dispatcher answers `absent` while
-   *  there is nothing behind either yet (the infra is not up, the
+   *  The dispatcher answers `absent` while there is nothing behind an
+   *  infra or trigger node's display yet (the infra is not up, the
    *  project is not activated), so asking early is harmless.
    */
   private syncDisplays(response: Pick<ParseResponse, 'project' | 'catalog'>): void {
@@ -1001,58 +1012,31 @@ export class GraphViewController {
       this.stopAllDisplays();
       return;
     }
-    const nodes = response.project.nodes;
-    // The parsed node first, the catalog only when it says nothing: the
-    // same precedence the webview's role predicates use, so the host
-    // never asks about a node the webview draws no panel for, or the
-    // reverse.
-    // SYNC: role precedence <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts
-    const isInfraNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
-      n.requiresInfra ?? response.catalog[n.nodeType]?.requiresInfra ?? false;
-    const isTriggerNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
-      n.features?.isTrigger ?? response.catalog[n.nodeType]?.features?.isTrigger ?? false;
-    const servesLive = (n: ParseResponse['project']['nodes'][number]): boolean =>
-      (n.features?.liveEndpoint ?? response.catalog[n.nodeType]?.features?.liveEndpoint) != null;
-
-    this.infraNodeIds = new Set(nodes.filter(isInfraNode).map((n) => n.id));
+    this.infraNodeIds = infraNodeIdsOf(response);
     // One decision per node, made HERE, from the parse that answers it:
     // where this node's display lives. Re-deriving the route later from
     // the mutable infra set let a node that changed type keep asking
     // its old endpoint while its buttons went to the new one, because a
     // node keeps its id when its type changes.
-    const showing = new Map<string, DisplayRoute>();
-    for (const n of nodes) {
-      // A node that exists once per instance has no one display to show
-      // here: each instance's copy shows its own through the instance
-      // door. The editor shows the shared program alone.
-      if (n.perInstance) continue;
-      // Both doors take the place spelled the way a person writes it
-      // (`one.door` for the `door` inside the file the site `one`
-      // includes): the node under the calls this view descended through.
-      if (isInfraNode(n)) {
-        if (servesLive(n)) showing.set(n.id, { source: 'infra', node: addressOf(callPath, n.id) });
-        continue;
-      }
-      if (isTriggerNode(n)) showing.set(n.id, { source: 'signal', node: addressOf(callPath, n.id) });
+    const showing = displayRoutesOf(response, callPath);
+    // A node whose display no longer comes from a wait (gone, or now a
+    // trigger) loses the wait's panel with it.
+    for (const nodeId of [...this.waitDisplays]) {
+      if (showing.get(nodeId)?.source !== 'wait') this.clearWaitDisplay(nodeId);
     }
-    this.displayRoutes = showing;
+    this.replaceRoutes(showing);
     this.displayProject = projectId;
     this.pointDisplayStream();
   }
 
-  /** Open the display stream on the nodes on screen, or close it when
-   *  there are none or the panel is hidden. Reconnects only when what it
-   *  should ask for changed. */
+  /** Open the display stream on the nodes on screen and the followed
+   *  run's waits, or close it when there is nothing to ask for or the
+   *  panel is hidden. Reconnects only when what it should ask for
+   *  changed. */
   private pointDisplayStream(): void {
     let path: string | undefined;
-    if (this.panel?.visible && this.displayProject && this.displayRoutes.size > 0) {
-      const of = (source: DisplayRoute['source']) =>
-        [...this.displayRoutes.values()]
-          .filter((r) => r.source === source)
-          .map((r) => encodeURIComponent(r.node))
-          .sort()
-          .join(',');
-      path = `/events/project/${this.displayProject}/displays?infra=${of('infra')}&signals=${of('signal')}`;
+    if (this.panel?.visible && this.displayProject) {
+      path = displayStreamPath(this.displayProject, this.displayRoutes.values(), this.liveRun);
     }
     if (path === this.displayPath) return;
     this.displayPath = path;
@@ -1063,10 +1047,12 @@ export class GraphViewController {
    *  panel. A message about a node no longer on screen belongs to
    *  nothing and is dropped. */
   private showDisplay(msg: DisplayFeedMessage): void {
-    const nodeId = [...this.displayRoutes.entries()].find(
-      ([, route]) => route.source === msg.source && route.node === msg.node,
-    )?.[0];
+    const nodeId = displayedNodeOf(this.displayRoutes, msg);
     if (nodeId === undefined) return;
+    if (msg.source === 'wait') {
+      if (msg.state === 'absent') this.waitDisplays.delete(nodeId);
+      else this.waitDisplays.add(nodeId);
+    }
     switch (msg.state) {
       case 'ok': {
         // An item the guard rejects is one no renderer can draw. It
@@ -1079,9 +1065,10 @@ export class GraphViewController {
         break;
       }
       // Nothing serves it yet: the infra is not provisioned, or the
-      // signal is not registered. A distinct RESTING state, never
-      // collapsed into a healthy empty list: the webview renders it with
-      // its own affordance, and stale items from a previous run clear.
+      // signal is not registered, or the node's wait is over. A distinct
+      // RESTING state, never collapsed into a healthy empty list: the
+      // webview renders it with its own affordance (or, for a wait, no
+      // panel), and stale items from a previous run clear.
       case 'absent':
         this.post({ kind: 'nodeDisplay', nodeId, state: 'absent' });
         break;
@@ -1095,8 +1082,28 @@ export class GraphViewController {
     }
   }
 
+  /** Take down the panel of every node showing a wait's display. */
+  private clearWaitDisplays(): void {
+    for (const nodeId of [...this.waitDisplays]) this.clearWaitDisplay(nodeId);
+  }
+
+  private clearWaitDisplay(nodeId: string): void {
+    this.waitDisplays.delete(nodeId);
+    this.post({ kind: 'nodeDisplay', nodeId, state: 'absent' });
+  }
+
+  /** Swap in `next` as the routes on screen, taking down the display
+   *  of every node that showed its own and no longer gets it there. */
+  private replaceRoutes(next: Map<string, DisplayRoute>): void {
+    for (const nodeId of ownDisplaysLost(this.displayRoutes, next)) {
+      this.post({ kind: 'nodeDisplay', nodeId, state: 'absent' });
+    }
+    this.displayRoutes = next;
+  }
+
   private stopAllDisplays(): void {
-    this.displayRoutes = new Map();
+    this.clearWaitDisplays();
+    this.replaceRoutes(new Map());
     this.displayProject = undefined;
     this.pointDisplayStream();
     // The set describes a parse that is no longer on screen, and

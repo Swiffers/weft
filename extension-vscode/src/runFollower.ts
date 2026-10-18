@@ -76,6 +76,11 @@ export type DispatcherEvent = { eventId: string } & (
   // journal and the questions it was parked on with it. No atUnix:
   // nothing was journaled, the journal is what went.
   | { kind: 'run_deleted'; runId: string; projectId: string }
+  // The run parked: every firing still open waits on a signal (a
+  // person, an outside job, a timer) and no worker drives it until an
+  // answer comes. Parking writes no journal row: a replay ends with it
+  // when the run is parked at the time of the read.
+  | { kind: 'run_parked'; runId: string; projectId: string }
   // Infra lifecycle. Emitted by the dispatcher's infra_event_bridge
   // from supervisor-written rows; drive action-bar refresh so
   // transient `stopping` / `terminating` states show up in the UI.
@@ -167,6 +172,13 @@ function identifiedEvent(value: unknown): DispatcherEvent {
 
 export type PostFn = (msg: HostMessage) => void;
 
+/** A followed run that has not ended, with the project it belongs to:
+ *  a display stream asks for its waits only on that project's stream. */
+export interface LiveRun {
+  runId: string;
+  projectId: string;
+}
+
 export class RunFollower implements vscode.Disposable {
   private eventSource: { close: () => void } | undefined;
   private generation = 0;
@@ -175,6 +187,18 @@ export class RunFollower implements vscode.Disposable {
   /// The run being followed, kept across a pause so coming back
   /// reopens it; cleared when the follow stops or is lost.
   private runId: string | undefined;
+  /// The followed run while it has not ended: its history is applied
+  /// and holds no terminal event, and no live one arrived since. What
+  /// `onLiveRun` listeners hear about.
+  private liveRun: LiveRun | undefined;
+  /// The project the followed run belongs to, from the first of its
+  /// events (every run event carries it); undefined until one arrived.
+  private runProject: string | undefined;
+  /// The followed run's history is applied: live events follow it.
+  private historyApplied = false;
+  /// The followed run's history or live stream carried its end.
+  private ended = false;
+  private readonly liveRunListeners: Array<(run: LiveRun | undefined) => void> = [];
 
   constructor(
     private readonly client: DispatcherClient,
@@ -185,6 +209,31 @@ export class RunFollower implements vscode.Disposable {
       if (paused) this.close();
       else if (this.runId) void this.start(this.runId);
     });
+  }
+
+  /** Hear which followed run has not ended yet, every time that
+   *  changes: a run once its history is applied without an end in it,
+   *  and once one of its events said which project it belongs to,
+   *  then undefined when it ends, the follow is lost or stopped, or
+   *  another run is followed. The graph asks for the displays of that
+   *  run's waits while it is set. */
+  onLiveRun(listener: (run: LiveRun | undefined) => void): void {
+    this.liveRunListeners.push(listener);
+  }
+
+  private setLiveRun(run: LiveRun | undefined): void {
+    // A run's project never changes, so its id says whether this changed.
+    if (run?.runId === this.liveRun?.runId) return;
+    this.liveRun = run;
+    for (const listener of this.liveRunListeners) listener(run);
+  }
+
+  /** Name the followed run live once its history is applied without an
+   *  end and its project is known. */
+  private announceLive(): void {
+    if (this.historyApplied && !this.ended && this.runId && this.runProject) {
+      this.setLiveRun({ runId: this.runId, projectId: this.runProject });
+    }
   }
 
   /** Hydrate a past run by replaying every journaled event up
@@ -203,6 +252,10 @@ export class RunFollower implements vscode.Disposable {
   private async start(runId: string): Promise<void> {
     this.close();
     this.runId = runId;
+    this.runProject = undefined;
+    this.historyApplied = false;
+    this.ended = false;
+    this.setLiveRun(undefined);
     this.post({ kind: 'runReset' });
     // Coming back opens it.
     if (this.pause.paused()) return;
@@ -313,12 +366,15 @@ export class RunFollower implements vscode.Disposable {
       buffering = false;
       for (const e of buffer) applyLive(e);
       buffer.length = 0;
+      this.historyApplied = true;
+      this.announceLive();
     }
   }
 
   /** Stop following: nothing reopens it. */
   stop(): void {
     this.runId = undefined;
+    this.setLiveRun(undefined);
     this.close();
   }
 
@@ -339,6 +395,7 @@ export class RunFollower implements vscode.Disposable {
   }
 
   private apply(e: DispatcherEvent): void {
+    this.runProject ??= e.projectId;
     switch (e.kind) {
       case 'node_started': {
         const firingEvent: NodeFiringEvent = {
@@ -440,6 +497,8 @@ export class RunFollower implements vscode.Disposable {
       }
       case 'run_completed':
       case 'run_failed':
+        this.ended = true;
+        this.setLiveRun(undefined);
         this.post({
           kind: 'runTerminal',
           runId: e.runId,
@@ -448,6 +507,8 @@ export class RunFollower implements vscode.Disposable {
         });
         break;
       case 'run_cancelled':
+        this.ended = true;
+        this.setLiveRun(undefined);
         // A cancel carries why: the text and, on every row written since
         // the cause existed, the structured value (a sibling run's stop
         // names the run and the tag).
@@ -466,6 +527,12 @@ export class RunFollower implements vscode.Disposable {
       case 'run_deleted':
         // Nothing to paint: the host drops the follow if this was the
         // run on screen, and the tree and the bar re-read.
+        break;
+      case 'run_parked':
+        // Nothing to paint: every open firing already shows waiting
+        // from its own `node_suspended`, and the waits keep their
+        // displays. The host re-reads the bar and the runs tree, where
+        // the run now reads waiting.
         break;
       case 'bus_joined':
         // Forward `offset` on every bus event so the inspector can
@@ -695,5 +762,7 @@ export class RunFollower implements vscode.Disposable {
         return _exhaustive;
       }
     }
+    // A run whose history held no event learns its project here.
+    this.announceLive();
   }
 }

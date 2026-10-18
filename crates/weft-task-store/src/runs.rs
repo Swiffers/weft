@@ -82,6 +82,31 @@ pub const RUN_QUEUED_CHANNEL: &str = "weft_run_queued";
 // SYNC: CANCEL_CHANNEL <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-broker/src/line.rs (audience)
 pub const CANCEL_CHANNEL: &str = "weft_cancel";
 
+/// The channel the dispatchers relay the events that ride no record row
+/// on (`weft_core::live_event::LiveEvent`, as JSON): each dispatcher pushes
+/// what it hears to whoever follows the event's project. Written by the
+/// dispatchers themselves and by the broker as it parks a run.
+pub const EVENTS_CHANNEL: &str = "weft_dispatcher_events";
+
+/// The most an event announced on [`EVENTS_CHANNEL`] may weigh, in bytes:
+/// Postgres NOTIFY refuses a payload past 8000.
+pub const EVENT_MAX_BYTES: usize = 7800;
+
+/// Announce `event` on [`EVENTS_CHANNEL`] through `executor`: inside the
+/// caller's transaction it is heard only if that commits. `Err` when the
+/// event weighs more than [`EVENT_MAX_BYTES`] (nobody would hear it, and no
+/// record replays it) or the database refused.
+pub async fn announce_event<'e, E: sqlx::PgExecutor<'e>>(executor: E, event: &weft_core::live_event::LiveEvent) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(event)?;
+    anyhow::ensure!(
+        payload.len() <= EVENT_MAX_BYTES,
+        "the event weighs {} bytes, more than the {EVENT_MAX_BYTES} a NOTIFY carries",
+        payload.len()
+    );
+    sqlx::query("SELECT pg_notify($1, $2)").bind(EVENTS_CHANNEL).bind(&payload).execute(executor).await?;
+    Ok(())
+}
+
 /// How an announcement names a run: `<project id> <run id>`.
 // SYNC: run_payload <-> parked_fire_notify in crates/weft-task-store/src/parked_fires.rs (GROUP)
 pub fn run_payload(project_id: uuid::Uuid, run_id: weft_core::RunId) -> String {

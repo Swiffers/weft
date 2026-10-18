@@ -1370,6 +1370,7 @@ pub(crate) async fn fetch_signal_live(state: &DispatcherState, node: &str, at: &
         .live(&at.token, at.address.as_deref())
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the trigger's display: {e}")))?
+        .map(|answer| answer.live)
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,

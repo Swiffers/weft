@@ -279,10 +279,12 @@ describe('actionable events', () => {
     c.handleEvent(started('a'));
     c.handleEvent({ kind: 'run_completed', runId: 'a', projectId: 'p' } as DispatcherEvent);
     c.handleEvent({ kind: 'infra_flaky', projectId: 'p' } as unknown as DispatcherEvent);
+    c.handleEvent({ kind: 'run_parked', runId: 'a', projectId: 'p' } as DispatcherEvent);
     expect(actionable.map((e) => e.kind)).toEqual([
       'run_started',
       'run_completed',
       'infra_flaky',
+      'run_parked',
     ]);
   });
 

@@ -456,8 +456,23 @@ pub async fn outputs(
     Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))
 }
 
+/// Where one node of a run stands (`weft_core::program::NodeState`), the
+/// same answer a program's `GetNodeState` reads. The node is spelled the
+/// way `--from` takes it (`one.render`).
+pub async fn node_state(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((run_id_str, node)): Path<(String, String)>,
+) -> Result<Json<weft_core::program::NodeState>, (StatusCode, String)> {
+    let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id")))?;
+    let project_id = authorize_run(&*state.journal, &caller.0, run_id).await?.project_id;
+    Ok(Json(crate::node_state::read(&state, project_id, run_id, &node).await?))
+}
+
 /// Replay journaled history through the same projection as live events.
-/// Terminals come from the journal, never a synthesized second completion.
+/// Terminals come from the journal, never a synthesized second completion;
+/// a run parked now ends its replay with `RunParked`, the one event about
+/// where it stands rather than what it did.
 pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -532,6 +547,16 @@ pub async fn replay(
             crate::events::IdentifiedEvent { event_id: record.event_id, event: () }
                 .project(|()| projected),
         );
+    }
+    // A run parked now says so after its history: parking writes no
+    // record row, and a reader that takes the history before the live
+    // events (`weft wait --waiting-for-input`) learns here that it waits.
+    let summary = state.journal.run_summary(run_id).await.map_err(|e| {
+        tracing::error!(target: "weft_dispatcher::api", %run_id, error = %e, "replay: reading the run's status failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if summary.is_some_and(|summary| summary.status == weft_core::program::RunStatus::WaitingForInput) {
+        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::RunParked { run_id, project_id }));
     }
     // A row the fold could not apply is painted as its corruption, at
     // the row, by the projector; the rows that never decoded follow.

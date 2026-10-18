@@ -72,6 +72,12 @@ pub struct SignalSpec {
     /// beside the other fields, each default left out.
     #[serde(flatten)]
     pub settings: crate::run_settings::RunSettings,
+    /// The last call a run's wait sends if its run is cancelled while it
+    /// waits (`crate::signal::cancel_call`). Kind-independent like
+    /// `access`, which it is sent as. A run's wait only: an entry trigger
+    /// has no run to cancel, and its registration is refused.
+    #[serde(default, rename = "onCancel", skip_serializing_if = "Option::is_none")]
+    pub on_cancel: Option<crate::signal::CancelCall>,
 }
 
 /// Preparing an entry captures it; waiting on a signal registers a live
@@ -101,6 +107,7 @@ impl SignalSpec {
             match_predicates: Vec::new(),
             limits: crate::signal::EntryLimits::default(),
             settings: crate::run_settings::RunSettings::default(),
+            on_cancel: None,
         }
     }
 }

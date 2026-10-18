@@ -15,7 +15,8 @@
 //!
 //! Endpoints (internal, platform identity required):
 //!   POST /prepare, /start, /unregister, /process, /match_push,
-//!   /wake_by_hand, /live, /rehydrate, /wake; GET /signals, /health.
+//!   /wake_by_hand, /live, /cancel_call, /rehydrate, /wake; GET /signals,
+//!   /health.
 //! A fire the listener raises itself (a timer's tick, an event on a held
 //! connection) goes straight to its project's worker door when it is an
 //! entry's, and as a `FireSignal` task through the broker otherwise

@@ -865,6 +865,47 @@ pub fn enclosing_loops(project: &ProjectDefinition, place: &Located) -> Vec<Loca
     loops_around(project, place)
 }
 
+/// A place whose state in a run is one thing (`GetNodeState`): a node
+/// outside every loop, or a loop, which is read as a whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatePlace {
+    Node(Located),
+    Loop(Located),
+}
+
+/// The place `spelled` names (written the way `--from` takes it) whose
+/// state a run can tell, or why it has none. A node inside a loop fires
+/// once per iteration, so it is refused like a cut inside a loop, and the
+/// loop around it is named instead; a plain group or an include's site
+/// has no state of its own.
+pub fn state_place(project: &ProjectDefinition, spelled: &str) -> Result<StatePlace, String> {
+    let (id, path) = super::resolve_address(project, spelled);
+    let place = Located::new(id.clone(), path);
+    let (found, subject, at) = if project.node(&id).is_some() {
+        (StatePlace::Node(place.clone()), "node", place)
+    } else if project.is_loop(&id) {
+        // A loop's own place is its entry: inside another loop's body, it
+        // runs once per iteration of that one.
+        let entry = Located::new(boundary_in_id(&id), place.path.clone());
+        (StatePlace::Loop(place), "loop", entry)
+    } else if project.group(&id).is_some() {
+        return Err(format!("'{spelled}' is a group, and a group has no state of its own; name a node inside it, or a loop"));
+    } else {
+        return Err(format!("'{spelled}' is no node or loop of this program"));
+    };
+    if !in_loop_body(project, &at) {
+        return Ok(found);
+    }
+    let around = loops_around(project, &at);
+    Err(match around.iter().rfind(|l| l.id != id) {
+        Some(outer) => {
+            let outer = super::address_of(project, &boundary_in_id(&outer.id), &outer.path);
+            format!("the {subject} '{spelled}' is inside loop '{outer}': it runs once per iteration, so it has no one state; read the loop '{outer}' instead")
+        }
+        None => format!("the {subject} '{spelled}' is inside a loop: it runs once per iteration, so it has no one state; read the loop instead"),
+    })
+}
+
 fn loops_around(project: &impl GraphView, place: &Located) -> Vec<Located> {
     let mut loops = Vec::new();
     for (depth, site) in place.path.iter().enumerate() {
@@ -1921,5 +1962,21 @@ mod tests {
         assert_eq!(*back, selection);
         let unknown = serde_json::from_value::<RecordedSelection>(written).unwrap_err().to_string();
         assert!(unknown.contains(recorded.digest()), "{unknown}");
+    }
+
+    /// A node outside every loop and a loop itself each have one state in
+    /// a run; a node inside a loop is refused naming the loop to read
+    /// instead, and a plain group or an unknown name says what it is.
+    #[test]
+    fn a_state_is_read_at_a_node_outside_loops_or_at_a_loop() {
+        let mut project = program();
+        assert_eq!(state_place(&project, "a"), Ok(StatePlace::Node(top("a"))));
+        assert_eq!(state_place(&project, "b"), Ok(StatePlace::Node(top("b"))), "a plain group's member is outside every loop");
+        assert!(state_place(&project, "g").unwrap_err().contains("is a group"));
+        assert!(state_place(&project, "nope").unwrap_err().contains("no node or loop"));
+        project.groups[0].kind = GroupKind::Loop { loop_config: json!({}) };
+        assert_eq!(state_place(&project, "g"), Ok(StatePlace::Loop(top("g"))));
+        let refusal = state_place(&project, "b").unwrap_err();
+        assert!(refusal.contains("inside loop 'g'") && refusal.contains("read the loop 'g'"), "{refusal}");
     }
 }

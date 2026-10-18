@@ -2,14 +2,14 @@
 //! clean markdown. Submits the crawl job, then parks on the job without
 //! holding a worker until it reaches a terminal state (a crawl the user
 //! asked for takes as long as it takes, so there is no deadline here;
-//! cancelling the run cancels the wait).
+//! cancelling the run cancels the wait and the crawl).
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::access::client::get_json;
 use weft::node::NodeOutput;
-use weft::signal::{PollEndpoint, Predicate};
+use weft::signal::{CancelCall, PollEndpoint, Predicate};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
@@ -52,17 +52,22 @@ impl Node for CrawlSiteNode {
         // forever.
         // The finished answer embeds the first page of crawled data, which
         // can weigh megabytes: the wait carries only the status, and the
-        // pages are read once it has ended.
+        // pages are read once it has ended. Cancelling the run cancels the
+        // crawl too, with the DELETE Firecrawl documents for it
+        // (https://docs.firecrawl.dev/api-reference/endpoint/crawl-delete).
         let status_url = format!("{}/crawl/{job}", super::firecrawl::API);
         let answer = ctx
-            .await_signal(PollEndpoint {
-                url: status_url.clone(),
-                interval_secs: 5,
-                access: Some(weft::primitive::AccessRef::from(&access)),
-                filters: vec![Predicate::neq("status", "scraping")],
-                carry: vec!["status".into(), "error".into()],
-                ..Default::default()
-            })
+            .await_signal_with_cancel(
+                PollEndpoint {
+                    url: status_url.clone(),
+                    interval_secs: 5,
+                    access: Some(weft::primitive::AccessRef::from(&access)),
+                    filters: vec![Predicate::neq("status", "scraping")],
+                    carry: vec!["status".into(), "error".into()],
+                    ..Default::default()
+                },
+                CancelCall::delete(status_url.clone()),
+            )
             .await?;
         match answer["status"].as_str().unwrap_or_default() {
             "completed" => {}

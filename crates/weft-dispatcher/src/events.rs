@@ -18,7 +18,8 @@
 //! each process publishes them to its own broadcast. The NOTIFY channel
 //! only carries the smaller cross-cutting events that have no row to read:
 //! ProjectRegistered, ProjectActivated, ProjectDeactivated,
-//! TriggerUrlChanged, RunDeleted. These fit inside Postgres NOTIFY's
+//! TriggerUrlChanged, RunDeleted, and RunParked, which the broker
+//! announces as it parks a run. These fit inside Postgres NOTIFY's
 //! 8000-byte payload cap with room to spare.
 
 use std::collections::HashMap;
@@ -32,7 +33,7 @@ pub use weft_core::live_event::{DispatcherEvent, IdentifiedEvent, LiveEvent};
 
 /// LISTEN channel name. Single channel for all cross-process events;
 /// receivers route by `project_id` themselves.
-pub const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
+
 
 #[derive(Clone)]
 pub struct EventBus {
@@ -57,13 +58,14 @@ impl Default for EventBus {
 impl EventBus {
     /// Bus with cross-process fanout via Postgres NOTIFY: what a sibling process
     /// publishes arrives on `signals` (the process's one `LISTEN`
-    /// connection, which must listen on [`NOTIFY_CHANNEL`]) and is
+    /// connection, which must listen on
+    /// [`weft_task_store::runs::EVENTS_CHANNEL`]) and is
     /// pushed into the local broadcast.
     pub fn with_notify(
         pool: PgPool,
         signals: &weft_task_store::pg_signal::PgSignalWatch,
     ) -> anyhow::Result<Self> {
-        signals.require(NOTIFY_CHANNEL)?;
+        signals.require(weft_task_store::runs::EVENTS_CHANNEL)?;
         let bus = Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             pool: Some(pool),
@@ -107,17 +109,6 @@ impl EventBus {
         let Some(pool) = &self.pool else {
             return;
         };
-        let payload = match serde_json::to_string(&event) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    target: "weft_dispatcher::events",
-                    error = %e,
-                    "serialize DispatcherEvent for NOTIFY"
-                );
-                return;
-            }
-        };
         // Postgres NOTIFY caps payloads at 8000 bytes (NAMEDATALEN -
         // some). Events sent via `publish()` (vs `publish_local()`)
         // do NOT have a journal poll-based recovery: ProjectRegistered
@@ -132,28 +123,15 @@ impl EventBus {
         // (`reason` on InfraFlaky, `error` on InfraConfigError,
         // `name` on ProjectRegistered, `node_id`/`url` on
         // TriggerUrlChanged) is bounded at construction via
-        // `weft_core::truncate_user_string(.., 4096)`, so tripping
-        // this branch is an invariant violation (an unbounded field
-        // slipped into a publish-path event), not expected input.
-        if payload.len() > 7800 {
+        // `weft_core::truncate_user_string(.., 4096)`, so a refusal for
+        // its size is an invariant violation (an unbounded field slipped
+        // into a publish-path event), not expected input.
+        if let Err(e) = weft_task_store::runs::announce_event(pool, &event).await {
             tracing::error!(
                 target: "weft_dispatcher::events",
-                size = payload.len(),
+                error = %format!("{e:#}"),
                 kind = ?std::mem::discriminant(&event.event),
-                "DispatcherEvent too large for Postgres NOTIFY; sibling instances will miss it"
-            );
-            return;
-        }
-        if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(NOTIFY_CHANNEL)
-            .bind(&payload)
-            .execute(pool)
-            .await
-        {
-            tracing::error!(
-                target: "weft_dispatcher::events",
-                error = %e,
-                "pg_notify failed"
+                "a DispatcherEvent could not be announced to sibling instances; they miss it"
             );
         }
     }
@@ -178,7 +156,7 @@ impl EventBus {
 async fn relay_sibling_events(mut heard: weft_task_store::pg_signal::Subscription, bus: EventBus) {
     loop {
         match heard.next().await {
-            Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload }) if channel == NOTIFY_CHANNEL => {
+            Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload }) if channel == weft_task_store::runs::EVENTS_CHANNEL => {
                 match serde_json::from_str::<LiveEvent>(&payload) {
                     Ok(event) => bus.publish_local_inner(&event).await,
                     Err(e) => tracing::warn!(

@@ -129,7 +129,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::delivery::WORKERS_BACK_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
-    crate::events::NOTIFY_CHANNEL,
+    weft_task_store::runs::EVENTS_CHANNEL,
     weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
     crate::reaper::STORAGE_SWEEP_CHANNEL,
     crate::display_feeds::LOOK_NOW_CHANNEL,
@@ -306,6 +306,7 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
     crate::task_executor::TaskRegistry::every_kind(|kind| match kind {
         TaskKind::RegisterSignal => Arc::new(crate::task_kinds::RegisterSignalExecutor),
         TaskKind::WithdrawSignal => Arc::new(crate::task_kinds::WithdrawSignalExecutor),
+        TaskKind::CancelCall => Arc::new(crate::task_kinds::CancelCallExecutor),
         TaskKind::FireSignal => Arc::new(crate::task_kinds::FireSignalExecutor),
         TaskKind::StopTagged => Arc::new(crate::task_kinds::StopTaggedExecutor),
         TaskKind::ProgramCall => Arc::new(crate::task_kinds::ProgramCallExecutor),

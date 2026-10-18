@@ -143,6 +143,9 @@ export function activate(context: vscode.ExtensionContext) {
     (msg) => graphView.post(msg),
     presence,
   );
+  // While the followed run has not ended, the graph shows what each of
+  // its waits says (a polled job's last answer) on the waiting node.
+  follower.onLiveRun((run) => graphView.setLiveRun(run));
 
   const autoFollow = new AutoFollowController(
     follower,

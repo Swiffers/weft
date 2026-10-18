@@ -156,10 +156,19 @@ weft_database_before_runs() { # container
     sleep 1
     waited=$((waited + 1))
   done
-  local found
+  # Two queries: Postgres resolves every table a statement names before it
+  # runs, so a database with no ledgers yet (its first start failed before
+  # building them) is asked whether they exist first. The boot builds both
+  # ledgers in one transaction, so one is enough to ask about.
+  local ledgers found
+  ledgers="$(docker exec "$1" psql -U weft -d weft -tAc \
+    "SELECT to_regclass('public.weft_schema_stamp') IS NOT NULL AND to_regclass('public.weft_migration') IS NOT NULL")" || return 1
+  if [[ "${ledgers}" != "t" ]]; then
+    echo no
+    return 0
+  fi
   found="$(docker exec "$1" psql -U weft -d weft -tAc \
-    "SELECT to_regclass('public.weft_schema_stamp') IS NOT NULL
-        AND EXISTS (SELECT 1 FROM weft_schema_stamp)
+    "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp)
         AND NOT EXISTS (SELECT 1 FROM weft_migration WHERE group_name = '_history' AND id = 'run')")" || return 1
   if [[ "${found}" == "t" ]]; then echo yes; else echo no; fi
 }

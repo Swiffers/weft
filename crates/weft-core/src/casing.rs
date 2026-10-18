@@ -94,7 +94,8 @@ fn words(name: &str, sep: char, allowed: impl Fn(char) -> bool) -> bool {
 /// `name`'s words in lower case. A word starts at `_`, `-` or a space,
 /// at each lower-to-upper step, and at the last capital of a run of
 /// capitals that a lower case letter follows (`XMLHttp` is `xml`,
-/// `http`).
+/// `http`), unless that letter is a plural's lone `s` (`userURLs` is
+/// `user`, `urls`).
 fn split_words(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let mut out: Vec<String> = Vec::new();
@@ -109,7 +110,11 @@ fn split_words(name: &str) -> Vec<String> {
         let prev = i.checked_sub(1).map(|j| chars[j]);
         let next = chars.get(i + 1).copied();
         let after_lower = prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit());
-        let ends_acronym = prev.is_some_and(|p| p.is_ascii_uppercase()) && next.is_some_and(|n| n.is_ascii_lowercase());
+        // A lone `s` closing a run of capitals is a plural (`URLs`), not the
+        // start of the next word.
+        let plural = next == Some('s') && !chars.get(i + 2).is_some_and(|n| n.is_ascii_lowercase());
+        let ends_acronym =
+            prev.is_some_and(|p| p.is_ascii_uppercase()) && next.is_some_and(|n| n.is_ascii_lowercase()) && !plural;
         if c.is_ascii_uppercase() && (after_lower || ends_acronym) && !word.is_empty() {
             out.push(std::mem::take(&mut word));
         }
@@ -172,6 +177,14 @@ mod tests {
         assert_eq!(Camel.spell("LLM_model"), "llmModel");
         assert_eq!(Snake.spell("getHTTPResponse"), "get_http_response");
         assert_eq!(Camel.check("port", "XMLHttp_request").unwrap_err(), "port 'XMLHttp_request' is not camelCase: write 'xmlHttpRequest'");
+    }
+
+    #[test]
+    fn a_plural_acronym_stays_one_word() {
+        assert_eq!(Camel.spell("user_URLs"), "userUrls");
+        assert_eq!(Snake.spell("userURLs"), "user_urls");
+        assert_eq!(Camel.spell("APIsList"), "apisList");
+        assert_eq!(Camel.spell("HTTPServer"), "httpServer");
     }
 
     #[test]

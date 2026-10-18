@@ -35,6 +35,22 @@ describe('run spec', () => {
       answers: [{ node: 'review', payload: 'yes', question: 'Continue?' }], caller: [{ text: 'hello' }] };
     expect(parseRunSpec(spec)).toEqual(spec);
   });
+  it('names the new spelling of every key an older weft spelled snake_case', () => {
+    expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', gave_up: 'quiet' }], settings: { hold_secs: 5 } })).toThrow(
+      'this spec was saved by an older weft, and these keys are spelled differently now: '
+        + '`answers[0].gave_up` is `gaveUp`, `settings.hold_secs` is `holdSecs`. The old spelling is no longer read; rename them',
+    );
+    expect(() => parseRunSpec({ name: 'x', frozen_from: { version: '1', execution_id: 'r', definition_hash: 'h' } })).toThrow(
+      'spelled differently now: `frozen_from` is `frozenFrom`, `frozen_from.execution_id` is `runId`, `frozen_from.definition_hash` is `definitionHash`.',
+    );
+    expect(() => parseRunSpec({ name: 'x', frozenFrom: { version: '1', runId: 'r', definitionHash: 'h' }, settings: { keep_for: '7d' } })).toThrow(
+      'spelled differently now: `settings.keep_for` is `keepFor`.',
+    );
+    // Any other refusal is the plain one.
+    expect(() => parseRunSpec({ name: 'x', bogus: 1 })).toThrow("spec: unknown field 'bogus'");
+    const current = { name: 'x', answers: [{ node: 'review', gaveUp: 'quiet' }], settings: { holdSecs: 5 } };
+    expect(parseRunSpec(current)).toEqual(current);
+  });
   it('reads a wait ending as a payload (null included), a skip or a give-up, and refuses two or none', () => {
     for (const answer of [{ node: 'review', payload: null }, { node: 'review', skipped: true }, { node: 'review', gaveUp: "node 'review' gave up its wait: quiet" }]) {
       const spec = { name: 'x', answers: [answer] };

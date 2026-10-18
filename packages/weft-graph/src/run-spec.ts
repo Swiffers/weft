@@ -81,9 +81,59 @@ const KEEP_FOR_PATTERN = /^(forever|[0-9]+[mhd])$/;
 // SYNC: INSTANCE_ID_PATTERN <-> crates/weft-core/src/storage/key.rs valid_segment, crates/weft-core/src/instance.rs InstanceId::new
 export const INSTANCE_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 
+/// The keys a saved spec file once spelled snake_case, and their spelling
+/// now: `[where, old, new]`, `where` the path of the object holding the
+/// key (`[]` for any list item). The old spelling is refused, never read
+/// as an alias; this only lets the refusal name the new one.
+// SYNC: RENAMED_SPEC_KEYS <-> crates/weft-core/src/run_spec.rs RENAMED_SPEC_KEYS (the table and the refusal RunSpec::parse_file builds from it)
+const RENAMED_SPEC_KEYS: Array<[string[], string, string]> = [
+  [[], 'frozen_from', 'frozenFrom'],
+  [['frozenFrom'], 'execution_id', 'runId'],
+  [['frozen_from'], 'execution_id', 'runId'],
+  [['frozenFrom'], 'definition_hash', 'definitionHash'],
+  [['frozen_from'], 'definition_hash', 'definitionHash'],
+  [['answers', '[]'], 'gave_up', 'gaveUp'],
+  [['settings'], 'keep_for', 'keepFor'],
+  [['settings'], 'hold_secs', 'holdSecs'],
+];
+
+/// Every `RENAMED_SPEC_KEYS` key `value` still holds, as "`at.old` is
+/// `new`".
+function renamedSpecKeys(value: unknown): string[] {
+  const at = (value: unknown, path: string[]): Array<[string, Record<string, unknown>]> => {
+    const [key, ...rest] = path;
+    if (key === undefined) return value && typeof value === 'object' && !Array.isArray(value) ? [['', value as Record<string, unknown>]] : [];
+    if (key === '[]') return Array.isArray(value) ? value.flatMap((item, i) => at(item, rest).map(([p, o]): [string, Record<string, unknown>] => [`[${i}]${p}`, o])) : [];
+    const child = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>)[key] : undefined;
+    return child === undefined ? [] : at(child, rest).map(([p, o]): [string, Record<string, unknown>] => [`.${key}${p}`, o]);
+  };
+  const out: string[] = [];
+  for (const [path, old, now] of RENAMED_SPEC_KEYS) {
+    for (const [place, object] of at(value, path)) {
+      if (!Object.prototype.hasOwnProperty.call(object, old)) continue;
+      const where = place.replace(/^\.+/, '');
+      out.push(`\`${where ? `${where}.${old}` : old}\` is \`${now}\``);
+    }
+  }
+  return out;
+}
+
 /// Validate files before they enter menus or dialogs. A type assertion alone
-/// cannot reject obsolete fields or malformed nested port maps.
+/// cannot reject obsolete fields or malformed nested port maps. When the
+/// reason is a key an older weft spelled differently, the refusal names
+/// every such key and its spelling now instead of a bare "unknown field".
+// SYNC: parseRunSpec <-> crates/weft-core/src/run_spec.rs RunSpec::parse_file (the RENAMED_SPEC_KEYS refusal)
 export function parseRunSpec(value: unknown): RunSpec {
+  try {
+    return checkRunSpec(value);
+  } catch (error) {
+    const renamed = renamedSpecKeys(value);
+    if (renamed.length === 0) throw error;
+    throw new Error(`this spec was saved by an older weft, and these keys are spelled differently now: ${renamed.join(', ')}. The old spelling is no longer read; rename them`);
+  }
+}
+
+function checkRunSpec(value: unknown): RunSpec {
   const object = (value: unknown, where: string): Record<string, unknown> => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${where}: expected an object`);
     return value as Record<string, unknown>;

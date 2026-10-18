@@ -108,6 +108,7 @@ pub struct RunSpec {
 /// now: `(where, old, new)`, `where` the path of the object holding the
 /// key (`[]` for any list item). The old spelling is refused, never read
 /// as an alias; this only lets the refusal name the new one.
+// SYNC: RENAMED_SPEC_KEYS <-> packages/weft-graph/src/run-spec.ts RENAMED_SPEC_KEYS (the table and the refusal parseRunSpec builds from it)
 const RENAMED_SPEC_KEYS: &[(&[&str], &str, &str)] = &[
     (&[], "frozen_from", "frozenFrom"),
     (&["frozenFrom"], "execution_id", "runId"),
@@ -125,6 +126,7 @@ impl RunSpec {
     /// key an older weft spelled differently, the refusal names every
     /// such key and its spelling now instead of serde's bare "unknown
     /// field".
+    // SYNC: RunSpec::parse_file <-> packages/weft-graph/src/run-spec.ts parseRunSpec (the RENAMED_SPEC_KEYS refusal)
     pub fn parse_file(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|error| {
             let renamed = serde_json::from_str::<Value>(text).map(|value| renamed_spec_keys(&value)).unwrap_or_default();

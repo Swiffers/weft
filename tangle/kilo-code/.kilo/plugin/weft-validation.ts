@@ -208,16 +208,18 @@ const validate = async (root: string, target: string, nodeEdit: boolean) => {
     // Names the model chose that are spelled off the weft way: the
     // compiler's `not-camel-case` (the program's names), and, after a node
     // edit, the catalog's spelling warnings (a node's metadata.json). The
-    // catalog lines carry no code, so they are told apart by the spelling
-    // message every one of them ends with. They get their own heading, so
-    // the model tells law-breaking from spelling at a glance.
+    // catalog lines carry no code, so they are picked by their `kind`.
+    // They get their own heading, so the model tells law-breaking from
+    // spelling at a glance.
     const spelling = diagnostics.filter((diagnostic: any) =>
       diagnostic.severity === "warning" && diagnostic.code === "not-camel-case",
     )
     const catalogSpelling: string[] = nodeEdit
-      ? (answer.warnings ?? []).filter((warning: unknown): warning is string =>
-          typeof warning === "string" && SPELLING.test(warning),
-        )
+      ? (answer.warnings ?? [])
+          .filter((warning: unknown): warning is { kind: string; message: string } =>
+            typeof warning === "object" && warning !== null && (warning as { kind?: unknown }).kind === "spelling",
+          )
+          .map((warning) => warning.message)
       : []
     if (!findings.length && !spelling.length && !catalogSpelling.length) return
     const sections: string[] = []
@@ -234,8 +236,6 @@ const validate = async (root: string, target: string, nodeEdit: boolean) => {
     return
   }
 }
-
-const SPELLING = /is not (camelCase|PascalCase|snake_case)/
 
 const formatFinding = (target: string) => (diagnostic: any) =>
   `  ${diagnostic.file ?? target}:${diagnostic.line ?? "?"}:${diagnostic.column ?? "?"} [${diagnostic.code ?? "diagnostic"}] ${diagnostic.message ?? ""}`

@@ -194,8 +194,8 @@ test("spelling warnings ride along under their own heading, the catalog's only a
       { severity: "warning", code: "unused", line: 2, column: 0, message: "something else" },
     ],
     warnings: [
-      "MyThing (nodes/my_thing/metadata.json): input 'chat_id' is not camelCase: write 'chatId'",
-      "an unrelated catalog warning",
+      { kind: "spelling", message: "MyThing (nodes/my_thing/metadata.json): input 'chat_id' is not camelCase: write 'chatId'" },
+      { kind: "left_out", message: "an unrelated catalog warning" },
     ],
   })
   results.push({ exit: 0, stdout: answer, stderr: "" })

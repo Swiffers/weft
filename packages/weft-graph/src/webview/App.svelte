@@ -13,7 +13,7 @@
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeFiring, RunState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
+  import type { ActionBarState, CatalogWarning, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
   import { credentialOwnerKind } from '../protocol';
@@ -55,7 +55,7 @@
   // failure (catalogError.error) or per-node soft warnings. Lives on
   // its own so a successful parse can't erase a live catalog problem.
   let catalogError: string | null = $state(null);
-  let catalogWarnings: string[] = $state([]);
+  let catalogWarnings: CatalogWarning[] = $state([]);
   // The in-canvas problems pill: parse + catalog problems folded into
   // one surface, each entry a short collapsed label plus the full text
   // for the expanded view.
@@ -65,8 +65,8 @@
       ? [{ label: 'node catalog error', text: catalogError, severity: 'error' as const }]
       : []),
     ...catalogWarnings.map((w) => ({
-      label: 'node catalog warning',
-      text: w,
+      label: w.kind === 'spelling' ? 'node spelling warning' : 'node catalog warning',
+      text: w.message,
       severity: 'warning' as const,
     })),
   ]);

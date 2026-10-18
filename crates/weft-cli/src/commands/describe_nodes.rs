@@ -24,7 +24,7 @@ struct NodesResponse<T> {
     /// Surfaced, not silent: a node mid-rename has a transient parse
     /// error the editor should see but not crash on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
+    warnings: Vec<weft_catalog::CatalogWarning>,
 }
 
 /// One row of `--list`: what a reader scanning for a node needs to
@@ -164,7 +164,7 @@ pub async fn run(
         return Ok(());
     }
 
-    let warnings: Vec<String> = cat.warnings().iter().map(ToString::to_string).collect();
+    let warnings = cat.warnings().to_vec();
     let printed = if compact {
         let catalog: BTreeMap<String, serde_json::Value> = catalog
             .iter()

@@ -18,7 +18,7 @@ import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, CatalogWarning, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
@@ -1742,8 +1742,9 @@ export class GraphViewController {
 
   /// The project's STORED runtime files for the picker: the same listing door
   /// `weft files` uses (the dispatcher's tenant file list), filtered to THIS
-  /// project's `project/` + `asset/` scopes, keys handed back TENANT-LESS
-  /// (the short address a picked ref writes into source).
+  /// project's `project/` scope plus the tenant's assets (content-addressed
+  /// `asset/<sha256>`, shared by every project of the tenant), keys handed
+  /// back TENANT-LESS (the short address a picked ref writes into source).
   private async runListRuntimeFiles(requestId: number): Promise<void> {
     const pid = this.watchedProjectId;
     if (!pid) {
@@ -1763,7 +1764,7 @@ export class GraphViewController {
         const slash = f.key.indexOf('/');
         if (slash < 0) return [];
         const scopeKey = f.key.slice(slash + 1);
-        if (!scopeKey.startsWith(`project/${pid}/`) && !scopeKey.startsWith(`asset/${pid}/`)) {
+        if (!scopeKey.startsWith(`project/${pid}/`) && !scopeKey.startsWith('asset/')) {
           return [];
         }
         return [{ key: scopeKey, filename: f.filename, mimeType: f.mimeType, sizeBytes: f.sizeBytes }];
@@ -2482,7 +2483,7 @@ export class GraphViewController {
     try {
       const response = await runWeftJson<{
         catalog: Record<string, unknown>;
-        warnings?: string[];
+        warnings?: CatalogWarning[];
       }>(['describe-nodes'], docDirOf(this.watchedDoc));
       this.post({
         kind: 'catalogAll',

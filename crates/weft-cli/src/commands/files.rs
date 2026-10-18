@@ -86,7 +86,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
         } else if space.starts_with("instance/") {
             format!("{space}/  (instance files)")
         } else if space == "asset" || space.starts_with("asset/") {
-            format!("{space}/  (project assets)")
+            format!("{space}/  (assets, shared by every project)")
         } else {
             format!("{space}/  (shared space)")
         };

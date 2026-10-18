@@ -189,7 +189,9 @@ pub struct CatalogProblem {
 }
 
 /// One line of [`FsCatalog::warnings`]. Never a failure on its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized as `{kind, message}` in `weft validate` and `weft
+/// describe-nodes` JSON, so a reader picks a kind without parsing the line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CatalogWarning {
     pub kind: WarningKind,
     /// The line as a person reads it.
@@ -197,7 +199,8 @@ pub struct CatalogWarning {
 }
 
 /// What a [`CatalogWarning`] is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WarningKind {
     /// A node or package left out of the catalog: one that failed to
     /// load, a node not ready yet, a package with no node in it yet.
@@ -854,8 +857,14 @@ impl DiscoverCtx<'_> {
     /// both find a service by name alone). Every claimant of a shared
     /// name is left out, told about all the others, because the walk's
     /// order is no reason for one folder to win.
+    ///
+    /// Every removal also notes, against the service the removed node
+    /// declared, why it went (`Withdrawn`): an app naming a service whose
+    /// declarers were all left out is then refused with that cause, never
+    /// with "no node declares it".
     fn settle(mut self) {
         let mut units = std::mem::take(&mut self.units);
+        let mut withdrawn = Withdrawn::new();
 
         // Package names: a clash takes the whole unit out.
         let mut by_name: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
@@ -871,21 +880,30 @@ impl DiscoverCtx<'_> {
         for entry in clashing.iter().chain(units_ok.iter()).flat_map(|u| &u.entries) {
             by_type.entry(entry.node_type.clone()).or_default().push(entry.source_dir.clone());
         }
+        let type_clashes: BTreeMap<String, CatalogError> = by_type
+            .into_iter()
+            .filter(|(_, dirs)| dirs.len() > 1)
+            .map(|(node_type, dirs)| (node_type.clone(), CatalogError::Collision { node_type, dirs }))
+            .collect();
+        for entry in clashing.iter().chain(units_ok.iter()).flat_map(|u| &u.entries) {
+            if let Some(error) = type_clashes.get(&entry.node_type) {
+                withdraw(&mut withdrawn, entry, error);
+            }
+        }
         for unit in clashing {
             let node_types = unit.entries.iter().map(|e| e.node_type.clone()).collect();
             let roots = by_name[&unit.name].clone();
-            self.record(node_types, CatalogError::PackageNameCollision { name: unit.name, roots });
-        }
-        for (node_type, dirs) in &by_type {
-            if dirs.len() > 1 {
-                self.record(
-                    vec![node_type.clone()],
-                    CatalogError::Collision { node_type: node_type.clone(), dirs: dirs.clone() },
-                );
+            let error = CatalogError::PackageNameCollision { name: unit.name, roots };
+            for entry in &unit.entries {
+                withdraw(&mut withdrawn, entry, &error);
             }
+            self.record(node_types, error);
         }
         for unit in &mut units_ok {
-            unit.entries.retain(|e| by_type[&e.node_type].len() == 1);
+            unit.entries.retain(|e| !type_clashes.contains_key(&e.node_type));
+        }
+        for (node_type, error) in type_clashes {
+            self.record(vec![node_type], error);
         }
 
         // Services, over what is left.
@@ -895,18 +913,27 @@ impl DiscoverCtx<'_> {
                 by_service.entry(service.service.clone()).or_default().push(entry.node_type.clone());
             }
         }
-        for (service, node_types) in &by_service {
-            if node_types.len() > 1 {
-                self.record(
-                    node_types.clone(),
-                    CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone() },
-                );
+        let service_clashes: BTreeMap<String, (Vec<String>, CatalogError)> = by_service
+            .into_iter()
+            .filter(|(_, node_types)| node_types.len() > 1)
+            .map(|(service, node_types)| {
+                let error = CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone() };
+                (service, (node_types, error))
+            })
+            .collect();
+        let clashing_service = |e: &CatalogEntry| {
+            e.metadata.service.as_ref().and_then(|s| service_clashes.get(&s.service)).map(|(_, error)| error)
+        };
+        for entry in units_ok.iter().flat_map(|u| &u.entries) {
+            if let Some(error) = clashing_service(entry) {
+                withdraw(&mut withdrawn, entry, error);
             }
         }
         for unit in &mut units_ok {
-            unit.entries.retain(|e| {
-                e.metadata.service.as_ref().is_none_or(|s| by_service[&s.service].len() == 1)
-            });
+            unit.entries.retain(|e| clashing_service(e).is_none());
+        }
+        for (node_types, error) in service_clashes.into_values() {
+            self.record(node_types, error);
         }
 
         // An app declared under `accessApps` is checked now that every
@@ -916,31 +943,48 @@ impl DiscoverCtx<'_> {
         // rule for a shipped app (`AppRegistration::check_shipped`). A root's
         // app is checked once, against the root's file, and a refusal leaves
         // out the members that inherit it; a member's own app, against the
-        // member's file.
-        let services: BTreeMap<&str, &weft_core::access::spec::AccessSpec> = units_ok
-            .iter()
-            .flat_map(|u| &u.entries)
-            .filter_map(|e| e.metadata.service.as_ref())
-            .map(|spec| (spec.service.as_str(), spec))
-            .collect();
-        let mut bad_apps: Vec<(Vec<String>, PathBuf, String)> = Vec::new();
-        for unit in &units_ok {
-            let file = unit.root.join("metadata.json");
-            if let Some(error) = refuse_apps(&services, &unit.root_apps) {
-                let inheriting = unit.entries.iter().filter(|e| unit.inheriting_apps.contains(&e.node_type));
-                bad_apps.push((inheriting.map(|e| e.node_type.clone()).collect(), file, error));
-            }
-            for entry in unit.entries.iter().filter(|e| !unit.inheriting_apps.contains(&e.node_type)) {
-                if let Some(error) = refuse_apps(&services, &entry.metadata.access_apps) {
-                    bad_apps.push((vec![entry.node_type.clone()], entry.source_dir.join("metadata.json"), error));
+        // member's file. A refusal can take out the node declaring a service
+        // another app names, so the check repeats over what is left until a
+        // round refuses nothing.
+        loop {
+            let services: BTreeMap<&str, &weft_core::access::spec::AccessSpec> = units_ok
+                .iter()
+                .flat_map(|u| &u.entries)
+                .filter_map(|e| e.metadata.service.as_ref())
+                .map(|spec| (spec.service.as_str(), spec))
+                .collect();
+            // (unit index, whether it is the root's app, the types left out, the file, why)
+            let mut refused: Vec<(usize, bool, Vec<String>, PathBuf, String)> = Vec::new();
+            for (index, unit) in units_ok.iter().enumerate() {
+                if let Some(error) = refuse_apps(&services, &withdrawn, &unit.root_apps) {
+                    let inheriting = unit.entries.iter().filter(|e| unit.inheriting_apps.contains(&e.node_type));
+                    let node_types = inheriting.map(|e| e.node_type.clone()).collect();
+                    refused.push((index, true, node_types, unit.root.join("metadata.json"), error));
+                }
+                for entry in unit.entries.iter().filter(|e| !unit.inheriting_apps.contains(&e.node_type)) {
+                    if let Some(error) = refuse_apps(&services, &withdrawn, &entry.metadata.access_apps) {
+                        let file = entry.source_dir.join("metadata.json");
+                        refused.push((index, false, vec![entry.node_type.clone()], file, error));
+                    }
                 }
             }
-        }
-        for (node_types, path, error) in &bad_apps {
-            self.record(node_types.clone(), CatalogError::Parse { path: path.clone(), error: error.clone() });
-        }
-        for unit in &mut units_ok {
-            unit.entries.retain(|e| !bad_apps.iter().any(|(types, _, _)| types.contains(&e.node_type)));
+            if refused.is_empty() {
+                break;
+            }
+            for (index, is_root, node_types, path, error) in refused {
+                let unit = &mut units_ok[index];
+                if is_root {
+                    // Reported once: a root with no member left to inherit
+                    // its app is not checked again.
+                    unit.root_apps.clear();
+                }
+                let error = CatalogError::Parse { path, error };
+                for entry in unit.entries.iter().filter(|e| node_types.contains(&e.node_type)) {
+                    withdraw(&mut withdrawn, entry, &error);
+                }
+                unit.entries.retain(|e| !node_types.contains(&e.node_type));
+                self.record(node_types, error);
+            }
         }
 
         // A unit whose every entry was taken out has nothing to serve;
@@ -965,21 +1009,41 @@ impl DiscoverCtx<'_> {
     }
 }
 
+/// Each service a node declared before `settle` left that node out,
+/// with every reason one of its declarers went.
+type Withdrawn = BTreeMap<String, BTreeSet<String>>;
+
+/// Notes `cause` against the service `entry` declares, if it declares one.
+fn withdraw(withdrawn: &mut Withdrawn, entry: &CatalogEntry, cause: &CatalogError) {
+    if let Some(spec) = &entry.metadata.service {
+        withdrawn.entry(spec.service.clone()).or_default().insert(cause.to_string());
+    }
+}
+
 /// The first app of `apps` (an `accessApps` map) a catalog declaring
-/// `services` refuses, as one line naming the app: a service it does not
-/// declare, a service whose connect takes no app, or an app that breaks a
-/// rule of [`AppRegistration::check_shipped`].
+/// `services` refuses, as one line naming the app: a service whose every
+/// declarer was left out (naming why, from `withdrawn`), a service it does
+/// not declare, a service whose connect takes no app, or an app that
+/// breaks a rule of [`AppRegistration::check_shipped`].
 fn refuse_apps(
     services: &BTreeMap<&str, &weft_core::access::spec::AccessSpec>,
+    withdrawn: &Withdrawn,
     apps: &BTreeMap<String, AppRegistration>,
 ) -> Option<String> {
     apps.iter().find_map(|(service, app)| {
         let refusal = match services.get(service.as_str()).map(|spec| &spec.acquisition) {
-            None => Err(format!(
-                "no node in this project declares a service named '{service}' (it declares: {}), so \
-                 this app would never be used; name one of those, or remove the app",
-                if services.is_empty() { "none".to_string() } else { services.keys().copied().collect::<Vec<_>>().join(", ") }
-            )),
+            None => match withdrawn.get(service) {
+                Some(causes) => Err(format!(
+                    "every node declaring the '{service}' service was left out, so this app has no \
+                     service to belong to: {}",
+                    causes.iter().map(String::as_str).collect::<Vec<_>>().join("; and ")
+                )),
+                None => Err(format!(
+                    "no node in this project declares a service named '{service}' (it declares: {}), so \
+                     this app would never be used; name one of those, or remove the app",
+                    if services.is_empty() { "none".to_string() } else { services.keys().copied().collect::<Vec<_>>().join(", ") }
+                )),
+            },
             Some(Acquisition::OAuth2 { registration_fields, .. }) => app.check_shipped(registration_fields),
             Some(_) => Err(format!(
                 "the '{service}' service connects without an app (only a service that signs in through \
@@ -2041,6 +2105,96 @@ mod package_tests {
                  service that signs in through OAuth takes one), so this app would never be used; remove it",
                 node.join("metadata.json").display()
             )]
+        );
+    }
+
+    /// Copies the standard node at `from` (under the stdlib) to `to`, its
+    /// `metadata.json` changed by `edit`.
+    fn copy_node_editing(from: &str, to: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        copy_dir(&stdlib_root().expect("stdlib root").join(from), to);
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(to.join("metadata.json")).expect("read")).expect("json");
+        edit(&mut meta);
+        fs::write(to.join("metadata.json"), meta.to_string()).expect("write");
+    }
+
+    /// An app naming a service whose every declarer was left out by a
+    /// collision is left out too, told that collision, never "no node in
+    /// this project declares" a service the project does declare. Two
+    /// ways a copied access node takes its service out: as a verbatim copy
+    /// (its type clashes) and renamed (only its service clashes).
+    #[test]
+    fn an_access_app_whose_service_a_collision_took_out_names_that_collision() {
+        for rename in [false, true] {
+            let root = tempfile::tempdir().expect("temp root");
+            copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("slack"));
+            let file = root.path().join("slack/metadata.json");
+            fs::write(&file, r#"{"accessApps": {"slack": {"label": "Ours", "client_id": "c"}}}"#).expect("write");
+            copy_node_editing("slack/access", &root.path().join("slack_copy"), |meta| {
+                if rename {
+                    meta["type"] = "SlackAccessCopy".into();
+                }
+            });
+
+            let cat = FsCatalog::discover(root.path()).expect("catalog");
+            let problems = cat.problems();
+            assert_eq!(problems.len(), 2, "{problems:?}");
+            if rename {
+                assert!(matches!(problems[0].error, CatalogError::ServiceCollision { .. }), "{problems:?}");
+            } else {
+                assert!(matches!(problems[0].error, CatalogError::Collision { .. }), "{problems:?}");
+            }
+            assert_eq!(
+                problems[1].error.to_string(),
+                format!(
+                    "parse: {}: accessApps.slack: every node declaring the 'slack' service was left out, so \
+                     this app has no service to belong to: {}",
+                    file.display(),
+                    problems[0].error
+                )
+            );
+            let members = &problems[1].node_types;
+            assert!(members.contains(&"SlackSendMessage".to_string()), "{members:?}");
+            assert!(members.iter().all(|t| cat.lookup(t).is_none()), "{members:?}");
+        }
+    }
+
+    /// A refused app that takes out the node declaring a service takes out
+    /// every app elsewhere naming that service, each told the first
+    /// refusal: the app checks repeat over what is left until a round
+    /// refuses nothing, so an app is never let through against a service
+    /// that has already left the catalog.
+    #[test]
+    fn an_access_app_whose_service_a_refused_app_took_out_names_that_refusal() {
+        let root = tempfile::tempdir().expect("temp root");
+        copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("slack"));
+        // `SlackAccess` sets no `accessApps` of its own, so it inherits
+        // this bad one and leaves with the rest of the package.
+        fs::write(
+            root.path().join("slack/metadata.json"),
+            r#"{"accessApps": {"slack": {"label": "Ours", "client_id": "c", "appTokn": "x"}}}"#,
+        )
+        .expect("write");
+        let keyed = root.path().join("keyed");
+        copy_node_editing("ai/elevenlabs/access", &keyed, |meta| {
+            meta["accessApps"] = serde_json::json!({ "slack": { "label": "Ours", "client_id": "c" } });
+        });
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        let problems = cat.problems();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].node_types.contains(&"SlackAccess".to_string()), "{problems:?}");
+        assert!(problems[0].error.to_string().ends_with("its service does not declare (known: label, client_id)"));
+        let node_type = cat.problems()[1].node_types.clone();
+        assert!(node_type.len() == 1 && cat.lookup(&node_type[0]).is_none(), "{node_type:?}");
+        assert_eq!(
+            problems[1].error.to_string(),
+            format!(
+                "parse: {}: accessApps.slack: every node declaring the 'slack' service was left out, so \
+                 this app has no service to belong to: {}",
+                keyed.join("metadata.json").display(),
+                problems[0].error
+            )
         );
     }
 

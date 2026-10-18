@@ -51,11 +51,12 @@ spec declares. The check never reads a node's data, so it says nothing about a
 `select`'s `options` or an input's `default`.
 
 If you have the graph open in the editor, these warnings show up in the graph
-view's problems list as "node catalog warning". On the command line,
+view's problems list as "node spelling warning". On the command line,
 `weft validate < src/main.weft` and `weft describe-nodes --list` print them on
 stderr, and the JSON from `weft validate` and from bare `weft describe-nodes`
-lists them under `warnings`. On stderr a warning looks like this, and the JSON entry is the
-same line without `warning: `:
+lists them under `warnings`, each as `{"kind": "spelling", "message": ...}`.
+On stderr a warning looks like this, and the JSON `message` is the same line
+without `warning: `:
 
 ```text
 warning: <NodeType> (<path to metadata.json>): <message>

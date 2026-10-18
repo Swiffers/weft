@@ -48,6 +48,14 @@ export interface ConfigFieldSpan {
 /// the field's value; the file-drop field sets/clears it); a text-typed one
 /// resolved at parse and renders read-only.
 /// SYNC: FileRef <-> crates/weft-core/src/project.rs FileRef, FileMarker
+/// One line of the node catalog's warnings (`weft describe-nodes` and
+/// `weft validate` JSON): a node or package left out, or a name a loaded
+/// node spells off the weft way (that node still loads).
+export interface CatalogWarning {
+  kind: 'left_out' | 'spelling';
+  message: string;
+}
+
 export interface FileRef {
   path: string;
   type: string;
@@ -1927,8 +1935,9 @@ export type HostMessage =
   /// with bad metadata.json). Rendered as a non-blocking banner so it
   /// isn't erased by an unrelated successful parse. `error` set means
   /// the whole catalog is missing; `warnings` carries per-node soft
-  /// failures when the catalog loaded but some nodes were skipped.
-  | { kind: 'catalogError'; error?: string; warnings?: string[] }
+  /// failures when the catalog loaded but some nodes were skipped, and
+  /// names a loaded node spells off the weft way.
+  | { kind: 'catalogError'; error?: string; warnings?: CatalogWarning[] }
   | { kind: 'firingEvent'; event: NodeFiringEvent }
   /// One metered call's cost record for a firing (a provider meter's
   /// figure). `costId` is the record's stable identity: the same record can

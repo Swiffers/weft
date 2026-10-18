@@ -169,8 +169,7 @@ def validate(root: str, target: str, node_edit: bool = False):
     # Names the model chose that are spelled off the weft way: the
     # compiler's `not-camel-case` (the program's names), and, after a node
     # edit, the catalog's spelling warnings (a node's metadata.json). The
-    # catalog lines carry no code, so they are told apart by the spelling
-    # message every one of them ends with.
+    # catalog lines carry no code, so they are picked by their `kind`.
     spelling = [
         d for d in diags
         if d.get("severity") == "warning" and d.get("code") == "not-camel-case"
@@ -179,7 +178,7 @@ def validate(root: str, target: str, node_edit: bool = False):
     if node_edit:
         catalog_spelling = [
             w for w in (out.get("warnings") or [])
-            if isinstance(w, str) and SPELLING.search(w)
+            if isinstance(w, dict) and w.get("kind") == "spelling"
         ]
     if not errors and not level_warnings and not spelling and not catalog_spelling:
         return None
@@ -201,11 +200,9 @@ def validate(root: str, target: str, node_edit: bool = False):
         for d in spelling:
             lines.append(_format_finding(d, target))
         for w in catalog_spelling:
-            lines.append("  " + w)
+            lines.append("  " + w.get("message", ""))
     return "\n".join(lines)
 
-
-SPELLING = re.compile(r"is not (camelCase|PascalCase|snake_case)")
 
 UNWRITTEN = (
     re.compile(r"unknown node type:? '([^']+)'"),

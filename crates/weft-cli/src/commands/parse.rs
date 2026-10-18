@@ -48,7 +48,7 @@ struct ValidateResponse {
     /// on their own: a program naming a left-out node gets its own
     /// diagnostic.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
+    warnings: Vec<weft_catalog::CatalogWarning>,
 }
 
 fn read_stdin() -> Result<String> {
@@ -625,7 +625,7 @@ fn do_validate(
         mode,
         source_id.as_deref(),
     );
-    ValidateResponse { diagnostics, warnings: catalog.warnings().iter().map(ToString::to_string).collect() }
+    ValidateResponse { diagnostics, warnings: catalog.warnings().to_vec() }
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
@@ -676,9 +676,10 @@ mod tests {
             weft_compiler::validate::ValidationMode::Runtime,
         );
         assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
-        assert!(resp.warnings.iter().any(|w| w.contains("broken")), "{:?}", resp.warnings);
+        assert!(resp.warnings.iter().any(|w| w.message.contains("broken")), "{:?}", resp.warnings);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["warnings"].as_array().map(|w| w.len()), Some(resp.warnings.len()));
+        assert_eq!(json["warnings"][0]["kind"], "left_out");
     }
 
     #[test]

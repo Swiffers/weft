@@ -168,7 +168,7 @@ the wrong casing loads, with a catalog warning:
 `weft describe-nodes --list` and `weft validate < src/main.weft` print it on
 stderr as `warning: <NodeType> (<path>): <message>` (a package root's
 defaults as `warning: package '<name>' defaults (<path>): ...`), and the
-graph view lists it as "node catalog warning". Clear every one on a node you
+graph view lists it as "node spelling warning". Clear every one on a node you
 write.
 
 If the ports a program adds to your node are named after data from outside

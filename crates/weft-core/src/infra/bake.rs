@@ -54,10 +54,7 @@ pub fn saved_for_run(
             continue;
         };
         let fits = |port: &str, value: &Value| {
-            node.outputs
-                .iter()
-                .find(|output| output.name == port)
-                .is_some_and(|output| output.port_type.accepts_runtime_value(value))
+            node.types_at(&place.path).output(port).is_some_and(|ty| ty.accepts_runtime_value(value))
         };
         let values: BTreeMap<String, Value> = row
             .baked

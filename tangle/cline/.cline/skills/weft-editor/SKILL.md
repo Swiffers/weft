@@ -36,8 +36,8 @@ to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
   cancelled, ⊘ skipped) and the type name, body with the label and its
   ports. Left rail: input ports. Right rail: output ports. Each port is a
   dot colored by its type (String gray, Number blue, Boolean rose, files
-  gold/purple/green/brown, List teal, Dict purple, Access teal, Bus amber,
-  MustOverride red); a required input carries a `*`.
+  gold/purple/green/brown, List teal, Dict purple, Access teal, Bus amber);
+  a required input carries a `*`.
 - **The small amber arrow top-left of every box** is `_should_flow`, the
   port that decides whether it runs: filled when something answers it,
   hollow when nothing does.

@@ -1,6 +1,6 @@
 //! LlmEmbed: texts to embedding vectors, through the wired provider's
 //! connection. Speaks the OpenRouter embeddings endpoint, so the
-//! provider must be an OpenRouterProvider whose model names an
+//! provider must be an OpenRouterModel whose model names an
 //! embedding model (voyage-4, text-embedding-3-small, qwen3, ...).
 
 use async_trait::async_trait;

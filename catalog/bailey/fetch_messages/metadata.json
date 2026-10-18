@@ -37,7 +37,8 @@
   "outputs": [
     {
       "name": "messages",
-      "type": "List[JsonDict]"
+      "type": "List[JsonDict]",
+      "narrowable": true
     },
     {
       "name": "count",

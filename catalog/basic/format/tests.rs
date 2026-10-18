@@ -15,6 +15,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("holes_are_named_once_in_order", names),
         NodeTest::basic("rendering_writes_strings_as_is_and_the_rest_as_json", renders),
         NodeTest::basic("doubled_braces_are_text_and_a_broken_hole_refuses", braces),
+        NodeTest::basic("the_compilers_placeholder_pattern_reads_the_holes_the_node_reads", compiler_agrees),
         NodeTest::fake("the_node_fills_from_its_wired_ports", node_fills),
         NodeTest::fake("a_hole_without_a_port_and_a_port_without_a_hole_both_refuse", node_refuses),
     ]
@@ -28,6 +29,28 @@ fn names() -> WeftResult<()> {
     let pieces = parse_template("Hi {{user}}, {{ count }} left, {{user}} again")?;
     assert_eq!(holes(&pieces), vec!["user", "count"]);
     assert!(holes(&parse_template("no holes { here }")?).is_empty());
+    Ok(())
+}
+
+/// The compiler checks the holes against the ports with the pattern the
+/// metadata declares (`placeholdersAreInputs`), knowing nothing of
+/// templates; this holds it to the node's own reading, doubled braces
+/// included, so the build and the run never disagree on a template.
+fn compiler_agrees() -> WeftResult<()> {
+    use weft::NodeManifest;
+    let spec = FormatNode.manifest().placeholders_are_inputs.as_ref().expect("Format declares its placeholders");
+    let regex = spec.regex().map_err(weft::node_error)?;
+    for template in [
+        "Hi {{user}}, {{ count }} left, {{user}} again",
+        "{{a}}{{b}}",
+        "answer as {{{{json}}}} for {{who}}",
+        "}}}} and {{{{ stay text, {{x}} does not",
+        "no holes { here }",
+    ] {
+        let node = holes(&parse_template(template)?);
+        let compiler = spec.names_in(&regex, template).map_err(weft::node_error)?;
+        assert_eq!(compiler, node, "{template}");
+    }
     Ok(())
 }
 
@@ -105,5 +128,9 @@ async fn node_refuses(rig: FakeRig) -> WeftResult<()> {
         .await
         .failure()?;
     assert!(unread.contains("`name`") && unread.contains("never reads"), "{unread}");
+    // The node's own setting is no port a hole reads: a wired template
+    // reading `{{template}}` is refused, never filled with null.
+    let own = rig.run(&FormatNode, json!({ "template": "Dear {{template}}" })).await.failure()?;
+    assert!(own.contains("{{template}}") && own.contains("declare"), "{own}");
     Ok(())
 }

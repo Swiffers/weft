@@ -1797,7 +1797,7 @@ async fn drive(
                 frames = ?group.frames,
                 "dispatching ready group"
             );
-            let (Some(node_def), Some(node_ports)) = (program.node(&node_id), program.ports(&node_id)) else {
+            let (Some(node_def), Some(node_ports)) = (program.node(&node_id), program.ports(&node_id, &group.frames)) else {
                 // Unreachable by construction: pulse-driven groups come
                 // from `project.nodes` itself and kicks are synthesized
                 // from the same definition set. If it ever fires, a
@@ -2167,7 +2167,7 @@ async fn drive(
             weft_core::picks::fill_picks(node_def, &mut bag, picks.get(&place));
             let delivered = with_instance_values(node_def, &place, instance, instance_values, bag);
             let inputs = match delivered.and_then(|delivered| {
-                weft_core::context::node_input_bag(node_def, delivered, &group.received.closed_ports)
+                weft_core::context::node_input_bag(node_def, &group.frames, delivered, &group.received.closed_ports)
             }) {
                 Ok(bag) => bag,
                 // A broken spec or malformed widget handle: the node
@@ -2304,7 +2304,8 @@ async fn drive(
             // that woke it is not what the trigger declared.
             let linked = match node_def.features.pure {
                 true => Ok(()),
-                false => ctx.link_file_inputs(node_def.inputs.iter().map(|p| (p.name.as_str(), &p.port_type))).await,
+                // Each input at its type where this firing runs.
+                false => ctx.link_file_inputs(node_ports.inputs.iter().map(|(name, ty)| (name.as_str(), ty))).await,
             };
             let cannot_start = match linked {
                 Err(err) => Some(err.to_string()),

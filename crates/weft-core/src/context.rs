@@ -473,8 +473,8 @@ impl RunContext {
     }
 
     /// The declared type of one of THIS instance's output ports, as the
-    /// compiled project resolved it (a metadata `MustOverride` output
-    /// reads as the concrete type the weft source declared on it).
+    /// compiled project resolved it (a narrowable output reads as the
+    /// type the weft source declared on it).
     /// For nodes whose behavior follows their resolved type (Cast, a
     /// node storing a file on a typed port). A port this node does not
     /// declare is the node's own mistake, never an outcome of the run:
@@ -1374,29 +1374,6 @@ impl ValueBag {
         self.order.iter().flatten().filter(|name| !self.spec_names.contains(name.as_str()))
     }
 
-    /// Add a declared input port the bag was not built with. The
-    /// production bag reads every port off the compiled node, so only
-    /// the node-test rig needs this: a case declaring a created port
-    /// (`rig.input_type("photo", ...)`) and then NOT delivering on it
-    /// is exactly the "declared, stayed silent" shape, and without
-    /// this the bag could not tell it from a port nobody wrote.
-    pub fn declare_port(&mut self, name: String) {
-        if let Some(order) = self.order.as_mut() {
-            if !order.contains(&name) {
-                order.push(name);
-            }
-        }
-    }
-
-    /// Does the node DECLARE this input, whatever this firing
-    /// delivered on it? The port list behind the bag is every input the
-    /// node has, in written order, so a name in it that is missing from
-    /// the values is a port that stayed silent. A bag with no port list
-    /// behind it (a wake or nested bag) declares nothing.
-    pub fn declares(&self, name: &str) -> bool {
-        self.order.as_ref().is_some_and(|order| order.iter().any(|port| port == name))
-    }
-
     /// The values behind the named holes of a text, in hole order.
     ///
     /// A node whose input ports ARE its parameters (a SQL query
@@ -1443,10 +1420,11 @@ impl ValueBag {
                 values.push(*value);
                 continue;
             }
-            // Declared but silent this firing: the author said it may be
-            // absent, so the hole reads null. Only a hole naming no port
-            // at all is the author's mistake.
-            if self.declares(hole) {
+            // A port the author created that stayed silent this firing:
+            // they said it may be absent, so the hole reads null. A hole
+            // naming no created port is the author's mistake, one naming
+            // the node type's own setting (`{{template}}`) included.
+            if self.created().any(|port| port == hole) {
                 values.push(ABSENT);
                 continue;
             }
@@ -1521,9 +1499,13 @@ impl ValueBag {
 /// node reading a shape it can never hold.
 pub fn node_input_bag(
     node: &crate::project::NodeDefinition,
+    frames: &crate::frames::LoopFrames,
     mut delivered: serde_json::Map<String, Value>,
     closed_ports: &[String],
 ) -> Result<ValueBag, String> {
+    // Each port's type where this firing runs (a node inside an included
+    // file has the types its site gave it).
+    let types = node.types_at(&crate::frames::call_path(frames));
     for input in &node.inputs {
         let Some(default) = &input.default else { continue };
         if closed_ports.iter().any(|p| p == &input.name) {
@@ -1534,7 +1516,7 @@ pub fn node_input_bag(
         // default fills it like an absent input.
         let absent = match delivered.get(&input.name) {
             None => true,
-            Some(Value::Null) => !crate::run::ready::port_admits_null(node, &input.name),
+            Some(Value::Null) => !types.input(&input.name).is_some_and(|ty| ty.port_value_type().contains_null()),
             Some(_) => false,
         };
         if absent {
@@ -3552,21 +3534,21 @@ mod node_input_bag_tests {
     fn access_reads_the_pick_through_the_stamped_port() {
         let picked = access_node(false, json!({}));
         let handle = json!({"account": {"id": "g-1", "identity": "Q"}});
-        let bag = node_input_bag(&picked, delivered(handle), &[]).expect("bag");
+        let bag = node_input_bag(&picked, &Vec::new(), delivered(handle), &[]).expect("bag");
         let marker = bag.access("account").expect("read").expect("picked");
         assert_eq!(marker.service(), "slack");
 
         let optional = access_node(true, json!({}));
-        let bag = node_input_bag(&optional, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&optional, &Vec::new(), delivered(json!({})), &[]).expect("bag");
         assert!(bag.access("account").expect("read").is_none(), "optional + unpicked = None");
 
         let required = access_node(false, json!({}));
-        let bag = node_input_bag(&required, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&required, &Vec::new(), delivered(json!({})), &[]).expect("bag");
         let err = bag.access("account").unwrap_err().to_string();
         assert!(err.contains("no slack connection picked"), "{err}");
 
         let plain = node(&[("prompt", None)], json!({}));
-        let bag = node_input_bag(&plain, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&plain, &Vec::new(), delivered(json!({})), &[]).expect("bag");
         let err = bag.access("prompt").unwrap_err().to_string();
         assert!(err.contains("not an access (connection picker) input"), "{err}");
     }
@@ -3577,7 +3559,7 @@ mod node_input_bag_tests {
     #[test]
     fn only_delivered_values_reach_the_bag() {
         let n = node(&[("to", None)], json!({"label": "x", "to": "braces"}));
-        let bag = node_input_bag(&n, delivered(json!({"to": 10})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"to": 10})), &[]).expect("bag");
         assert_eq!(bag.get::<u64>("to").unwrap(), 10, "the delivered value is the value");
         assert!(bag.raw("label").is_none(), "config is not an input home");
         assert_eq!(bag.object().unwrap().len(), 1);
@@ -3590,8 +3572,7 @@ mod node_input_bag_tests {
     #[test]
     fn a_wired_object_arrives_as_that_object() {
         let n = node(&[("prompt", None), ("config", None)], json!({}));
-        let bag = node_input_bag(
-            &n,
+        let bag = node_input_bag(&n, &Vec::new(),
             delivered(json!({
                 "prompt": "hi",
                 "config": {"model": "from-config-node", "temperature": 0.2}
@@ -3616,7 +3597,7 @@ mod node_input_bag_tests {
             &[("method", Some(json!("GET"))), ("model", Some(json!("base")))],
             json!({}),
         );
-        let bag = node_input_bag(&n, delivered(json!({"model": "wired"})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"model": "wired"})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("method").unwrap(), "GET", "absent input reads its default");
         assert_eq!(bag.get::<String>("model").unwrap(), "wired", "a wired value beats the default");
         // The default shows through the whole-record read too: the bag
@@ -3624,11 +3605,11 @@ mod node_input_bag_tests {
         assert_eq!(bag.object().unwrap().get("method"), Some(&json!("GET")));
 
         let bag =
-            node_input_bag(&n, delivered(json!({})), &["method".to_string()]).expect("bag");
+            node_input_bag(&n, &Vec::new(), delivered(json!({})), &["method".to_string()]).expect("bag");
         assert!(bag.raw("method").is_none(), "a closed input is not defaulted");
 
         // A null on a plain String port is no value: the default fills it.
-        let bag = node_input_bag(&n, delivered(json!({"method": null})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"method": null})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("method").unwrap(), "GET");
         // On a nullable port the null IS the value and stays.
         let nullable: crate::project::NodeDefinition = serde_json::from_value(json!({
@@ -3638,7 +3619,7 @@ mod node_input_bag_tests {
             "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
             "requiresInfra": false, "images": []
         })).unwrap();
-        let bag = node_input_bag(&nullable, delivered(json!({"note": null})), &[]).expect("bag");
+        let bag = node_input_bag(&nullable, &Vec::new(), delivered(json!({"note": null})), &[]).expect("bag");
         assert_eq!(bag.raw("note"), Some(&json!(null)), "null is data on a nullable port");
     }
 
@@ -3651,7 +3632,7 @@ mod node_input_bag_tests {
             &[("url", None)],
             json!({"parentId": "g1", "_label": "My node", "_tags": ["a"]}),
         );
-        let bag = node_input_bag(&n, delivered(json!({"url": "http://x"})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"url": "http://x"})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("url").unwrap(), "http://x");
         assert!(bag.raw("parentId").is_none(), "parentId is compiler plumbing, not input data");
         assert!(bag.raw("_label").is_none(), "_-reserved keys are editor plumbing, not input data");
@@ -3686,7 +3667,7 @@ mod node_input_bag_tests {
             "account": {"id": "grant-1", "identity": "Q @ Acme"},
             "channel": "C42"
         });
-        let bag = node_input_bag(&n, delivered(written), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(written), &[]).expect("bag");
 
         let access: crate::access::Access = bag.get("account").unwrap();
         assert_eq!(access.access_id(), "grant-1");
@@ -3723,15 +3704,15 @@ mod node_input_bag_tests {
 
         let n = make(json!("slack"));
         let pick = json!({"channel": {"id": "C42", "label": "#general"}});
-        let bag = node_input_bag(&n, delivered(pick), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(pick), &[]).expect("bag");
         assert_eq!(bag.get::<String>("channel").unwrap(), "C42", "the object form unwraps");
 
         let bad = json!({"channel": {"label": "#general"}});
-        let e = node_input_bag(&n, delivered(bad), &[]).unwrap_err();
+        let e = node_input_bag(&n, &Vec::new(), delivered(bad), &[]).unwrap_err();
         assert!(e.contains("string `id`"), "{e}");
 
         let n = make(json!(null));
-        let e = node_input_bag(&n, delivered(json!({})), &[]).unwrap_err();
+        let e = node_input_bag(&n, &Vec::new(), delivered(json!({})), &[]).unwrap_err();
         assert!(e.contains("no service stamp"), "{e}");
     }
 
@@ -3752,7 +3733,7 @@ mod node_input_bag_tests {
         }))
         .expect("node json");
         let wired = crate::access::Access::new("grant-1", "google", None).to_value();
-        let bag = node_input_bag(&n, delivered(json!({"account": wired})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"account": wired})), &[]).expect("bag");
         let access: crate::access::Access = bag.get("account").unwrap();
         assert_eq!(access.required_permissions(), ["drive.readonly".to_string()]);
     }
@@ -3777,7 +3758,7 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({"channel": "C-wired"})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"channel": "C-wired"})), &[]).expect("bag");
         assert!(bag.raw("account").is_none(), "unconnected = absent, reads fail loud");
         assert_eq!(bag.get::<String>("channel").unwrap(), "C-wired");
     }
@@ -3798,7 +3779,7 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({"code": "return {}", "a": 7})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"code": "return {}", "a": 7})), &[]).expect("bag");
         let data: Vec<&str> = bag.custom().map(|(k, _)| k.as_str()).collect();
         assert_eq!(data, vec!["a"], "settings are excluded, instance ports remain");
         let settings: Vec<&str> = bag.declared().map(|(k, _)| k.as_str()).collect();

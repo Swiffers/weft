@@ -1114,7 +1114,7 @@ pub struct SweepRunResponse {
 ///
 /// This is the one place the language looks at BYTES to name a type. The
 /// stored MIME of a synced asset comes from here first (a PNG named
-/// `.txt` is still `image/png`), and [`check_declared_kind`] holds an
+/// `.txt` is still `image/png`), and [`received_file`] holds an
 /// `@asset` declaration to it; it never picks a marker.
 pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
     let starts = |sig: &[u8]| head.starts_with(sig);
@@ -1204,54 +1204,125 @@ pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// The kind of file a byte prefix announces itself as: [`sniff_mime`]
-/// read as a kind, and only for the media kinds (a PDF or a zip has a
-/// signature but is a `Blob`, which no `@asset` declaration is held to).
-pub fn sniff_file_kind(head: &[u8]) -> Option<crate::weft_type::FileKind> {
+/// What a file handed over for a place declared `declared` (a caller's
+/// upload, an `@asset` in source) is stored as: its media type and the
+/// kind of file value it becomes, or why the place cannot take it. An
+/// `Image` declaration over video bytes is refused naming both kinds,
+/// bytes with no known signature cannot be a declared media kind, and a
+/// union is held to its file members (`Image | Null` takes only an
+/// image, `Media` any of image, video, audio).
+///
+/// The error names WHAT is wrong and nothing about where it came from:
+/// a caller must never be shown a piece of weft syntax their request has
+/// nothing to do with. Each caller frames it.
+///
+/// The stored type is the one the sender stated (`claimed`: a request's
+/// `Content-Type`, a `data:` link's), so a `.csv` stays `text/csv`. The
+/// first bytes only fill it in when none was stated (two containers hold
+/// either video or audio, WebM and MP4, and the declaration picks which),
+/// and catch a stated media kind the bytes plainly are not (`image/png`
+/// over an mp3). With nothing stated and nothing recognized, the file is
+/// `application/octet-stream`. A place that admits `Blob` but not the kind
+/// the bytes are takes them as plain bytes when nothing was stated; a
+/// stated type the place does not admit is refused. A declaration that is
+/// not a file type takes the file as it is (its caller decides).
+pub fn received_file(
+    bytes: &[u8],
+    claimed: Option<&str>,
+    declared: &crate::weft_type::WeftType,
+) -> Result<(String, crate::weft_type::FileKind), String> {
     use crate::weft_type::FileKind;
-    match FileKind::from_mime(sniff_mime(head)?) {
-        FileKind::Blob => None,
-        kind => Some(kind),
+    let admitted = declared.admitted_file_kinds();
+    let expected = || admitted.iter().map(|k| k.primitive().to_string()).collect::<Vec<_>>().join(" or ");
+    let sniffed = sniff_mime(bytes);
+    // Every kind the bytes could be: one, or either of a container's two.
+    let byte_kinds: Vec<FileKind> = match sniffed {
+        Some(mime) if audio_or_video(mime).is_some() => vec![FileKind::Video, FileKind::Audio],
+        Some(mime) => vec![FileKind::from_mime(mime)],
+        None => Vec::new(),
+    };
+    // A media place holds the bytes to its kinds whatever was stated.
+    if !admitted.is_empty() && !admitted.contains(&FileKind::Blob) && !byte_kinds.iter().any(|k| admitted.contains(k)) {
+        return Err(match byte_kinds.first() {
+            Some(found) => format!("the bytes are {}, not the {} that was declared", found.primitive(), expected()),
+            None => format!(
+                "the bytes carry no {} signature this weft knows (declare it Blob to skip the check)",
+                expected()
+            ),
+        });
     }
+    // A stated type that names no media kind (`application/octet-stream`,
+    // curl's form type) says nothing about bytes that ARE a media kind a
+    // place needs: those are read off the bytes, as when nothing was
+    // stated. Any other statement stands.
+    let stated = claimed.map(str::trim).filter(|mime| !mime.is_empty()).filter(|mime| {
+        FileKind::from_mime(mime) != FileKind::Blob
+            || admitted.is_empty()
+            || admitted.contains(&FileKind::Blob)
+            || !byte_kinds.iter().any(|k| admitted.contains(k))
+    });
+    let mime = match (stated, sniffed) {
+        // The media type itself is case-blind (`Image/PNG` is `image/png`):
+        // it is stored lower-cased, its parameters as sent. A container
+        // stated as the half the place does not take (`video/webm` over a
+        // voice clip for an Audio place) is the half it does.
+        (Some(stated), _) => {
+            let (essence, params) = stated.split_once(';').map_or((stated, ""), |(e, p)| (e, p));
+            let essence = essence.trim().to_ascii_lowercase();
+            let essence = match sniffed.and_then(audio_or_video) {
+                Some((video, audio)) if [video, audio].contains(&essence.as_str()) => {
+                    let kind = FileKind::from_mime(&essence);
+                    let other = if kind == FileKind::Audio { (FileKind::Video, video) } else { (FileKind::Audio, audio) };
+                    if !admitted.is_empty() && !admitted.contains(&kind) && admitted.contains(&other.0) {
+                        other.1.to_string()
+                    } else {
+                        essence
+                    }
+                }
+                _ => essence,
+            };
+            if params.is_empty() { essence } else { format!("{essence};{params}") }
+        }
+        (None, Some(sniffed)) => {
+            let fits = |kind: FileKind| admitted.is_empty() || admitted.contains(&kind);
+            match audio_or_video(sniffed) {
+                Some((_, audio)) if fits(FileKind::Audio) && !fits(FileKind::Video) => audio.to_string(),
+                Some((video, _)) if fits(FileKind::Video) => video.to_string(),
+                _ if fits(FileKind::from_mime(sniffed)) => sniffed.to_string(),
+                _ => OCTET_STREAM.to_string(),
+            }
+        }
+        (None, None) => OCTET_STREAM.to_string(),
+    };
+    let kind = FileKind::from_mime(&mime);
+    if !admitted.is_empty() && !admitted.contains(&kind) {
+        return Err(format!("it was sent as {mime}, which is not the {} that was declared", expected()));
+    }
+    if kind != FileKind::Blob && !byte_kinds.is_empty() && !byte_kinds.contains(&kind) {
+        return Err(format!("it was sent as {mime}, but the bytes are {}", byte_kinds[0].primitive()));
+    }
+    Ok((mime, kind))
 }
 
-/// Hold a file's bytes to the kind something declared for them: an
-/// `Image` declaration over video bytes is a loud error naming both
-/// kinds, and bytes with no known signature cannot be the declared kind
-/// either. `Blob` checks nothing (it is the declaration for "bytes of
-/// any shape"), and so does a declaration that is not a file type.
-///
-/// The error names WHAT is wrong and nothing about where it came from,
-/// because the same check runs over an `@asset` in source and over a
-/// caller's upload, and a caller must never be shown a piece of weft
-/// syntax their request has nothing to do with. Each caller frames it.
-pub fn check_declared_kind(
-    declared: &crate::weft_type::WeftType,
-    head: &[u8],
-) -> Result<(), String> {
-    use crate::weft_type::FileKind;
-    let Some(kind) = declared.concrete_file_kind() else { return Ok(()) };
-    if kind == FileKind::Blob {
-        return Ok(());
-    }
-    match sniff_file_kind(head) {
-        Some(found) if found == kind => Ok(()),
-        Some(found) => Err(format!(
-            "the bytes are {}, not the {} that was declared",
-            found.primitive(),
-            kind.primitive()
-        )),
-        None => Err(format!(
-            "the bytes carry no {} signature this weft knows (declare it Blob to skip \
-             the check)",
-            kind.primitive()
-        )),
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// The (video, audio) media types of a container that holds either,
+/// read from its sniffed type.
+fn audio_or_video(sniffed: &str) -> Option<(&'static str, &'static str)> {
+    match sniffed {
+        "video/webm" => Some(("video/webm", "audio/webm")),
+        "video/mp4" | "audio/mp4" => Some(("video/mp4", "audio/mp4")),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod sniff_tests {
-    use super::{check_declared_kind, sniff_file_kind, sniff_mime};
+    use super::{received_file, sniff_mime};
+
+    fn check_declared_kind(declared: &WeftType, head: &[u8]) -> Result<(), String> {
+        received_file(head, None, declared).map(|_| ())
+    }
     use crate::weft_type::{FileKind, WeftPrimitive, WeftType};
 
     #[test]
@@ -1281,6 +1352,7 @@ mod sniff_tests {
 
     #[test]
     fn signatures_name_their_kind() {
+        let sniff_file_kind = |head: &[u8]| sniff_mime(head).map(FileKind::from_mime).filter(|k| *k != FileKind::Blob);
         assert_eq!(sniff_file_kind(b"\x89PNG\r\n\x1a\n...."), Some(FileKind::Image));
         assert_eq!(sniff_file_kind(b"\xff\xd8\xff\xe0JFIF"), Some(FileKind::Image));
         assert_eq!(sniff_file_kind(b"RIFF\0\0\0\0WEBPVP8 "), Some(FileKind::Image));
@@ -1307,6 +1379,60 @@ mod sniff_tests {
         // Blob and text declarations check nothing.
         assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::Blob), b"just text").is_ok());
         assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::String), b"ID3").is_ok());
+    }
+
+    /// A union is held to its file members: an optional image still
+    /// takes only an image, and `Media` takes any media kind but no
+    /// unrecognized bytes. `File` admits Blob, so it checks nothing.
+    #[test]
+    fn a_union_is_held_to_its_file_members() {
+        let optional_image = WeftType::parse("Image | Null").unwrap();
+        assert!(check_declared_kind(&optional_image, b"\x89PNG\r\n\x1a\n").is_ok());
+        let e = check_declared_kind(&optional_image, b"ID3\x04").unwrap_err();
+        assert!(e.contains("are Audio, not the Image"), "{e}");
+        let media = WeftType::parse("Media").unwrap();
+        assert!(check_declared_kind(&media, b"ID3\x04").is_ok());
+        let e = check_declared_kind(&media, b"just text").unwrap_err();
+        assert!(e.contains("no Image or Video or Audio signature"), "{e}");
+        assert!(check_declared_kind(&WeftType::parse("File").unwrap(), b"just text").is_ok());
+    }
+
+    /// The bytes decide the stored type; a sender's claim only picks
+    /// audio or video in a container that holds either.
+    #[test]
+    fn a_received_file_keeps_the_type_it_was_sent_as() {
+        use crate::weft_type::FileKind;
+        let file = WeftType::parse("File").unwrap();
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(received_file(png, Some("image/x-anything"), &file).unwrap(), ("image/x-anything".into(), FileKind::Image));
+        assert_eq!(received_file(b"a,b\n1,2", Some("text/csv"), &file).unwrap(), ("text/csv".into(), FileKind::Blob));
+        // Nothing stated: the bytes fill it in, else plain bytes.
+        assert_eq!(received_file(png, None, &file).unwrap(), ("image/png".into(), FileKind::Image));
+        assert_eq!(received_file(b"a,b\n1,2", None, &file).unwrap(), ("application/octet-stream".into(), FileKind::Blob));
+        // A generic statement over a picture for an Image place: the
+        // bytes decide; an upper-case statement reads as its kind.
+        let image = WeftType::parse("Image").unwrap();
+        assert_eq!(received_file(png, Some("application/octet-stream"), &image).unwrap(), ("image/png".into(), FileKind::Image));
+        assert_eq!(received_file(png, Some("Image/PNG"), &image).unwrap(), ("image/png".into(), FileKind::Image));
+        // A stated media kind the bytes plainly are not is refused.
+        let e = received_file(b"ID3\x04 an mp3", Some("image/png"), &file).unwrap_err();
+        assert!(e.contains("sent as image/png, but the bytes are Audio"), "{e}");
+        // A Blob place takes unrecognized or unstated bytes as plain bytes,
+        // and refuses a stated type it does not admit.
+        let blob = WeftType::parse("Blob").unwrap();
+        assert_eq!(received_file(png, None, &blob).unwrap(), ("application/octet-stream".into(), FileKind::Blob));
+        let e = received_file(png, Some("image/png"), &blob).unwrap_err();
+        assert!(e.contains("sent as image/png, which is not the Blob"), "{e}");
+        // WebM holds either: the statement, then the declaration, picks.
+        let webm = b"\x1aE\xdf\xa3\x01\x00\x00\x00";
+        let audio = WeftType::parse("Audio").unwrap();
+        assert_eq!(received_file(webm, Some("audio/webm"), &file).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        assert_eq!(received_file(webm, None, &audio).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        assert_eq!(received_file(webm, None, &file).unwrap(), ("video/webm".into(), FileKind::Video));
+        // Stated as the container's other half, it is the half the place takes.
+        assert_eq!(received_file(webm, Some("video/webm"), &audio).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        let e = received_file(webm, Some("audio/webm"), &WeftType::parse("Image").unwrap()).unwrap_err();
+        assert!(e.contains("not the Image"), "{e}");
     }
 
     /// The reason says what is wrong with the bytes and nothing about

@@ -29,6 +29,7 @@
     {
       "name": "file",
       "type": "File",
+      "narrowable": true,
       "description": "The message's media, stored."
     },
     {

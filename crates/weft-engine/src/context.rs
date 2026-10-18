@@ -1452,15 +1452,6 @@ pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// often a still-running one says so.
 const INFRA_APPLY_REPORT_EVERY: Duration = Duration::from_secs(30);
 
-/// The runtime output-type gate: a node may only emit on a port a value
-/// its declared type accepts (`WeftType::accepts_runtime_value`: a
-/// declared named/record shape validates the value against its
-/// contract, everything else infers and compares structurally; an
-/// unresolved declared type accepts anything).
-fn type_accepts(declared: &WeftType, value: &Value) -> bool {
-    declared.accepts_runtime_value(value)
-}
-
 /// Journal write for teardown paths that cannot propagate errors: a
 /// failure is logged. Through a `DriveJournal` the write is only handed
 /// over, so a failure here means the drive was already poisoned or its
@@ -3384,31 +3375,26 @@ impl ContextHandle for RunnerHandle {
             // fails the call outright, naming where the bytes belong.
             weft_core::storage::check_wire_value(&self.place, &port, &value)
                 .map_err(WeftError::NodeFailed)?;
-            match self.declared_outputs.get(&port).map(|d| (d, d.as_generator())) {
-                Some((_, Some(element))) if !type_accepts(element, &value) => {
-                    return Err(WeftError::NodeFailed(format!(
-                        "node '{}' yielded a value on stream port '{}' that the element \
-                         type '{}' does not accept (got {})",
-                        self.place,
-                        port,
-                        element,
-                        WeftType::infer(&value),
-                    )));
-                }
-                Some((declared, None)) if !type_accepts(declared, &value) => {
-                    return Err(WeftError::NodeFailed(format!(
-                        "node '{}' emitted a value on port '{}' that its declared type '{}' \
-                         does not accept (got {})",
-                        self.place,
-                        port,
-                        declared,
-                        WeftType::infer(&value),
-                    )));
-                }
-                _ => {
+            let (declared, what) = match self.declared_outputs.get(&port) {
+                Some(declared) => match declared.as_generator() {
+                    Some(element) => (element, "yielded a value on stream port"),
+                    None => (declared, "emitted a value on port"),
+                },
+                None => {
                     kept.outputs.insert(port, value);
+                    continue;
                 }
-            }
+            };
+            // An open record drops the keys it does not declare here, so
+            // what flows on carries only what the port says it holds.
+            let value = declared.conform_value(value).map_err(|why| {
+                WeftError::NodeFailed(format!(
+                    "node '{}' {what} '{port}' that its declared type '{declared}' does not \
+                     accept: {why}",
+                    self.place,
+                ))
+            })?;
+            kept.outputs.insert(port, value);
         }
 
         // The call is now known to proceed: claim every touched port
@@ -3716,7 +3702,7 @@ fn http_client() -> &'static reqwest::Client {
 
 #[cfg(test)]
 mod type_check_tests {
-    use super::type_accepts;
+    use serde_json::Value;
     use weft_core::storage::StoredFile;
     use weft_core::weft_type::{FileKind, WeftType};
 
@@ -3742,34 +3728,53 @@ mod type_check_tests {
         .to_value()
     }
 
+    fn accepts(declared: &WeftType, value: Value) -> bool {
+        declared.conform_value(value).is_ok()
+    }
+
     #[test]
     fn declared_file_accepts_any_stored_file() {
         let file = WeftType::file();
-        assert!(type_accepts(&file, &image_value()));
-        assert!(type_accepts(&file, &video_value()));
+        assert!(accepts(&file, image_value()));
+        assert!(accepts(&file, video_value()));
     }
 
     #[test]
     fn narrowed_image_accepts_image_rejects_video() {
         // The File port narrowed to Image: an image flows, a video does not.
         let image = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Image);
-        assert!(type_accepts(&image, &image_value()));
-        assert!(!type_accepts(&image, &video_value()), "a video on an Image port is refused");
+        assert!(accepts(&image, image_value()));
+        assert!(!accepts(&image, video_value()), "a video on an Image port is refused");
     }
 
     #[test]
     fn primitive_mismatch_is_rejected() {
         let number = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number);
-        assert!(type_accepts(&number, &serde_json::json!(42)));
-        assert!(!type_accepts(&number, &serde_json::json!("not a number")));
+        assert!(accepts(&number, serde_json::json!(42)));
+        assert!(!accepts(&number, serde_json::json!("not a number")));
     }
 
     #[test]
     fn unresolved_declared_accepts_anything() {
-        // A TypeVar / MustOverride port has no concrete contract yet, so the
-        // gate must not reject (is_compatible short-circuits on unresolved).
-        assert!(type_accepts(&WeftType::MustOverride, &video_value()));
-        assert!(type_accepts(&WeftType::type_var("T"), &serde_json::json!("anything")));
+        // A TypeVar port has no concrete contract yet, so the gate must
+        // not reject (is_compatible short-circuits on unresolved).
+        assert!(accepts(&WeftType::type_var("T"), video_value()));
+        assert!(accepts(&WeftType::type_var("T"), serde_json::json!("anything")));
+    }
+
+    /// A narrowed output holds the value to the declared shape: a
+    /// missing field fails naming it, an open record's extra key is
+    /// dropped on the way out.
+    #[test]
+    fn a_declared_record_names_the_missing_field_and_an_open_one_drops_extras() {
+        let verdict = WeftType::parse("{ label: String, score: Number }").expect("type");
+        let why = verdict.conform_value(serde_json::json!({ "label": "ok" })).unwrap_err();
+        assert!(why.contains("missing required field \"score\""), "{why}");
+        let open = WeftType::parse("{ label: String, .. }").expect("type");
+        assert_eq!(
+            open.conform_value(serde_json::json!({ "label": "ok", "extra": 1 })),
+            Ok(serde_json::json!({ "label": "ok" })),
+        );
     }
 
     // Touch FileKind so the import is used even if the helpers change.

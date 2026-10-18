@@ -86,7 +86,8 @@
     },
     {
       "name": "attachments",
-      "type": "List[File]"
+      "type": "List[File]",
+      "narrowable": true
     }
   ],
   "firesWith": {

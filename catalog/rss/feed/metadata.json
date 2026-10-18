@@ -55,6 +55,7 @@
     {
       "name": "entry",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The whole parsed entry (id, title, link, summary, published, author)."
     }
   ],

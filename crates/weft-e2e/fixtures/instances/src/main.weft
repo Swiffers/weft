@@ -6,16 +6,16 @@
 # an ungated route, where naming an instance is refused.
 
 keys = ApiKeyAuth
-hook = Route -> (text: String) { path: "__E2E_PATH__/hook", method: "POST" }
+hook = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/hook", method: "POST" }
 hook.auth = keys.access
 
 theirs = ApiKeyAuth { account: @instance_filled }
 probe = InstanceProbe
-probe.text = hook.text
+probe.text = hook.body.text
 probe.key = theirs.access
 answer = Reply
 answer.body = probe.body
 
-open = Route -> (text: String) { path: "__E2E_PATH__/open", method: "POST" }
+open = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/open", method: "POST" }
 echo = Reply
-echo.body = open.text
+echo.body = open.body.text

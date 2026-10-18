@@ -14,7 +14,7 @@
       "name": "provider",
       "type": "LlmProvider",
       "required": true,
-      "description": "Wire an OpenRouterProvider whose model names the model to use."
+      "description": "Wire an OpenRouter Model node whose model names the embedding model to use."
     },
     {
       "name": "texts",

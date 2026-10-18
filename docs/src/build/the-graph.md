@@ -65,9 +65,9 @@ boxes, dropdowns, tickboxes, code editors, file pickers. A field fed by an
 arrow hides itself, because the arrow is now the source of that value.
 
 Under the inputs there is a **+ input** button, and **output +** under the
-outputs. A port you add starts with the type `MustOverride`, which is weft
-saying nobody has decided this yet, and the build stops until you do.
-Right-click the new dot and pick the **Type:** row to set it.
+outputs. A port you add with no type takes its type from what you wire to it.
+If you want to set one yourself, right-click the new dot and pick the
+**Type:** row.
 
 That same right-click menu makes an input required or optional, removes it, or
 puts a catalog port back the way it was.

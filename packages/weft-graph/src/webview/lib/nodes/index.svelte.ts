@@ -11,7 +11,7 @@
  * `$derived` reads on first render see a populated registry.
  */
 
-import type { NodeTemplate, PortDefinition } from '../types';
+import type { NodeTemplate, PortDefinition, TemplateOutputPort } from '../types';
 import type { CatalogEntry, InputSpec, OutputSpec } from '../../../protocol';
 import { BUILTIN_NODE_ICONS, resolveIcon } from './icons';
 
@@ -37,9 +37,10 @@ function toInputPort({ type, required, ...rest }: InputSpec): PortDefinition {
 }
 
 /// Wire output (`{ name, type, ... }`) -> render port. Same generic
-/// spread discipline as `toInputPort`. An output carries no optionality:
-/// `required` is the constant the render port expects for one.
-function toOutputPort({ type, ...rest }: OutputSpec): PortDefinition {
+/// spread discipline as `toInputPort` (`narrowable` rides through). An
+/// output carries no optionality: `required` is the constant the render
+/// port expects for one.
+function toOutputPort({ type, ...rest }: OutputSpec): TemplateOutputPort {
 	return { ...rest, portType: type, required: true };
 }
 
@@ -61,6 +62,11 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		requiresInfra: entry.requiresInfra ?? false,
 		defaultInputs: (entry.inputs ?? []).map(toInputPort),
 		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
+		// The catalog keys bounds by variable; the template carries them
+		// in the instance's wire shape, so one check reads either.
+		...(entry.typeParams
+			? { typeParams: Object.entries(entry.typeParams).map(([name, bound]) => ({ name, bound })) }
+			: {}),
 		features: entry.features,
 		display: entry.display,
 		// `weft describe-nodes` ships the entry-kind vocabulary inline

@@ -1,12 +1,15 @@
-//! The shared inference plumbing behind `LlmInference` and `LlmStream`.
+//! The shared inference plumbing behind `LlmInference`,
+//! `LlmInferenceJson` and `LlmStream`.
 //!
-//! Both nodes make the same call and differ only in transport (buffered
-//! vs deltas on a bus), so everything else lives here: reading the
-//! wired `LlmProvider` object into a minillmlib generator over the
+//! The three nodes make the same call and differ only in transport
+//! (buffered vs deltas on a bus) and in what they hand out on
+//! `response` (the text, or the text parsed as JSON and held to the
+//! type the program declared), so everything else lives here: reading
+//! the wired `LlmProvider` object into a minillmlib generator over the
 //! opened connection's client, reading the wired params object into
 //! completion parameters, assembling the conversation in stored form,
-//! externalizing it at the call boundary, and internalizing the reply
-//! back into stored form.
+//! externalizing it at the call boundary, the buffered call itself, and
+//! internalizing the reply back into stored form.
 //!
 //! The paid-call surface is unchanged from the shape the docs describe:
 //! open the connection (`ctx.open`, one resolve, one lease for THIS
@@ -15,8 +18,8 @@
 //! hold no cost bookkeeping at all.
 
 use minillmlib::{
-    ChatNode, CompletionParameters, GeneratorInfo, Message, MiniLLMError, NodeCompletionParameters,
-    OpenRouterRouting, Reasoning, ToolChoice, ToolDefinition,
+    ChatNode, CompletionParameters, CompletionResponse, GeneratorInfo, Message, MiniLLMError,
+    NodeCompletionParameters, OpenRouterRouting, Reasoning, ToolChoice, ToolDefinition,
 };
 use serde_json::Value;
 
@@ -84,7 +87,8 @@ impl LlmCall {
 
 /// Whether `err` is the provider refusing the request over reasoning:
 /// an API error carrying a client status whose provider message names
-/// reasoning. weft never asks the lib to retry, so the error is the
+/// reasoning. The raw stream every node starts is one request (the
+/// lib's retry loop is not on that path), so the error is the
 /// provider's own answer.
 fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
     match err {
@@ -148,7 +152,7 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
         }
         None => {
             return Err(WeftError::Input(
-                "the wired LlmProvider object carries no connection; pick one on the provider node"
+                "the wired LlmProvider object carries no connection; wire the service's Access node into its Model node"
                     .to_string(),
             ))
         }
@@ -324,15 +328,40 @@ pub async fn to_wire(ctx: &RunContext, llm: &LlmCall) -> WeftResult<ChatNode> {
     Ok(leaf)
 }
 
-/// Everything both nodes do once the reply is in hand, in one place:
-/// reject a reply with no substance or no finish reason, append the
-/// assistant message and internalize the conversation back into stored
-/// form (any raw reply media becomes storage references; everything
-/// already stored passes through untouched), and set the shared
-/// output ports (the conversation, and `toolCalls` only when the model
-/// actually called tools, so a downstream tool branch stays
-/// structurally dead on a plain reply). The caller sets its own
-/// `response` port on the returned output.
+/// The buffered call: assemble it, send it, and hand back the call with
+/// the model's whole reply. It streams internally so a Stop lands
+/// mid-generation instead of after it; on cancel, dropping the stream
+/// is all the wrap-up there is (the metered client resolves the
+/// interrupted call's real cost on its own).
+pub async fn complete(ctx: &RunContext) -> WeftResult<(LlmCall, CompletionResponse)> {
+    let llm = assemble(ctx).await?;
+    let leaf = to_wire(ctx, &llm).await?;
+    let stream = leaf
+        .complete_streaming(&llm.generator, Some(&llm.params))
+        .await
+        .map_err(|e| llm.call_error(e))?;
+    let cancelled = ctx.cancellation();
+    let response = tokio::select! {
+        collected = stream.collect() => collected.map_err(|e| llm.call_error(e))?,
+        err = cancelled.cancelled_err() => return Err(err),
+    };
+    Ok((llm, response))
+}
+
+/// Everything the nodes do once the reply is in hand, in one place:
+/// reject a reply with no substance or no finish reason, ask the node
+/// for its `response` value (`answer`: `None` leaves the port unset),
+/// append the assistant message and internalize the conversation back
+/// into stored form (any raw reply media becomes storage references;
+/// everything already stored passes through untouched), and set the
+/// output ports (`response`, the conversation, and `toolCalls` only
+/// when the model actually called tools, so a downstream tool branch
+/// stays structurally dead on a plain reply).
+///
+/// `answer` runs BEFORE anything is written: a node that refuses the
+/// reply (an answer that is not the JSON the program declared) fails
+/// there, and the conversation file stays exactly as it was, so a
+/// retry sends the model the same conversation again.
 ///
 /// The conversation is kept in a file, never on a wire: this call's
 /// turn (its user message and the reply) is added to the end of the
@@ -344,13 +373,16 @@ pub async fn to_wire(ctx: &RunContext, llm: &LlmCall) -> WeftResult<ChatNode> {
 pub async fn finish(
     ctx: &RunContext,
     llm: LlmCall,
-    response: &minillmlib::CompletionResponse,
-    output: NodeOutput,
+    response: &CompletionResponse,
+    answer: impl FnOnce(&CompletionResponse) -> WeftResult<Option<Value>>,
 ) -> WeftResult<NodeOutput> {
     ensure_reply_substance(response, llm.announces_finish)?;
+    let mut output = NodeOutput::new();
+    if let Some(value) = answer(response)? {
+        output = output.set("response", value);
+    }
     let assistant = serde_json::to_value(response.to_assistant_message())
         .node_err("serializing the assistant message")?;
-    let mut output = output;
     if llm.history_file.is_some() || ctx.is_output_wired("historyFile") {
         let mut turn = llm.stored[llm.stored.len() - llm.new_turn..].to_vec();
         turn.push(assistant);
@@ -374,6 +406,13 @@ pub async fn finish(
         }
     }
     Ok(output)
+}
+
+/// The `response` of a node that hands the reply out as text (the
+/// [`finish`] answer of LlmInference and LlmStream): the reply's text,
+/// empty on a turn that only called tools.
+pub fn reply_text(reply: &CompletionResponse) -> WeftResult<Option<Value>> {
+    Ok(Some(Value::String(reply.content.clone())))
 }
 
 /// What the `reasoning` setting sends, in its three states. Unset (the
@@ -403,7 +442,7 @@ pub fn reasoning_config(reasoning: Option<bool>, effort: Option<&str>) -> Option
 /// OpenAI-compatible server may end a complete reply by just closing,
 /// so absence proves nothing there and is accepted.)
 fn ensure_reply_substance(
-    response: &minillmlib::CompletionResponse,
+    response: &CompletionResponse,
     announces_finish: bool,
 ) -> WeftResult<()> {
     if response.content.trim().is_empty()

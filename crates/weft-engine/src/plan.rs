@@ -44,6 +44,14 @@ pub(crate) struct NodePorts {
     pub(crate) outputs: Arc<HashMap<String, WeftType>>,
 }
 
+/// A node's ports at every place it runs: its own, and those of each
+/// place whose types differ (a node inside an included file a site
+/// resolved its own way, `NodeDefinition::place_types`).
+struct PlacedPorts {
+    own: NodePorts,
+    places: Vec<(Vec<String>, NodePorts)>,
+}
+
 /// See the module doc.
 pub(crate) struct ProgramTables {
     pub(crate) project: Arc<ProjectDefinition>,
@@ -51,7 +59,7 @@ pub(crate) struct ProgramTables {
     pub(crate) selection: Option<RecordedSelection>,
     pub(crate) index: ProgramIndex,
     pub(crate) dispatchable: Option<HashSet<Located>>,
-    ports: Vec<NodePorts>,
+    ports: Vec<PlacedPorts>,
     /// The group boundaries (a group's In and Out, a loop's): runtime
     /// machinery whose whole state is on record.
     pub(crate) boundaries: HashSet<String>,
@@ -68,9 +76,31 @@ impl ProgramTables {
         let ports = project
             .nodes
             .iter()
-            .map(|node| NodePorts {
-                inputs: Arc::new(node.inputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect()),
-                outputs: Arc::new(node.outputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect()),
+            .map(|node| {
+                // The node's own inputs: the gates are the language's
+                // (the bag drops them too), so a node asking what it
+                // declares (a List with no items, a script binding its
+                // ports by name) never sees them.
+                let ports_at = |types: weft_core::project::TypesAt<'_>| NodePorts {
+                    inputs: Arc::new(
+                        node.inputs
+                            .iter()
+                            .filter(|p| !weft_core::run::skip::is_gate_port(&p.name))
+                            .filter_map(|p| Some((p.name.clone(), types.input(&p.name)?.clone())))
+                            .collect(),
+                    ),
+                    outputs: Arc::new(
+                        node.outputs.iter().filter_map(|p| Some((p.name.clone(), types.output(&p.name)?.clone()))).collect(),
+                    ),
+                };
+                PlacedPorts {
+                    own: ports_at(node.types_at::<&str>(&[])),
+                    places: node
+                        .place_types
+                        .iter()
+                        .map(|place| (place.place.clone(), ports_at(node.types_at(&place.place))))
+                        .collect(),
+                }
             })
             .collect::<Vec<_>>();
         let boundaries = project.nodes.iter().filter(|n| n.group_boundary.is_some()).map(|n| n.id.clone()).collect();
@@ -83,9 +113,15 @@ impl ProgramTables {
         self.index.node(&self.project, id)
     }
 
-    /// The ports of the node whose id is `id`.
-    pub(crate) fn ports(&self, id: &str) -> Option<&NodePorts> {
-        self.index.position(id).map(|at| &self.ports[at])
+    /// The ports of the node whose id is `id`, as they are where it
+    /// fires at `frames` (the include call path on them picks the place).
+    pub(crate) fn ports(&self, id: &str, frames: &weft_core::frames::LoopFrames) -> Option<&NodePorts> {
+        let at = self.index.position(id)?;
+        let placed = &self.ports[at];
+        // The same reading `NodeDefinition::types_at` makes: the entry of
+        // the place this firing runs at, else the node's own.
+        let place = self.project.nodes[at].place_of(&weft_core::frames::call_path(frames));
+        Some(place.map_or(&placed.own, |index| &placed.places[index].1))
     }
 
     /// The nodes ready to fire on `pulses`, in the program's order: what
@@ -590,6 +626,61 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(asked, scanned);
         }
+    }
+
+    /// The inputs a firing is told its node declares are the node's own:
+    /// the gates are the language's, so a List with no item ports sees
+    /// none, as it does in the node-test rig.
+    #[test]
+    fn a_nodes_declared_inputs_leave_out_the_gates() {
+        let project: Arc<ProjectDefinition> = Arc::new(
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::from_u128(11),
+                "nodes": [
+                    { "id": "n", "nodeType": "N", "position": { "x": 0.0, "y": 0.0 },
+                      "inputs": [
+                        { "name": "item", "portType": "String", "required": true },
+                        { "name": weft_core::run::skip::SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false },
+                        { "name": weft_core::run::skip::SHOULD_NOT_FLOW_PORT, "portType": "T__should_not_flow", "required": false }
+                      ] }
+                ],
+                "edges": []
+            }))
+            .unwrap(),
+        );
+        let program = ProgramTables::new(project, None);
+        let ports = program.ports("n", &Vec::new()).expect("the node's ports");
+        assert_eq!(ports.inputs.keys().collect::<Vec<_>>(), vec!["item"]);
+    }
+
+    /// A node an included file shares between sites hands each firing
+    /// the types of the place its frames name, and its own elsewhere.
+    #[test]
+    fn a_firing_gets_the_ports_of_its_place() {
+        let project: Arc<ProjectDefinition> = Arc::new(
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::from_u128(12),
+                "nodes": [
+                    { "id": "n", "nodeType": "N", "position": { "x": 0.0, "y": 0.0 },
+                      "inputs": [{ "name": "file", "portType": "Image", "required": true }],
+                      "outputs": [{ "name": "file", "portType": "Image", "required": true }],
+                      "placeTypes": [
+                        { "place": ["img"], "inputs": { "file": "Image" }, "outputs": { "file": "Image" } },
+                        { "place": ["vid"], "inputs": { "file": "Video" }, "outputs": { "file": "Video" } }
+                      ] }
+                ],
+                "edges": []
+            }))
+            .unwrap(),
+        );
+        let program = ProgramTables::new(project, None);
+        let at = |site: &str| {
+            let frames = vec![weft_core::frames::Frame::Call { site: site.into() }];
+            program.ports("n", &frames).expect("the node's ports").outputs["file"].clone()
+        };
+        assert_eq!(at("img"), WeftType::parse("Image").unwrap());
+        assert_eq!(at("vid"), WeftType::parse("Video").unwrap());
+        assert_eq!(program.ports("n", &Vec::new()).unwrap().outputs["file"], WeftType::parse("Image").unwrap());
     }
 
     /// A plan of a node that is no trigger never starts a run, and says why.

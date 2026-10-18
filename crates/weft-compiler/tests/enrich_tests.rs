@@ -92,9 +92,7 @@ bad = NotARealNode
 #[test]
 fn enrich_rejects_custom_port_on_node_that_disallows_it() {
     // `Text` does not set canAddOutputPorts, so a user-declared custom
-    // output port on it must fail loud, not vanish silently. The port
-    // carries a concrete type so it reaches the can-add check (a
-    // MustOverride placeholder would trip the needs-a-type error first).
+    // output port on it must fail loud, not vanish silently.
     let source = r#"
 
 t = Text() -> (bogus: String) { value: "hi" }
@@ -499,7 +497,7 @@ out.data = human.testRejected
 "#;
     let mut project = compile(wrong_type, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
-    assert!(format!("{err}").contains("incompatible"), "type mismatch must error: {err}");
+    assert!(format!("{err}").contains("always gives it Boolean"), "type mismatch must error: {err}");
 
     let unknown_port = r#"
 
@@ -977,23 +975,34 @@ fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
     );
 }
 
-/// An input required only once wired has its requiredness decided by its
-/// wiring, so a header line declaring it required is refused, naming the
-/// fix; declaring it optional says nothing new and stays legal.
+/// A program may make an optional input required or optional even when
+/// wired, but never a required one optional: that is refused naming the
+/// port and why.
 #[test]
-fn enrich_refuses_making_an_input_required_when_wired_always_required() {
-    let errors_for = |header: &str| {
-        let source = format!("\ns = StartInfra({header}) {{ node: \"svc\" }}\n");
+fn enrich_refuses_making_a_required_input_optional() {
+    let errors_for = |node: &str, header: &str| {
+        let source = format!("\nn = {node}({header}) {{}}\n");
         let mut project = compile(&source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
-        weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict)
+        let errors: Vec<String> = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict)
             .into_iter()
             .map(|e| e.message)
-            .collect::<Vec<_>>()
+            .collect();
+        (project, errors)
     };
-    let refused = errors_for("instance: String");
-    assert!(
-        refused.iter().any(|m| m.contains("required only when wired") && m.contains("instance?")),
-        "{refused:?}"
-    );
-    assert!(errors_for("instance?: String").is_empty(), "optional is what it already is");
+    let (_, refused) = errors_for("Debug", "data?: JsonDict");
+    assert!(refused.iter().any(|m| m.contains("'data'") && m.contains("its code needs it")), "{refused:?}");
+
+    let (project, errors) = errors_for("StartInfra", "instance: String");
+    assert!(errors.is_empty(), "{errors:?}");
+    let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
+    assert!(instance.required && !instance.optional, "written without `?`: always required");
+
+    let (project, errors) = errors_for("StartInfra", "instance?: String");
+    assert!(errors.is_empty(), "{errors:?}");
+    let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
+    assert!(!instance.required && instance.optional, "written `?`: runs without it even when wired");
+
+    let (project, _) = errors_for("StartInfra", "");
+    let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
+    assert!(!instance.required && !instance.optional, "unwritten: required once wired");
 }

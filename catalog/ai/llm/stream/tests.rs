@@ -6,6 +6,7 @@ use serde_json::json;
 use weft::bus::BusEntryKind;
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
+use super::super::testing::sse;
 use super::LlmStreamNode;
 
 pub fn tests() -> Vec<NodeTest> {
@@ -81,25 +82,6 @@ async fn truncated(rig: FakeRig) -> WeftResult<()> {
     let mut cursor = bus.cursor_from_start();
     while cursor.next().await.is_some() {}
     Ok(())
-}
-
-/// OpenAI-style SSE chunks ending in a finish reason and `[DONE]`.
-fn sse(chunks: &[&str], finish: Option<&str>) -> Vec<u8> {
-    let mut body = String::new();
-    for c in chunks {
-        body.push_str(&format!(
-            "data: {}\n\n",
-            json!({ "id": "gen-1", "choices": [{ "delta": { "content": c } }] })
-        ));
-    }
-    if let Some(reason) = finish {
-        body.push_str(&format!(
-            "data: {}\n\n",
-            json!({ "id": "gen-1", "choices": [{ "delta": {}, "finish_reason": reason }] })
-        ));
-    }
-    body.push_str("data: [DONE]\n\n");
-    body.into_bytes()
 }
 
 async fn streams(rig: FakeRig) -> WeftResult<()> {

@@ -1,11 +1,11 @@
-//! OpenRouterProvider self-tests: the emitted `LlmProvider` object,
+//! OpenRouterModel self-tests: the emitted `LlmProvider` object,
 //! including the routing knobs riding it verbatim.
 
 use serde_json::json;
 
 use weft::{FakeRig, NodeTest, WeftResult};
 
-use super::OpenRouterProviderNode;
+use super::OpenRouterModelNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![NodeTest::fake("routing_knobs_ride_the_provider_object", emits_with_knobs)]
@@ -14,9 +14,9 @@ pub fn tests() -> Vec<NodeTest> {
 async fn emits_with_knobs(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
-            &OpenRouterProviderNode,
+            &OpenRouterModelNode,
             json!({
-                "connection": rig.access("openrouter"),
+                "access": rig.access("openrouter"),
                 "model": "anthropic/claude-sonnet-4.5",
                 "servingProvider": "anthropic",
                 "providerFallbacks": false,
@@ -30,5 +30,6 @@ async fn emits_with_knobs(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(provider["servingProvider"], json!("anthropic"));
     assert_eq!(provider["providerFallbacks"], json!(false));
     assert!(provider["account"].get("__weft_access__").is_some());
+    assert!(provider.get("access").is_none(), "the wired connection rides as `account` only");
     Ok(())
 }

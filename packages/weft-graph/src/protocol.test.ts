@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { parseFileValue, typeReferencesFile, type CatalogEntry, type Widget } from './protocol';
+import { narrowingBound, parseFileValue, tryParseWeftType, typeReferencesFile, type CatalogEntry, type NodeDefinition, type OutputSpec, type Widget } from './protocol';
+import { declarationProblem, declarationRule } from './webview/lib/projection/header-ports';
+import { NODE_TYPE_CONFIG, registerCatalog } from './webview/lib/nodes/index.svelte';
 
 describe('typeReferencesFile', () => {
 	it('matches file primitives and aliases, alone and in composites', () => {
@@ -14,9 +16,7 @@ describe('typeReferencesFile', () => {
 		}
 	});
 
-	it('answers structurally: a dict KEY is an index, never a stored value', () => {
-		// Mirrors Rust's Dict(_, v) arm; the old token regex could not
-		// tell the two positions apart.
+	it('answers structurally from a dict value, and a dict keyed by a file is no type', () => {
 		expect(typeReferencesFile('Dict[String, Image]')).toBe(true);
 		expect(typeReferencesFile('Dict[Image, String]')).toBe(false);
 	});
@@ -138,5 +138,86 @@ describe('catalog wire fixture', () => {
 			}
 		};
 		expect(label({ kind: 'text' })).toBe('text');
+	});
+});
+
+describe('narrowable outputs and type parameters on the wire', () => {
+	it('reads an output narrowing bound', () => {
+		const route: OutputSpec[] = [
+			{ name: 'answer', type: 'JsonDict', narrowable: true },
+			{ name: 'body', type: 'JsonDict', narrowable: 'JsonDict | String | File' },
+			{ name: 'status', type: 'Number' },
+		];
+		expect(route.map(narrowingBound)).toEqual(['JsonDict', 'JsonDict | String | File', null]);
+	});
+
+	it("holds a declaration to a catalog entry's bounds and to a node's resolved ones", () => {
+		const entry = {
+			type: 'KeepFile', label: 'Keep File', description: '', tags: [],
+			inputs: [{ name: 'file', type: 'T', required: true }, { name: 'more', type: 'T2', required: true }],
+			outputs: [],
+			typeParams: { T: 'Media', T2: 'List[T]' },
+		} as unknown as CatalogEntry;
+		registerCatalog({ KeepFile: entry });
+		const template = NODE_TYPE_CONFIG.KeepFile;
+		const file = declarationRule('input', template.defaultInputs[0], template.typeParams);
+		expect(declarationProblem(file, 'String')).toBe('`T` has to fit in Media, and what is connected makes it String');
+		expect(declarationProblem(file, 'Image')).toBeNull();
+
+		const node: Pick<NodeDefinition, 'typeParams'> = {
+			typeParams: [{ name: 'T', bound: 'Media', resolved: 'Video' }, { name: 'T2', bound: 'List[T]' }],
+		};
+		const more = declarationRule('input', template.defaultInputs[1], node.typeParams);
+		expect(declarationProblem(more, 'List[Video]')).toBeNull();
+		expect(declarationProblem(more, 'List[Image]')).toBe('`T2` has to fit in List[Video], and what is connected makes it List[Image]');
+	});
+});
+
+describe('tryParseWeftType leaves only declarable unknown names to the compiler', () => {
+	const refusal = (s: string) => {
+		const parsed = tryParseWeftType(s);
+		if (parsed.ok) throw new Error(`${s} parsed`);
+		return parsed;
+	};
+
+	it('an unknown declarable name is the compiler\'s, wherever it sits', () => {
+		for (const s of ['Verdict', 'List[Verdict]', 'Verdict | Number', '{ a: Verdict, b?: Score }', 'Dict[String, Verdict]']) {
+			expect(refusal(s).unknownName, s).toBe(true);
+		}
+		expect(refusal('Verdict | Score').error).toBe('`Verdict` is not a type');
+	});
+
+	// SYNC assertions with crates/weft-core/src/weft_type.rs parse_single_type
+	it('a name no project can declare is refused outright', () => {
+		for (const s of ['List', 'Dict', 'Generator', 'string', 'List[string]']) {
+			expect(refusal(s).unknownName, s).toBe(false);
+		}
+		expect(refusal('List').error).toBe('`List` is not a type');
+		expect(refusal('string').error).toBe('`string` is not a type');
+	});
+
+	it('a definite error elsewhere wins over an unknown name before it', () => {
+		const key = refusal('Dict[Number, Verdict]');
+		expect(key.unknownName).toBe(false);
+		expect(key.error).toBe(
+			"`Dict[Number, Verdict]`: a dict's keys are always text, so its key type is `String`. "
+			+ 'To key by a Number, use `List[{key: Number, value: Verdict}]`',
+		);
+		const foo = refusal('Verdict | Foo[String]');
+		expect(foo.unknownName).toBe(false);
+		expect(foo.error).toBe('`Foo[...]` is not a type; the types that take one are List, Generator and Dict');
+		const field = refusal('{a: Verdict, b}');
+		expect(field.unknownName).toBe(false);
+		expect(field.error).toBe('`{a: Verdict, b}`: the field `b` has no type (`name: Type`)');
+	});
+
+	it('a declared name that is no type name says why, like the compiler', () => {
+		expect(refusal('verdict=String').error).toBe(
+			'`verdict=String`: `verdict` is not a type name: a type name starts with an uppercase letter '
+			+ 'and contains only letters, digits, and underscores',
+		);
+		expect(refusal('List=String').error).toBe('`List=String`: `List` is not a type name: `List` is reserved by the type language');
+		expect(refusal('Media=String').error).toBe('`Media=String`: `Media` is not a type name: `Media` is reserved by the type language');
+		expect(refusal('Kind=Verdict').unknownName).toBe(true);
 	});
 });

@@ -292,6 +292,8 @@ fn worker_emission_declares_but_never_enables_node_tests() {
     let node = NodeDefinition {
         id: "send".into(),
         node_type: "SlackSendMessage".into(),
+        type_params: Vec::new(),
+        place_types: Vec::new(),
         label: None,
         config: serde_json::Value::Object(Default::default()),
         position: Position { x: 0.0, y: 0.0 },

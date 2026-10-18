@@ -5,9 +5,9 @@
 # ctx-path coverage; the zero-Rust path (Reply / Stream / Close) has its own
 # fixtures (api_reply, api_stream, socket_loop).
 
-route = Route -> (message: String) { path: "__E2E_PATH__", method: "POST" }
+route = Route -> (body: { message?: String, .. }) { path: "__E2E_PATH__", method: "POST" }
 responder = LiveHttpResponder
 out = Debug
 
-responder.message = route.message
+responder.message = route.body.message
 out.data = responder.done

@@ -837,7 +837,7 @@ struct OtherNode {
 ///
 /// The flattening is the LENIENT one (lex, parse, includes inlined, no
 /// enrich and no validation), because connecting is what you do to a
-/// program that is not wired up yet: an unmet `MustOverride` or a
+/// program that is not wired up yet: an unresolved type variable or a
 /// mis-typed literal leaves the node list whole, and the places come
 /// from the node list alone. A parse error is refused the way the file
 /// walk refuses one, naming the file and the line.
@@ -923,7 +923,7 @@ fn collect_targets(
     // The lenient parse answers even on broken source, with a PARTIAL
     // node list; operating on that (and rewriting the file from it)
     // would silently work on half the project. Refuse on PARSE errors
-    // only: type-level diagnostics (an unresolved MustOverride in a
+    // only: type-level diagnostics (an unresolved type variable in a
     // subgraph viewed standalone, a mis-typed literal) leave the node
     // list complete and the editor edits such files freely.
     if let Some(first) = diagnostics.iter().find(|d| {

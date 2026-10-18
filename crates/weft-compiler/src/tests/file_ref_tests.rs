@@ -89,10 +89,7 @@ fn marker_with_bracketed_type_containing_comma() {
     assert_eq!(fr.path, "d.json");
     assert_eq!(
         fr.ty,
-        WeftType::dict(
-            WeftType::Primitive(WeftPrimitive::String),
-            WeftType::Primitive(WeftPrimitive::Number)
-        )
+        WeftType::dict(WeftType::Primitive(WeftPrimitive::Number))
     );
 }
 

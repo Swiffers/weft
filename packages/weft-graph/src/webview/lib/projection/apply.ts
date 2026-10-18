@@ -219,8 +219,14 @@ function mergedSigPort(
   // never carry one (Rust guarantees it absent there).
   stampDeclared: boolean,
 ): PortDefinition {
+  // The sig's `required` is its SPELLING (`x:` or `x?:`), and on a node
+  // a written `x?:` is what `optional` means: the node runs without it
+  // even when wired. A container port has only the two written states,
+  // carried by `required` alone.
+  const { optional: _priorOptional, ...rest } = prior ?? {};
   return {
-    ...(prior ?? {}),
+    ...rest,
+    ...(stampDeclared && !sig.required ? { optional: true } : {}),
     name: sig.name,
     required: sig.required,
     // The RENDERED type is what the port shows (a reparse re-runs
@@ -289,7 +295,8 @@ function updateNodePortSurface(
     }
     // A REVERTED port went back to its provided shape: its header line
     // is gone (the server's rewrite omits it), so it is no longer
-    // declared, and requiredness returns to the provided value. The
+    // declared, and requiredness returns to the provided value (never
+    // `optional`, which only a written `x?:` sets). The
     // rendered TYPE stays as-is unless the revert carries one (a gesture
     // revert does; a deletion revert deliberately omits it, since the
     // provided spelling may be an uninstantiated generic and the
@@ -305,7 +312,7 @@ function updateNodePortSurface(
         if (sig) return mergedSigPort(sig, p, true);
         const rev = revByName.get(p.name);
         if (rev) {
-          const { declaredType: _undeclared, ...rest } = p;
+          const { declaredType: _undeclared, optional: _unwritten, ...rest } = p;
           return { ...rest, required: rev.required, portType: rev.portType ?? p.portType };
         }
         return p;

@@ -521,6 +521,7 @@ pub fn filled_node(node: &crate::project::NodeDefinition, values: Option<&PlaceV
 /// `Err` is only a program that cannot look anything up. The same walk the editor does over its canvas, over the
 /// compiled program, so an instance's dropdown lists what the node's run
 /// would reach.
+// SYNC: lookup_connection (the trace through boundaries) <-> packages/weft-graph/src/webview/lib/utils/access-trace.ts accessFeedingEdge
 pub fn lookup_connection(
     project: &crate::project::ProjectDefinition,
     at: &crate::frames::Located,

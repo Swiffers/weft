@@ -114,6 +114,72 @@ async fn routes_answer_with_status_headers_and_bodies() -> anyhow::Result<()> {
     project.finish().await
 }
 
+/// A route whose body fields are all optional, built back into an
+/// object by a JsonObject gated on the route: a caller sending `{}`
+/// gets `{}`, where the object used to be skipped with every key
+/// absent and the caller left with "the run ended without answering".
+#[tokio::test]
+async fn an_empty_body_builds_an_empty_object() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_reply", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+
+    let (status, _, body) =
+        live::http_json(&disp, Method::POST, &format!("{base}/note"), &[], &json!({})).await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!({}));
+
+    let (status, _, body) =
+        live::http_json(&disp, Method::POST, &format!("{base}/note"), &[], &json!({ "title": "hi" })).await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!({ "title": "hi" }));
+
+    project.finish().await
+}
+
+/// A route declaring its body's type answers a body that does not fit
+/// 400, naming the field, before the run starts: a missing required
+/// field, and a key the type does not declare.
+#[tokio::test]
+async fn a_typed_body_that_does_not_fit_is_answered_400() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_reply", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+
+    let (status, _, body) =
+        live::http_json(&disp, Method::POST, &format!("{base}/signup"), &[], &json!({ "age": 3 })).await?;
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    let v: Value = serde_json::from_slice(&body)?;
+    assert!(v["error"].as_str().is_some_and(|e| e.contains("missing required field \"email\"")), "{v}");
+
+    let (status, _, body) = live::http_json(
+        &disp,
+        Method::POST,
+        &format!("{base}/signup"),
+        &[],
+        &json!({ "email": "a@b.c", "userId": 1 }),
+    )
+    .await?;
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    let v: Value = serde_json::from_slice(&body)?;
+    assert!(v["error"].as_str().is_some_and(|e| e.contains("unknown field \"userId\"")), "{v}");
+
+    let (status, _, body) = live::http_json(
+        &disp,
+        Method::POST,
+        &format!("{base}/signup"),
+        &[],
+        &json!({ "email": "a@b.c", "age": 30 }),
+    )
+    .await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<Value>(&body)?, json!({ "email": "a@b.c", "age": 30 }));
+
+    project.finish().await
+}
+
 /// The fast loop: a route answered with NO install reachable from
 /// outside, no activation and no listener armed.
 ///

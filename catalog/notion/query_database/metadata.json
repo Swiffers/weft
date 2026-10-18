@@ -83,6 +83,7 @@
     {
       "name": "items",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "The matching pages, raw Notion page objects."
     },
     {

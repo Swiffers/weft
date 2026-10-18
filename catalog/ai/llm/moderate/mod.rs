@@ -1,14 +1,14 @@
 //! LlmModerate: content-safety classification through OpenAI's
-//! moderation endpoint (free, no usage caps). The provider must be an
-//! OpenAIProvider, and only its connection is used: moderation has its
-//! own model family, picked on this node's `model`, so the same provider
-//! can feed chat nodes and this one.
+//! moderation endpoint (free, no usage caps). It takes the OpenAI
+//! connection itself on `access` (wired from an OpenAIAccess node, the
+//! same one feeding the chat nodes' OpenAI Model nodes): moderation has
+//! its own model family, picked on this node's `model`.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmModerateNode;
@@ -24,9 +24,13 @@ impl Node for LlmModerateNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        // The provider's own model is a chat model in the usual setup
-        // (one OpenAIProvider for everything); moderation names its own.
-        let (_, account) = super::provider::read_for(&ctx, "openai", "moderation")?;
+        let account: Access = ctx.inputs.get("access")?;
+        if account.service() != "openai" {
+            return Err(WeftError::Input(format!(
+                "moderation speaks the OpenAI API; wire an OpenAIAccess (got a {} connection)",
+                account.service()
+            )));
+        }
         let model: String = ctx.inputs.get("model")?;
         let text: String = ctx.inputs.get("text")?;
 

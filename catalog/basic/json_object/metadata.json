@@ -1,7 +1,7 @@
 {
   "type": "JsonObject",
   "label": "Build an object",
-  "description": "Build one JSON object from wired values (a reply body, a request body): each input becomes a key of the same name, in written order, so `job: open.id` beside `status: \"running\"` is `{\"job\": \"...\", \"status\": \"running\"}`. Nest by wiring another JsonObject's `object` onto a key. Keys are required, so a closed branch skips the node; a key written `key?:` is left out (not null) when nothing arrives.",
+  "description": "Build one JSON object from wired values (a reply body, a request body): each input becomes a key of the same name, in written order, so `job: open.id` beside `status: \"running\"` is `{\"job\": \"...\", \"status\": \"running\"}`. Nest by wiring another JsonObject's `object` onto a key. Keys are required, so a closed branch skips the node; a key written `key?:` is left out (not null) when nothing arrives, and with every key optional and none arriving the object is `{}`. A node whose keys are all optional needs its `_should_flow` wired to what must have happened (`body._should_flow = route.fired`).",
   "tags": [
     "json",
     "object",
@@ -18,7 +18,8 @@
     {
       "name": "object",
       "type": "JsonDict",
-      "description": "The object, keyed by input name in written order. A port declaring a record type accepts it when the shape agrees."
+      "narrowable": true,
+      "description": "The object, keyed by input name in written order. Declare its type to have it held to a record (`-> (object: Signup)`): an object that does not fit fails the node naming the field."
     }
   ],
   "features": {

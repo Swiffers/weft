@@ -1,11 +1,12 @@
 //! ChatHistoryAppend self-tests: appending in stored form to a
 //! conversation file, and the tool-role rules.
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-use weft::storage::{StorageScope, StoredFile};
+use weft::storage::StoredFile;
 use weft::{FakeRig, NodeTest, WeftResult};
 
+use super::super::testing::{conversation, conversation_file};
 use super::ChatHistoryAppendNode;
 
 pub fn tests() -> Vec<NodeTest> {
@@ -20,18 +21,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_tool_result_is_appended_in_place", appends_to_file),
         NodeTest::fake("two_appends_at_once_both_land", appends_at_once),
     ]
-}
-
-/// A conversation as an author starts one: a project file holding it.
-fn conversation_file(rig: &FakeRig, messages: Value) -> Value {
-    rig.store_file_in(&StorageScope::Project, "chat.json", "application/json", serde_json::to_vec(&messages).expect("json"))
-}
-
-/// The conversation the file value `file` names holds now.
-fn conversation(rig: &FakeRig, file: &Value) -> WeftResult<Vec<Value>> {
-    let key = StoredFile::from_value(file)?.key;
-    let written: Value = serde_json::from_slice(&rig.stored_bytes(&key)?).expect("the file holds JSON");
-    Ok(written.as_array().expect("a list of messages").clone())
 }
 
 async fn cache_breakpoint(rig: FakeRig) -> WeftResult<()> {

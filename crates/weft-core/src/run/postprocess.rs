@@ -87,7 +87,9 @@ pub fn postprocess_output(
             let delivered = if edge.path.is_empty() {
                 Some(value.clone())
             } else {
-                match crate::deref::project_value(value, &port.port_type, &edge.path) {
+                // Read off the type the port has where this firing ran.
+                let at = node.types_at(&crate::frames::call_path(frames));
+                match crate::deref::project_value(value, at.output(&port.name).unwrap_or(&port.port_type), &edge.path) {
                     Ok(crate::deref::Projection::Value(v)) => Some(Arc::new(v)),
                     Ok(crate::deref::Projection::Closed { .. }) => None,
                     Err(e) => {
@@ -722,6 +724,8 @@ mod fan_in_tests {
         let n = crate::project::NodeDefinition {
             id: id.into(),
             node_type: "Test".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: Value::Null,
             position: crate::project::Position { x: 0.0, y: 0.0 },

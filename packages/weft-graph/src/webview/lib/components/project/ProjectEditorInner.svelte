@@ -21,13 +21,13 @@
 	import { effectiveAccessValue, installPicksVersion, loadInstallPicks } from "./install-picks.svelte";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
-	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, portValueFirstForm } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, typeVarBoundRefuses, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
 	import InstallSwitch from './InstallSwitch.svelte';
 	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
-	import type { CredentialOwnerKind, EditOp, SourceLocation, TextEdit } from "../../../../protocol";
-	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
+	import type { CredentialOwnerKind, EditOp, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
+	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, expandedOf, expandedToWrite, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
@@ -1110,8 +1110,14 @@
 						// and wrong for a derived one (a hand-authored shadow line
 						// restating the derived shape is the author's only record
 						// of the declaration, and must round-trip).
-						const ins = headerPortSigs(prevInputs, nextInputs, defaults?.defaultInputs);
-						const outs = headerPortSigs(prevOutputs, nextOutputs, defaults?.defaultOutputs);
+						// The inputs a wire feeds: an optional catalog port the
+						// program never wrote is spelled by its wiring, so the
+						// line keeps meaning what the port means now.
+						const wiredInputs = new Set(fold.project.edges
+							.filter((e) => e.target === nodeId && e.targetHandle)
+							.map((e) => e.targetHandle as string));
+						const ins = headerPortSigs(prevInputs, nextInputs, defaults?.defaultInputs, wiredInputs);
+						const outs = headerPortSigs(prevOutputs, nextOutputs, defaults?.defaultOutputs, new Set());
 						// A derived port must not be WRITTEN into the header
 						// unless the source already declares it (a hand-authored
 						// shadow line, which merges cleanly at enrich and must
@@ -1586,6 +1592,9 @@
 					portLiterals: (n as typeof n & { portLiterals?: Record<string, unknown> }).portLiterals,
 					portLiteralSpans: n.portLiteralSpans,
 					features: n.features,
+					// The bounds on the node's type variables, which the wire
+					// gate holds a source to (isValidConnection).
+					typeParams: n.typeParams,
 					// What the compiler said about this node, so the role
 					// predicates read the instance before the catalog, the
 					// way the host does before it starts a poller.
@@ -3140,8 +3149,27 @@
 			if (walked.kind === 'unparsed') return true;
 			sourceType = walked.type;
 		}
+		return wireTypesFit(sourceType, targetType, nodeTypeParams(connection.target!));
+	}
+
+	/** The bounds on a node's type variables: the parse's, or, for a node
+	 *  added here and not parsed yet, its node type's. */
+	function nodeTypeParams(nodeId: string): TypeParamWire[] | undefined {
+		const node = nodes.find(n => n.id === nodeId);
+		if (!node) return undefined;
+		return (node.data.typeParams as TypeParamWire[] | undefined)
+			?? NODE_TYPE_CONFIG[node.data.nodeType as string]?.typeParams;
+	}
+
+	/** May a wire carrying `sourceType` land on a port typed `targetType`
+	 *  of a node bounding its type variables with `targetParams`? The
+	 *  frontend mirror of the compiler's rules; a type this side cannot
+	 *  parse passes (the compiler is the authority on those). */
+	function wireTypesFit(sourceType: string | null, targetType: string | null, targetParams: readonly TypeParamWire[] | undefined): boolean {
+		if (sourceType === null || targetType === null) return true;
 		if (parseWeftType(sourceType) === null || parseWeftType(targetType) === null) return true;
-		return isWeftTypeCompatible(sourceType, targetType);
+		return isWeftTypeCompatible(sourceType, targetType)
+			&& !typeVarBoundRefuses(sourceType, targetType, targetParams);
 	}
 
 	// Track current connection line color based on source handle
@@ -3350,15 +3378,11 @@
 				&& !(origin.data.config as Record<string, string>)?.parentId
 				&& !(wire.handle ?? '').endsWith('__inner');
 			if (originTopLevel) {
-				const compatible = (from: string | null, to: string | null): boolean =>
-					from === null || to === null
-					|| parseWeftType(from) === null || parseWeftType(to) === null
-					|| isWeftTypeCompatible(from, to);
 				const template = NODE_TYPE_CONFIG[type];
 				const originType = handlePortType(wire.nodeId, wire.handle, wire.side);
 				if (wire.side === 'source') {
 					const input = (template?.defaultInputs ?? []).find(
-						p => acceptsWire(p) && compatible(originType, p.portType),
+						p => acceptsWire(p) && wireTypesFit(originType, p.portType, template?.typeParams),
 					);
 					if (input) {
 						const ref = toWeftEdgeRef(wire.nodeId, wire.handle || 'value', id, input.name);
@@ -3366,7 +3390,9 @@
 					}
 				} else if (!vetoLiteralDrivenTarget(wire.nodeId, wire.handle)) {
 					// Dragged backwards from an input: the new node drives it.
-					const output = (template?.defaultOutputs ?? []).find(p => compatible(p.portType, originType));
+					const output = (template?.defaultOutputs ?? []).find(
+						p => wireTypesFit(p.portType, originType, nodeTypeParams(wire.nodeId)),
+					);
 					if (output) {
 						const ref = toWeftEdgeRef(id, output.name, wire.nodeId, wire.handle || 'value');
 						edgeOp = { op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
@@ -4152,6 +4178,10 @@
 	// narrower local type once dropped it silently). toPortSigs writes a
 	// CONTAINER signature, which is its whole surface: the rendered type
 	// IS the spelling there, and declaredType deliberately plays no part.
+	// The one rendered type with a shorter spelling is the port's own
+	// variable (`portVar`), which is what a port written with no type
+	// holds: it goes back as the bare name. `rendered` rides along so the
+	// projection keeps showing the type until the reparse.
 	function toPortSigs(ports: HeaderPortLike[], side: 'input' | 'output'): import('../../../../protocol').EditPortSig[] {
 		// portRequired: the ONE missing-value polarity (Rust's serde
 		// default: not required); rendered ports always carry the flag,
@@ -4162,7 +4192,8 @@
 		return (ports ?? []).map(p => ({
 			name: p.name,
 			required: side === 'output' || portRequired(p),
-			portType: p.portType,
+			portType: p.portType === portVar(side, p.name) ? '' : p.portType,
+			rendered: p.portType,
 		}));
 	}
 

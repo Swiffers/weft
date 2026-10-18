@@ -971,8 +971,8 @@
                     "config": { "parentId": "lp" },
                     "position": { "x": 3.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "results", "portType": "Number", "required": false },
-                        { "name": "done", "portType": "Boolean", "required": false }
+                        { "name": "results", "portType": "Number", "required": false, "optional": true },
+                        { "name": "done", "portType": "Boolean", "required": false, "optional": true }
                     ],
                     "outputs": [{ "name": "results", "portType": "List[Number | Null]", "required": false }],
                     "features": {}, "scope": [],

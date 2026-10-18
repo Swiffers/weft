@@ -1,20 +1,20 @@
-//! OpenAIProvider self-tests: the emitted `LlmProvider` object.
+//! OpenAIModel self-tests: the emitted `LlmProvider` object.
 
 use serde_json::json;
 
 use weft::{FakeRig, NodeTest, WeftResult};
 
-use super::OpenAIProviderNode;
+use super::OpenAIModelNode;
 
 pub fn tests() -> Vec<NodeTest> {
-    vec![NodeTest::fake("emits_kind_model_and_the_picked_connection", emits_provider)]
+    vec![NodeTest::fake("emits_kind_model_and_the_wired_connection", emits_provider)]
 }
 
 async fn emits_provider(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
-            &OpenAIProviderNode,
-            json!({ "connection": rig.access("openai"), "model": "gpt-4o-mini" }),
+            &OpenAIModelNode,
+            json!({ "access": rig.access("openai"), "model": "gpt-4o-mini" }),
         )
         .await
         .ok()?;

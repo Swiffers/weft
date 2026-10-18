@@ -20,7 +20,9 @@
 //! and a caller checking `"error" in body` must not be told yes by a
 //! key we invented. Every created key is required unless it carries
 //! `?`, so an absent REQUIRED key skips this node entirely (the engine
-//! does that before the body runs) and nothing half-built escapes.
+//! does that before the body runs) and nothing half-built escapes. With
+//! every key optional and none arriving, the object is `{}`: the node
+//! ran because its gate said so, and an empty object is the true answer.
 
 use async_trait::async_trait;
 
@@ -50,14 +52,14 @@ impl Node for JsonObjectNode {
         for (key, value) in ctx.inputs.in_order()? {
             object.insert(key.clone(), value.clone());
         }
-        // An empty object is almost always a node somebody added and
-        // never wired, and it would travel on as `{}` with nothing on
-        // screen saying why. The one case that wants a literal `{}` can
-        // write it as a literal, since no wire is involved.
-        if object.is_empty() {
+        // A JsonObject with no keys at all is a node somebody added and
+        // never wired, and `{}` from it would say nothing about why.
+        // Every optional key staying silent is different: the keys
+        // exist, and `{}` is the true answer.
+        if ctx.declared_inputs().is_empty() {
             return Err(weft::node_error(
-                "nothing is wired onto this JsonObject, so there are no keys to build. \
-                 Wire a value onto it for each key you want, naming the key",
+                "this JsonObject has no keys, so there is nothing to build. Wire a value onto \
+                 it for each key you want, naming the key",
             ));
         }
         ctx.pulse_downstream(NodeOutput::new().set("object", serde_json::Value::Object(object)))

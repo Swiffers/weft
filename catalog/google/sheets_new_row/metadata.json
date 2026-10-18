@@ -115,6 +115,7 @@
     {
       "name": "row",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "Keyed by the header (c0, c1, ... without one)."
     },
     {

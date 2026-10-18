@@ -102,6 +102,7 @@
     {
       "name": "record",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The created record (id, createdTime, fields)."
     }
   ],

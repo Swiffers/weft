@@ -4,9 +4,9 @@
 //! The query's parameters are the node's own input ports, declared
 //! inline and read by name in the SQL:
 //!
-//!     lookup = PostgresExecuteQuery(user_id: String) {
+//!     lookup = PostgresExecuteQuery(userId: String) -> (row: User) {
 //!       account: db.access
-//!       query: "SELECT * FROM users WHERE telegram_id = $user_id"
+//!       query: "SELECT * FROM users WHERE telegram_id = $userId"
 //!     }
 //!
 //! Every `$name` binds the port of that name (typed the way the
@@ -18,20 +18,19 @@
 //! protocol, each with the ports it names, inside one transaction.
 //! Either way the rows of the LAST statement come back.
 //!
-//! Custom output ports (`-> (sheet: String)`) read the first row's
-//! columns by name, so a one-row query hands each value out as its
-//! own port without a Python node in between.
+//! They come back twice from the one result: every row on `rows`, the
+//! first on `row`. Both are narrowable, so a program that knows the
+//! shape declares it (`-> (row: User)` with `type User = { id: String,
+//! name: String, .. }`) and the emit check holds every row to it. With
+//! no rows `row` closes, unless the program typed it to admit null
+//! (`-> (row: User | Null)`), which reads as "no such row" instead.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, NodeOutput, WeftResult};
 
-use super::postgres::{
-    connect, plan, ports_read, query_json, refuse_shadowed_columns, refuse_unanswered_ports,
-    script_json, steps_json, Plan,
-    Statement,
-};
+use super::postgres::{connect, plan, ports_read, query_json, script_json, steps_json, Plan, Statement};
 
 #[derive(NodeManifest)]
 pub struct PostgresExecuteQueryNode;
@@ -50,10 +49,11 @@ impl Node for PostgresExecuteQueryNode {
         let account: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
         let plan = plan(&query)?;
-        // The placeholders and the node's own custom ports have to
-        // match both ways; the ctx owns that matching (the Format node
-        // has the same job with `{{name}}` holes) and names whichever
-        // side is short. A script reads no port, so it declares none.
+        // The placeholders and the inputs the program added have to
+        // match both ways. The compiler checks the query written in the
+        // source (`placeholdersAreInputs`); one arriving on a wire is
+        // checked here, by the ctx, which names whichever side is
+        // short. A script reads no port, so it declares none.
         let names = ports_read(&plan);
         let values: Vec<&Value> = ctx.inputs.for_holes(
             &names,
@@ -88,17 +88,27 @@ impl Node for PostgresExecuteQueryNode {
                 steps_json(&mut client, &bound).await?
             }
         };
-        let count = rows.len() as f64;
-        // Custom outputs read the first row's columns by name; a
-        // query that answered no rows leaves them unmentioned, which
-        // closes them.
-        let first = rows.first().cloned().unwrap_or(Value::Null);
-        // A column named like one of this node's own ports would be
-        // overwritten by the node a line below, silently.
-        refuse_shadowed_columns(&first, &["rows", "count"])?;
-        // ...and a port the author declared that no column answers.
-        refuse_unanswered_ports(&first, &ctx.data_outputs(), &["rows", "count"])?;
-        let output = ctx.fan_declared(&first).set("rows", json!(rows)).set("count", count);
-        ctx.pulse_downstream(output).await
+        emit(&ctx, rows).await
     }
+}
+
+/// Send one answered result ([`answer`]), reading off the program's
+/// declaration of `row` whether it takes `null`.
+pub async fn emit(ctx: &RunContext, rows: Vec<Value>) -> WeftResult<()> {
+    let row_admits_null = ctx.output_type("row")?.contains_null();
+    ctx.pulse_downstream(answer(rows, row_admits_null)).await
+}
+
+/// What one answered result emits: `rows` (`[]` for none) and `count`
+/// always, and `row` the first row. With no rows, `row` carries `null`
+/// when the program typed it to admit null, and is left out otherwise,
+/// which closes it.
+pub fn answer(rows: Vec<Value>, row_admits_null: bool) -> NodeOutput {
+    let mut output = NodeOutput::new().set("count", rows.len() as f64);
+    match rows.first() {
+        Some(first) => output = output.set("row", first.clone()),
+        None if row_admits_null => output = output.set("row", Value::Null),
+        None => {}
+    }
+    output.set("rows", Value::Array(rows))
 }

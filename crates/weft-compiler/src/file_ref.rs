@@ -107,11 +107,11 @@ pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
                  Image, Video, Audio, Blob for a file, or a text type such as String"
             )));
         }
-        (Some(t), _) => match WeftType::parse(t.trim()) {
-            Some(ty) => ty,
-            None => return Some(Err(format!(
-                "{name}: invalid type {:?}; a file kind is Image, Video, Audio or Blob, a text kind \
-                 is String, Number, Boolean, JsonDict, JsonList or a JSON shape",
+        (Some(t), _) => match WeftType::try_parse(t.trim()) {
+            Ok(ty) => ty,
+            Err(why) => return Some(Err(format!(
+                "{name}: invalid type {:?} ({why}); a file kind is Image, Video, Audio or Blob, a \
+                 text kind is String, Number, Boolean, JsonDict, a List or a record shape",
                 t.trim()
             ))),
         },

@@ -28,14 +28,14 @@ describe('skipReasonText', () => {
 			"nothing ever answered its `_should_flow` because 'query' failed: the database is down",
 		],
 		[
-			{ kind: 'every_input_closed', failure: down },
-			"every input closed because 'query' failed: the database is down",
+			{ kind: 'nothing_joined', failure: down },
+			"none of the branches it joins delivered because 'query' failed: the database is down",
 		],
+		[{ kind: 'nothing_joined' }, 'none of the branches it joins delivered'],
 		[
 			{ kind: 'one_of_group_closed', ports: ['a', 'b'], failure: down },
 			"every input of the group (a, b) closed because 'query' failed: the database is down",
 		],
-		[{ kind: 'every_input_closed' }, 'every input closed'],
 		[
 			{ kind: 'one_of_group_closed', ports: ['a', 'b'] },
 			'every input of the group (a, b) closed',

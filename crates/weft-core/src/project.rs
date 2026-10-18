@@ -329,6 +329,23 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
+    /// The bounds on this node's type variables: its node type's
+    /// `typeParams` and the ones the program wrote on it
+    /// (`ExecPython[T: Media](...)`, or on the group a boundary halves,
+    /// which both its boundaries carry). Each carries what its variable
+    /// resolved to once enrich has run; validate holds the two together.
+    // SYNC: type_params <-> packages/weft-graph/src/protocol.ts NodeDefinition.typeParams
+    #[serde(default, rename = "typeParams", skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<crate::weft_type::TypeParam>,
+    /// The port types this node has at each place it runs, when they
+    /// differ from one place to another: a node inside an included file
+    /// whose type variables a site resolves its own way (`blur` included
+    /// once for an Image, once for a Video). One entry per place; empty
+    /// when every place agrees, the node's own port types being the types
+    /// at all of them. [`Self::types_at`] is the one reading.
+    // SYNC: NodeDefinition.place_types <-> packages/weft-graph/src/protocol.ts NodeDefinition.placeTypes
+    #[serde(default, rename = "placeTypes", skip_serializing_if = "Vec::is_empty")]
+    pub place_types: Vec<PlaceTypes>,
     /// `true` if this node implements `Node::provision_infra` and the
     /// dispatcher must run InfraSetup before activate. Mirrored from
     /// NodeMetadata.requires_infra at enrich time.
@@ -549,6 +566,20 @@ impl NodeDefinition {
     /// (synthetic nodes carry no header). The single home for "point a
     /// diagnostic at this node's header line", so every diagnostic site uses
     /// the same fallback rather than repeating `header_span.unwrap_or_default()`.
+    /// This node's port types at the place `path` reaches (an include
+    /// call path, outermost site first; empty at the top).
+    pub fn types_at<S: AsRef<str>>(&self, path: &[S]) -> TypesAt<'_> {
+        TypesAt { node: self, place: self.place_of(path).map(|index| &self.place_types[index]) }
+    }
+
+    /// Which [`Self::place_types`] entry is the place `path` reaches,
+    /// `None` when the node's own types are the types there.
+    pub fn place_of<S: AsRef<str>>(&self, path: &[S]) -> Option<usize> {
+        self.place_types.iter().position(|p| {
+            p.place.len() == path.len() && p.place.iter().zip(path).all(|(a, b)| a == b.as_ref())
+        })
+    }
+
     pub fn header_span_or_default(&self) -> Span {
         self.header_span.unwrap_or_default()
     }
@@ -637,12 +668,17 @@ pub struct InputDefinition {
     // SYNC: InputDefinition.accepts <-> packages/weft-graph/src/protocol.ts InputDefinition.accepts, packages/weft-connect/src/core/wire.ts InputDefinition.accepts
     #[serde(default = "Accepts::both")]
     pub accepts: Accepts,
-    /// Optional while unwired, required once wired (mirrored from the
-    /// metadata's `requiredWhenWired`): a wire into it that arrives
-    /// closed skips the node. [`Self::is_required`] is the one reading.
-    // SYNC: InputDefinition.required_when_wired <-> packages/weft-connect/src/core/wire.ts InputDefinition.requiredWhenWired
-    #[serde(default, rename = "requiredWhenWired", skip_serializing_if = "std::ops::Not::not")]
-    pub required_when_wired: bool,
+    /// The node runs without this input even when it is wired and the
+    /// wire closed (nothing arrived, or its source failed): the program
+    /// wrote `x?: T` (or a key creating the port, `x?:`), or the compiler
+    /// made the port to pass an absence on (a group boundary, a gate).
+    /// An input that is neither `required` nor `optional` is the default
+    /// for one the node's metadata calls optional: unwired the node runs
+    /// without it, wired it is required. [`Self::is_required`] is the one
+    /// reading.
+    // SYNC: InputDefinition.optional <-> packages/weft-graph/src/protocol.ts InputDefinition.optional, packages/weft-connect/src/core/wire.ts InputDefinition.optional
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
     /// The input's effective editor widget (declared, else derived from
     /// the RESOLVED instance type after TypeVar substitution). Always
     /// present after enrich.
@@ -694,7 +730,60 @@ pub struct InputDefinition {
     pub requires_values: Option<Vec<String>>,
 }
 
+/// A node's port types at one place it runs ([`NodeDefinition::place_types`]):
+/// the call path that reaches it (each include site's id, outermost
+/// first), and every port's type there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceTypes {
+    pub place: Vec<String>,
+    pub inputs: std::collections::BTreeMap<String, WeftType>,
+    pub outputs: std::collections::BTreeMap<String, WeftType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<crate::weft_type::TypeParam>,
+}
+
+/// One node's port types at one place: the node's own, or its
+/// [`PlaceTypes`] entry for that place.
+pub struct TypesAt<'a> {
+    node: &'a NodeDefinition,
+    place: Option<&'a PlaceTypes>,
+}
+
+impl<'a> TypesAt<'a> {
+    /// The type of input `port` here.
+    pub fn input(&self, port: &str) -> Option<&'a WeftType> {
+        match self.place {
+            Some(place) => place.inputs.get(port),
+            None => self.node.inputs.iter().find(|p| p.name == port).map(|p| &p.port_type),
+        }
+    }
+
+    /// The type of output `port` here.
+    pub fn output(&self, port: &str) -> Option<&'a WeftType> {
+        match self.place {
+            Some(place) => place.outputs.get(port),
+            None => self.node.outputs.iter().find(|p| p.name == port).map(|p| &p.port_type),
+        }
+    }
+
+    /// The node's type parameters here, each with what it resolved to.
+    pub fn type_params(&self) -> &'a [crate::weft_type::TypeParam] {
+        match self.place {
+            Some(place) => &place.type_params,
+            None => &self.node.type_params,
+        }
+    }
+}
+
 impl PortDefinition {
+    /// Whether the header that declares this port, on `side`, wrote no
+    /// type for it (`(x)`), or one that did not parse: its type is then
+    /// its own variable ([`WeftType::port_var`]), taken from what is wired.
+    pub fn is_untyped(&self, side: crate::weft_type::PortSide) -> bool {
+        self.port_type == WeftType::port_var(side, &self.name)
+    }
+
     /// Whether this port carries a stream (`Generator[T]`). THE one
     /// reading of a port's type for that question; the node-level
     /// readers in `run::ready` are built on it.
@@ -706,19 +795,21 @@ impl PortDefinition {
 impl InputDefinition {
     /// Whether a closed value on this input skips the node, given
     /// whether a wire feeds it where the node fires: always for a
-    /// required input, and for a `requiredWhenWired` one only when wired.
+    /// required input, never for an `optional` one, and otherwise only
+    /// when wired.
     pub fn is_required(&self, wired: bool) -> bool {
-        self.required || (wired && self.required_when_wired)
+        self.required || (wired && !self.optional)
     }
 
     /// An input for a pure WIRE port (a boundary passthrough side, a
     /// source-declared custom port): drivers from the type, no editor
-    /// surface beyond what enrich later stamps.
+    /// surface beyond what enrich later stamps. Not `optional`: a port
+    /// that runs without a closed wire says so with [`Self::with_optional`].
     pub fn from_wire_port(port: PortDefinition) -> Self {
         Self {
             accepts: Accepts::for_type(&port.port_type),
             port,
-            required_when_wired: false,
+            optional: false,
             widget: None,
             default: None,
             label: None,
@@ -729,6 +820,15 @@ impl InputDefinition {
         }
     }
 
+}
+
+impl InputDefinition {
+    /// This input, marked to run without a value even when wired and the
+    /// wire closed when `optional` (see [`Self::optional`]).
+    pub fn with_optional(mut self, optional: bool) -> Self {
+        self.optional = optional;
+        self
+    }
 }
 
 impl std::ops::Deref for InputDefinition {
@@ -1470,6 +1570,8 @@ mod infra_triggers_depend_on_tests {
         NodeDefinition {
             id: id.into(),
             node_type: "Any".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -1794,7 +1896,7 @@ mod project_wire_tests {
                 declared_type: None,
             },
             accepts: Accepts::wire_only(),
-            required_when_wired: false,
+            optional: false,
             widget: None,
             default: None,
             label: None,
@@ -1806,6 +1908,8 @@ mod project_wire_tests {
         let node = NodeDefinition {
             id: "g.n".into(),
             node_type: "Llm".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: default_config(),
             position: Position { x: 0.0, y: 0.0 },
@@ -1906,6 +2010,8 @@ mod project_wire_tests {
         NodeDefinition {
             id: id.into(),
             node_type: "Any".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: default_config(),
             position: Position { x: 0.0, y: 0.0 },

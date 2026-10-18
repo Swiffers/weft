@@ -76,11 +76,13 @@
     {
       "name": "dataCollection",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "Each data collection item's id and the value ElevenLabs found for it in the conversation, once the analysis is done: the items Agent: Create's `dataCollection` set up."
     },
     {
       "name": "evaluation",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "Each success criterion's id and its result (`success`, `failure` or `unknown`), once the analysis is done: the criteria Agent: Create's `evaluationCriteria` set up."
     },
     {

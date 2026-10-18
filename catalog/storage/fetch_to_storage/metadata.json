@@ -58,6 +58,7 @@
     {
       "name": "file",
       "type": "File",
+      "narrowable": true,
       "description": "The stored file."
     },
     {

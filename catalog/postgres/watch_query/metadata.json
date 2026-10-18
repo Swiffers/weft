@@ -1,7 +1,7 @@
 {
   "type": "PostgresWatchQuery",
   "label": "Postgres: Watch query",
-  "description": "Keep a query's result live: run it now and on a cadence, and send the rows on the `rows` bus each time they differ from last time (pipe it into a Stream behind a Route for a live page). Parameters are inline-declared input ports read by name (`$user_id`), as in Postgres: Query; one statement only. With `channel` set it also LISTENs, so a `NOTIFY` from the database re-runs the query at once. A declared output port named after a column (`-> (count: Bus)`) gets that column of the first row as its own bus, so `select count(*)` sends `7` rather than `[{\"count\": 7}]`. A tick with no rows sends nothing on those ports and leaves them open. Runs until the run ends, then the buses close.",
+  "description": "Keep a query's result live: run it now and on a cadence, and send it on the `rows` bus (every row) and the `row` bus (the first row) each time it differs from last time (pipe one into a Stream behind a Route for a live page). Parameters are inline-declared input ports read by name (`$userId`), as in Postgres: Query, and the build checks them the same way; one statement only. With `channel` set it also LISTENs, so a `NOTIFY` from the database re-runs the query at once. A result with no rows sends `[]` on `rows` and `null` on `row`, and both stay open, since the next run may answer some. Runs until the run ends, then the buses close.",
   "tags": [
     "postgres",
     "database",
@@ -64,27 +64,20 @@
     {
       "name": "rows",
       "type": "Bus",
-      "description": "One message per change carrying the whole row list (the first right after start)."
+      "description": "One message per change carrying every row, `[]` when the query answers none (the first right after start)."
+    },
+    {
+      "name": "row",
+      "type": "Bus",
+      "description": "One message each time the first row changes, carrying that row, or `null` while the query answers none (the first right after start)."
     }
   ],
   "features": {
-    "canAddOutputPorts": true,
-    "addedPortsAreDataKeys": true,
-    "canAddInputPorts": true
+    "canAddInputPorts": true,
+    "addedPortsAreDataKeys": true
   },
-  "validate": [
-    {
-      "when": {
-        "kind": "config_matches",
-        "field": "query",
-        "regex": "(?i)\\bas\\s+\"?rows\"?\\b"
-      },
-      "then": {
-        "message": "'{id}' aliases a column to `rows`, which is this node's own output (the whole result, on a bus). A column of that name has nowhere to go. Alias it to something else in the SQL and declare a port for that name.",
-        "level": "structural",
-        "severity": "error",
-        "field": "query"
-      }
-    }
-  ]
+  "placeholdersAreInputs": {
+    "in": "query",
+    "pattern": "(?s)--[^\\n]*|/\\*.*?\\*/|[Ee](?:'(?:[^'\\\\]|\\\\.)*')+|(?:'[^']*')+|(?:\"[^\"]*\")+|\\$(?<tag>(?:[A-Za-z_][[:word:]]*)?)\\$.*?\\$\\k<tag>\\$|[[:word:]]+(?:\\$[[:word:]]+)*\\$?|\\$(?<name>[A-Za-z_][[:word:]]*)"
+  }
 }

@@ -30,7 +30,7 @@
     },
     {
       "name": "pages",
-      "type": "List[JsonDict]",
+      "type": "List[{ index: Number, markdown: String }]",
       "description": "Each page: index and markdown."
     },
     {

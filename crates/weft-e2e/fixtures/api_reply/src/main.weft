@@ -2,7 +2,7 @@
 # answered by a Reply or a Close. The rig calls each and asserts status,
 # headers and body.
 #
-#   POST hello        a declared body key, a computed body, a 201 with a header
+#   POST hello        a typed body read by key, a computed body, a 201 with a header
 #   GET  users/{id}   a path capture and the query; 200 for id 42, 404 otherwise
 #   POST say (text)   a text route: the whole body on one port, echoed as text
 #   DELETE gone       a bodiless answer through Close, ordered by a decision
@@ -10,30 +10,36 @@
 #                     outcome, a Reply on one case, a Close with a reason on the other
 #   GET  slow         an answer that takes a few seconds, for taking the triggers
 #                     down while a call is running
+#   POST note         every body field optional, built back into an object: a
+#                     caller sending `{}` gets `{}`
+#   POST signup       a typed body: one that does not fit is answered 400 naming
+#                     the field, before the run starts
 
-hello = Route -> (name: String) { path: "__E2E_PATH__/hello", method: "POST" }
+type Signup = { email: String, age?: Number }
+
+hello = Route -> (body: { name: String, .. }) { path: "__E2E_PATH__/hello", method: "POST" }
 greet = ExecPython(name: String, path: String, headers: Dict[String, String]) -> (body: JsonDict) {
   code: "return {'body': {'greeting': 'hello ' + name, 'path': path, 'agent': headers.get('user-agent', '')}}"
 }
-greet.name = hello.name
+greet.name = hello.body.name
 greet.path = hello.path
 greet.headers = hello.headers
 answer = Reply { status: 201, headers: { "x-run": "e2e" } }
 answer.body = greet.body
 
-user = Route { path: "__E2E_PATH__/users/{id}", method: "GET" }
-lookup = ExecPython(params: Dict[String, String], query: Dict[String, String]) -> (body: JsonDict, status: Number) {
-  code: "uid = params['id']\nif uid == '42':\n    return {'body': {'id': uid, 'name': 'Ada', 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
+user = Route -> (id: String) { path: "__E2E_PATH__/users/{id}", method: "GET" }
+lookup = ExecPython(id: String, query: Dict[String, String]) -> (body: JsonDict, status: Number) {
+  code: "uid = id\nif uid == '42':\n    return {'body': {'id': uid, 'name': 'Ada', 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
 }
-lookup.params = user.params
+lookup.id = user.id
 lookup.query = user.query
 found = Reply
 found.body = lookup.body
 found.status = lookup.status
 
-say = Route -> (line: String) { path: "__E2E_PATH__/say", method: "POST", dataType: "text" }
+say = Route -> (body: String) { path: "__E2E_PATH__/say", method: "POST", dataType: "text" }
 shout = ExecPython(line: String) -> (out: String) { code: "return {'out': line.upper()}" }
-shout.line = say.line
+shout.line = say.body
 loud = Reply
 loud.body = shout.out
 
@@ -46,11 +52,11 @@ bye._should_flow = when_gone.ok
 # The pattern the skills teach for "do this, and if it did not work, stop
 # here": a Switch on the outcome, the passing case gating the Reply and the
 # failing case gating a Close whose `reason` is the body under its `status`.
-sweep = Route { path: "__E2E_PATH__/sweep/{what}", method: "DELETE" }
-clear = ExecPython(params: Dict[String, String]) -> (removed: Number) {
-  code: "return {'removed': 3 if params['what'] == 'cards' else 0}"
+sweep = Route -> (what: String) { path: "__E2E_PATH__/sweep/{what}", method: "DELETE" }
+clear = ExecPython(what: String) -> (removed: Number) {
+  code: "return {'removed': 3 if what == 'cards' else 0}"
 }
-clear.params = sweep.params
+clear.what = sweep.what
 outcome = Switch {
   value: clear.removed
   cases: [
@@ -81,3 +87,13 @@ nap = ExecPython(path: String) -> (body: JsonDict) { code: "import time\ntime.sl
 nap.path = slow.path
 rested = Reply
 rested.body = nap.body
+
+note = Route -> (body: { title?: String, note?: String }) { path: "__E2E_PATH__/note", method: "POST" }
+echo = JsonObject { title?: note.body.title, note?: note.body.note }
+echo._should_flow = note.fired
+noted = Reply
+noted.body = echo.object
+
+signup = Route -> (body: Signup) { path: "__E2E_PATH__/signup", method: "POST" }
+welcome = Reply
+welcome.body = signup.body

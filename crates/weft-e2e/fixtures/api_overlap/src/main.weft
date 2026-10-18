@@ -4,6 +4,6 @@
 # projects already serve. Activation must refuse the second, naming the
 # overlap, before any route is armed.
 
-a = Route { path: "__E2E_PATH__/chat/{a}", method: "POST" }
+a = Route -> (room: String) { path: "__E2E_PATH__/chat/{room}", method: "POST" }
 ra = Reply
-ra.body = a.params
+ra.body = a.room

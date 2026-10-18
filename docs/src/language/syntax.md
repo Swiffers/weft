@@ -131,6 +131,51 @@ convert = Cast -> (value: Boolean)
 Those are fragments: the nodes still need their other required inputs before
 they can run.
 
+### Optional and required inputs
+
+A node's metadata says which of its inputs it can run without. Where you use
+the node, you can declare the input yourself: without `?` it is required, and
+with `?` the node runs without it. If the metadata requires that input, the `?`
+is a compile error.
+
+| What the node's metadata says | What the program writes | Result |
+|---|---|---|
+| required | nothing | always required |
+| required | `x?: T` | compile error naming the port: the node's code needs it |
+| optional | nothing | unwired: runs without it. Wired: waits for it, and skips if the wire closes |
+| optional | `x: T` (no `?`) | always required |
+| optional | `x?: T` | runs without it even when wired and the wire closed, whether nothing arrived or the source failed |
+
+A wire closes when its source finished without sending on that port, or
+failed. A node that skips closes its own outputs in turn.
+
+If you want the build to refuse a node until something fills an input,
+declare that input without `?`. `SlackSendMessage` takes `text` or `blocks`, so neither is
+required on its own, but this message must have text:
+
+```weft
+send = SlackSendMessage(text: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+}
+```
+
+If you want a node to run when a wire into it brings nothing, write the `?`.
+Here `ask` is a `SlackReceiveMessage`, whose `thread` sends nothing when the
+message was not in a thread. With `threadTs?`, such a message gets its answer
+at the top of the channel. Without the `?`, `answer` waits for `threadTs` and
+skips:
+
+```weft
+answer = SlackSendMessage(threadTs?: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+  threadTs: ask.thread
+}
+```
+
 ### Extra inputs
 
 Some nodes, `ExecPython` and `FirstInOrder` among them, let you invent input
@@ -149,9 +194,11 @@ summary = ExecPython -> (out: String) {
 `limit` becomes a `Number`. `text` takes whatever type `draft.answer` has. A
 bare `null` gives it nothing to work from, so that fails.
 
-The `?` on `notes?` makes it optional, so a closed arrow there does not skip
-the node. That spelling only works when you are creating the port; to make a
-port optional in a full signature, write `notes?: String` there instead.
+The `?` on `notes?` works like `x?: T` in the table above: the node runs
+without `notes` even when its wire closes. Without the `?`, a port you create
+this way is required. That spelling only works when you are creating the port;
+for a port the node already has, write the `?` in the signature, like
+`(threadTs?: String)`.
 
 Extra inputs stay in the order you wrote them, which matters for
 `FirstInOrder`, since it takes the first one that supplied a value.

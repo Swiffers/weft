@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::bus::BusOptions;
-use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::call;
@@ -64,9 +63,7 @@ impl Node for LlmStreamNode {
         drop(bus); // the close IS the end-of-stream signal
 
         let response = stream.collect().await.map_err(|e| llm.call_error(e))?;
-        let output = call::finish(&ctx, llm, &response, NodeOutput::new())
-            .await?
-            .set("response", response.content.clone());
+        let output = call::finish(&ctx, llm, &response, call::reply_text).await?;
         ctx.pulse_downstream(output).await
     }
 }

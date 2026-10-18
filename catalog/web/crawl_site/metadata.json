@@ -39,7 +39,7 @@
   "outputs": [
     {
       "name": "pages",
-      "type": "List[JsonDict]",
+      "type": "List[{ url: String | Null, title: String | Null, markdown: String }]",
       "description": "Each page: url, title, markdown."
     },
     {

@@ -1,6 +1,6 @@
 import type { PortDefinition, PortType } from '../types';
-import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
-import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
+import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
+import { parseWeftType, substituteTypeVars, weftTypeToWireString, type WeftType } from '../types';
 
 // The wire types ARE the webview's types: `PortType` is a plain string,
 // so nothing narrows. The shorter local names stay because this module
@@ -115,41 +115,12 @@ function resolvePortName(template: string, key: string): string {
 // SYNC: AUTO_TYPE_VAR_MARKER <-> crates/weft-core/src/node.rs AUTO_TYPE_VAR
 const AUTO_TYPE_VAR_MARKER = 'T_Auto';
 
-/** Recursively replace every `T_Auto` marker in a parsed WeftType with a
- *  TypeVar scoped to the field key. Every container arm recurses, so a
- *  nested placeholder scopes exactly like a top-level one.
+/** Replace every `T_Auto` marker in a parsed WeftType, at any depth,
+ *  with a TypeVar scoped to the field key.
  *  SYNC: materializeAutoTypeVars <-> crates/weft-core/src/node.rs materialize_auto_type_vars */
 function materializeAutoTypeVars(t: WeftType, key: string): WeftType {
-	switch (t.kind) {
-		case 'typevar':
-			if (t.name === AUTO_TYPE_VAR_MARKER) {
-				return { kind: 'typevar', name: `T__${key}` };
-			}
-			return t;
-		case 'list':
-			return { kind: 'list', inner: materializeAutoTypeVars(t.inner, key) };
-		case 'dict':
-			return {
-				kind: 'dict',
-				key: materializeAutoTypeVars(t.key, key),
-				value: materializeAutoTypeVars(t.value, key),
-			};
-		case 'union':
-			return { kind: 'union', types: t.types.map(x => materializeAutoTypeVars(x, key)) };
-		case 'record':
-			return {
-				kind: 'record',
-				fields: t.fields.map(f => ({ ...f, ty: materializeAutoTypeVars(f.ty, key) })),
-			};
-		case 'generator':
-			return { kind: 'generator', inner: materializeAutoTypeVars(t.inner, key) };
-		// No 'named' case: a declared body is concrete by construction
-		// (the Rust registry and wire parser both refuse a type
-		// variable inside one), so there is never a T_Auto to
-		// materialize beneath an alias.
-		default:
-			return t;
-	}
+	return substituteTypeVars(t, (name) =>
+		name === AUTO_TYPE_VAR_MARKER ? { kind: 'typevar', name: portVar('input', key) } : undefined);
 }
 
 /** Replace T_Auto markers in a port type string with key-scoped TypeVar names.

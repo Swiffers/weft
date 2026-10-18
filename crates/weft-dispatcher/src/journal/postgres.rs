@@ -1086,14 +1086,10 @@ impl Journal for PostgresJournal {
         // in the same order.
         let locked = weft_journal::record::lock_in(&mut tx, run_id).await?;
         // The wake signals go: a fire that resolves its signal row after
-        // this commits finds nothing to wake.
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
-            .bind(run_id)
-            .fetch_all(&mut *tx)
-            .await
-            .context("cancel_run: strip the run's signals: read a signal row")?;
-        let removed: Vec<SignalRegistration> = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
-        let mut write = CancelWrite { removed, ..CancelWrite::default() };
+        // this commits finds nothing to wake. The run is cancelled, so each
+        // wait's last call is queued with them.
+        let (removed, cancel_calls) = remove_run_waits_in(&mut tx, run_id, true).await.context("cancel_run")?;
+        let mut write = CancelWrite { removed, cancel_calls, ..CancelWrite::default() };
         match locked {
             Some(locked) if locked.state == "ended" => {}
             Some(locked) if locked.owner.is_some() => {
@@ -1678,12 +1674,25 @@ impl Journal for PostgresJournal {
         &self,
         run_id: RunId,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
-            .bind(run_id)
-            .fetch_all(&self.pool)
-            .await
-            .context("signal_remove_for_run_id: read a signal row")?;
-        rows.into_iter().map(row_to_signal).collect()
+        let mut tx = self.pool.begin().await?;
+        // Whether the run was cancelled, which a wait registered after the
+        // cancel (or a lost fast run, ended cancelled with its waits left
+        // for here) needs to send its last call. Read, never locked: the
+        // caller (`crate::run_ends`) holds the ended run's row in a
+        // transaction of its own while this runs, and an ended run's
+        // outcome no longer moves.
+        // The outcome alone decides: a cancel asked of a run that finished
+        // before its worker saw it left the run completed or failed, and
+        // its waits send nothing.
+        let cancelled: bool = sqlx::query_scalar("SELECT COALESCE(outcome = 'cancelled', FALSE) FROM run WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        let (removed, _) = remove_run_waits_in(&mut tx, run_id, cancelled).await.context("signal_remove_for_run_id")?;
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        Ok(removed)
     }
 
     async fn signal_remove_for_project(
@@ -1692,6 +1701,69 @@ impl Journal for PostgresJournal {
     ) -> anyhow::Result<Vec<SignalRegistration>> {
         remove_project_signals(&self.pool, project_id).await
     }
+}
+
+/// Take every wait of `run_id` down in the caller's transaction, and when
+/// the run was `cancelled`, queue the last call of each wait that carries
+/// one (`weft_task_store::TaskKind::CancelCall`) in the same commit, so the
+/// outside service hears of the cancel even if this process dies right
+/// after. THE removal of a run's waits: the cancel and the ending of a run
+/// that held waits both come through here, so a wait is told of its run's
+/// cancel however it went (registered after the cancel, or ended with its
+/// run lost). Answers the waits removed and how many calls were queued.
+async fn remove_run_waits_in(
+    tx: &mut sqlx::PgConnection,
+    run_id: RunId,
+    cancelled: bool,
+) -> anyhow::Result<(Vec<SignalRegistration>, usize)> {
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
+        .bind(run_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("strip the run's signals: read a signal row")?;
+    let removed: Vec<SignalRegistration> = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
+    let cancel_calls = match cancelled {
+        true => queue_cancel_calls_in(tx, &removed).await?,
+        false => 0,
+    };
+    Ok((removed, cancel_calls))
+}
+
+/// Queue, in the caller's transaction, the last call of each of `waits`
+/// that carries one (`weft_task_store::TaskKind::CancelCall`), for waits
+/// just taken down because their run was cancelled. Answers how many it
+/// queued (a call already queued for the same wait is not queued again).
+async fn queue_cancel_calls_in(tx: &mut sqlx::PgConnection, waits: &[SignalRegistration]) -> anyhow::Result<usize> {
+    let mut queued = 0;
+    for wait in waits {
+        let call = match wait.cancel_call() {
+            Ok(Some(call)) => call,
+            Ok(None) => continue,
+            // Registration validated the spec, so this row was written
+            // past that check; the waits still go.
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_dispatcher::cancel",
+                    run_id = ?wait.run_id, token = %wait.token, error = %format!("{e:#}"),
+                    "a cancelled wait's spec cannot be read, so whether it carries a last call is unknown; none is sent"
+                );
+                continue;
+            }
+        };
+        let task = weft_task_store::tasks::NewTask {
+            kind: weft_task_store::TaskKind::CancelCall,
+            project_id: Some(wait.project_id),
+            dedup_key: Some(weft_task_store::kinds::cancel_call_key(&wait.token)),
+            run_id: wait.run_id,
+            tenant_id: wait.tenant_id.clone(),
+            payload: serde_json::to_value(&call).context("a last call's payload")?,
+        };
+        let outcome = weft_task_store::tasks::enqueue_dedup_in(&mut *tx, task).await.context("queue a last call")?;
+        if matches!(outcome, weft_task_store::tasks::DedupOutcome::Inserted(_)) {
+            queued += 1;
+        }
+    }
+    Ok(queued)
 }
 
 /// Erase every trace of these runs, inside the caller's transaction.
@@ -1755,7 +1827,22 @@ pub(crate) async fn erase_project_runs(tx: &mut sqlx::PgConnection, project_id: 
         .bind(project_id)
         .fetch_all(&mut *tx)
         .await?;
+    // Removing the project ends the runs it had not ended yet (a run whose
+    // cancel its worker had not written when the worker was retired):
+    // their waits go out like a cancelled run's, with their last calls.
+    // A run that ended any other way sends none.
+    let cut_short: std::collections::HashSet<RunId> = sqlx::query_scalar(
+        "SELECT run_id FROM run WHERE project_id = $1 AND (state <> 'ended' OR outcome = 'cancelled')",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
     let removed = erase_run_ids(tx, &run_ids).await?;
+    let cut_short_waits: Vec<SignalRegistration> =
+        removed.iter().filter(|wait| wait.run_id.is_some_and(|run| cut_short.contains(&run))).cloned().collect();
+    queue_cancel_calls_in(tx, &cut_short_waits).await?;
     Ok((run_ids.len(), removed))
 }
 

@@ -42,6 +42,9 @@ struct FakeState {
     /// Answers handed to a run its worker drives, by run, for the worker
     /// to take (the Postgres `parked_fire` rows `hand_answer_in` writes).
     handed: HashMap<RunId, Vec<(String, weft_core::primitive::WaitAnswer)>>,
+    /// The last calls queued for the waits of cancelled runs, in order
+    /// (the Postgres `cancel_call` tasks).
+    cancel_calls: Vec<weft_core::signal::listener_protocol::CancelCallRequest>,
 }
 
 #[derive(Default)]
@@ -96,6 +99,11 @@ impl FakeJournal {
         note(row, std::slice::from_ref(event));
         g.events.push(event.clone());
         Ok(())
+    }
+
+    /// The last calls queued for the waits of cancelled runs, in order.
+    pub fn cancel_calls(&self) -> Vec<weft_core::signal::listener_protocol::CancelCallRequest> {
+        self.inner.lock().unwrap().cancel_calls.clone()
     }
 
     /// The answers handed to `run_id`'s worker, in order.
@@ -210,6 +218,21 @@ fn born(g: &FakeState, birth: &RunEvent, state: &'static str, owner: Option<Stri
         ending: None,
         skipped: 0,
     })
+}
+
+/// Mirror of Postgres's `remove_run_waits_in`: every wait of `run_id`
+/// goes, and when the run was `cancelled` the last call of each that
+/// carries one is queued. Answers the waits and how many calls it queued.
+fn remove_run_waits(g: &mut FakeState, run_id: RunId, cancelled: bool) -> (Vec<SignalRegistration>, usize) {
+    let keys: Vec<String> = g.signals.iter().filter(|(_, s)| s.run_id == Some(run_id)).map(|(k, _)| k.clone()).collect();
+    let removed: Vec<SignalRegistration> = keys.into_iter().filter_map(|k| g.signals.remove(&k)).collect();
+    if !cancelled {
+        return (removed, 0);
+    }
+    let calls: Vec<_> = removed.iter().filter_map(|wait| wait.cancel_call().ok().flatten()).collect();
+    let queued = calls.len();
+    g.cancel_calls.extend(calls);
+    (removed, queued)
 }
 
 /// End `run_id`, a run nobody drives, cancelled for `cause`, with
@@ -360,11 +383,8 @@ impl Journal for FakeJournal {
         cause: &weft_core::run::CancelCause,
     ) -> anyhow::Result<crate::journal::CancelWrite> {
         let mut g = self.inner.lock().unwrap();
-        // The strip is `signal_remove_for_run_id`'s predicate: every
-        // signal tied to the run.
-        let keys: Vec<String> = g.signals.iter().filter(|(_, s)| s.run_id == Some(run_id)).map(|(k, _)| k.clone()).collect();
-        let removed: Vec<SignalRegistration> = keys.into_iter().filter_map(|k| g.signals.remove(&k)).collect();
-        let mut write = crate::journal::CancelWrite { removed, ..Default::default() };
+        let (removed, cancel_calls) = remove_run_waits(&mut g, run_id, true);
+        let mut write = crate::journal::CancelWrite { removed, cancel_calls, ..Default::default() };
         let Some(row) = g.runs.get(&run_id) else { return Ok(write) };
         match (row.state, row.owner.is_some()) {
             ("ended", _) => {}
@@ -768,20 +788,10 @@ impl Journal for FakeJournal {
         run_id: RunId,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
         let mut g = self.inner.lock().unwrap();
-        // Mirror the postgres predicate EXACTLY (`DELETE ... WHERE run =
-        // $1`, `SIGNAL_DELETE_BY_RUN_ID_RETURNING`): every signal tied to
-        // the run goes, whatever its kind, so the fake and the real
-        // store cannot diverge the day an entry signal carries a run.
-        let keys: Vec<String> = g
-            .signals
-            .iter()
-            .filter(|(_, s)| s.run_id == Some(run_id))
-            .map(|(k, _)| k.clone())
-            .collect();
-        Ok(keys
-            .into_iter()
-            .filter_map(|k| g.signals.remove(&k))
-            .collect())
+        // Every signal tied to the run goes, whatever its kind, as the
+        // Postgres delete does; a cancelled run's waits queue their calls.
+        let cancelled = g.runs.get(&run_id).is_some_and(|row| matches!(row.ending, Some(RunEvent::RunCancelled { .. })));
+        Ok(remove_run_waits(&mut g, run_id, cancelled).0)
     }
 
     async fn signal_remove_for_project(

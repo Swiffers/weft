@@ -159,6 +159,10 @@ pub(crate) async fn run_call(
             let total = crate::api::run::count_runs(state, &tenant, project_id, filter).await?;
             answered(serde_json::to_value(RunsCounted { total }).map_err(internal("answer"))?)
         }
+        ProgramCall::NodeState { run, node } => {
+            let read = crate::node_state::read(state, project_id, *run, node).await?;
+            answered(serde_json::to_value(read).map_err(internal("answer"))?)
+        }
         ProgramCall::TokensRevoke { instance, id } => {
             let tenant = owner().await?;
             let revoked = crate::journal::postgres::revoke_instance_tokens(&state.pg_pool, tenant.as_str(), project_id, instance, *id)

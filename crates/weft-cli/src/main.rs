@@ -206,6 +206,11 @@ enum Cmd {
     /// Rebuilding while runs are in flight is non-disruptive:
     /// in-flight work finishes on workers baked from its own image,
     /// and this run lands on a fresh current-image worker.
+    ///
+    /// Following the run to its end, it exits with the code `weft wait`
+    /// gives that ending (see `weft wait --help`): 0 when the run
+    /// completed, 10 when it failed or was cancelled. With `--detach` or
+    /// `--json` it only starts the run and exits 0.
     Run {
         /// Load `examples/<name>.json`; explicit run flags edit its settings.
         spec: Option<String>,
@@ -395,6 +400,33 @@ enum Cmd {
     Follow { project: String },
     /// Stop a run that is still going, named by its id or the start of it.
     Stop { run_id: String },
+    /// Wait until a run ends, then say how it ended, in one line and in
+    /// the exit code.
+    ///
+    /// The run is named by its id or the start of it. A run that already
+    /// ended is answered at once. A timeout only stops the waiting: the
+    /// run carries on, and calling `weft wait` again picks it back up.
+    #[command(after_long_help = commands::wait::exit_codes_help())]
+    Wait {
+        run_id: String,
+        /// How long to wait before giving up on hearing back: a whole
+        /// number and a unit (`30s`, `10m`), at most 10 minutes.
+        #[arg(long, value_name = "duration", default_value = "10m", value_parser = commands::wait::parse_timeout)]
+        timeout: std::time::Duration,
+        /// Also return as soon as the run parks: every node still open
+        /// waits on something (a form, a timer, an outside job), which
+        /// `weft runs` shows as `waiting_for_input`.
+        #[arg(long)]
+        waiting_for_input: bool,
+    },
+    /// Where one node of a run stands: pending, running, waiting (with
+    /// the raw last answer its wait saw, like an outside job's status),
+    /// completed, failed (with its error), skipped or cancelled.
+    ///
+    /// The run is named by its id or the start of it; the node the way
+    /// `weft run --from` takes it (`render`, `one.render`). A node inside
+    /// a loop runs once per iteration and is refused: name the loop.
+    NodeState { run_id: String, node: String },
     /// Prepare and save trigger settings without listening for events.
     Bake {
         project: Option<String>,
@@ -1800,7 +1832,7 @@ fn main() -> std::process::ExitCode {
         }
     };
     match runtime.block_on(run(cli, wanted)) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => code,
         // A verb's progress channel already reported this one; a
         // second report would be the same message again.
         Err(e) if e.is::<progress::Reported>() => std::process::ExitCode::FAILURE,
@@ -1881,10 +1913,13 @@ fn invoked_as_daemon_which() -> bool {
     )
 }
 
-async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyhow::Result<()> {
+/// Run the command and answer the exit code it ends with: 0 for every
+/// command that completes, except the two that report how a run ended
+/// (`weft run` following its run, `weft wait`), which exit with that
+/// ending's code (`commands::wait::Outcome`).
+async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyhow::Result<std::process::ExitCode> {
     let ctx = commands::Ctx::new(commands::Dispatcher::from_flag_or_env(cli.dispatcher), cli.on, cli.json)?;
-
-    match cli.command {
+    let done = match cli.command {
         Cmd::New { name, assistants, remember, ci } => commands::new::run(ctx, name, assistants, remember, ci).await,
         Cmd::Ci { action: CiCmd::Add { cloud } } => commands::ci::add(ctx, cloud).await,
         Cmd::Build { referenced } => commands::build::run(ctx, node_set(referenced)).await,
@@ -1912,7 +1947,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
         Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, clear, durable, fast, keep_for, hold_secs } => {
-            commands::run::run(
+            return commands::run::run(
                 ctx,
                 commands::run::RunArgs {
                     spec,
@@ -1926,7 +1961,11 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
                     save,
                 },
             )
-            .await
+            .await;
+        }
+        Cmd::NodeState { run_id, node } => commands::node_state::run(ctx, run_id, node).await,
+        Cmd::Wait { run_id, timeout, waiting_for_input } => {
+            return commands::wait::run(ctx, run_id, timeout, waiting_for_input).await.map(commands::wait::Outcome::exit_code);
         }
         Cmd::Checkpoint { label, root } => commands::checkpoint::run(ctx, label, root).await,
         Cmd::Branch { reference, discard } => commands::branch::run(ctx, reference, discard).await,
@@ -2029,7 +2068,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
                 TargetCmd::Show { name } => commands::target::TargetAction::Show { name },
                 TargetCmd::Remove { name } => commands::target::TargetAction::Remove { name },
                 TargetCmd::Key => {
-                    return commands::target::key(&ctx);
+                    return commands::target::key(&ctx).map(|()| std::process::ExitCode::SUCCESS);
                 }
                 TargetCmd::Export { name, github, front_env, frontend } => commands::target::TargetAction::Export { name, github, front_env, frontend },
             };
@@ -2072,7 +2111,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             run_id, keep_days, all, images, build_plane, build_cache, project, instance, status, node, tag, cancel_running, yes,
         } => {
             if build_plane {
-                return commands::runs::clean_build_plane().await;
+                return commands::runs::clean_build_plane().await.map(|()| std::process::ExitCode::SUCCESS);
             }
             let narrow = commands::runs::CleanNarrowing { instance, status, node, tag, cancel_running };
             commands::runs::clean(
@@ -2080,7 +2119,8 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             )
             .await
         }
-    }
+    };
+    done.map(|()| std::process::ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -2113,6 +2153,17 @@ mod command_contract_tests {
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn wait_defaults_to_ten_minutes_and_refuses_longer() {
+        let cli = Cli::try_parse_from(["weft", "wait", "3f2a"]).unwrap();
+        let Cmd::Wait { run_id, timeout, waiting_for_input } = cli.command else { panic!("wait command") };
+        assert_eq!((run_id.as_str(), timeout, waiting_for_input), ("3f2a", commands::wait::MAX_TIMEOUT, false));
+        let cli = Cli::try_parse_from(["weft", "wait", "3f2a", "--timeout", "30s", "--waiting-for-input"]).unwrap();
+        let Cmd::Wait { timeout, waiting_for_input, .. } = cli.command else { panic!("wait command") };
+        assert_eq!((timeout, waiting_for_input), (std::time::Duration::from_secs(30), true));
+        assert!(Cli::try_parse_from(["weft", "wait", "3f2a", "--timeout", "11m"]).is_err());
     }
 
     #[test]

@@ -271,11 +271,12 @@
   let seenCallerOffsets = new Set<string>();
 
   // What each node is showing, keyed by node id. An infra node's
-  // container and the listener kind holding a trigger's signal both
-  // serve the same shape, so there is one map for both.
+  // container and the listener kind holding a signal (a trigger's, or
+  // a wait's in the followed run) all serve the same shape, so there is
+  // one map for all of them.
   //
-  //   - a node with a display (infra serving /live, or a trigger)
-  //     → displayByNode
+  //   - a node with a display (infra serving /live, a trigger, or a
+  //     node waiting in the followed run) → displayByNode
   //   - debug nodes (features.showDebugPreview)
   //     → runState.nodeOutputs
   //   - everything else → no body panel; modal inspector only.

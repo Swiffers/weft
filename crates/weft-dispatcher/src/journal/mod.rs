@@ -396,8 +396,10 @@ pub trait Journal: Send + Sync {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// All signals tied to one run (resume signals).
-    /// Used on cancel to unregister everything that was waiting.
+    /// Take every signal tied to one run (its waits) down, for the
+    /// listener to let go of; a run that ended cancelled has each wait's
+    /// last call queued with them, as `cancel_run` does. Used once a run
+    /// that held waits has ended.
     async fn signal_remove_for_run_id(
         &self,
         run_id: RunId,
@@ -559,6 +561,26 @@ impl SignalRegistration {
         serde_json::from_str(&self.spec_json).map_err(|e| anyhow::anyhow!("signal {} spec: {e}", self.token))
     }
 
+    /// The last call this wait sends now that its run was cancelled
+    /// (`weft_core::signal::cancel_call`), ready for the listener, or
+    /// `None` when it carries none. `Err` when its spec cannot be read, so
+    /// whether it carries one is unknown.
+    pub fn cancel_call(&self) -> anyhow::Result<Option<weft_core::signal::listener_protocol::CancelCallRequest>> {
+        let spec = self.spec()?;
+        if spec.on_cancel.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(weft_core::signal::listener_protocol::CancelCallRequest {
+            token: self.token.clone(),
+            tenant_id: self.tenant_id.clone(),
+            for_instance: self
+                .instance
+                .clone()
+                .map(|instance| weft_core::instance::InstanceScope { project_id: self.project_id, instance }),
+            spec,
+        }))
+    }
+
     /// Compute the public URL for this signal given a dispatcher base
     /// URL. The route depends on the surface AND, for public entries,
     /// whether it is a LIVE connection (served only at `/connect/...`,
@@ -680,6 +702,9 @@ pub struct CancelWrite {
     /// The run nobody drove was ended here, with this many per-node cancel
     /// rows; `None` when nothing was ended here.
     pub node_cancellations: Option<usize>,
+    /// How many of `removed` carried a last call, queued for the listener
+    /// to send in the same commit (`weft_task_store::TaskKind::CancelCall`).
+    pub cancel_calls: usize,
 }
 
 /// The query for a page of a tenant's runs: pagination plus optional

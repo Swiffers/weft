@@ -18,6 +18,15 @@
         "kind": "text"
       },
       "label": "Status URL"
+    },
+    {
+      "name": "cancelUrl",
+      "type": "String",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Cancel URL",
+      "description": "Where the job is told to stop (a PUT) when the run is cancelled while it waits."
     }
   ],
   "outputs": [

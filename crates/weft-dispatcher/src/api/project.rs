@@ -441,6 +441,7 @@ pub async fn remove(
     // remain in the listener leaves dangling registrations that
     // outlive their owning project.
     deactivate_project(&state, id).await?;
+    send_last_calls(&state, id).await?;
     // The project's OWNING tenant is its `project.tenant_id`, the same source that
     // keyed everything of the project's that lives outside the project row: its
     // stored data, and the connections its nodes published. `tenant_router` is a
@@ -3937,6 +3938,32 @@ pub async fn deactivate_project(
     )
     .await?;
     Ok(taken != crate::take_down::TakenDown::ProjectGone)
+}
+
+/// Wait until every last call the project's cancelled runs queued
+/// (`weft_task_store::TaskKind::CancelCall`) has gone out, or failed (its
+/// task logs why): what `weft rm` deletes next includes what a call needs
+/// to go out (an instance's connections, the project's infra addresses).
+/// No deadline: each call is bounded where it is sent
+/// (`weft_listener::kinds::cancel_call`), and how long the queue takes to
+/// reach it is not this call's to cut short.
+async fn send_last_calls(state: &DispatcherState, id: uuid::Uuid) -> Result<(), StatusError> {
+    let calls: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM task WHERE project_id = $1 AND kind = $2 AND status IN ('pending', 'claimed')",
+    )
+    .bind(id)
+    .bind(weft_task_store::TaskKind::CancelCall.as_str())
+    .fetch_all(&state.pg_pool)
+    .await
+    .map_err(|e| StatusError::Other(StatusCode::SERVICE_UNAVAILABLE, format!("could not read the project's last calls: {e}; retry `weft rm`")))?;
+    for call in calls {
+        weft_task_store::terminal::wait_for_terminal_in_project(&state.pg_pool, &state.signals, call, id, std::time::Duration::MAX)
+            .await
+            .map_err(|e| {
+                StatusError::Other(StatusCode::SERVICE_UNAVAILABLE, format!("could not wait for a last call of a cancelled run: {e:#}; retry `weft rm`"))
+            })?;
+    }
+    Ok(())
 }
 
 /// `POST /projects/{id}/quiesce`: take the whole project down (every

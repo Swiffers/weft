@@ -15,6 +15,11 @@
 //! - the one-shot routes (speech, dialogue, sound, music, project
 //!   dubbing, transcription, alignment) are priced from their request or their
 //!   answer; `batch_route` lists them.
+//! - `flows/image` and `flows/video` (Image & Video generation) are priced
+//!   from their request, at the rate a hand-captured price table states for
+//!   the model at the request's settings; the job's read
+//!   (`flows/{image,video}/{id}`) settles whether that price was charged.
+//!   The "Image & Video" section below has the rules.
 //!
 //! Everything else is Unknown: the install's key never travels on it, and a
 //! caller's own key passes it through unmeasured, exactly like any unknown
@@ -25,6 +30,9 @@
 //! reads to configure the session, so the observer and the provider price
 //! the same bytes the same way. A frame that does not parse as an audio
 //! chunk accrues nothing (the provider ignores or refuses it too).
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use serde_json::{json, Value};
 
@@ -243,12 +251,7 @@ fn one_segment(s: &str) -> bool {
 /// (`voices/add`, listing) is free; the voice-DESIGN routes
 /// (`text-to-voice/...`) stay Unknown deliberately: their credit
 /// price is not published in USD, and a guessed figure would misbill,
-/// so they run on the caller's own key only until priced. The Image &
-/// Video routes (`flows/...`, and the `assets` they read) stay Unknown
-/// for the same reason: a generation costs credits that depend on the
-/// model, the resolution and the duration, ElevenLabs publishes no USD
-/// rate for them, and neither the create nor the finished job reports
-/// what it cost.
+/// so they run on the caller's own key only until priced.
 enum BatchRoute {
     Tts,
     /// Text to dialogue: every line's characters at the model's speech
@@ -484,6 +487,256 @@ fn music_bytes_per_second(query: &str, request_body: &[u8]) -> f64 {
         }
         Some(_) => output_bytes_per_second(query),
     }
+}
+
+// ── Image & Video (`flows/image`, `flows/video`) ─────────────────────
+//
+// A generation's price is a function of its request: the model, the
+// settings that model's price depends on, and how much it makes (one
+// image per request, since no image model takes a count, or the video's
+// seconds). ElevenLabs publishes no USD rate for these routes and no
+// answer states a cost, so the rates come from `elevenlabs_prices.json`,
+// the web app's pricing table captured BY HAND on 2026-10-16 for tier
+// `grant_tier_2_2025_07_23` (its endpoint answers only a signed-in
+// session). Refreshing it is manual: capture it again and replace the
+// file. A request whose price key the table does not hold, or whose
+// quantity cannot be read, is priced unknown, never at the table's
+// `any` row or the nearest key.
+//
+// The create only queues the job, and ElevenLabs does not charge a
+// failed generation, so the create opens a charge under the generation
+// id it answers and the job's read settles it: the quoted price once
+// the job reads `completed`, nothing once it reads `failed`.
+
+/// The hand-captured price table, parsed once.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FlowPrices {
+    tier: String,
+    captured_on: String,
+    /// US cents per image, by price key.
+    image_cents_per_image: HashMap<String, f64>,
+    /// US cents per second of video, by price key.
+    video_cents_per_second: HashMap<String, f64>,
+}
+
+static FLOW_PRICES: LazyLock<FlowPrices> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("elevenlabs_prices.json"))
+        .expect("the checked-in ElevenLabs price table parses (a test holds it to that)")
+});
+
+/// What a generation route makes.
+#[derive(Clone, Copy)]
+enum FlowMedia {
+    Image,
+    Video,
+}
+
+/// An Image & Video route.
+enum FlowRoute<'a> {
+    /// `POST flows/image` or `POST flows/video`: queues a generation and
+    /// opens its charge.
+    Create(FlowMedia),
+    /// `GET flows/{image,video}/{id}`: the job's state, which settles the
+    /// charge.
+    Job(&'a str),
+}
+
+fn flow_route<'a>(method: &str, path: &'a str) -> Option<FlowRoute<'a>> {
+    let rest = path.strip_prefix("flows/")?;
+    let (noun, id) = match rest.split_once('/') {
+        None => (rest, None),
+        Some((noun, id)) => (noun, Some(id)),
+    };
+    let media = match noun {
+        "image" => FlowMedia::Image,
+        "video" => FlowMedia::Video,
+        _ => return None,
+    };
+    match (method, id) {
+        ("POST", None) => Some(FlowRoute::Create(media)),
+        ("GET", Some(id)) if one_segment(id) => Some(FlowRoute::Job(id)),
+        _ => None,
+    }
+}
+
+/// A generation request's price: the table key its settings make, the
+/// key's rate, and how many images or seconds it makes.
+#[derive(Debug, PartialEq)]
+struct FlowQuote {
+    key: String,
+    cents_per_unit: f64,
+    units: f64,
+}
+
+impl FlowQuote {
+    fn usd(&self) -> f64 {
+        self.cents_per_unit * self.units / 100.0
+    }
+}
+
+/// A text setting of the request, or the model's default when the
+/// request leaves it out.
+fn flow_text(body: &Value, field: &str, default: &str) -> Result<String, String> {
+    match &body[field] {
+        Value::Null => Ok(default.to_string()),
+        Value::String(text) => Ok(text.clone()),
+        other => Err(format!("the request's `{field}` is {other}, not text")),
+    }
+}
+
+/// A yes/no setting of the request, or the model's default.
+fn flow_flag(body: &Value, field: &str, default: bool) -> Result<bool, String> {
+    match &body[field] {
+        Value::Null => Ok(default),
+        Value::Bool(flag) => Ok(*flag),
+        other => Err(format!("the request's `{field}` is {other}, not true or false")),
+    }
+}
+
+/// The video's length in seconds (`duration_secs`), or the model's
+/// default.
+fn flow_seconds(body: &Value, default: f64) -> Result<f64, String> {
+    match &body["duration_secs"] {
+        Value::Null => Ok(default),
+        other => other
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .ok_or_else(|| format!("the request's `duration_secs` is {other}, not a length in seconds")),
+    }
+}
+
+/// The price key of an image request, following the table's keys for
+/// each model: the settings that move a model's price follow its id, in
+/// the table's order, with the default the API reference states for a
+/// setting the request leaves out. A setting the table does not price
+/// (a GPT Image 2's resolution, a Seedream 5 Lite's) is not part of the
+/// key.
+fn image_key(model: &str, body: &Value) -> Result<String, String> {
+    Ok(match model {
+        "gemini-2.5-flash-image" | "bytedance-seedream-5-lite" => model.to_string(),
+        "gemini-3-pro-image" | "gemini-3.1-flash-image" | "gemini-3.1-flash-lite-image" => {
+            format!("{model}-{}", flow_text(body, "resolution", "1K")?)
+        }
+        "bytedance-seedream-5-pro" => format!("{model}-{}", flow_text(body, "resolution", "2K")?),
+        "gpt-image-1" | "gpt-image-1.5" => format!(
+            "{model}-{}-{}",
+            flow_text(body, "quality", "medium")?,
+            flow_text(body, "aspect_ratio", "1:1")?
+        ),
+        "gpt-image-2" => format!("{model}-{}", flow_text(body, "quality", "medium")?),
+        "gpt-image-2.5-sunburst" | "gpt-image-2.5-flare" => {
+            format!("{model}-{}", flow_text(body, "quality", "high")?)
+        }
+        _ => return Err(format!("no price rule for the image model '{model}'")),
+    })
+}
+
+/// The price key of a video request and the seconds it makes, following
+/// the table's keys the way [`image_key`] does.
+fn video_key(model: &str, body: &Value) -> Result<(String, f64), String> {
+    match model {
+        // Veo: the bare id is 720p and 1080p alike, `-4K` the top
+        // resolution, and `-audio` a video with sound.
+        "veo-3.1-generate-001" | "veo-3.1-fast-generate-001" => {
+            let resolution = flow_text(body, "resolution", "720p")?;
+            let mut key = model.to_string();
+            if !matches!(resolution.as_str(), "720p" | "1080p") {
+                key = format!("{key}-{resolution}");
+            }
+            if flow_flag(body, "generate_audio", true)? {
+                key.push_str("-audio");
+            }
+            Ok((key, flow_seconds(body, 8.0)?))
+        }
+        // Seedance: resolution, then aspect ratio; sound does not move the
+        // price. Seedance 2.5 takes its aspect from a start frame whatever
+        // the request says (the API reference: "First-frame /
+        // first-and-last-frame tasks always use `auto`"), and `auto` has
+        // no price, since the frame decides it.
+        "bytedance-seedance-v2" | "bytedance-seedance-v2-fast" | "bytedance-seedance-v2-mini"
+        | "bytedance-seedance-v2.5" => {
+            let resolution = flow_text(body, "resolution", "720p")?;
+            let aspect = if model == "bytedance-seedance-v2.5" && !body["start_frame"].is_null() {
+                "auto".to_string()
+            } else {
+                flow_text(body, "aspect_ratio", "16:9")?
+            };
+            Ok((format!("{model}-{resolution}-{aspect}"), flow_seconds(body, 5.0)?))
+        }
+        "creatify-aurora" => Err(
+            "a lip-sync video is as long as its audio, and the request does not state that length".to_string(),
+        ),
+        _ => Err(format!("no price rule for the video model '{model}'")),
+    }
+}
+
+/// What a generation request costs, or why it cannot be priced.
+fn flow_quote(media: FlowMedia, body: &Value) -> Result<FlowQuote, String> {
+    let model = body["model_id"].as_str().ok_or("the request names no `model_id`")?;
+    let (key, units, table) = match media {
+        FlowMedia::Image => (image_key(model, body)?, 1.0, &FLOW_PRICES.image_cents_per_image),
+        FlowMedia::Video => {
+            let (key, seconds) = video_key(model, body)?;
+            (key, seconds, &FLOW_PRICES.video_cents_per_second)
+        }
+    };
+    let cents_per_unit = *table.get(&key).ok_or_else(|| {
+        format!(
+            "the price table (tier {}, captured {}) has no '{key}'",
+            FLOW_PRICES.tier, FLOW_PRICES.captured_on
+        )
+    })?;
+    Ok(FlowQuote { key, cents_per_unit, units })
+}
+
+/// The create's tap: the request's quote as a seed, and the generation id
+/// the answer names.
+fn flow_create_tap(media: FlowMedia, request_body: &[u8]) -> super::JsonBodyObservation {
+    let request: Value = serde_json::from_slice(request_body).unwrap_or(Value::Null);
+    let mut seed = serde_json::Map::new();
+    seed.insert("model".into(), request["model_id"].clone());
+    match flow_quote(media, &request) {
+        Ok(quote) => {
+            seed.insert("usd".into(), json!(quote.usd()));
+            seed.insert("priceKey".into(), json!(quote.key));
+            seed.insert("centsPerUnit".into(), json!(quote.cents_per_unit));
+            seed.insert(
+                match media {
+                    FlowMedia::Image => "images",
+                    FlowMedia::Video => "seconds",
+                }
+                .into(),
+                json!(quote.units),
+            );
+        }
+        Err(why) => {
+            seed.insert("usd".into(), Value::Null);
+            seed.insert("resolution".into(), json!(format!("price unknown: {why}")));
+        }
+    }
+    super::JsonBodyObservation::new().seed(seed).field("generationId", "/id").note_outcome()
+}
+
+/// Settle a generation's charge from a read of its job: the quote once it
+/// completed, nothing once it failed, and no verdict while it runs.
+fn flow_settled(observed: &crate::ObservedCall, scratch: &Value) -> Option<MeasuredCost> {
+    let mut metadata = scratch.clone();
+    let amount_usd = match observed.data["status"].as_str() {
+        Some("completed") => scratch["usd"].as_f64(),
+        Some("failed") => {
+            metadata["resolution"] =
+                json!("the generation failed, and ElevenLabs does not charge a failed generation");
+            Some(0.0)
+        }
+        _ => return None,
+    };
+    if let Some(fields) = metadata.as_object_mut() {
+        // The amount and the model are the cost's own fields.
+        fields.remove("usd");
+        fields.remove("model");
+    }
+    Some(MeasuredCost { amount_usd, model: scratch["model"].as_str().map(str::to_string), metadata })
 }
 
 // ── Batch transcription (`speech-to-text`) ───────────────────────────
@@ -1030,6 +1283,11 @@ impl ProviderMeter for ElevenLabsMeter {
         if path == REALTIME_STT || streaming_tts_voice(path).is_some() {
             return RouteClass::BillableSession;
         }
+        match flow_route(method, path) {
+            Some(FlowRoute::Create(_)) => return RouteClass::Billable(crate::Pricing::Metered),
+            Some(FlowRoute::Job(_)) => return RouteClass::Reports,
+            None => {}
+        }
         match project_route(method, path) {
             Some(ProjectRoute::Create) => return RouteClass::Billable(crate::Pricing::Metered),
             Some(ProjectRoute::Delete) => return RouteClass::Free,
@@ -1060,6 +1318,15 @@ impl ProviderMeter for ElevenLabsMeter {
         };
         if project_route("POST", path).is_some() || project_route("GET", path).is_some() {
             return Box::new(project_tap());
+        }
+        // A generation is priced from its request when it is queued; a
+        // read of its job says whether that price was charged.
+        match flow_route("POST", path).or_else(|| flow_route("GET", path)) {
+            Some(FlowRoute::Create(media)) => return Box::new(flow_create_tap(media, request_body)),
+            Some(FlowRoute::Job(_)) => {
+                return Box::new(super::JsonBodyObservation::new().field("status", "/status"));
+            }
+            None => {}
         }
         let pricing = match batch_route("POST", path) {
             // The whole cost is a function of the request: settled the
@@ -1130,13 +1397,22 @@ impl ProviderMeter for ElevenLabsMeter {
 
     fn opens_charge(&self, path: &str, observed: &crate::ObservedCall) -> Option<String> {
         // A create ElevenLabs refused spent nothing; `resolve` books it.
-        if !matches!(project_route("POST", path), Some(ProjectRoute::Create)) || observed.data["accepted"] != json!(true) {
+        if observed.data["accepted"] != json!(true) {
+            return None;
+        }
+        if let Some(FlowRoute::Create(_)) = flow_route("POST", path) {
+            return observed.data["generationId"].as_str().map(str::to_string);
+        }
+        if !matches!(project_route("POST", path), Some(ProjectRoute::Create)) {
             return None;
         }
         observed.data["projectId"].as_str().map(str::to_string)
     }
 
     fn charge_reported_on(&self, path: &str, _observed: &crate::ObservedCall) -> Option<String> {
+        if let Some(FlowRoute::Job(id)) = flow_route("GET", path) {
+            return Some(id.to_string());
+        }
         match project_route("POST", path).or_else(|| project_route("GET", path))? {
             ProjectRoute::Create | ProjectRoute::Delete => None,
             ProjectRoute::AddLanguage(id) | ProjectRoute::Language(id) | ProjectRoute::Project(id) => {
@@ -1156,6 +1432,9 @@ impl ProviderMeter for ElevenLabsMeter {
         // the charge stays open for one that does.
         if !(200..300).contains(&observed.status) {
             return None;
+        }
+        if let Some(FlowRoute::Job(_)) = flow_route("GET", path) {
+            return flow_settled(&observed, scratch);
         }
         if let Some(seconds) = observed.data["durationS"].as_f64() {
             scratch["durationS"] = json!(seconds);
@@ -1200,18 +1479,23 @@ impl ProviderMeter for ElevenLabsMeter {
         observed: crate::ObservedCall,
         _follow_up: FollowUp<'_>,
     ) -> MeasuredCost {
-        // Only a project create that opened no charge lands here from the
-        // project routes: one ElevenLabs refused, or one it took without
-        // naming the project, which nothing can then report on.
-        if matches!(project_route("POST", path), Some(ProjectRoute::Create)) {
-            if let Some(cost) = super::cost_from_status(observed.status, "the dubbing project create") {
+        // Only a create that opened no charge lands here from the project
+        // and generation routes: one ElevenLabs refused, or one it took
+        // without naming what it made, which nothing can then report on.
+        let create = match (flow_route("POST", path), project_route("POST", path)) {
+            (Some(FlowRoute::Create(_)), _) => Some(("the generation create", "generation")),
+            (_, Some(ProjectRoute::Create)) => Some(("the dubbing project create", "project")),
+            _ => None,
+        };
+        if let Some((what, made)) = create {
+            if let Some(cost) = super::cost_from_status(observed.status, what) {
                 return cost;
             }
             return MeasuredCost {
                 amount_usd: None,
                 model: observed.data["model"].as_str().map(str::to_string),
                 metadata: json!({
-                    "resolution": "ElevenLabs took the project but named no project id, so nothing can report on it"
+                    "resolution": format!("ElevenLabs took the {made} but named no {made} id, so nothing can report on it")
                 }),
             };
         }
@@ -1377,13 +1661,21 @@ mod tests {
         // voice DESIGN is also unpriced until a USD rate is published.
         assert_eq!(ELEVENLABS.classify("POST", "voices/add"), RouteClass::Unknown);
         assert_eq!(ELEVENLABS.classify("POST", "text-to-voice/design"), RouteClass::Unknown);
-        // Image & Video is credit-priced with no USD rate and no cost on
-        // the job, so the runtime credential never travels there either.
+        // An image or video generation is priced from its request, and a
+        // read of its job reports on it. Template runs, the generation
+        // lists and the temporary assets a generation reads stay Unknown.
+        assert!(billable("POST", "flows/image"));
+        assert!(billable("POST", "flows/video"));
+        assert_eq!(ELEVENLABS.classify("GET", "flows/image/g1"), RouteClass::Reports);
+        assert_eq!(ELEVENLABS.classify("GET", "flows/video/g1"), RouteClass::Reports);
         for (m, p) in [
-            ("POST", "flows/image"),
-            ("POST", "flows/video"),
-            ("GET", "flows/video/g1"),
+            ("GET", "flows/image"),
+            ("GET", "flows/video"),
+            ("POST", "flows/video/g1"),
+            ("DELETE", "flows/video/g1"),
+            ("POST", "flows/text-to-speech"),
             ("POST", "flows/templates/t1/runs"),
+            ("GET", "flows/templates/t1/runs/r1"),
             ("POST", "assets"),
             ("DELETE", "assets/a1"),
         ] {
@@ -1400,6 +1692,12 @@ mod tests {
             "text-to-dialoguex",
             "dubbing/d1/audio/fr/extra",
             "dubbing/../voices",
+            "flows/image/",
+            "flows/imagex",
+            "flows/image/../user",
+            "flows/video/%2e%2e",
+            "flows/video/g1/extra",
+            "flows/../user",
         ] {
             assert_eq!(
                 ELEVENLABS.classify("POST", trick),
@@ -1910,6 +2208,218 @@ mod tests {
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow = FollowUp { http: &http, base_url: NOWHERE, shared: &shared };
         let cost = ELEVENLABS.resolve("dubbing/project", refused, follow).await;
+        assert_eq!(cost.amount_usd, Some(0.0));
+    }
+
+    /// The checked-in table parses, holds every row the capture had, and
+    /// says when and for which tier it was captured.
+    #[test]
+    fn the_price_table_parses_whole() {
+        assert_eq!(FLOW_PRICES.image_cents_per_image.len(), 82);
+        assert_eq!(FLOW_PRICES.video_cents_per_second.len(), 296);
+        assert_eq!(FLOW_PRICES.tier, "grant_tier_2_2025_07_23");
+        assert_eq!(FLOW_PRICES.captured_on, "2026-10-16");
+    }
+
+    /// The key and the quantity a request prices at, in cents per unit.
+    fn quoted(media: FlowMedia, body: Value) -> Result<FlowQuote, String> {
+        flow_quote(media, &body)
+    }
+
+    fn assert_quote(media: FlowMedia, body: Value, key: &str, cents_per_unit: f64, units: f64) {
+        let quote = quoted(media, body.clone()).unwrap_or_else(|why| panic!("{body}: {why}"));
+        assert_eq!(quote.key, key, "{body}");
+        assert!((quote.cents_per_unit - cents_per_unit).abs() < 1e-9, "{body}: {quote:?}");
+        assert_eq!(quote.units, units, "{body}");
+    }
+
+    /// Every image family, each setting its price moves with, and the
+    /// default the API reference states when the request leaves one out.
+    /// No image model takes a count, so a request is one image.
+    #[test]
+    fn every_image_family_builds_its_price_key() {
+        let image = |body: Value, key: &str, cents: f64| assert_quote(FlowMedia::Image, body, key, cents, 1.0);
+        image(json!({ "model_id": "gemini-2.5-flash-image" }), "gemini-2.5-flash-image", 4.98);
+        // Gemini: the resolution, 1K when left out.
+        image(json!({ "model_id": "gemini-3-pro-image" }), "gemini-3-pro-image-1K", 24.12);
+        image(json!({ "model_id": "gemini-3-pro-image", "resolution": "4K" }), "gemini-3-pro-image-4K", 36.0);
+        image(json!({ "model_id": "gemini-3.1-flash-image", "resolution": "2K" }), "gemini-3.1-flash-image-2K", 12.12);
+        image(json!({ "model_id": "gemini-3.1-flash-image", "resolution": "512" }), "gemini-3.1-flash-image-512", 5.4);
+        image(json!({ "model_id": "gemini-3.1-flash-lite-image" }), "gemini-3.1-flash-lite-image-1K", 4.08);
+        // GPT Image 1 and 1.5: quality then aspect ratio, medium and 1:1
+        // when left out; the background moves nothing.
+        image(json!({ "model_id": "gpt-image-1", "quality": "high", "aspect_ratio": "3:2" }), "gpt-image-1-high-3:2", 31.8);
+        image(json!({ "model_id": "gpt-image-1", "background": "transparent" }), "gpt-image-1-medium-1:1", 6.84);
+        image(json!({ "model_id": "gpt-image-1.5", "quality": "low", "aspect_ratio": "2:3" }), "gpt-image-1.5-low-2:3", 3.36);
+        // GPT Image 2 and 2.5: quality alone (medium, and high on 2.5,
+        // when left out); the table does not price their resolution.
+        image(json!({ "model_id": "gpt-image-2", "resolution": "4K" }), "gpt-image-2-medium", 6.48);
+        image(json!({ "model_id": "gpt-image-2", "quality": "high" }), "gpt-image-2-high", 25.44);
+        image(json!({ "model_id": "gpt-image-2.5-sunburst" }), "gpt-image-2.5-sunburst-high", 6.6828);
+        image(json!({ "model_id": "gpt-image-2.5-flare", "quality": "max" }), "gpt-image-2.5-flare-max", 25.65);
+        // Seedream: 5 Pro by resolution (2K when left out), 5 Lite flat.
+        image(json!({ "model_id": "bytedance-seedream-5-pro" }), "bytedance-seedream-5-pro-2K", 16.2);
+        image(json!({ "model_id": "bytedance-seedream-5-pro", "resolution": "1K" }), "bytedance-seedream-5-pro-1K", 8.1);
+        image(json!({ "model_id": "bytedance-seedream-5-lite", "resolution": "3K" }), "bytedance-seedream-5-lite", 4.2);
+    }
+
+    /// Every video family, priced per second times the request's length
+    /// (or the model's default length).
+    #[test]
+    fn every_video_family_builds_its_price_key() {
+        let video = |body: Value, key: &str, cents: f64, seconds: f64| {
+            assert_quote(FlowMedia::Video, body, key, cents, seconds)
+        };
+        // Veo: `-4K` only at the top resolution, `-audio` with sound
+        // (sound on and 8 seconds when left out).
+        video(json!({ "model_id": "veo-3.1-generate-001" }), "veo-3.1-generate-001-audio", 48.0, 8.0);
+        video(
+            json!({ "model_id": "veo-3.1-generate-001", "resolution": "1080p", "generate_audio": false, "duration_secs": 4 }),
+            "veo-3.1-generate-001",
+            24.0,
+            4.0,
+        );
+        video(json!({ "model_id": "veo-3.1-generate-001", "resolution": "4K" }), "veo-3.1-generate-001-4K-audio", 72.0, 8.0);
+        video(
+            json!({ "model_id": "veo-3.1-fast-generate-001", "resolution": "4K", "generate_audio": false, "duration_secs": 6 }),
+            "veo-3.1-fast-generate-001-4K",
+            36.0,
+            6.0,
+        );
+        // Seedance: resolution then aspect ratio (720p, 16:9 and 5
+        // seconds when left out); sound moves nothing.
+        video(json!({ "model_id": "bytedance-seedance-v2" }), "bytedance-seedance-v2-720p-16:9", 36.288, 5.0);
+        video(
+            json!({ "model_id": "bytedance-seedance-v2", "resolution": "4k", "aspect_ratio": "1:1", "generate_audio": false, "duration_secs": 15 }),
+            "bytedance-seedance-v2-4k-1:1",
+            186.624,
+            15.0,
+        );
+        video(json!({ "model_id": "bytedance-seedance-v2-fast", "resolution": "480p", "aspect_ratio": "21:9" }), "bytedance-seedance-v2-fast-480p-21:9", 13.5, 5.0);
+        video(json!({ "model_id": "bytedance-seedance-v2-mini", "aspect_ratio": "9:16" }), "bytedance-seedance-v2-mini-720p-9:16", 18.144, 5.0);
+        video(
+            json!({ "model_id": "bytedance-seedance-v2.5", "resolution": "1080p", "aspect_ratio": "4:3", "duration_secs": 30 }),
+            "bytedance-seedance-v2.5-1080p-4:3",
+            124.248,
+            30.0,
+        );
+    }
+
+    /// Veo 3.1 without sound is 24 cents a second (the usage report's
+    /// $0.24/s), so an 8-second video is $1.92.
+    #[test]
+    fn veo_is_24_cents_a_second() {
+        let quote = quoted(
+            FlowMedia::Video,
+            json!({ "model_id": "veo-3.1-generate-001", "generate_audio": false, "duration_secs": 8 }),
+        )
+        .unwrap();
+        assert!((quote.cents_per_unit - 24.0).abs() < 1e-9);
+        assert!((quote.usd() - 1.92).abs() < 1e-9, "{quote:?}");
+    }
+
+    /// A key the table does not hold, a model with no rule, and a length
+    /// that does not read are all unknown: never the table's `any` row,
+    /// never the nearest key.
+    #[test]
+    fn what_the_table_does_not_price_is_unknown() {
+        for (media, body) in [
+            // A resolution the model's rows do not have.
+            (FlowMedia::Image, json!({ "model_id": "gemini-3.1-flash-lite-image", "resolution": "4K" })),
+            (FlowMedia::Image, json!({ "model_id": "gpt-image-1", "aspect_ratio": "16:9" })),
+            // A model the table has a row for but no request rule (and
+            // the `any` row, by name).
+            (FlowMedia::Image, json!({ "model_id": "flux-1-kontext" })),
+            (FlowMedia::Image, json!({ "model_id": "any" })),
+            (FlowMedia::Video, json!({ "model_id": "any" })),
+            (FlowMedia::Image, json!({ "prompt": "no model" })),
+            // `auto` leaves the aspect, and so the price, to the model.
+            (FlowMedia::Video, json!({ "model_id": "bytedance-seedance-v2", "aspect_ratio": "auto" })),
+            // Seedance 2.5 uses `auto` with a start frame, whatever the
+            // request says.
+            (
+                FlowMedia::Video,
+                json!({ "model_id": "bytedance-seedance-v2.5", "aspect_ratio": "16:9", "start_frame": { "type": "asset", "asset_id": "a1" } }),
+            ),
+            // A lip-sync video is as long as its audio.
+            (FlowMedia::Video, json!({ "model_id": "creatify-aurora", "resolution": "480p" })),
+            // A length or a setting that does not read.
+            (FlowMedia::Video, json!({ "model_id": "veo-3.1-generate-001", "duration_secs": "8" })),
+            (FlowMedia::Video, json!({ "model_id": "veo-3.1-generate-001", "duration_secs": 0 })),
+            (FlowMedia::Video, json!({ "model_id": "veo-3.1-generate-001", "generate_audio": "yes" })),
+            (FlowMedia::Image, json!({ "model_id": "gpt-image-2", "quality": 3 })),
+        ] {
+            assert!(quoted(media, body.clone()).is_err(), "{body} must be unknown");
+        }
+    }
+
+    /// One generation route's answer, as the harness observes it.
+    fn generation_answer(path: &str, request: Value, status: u16, answer: Value) -> crate::ObservedCall {
+        let mut obs = ELEVENLABS.observe(path, "", &serde_json::to_vec(&request).unwrap());
+        obs.on_status(status);
+        obs.on_chunk(&serde_json::to_vec(&answer).unwrap());
+        obs.end(false)
+    }
+
+    /// The create opens a charge under the generation id carrying its
+    /// quote; a read of the job while it runs settles nothing, and the
+    /// read that finds it completed books the quote.
+    #[tokio::test]
+    async fn a_generation_is_charged_its_quote_once_it_completes() {
+        let request = json!({ "model_id": "veo-3.1-generate-001", "prompt": "a corgi", "generate_audio": false, "duration_secs": 8 });
+        let created = generation_answer("flows/video", request, 200, json!({ "id": "g1", "status": "pending" }));
+        assert_eq!(ELEVENLABS.opens_charge("flows/video", &created).as_deref(), Some("g1"));
+        let mut scratch = created.data;
+        let running = generation_answer("flows/video/g1", Value::Null, 200, json!({ "id": "g1", "status": "generating" }));
+        assert_eq!(ELEVENLABS.charge_reported_on("flows/video/g1", &running).as_deref(), Some("g1"));
+        assert!(fold_at("flows/video/g1", running, &mut scratch, NOWHERE).await.is_none());
+        let done = generation_answer(
+            "flows/video/g1",
+            Value::Null,
+            200,
+            json!({ "id": "g1", "status": "completed", "content_url": "https://x.example/v.mp4", "content_mime_type": "video/mp4" }),
+        );
+        let cost = fold_at("flows/video/g1", done, &mut scratch, NOWHERE).await.expect("a completed job closes it");
+        assert!((cost.amount_usd.unwrap() - 1.92).abs() < 1e-9, "{cost:?}");
+        assert_eq!(cost.model.as_deref(), Some("veo-3.1-generate-001"));
+        assert_eq!(cost.metadata["priceKey"], json!("veo-3.1-generate-001"));
+        assert_eq!(cost.metadata["seconds"], json!(8.0));
+    }
+
+    /// A failed generation is not charged; one whose request the table
+    /// cannot price closes unknown once it completes, saying why.
+    #[tokio::test]
+    async fn a_failed_generation_is_free_and_an_unpriced_one_unknown() {
+        let priced = json!({ "model_id": "gemini-3.1-flash-image", "prompt": "a corgi" });
+        let mut scratch = generation_answer("flows/image", priced, 200, json!({ "id": "g2", "status": "pending" })).data;
+        let failed = generation_answer(
+            "flows/image/g2",
+            Value::Null,
+            200,
+            json!({ "id": "g2", "status": "failed", "failure_reason": "moderation", "error_message": "no" }),
+        );
+        let cost = fold_at("flows/image/g2", failed, &mut scratch, NOWHERE).await.expect("a failed job closes it");
+        assert_eq!(cost.amount_usd, Some(0.0));
+
+        let unpriced = json!({ "model_id": "gemini-3.1-flash-lite-image", "resolution": "4K", "prompt": "a corgi" });
+        let mut scratch = generation_answer("flows/image", unpriced, 200, json!({ "id": "g3", "status": "pending" })).data;
+        let done = generation_answer("flows/image/g3", Value::Null, 200, json!({ "id": "g3", "status": "completed" }));
+        let cost = fold_at("flows/image/g3", done, &mut scratch, NOWHERE).await.expect("a completed job closes it");
+        assert_eq!(cost.amount_usd, None);
+        let why = cost.metadata["resolution"].as_str().unwrap();
+        assert!(why.contains("gemini-3.1-flash-lite-image-4K"), "{why}");
+    }
+
+    /// A refused create opens nothing and spends nothing.
+    #[tokio::test]
+    async fn a_refused_generation_spends_nothing() {
+        let request = json!({ "model_id": "veo-3.1-generate-001", "prompt": "a corgi", "duration_secs": 5 });
+        let refused = generation_answer("flows/video", request, 422, json!({ "detail": "duration_secs must be 4, 6 or 8" }));
+        assert_eq!(ELEVENLABS.opens_charge("flows/video", &refused), None);
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow = FollowUp { http: &http, base_url: NOWHERE, shared: &shared };
+        let cost = ELEVENLABS.resolve("flows/video", refused, follow).await;
         assert_eq!(cost.amount_usd, Some(0.0));
     }
 }

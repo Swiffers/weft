@@ -107,6 +107,11 @@ async fn crawl_accumulates(rig: FakeRig) -> WeftResult<()> {
         vec![weft::signal::Predicate::neq("status", "scraping")]
     );
     assert_eq!(awaited[0].config["carry"], json!(["status", "error"]), "the wait carries the status, never the pages");
+    assert_eq!(
+        awaited[0].on_cancel,
+        Some(weft::signal::CancelCall::delete("https://api.firecrawl.dev/v2/crawl/job-1")),
+        "cancelling the run cancels the crawl"
+    );
     Ok(())
 }
 

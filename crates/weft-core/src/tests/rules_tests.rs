@@ -118,6 +118,11 @@ fn a_name_on_an_input_is_held_to_the_programs_nodes() {
     assert!(!fires_on(&program(Some(instance_filled_literal(None))), &names), "unknown yet");
     let infra = rule(json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "node": { "role": "infra" } } } }));
     assert!(fires_on(&program(Some(json!("n"))), &infra), "`n` has no infra");
+    // A place whose state a run tells: the node outside every loop is
+    // one, a name nobody wrote is not.
+    let state = rule(json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "state": {} } } }));
+    assert!(!fires_on(&program(Some(json!("n"))), &state), "`n` is a node outside every loop");
+    assert!(fires_on(&program(Some(json!("ghost"))), &state));
 }
 
 /// A `node.field` written on an input (list items, or an object's keys)

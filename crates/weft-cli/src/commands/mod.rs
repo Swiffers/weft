@@ -8,6 +8,8 @@ pub mod ensure;
 pub mod run;
 pub mod follow;
 pub mod stop;
+pub mod node_state;
+pub mod wait;
 pub mod activate;
 pub mod bake;
 pub mod deactivate;
@@ -338,18 +340,18 @@ impl Ctx {
     /// don't have to repeat the trap), then the error propagates
     /// wrapped as [`crate::progress::Reported`]: the user has seen it,
     /// and `main` only turns it into the exit code.
-    pub async fn with_progress<F, Fut>(
+    pub async fn with_progress<T, F, Fut>(
         &self,
         verb: crate::progress::ActionVerb,
         body: F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<T>
     where
         F: FnOnce(crate::progress::Progress) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<()>>,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
         let progress = self.progress(verb);
         match body(progress.clone()).await {
-            Ok(()) => Ok(()),
+            Ok(done) => Ok(done),
             Err(e) => {
                 // Skip the auto-trap if the body already emitted a
                 // structured error: the editor would otherwise see

@@ -1,14 +1,17 @@
 //! `weft follow <project>`: subscribe to the dispatcher's SSE stream
 //! for a project and render live events. The single-run stream
 //! is reached via `weft run`'s internal call to `follow_run_id` after
-//! it kicks off a run; users don't address it directly.
+//! it kicks off a run, and by `weft wait`, which reads the same stream
+//! for its outcome instead of printing it.
 
 use anyhow::Context;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use serde_json::Value;
 use futures::StreamExt;
 use weft_core::live_event::LiveEvent;
 
+use super::wait::Outcome;
 use super::Ctx;
 
 #[derive(Clone, Copy)]
@@ -24,51 +27,74 @@ impl FollowTarget<'_> {
             Self::Run(run_id) => format!("/events/run/{run_id}"),
         }
     }
+}
 
-    fn finished(self, event: &LiveEvent) -> bool {
-        matches!(self, Self::Run(_)) && event.event.is_run_terminal()
-    }
+/// Where a watcher is in a stream: an event, or the moment everything
+/// that happened before it subscribed has been read, so only live events
+/// are left. A run's watcher hears its history first, then `CaughtUp`
+/// once; a project's has no history and hears `CaughtUp` at once.
+pub enum Step<'a> {
+    Event(&'a LiveEvent),
+    CaughtUp,
 }
 
 pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    follow_sse(&client, ctx.on(), FollowTarget::Project(&project), |event| {
-        print_event(&serde_json::to_value(event)?);
-        Ok(())
+    let never: std::convert::Infallible = watch_sse(&client, ctx.on(), FollowTarget::Project(&project), |step| {
+        if let Step::Event(event) = step {
+            print_event(&serde_json::to_value(event)?);
+        }
+        Ok(ControlFlow::Continue(()))
     })
-    .await
+    .await?;
+    match never {}
 }
 
 /// Follow one run to its end, each event printed the way the program
 /// reads (`one.strip`, `gate`) when the project's definition is at
 /// hand; ids otherwise. `on` is the target the command was run `--on`,
-/// which the hints carry.
+/// which the hints carry. Answers how the run ended.
 pub async fn follow_run_id(
     client: &crate::client::DispatcherClient,
     on: Option<&str>,
     run_id: &str,
     definition: Option<&weft_core::ProjectDefinition>,
-) -> anyhow::Result<()> {
-    follow_sse(client, on, FollowTarget::Run(run_id), |event| {
+) -> anyhow::Result<Outcome> {
+    watch_run(client, on, run_id, |step| {
+        let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
         let row = serde_json::to_value(event)?;
         match definition {
             Some(definition) => if let Some(spelled) = super::runs::spell_node(row, definition) { print_event(&spelled) },
             None => print_event(&row),
         }
-        Ok(())
+        Ok(match Outcome::ended(&event.event)? {
+            Some(outcome) => ControlFlow::Break(outcome),
+            None => ControlFlow::Continue(()),
+        })
     }).await
+}
+
+/// Watch one run's events, its history first and then the live ones,
+/// until `watch` breaks with what it was watching for.
+pub async fn watch_run<T>(
+    client: &crate::client::DispatcherClient,
+    on: Option<&str>,
+    run_id: &str,
+    watch: impl FnMut(Step<'_>) -> anyhow::Result<ControlFlow<T>>,
+) -> anyhow::Result<T> {
+    watch_sse(client, on, FollowTarget::Run(run_id), watch).await
 }
 
 fn print_event(event: &Value) {
     println!("{}", format_event(event));
 }
 
-async fn follow_sse(
+async fn watch_sse<T>(
     client: &crate::client::DispatcherClient,
     on: Option<&str>,
     target: FollowTarget<'_>,
-    mut emit: impl FnMut(&LiveEvent) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    mut watch: impl FnMut(Step<'_>) -> anyhow::Result<ControlFlow<T>>,
+) -> anyhow::Result<T> {
     let inspect = || {
         format!(
             "the run may still be running. Inspect it with `{}` and `{}`",
@@ -84,24 +110,27 @@ async fn follow_sse(
     // a seen-event cache for the lifetime of a potentially unbounded run.
     let mut history_ids = HashSet::new();
     // The server is listening now. Recover everything that ran before
-    // attachment, including an already-finished run. New events remain
-    // buffered on the open stream meanwhile.
+    // attachment, including an already-finished run: the live stream
+    // carries only what happens from now on, never the past, and does not
+    // close for a run that already ended. New events remain buffered on
+    // the open stream meanwhile.
     if let FollowTarget::Run(run_id) = target {
         for event in super::versions::replay_rows(client, run_id).await? {
             if !history_ids.insert(event_identity(&event)?.to_owned()) { continue; }
-            emit(&event)?;
-            if target.finished(&event) {
-                return Ok(());
+            if let ControlFlow::Break(done) = watch(Step::Event(&event))? {
+                return Ok(done);
             }
         }
+    }
+    if let ControlFlow::Break(done) = watch(Step::CaughtUp)? {
+        return Ok(done);
     }
     while let Some(ev) = stream.next().await {
         let ev = ev.with_context(|| format!("live updates interrupted; {}", inspect()))?;
         let event: LiveEvent = serde_json::from_str(&ev.data).context("decode run event")?;
         if history_ids.contains(event_identity(&event)?) { continue; }
-        emit(&event)?;
-        if target.finished(&event) {
-            return Ok(());
+        if let ControlFlow::Break(done) = watch(Step::Event(&event))? {
+            return Ok(done);
         }
     }
     anyhow::bail!(
@@ -230,6 +259,18 @@ mod tests {
         fields
     }
 
+    /// Every event into `seen`, stopping at a run's ending the way
+    /// `follow_run_id` does; a project's watch never stops by itself.
+    async fn collect(client: &DispatcherClient, target: FollowTarget<'_>, seen: &mut Vec<LiveEvent>) -> anyhow::Result<()> {
+        watch_sse(client, None, target, |step| {
+            let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
+            seen.push(event.clone());
+            let ended = Outcome::ended(&event.event)?.is_some();
+            Ok(if ended && matches!(target, FollowTarget::Run(_)) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) })
+        })
+        .await
+    }
+
     fn ids(seen: &[LiveEvent]) -> Vec<String> {
         seen.iter().map(|e| e.event_id.clone()).collect()
     }
@@ -242,9 +283,7 @@ mod tests {
             let terminal = event("done", "run_completed", 1);
             let server = server(vec![terminal], vec![], true).await;
             let mut seen = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, None, FollowTarget::Run("a"), |raw| { seen.push(raw.clone()); Ok(()) },
-            )).await.expect("completed history must finish follow").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Run("a"), &mut seen)).await.expect("completed history must finish follow").unwrap();
             assert_eq!(ids(&seen), vec!["done"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe", "history"]);
         }
@@ -259,9 +298,7 @@ mod tests {
             let terminal = event("done", "run_completed", 1);
             let server = server(vec![started], vec![terminal], true).await;
             let mut seen = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, None, FollowTarget::Run("a"), |raw| { seen.push(raw.clone()); Ok(()) },
-            )).await.expect("live completion must finish follow").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Run("a"), &mut seen)).await.expect("live completion must finish follow").unwrap();
             assert_eq!(ids(&seen), vec!["start", "done"]);
         }
     );
@@ -274,9 +311,7 @@ mod tests {
             let events = vec![event("done:a", "run_completed", 1), event("done:b", "run_cancelled", 2)];
             let server = server(vec![], events, false).await;
             let mut seen = Vec::new();
-            let err = tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, None, FollowTarget::Project("p"), |raw| { seen.push(raw.clone()); Ok(()) },
-            )).await.expect("a closed stream must stop following").unwrap_err();
+            let err = tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Project("p"), &mut seen)).await.expect("a closed stream must stop following").unwrap_err();
             assert!(err.to_string().contains("live updates"), "{err}");
             assert_eq!(ids(&seen), vec!["done:a", "done:b"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe"]);
@@ -293,9 +328,7 @@ mod tests {
             let terminal = event("row:3", "run_completed", 1);
             let server = server(vec![first.clone()], vec![first, second, terminal], true).await;
             let mut seen = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, None, FollowTarget::Run("a"), |event| { seen.push(event.clone()); Ok(()) },
-            )).await.expect("completed follow must return").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Run("a"), &mut seen)).await.expect("completed follow must return").unwrap();
             assert_eq!(ids(&seen), vec!["row:1", "row:2", "row:3"]);
         }
     );

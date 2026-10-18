@@ -103,18 +103,23 @@ async fn listener_resolve(
 /// whether it is an infra endpoint, whose address can move (a local
 /// unit's port on the machine moves when the unit is made again), so the
 /// listener asks again after a connect to it fails. Listener role only,
-/// and only for a signal it holds: the project comes off that signal's
-/// row, so only that project's infra is looked at.
+/// and only for a signal it holds, or a cancelled wait whose last call it
+/// is sending: the project comes off that signal's row (or that call's
+/// task), so only that project's infra is looked at.
 async fn listener_infra_address(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<ListenerInfraAddressRequest>,
 ) -> Result<Json<ListenerInfraAddress>, ApiError> {
     listener_only(&caller)?;
-    let project = crate::held_signals::signal_held_project(&state.pool, &req.signal_token)
-        .await
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "no signal is held under this token".to_string()))?;
+    let held = crate::held_signals::signal_held_project(&state.pool, &req.signal_token).await.map_err(internal)?;
+    let project = match held {
+        Some(project) => project,
+        None => crate::held_signals::cancel_call_project(&state.pool, &req.signal_token)
+            .await
+            .map_err(internal)?
+            .ok_or((StatusCode::NOT_FOUND, "no signal is held under this token, and no last call of it is being sent".to_string()))?,
+    };
     let rows: Vec<(Value, Value)> =
         sqlx::query_as("SELECT endpoints_json, install_endpoints_json FROM infra_node WHERE project_id = $1")
             .bind(project)

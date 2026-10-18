@@ -371,6 +371,7 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
             let filled = crate::instance::instance_filled_fields(found).any(|(f, _)| f == field);
             has_field && instance_filled.is_none_or(|wanted| filled == wanted)
         }
+        Named::State {} => crate::project::selection::state_place(project, spelled).is_ok(),
     };
     names.into_iter().filter(|name| !fits(name)).map(str::to_string).collect()
 }
@@ -386,7 +387,7 @@ fn refused_name(name: &str, cx: &RuleContext, named: Named) -> String {
             Some((at, field)) => (at, Some(field)),
             None => return format!("'{name}'"),
         },
-        Named::Node { .. } => (name, None),
+        Named::Node { .. } | Named::State {} => (name, None),
     };
     let suffix = format!(".{at}");
     let meant: BTreeSet<String> = cx

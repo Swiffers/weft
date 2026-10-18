@@ -1,6 +1,8 @@
 //! `weft run`: compile + register the cwd project, record the code as a
 //! version, start a run under it, stream logs until completion (or
-//! `--detach`).
+//! `--detach`). A run it follows to its end sets its exit code the way
+//! `weft wait` does (`wait::Outcome`): 0 when it completed, non-zero when
+//! it failed or was cancelled. A run it only starts exits 0.
 //!
 //! A run has no entry point of its own: the dispatcher kicks every root
 //! of the graph (a node no wire feeds) and pulses run whatever they
@@ -34,7 +36,7 @@ pub struct RunArgs {
     pub save: Option<String>,
 }
 
-pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Run, |progress| async move {
         run_inner(&ctx_inner, &progress, args).await
@@ -58,7 +60,7 @@ fn spec_for(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<Option<RunSpec>> {
     }
 }
 
-async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArgs) -> anyhow::Result<()> {
+async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
     if (!args.seed_until.is_empty() || !args.seed_before.is_empty()) && !args.seed {
         bail!("--seed-until and --seed-before need --seed");
     }
@@ -129,10 +131,10 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     // the action-bar state machine in `cli_running` while the run is
     // actually `run_running`.
     if args.detach || ctx.json() {
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
-    super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&definition)).await?;
-    Ok(())
+    let outcome = super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&definition)).await?;
+    Ok(outcome.exit_code())
 }
 
 fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<()> {

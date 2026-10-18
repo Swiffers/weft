@@ -23,6 +23,13 @@ weft_core::wire_enum! {
         /// goes, and the listener lets go of it, so nobody is still asked to
         /// answer it. Producer = worker (via broker).
         WithdrawSignal = "withdraw_signal",
+        /// Send the last call of a wait whose run was cancelled
+        /// (`weft_core::signal::listener_protocol::CancelCallRequest`, the
+        /// payload as it is), through the listener. Producer = the
+        /// dispatcher's cancel, in the transaction that takes the wait
+        /// down, so a cancel never loses its call to a crash; no caller of
+        /// the broker may enqueue it. Deduplicated on [`cancel_call_key`].
+        CancelCall = "cancel_call",
         /// An answer to a waiting run that a listener picked up (a timer's
         /// tick, an event on a connection it holds), already processed by its
         /// kind. Producer = listener (via broker), which never opens an HTTP
@@ -52,6 +59,14 @@ weft_core::wire_enum! {
         /// that writes the plan down; no caller of the broker may enqueue it.
         Resync = "resync",
     }
+}
+
+/// The dedup key of the [`TaskKind::CancelCall`] of the wait `token`: one
+/// per wait, so a cancel that runs twice queues its call once. The
+/// broker finds the call's project by it while the call is out.
+// SYNC: cancel_call_key <-> crates/weft-broker/src/held_signals.rs cancel_call_project
+pub fn cancel_call_key(token: &str) -> String {
+    format!("cancel_call:{token}")
 }
 
 /// Payload for `TaskKind::FireSignal`: an answer to a waiting run a

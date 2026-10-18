@@ -282,7 +282,26 @@ impl RunContext {
     ///
     /// Returns the value the fire carried.
     pub async fn await_signal<K: crate::signal::Signal>(&self, kind: K) -> WeftResult<Value> {
+        self.await_spec(crate::signal::to_spec(kind)).await
+    }
+
+    /// [`Self::await_signal`] for a wait on a job running on an outside
+    /// service: if the run is cancelled while it waits, the listener
+    /// sends `on_cancel` once (the service's own cancel address for the
+    /// job), as the connection the signal carries, so the service stops
+    /// working and charging. Never sent when the wait is answered or the
+    /// run ends any other way (`crate::signal::cancel_call`).
+    pub async fn await_signal_with_cancel<K: crate::signal::Signal>(
+        &self,
+        kind: K,
+        on_cancel: crate::signal::CancelCall,
+    ) -> WeftResult<Value> {
         let mut spec = crate::signal::to_spec(kind);
+        spec.on_cancel = Some(on_cancel);
+        self.await_spec(spec).await
+    }
+
+    async fn await_spec(&self, mut spec: SignalSpec) -> WeftResult<Value> {
         // A parked signal outlives the firing's file links.
         spec.config = crate::storage::media::strip_links(&spec.config);
         self.handle.await_signal(spec).await

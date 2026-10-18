@@ -970,9 +970,21 @@ impl ProjectStoreOps for PostgresProjectStore {
         tracing::info!(target: "weft_dispatcher::project", project_id = %id, runs = erased, "erasing the project's runs");
         // What the project's runs needed and its triggers ran on: nothing
         // reads them any more. Work queued for it goes too, a task being
-        // run included (its claimant finds its claim gone and stands down).
+        // run included (its claimant finds its claim gone and stands down),
+        // except the last calls its cancelled runs queued: those tell
+        // outside services to stop working and charging for runs that are
+        // gone now. `weft rm` waits for the ones queued before it starts
+        // deleting (`crate::api::project::remove`); the ones queued here,
+        // for the runs this removal cuts short (`erase_project_runs`), go
+        // out with whatever of what they need is still there when they are
+        // sent (an author's connection stays; an instance's goes with the
+        // project right after this, and a call sent later fails, logged).
         signals.extend(crate::journal::postgres::remove_project_signals(&mut *tx, id).await?);
-        sqlx::query("DELETE FROM task WHERE project_id = $1").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM task WHERE project_id = $1 AND kind <> $2")
+            .bind(id)
+            .bind(weft_task_store::TaskKind::CancelCall.as_str())
+            .execute(&mut *tx)
+            .await?;
         weft_task_store::unanswered::forget_project(&mut *tx, id).await?;
         sqlx::query("DELETE FROM project_definition WHERE project_id = $1").bind(id).execute(&mut *tx).await?;
         crate::infra_owner::release_project(&mut tx, id).await?;

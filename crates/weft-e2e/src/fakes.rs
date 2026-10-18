@@ -122,16 +122,20 @@ async fn poll_handler(State(body): State<Arc<Mutex<String>>>) -> impl IntoRespon
 /// "is it done yet" endpoint: the first `pending` reads answer
 /// `{"status": "IN_PROGRESS"}`, every read after them answers
 /// `{"status": "COMPLETED", "result": <result>}`. Counts the reads, so a
-/// test can see the job was polled until done and not after.
+/// test can see the job was polled until done and not after, and the
+/// calls to its cancel address (`PUT /cancel`), so a test can see a
+/// cancelled run's last call reached it, and how many times.
 pub struct JobFake {
     base_url: String,
     reads: Arc<std::sync::atomic::AtomicUsize>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
     _server: AbortOnDrop,
 }
 
 #[derive(Clone)]
 struct JobState {
     reads: Arc<std::sync::atomic::AtomicUsize>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
     pending: usize,
     result: Arc<String>,
 }
@@ -141,15 +145,29 @@ impl JobFake {
     /// is done with `result`.
     pub async fn start(pending: usize, result: &str) -> Result<Self> {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (gateway, listener, port) = bind_host("job").await?;
+        let state = JobState { reads: reads.clone(), cancels: cancels.clone(), pending, result: Arc::new(result.to_string()) };
         let app = Router::new()
             .route("/status", get(job_status))
-            .with_state(JobState { reads: reads.clone(), pending, result: Arc::new(result.to_string()) });
+            .route("/cancel", axum::routing::put(job_cancel))
+            .with_state(state);
         Ok(Self {
             base_url: format!("http://{gateway}:{port}"),
             reads,
+            cancels,
             _server: serve_axum(listener, app),
         })
+    }
+
+    /// The reachable URL of the job's cancel address (`<base>/cancel`).
+    pub fn cancel_url(&self) -> String {
+        format!("{}/cancel", self.base_url)
+    }
+
+    /// How many times the job was asked to cancel so far.
+    pub fn cancels(&self) -> usize {
+        self.cancels.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The reachable URL of the status address (`<base>/status`).
@@ -161,6 +179,11 @@ impl JobFake {
     pub fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+async fn job_cancel(State(state): State<JobState>) -> impl IntoResponse {
+    state.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    axum::Json(serde_json::json!({ "status": "CANCELLED" }))
 }
 
 async fn job_status(State(state): State<JobState>) -> impl IntoResponse {

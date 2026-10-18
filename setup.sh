@@ -607,6 +607,10 @@ if [[ "${run_log}" != /dev/null ]] && [[ "$(wc -l < "${run_log}")" -gt 400 ]]; t
   tail -n 400 "${run_log}" > "${run_log}.tmp" 2>/dev/null && mv "${run_log}.tmp" "${run_log}" 2>/dev/null || rm -f "${run_log}.tmp"
 fi
 current_section="(argument parsing)"
+# Whether this run has started changing the install (its binaries, its
+# daemon, its extensions): until then a failure leaves the install as it
+# was, and the exit line says so.
+install_touched=0
 # The exit code arrives as $1: a composite trap (`cleanup; log_run_exit`)
 # would otherwise have $? read the CLEANUP's status and journal a died
 # run as `DONE ok`.
@@ -628,9 +632,11 @@ log_run_exit() {
       "$(date '+%Y-%m-%d %H:%M:%S')" "${code}" "${current_section}" >> "${run_log}"
     local journal_note=""
     [[ "${run_log}" != /dev/null ]] && journal_note=" (journal: ${run_log})"
-    printf '  %s%s%s this run FAILED in %s%s%s; the install is incomplete%s\n' \
+    local state_note="the install is incomplete"
+    [[ ${install_touched} -eq 0 ]] && state_note="nothing was installed"
+    printf '  %s%s%s this run FAILED in %s%s%s; %s%s\n' \
       "${C_RED}" "${SYM_FAIL}" "${C_RESET}" "${C_BOLD}" "${current_section}" "${C_RESET}" \
-      "${journal_note}" >&2
+      "${state_note}" "${journal_note}" >&2
     if [[ ${#bump_pending_notes[@]} -gt 0 ]]; then
       local n
       for n in "${bump_pending_notes[@]}"; do
@@ -986,6 +992,7 @@ fi
 
 if [[ -n "${write_migration}" ]]; then
   section "migration"
+  install_touched=1
   # Everything this run's shape needs, named up front instead of a
   # bare command-not-found mid-run: cargo (the schema generator
   # compiles from source) and docker (the throwaway
@@ -1283,6 +1290,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
   if [[ $do_uninstall -eq 1 ]]; then
     section "Uninstall"
+    install_touched=1
     hint "${C_DIM}preserving data; pass --purge to wipe everything${C_RESET}"
 
     # 1. Stop weft's runtime, then take it off the service manager so
@@ -1384,6 +1392,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
   if [[ $do_purge -eq 1 ]]; then
     section "Purge"
+    install_touched=1
     hint "${C_DIM}true clean slate; next install pays a full rebuild cost${C_RESET}"
 
     # A purge with the docker CLI present but the daemon down cannot do
@@ -1580,6 +1589,7 @@ if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && weft_old_install_present; 
       exit 1
     fi
   fi
+  install_touched=1
   "${here}/scripts/scrub-old-install.sh" --yes || { fail "the wipe did not finish; see above, then run ./setup.sh again"; exit 1; }
   ok "the older weft is gone; installing this one"
 fi
@@ -1812,6 +1822,55 @@ if [[ $build_browser -eq 1 ]]; then
 fi
 fail_on_missing_tools "Extensions"
 
+# ---- a database from before runs were renamed --------------------------
+#
+# A database from before runs were renamed cannot be carried forward: the
+# runtime refuses to boot on one, and the CLI this run installs cannot
+# talk to the runtime still serving it. So the question is asked here,
+# before anything is installed, and a no leaves the install exactly as it
+# was; the wipe itself waits for the daemon step, which stops the old
+# runtime first. A run that installs the CLI without refreshing the
+# daemon is refused instead: it would put that CLI in front of the old
+# runtime.
+# SYNC: resource names <-> crates/weft-core/src/infra/install.rs (resource_prefix)
+wipe_stale_db=0
+if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && command -v docker >/dev/null 2>&1; then
+  if [[ "${install_env}" == "default" ]]; then install_prefix="weft"; else install_prefix="weft-${install_env}"; fi
+  pg_container="${install_prefix}-postgres"
+  if ! stale_db="$(weft_database_before_runs "${pg_container}")"; then
+    fail "could not read the database in ${pg_container} to check its age; see docker, then run ./setup.sh again"
+    exit 1
+  fi
+  if [[ "${stale_db}" == "yes" ]]; then
+    section "A database from before runs were renamed"
+    if [[ $refresh_daemon -eq 0 ]]; then
+      fail "this install's database (${install_env}) was built by a weft from before runs were renamed, and this run installs a CLI that cannot talk to it without refreshing the daemon; nothing installed. Run ./setup.sh without --no-daemon (or with --daemon) to wipe and rebuild it"
+      exit 1
+    fi
+    warn "this install's database (${install_env}) was built by a weft from before runs were renamed,"
+    warn "and this version cannot carry it forward. It is going to be wiped: the projects on your"
+    warn "disk are not touched, but their run history, versions, stored connections, stored files"
+    warn "and running infra are."
+    if [[ $assume_yes -eq 0 ]]; then
+      if [[ ! -t 0 ]]; then
+        fail "no terminal to ask on; nothing wiped and nothing installed; run ./setup.sh --yes to wipe it and install"
+        exit 1
+      fi
+      # End of input (Ctrl-D) is a no.
+      read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
+      if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
+        hint "nothing wiped and nothing installed; run ./setup.sh again when you are ready"
+        exit 1
+      fi
+    fi
+    wipe_stale_db=1
+  fi
+fi
+
+# Every check that can refuse this run without touching the install is
+# above; from here on it changes the install.
+install_touched=1
+
 # What the other scripts and the development editor read to find this
 # checkout's install, once it is in place: after the daemon start when
 # this run refreshes it, else as soon as the binaries are.
@@ -1977,36 +2036,12 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # it starts on it too.
     install_env_cmd=(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${installed_bin}")
 
-    # A database from before runs were renamed cannot be carried forward:
-    # the runtime refuses to boot on one. So this install's database is
-    # wiped first (asked, unless --yes), with everything only it gave a
+    # The database from before runs were renamed, agreed to above before
+    # anything was installed: wiped now, with everything only it gave a
     # meaning to (its stored files, its projects' workers and infra), and
     # the start below builds a fresh one. Only this install's: its config,
     # its keys and every other install stay as they are.
-    # SYNC: resource names <-> crates/weft-core/src/infra/install.rs (resource_prefix)
-    if [[ "${install_env}" == "default" ]]; then install_prefix="weft"; else install_prefix="weft-${install_env}"; fi
-    pg_container="${install_prefix}-postgres"
-    if ! stale_db="$(weft_database_before_runs "${pg_container}")"; then
-      fail "could not read the database in ${pg_container} to check its age; see docker, then run ./setup.sh again"
-      exit 1
-    fi
-    if [[ "${stale_db}" == "yes" ]]; then
-      warn "this install's database (${install_env}) was built by a weft from before runs were renamed,"
-      warn "and this version cannot carry it forward. It is going to be wiped: the projects on your"
-      warn "disk are not touched, but their run history, versions, stored connections, stored files"
-      warn "and running infra are."
-      if [[ $assume_yes -eq 0 ]]; then
-        if [[ ! -t 0 ]]; then
-          fail "no terminal to ask on; run ./setup.sh --yes to wipe it and install"
-          exit 1
-        fi
-        # End of input (Ctrl-D) is a no.
-        read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
-        if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
-          hint "nothing wiped and the daemon not started; run ./setup.sh again when you are ready"
-          exit 1
-        fi
-      fi
+    if [[ $wipe_stale_db -eq 1 ]]; then
       "${install_env_cmd[@]}" daemon stop >/dev/null 2>&1 || true
       weft_wipe_database "${pg_container}" "${install_dir}" "${install_env}" "${install_prefix}" || { fail "the database of ${install_env} could not be removed; see above, then run ./setup.sh again"; exit 1; }
       ok "the old database of ${install_env} is gone; starting on a fresh one"

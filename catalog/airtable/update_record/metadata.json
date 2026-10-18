@@ -108,6 +108,7 @@
     {
       "name": "record",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The updated record."
     }
   ],

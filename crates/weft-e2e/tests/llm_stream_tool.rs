@@ -31,14 +31,14 @@ async fn llm_stream_and_tool_loop_close_in_the_graph() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/llm", "openrouter")?,
+        catalog_spec("ai/llm", "openrouter_access")?,
         "own",
         serde_json::json!({ "key": key }),
     )
     .await?;
 
     let mut project = Project::prepare("llm_stream_tool", disp).await?;
-    set_account(&project, "prov", conn.handle()).await?;
+    set_account(&project, "openrouter", conn.handle()).await?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

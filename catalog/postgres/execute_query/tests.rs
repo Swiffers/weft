@@ -1,20 +1,21 @@
 //! PostgresExecuteQuery self-tests: the pure parameter/identifier
 //! plumbing, the placeholder reading that turns the node's ports into
-//! the query's parameters, and everything the node must refuse BEFORE
-//! a dial (fake; the fake rig has no sockets). The query path itself
-//! needs a real database and is exercised end to end there.
+//! the query's parameters (and the compiler's pattern that must find
+//! the same names), what an answered result emits on `rows` and `row`
+//! (through the rig's emit check, with the result handed in), and
+//! everything the node must refuse BEFORE a dial (fake; the fake rig
+//! has no sockets). The query path itself needs a real database and is
+//! exercised end to end there.
 
+use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{FakeRig, Node, NodeManifest, NodeMetadata, NodeTest, RunContext, WeftResult, WeftType};
 
 use tokio_postgres::types::Type;
 
-use super::super::postgres::{
-    params_of, placeholders, plan, quote_ident, refuse_shadowed_columns, refuse_unanswered_ports,
-    spell_parameters, Plan, Statement,
-};
-use super::PostgresExecuteQueryNode;
+use super::super::postgres::{params_of, placeholders, plan, quote_ident, spell_parameters, Plan, Statement};
+use super::{answer, emit, PostgresExecuteQueryNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -25,8 +26,12 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("placeholders_count_statements_and_refuse_positions", placeholder_statements),
         NodeTest::basic("plan_reads_the_query_as_a_query_or_a_script", plan_mismatches),
         NodeTest::basic("a_refusal_names_the_port_not_the_position", spelled_parameters),
-        NodeTest::basic("a_column_named_like_one_of_our_ports_is_refused", shadowed_columns),
-        NodeTest::basic("a_port_no_column_answers_is_refused", unanswered_ports),
+        NodeTest::basic("placeholders_and_the_metadata_pattern_agree", pattern_agrees),
+        NodeTest::basic("a_result_fills_rows_row_and_count", answers),
+        NodeTest::fake("no_rows_sends_an_empty_list_and_closes_row", no_rows),
+        NodeTest::fake("no_rows_sends_null_on_a_row_typed_to_admit_it", no_rows_nullable),
+        NodeTest::fake("a_declared_record_that_fits_passes", declared_fits),
+        NodeTest::fake("a_row_that_does_not_fit_fails_naming_the_field", declared_misfits),
         NodeTest::fake("a_non_numeric_port_refuses_before_dialing", bad_port),
         NodeTest::fake("an_unknown_tls_setting_refuses_before_dialing", bad_tls),
         NodeTest::fake("an_unread_port_refuses_before_dialing", unread_port),
@@ -40,7 +45,7 @@ pub fn tests() -> Vec<NodeTest> {
     ]
 }
 
-/// `photo?: File` on a card sent with no picture: the author said the
+/// `photo?: String` on a card sent with no photo link: the author said the
 /// value may be absent, so the query binds SQL NULL instead of refusing.
 /// The refusal is the thing under test, so this asserts the node got
 /// PAST the hole check; the dial itself has no socket in a fake rig.
@@ -308,14 +313,14 @@ async fn missing_port(rig: FakeRig) -> WeftResult<()> {
             &PostgresExecuteQueryNode,
             json!({
                 "account": rig.access("postgres"),
-                "query": "SELECT * FROM users WHERE id = $user_id",
+                "query": "SELECT * FROM users WHERE id = $userId",
             }),
         )
         .await
         .result
         .expect_err("a placeholder with no port must refuse")
         .to_string();
-    assert!(err.contains("`$user_id`") && err.contains("declare"), "{err}");
+    assert!(err.contains("`$userId`") && err.contains("declare"), "{err}");
     Ok(())
 }
 
@@ -358,55 +363,6 @@ fn spelled_parameters() -> WeftResult<()> {
     // survive that unchanged rather than come out mangled.
     let no_ports = spell_parameters("ERROR: relation \"cards\" does not exist", &[]);
     assert_eq!(no_ports, "ERROR: relation \"cards\" does not exist");
-    Ok(())
-}
-
-/// `select count(*) as count` asks for a port this node already
-/// answers with the number of rows. Nothing downstream could tell the
-/// two apart (both are Numbers, and the node's own value is written
-/// last), so an API served `1` for a page of nine cards. It refuses
-/// now, and says where to put the column instead.
-/// The mirror: a declared port the SELECT answers no column for. It
-/// used to close in silence and skip everything behind it.
-fn unanswered_ports() -> WeftResult<()> {
-    let declared = |names: &[&str]| -> std::collections::HashMap<String, weft::WeftType> {
-        names
-            .iter()
-            .map(|n| ((*n).to_string(), weft::WeftType::parse("String").expect("String parses")))
-            .collect()
-    };
-    let row = json!({ "id": 1, "name": "ada", "note": "hi" });
-
-    let missed = refuse_unanswered_ports(&row, &declared(&["card", "rows", "count"]), &["rows", "count"])
-        .expect_err("no column called 'card'");
-    let said = missed.to_string();
-    assert!(said.contains("'card'"), "it names the port: {said}");
-    assert!(said.contains("'name'"), "it names what the query did answer: {said}");
-    assert!(!said.contains("'rows'"), "the node's own ports are not columns: {said}");
-
-    // A port that matches a column, and the node's own ports, are fine.
-    refuse_unanswered_ports(&row, &declared(&["name", "rows", "count"]), &["rows", "count"])?;
-
-    // No rows means every declared port closes, and that IS the right
-    // reading of a query that answered nothing.
-    refuse_unanswered_ports(&Value::Null, &declared(&["card"]), &["rows", "count"])?;
-    Ok(())
-}
-
-fn shadowed_columns() -> WeftResult<()> {
-    let clash = refuse_shadowed_columns(&json!({ "count": 9, "title": "ada" }), &["rows", "count"])
-        .expect_err("a column called 'count' has nowhere to go");
-    let said = clash.to_string();
-    assert!(said.contains("'count'"), "it names the column: {said}");
-    assert!(said.contains("as count_value"), "it names the fix: {said}");
-
-    // Every other name is exactly what the added ports are for.
-    refuse_shadowed_columns(&json!({ "total": 9, "title": "ada" }), &["rows", "count"])?;
-
-    // A query that answered nothing has no columns to clash, and a
-    // node with no ports of its own can never clash at all.
-    refuse_shadowed_columns(&Value::Null, &["rows", "count"])?;
-    refuse_shadowed_columns(&json!({ "count": 9 }), &[])?;
     Ok(())
 }
 
@@ -460,5 +416,155 @@ async fn bad_setting_wired(rig: FakeRig) -> WeftResult<()> {
     rig.wire_output("error");
     let err = run_query(&rig).await.failure()?;
     assert!(err.contains("TLS setting"), "{err}");
+    Ok(())
+}
+
+/// The compiler reads a query's placeholders with the metadata's
+/// `placeholdersAreInputs` pattern, the node with `placeholders()`;
+/// they must find the same names, or a query the node runs fails the
+/// build (or one it refuses passes it). Each query here is one the
+/// node accepts, chosen for a shape where the two could part.
+///
+/// One shape is known to part, and it is not in this list: a block
+/// comment NESTED in another (`/* a /* b */ $x */`). Comments nest to
+/// any depth, which no regular pattern can follow, so the pattern ends
+/// the comment at the first `*/` and `$x` reads as a placeholder the
+/// node would never read.
+fn pattern_agrees() -> WeftResult<()> {
+    let spec = PostgresExecuteQueryNode
+        .manifest()
+        .placeholders_are_inputs
+        .as_ref()
+        .expect("the node declares placeholdersAreInputs");
+    assert_eq!(spec.setting, "query");
+    let regex = spec.regex().map_err(weft::WeftError::NodeFailed)?;
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT $b, $a, $b::int FROM t WHERE x = $a", &["b", "a"]),
+        ("SELECT * FROM users WHERE id = $userId AND at > $when::timestamptz", &["userId", "when"]),
+        // Strings: `''` escapes a quote, so the string goes on past it.
+        ("SELECT 'it''s $no', $yes", &["yes"]),
+        // `E'...'` escapes with a backslash too, upper or lower case.
+        ("SELECT E'a\\'$no\\\\', e'$no2''$no3', $yes", &["yes"]),
+        // A quote after a word ending in `e` is a plain string, where a
+        // backslash escapes nothing.
+        ("SELECT some'a\\', $e", &["e"]),
+        // After a `$` too: `a$e` is one identifier and `$E` a
+        // placeholder, so the quote after either opens a plain string.
+        ("SELECT a$e'x\\', $E'\\', $w", &["E", "w"]),
+        ("SELECT \"we$ird\", \"a\"\"$b\", $c", &["c"]),
+        // A `$` inside an identifier is part of the name.
+        ("SELECT x$y, col$1, a$b$c, $z FROM t", &["z"]),
+        ("SELECT 1 -- $no\n, $a /* $no */ , $b", &["a", "b"]),
+        ("DO $$ BEGIN PERFORM $no; END $$; SELECT $yes", &["yes"]),
+        ("SELECT $$a$$||$tail", &["tail"]),
+        ("CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $body$ SELECT $no; $body$; SELECT f(), $x", &["x"]),
+        ("SELECT $a$ $inside $a$, $b", &["b"]),
+        // A `$tag$` body runs to its OWN closing tag: another tag inside
+        // it, and what sits between that pair, is text.
+        ("CREATE FUNCTION f() AS $fn$ BEGIN EXECUTE $q$ SELECT $zz $q$; END $fn$; SELECT $a", &["a"]),
+        ("SELECT $f$ one $g$ $zz $f$, $a", &["a"]),
+        // A positional `$1` names no input (a script's own PREPARE).
+        ("PREPARE p AS SELECT $1; EXECUTE p(1)", &[]),
+        // A name read twice, and read by two statements, is one input.
+        ("UPDATE t SET n = $n WHERE id = $id; SELECT * FROM t WHERE id = $id", &["n", "id"]),
+        // The query the placeholder-quoting test reads.
+        (
+            "SELECT '$not', \"$col\", x$y, E'\\'$no', $$ $body; $$, $fn$ $inner; $fn$ \
+             -- $line; \n /* $block; /* nested */ */ FROM t WHERE id = $real",
+            &["real"],
+        ),
+    ];
+    for (query, expected) in cases {
+        let node = placeholders(query)?.names();
+        let compiler = spec.names_in(&regex, query).map_err(weft::WeftError::NodeFailed)?;
+        assert_eq!(node, *expected, "the node's reading of {query:?}");
+        assert_eq!(compiler, *expected, "the metadata pattern's reading of {query:?}");
+    }
+    Ok(())
+}
+
+fn answers() -> WeftResult<()> {
+    let ada = json!({ "id": "1", "name": "ada" });
+    let bo = json!({ "id": "2", "name": "bo" });
+
+    let none = answer(Vec::new(), false).outputs;
+    assert_eq!(none.get("rows"), Some(&json!([])), "no rows is an empty list, sent");
+    assert_eq!(none.get("count"), Some(&json!(0.0)));
+    assert!(!none.contains_key("row"), "no rows leaves `row` out, which closes it");
+    assert_eq!(answer(Vec::new(), true).outputs.get("row"), Some(&Value::Null), "unless it takes null");
+
+    let one = answer(vec![ada.clone()], false).outputs;
+    assert_eq!(one.get("row"), Some(&ada));
+    assert_eq!(one.get("rows"), Some(&json!([ada.clone()])));
+
+    let several = answer(vec![ada.clone(), bo.clone()], true).outputs;
+    assert_eq!(several.get("row"), Some(&ada), "the FIRST row, whatever `row` takes");
+    assert_eq!(several.get("rows"), Some(&json!([ada, bo])), "and every row on `rows`");
+    assert_eq!(several.get("count"), Some(&json!(2.0)));
+    Ok(())
+}
+
+/// The node's own emission over a result handed in, under the node's
+/// own manifest: what a query answering these rows sends, through the
+/// rig's emit check, with no database behind it.
+struct Answered(Vec<Value>);
+
+impl NodeManifest for Answered {
+    fn manifest(&self) -> &'static NodeMetadata {
+        PostgresExecuteQueryNode.manifest()
+    }
+}
+
+#[async_trait]
+impl Node for Answered {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        emit(&ctx, self.0.clone()).await
+    }
+}
+
+fn ty(text: &str) -> WeftType {
+    WeftType::parse(text).unwrap_or_else(|| panic!("{text} parses"))
+}
+
+async fn no_rows(rig: FakeRig) -> WeftResult<()> {
+    let outcome = rig.run(&Answered(Vec::new()), json!({})).await.ok()?;
+    assert_eq!(outcome.output("rows")?, &json!([]));
+    assert!(!outcome.outputs.contains_key("row"), "`row` closes: {:?}", outcome.outputs);
+    Ok(())
+}
+
+async fn no_rows_nullable(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("row", ty("JsonDict | Null"));
+    let outcome = rig.run(&Answered(Vec::new()), json!({})).await.ok()?;
+    assert_eq!(outcome.output("row")?, &Value::Null);
+    assert_eq!(outcome.output("rows")?, &json!([]), "`rows` is filled from the same result");
+    Ok(())
+}
+
+/// `-> (row: User)` and `-> (rows: List[User])` with an open `User`:
+/// the rows fit, and the columns `User` does not name are dropped.
+async fn declared_fits(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("row", ty("{ id: String, name: String | Null, .. }"));
+    rig.output_type("rows", ty("List[{ id: String, name: String | Null, .. }]"));
+    let rows = vec![
+        json!({ "id": "1", "name": "ada", "joined": "2024-05-01" }),
+        json!({ "id": "2", "name": null, "joined": "2024-06-01" }),
+    ];
+    let outcome = rig.run(&Answered(rows), json!({})).await.ok()?;
+    assert_eq!(outcome.output("row")?, &json!({ "id": "1", "name": "ada" }));
+    assert_eq!(
+        outcome.output("rows")?,
+        &json!([{ "id": "1", "name": "ada" }, { "id": "2", "name": null }])
+    );
+    Ok(())
+}
+
+async fn declared_misfits(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("row", ty("{ id: String, email: String, .. }"));
+    let err = rig
+        .run(&Answered(vec![json!({ "id": "1", "name": "ada" })]), json!({}))
+        .await
+        .failure()?;
+    assert!(err.contains("missing required field \"email\""), "{err}");
     Ok(())
 }

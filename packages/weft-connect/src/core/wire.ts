@@ -386,9 +386,11 @@ export interface PortDefinition {
   /// mirror of the matching carry output. Never user-editable; the user
   /// changes the output's role to remove the synthesized input.
   synthesizedFromCarry?: boolean;
-  /// The type the SOURCE header declares for this port; absent when the
-  /// header does not declare it (a catalog port, a config-derived one,
-  /// a synthesized one). The editor rewrites the header from THIS,
+  /// The type the SOURCE header declares for this port, verbatim (a typo
+  /// included); the empty string when the header names the port with no
+  /// type (`(x)`, whose type is then its own variable `T__x`); absent
+  /// when the header does not declare it (a catalog port, a
+  /// config-derived one, a synthesized one). The editor rewrites the header from THIS,
   /// never from `portType`: the rendered type may be an
   /// inference-resolved instantiation of a generic, which must not get
   /// frozen into source as if the author wrote it.
@@ -407,11 +409,13 @@ export interface PortDefinition {
 export interface InputDefinition extends PortDefinition {
   // SYNC: InputDefinition.accepts <-> crates/weft-core/src/project.rs InputDefinition.accepts
   accepts?: Accepts;
-  /// Optional while unwired, required once wired: a wire into it that
-  /// arrives closed skips the node. Its wiring decides, so the editor
-  /// draws it required only while a wire feeds it.
-  // SYNC: InputDefinition.requiredWhenWired <-> crates/weft-core/src/project.rs InputDefinition.required_when_wired
-  requiredWhenWired?: boolean;
+  /// The program wrote `x?:` (or a key creating the port written
+  /// `x?:`): the node runs without it even when wired and the wire
+  /// closed. Never with `required`. With neither flag, the node runs
+  /// without it while unwired and needs it once wired (`inputIsRequired`
+  /// in the graph protocol is the one reading).
+  // SYNC: InputDefinition.optional <-> crates/weft-core/src/project.rs InputDefinition.optional
+  optional?: boolean;
   // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
   widget?: Widget;
   default?: unknown;

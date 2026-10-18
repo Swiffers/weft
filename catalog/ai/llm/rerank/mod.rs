@@ -1,6 +1,6 @@
 //! LlmRerank: reorder documents by relevance to a query, through the
 //! wired provider's connection. Speaks the OpenRouter rerank
-//! endpoint, so the provider must be an OpenRouterProvider whose
+//! endpoint, so the provider must be an OpenRouterModel whose
 //! model names a rerank model (cohere/rerank-4-pro, ...).
 
 use async_trait::async_trait;

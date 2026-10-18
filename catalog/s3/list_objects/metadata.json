@@ -32,7 +32,7 @@
   "outputs": [
     {
       "name": "objects",
-      "type": "List[JsonDict]",
+      "type": "List[{ key: String, sizeBytes: Number, lastModified: String }]",
       "description": "Each object: key, sizeBytes, lastModified."
     },
     {

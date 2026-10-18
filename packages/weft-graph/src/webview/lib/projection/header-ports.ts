@@ -3,8 +3,8 @@
 // A node's header is NOT its whole port surface: the catalog provides
 // the node type's own ports at enrich, and the header declares only the
 // CUSTOM ones, plus a catalog port whose type or requiredness the
-// author overrides (filling a MustOverride output, retyping a port from
-// the context menu). Writing the full rendered list instead freezes the
+// author overrides (retyping a port from the context menu, making an
+// optional one required). Writing the full rendered list instead freezes the
 // node type's entire signature into source: internal machinery included
 // (`_should_flow`), every structural type expanded, and catalog updates
 // no longer reaching the node. Groups and Loops are different: their
@@ -17,12 +17,15 @@
 // defaults would mistake every such instantiation for an author
 // override and freeze it into source.
 
-import type { EditPortSig, RevertedPortSig } from '../../../protocol';
-import { isGatePort, containsTypevar, parseWeftType } from '../../../protocol';
+import type { EditPortSig, RevertedPortSig, OutputSpec, TypeParamWire, WeftType } from '../../../protocol';
+import { isGatePort, containsUnresolvedLeaf, inputIsRequired, narrowingBound, parseWeftType, tryParseWeftType } from '../../../protocol';
+import { collectTypeVarBindings, fitsWithin, isCompatible, typeParamBound, typeParamViolation, weftTypesEqual, weftTypeToString } from '../types';
 
 export interface HeaderPortLike {
 	name: string;
 	required?: boolean;
+	/** The program wrote it `x?:` (inputs only; see `InputDefinition.optional`). */
+	optional?: boolean;
 	/** The rendered type. Every rendered port carries one. */
 	portType: string;
 	declaredType?: string;
@@ -44,22 +47,74 @@ export const headerWorthy = (p: Pick<HeaderPortLike, 'synthesizedFromCarry'>): b
 /// carries it explicitly. Shared with the group signature writer.
 export const portRequired = (p: HeaderPortLike | undefined): boolean => p?.required === true;
 
+/** Whether a closed value on this port skips its node, given whether a
+ *  wire feeds it (`inputIsRequired` over a port whose flags may be absent). */
+const meansRequired = (p: HeaderPortLike, wired: boolean): boolean =>
+	inputIsRequired({ required: portRequired(p), optional: p.optional }, wired);
+
+/** Where an input's requiredness stands, which decides what a gesture
+ *  may change it to:
+ *   - `node_requires`: the node's metadata requires it, so its code
+ *     needs it and the compiler refuses `x?:` on it.
+ *   - `required` / `optional`: the program wrote it `x:` / `x?:` (every
+ *     container port is one of these two).
+ *   - `wiring`: the metadata calls it optional and the program wrote
+ *     nothing: the node runs without it while unwired, and needs it once
+ *     wired (a closed wire skips the node). */
+export type InputRequiredness = 'node_requires' | 'required' | 'optional' | 'wiring';
+
+/** A node input's `InputRequiredness`, `provided` being the node type's
+ *  own port of that name (absent for a port the program added). */
+export function nodeInputRequiredness(
+	p: HeaderPortLike,
+	provided: HeaderPortLike | undefined,
+): InputRequiredness {
+	if (portRequired(provided)) return 'node_requires';
+	if (portRequired(p)) return 'required';
+	return p.optional ? 'optional' : 'wiring';
+}
+
+/** Whether the header spells this port without `?`, chosen so the line
+ *  means what the port means now: a port the node requires never takes
+ *  `?` (the compiler refuses it); a port the program wrote keeps its own
+ *  spelling; and a port the metadata calls optional that the program
+ *  never wrote is spelled `x:` while wired (required, as wired it already
+ *  is) and `x?:` while unwired (the node runs without it, as it already
+ *  does). */
+function spelledRequired(p: HeaderPortLike, provided: HeaderPortLike | undefined, wired: boolean): boolean {
+	if (portRequired(provided) || portRequired(p)) return true;
+	return p.optional ? false : wired;
+}
+
+/** The two requiredness flags as one comparable state. */
+const requirednessState = (p: HeaderPortLike): string =>
+	portRequired(p) ? 'required' : p.optional ? 'optional' : 'wiring';
+
 /** A node's port surface as one gesture writes it, computed from the
- *  gesture's `next` list against the pre-gesture `previous` list and the
- *  node type's catalog `defaults`.
+ *  gesture's `next` list against the pre-gesture `previous` list, the
+ *  node type's catalog `defaults`, and the input names a wire feeds
+ *  (`wired`, empty for outputs and for a fresh copy).
  *   - `sigs`: the header-worthy ports. A port the GESTURE just added or
  *     changed (new name, or type / requiredness differs from `previous`)
  *     is written with its new values; a port the source header already
- *     declares (`declaredType` set) round-trips with the DECLARED type.
+ *     declares (`declaredType` set) round-trips with the DECLARED type,
+ *     the empty spelling of a port written with no type included. A
+ *     brand new port writes its own `declaredType` when it carries one
+ *     (`''`: the bare name, no type chosen yet). Each sig's `required`
+ *     is the spelling that keeps the port's meaning (`spelledRequired`).
  *     Each sig also carries `rendered`, the port's inference-resolved
  *     type, which the optimistic projection shows (the header spelling
  *     may be a generic that inference instantiated per wire).
  *   - `reverted`: ports whose intended header line would restate the
- *     catalog default exactly (same type and requiredness), so it leaves
- *     the header instead: this UN-declares a port the user just reverted
- *     (a toggle-on-then-off, a retype back to the default) instead of
+ *     catalog default, so it leaves the header instead: this UN-declares
+ *     a port the user just retyped back to the default instead of
  *     freezing the default into source, and heals a polluted header
- *     whose lines still spell the defaults. A line polluted with an
+ *     whose lines still spell the defaults. An untouched line restates
+ *     the default only with the default's own requiredness; a retyped
+ *     one also when its spelling means, at the current wiring, what the
+ *     default means (the spelling `spelledRequired` picks for an
+ *     unwritten port). A requiredness the gesture just set is the
+ *     author's ask and is always written. A line polluted with an
  *     inference-RESOLVED spelling (`data: String` over a catalog
  *     `data: T`) is NOT healed: the declared string differs from the
  *     default's, and loosening the gate to a semantic compare would let
@@ -72,6 +127,7 @@ export function headerPortSigs(
 	previous: HeaderPortLike[],
 	next: HeaderPortLike[],
 	defaults: HeaderPortLike[] | undefined,
+	wired: ReadonlySet<string>,
 ): { sigs: EditPortSig[]; reverted: RevertedPortSig[] } {
 	const prevByName = new Map(previous.map((p) => [p.name, p]));
 	const defByName = new Map((defaults ?? []).map((d) => [d.name, d]));
@@ -80,26 +136,32 @@ export function headerPortSigs(
 	for (const p of next) {
 		if (isGatePort(p.name)) continue;
 		const prev = prevByName.get(p.name);
+		const d = defByName.get(p.name);
+		const isWired = wired.has(p.name);
 		const typeChanged = !prev || prev.portType !== p.portType;
-		const requiredChanged = !prev || portRequired(prev) !== portRequired(p);
+		const requiredChanged = !prev || requirednessState(prev) !== requirednessState(p);
 		// The type the header WOULD spell for this port. A required-only
 		// toggle must not carry the RENDERED type into source (an
 		// inference-resolved generic would get frozen), so it keeps the
 		// declared spelling, or the catalog's; only an actual retype (or
-		// a brand new port, whose rendered type IS its authored one)
-		// writes the rendered value.
+		// a brand new port with no spelling of its own, whose rendered
+		// type IS its authored one) writes the rendered value.
 		let portType: string;
-		if (typeChanged) portType = p.portType;
+		if (!prev) portType = p.declaredType ?? p.portType;
+		else if (typeChanged) portType = p.portType;
 		else if (p.declaredType !== undefined) portType = p.declaredType;
-		else if (requiredChanged) portType = defByName.get(p.name)?.portType ?? p.portType;
+		else if (requiredChanged) portType = d?.portType ?? p.portType;
 		else continue; // untouched and undeclared: the catalog provides it
 		// ONE restates-the-default gate, gesture or not.
-		const d = defByName.get(p.name);
-		if (d && d.portType === portType && portRequired(d) === portRequired(p)) {
-			reverted.push({ name: p.name, required: portRequired(p), portType: p.portType });
+		const restatesDefault = d !== undefined && d.portType === portType && !requiredChanged
+			&& (typeChanged
+				? meansRequired(p, isWired) === meansRequired(d, isWired)
+				: requirednessState(p) === requirednessState(d));
+		if (restatesDefault) {
+			reverted.push({ name: p.name, required: portRequired(d), portType: p.portType });
 			continue;
 		}
-		sigs.push({ name: p.name, required: portRequired(p), portType, rendered: p.portType });
+		sigs.push({ name: p.name, required: spelledRequired(p, d, isWired), portType, rendered: p.portType });
 	}
 	return { sigs, reverted };
 }
@@ -113,7 +175,7 @@ export function copiedPortSigs(
 	ports: HeaderPortLike[],
 	defaults: HeaderPortLike[] | undefined,
 ): EditPortSig[] {
-	return headerPortSigs(ports, ports, defaults).sigs.map((s) => ({ ...s, rendered: s.portType }));
+	return headerPortSigs(ports, ports, defaults, new Set()).sigs.map((s) => ({ ...s, rendered: s.portType }));
 }
 
 /** What the delete gesture on this port would DO, or null when there is
@@ -155,7 +217,7 @@ export function portDeleteAction(
  *  re-creates the port, so routing it through `removed` would kill its
  *  wires and the port would come back bare. The revert sig asserts the
  *  name, the provided requiredness, and the provided type UNLESS that
- *  spelling holds a typevar anywhere (`T`, `T__key`, `List[T]`): there the
+ *  spelling holds a typevar anywhere (`T`, `T__in__key`, `List[T]`): there the
  *  projection's current rendered type is the best answer until the
  *  reparse re-runs inference, while for a concrete default keeping the
  *  deleted override's type on screen would let the next gesture read
@@ -178,7 +240,7 @@ export function partitionRemovals(
 		// projection keeps its rendered type rather than painting a string
 		// nobody could read.
 		const parsed = parseWeftType(d.portType);
-		const concrete = parsed !== null && !containsTypevar(parsed);
+		const concrete = parsed !== null && !containsUnresolvedLeaf(parsed);
 		reverted.push({
 			name,
 			required: portRequired(d),
@@ -203,4 +265,105 @@ export function removedPortNames(
 	return previous
 		.filter((p) => !isGatePort(p.name) && !kept.has(p.name))
 		.map((p) => p.name);
+}
+
+/** What the program may declare on a port its node type provides, the
+ *  rule the compiler holds a header to:
+ *   - `free`: any type (a port the program added).
+ *   - `fits`: a type that fits `bound`. An input narrows within its own
+ *     type, and so does an output whose type holds a variable (the
+ *     declaration pins it, and each variable it pins has to fit the
+ *     node's bound on it, from `typeParams`); a `narrowable` output
+ *     narrows within its narrowing bound, a stream item-wise
+ *     (`fitsWithin`).
+ *   - `fixed`: an output that is the node's contract, so nothing but
+ *     its own type.
+ *  `provided` is the node type's own port of that name, absent for a
+ *  port the program added; for an output it carries `narrowable`.
+ *  `typeParams` is the node's bounds on its type variables. */
+// SYNC: declarationRule <-> crates/weft-compiler/src/enrich.rs input_fits, crates/weft-core/src/node.rs NodeMetadata::output_declaration_fits
+export type DeclarationRule =
+	| { kind: 'free' }
+	| { kind: 'fits'; bound: string; narrowable: boolean; typeParams?: readonly TypeParamWire[] }
+	| { kind: 'fixed'; type: string };
+
+export function declarationRule(
+	side: 'input' | 'output',
+	provided: (HeaderPortLike & Partial<Pick<OutputSpec, 'narrowable'>>) | undefined,
+	typeParams?: readonly TypeParamWire[],
+): DeclarationRule {
+	if (!provided) return { kind: 'free' };
+	const own = parseWeftType(provided.portType);
+	// A type this side cannot read is the compiler's to judge.
+	if (!own) return { kind: 'free' };
+	if (side === 'input' || containsUnresolvedLeaf(own)) {
+		return {
+			kind: 'fits',
+			bound: provided.portType,
+			narrowable: false,
+			...(typeParams?.length && containsUnresolvedLeaf(own) ? { typeParams } : {}),
+		};
+	}
+	const bound = narrowingBound({ type: provided.portType, narrowable: provided.narrowable });
+	return bound === null
+		? { kind: 'fixed', type: provided.portType }
+		: { kind: 'fits', bound, narrowable: true };
+}
+
+/** Why `declared` may not be written on a port under `rule`, or null
+ *  when it may. A spelling that only names a type this side has no
+ *  registry for (a type the project declares) is the compiler's to
+ *  judge, so it passes; any other unreadable spelling is refused with
+ *  the compiler's own message. */
+export function declarationProblem(
+	rule: DeclarationRule,
+	declared: string,
+): string | null {
+	const parsed = tryParseWeftType(declared);
+	if (!parsed.ok) return parsed.unknownName ? null : parsed.error;
+	switch (rule.kind) {
+		case 'free':
+			return null;
+		case 'fixed': {
+			const own = parseWeftType(rule.type);
+			return own && weftTypesEqual(parsed.type, own)
+				? null
+				: `this output always holds ${rule.type}`;
+		}
+		case 'fits': {
+			const bound = parseWeftType(rule.bound);
+			if (!bound) return null;
+			const fits = rule.narrowable ? fitsWithin(parsed.type, bound) : isCompatible(parsed.type, bound);
+			if (!fits) return `${declared} does not fit in ${weftTypeToString(bound)}`;
+			return rule.typeParams ? pinnedBoundProblem(bound, parsed.type, rule.typeParams) : null;
+		}
+	}
+}
+
+/** Why the variables `declared` pins on a port typed `own` break the
+ *  node's bounds, in the compiler's words, or null when every one fits:
+ *  the declaration binds each variable it covers (enrich's declared
+ *  narrowing), and each bound on a variable it bound is then held to
+ *  that binding (validate's `type-bound`). */
+// SYNC: pinnedBoundProblem <-> crates/weft-compiler/src/enrich.rs collect_type_var_bindings, crates/weft-compiler/src/validate.rs check_type_bounds
+function pinnedBoundProblem(own: WeftType, declared: WeftType, typeParams: readonly TypeParamWire[]): string | null {
+	const bindings: [string, WeftType][] = [];
+	collectTypeVarBindings(own, declared, bindings);
+	const pinned = new Map<string, WeftType>();
+	for (const [name, ty] of bindings) {
+		const first = pinned.get(name);
+		if (first === undefined) pinned.set(name, ty);
+		else if (!weftTypesEqual(first, ty)) {
+			return `the declared ports pin type '${name}' to two different types `
+				+ `(${weftTypeToString(first)} and ${weftTypeToString(ty)}); every port that carries '${name}' `
+				+ `on one node has to name the same type`;
+		}
+	}
+	for (const param of typeParams) {
+		const resolved = pinned.get(param.name);
+		const bound = resolved ? typeParamBound(param, typeParams, pinned) : null;
+		const why = resolved && bound ? typeParamViolation(param.name, bound, resolved) : null;
+		if (why) return why;
+	}
+	return null;
 }

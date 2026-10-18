@@ -127,7 +127,7 @@ Setting the run up:
 | `connection_value(&self, service: &str, name: &str, value: &str)` | A value the opened connection answers (`conn.value(name)`) |
 | `connection_permissions(&self, service: &str, granted: &[&str])` | What the connection has granted, checked against what the input requires |
 | `published_connection(&self, service: &str, values: &[(&str, &str)])` | Says the node already published this connection on an earlier run |
-| `output_type(&self, port: &str, ty: WeftType)` | The type the compiler would give a port declared `MustOverride` |
+| `output_type(&self, port: &str, ty: WeftType)` | Declares the type of an output, the way a program does on a narrowable output (`-> (response: Verdict)`) or on one it adds. If the compiler would refuse that type (an output that is not narrowable takes only its own), the run fails with `the case declares output ...` |
 | `input_type(&self, port: &str, ty: WeftType)` | Declares an added input port and its type |
 | `wire_output(&self, port: &str)` | Wires an output downstream. Nothing is wired unless you say so |
 | `hang_up_server(&self) -> u16` | A local port that hangs up on every connection, for raw socket clients |

@@ -1553,6 +1553,8 @@ mod tests {
         NodeDefinition {
             id: id.into(),
             node_type: node_type.into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },

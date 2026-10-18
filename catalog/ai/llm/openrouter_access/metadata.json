@@ -1,0 +1,76 @@
+{
+  "type": "OpenRouterAccess",
+  "label": "OpenRouter Access",
+  "description": "Connect OpenRouter once, with the built-in credits connection or your own OpenRouter API key, and wire `access` into every OpenRouter Model node: one access for however many models.",
+  "tags": [
+    "ai",
+    "provider",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "openrouter",
+    "label": "OpenRouter",
+    "doors": ["shared", "own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-or-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://openrouter.ai/api/v1/key",
+      "captures": [
+        {
+          "name": "keyLabel",
+          "path": "data.label",
+          "optional": true
+        }
+      ]
+    },
+    "identity": "{keyLabel}",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "ownPage": {
+      "guide": {
+        "link": "https://openrouter.ai/keys",
+        "steps": [
+          "Open openrouter.ai/keys and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "description": "Wire into OpenRouter Model nodes' `access` input."
+    }
+  ]
+}

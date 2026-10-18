@@ -783,8 +783,8 @@
                 "id": id, "nodeType": "Passthrough", "label": null,
                 "config": { "parentId": group }, "position": { "x": 0.0, "y": 0.0 },
                 "inputs": [
-                    { "name": "value", "portType": "String", "required": false },
-                    { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                    { "name": "value", "portType": "String", "required": false, "optional": true },
+                    { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
                 ],
                 "outputs": [{ "name": "value", "portType": "String", "required": false }],
                 "features": {}, "scope": scope, "requiresInfra": false, "images": [],
@@ -935,8 +935,8 @@
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": "b", "portType": "String", "required": false }
+                        { "name": "a", "portType": "String", "required": false, "optional": true },
+                        { "name": "b", "portType": "String", "required": false, "optional": true }
                     ],
                     "outputs": [
                         { "name": "a", "portType": "String", "required": false },
@@ -1022,8 +1022,8 @@
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                        { "name": "a", "portType": "String", "required": false, "optional": true },
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
                     ],
                     "outputs": [{ "name": "a", "portType": "String", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
@@ -1054,8 +1054,8 @@
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                        { "name": "a", "portType": "String", "required": false, "optional": true },
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
                     ],
                     "outputs": [{ "name": "a", "portType": "String", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
@@ -1065,7 +1065,7 @@
                 {
                     "id": "g__out", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "v", "portType": "String", "required": false }],
+                    "inputs": [{ "name": "v", "portType": "String", "required": false, "optional": true }],
                     "outputs": [{ "name": "v", "portType": "String", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
                     "groupBoundary": { "groupId": "g", "role": "Out" }
@@ -1204,7 +1204,7 @@
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
                     ],
                     "outputs": [],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
@@ -1214,7 +1214,7 @@
                 {
                     "id": "g__out", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "v", "portType": "String", "required": false }],
+                    "inputs": [{ "name": "v", "portType": "String", "required": false, "optional": true }],
                     "outputs": [{ "name": "v", "portType": "String", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
                     "groupBoundary": { "groupId": "g", "role": "Out" }
@@ -1432,8 +1432,8 @@
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                        { "name": "a", "portType": "String", "required": false, "optional": true },
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
                     ],
                     "outputs": [{ "name": "a", "portType": "String", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
@@ -1483,9 +1483,9 @@
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": "b", "portType": "String", "required": false },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false }
+                        { "name": "a", "portType": "String", "required": false, "optional": true },
+                        { "name": "b", "portType": "String", "required": false, "optional": true },
+                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
                     ],
                     "outputs": [
                         { "name": "a", "portType": "String", "required": false },
@@ -1550,7 +1550,7 @@
                 {
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "a", "portType": "String", "required": false }],
+                    "inputs": [{ "name": "a", "portType": "String", "required": false, "optional": true }],
                     "outputs": [{ "name": "a", "portType": "String", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
                     "groupBoundary": { "groupId": "g", "role": "In" }
@@ -1635,8 +1635,8 @@
                     "id": "l__out", "nodeType": "LoopOut", "label": null,
                     "config": { "parentId": "l" }, "position": { "x": 0.0, "y": 0.0 },
                     "inputs": [
-                        { "name": "results", "portType": "String", "required": false },
-                        { "name": "done", "portType": "Boolean", "required": false }
+                        { "name": "results", "portType": "String", "required": false, "optional": true },
+                        { "name": "done", "portType": "Boolean", "required": false, "optional": true }
                     ],
                     "outputs": [{ "name": "results", "portType": "List[String | Null]", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
@@ -1801,7 +1801,7 @@
                 {
                     "id": "g__in", "nodeType": "Passthrough", "label": null,
                     "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "a", "portType": "Number", "required": false }],
+                    "inputs": [{ "name": "a", "portType": "Number", "required": false, "optional": true }],
                     "outputs": [{ "name": "a", "portType": "Number", "required": false }],
                     "features": {}, "scope": [], "requiresInfra": false, "images": [],
                     "groupBoundary": { "groupId": "g", "role": "In" }

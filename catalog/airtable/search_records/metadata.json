@@ -108,6 +108,7 @@
     {
       "name": "records",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "The matching records (id, createdTime, fields)."
     },
     {

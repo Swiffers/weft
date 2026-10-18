@@ -58,7 +58,7 @@
   "outputs": [
     {
       "name": "events",
-      "type": "List[JsonDict]",
+      "type": "List[{ id: String, summary: String | Null, start: String | Null, end: String | Null, location: String | Null, description: String | Null, link: String }]",
       "description": "Each event: id, summary, start, end, location, description, link."
     },
     {

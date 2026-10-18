@@ -360,6 +360,28 @@ describe('applyOpsToProject: ports', () => {
     expect(data.declaredType).toBeUndefined();
   });
 
+  it('updateNodePorts reads a sig spelled `x?:` as optional on a node, and a revert or `x:` clears it', () => {
+    // On a node a written `x?:` runs without its value even when wired,
+    // which is what `optional` says; the projection must say it too, or
+    // the marker and the next gesture's spelling read a stale state.
+    const port = (p: ProjectDefinition) => p.nodes.find((n) => n.id === 'debug_1')!.inputs.find((i) => i.name === 'data')!;
+    const portsOp = (over: Partial<Extract<EditOp, { op: 'update_node_ports' }>>) => ops({
+      op: 'update_node_ports', node: 'debug_1',
+      inputs: [], outputs: [],
+      removedInputs: [], removedOutputs: [],
+      revertedInputs: [], revertedOutputs: [],
+      ...over,
+    });
+    const optional = applyOpsToProject(fixture(), portsOp({ inputs: [{ name: 'data', required: false, portType: 'T' }] }), catalog);
+    expect(port(optional)).toMatchObject({ required: false, optional: true, declaredType: 'T' });
+    const required = applyOpsToProject(optional, portsOp({ inputs: [{ name: 'data', required: true, portType: 'T' }] }), catalog);
+    expect(port(required).required).toBe(true);
+    expect(port(required).optional).toBeUndefined();
+    const reverted = applyOpsToProject(optional, portsOp({ revertedInputs: [{ name: 'data', required: true }] }), catalog);
+    expect(port(reverted).optional).toBeUndefined();
+    expect(port(reverted).declaredType).toBeUndefined();
+  });
+
   it('updateNodePorts refuses a name that is both updated and removed', () => {
     // The server would keep the port (it is in the sigs) while this side
     // drops it (it is removed): no single meaning, so fail at the door.

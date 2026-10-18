@@ -177,14 +177,17 @@ template's ids), set `features.addedPortsAreDataKeys`. The compiler's
 `not-camel-case` warning then leaves the ports a program adds alone, and still
 checks the name the program gives the node.
 
-Input entry: `name`, `type`, `required`, `requiredWhenWired`, `accepts`,
+Input entry: `name`, `type`, `required`, `accepts`,
 `widget`, `default`, `label`, `placeholder`, `description`, `requiresScopes`,
 `requiresValues`.
 
 If an unwired input means something of its own (no `instance`: the program's
-own copy), mark it `requiredWhenWired`, not `required`: unwired, the node runs;
-wired, a wire that delivers nothing skips the node instead of falling back to
-that meaning. If an optional input needs one more permission when it is used,
+own copy), leave it optional (no `required`): unwired, the node runs without
+it; wired, the node waits for it and skips if the wire closes, so a wire that
+delivers nothing never falls back to that meaning. A program can change this
+on its own use of the node (`x: T` requires it, `x?: T` runs without it even
+when wired; the `weft-language` skill has the table), but never make a
+`required` input optional. If an optional input needs one more permission when it is used,
 leave it out of `requiresScopes`, which every program using the node is asked
 for. In `run`, when the input is used and before `ctx.client(&account)`, copy
 `account.required_permissions()` (it already holds the declared ones), push the
@@ -201,7 +204,7 @@ any other word fails to load. `json` also fits a `JsonDict` input
 (edited as JSON text); the others edit a `String`. A `number` widget with a whole `step`
 (`"step": 1`) takes whole numbers only: the compiler checks a written value
 and the runtime a wired one, so your body can cast it to an integer.
-Output entry: `name`, `type`, `description` (an output has no `required`), and on an infra node `baked` (see Infra node).
+Output entry: `name`, `type`, `description` (an output has no `required`), `narrowable`, and on an infra node `baked` (see Infra node). If only the program knows an output's shape (a model's JSON answer, a request's body, a query's rows), type it broadly and set `"narrowable": true` (any type that fits inside `type`), or a type string (anything that fits inside that type, which may be wider than `type`): the program then declares what it holds (`-> (response: Verdict)`), and each value is checked against that at run time. Without it, a program can only restate the output's own type.
 
 A `validate` rule's `when` is a closed set of conditions, combined with
 `all`, `any` and `not`: the input and config checks (`input_satisfied`,

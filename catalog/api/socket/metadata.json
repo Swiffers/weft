@@ -1,7 +1,7 @@
 {
   "type": "Socket",
   "label": "Socket",
-  "description": "A WebSocket endpoint: each connection opened at its path starts one run, and every message the caller sends is one item of `inbound`, so a Loop over it runs once per message. The opening request comes out on the fixed ports. Answer with Reply per message and Close at the end.",
+  "description": "A WebSocket endpoint: each connection opened at its path starts one run, and every message the caller sends is one item of `inbound`, so a Loop over it runs once per message. The opening request comes out on the fixed ports. Declare the item type to have each message checked (`-> (inbound: Generator[Move])`): a message that does not fit is refused back to the caller naming the field, and the session goes on. Answer with Reply per message and Close at the end.",
   "tags": [
     "api",
     "websocket",
@@ -31,7 +31,7 @@
       },
       "default": "json",
       "label": "Message shape",
-      "description": "What each message is, both ways: `json` (`inbound: Generator[JsonDict]`, or `Generator[Image]` to store a `data:` URL or base64 message), `text` (`Generator[String]`), `bytes` (each binary frame stored, `Generator[File]`)."
+      "description": "What each message is, both ways: `json` (`inbound: Generator[JsonDict]` or a record type, or `Generator[Image]` to store a `data:` URL or base64 message), `text` (`Generator[String]`), `bytes` (each binary frame stored, `Generator[File]`)."
     },
     {
       "name": "auth",
@@ -112,12 +112,14 @@
     {
       "name": "caller",
       "type": "JsonDict | Null",
+      "narrowable": true,
       "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
     },
     {
       "name": "inbound",
-      "type": "Generator[MustOverride]",
-      "description": "One item per caller message, in order; ends when the caller disconnects. Declare the item type to match `dataType`. A second reader needs a custom node using the ctx (inbound is broadcast there)."
+      "type": "Generator[JsonDict]",
+      "narrowable": "Generator[JsonDict | String | File]",
+      "description": "One item per caller message, in order; ends when the caller disconnects. Each message is held to the item type declared here (matching `dataType`). A second reader needs a custom node using the ctx (inbound is broadcast there)."
     }
   ],
   "claimsRoute": {
@@ -134,10 +136,54 @@
   },
   "features": {
     "isTrigger": true,
-    "liveConnection": "websocket",
-    "canAddOutputPorts": true
+    "liveConnection": "websocket"
   },
   "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "config_in_set", "field": "dataType", "values": ["text", "bytes"] } },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[JsonDict | File]" } }
+        ]
+      },
+      "then": {
+        "message": "Socket '{id}' takes json messages, each one JSON object (or a picture as a `data:` URL or base64): declare `inbound` as `Generator[<a record type or JsonDict>]` or `Generator[Image]`, or set `dataType` to the shape the messages have.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "dataType", "equals": "text" },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[String]" } }
+        ]
+      },
+      "then": {
+        "message": "Socket '{id}' takes text messages, each one String: declare `-> (inbound: Generator[String])`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "dataType", "equals": "bytes" },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[File]" } }
+        ]
+      },
+      "then": {
+        "message": "Socket '{id}' takes byte messages, each stored as a file: declare `-> (inbound: Generator[File])`, or the kind they have to be (`Generator[Image]`), which is checked against the bytes.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
     {
       "when": {
         "kind": "config_matches",

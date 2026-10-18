@@ -763,12 +763,11 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::
             if is_input && node.features.is_trigger {
                 refusal.errors.push(format!("trigger '{spelled}' cannot be a from start; use --fire with a prepared trigger or --emit to supply its outputs"));
             }
+            // Each port's type at this place (a node inside an included
+            // file has the types its site gave it).
+            let types = node.types_at(&place.path);
             for (port, value) in ports {
-                let declared = if is_input {
-                    node.inputs.iter().find(|p| &p.name == port).map(|p| &p.port_type)
-                } else {
-                    node.outputs.iter().find(|p| &p.name == port).map(|p| &p.port_type)
-                };
+                let declared = if is_input { types.input(port) } else { types.output(port) };
                 match declared {
                     None if is_input => {
                         warnings.push(format!("ignored supplied input '{spelled}.{port}': this input port does not exist in the current program"));
@@ -1399,6 +1398,7 @@ mod tests {
     fn an_unfed_optional_crossing_only_warns() {
         let mut project = program();
         project.nodes[1].inputs[0].port.required = false;
+        project.nodes[1].inputs[0].optional = true;
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), ..RunSpec::whole("x") };
         let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert!(resolved.crossings[0].needed_by.is_none());
@@ -1406,13 +1406,26 @@ mod tests {
         assert!(resolved.warnings.iter().any(|w| w.contains("b.in gets nothing in this run")), "{:?}", resolved.warnings);
     }
 
+    /// An input the metadata calls optional is required once wired, so a
+    /// run cutting its wire needs it handed a value like a required one.
+    #[test]
+    fn an_unfed_crossing_into_an_optional_wired_input_is_needed() {
+        let mut project = program();
+        project.nodes[1].inputs[0].port.required = false;
+        let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), ..RunSpec::whole("x") };
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
+        assert_eq!(resolved.crossings[0].needed_by.as_deref(), Some("b.in"));
+    }
+
     /// One node of a hand-built program: `(id, scope, boundary, inputs,
-    /// outputs, trigger)`, each input `(name, required)`.
+    /// outputs, trigger)`, each input `(name, required)`. An input that is
+    /// not required is `optional` (it runs without a value even when its
+    /// wire closes), as the compiler makes a boundary's ports and a `?`.
     fn node(id: &str, scope: &[&str], boundary: Option<(&str, &str)>, inputs: &[(&str, bool)], outputs: &[&str], trigger: bool) -> Value {
         let mut n = json!({
             "id": id, "nodeType": if boundary.is_some() { "Passthrough" } else { "T" }, "label": null,
             "config": {}, "position": {"x": 0, "y": 0}, "scope": scope,
-            "inputs": inputs.iter().map(|(name, required)| json!({"name": name, "portType": "String", "required": required})).collect::<Vec<_>>(),
+            "inputs": inputs.iter().map(|(name, required)| json!({"name": name, "portType": "String", "required": required, "optional": !required})).collect::<Vec<_>>(),
             "outputs": outputs.iter().map(|name| json!({"name": name, "portType": "String", "required": true})).collect::<Vec<_>>(),
             "features": {"isTrigger": trigger}, "requiresInfra": false
         });
@@ -1546,8 +1559,8 @@ mod tests {
                  "features": {}, "requiresInfra": false},
                 {"id": "g__in", "nodeType": "Passthrough", "label": null, "config": {}, "position": {"x": 0, "y": 0},
                  "groupBoundary": {"groupId": "g", "role": "In"},
-                 "inputs": [{"name": "a", "portType": "String", "required": false},
-                            {"name": "b", "portType": "String", "required": false}],
+                 "inputs": [{"name": "a", "portType": "String", "required": false, "optional": true},
+                            {"name": "b", "portType": "String", "required": false, "optional": true}],
                  "outputs": [{"name": "a", "portType": "String", "required": true},
                              {"name": "b", "portType": "String", "required": true}],
                  "features": {}, "requiresInfra": false},
@@ -1557,7 +1570,7 @@ mod tests {
                  "features": {}, "requiresInfra": false},
                 {"id": "g.maybe", "nodeType": "T", "label": null, "config": {}, "position": {"x": 0, "y": 0},
                  "scope": ["g"],
-                 "inputs": [{"name": "in", "portType": "String", "required": false}], "outputs": [],
+                 "inputs": [{"name": "in", "portType": "String", "required": false, "optional": true}], "outputs": [],
                  "features": {}, "requiresInfra": false},
                 {"id": "g__out", "nodeType": "Passthrough", "label": null, "config": {}, "position": {"x": 0, "y": 0},
                  "groupBoundary": {"groupId": "g", "role": "Out"},

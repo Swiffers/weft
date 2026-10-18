@@ -111,6 +111,7 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "Matching rows, keyed by the header."
     },
     {

@@ -122,7 +122,9 @@ function displayName(id: string, parentId: string | undefined): string {
   return segments[segments.length - 1] || local;
 }
 
-function groupToNodeInstance(g: HostGroup): NodeInstance {
+/// `typeParams`: the bounds the group declares (`Group[T: Media]`), which
+/// the wire carries on its boundary nodes, not on the group.
+function groupToNodeInstance(g: HostGroup, typeParams: HostNode['typeParams']): NodeInstance {
   // `kind` is required on the wire; if it lands as anything other
   // than the two known values, the host/webview view of the project
   // has drifted (version skew, corruption). Silently treating an
@@ -170,6 +172,7 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     inputs: g.inPorts.map(copyPort),
     outputs: g.outPorts.map(copyPort),
     features: {},
+    ...(typeParams ? { typeParams } : {}),
     scope: parentId ? [parentId] : [],
     // The included file's own group, which the editor opens by default.
     ...(g.anonymous ? { anonymous: true } : {}),
@@ -223,6 +226,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     inputs: n.inputs.map(copyPort),
     outputs: n.outputs.map(copyPort),
     features: n.features,
+    ...(n.typeParams ? { typeParams: n.typeParams } : {}),
     requiresInfra: n.requiresInfra,
     perInstance: n.perInstance,
     scope: n.scope,
@@ -244,7 +248,10 @@ export function translateProject(
   }
   const structuralNodes: NodeInstance[] = [];
   // Groups first (v1 requires parent-before-child order).
-  for (const g of host.groups) structuralNodes.push(groupToNodeInstance(g));
+  for (const g of host.groups) {
+    const boundaryIn = host.nodes.find((n) => n.id === boundaryInId(g.id));
+    structuralNodes.push(groupToNodeInstance(g, boundaryIn?.typeParams));
+  }
   for (const n of host.nodes) {
     if (passthroughIds.has(n.id)) continue;
     if (n.groupBoundary) continue;

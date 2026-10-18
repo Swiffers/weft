@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::weft_type::{FileKind, WeftType};
+use crate::weft_type::{FileKind, WeftPrimitive, WeftType};
 
 /// What external form a stored media slot takes: a presigned URL
 /// (cheap: nothing is downloaded, the consumer fetches the bytes
@@ -137,9 +137,24 @@ pub fn classify_media_slot(value: &Value) -> Result<MediaSlotContent, String> {
 pub fn media_slots(value: &Value, ty: &WeftType) -> Vec<Value> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    walk(value, ty, &mut |slot| {
+    walk(value, ty, &mut |slot, _| {
         if seen.insert(slot.to_string()) {
             out.push(slot.clone());
+        }
+        None
+    });
+    out
+}
+
+/// [`media_slots`] with the type each slot is declared as (`Image`, or
+/// the union `Image | Null` it sits in), for a caller that holds what
+/// arrives in a slot to what the slot says it takes. One entry per
+/// distinct (value, type) pair, in traversal order.
+pub fn typed_media_slots(value: &Value, ty: &WeftType) -> Vec<(Value, WeftType)> {
+    let mut out: Vec<(Value, WeftType)> = Vec::new();
+    walk(value, ty, &mut |slot, slot_ty| {
+        if !out.iter().any(|(v, t)| v == slot && t == slot_ty) {
+            out.push((slot.clone(), slot_ty.clone()));
         }
         None
     });
@@ -155,7 +170,7 @@ pub fn substitute_media(
     ty: &WeftType,
     replacements: &HashMap<String, Value>,
 ) -> Value {
-    walk(value, ty, &mut |slot| replacements.get(&slot.to_string()).cloned())
+    walk(value, ty, &mut |slot, _| replacements.get(&slot.to_string()).cloned())
         .unwrap_or_else(|| value.clone())
 }
 
@@ -166,7 +181,7 @@ pub fn substitute_media(
 /// body that only speaks URLs (Python, a provider) reads the link. The
 /// inverse is [`strip_links`].
 pub fn with_links(value: &Value, ty: &WeftType, links: &HashMap<String, String>) -> Value {
-    walk(value, ty, &mut |slot| {
+    walk(value, ty, &mut |slot, _| {
         let url = links.get(&slot.to_string())?;
         let mut linked = slot.clone();
         let obj = linked.as_object_mut()?;
@@ -206,26 +221,36 @@ pub fn strip_links(value: &Value) -> Value {
     }
 }
 
+/// Whether a stored-file value sits anywhere in `value`. Type-free, like
+/// [`strip_links`]: it finds markers by their sentinel.
+pub fn holds_file_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => FileKind::from_marker_obj(map).is_some() || map.values().any(holds_file_marker),
+        Value::Array(items) => items.iter().any(holds_file_marker),
+        _ => false,
+    }
+}
+
 /// The one traversal both verbs share. `f` sees every media slot's
-/// value and answers an optional replacement; the walk answers a
-/// rebuilt value when anything changed underneath (None = subtree
-/// unchanged, caller keeps the original).
+/// value and the type the slot is declared as, and answers an optional
+/// replacement; the walk answers a rebuilt value when anything changed
+/// underneath (None = subtree unchanged, caller keeps the original).
 fn walk(
     value: &Value,
     ty: &WeftType,
-    f: &mut impl FnMut(&Value) -> Option<Value>,
+    f: &mut impl FnMut(&Value, &WeftType) -> Option<Value>,
 ) -> Option<Value> {
     match ty {
-        WeftType::Primitive(p) if FileKind::from_primitive(*p).is_some() => f(value),
+        WeftType::Primitive(p) if FileKind::from_primitive(*p).is_some() => f(value, ty),
         WeftType::List(inner) => {
             let items = value.as_array()?;
             rebuild_seq(items, |item| walk(item, inner, f))
         }
-        WeftType::Dict(_, v_ty) => {
+        WeftType::Dict(v_ty) => {
             let map = value.as_object()?;
             rebuild_map(map, |_, v| walk(v, v_ty, f))
         }
-        WeftType::Record(fields) => {
+        WeftType::Record { fields, .. } => {
             let map = value.as_object()?;
             rebuild_map(map, |k, v| {
                 let field = fields.iter().find(|fld| fld.name == *k)?;
@@ -234,18 +259,36 @@ fn walk(
         }
         WeftType::Named { body, .. } => walk(value, body, f),
         WeftType::Union(members) => {
-            // A union slot is a media slot exactly when a member is
-            // ITSELF a media type (`Image | Null`, `Media`) and the
-            // value holds media material. Members that merely CONTAIN
-            // media deeper (`String | List[Part]`) don't make the slot
-            // one: a plain string there is text, even when it looks
-            // like a URL; the walk descends instead.
-            if members.iter().any(|m| m.is_file_valued()) && classify_media_slot(value).is_ok() {
-                return f(value);
+            // A union with a member that is ITSELF a file (`Image |
+            // Null`, `Media`) makes the slot a media slot when the value
+            // is a stored-file object (well formed or not: a broken one
+            // reaches `f`, which says so), or a string the union can only
+            // read as a file. With a `String` member a string is text,
+            // whatever it looks like (a URL, a `data:` URL), and is never
+            // fetched or decoded. Members that merely CONTAIN files
+            // deeper (`String | List[Part]`) don't make the slot one: the
+            // walk descends into them instead, never into the file
+            // members.
+            if members.iter().any(|m| m.is_file_valued()) {
+                let takes_text = members.iter().any(takes_text);
+                let is_file_object = value.as_object().and_then(FileKind::from_marker_obj).is_some();
+                if is_file_object || (value.is_string() && !takes_text) {
+                    return f(value, ty);
+                }
             }
-            members.iter().find_map(|m| walk(value, m, f))
+            members.iter().filter(|m| !m.is_file_valued()).find_map(|m| walk(value, m, f))
         }
         _ => None,
+    }
+}
+
+/// Whether a value of `ty` may be text: `String`, through any declared
+/// name and nested union (`type Text = String | Number`).
+fn takes_text(ty: &WeftType) -> bool {
+    match ty.structural() {
+        WeftType::Primitive(WeftPrimitive::String) => true,
+        WeftType::Union(members) => members.iter().any(takes_text),
+        _ => false,
     }
 }
 

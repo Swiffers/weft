@@ -5,10 +5,10 @@
 #
 #   POST look   { "photo": "<data url or base64 png>" }
 
-look = Route -> (photo: Image) { path: "__E2E_PATH__/look", method: "POST" }
+look = Route -> (body: { photo?: Image, .. }) { path: "__E2E_PATH__/look", method: "POST" }
 inspect = ExecPython(photo: Image) -> (body: JsonDict, same: Image) {
   code: @file("assets/scripts/inspect.py")
 }
-inspect.photo = look.photo
+inspect.photo = look.body.photo
 answer = Reply
 answer.body = inspect.body

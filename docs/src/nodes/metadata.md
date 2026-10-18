@@ -102,8 +102,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 |---|---|---|---|
 | `name` | String | **required** | The port name, unique among inputs |
 | `type` | type string | **required** | What it takes |
-| `required` | Boolean | `false` | A firing with nothing here skips the node. Write it only when true |
-| `requiredWhenWired` | Boolean | `false` | For an input whose absence means something (no `instance`: the program's own copy). Unwired, the node runs without it; wired, a wire that delivers nothing skips the node instead of falling back to that meaning. Never with `required` |
+| `required` | Boolean | `false` | Write it only when true. `true`: the node cannot run without it, and a program cannot make it optional. Left out: unwired, the node runs without it; wired, it waits for the wire and skips if the wire closes, and a program can change this where it uses the node. For how, go and read [optional and required inputs](../language/syntax.md#optional-and-required-inputs) |
 | `accepts` | List | both | `["wire"]` refuses a written value, `["literal"]` refuses an arrow. A `Bus` or `Generator` port is wire-only whatever you say |
 | `widget` | Object | from the type | The editor control |
 | `default` | any | none | What the runtime supplies when nothing drives the input. Never written into source |
@@ -120,6 +119,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `name` | String | **required** | The port name |
 | `type` | type string | **required** | What it emits |
 | `description` | String | none | A sentence next to the port |
+| `narrowable` | `true` or a type string | none | For an output whose shape only the program knows (a model's JSON answer, a request's body, a query's rows): type it broadly and set this, and a program declares what it holds (`-> (response: Verdict)`). `true` lets a program declare any type that fits inside `type`. A type string lets it declare anything that fits inside that type instead, which may be wider than `type`. Each value is checked against the declared type at run time, and one that does not fit fails the node. Without it, a program can only restate the output's own type |
 | `baked` | Boolean | `false` | On an infrastructure node: the value is worked out when the node's infra is applied, and saved, so a run that reads nothing else from the node uses the saved value instead of running the node. For how, go and read [baking](infrastructure.md#outputs-saved-with-the-infrastructure-baking) |
 
 An output has no `required`. A firing that emits nothing on a port closes it,
@@ -350,6 +350,14 @@ trigger has no `firesWith`, its payloads go through unchecked.
 `pathField` names the config field holding the route pattern, and the optional
 `methodField` names the one holding the HTTP method. Leave the method out, or
 leave it empty on the node in your program, and the node claims every method.
+
+If your node puts the path's captures on outputs a program adds (`-> (id:
+String)` on `cards/{id}`), set `capturesAreOutputs: true`; the node also needs
+`features.canAddOutputPorts`. The compiler then refuses an added output the
+path does not capture, or one not typed `String`, with
+`route-output-not-a-capture`, and a capture named like one of the node's own
+outputs with `route-capture-shadows-output`. Filling each port is your node's
+code: emit the capture under the port's name.
 
 ## accessApps
 

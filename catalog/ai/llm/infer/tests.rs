@@ -7,12 +7,13 @@
 use serde_json::{json, Value};
 
 use weft::storage::{StorageScope, StoredFile};
-use weft::{FakeRig, LiveRig, NodeTest, WeftResult, WeftType};
+use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use minillmlib::Reasoning;
 
 use super::super::call::{empty_reply_message, reasoning_config};
 use super::super::chat::{answer_unanswered_tool_calls, auto_cache_marks, has_cache_mark, UNANSWERED_TOOL_CALL};
+use super::super::testing::{conversation, conversation_file, provider, sse};
 use super::LlmInferenceNode;
 
 pub fn tests() -> Vec<NodeTest> {
@@ -31,7 +32,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_wired_history_file_output_starts_a_conversation", starts_a_conversation),
         NodeTest::fake("a_history_file_grows_in_place", history_file_grows),
         NodeTest::fake("a_history_file_that_is_no_conversation_is_refused_before_the_call", history_file_refused),
-        NodeTest::fake("parse_json_repairs_and_parses_the_reply", parse_json),
+        NodeTest::fake("a_reply_that_looks_like_json_stays_text", json_looking_reply_stays_text),
         NodeTest::fake("a_stream_without_finish_reason_is_truncated", truncated),
         NodeTest::fake("media_rides_the_user_message_as_image_parts", media_parts),
         NodeTest::fake("tools_and_tool_choice_ride_and_calls_surface", tool_round),
@@ -125,7 +126,6 @@ fn unanswered_tool_calls() -> WeftResult<()> {
 /// unanswered, so a run sharing the file that is still mid tool call
 /// can write the real answer without the call ending up with two.
 async fn unanswered_on_the_wire(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
     let stopped = json!([
         { "role": "user", "content": "render" },
@@ -147,7 +147,6 @@ async fn unanswered_on_the_wire(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn reasoning_off_on_the_wire(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
     rig.run(
         &LlmInferenceNode,
@@ -162,7 +161,6 @@ async fn reasoning_off_on_the_wire(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn unset_sends_nothing(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
     rig.run(&LlmInferenceNode, json!({ "provider": provider(&rig), "prompt": "hi", "params": {} }))
         .await
@@ -181,7 +179,6 @@ async fn unset_sends_nothing(rig: FakeRig) -> WeftResult<()> {
 /// server failure whose text mentions reasoning is transient, so it
 /// goes to a wired `error` like any other provider failure.
 async fn reasoning_transient(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -203,7 +200,6 @@ async fn reasoning_transient(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn reasoning_refused(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -225,7 +221,6 @@ async fn reasoning_refused(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn auto_cache_on_the_wire(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
     let file = conversation_file(&rig, json!([
         { "role": "user", "content": "q1" },
@@ -276,47 +271,11 @@ async fn auto_cache_on_the_wire(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-fn provider(rig: &FakeRig) -> serde_json::Value {
-    json!({ "kind": "openrouter", "model": "test/model", "account": rig.access("openrouter") })
-}
-
-/// A conversation as an author starts one: a project file holding it.
-fn conversation_file(rig: &FakeRig, messages: Value) -> Value {
-    rig.store_file_in(&StorageScope::Project, "chat.json", "application/json", serde_json::to_vec(&messages).expect("json"))
-}
-
-/// The conversation the file value `file` names holds now.
-fn conversation(rig: &FakeRig, file: &Value) -> WeftResult<Vec<Value>> {
-    let key = StoredFile::from_value(file)?.key;
-    let written: Value = serde_json::from_slice(&rig.stored_bytes(&key)?).expect("the file holds JSON");
-    Ok(written.as_array().expect("a list of messages").clone())
-}
-
-/// OpenAI-style SSE chunks ending in a finish reason and `[DONE]`.
-fn sse(chunks: &[&str], finish: Option<&str>) -> Vec<u8> {
-    let mut body = String::new();
-    for c in chunks {
-        body.push_str(&format!(
-            "data: {}\n\n",
-            json!({ "id": "gen-1", "choices": [{ "delta": { "content": c } }] })
-        ));
-    }
-    if let Some(reason) = finish {
-        body.push_str(&format!(
-            "data: {}\n\n",
-            json!({ "id": "gen-1", "choices": [{ "delta": {}, "finish_reason": reason }] })
-        ));
-    }
-    body.push_str("data: [DONE]\n\n");
-    body.into_bytes()
-}
-
 /// A conversation kept in a file: it is read from the file, sent, and
 /// this call's turn is added to that same file in place (next version),
 /// which comes out on `historyFile`; no second file appears, and the
 /// change is recorded as a readable diff.
 async fn history_file_grows(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["a2"], Some("stop")));
     let file = conversation_file(&rig, json!([{ "role": "user", "content": "q1" }, { "role": "assistant", "content": "a1" }]));
     let outcome = rig
@@ -343,7 +302,6 @@ async fn history_file_grows(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn history_file_refused(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     let file = rig.store_file("notes.txt", "text/plain", b"hello".to_vec());
     let err = rig
         .run(&LlmInferenceNode, json!({ "provider": provider(&rig), "prompt": "hi", "historyFile": file }))
@@ -361,7 +319,6 @@ async fn history_file_refused(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn completion(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -393,7 +350,6 @@ async fn completion(rig: FakeRig) -> WeftResult<()> {
 /// With no file in and the `historyFile` output read, the call starts a
 /// conversation: a new file holding its turn.
 async fn starts_a_conversation(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["Hello"], Some("stop")));
     rig.wire_output("historyFile");
     let outcome = rig
@@ -406,30 +362,19 @@ async fn starts_a_conversation(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn parse_json(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("JsonDict").expect("JsonDict parses"));
-    // A reply that needs the repairer: prose around a fenced object
-    // with single-quoted keys, nothing serde would accept as-is.
-    rig.respond_raw(
-        "POST",
-        "/api/v1/chat/completions",
-        200,
-        "text/event-stream",
-        sse(&["Here is the JSON: ```json {'answer': 42} ```"], Some("stop")),
-    );
+/// The reply is handed out as the model wrote it, even when it looks
+/// like JSON: parsing is LlmInferenceJson's job.
+async fn json_looking_reply_stays_text(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&[r#"{"answer": 42}"#], Some("stop")));
     let outcome = rig
-        .run(
-            &LlmInferenceNode,
-            json!({ "provider": provider(&rig), "prompt": "json please", "parseJson": true }),
-        )
+        .run(&LlmInferenceNode, json!({ "provider": provider(&rig), "prompt": "json please" }))
         .await
         .ok()?;
-    assert_eq!(outcome.outputs["response"], json!({ "answer": 42 }));
+    assert_eq!(outcome.outputs["response"], json!(r#"{"answer": 42}"#));
     Ok(())
 }
 
 async fn truncated(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     // A body that STOPS mid-stream: no finish reason and no `[DONE]`
     // (which the wire parser reads as a synthesized "stop"), i.e. the
     // connection dropped mid-generation.
@@ -456,7 +401,6 @@ async fn truncated(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn media_parts(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -501,7 +445,6 @@ async fn media_parts(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn tool_round(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     // A reply that ONLY calls a tool: no text, tool_call deltas, then
     // the tool_calls finish reason.
     let body = format!(
@@ -551,7 +494,6 @@ async fn tool_round(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn params_shape(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -591,7 +533,6 @@ async fn params_shape(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn history_system_wins(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -630,7 +571,6 @@ async fn history_system_wins(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn anthropic_wire(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     // Anthropic's own stream framing: typed events, text deltas, the
     // stop reason on message_delta.
     let body = format!(
@@ -671,7 +611,6 @@ async fn anthropic_wire(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn custom_no_account(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/v1/chat/completions",
@@ -700,7 +639,6 @@ async fn custom_no_account(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn routing_pins(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",
@@ -743,7 +681,6 @@ async fn live_completion(rig: LiveRig) -> WeftResult<()> {
 
 /// The provider refusing the call, the failure both `error` tests read.
 fn refuse_the_call(rig: &FakeRig) {
-    rig.output_type("response", WeftType::parse("String").expect("String parses"));
     rig.respond_raw(
         "POST",
         "/api/v1/chat/completions",

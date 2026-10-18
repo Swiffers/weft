@@ -43,6 +43,7 @@
     {
       "name": "files",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "{id, name, mimeType} each."
     }
   ],

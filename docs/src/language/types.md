@@ -33,7 +33,6 @@ Generator[String]
 | `Generator[T]` | A stream of `T`. Go and read [streams and buses](streams-and-buses.md) |
 | `Bus` | A live channel. Same page |
 | `Empty` | Nothing can be one. See below |
-| `MustOverride` | Nobody has decided yet, and the build stops until you do |
 | `T`, `T1` to `T99` | A type variable. The node works with whatever you connect |
 
 A stored file on a wire is never the bytes. It is a small marker saying where
@@ -67,9 +66,13 @@ List[Dict[String, String | Null]])`, and the fix is the `| Null` on that field.
 `List[String]` or a `List[Number]` without complaint. Inside a union it
 disappears: `Number | Empty` is just `Number`.
 
-When a type is still `MustOverride`, or still a bare type variable, weft lets
-the arrow through and tells you to decide. That is the `must-override-unmet`
-and `unresolved-typevar` pair.
+A port typed with a type variable (`T`, `T2`) gets its type where the node is
+used: from the type your program declares on it, or from what is wired to
+it. `Cast`'s output is the type variable `T2` (its input is `T`), so it takes
+the type you declare on it (`-> (value: Boolean)`), or else the type of the
+port it feeds. A port you declare in a
+header with no type, like `(x)`, takes its type from what is wired to it. A
+type variable nothing pins is the `unresolved-typevar` error.
 
 ## Giving a type a name
 
@@ -113,8 +116,9 @@ to declare the type on the source port, or `Cast` it first.
 
 The interesting case is an optional field. If you read `?`-marked key and it is
 missing, or it is `null`, **the wire closes**. It does not deliver `null`. So
-the node you wired it into applies its own rules: a required input skips, an
-optional one lets the others decide. For what a closure does, go and read
+the node you wired it into applies its own rules: it skips, unless you declared
+that input with `?` (`x?: T`), and then it runs without it. For what a closure
+does, go and read
 [how a program runs](how-a-program-runs.md#how-a-branch-stops-the-nodes-after-it).
 
 A required key that is missing is an error naming the key, never a quiet null.

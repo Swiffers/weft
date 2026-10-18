@@ -72,6 +72,7 @@
     {
       "name": "file",
       "type": "File",
+      "narrowable": true,
       "description": "The stored media for image, video, audio, document and sticker messages; absent otherwise."
     },
     {

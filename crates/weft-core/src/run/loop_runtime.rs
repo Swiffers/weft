@@ -1152,7 +1152,10 @@ pub fn instantiate(
                             group_id, carry_port,
                         )
                     })?;
-                Arc::new(port.port_type.zero_value())
+                // The carry's type where this loop runs (inside an
+                // included file, its site's).
+                let at = node_def.types_at(&crate::frames::call_path(frames));
+                Arc::new(at.input(&port.name).unwrap_or(&port.port_type).zero_value())
             }
         };
         seed_carry.push((carry_port.clone(), v));

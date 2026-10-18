@@ -8,10 +8,21 @@
 //!   - Any REQUIRED port arrived as a closure -> skip. Required means
 //!     the body declared "I cannot run without this", and the engine
 //!     has proof nothing will ever arrive.
-//!   - Every port (when ALL inputs are optional) arrived as a closure
-//!     -> skip. Nothing the body could meaningfully act on. Running a
-//!     no-input firing would be busy-work.
 //!   - Every port of a `@require_one_of` group arrived as a closure.
+//!   - A join (`features.join`) none of whose branches can deliver
+//!     (each arrived closed, or has neither a wire nor a value), so
+//!     there is nothing to pass on.
+//!
+//! An OPTIONAL port takes absence and failure alike: optional means "I
+//! run without it", whatever the reason it is missing. So a node whose
+//! every input closed still runs, unless it is required to wait on one
+//! of them; when that is its meaning, the gate says so. The compiler
+//! refuses a node whose wired inputs are all optional and whose gate is
+//! not wired (when it runs would be undecided), unless something else
+//! decides it: a `@require_one_of`, being a join, or being fed by a
+//! group port that is there whenever the group runs (a gated group's
+//! port, a loop's item or index). The compiler's own nodes (group
+//! boundaries, whose ports are all optional) and triggers are not asked.
 //!
 //! A user-emitted `null` on a required port is NOT a skip. Null is
 //! data the body has to interpret; the body runs.
@@ -66,10 +77,10 @@ pub enum SkipReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<Failure>,
     },
-    /// Every input this node could act on arrived closed (or could
-    /// never arrive at all). `failure` when one of them closed because
-    /// its producer broke.
-    EveryInputClosed {
+    /// A join (`features.join`) whose every branch closed: none of them
+    /// delivered, so there is nothing to pass on. `failure` when one of
+    /// them closed because its producer broke.
+    NothingJoined {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<Failure>,
     },
@@ -105,7 +116,7 @@ impl SkipReason {
             Self::WatchedNodeFailed { failure } => Some(failure),
             Self::FlowClosed { failure }
             | Self::RequiredInputClosed { failure, .. }
-            | Self::EveryInputClosed { failure }
+            | Self::NothingJoined { failure }
             | Self::OneOfGroupClosed { failure, .. } => failure.as_ref(),
         }
     }
@@ -120,6 +131,7 @@ fn after_failure(failure: &Option<Failure>) -> String {
     }
 }
 
+// SYNC: Display for SkipReason <-> packages/weft-graph/src/webview/lib/utils/status.ts skipReasonText
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -136,8 +148,8 @@ impl std::fmt::Display for SkipReason {
             Self::RequiredInputClosed { port, failure } => {
                 write!(f, "the required input '{port}' closed{}", after_failure(failure))
             }
-            Self::EveryInputClosed { failure } => {
-                write!(f, "every input closed{}", after_failure(failure))
+            Self::NothingJoined { failure } => {
+                write!(f, "none of the branches it joins delivered{}", after_failure(failure))
             }
             Self::OneOfGroupClosed { ports, failure } => {
                 write!(f, "every input of the group ({}) closed{}", ports.join(", "), after_failure(failure))
@@ -163,13 +175,14 @@ pub const SHOULD_FLOW_PORT: &str = "_should_flow";
 ///
 /// Why the language needs a second spelling at all. Acting on a value
 /// that arrived is free: wire it into `_should_flow`. Acting on one
-/// that did NOT is the shape nothing else can express, because every
-/// other node in the language SKIPS when its inputs close, so nothing
-/// downstream is left alive to notice the absence. A node that decides
-/// can announce its own "no" on a second port, which covers a decision;
-/// it cannot cover data that simply never came (a key missing from a
-/// request body, an optional input nobody filled). This is the one port
-/// that fires ON a closure, which is what makes that case writable.
+/// that did NOT is the shape a required input cannot express: a node
+/// SKIPS when a required input closes, so it is never alive to notice
+/// the absence, and a node taking the value as optional runs either way
+/// without saying which happened. A node that decides can announce its
+/// own "no" on a second port, which covers a decision; it cannot cover
+/// data that simply never came (a key missing from a request body).
+/// This is the one port that fires ON a closure, which is what makes
+/// "run exactly when this did not come" writable.
 ///
 /// A node has ONE gate: wiring both spellings is refused by the
 /// compiler, not silently combined.
@@ -252,12 +265,15 @@ pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether `node` skips this firing, and why. `filled` holds the ports
+/// that have a value without a wire delivering it (`ready::filled_ports`:
+/// its literals and the values a carved run hands in).
 pub fn check_should_skip(
     node: &NodeDefinition,
     group_pulses: &[&Pulse],
     required: &HashSet<&str>,
     wired: &HashSet<&str>,
-    literal_filled: &HashSet<&str>,
+    filled: &HashSet<&str>,
 ) -> Option<SkipReason> {
     // Rule 0: `_should_flow` said no. The port is optional, so neither
     // of its skip reasons reaches rule 1.
@@ -266,10 +282,11 @@ pub fn check_should_skip(
     }
 
     // Rule 1: any wired required port that arrived as a closure -> skip.
-    // `required` is built by `ready::required_inputs`, which counts a
-    // `requiredWhenWired` input as required exactly where it is wired.
-    // (`literal_filled` never overlaps `wired`: wires are authoritative
-    // and config only fills unwired ports, so no config check here.)
+    // `required` is built by `ready::required_inputs`, which counts an
+    // input that is not `optional` as required exactly where it is wired.
+    // (A value a carved run hands in for a wired port replaces that
+    // port's closure among `group_pulses` already, and a literal only
+    // fills an unwired port, so `filled` needs no check here.)
     // Generator ports are exempt: their closure is the empty stream,
     // not "nothing is coming" (module doc).
     for port_name in required {
@@ -284,67 +301,26 @@ pub fn check_should_skip(
         }
     }
 
-    // A scope's In boundary stops here: `_should_flow` is the only gate
-    // a group has, and a loop's only other gates are the lists it
-    // iterates (its required ports, rule 1). Every other input of a
-    // scope is optional at the boundary: a closed one closes that edge
-    // into the children, and each child applies its own rule as if the
-    // scope were not there. So "every input closed" never skips a
-    // scope; it starts, and what runs inside decides for itself.
-    if node
-        .group_boundary
-        .as_ref()
-        .is_some_and(|b| b.role == crate::project::GroupBoundaryRole::In)
-    {
-        return None;
-    }
-
-    // Rule 2: every port dead -> skip. Covers the all-optional case
-    // (a node with only optional inputs whose every input was closed
-    // upstream has no value to act on). For nodes with at least one
-    // required input, rule 1 already covered the "required closed"
-    // case; this catches "every optional closed too" only when there
-    // are no required inputs at all. A port is dead when it arrived
-    // as a closure OR can never produce a value at all (unwired and
-    // not config-filled); counting unwired ports as alive would fire
-    // the body with a completely empty input bag, exactly the
-    // busy-work firing this rule exists to prevent. Same shape as the
-    // oneOfRequired loop below.
-    // Only inputs a wire can drive participate: a literal-only port (a
-    // compiler-read list, an author-narrowed setting) is not data flow,
-    // so it neither keeps the node alive (a node whose data wires all
-    // closed has nothing to act on) nor counts as a dead port (a node
-    // with ONLY such inputs is an emitter and must run).
-    // `_should_flow` is permission, not data: it can never be the value
-    // a body acts on, so it neither keeps a node alive here nor counts
-    // as one of the dead ports. Rule 0 above is the only rule that reads
-    // it.
-    let wireable: Vec<&crate::project::InputDefinition> = node
-        .inputs
-        .iter()
-        .filter(|p| p.accepts.wire && !is_gate_port(&p.name))
-        .collect();
-    if !wireable.is_empty() {
-        let all_dead = wireable.iter().all(|port| {
-            if literal_filled.contains(port.name.as_str()) {
-                return false;
-            }
-            if !wired.contains(port.name.as_str()) {
-                // An unwired setting can still supply its declared default.
-                // A closed wire below remains closed even when a default exists.
-                return port.default.is_none();
-            }
-            // A wired generator port in a formed group has an arrival
-            // by construction, and even a closure-arrival is a live
-            // value (the empty stream): never dead.
-            if port.is_generator() {
-                return false;
-            }
-            port_arrived_closed(group_pulses, &port.name)
-        });
-        if all_dead {
-            let failure = first_failure(group_pulses, wireable.iter().map(|port| port.name.as_str()));
-            return Some(SkipReason::EveryInputClosed { failure });
+    // A join runs on the first of its branches that delivers. When none
+    // can (each closed, or has no wire and no value to deliver), there is
+    // nothing to run, and the skip closes its output, carrying the
+    // failure of a branch that broke so a `_should_not_flow` further on
+    // reads a failure rather than an absence. A branch in `filled` (a
+    // literal, or a value a carved run hands in) always delivers.
+    if node.features.join {
+        let branches: Vec<&str> = node
+            .inputs
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|p| !is_gate_port(p))
+            .collect();
+        let nothing = !branches.is_empty()
+            && branches.iter().all(|p| {
+                !filled.contains(p) && (!wired.contains(p) || port_arrived_closed(group_pulses, p))
+            });
+        if nothing {
+            let failure = first_failure(group_pulses, branches.into_iter());
+            return Some(SkipReason::NothingJoined { failure });
         }
     }
 
@@ -354,7 +330,7 @@ pub fn check_should_skip(
             continue;
         }
         let all_closed = group.iter().all(|port_name| {
-            if literal_filled.contains(port_name.as_str()) {
+            if filled.contains(port_name.as_str()) {
                 return false;
             }
             if !wired.contains(port_name.as_str()) {
@@ -527,11 +503,11 @@ mod tests {
         );
     }
 
-    /// The guard is permission, never data: a live guard must not keep
-    /// a node alive whose every real input closed, or the body fires
-    /// with nothing to act on.
+    /// With the gate open, a node whose every input is optional runs
+    /// even when every one of them closed: optional means "I run
+    /// without it". The gate is where the author said when it runs.
     #[test]
-    fn a_live_guard_does_not_revive_a_node_whose_inputs_all_closed() {
+    fn an_open_guard_runs_a_node_whose_optional_inputs_all_closed() {
         let mut node = node_all_optional();
         node.inputs.push(
             serde_json::from_value(json!({
@@ -547,22 +523,89 @@ mod tests {
         let wired: HashSet<&str> = ["a", "b", SHOULD_FLOW_PORT].into_iter().collect();
         assert_eq!(
             check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
-            Some(SkipReason::EveryInputClosed { failure: None }),
+            None,
         );
     }
 
+    /// An optional input takes a closure that carries a failure the same
+    /// as one that carries none: it runs without the value either way.
     #[test]
-    fn unwired_defaults_keep_a_node_alive_but_closed_wires_do_not() {
-        let mut node = node_all_optional();
-        for port in &mut node.inputs {
-            port.default = Some(json!("setting"));
-        }
-        assert_eq!(check_should_skip(&node, &[], &HashSet::new(), &HashSet::new(), &HashSet::new()), None);
-        let pulses = vec![closure_pulse("a"), closure_pulse("b")];
-        let wired = ["a", "b"].into_iter().collect();
+    fn an_optional_input_takes_a_failed_closure_like_an_absence() {
+        let node = node_all_optional();
+        let failure = Failure { node: "up".into(), error: "the database is down".into() };
+        let failed = Pulse::closure_with_failure(uuid::Uuid::new_v4(), uuid::Uuid::nil(), Vec::new(), "n", "a", Some(failure));
+        let pulses = vec![failed, data_pulse("b", json!(1))];
+        let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
         assert_eq!(
             check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
-            Some(SkipReason::EveryInputClosed { failure: None }),
+            None,
+        );
+    }
+
+    /// A required input that closed with a failure still skips the node,
+    /// and the skip passes the failure on.
+    #[test]
+    fn a_required_input_closed_by_a_failure_skips_and_passes_it_on() {
+        let node = node_one_required();
+        let failure = Failure { node: "up".into(), error: "the database is down".into() };
+        let failed = Pulse::closure_with_failure(uuid::Uuid::new_v4(), uuid::Uuid::nil(), Vec::new(), "n", "a", Some(failure.clone()));
+        let pulses = vec![failed];
+        let required: HashSet<&str> = ["a"].into_iter().collect();
+        let wired: HashSet<&str> = ["a"].into_iter().collect();
+        let reason = check_should_skip(&node, &view(&pulses), &required, &wired, &HashSet::new())
+            .expect("a closed required input skips");
+        assert_eq!(reason.inherited_failure(), Some(&failure));
+    }
+
+    fn join_of(branches: &[&str]) -> crate::project::NodeDefinition {
+        let mut node = node_all_optional();
+        node.inputs = branches
+            .iter()
+            .map(|name| serde_json::from_value(json!({ "name": name, "portType": "T", "required": false })).expect("port"))
+            .collect();
+        node.features.join = true;
+        node
+    }
+
+    /// A join runs on the first branch that delivered: one value among
+    /// closed branches is enough.
+    #[test]
+    fn a_join_with_one_branch_delivered_runs() {
+        let node = join_of(&["a", "b"]);
+        let pulses = vec![closure_pulse("a"), data_pulse("b", json!(1))];
+        let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
+        assert_eq!(check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()), None);
+    }
+
+    /// Every branch closed: nothing joined, and a branch that broke hands
+    /// its failure on.
+    #[test]
+    fn a_join_whose_every_branch_closed_skips_passing_a_failure_on() {
+        let node = join_of(&["a", "b"]);
+        let failure = Failure { node: "up".into(), error: "the database is down".into() };
+        let pulses = vec![
+            closure_pulse("a"),
+            Pulse::closure_with_failure(uuid::Uuid::new_v4(), uuid::Uuid::nil(), Vec::new(), "n", "b", Some(failure.clone())),
+        ];
+        let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
+        assert_eq!(
+            check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
+            Some(SkipReason::NothingJoined { failure: Some(failure) }),
+        );
+        // A branch filled by a literal always delivers.
+        let pulses = vec![closure_pulse("a")];
+        let wired: HashSet<&str> = ["a"].into_iter().collect();
+        let literal: HashSet<&str> = ["b"].into_iter().collect();
+        assert_eq!(check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &literal), None);
+        // A branch with neither a wire nor a value delivers nothing
+        // either: the broken one's failure still passes on.
+        let failure_on_a = Failure { node: "up".into(), error: "the query failed".into() };
+        let pulses = vec![Pulse::closure_with_failure(
+            uuid::Uuid::new_v4(), uuid::Uuid::nil(), Vec::new(), "n", "a", Some(failure_on_a.clone()),
+        )];
+        assert_eq!(
+            check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
+            Some(SkipReason::NothingJoined { failure: Some(failure_on_a) }),
         );
     }
 
@@ -606,9 +649,9 @@ mod tests {
         let pulses = vec![closure_pulse("rows")];
         let required: HashSet<&str> = ["rows"].into_iter().collect();
         let wired: HashSet<&str> = ["rows"].into_iter().collect();
-        let literal_filled = HashSet::new();
+        let filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_none(),
             "an empty stream must RUN its consumer, not skip it"
         );
     }
@@ -619,9 +662,9 @@ mod tests {
         let pulses = vec![data_pulse("a", json!(null))];
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let literal_filled = HashSet::new();
+        let filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_none(),
             "user-emitted null is data; required port + null must NOT skip"
         );
     }
@@ -632,50 +675,34 @@ mod tests {
         let pulses = vec![closure_pulse("a")];
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let literal_filled = HashSet::new();
+        let filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_some(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_some(),
             "closure on a required port must skip"
         );
     }
 
+    /// Every optional input closed is not a reason to skip: the node
+    /// runs without them, scope boundaries and plain nodes alike (when
+    /// such a node runs is its gate's to say, which the compiler
+    /// demands).
     #[test]
-    fn all_optional_all_closed_skips() {
-        let node = node_all_optional();
+    fn all_optional_all_closed_runs() {
         let pulses = vec![closure_pulse("a"), closure_pulse("b")];
-        let required = HashSet::new();
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let literal_filled = HashSet::new();
-        assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_some(),
-            "all-optional + all-closed must skip"
-        );
-    }
-
-    /// A scope's In boundary has one gate, `_should_flow`: every input
-    /// closed does not skip it (the closures reach the children, who
-    /// decide for themselves), where the same shape on a plain node
-    /// skips.
-    #[test]
-    fn a_scope_in_boundary_never_skips_on_closed_inputs() {
         let mut boundary = node_all_optional();
         boundary.group_boundary = Some(crate::project::GroupBoundary {
             group_id: "g".into(),
             role: crate::project::GroupBoundaryRole::In,
         });
-        let pulses = vec![closure_pulse("a"), closure_pulse("b")];
-        let required = HashSet::new();
-        let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let literal_filled = HashSet::new();
-        assert!(
-            check_should_skip(&boundary, &view(&pulses), &required, &wired, &literal_filled).is_none(),
-            "an In boundary starts its scope whatever its inputs did"
-        );
-        let plain = node_all_optional();
-        assert!(
-            check_should_skip(&plain, &view(&pulses), &required, &wired, &literal_filled).is_some(),
-            "the same closures skip a plain node"
-        );
+        for node in [node_all_optional(), boundary] {
+            assert_eq!(
+                check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
+                None,
+                "{:?}",
+                node.group_boundary
+            );
+        }
     }
 
     #[test]
@@ -684,41 +711,25 @@ mod tests {
         let pulses = vec![data_pulse("a", json!(7)), closure_pulse("b")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let literal_filled = HashSet::new();
+        let filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_none(),
             "all-optional + one value + one closed must NOT skip"
         );
     }
 
     #[test]
-    fn all_optional_closed_wire_plus_unwired_unconfigured_skips() {
-        // `a` wired and closed, `b` unwired with no config: nothing
-        // the body could act on. Counting the unwired port as alive
-        // would fire the body with an empty input bag (busy-work).
+    fn all_optional_closed_wire_plus_a_filled_port_fires() {
+        // `a` wired and closed, `b` config-filled: optional `a` runs
+        // without its value.
         let node = node_all_optional();
         let pulses = vec![closure_pulse("a")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let literal_filled = HashSet::new();
+        let filled: HashSet<&str> = ["b"].into_iter().collect();
         assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_some(),
-            "closed wire + unwired unconfigured port must skip"
-        );
-    }
-
-    #[test]
-    fn all_optional_closed_wire_plus_literal_filled_fires() {
-        // Same shape but `b` is config-filled: the body has a value
-        // to act on, so it fires.
-        let node = node_all_optional();
-        let pulses = vec![closure_pulse("a")];
-        let required = HashSet::new();
-        let wired: HashSet<&str> = ["a"].into_iter().collect();
-        let literal_filled: HashSet<&str> = ["b"].into_iter().collect();
-        assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
-            "a config-filled port keeps the node alive"
+            check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_none(),
+            "a closed optional input does not skip the node"
         );
     }
 
@@ -728,9 +739,9 @@ mod tests {
         let pulses = vec![data_pulse("a", json!(null)), closure_pulse("b")];
         let required = HashSet::new();
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
-        let literal_filled = HashSet::new();
+        let filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &filled).is_none(),
             "user-emitted null is data; one null + one closed must NOT skip"
         );
     }

@@ -223,8 +223,9 @@ outside on their own lines.
 
 Some node types accept extra inputs beyond the ones they declare, and on
 those a key naming no declared port creates one. A wire types it from the
-source, a literal from its own type, `null` is an error. `key?:` makes the
-created port optional, whatever the node's own default is.
+source, a literal from its own type, `null` is an error. Written `key?:`, the
+node runs without the created port even when it is wired and the wire closes;
+written without `?`, the port is required.
 
 Which types accept them is the node's to say, not this page's: its wiring
 view carries a `features` block, and `canAddInputPorts` there means you may
@@ -486,9 +487,11 @@ ok     = Cast -> (value: Boolean)
 
 What the node does with the ports you named is its own business, and its
 description says it (how `ExecPython` hands inputs to the script and reads
-its outputs back is in that node's description). Write only the ports the type leaves open (a `MustOverride`
-output must be pinned once something reads it; one nothing reads can stay
-unpinned). An empty body equals no body.
+its outputs back is in that node's description). Write only the ports the type leaves open. A port
+typed with a type variable (`T`, `T2`) gets its type where the node is used:
+from the type you declare on it, or from what is wired to it. A header port
+written with no type, `(x)`, takes the type of what is wired to it. An empty
+body equals no body.
 
 ## Inline expressions
 
@@ -534,7 +537,9 @@ container for that node. `@instance_filled` (or `@instance_filled(<fallback>)`) 
 value goes makes that value each instance's own, a connection included
 (`account: @instance_filled`); the fallback may be a value, `@file(...)` or
 `@asset(...)`; never on a wired field (`instance-filled-wired`) or
-a group's own port (`instance-filled-boundary`). Every node reading either
+a group's own port (`instance-filled-boundary`), nor on a field of a node
+in an included file whose sites give it different types
+(`instance-filled-place-types`). Every node reading either
 follows, per instance. A `Route` or `Socket` that would follow is a compile
 error: routes stay shared and pick the instance per call. The
 `weft-instances` skill has what all of that means and the shape a program
@@ -551,8 +556,7 @@ with instances takes; `weft-members` adds the shape for several people.
 | unions | `String \| Number`, `Number \| Null` |
 | records | `{ role: String, name?: String }`, strict: undeclared keys refused |
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
-| type variables | `T`, unified across a node's ports, must pin to concrete (`unresolved-typevar`) |
-| `MustOverride` | the author pins it in an inline signature; wired and unpinned is `must-override-unmet`, unwired is left alone |
+| type variables | `T`, `T2`, unified across a node's ports, pinned by what is wired to the port or by the type the program declares on it (`Cast`'s output is `T2`: `-> (value: Card)` pins it, and so does the port it feeds); one nothing pins is `unresolved-typevar` |
 | live handles | `Bus`, `Generator[T]`, `Access`; never literals |
 
 A record is usable inline in any signature (`p: { wpm: Number, delay: Number
@@ -584,9 +588,57 @@ on a record field, `notes?: review.notes` on a config key that creates a port.
 On a key, `?` only works when that key CREATES the port (a node like
 `ExecPython` that lets you invent inputs). On a port the node already declares,
 `width?: self.width` is refused with "'width?' marks a port optional, but
-'width' is not a port this node creates": whether a declared port is optional
-is the node's own decision. `here: String?` is refused. An output port takes no `?`: emitting nothing on
+'width' is not a port this node creates. Declare optionality on the port
+itself (`width?: Type`) instead".
+`here: String?` is refused. An output port takes no `?`: emitting nothing on
 it closes it, and no marker changes that.
+
+Whether a node needs an input comes from its metadata and from what the
+program writes on the port:
+
+| What the node's metadata says | What the program writes | Result |
+|---|---|---|
+| required | nothing | always required |
+| required | `x?: T` | compile error naming the port: the node's code needs it |
+| optional | nothing | unwired: runs without it. Wired: waits for it, and skips if the wire closes |
+| optional | `x: T` (no `?`) | always required |
+| optional | `x?: T` | runs without it even when wired and the wire closed, whether nothing arrived or the source failed |
+
+A wire closes when its source finished without sending on that port, or
+failed, and a skipped node closes its own outputs in turn. So a wired input
+skips its node when it closes, unless the program wrote `?` on it.
+
+If an input the node's metadata leaves optional must be filled before the
+program builds, declare it without `?`. `SlackSendMessage` takes `text` or
+`blocks`, so neither is required alone; this one is refused until `text` has
+a wire or a value:
+
+````weft
+send = SlackSendMessage(text: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+}
+````
+
+If the node must run when a wire into it brings nothing, write `?`. Here
+`ask` is a `SlackReceiveMessage`, whose `thread` sends nothing for a message
+that was not in a thread. With `threadTs?` the answer goes to the top of the
+channel; without the `?`, `answer` waits for `threadTs` and skips:
+
+````weft
+answer = SlackSendMessage(threadTs?: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+  threadTs: ask.thread
+}
+````
+
+A node whose every wired input is written with `?` has nothing saying when it
+runs, and the compiler refuses it (`run-undecided`): gate it with
+`_should_flow`, drop the `?` from the input it cannot do without, or add
+`@require_one_of`.
 
 A cast CONVERTS a value to the type declared on its output. Any node can be
 one: its metadata names one input and one output under `features.castPorts`,
@@ -632,11 +684,12 @@ the run and
 on frames (loop iterations).
 
 A node that emits on some outputs and not others closes the rest. A [closed]
-pulse on a required input skips the node and closes its outputs; on an
-optional input the node fires anyway; on `_should_flow` the node skips,
-period. Skips cascade forward until a node opted into absence with `?`. A
-failure propagates exactly like a missing value, and a downstream optional
-input is the recovery path.
+pulse on an input the node needs (a required one, or a wired one the program
+did not write `?` on) skips the node and closes its outputs; on an input
+written `?` the node fires anyway; on `_should_flow` the node skips, period.
+Skips cascade forward until a node opted into absence with `?`. A failure
+propagates exactly like a missing value, and a downstream input written `?`
+is the recovery path.
 
 Branching is only this: a branch in weft is a node that ran or a port that
 closed, and nothing else. Any Boolean reaches a `_should_flow`, so a node of
@@ -1008,7 +1061,15 @@ its site (`one.door`).
 The file is compiled once and every `@include` of it is a call: a run
 reaching `triage` sends its port values into the file's one body under a
 frame naming the call site, and the results come back to that site alone.
-Includes and loops nest freely.
+Includes and loops nest freely. Only the type check repeats per call site: a
+file holding `Group[T: Media](file: T) -> (out: T)` (`[T: Media]` limits
+`T` to kinds of `Media`; without it, `T` takes any type) can be included once fed an `Image` and once fed a `Video`, and each
+site's `out` keeps the type that went in. That holds however deep you go: for
+a group nested inside the file, for a node's type variable, and for another
+file the file includes. If the file is included as `img` and as `vid`, and it
+includes another file as `inner`, then `img.inner` and `vid.inner` are
+separate sites with their own types. The nodes and their code stay one copy
+each.
 An included file has no name you write or read: a node inside is always
 addressed through the site, the way the source reads. `weft events <run>
 --node triage.classify` shows that one use of it and every row prints its

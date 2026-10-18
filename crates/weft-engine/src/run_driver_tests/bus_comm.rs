@@ -2685,8 +2685,8 @@
                   "position": {"x":2.0,"y":0.0},
                   "groupBoundary": { "groupId": "g", "role": "Out" },
                   "inputs": [
-                      { "name": "results", "portType": "String", "required": false },
-                      { "name": "done", "portType": "Boolean", "required": false }
+                      { "name": "results", "portType": "String", "required": false, "optional": true },
+                      { "name": "done", "portType": "Boolean", "required": false, "optional": true }
                   ],
                   "outputs": [{ "name": "results", "portType": "List[String | Null]", "required": false }],
                   "scope": [], "features": {}, "requiresInfra": false, "images": [] },

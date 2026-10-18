@@ -111,6 +111,16 @@ Ten includes of the same file are one body and ten frames, the way ten
 iterations of a loop are one body and ten frames. The two nest freely, so a
 loop inside an include inside a loop is just a deeper stack.
 
+Only the type check runs once per include. If `blur.weft` holds
+`Group[T: Media](file: T) -> (out: T)` (`[T: Media]` limits `T` to kinds of
+`Media`; without it, `T` takes any type),
+you can include it once fed an `Image` and once fed a `Video`, and each `out`
+keeps the type that went in. That holds however deep you go: for a group
+nested inside the file, for a node's type variable, and for another file the
+file includes. If `img` and `vid` are your two includes of `blur.weft`, and it
+includes a file as `inner`, `img.inner` and `vid.inner` each get their own
+types. The nodes and their code stay one copy each.
+
 ### Naming a node inside one
 
 An included file has no name you write. Its nodes are named through the site:

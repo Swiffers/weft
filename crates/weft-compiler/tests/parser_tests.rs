@@ -36,12 +36,13 @@ impl MetadataCatalog for EmptyCatalog {
     }
 }
 
-/// A port declared with an invalid / unknown type must be KEPT (rendered red as
-/// MustOverride in the editor) and surfaced as a diagnostic, NOT dropped so it
-/// silently vanishes from the canvas. Regression for "the port vanishes when I
-/// mistype its type instead of going red".
+/// A port declared with an invalid / unknown type must be KEPT (typed with its
+/// own variable, as an untyped port is, with the author's text kept as its
+/// declared spelling) and surfaced as a diagnostic, NOT dropped so it silently
+/// vanishes from the canvas. Regression for "the port vanishes when I mistype
+/// its type instead of going red".
 #[test]
-fn invalid_port_type_keeps_the_port_as_must_override_with_a_diagnostic() {
+fn invalid_port_type_keeps_the_port_with_its_own_variable_and_a_diagnostic() {
     let source = "n = SomeNode -> (result: Nonexistent)\n";
     let (project, diagnostics) =
         weft_compiler::parse_only(source, uuid::Uuid::nil(), CompileFs::none(), &EmptyCatalog, None);
@@ -53,9 +54,11 @@ fn invalid_port_type_keeps_the_port_as_must_override_with_a_diagnostic() {
         .iter()
         .find(|p| p.name == "result")
         .expect("the bad-typed port is KEPT, not dropped");
-    // It is the red 'needs a type' placeholder, which the editor renders as
-    // must-override (the same signal the user described as "should be red").
-    assert!(port.port_type.is_must_override(), "bad type becomes MustOverride (red)");
+    // It takes its type from what is wired to it, and the typo stays the
+    // declared spelling so a header rewrite does not erase it.
+    assert_eq!(port.port_type, WeftType::port_var(weft_core::weft_type::PortSide::Output, "result"), "bad type becomes the port's own variable");
+    assert!(port.is_untyped(weft_core::weft_type::PortSide::Output), "the port's type is its own variable");
+    assert_eq!(port.declared_type.as_deref(), Some("Nonexistent"),"the author's text stays the declared spelling");
 
     // The bad type is surfaced as a diagnostic so the user knows to fix it.
     assert!(
@@ -302,7 +305,7 @@ fn a_reserved_type_keyword_as_a_name_errors_on_its_declaration_line() {
     // Naming a group with the reserved `Group` keyword must fail loudly ON the
     // declaration line (line 1 here), not only cryptically where it's later
     // referenced.
-    let source = "Group = Group() -> (test: MustOverride) {\n}\n";
+    let source = "Group = Group() -> (test) {\n}\n";
     let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
     let reserved = errors.iter().find(|e| e.message.contains("reserved type keyword"));
     assert!(reserved.is_some(), "expected a reserved-keyword error, got {errors:?}");
@@ -521,14 +524,17 @@ node = ExecPython(
 }
 
 #[test]
-fn an_untyped_port_must_be_overridden() {
+fn an_untyped_port_gets_its_own_type_variable() {
     let source = r#"
 node = ExecPython(data) -> (result) {}
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile MustOverride ports");
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile untyped ports");
     let node = &result.nodes[0];
-    assert_eq!(node.inputs[0].port_type, WeftType::MustOverride);
-    assert_eq!(node.outputs[0].port_type, WeftType::MustOverride);
+    assert_eq!(node.inputs[0].port_type, WeftType::port_var(weft_core::weft_type::PortSide::Input, "data"));
+    assert_eq!(node.outputs[0].port_type, WeftType::port_var(weft_core::weft_type::PortSide::Output, "result"));
+    // The header declares them, with the empty spelling (written back bare).
+    assert_eq!(node.inputs[0].declared_type.as_deref(), Some(""));
+    assert_eq!(node.outputs[0].declared_type.as_deref(), Some(""));
 }
 
 #[test]
@@ -672,7 +678,6 @@ node = ExecPython(
     assert_eq!(node.outputs.len(), 1);
     // Verify Dict[String, Number] parsed correctly
     assert_eq!(node.inputs[0].port_type, WeftType::dict(
-        WeftType::primitive(WeftPrimitive::String),
         WeftType::primitive(WeftPrimitive::Number),
     ));
 }
@@ -1567,7 +1572,7 @@ node = ExecPython(data?, required_data) -> (result) {}
     let node = &result.nodes[0];
     assert!(!node.inputs[0].required, "data? should be optional");
     assert!(node.inputs[1].required, "required_data should be required (default)");
-    assert_eq!(node.inputs[0].port_type, WeftType::MustOverride);
+    assert_eq!(node.inputs[0].port_type, WeftType::port_var(weft_core::weft_type::PortSide::Input, "data"));
 }
 
 // ─── Null in Types ─────────────────────────────────────────────────────────

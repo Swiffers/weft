@@ -138,15 +138,17 @@ pub fn starting_parameters(
         {
             let port = edge.target_handle.as_deref().unwrap_or("default");
             let source_port = edge.source_handle.as_deref().unwrap_or("default");
+            // The source's type where its value was made (a node inside an
+            // included file has the types its site gave it).
             let source_type = project.nodes.iter().find(|node| node.id == source.id)
-                .and_then(|node| node.outputs.iter().find(|port| port.name == source_port))
+                .and_then(|node| node.types_at(&source.path).output(source_port).cloned())
                 .ok_or_else(|| anyhow::anyhow!("seed wire names undeclared output '{}.{source_port}'", source.id))?;
             let mut values = Vec::new();
             for output in history.iter().filter(|output| output.place() == source
                 && output.port == source_port && loop_indices(&output.frames).is_empty() && !output.closed) {
                 // Freeze the value delivered by this wire, including its field
                 // projection, rather than the source's enclosing object.
-                match crate::deref::project_value(&output.value, &source_type.port_type, &edge.path)
+                match crate::deref::project_value(&output.value, &source_type, &edge.path)
                     .map_err(anyhow::Error::msg)? {
                     crate::deref::Projection::Value(value) => values.push(value),
                     crate::deref::Projection::Closed { .. } => {},

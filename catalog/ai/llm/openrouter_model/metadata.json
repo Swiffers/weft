@@ -1,69 +1,22 @@
 {
-  "type": "OpenRouterProvider",
-  "label": "OpenRouter",
-  "description": "Serve LLM calls through OpenRouter, with the built-in credits connection or your own OpenRouter API key; wire the provider output into any LLM node, one provider node for however many calls.",
+  "type": "OpenRouterModel",
+  "label": "OpenRouter Model",
+  "description": "Pick an OpenRouter model to serve LLM calls, on the connection an OpenRouter Access node holds; wire the provider output into any LLM node, one model node for however many calls.",
   "tags": [
     "ai",
     "provider",
     "model",
-    "credentials"
+    "llm"
   ],
-  "icon": "KeyRound",
+  "icon": "Cpu",
   "color": "#6b6b99",
-  "service": {
-    "service": "openrouter",
-    "label": "OpenRouter",
-    "doors": ["shared", "own"],
-    "acquisition": {
-      "kind": "static",
-      "fields": [
-        {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "sk-or-..."
-        }
-      ]
-    },
-    "auth": [
-      {
-        "kind": "header",
-        "name": "Authorization",
-        "value": "Bearer {key}"
-      }
-    ],
-    "test": {
-      "url": "https://openrouter.ai/api/v1/key",
-      "captures": [
-        {
-          "name": "keyLabel",
-          "path": "data.label",
-          "optional": true
-        }
-      ]
-    },
-    "identity": "{keyLabel}",
-    "verification": {
-      "rung": "reports_validity",
-      "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://openrouter.ai/keys",
-        "steps": [
-          "Open openrouter.ai/keys and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
-    }
-  },
   "inputs": [
     {
-      "name": "connection",
+      "name": "access",
       "type": "Access",
-      "widget": {
-        "kind": "access"
-      },
-      "label": "Connection"
+      "required": true,
+      "accepts": ["wire"],
+      "description": "The OpenRouter connection: wire an OpenRouter Access node's `access`."
     },
     {
       "name": "model",
@@ -71,7 +24,7 @@
       "required": true,
       "widget": {
         "kind": "remote_select",
-        "access": "connection",
+        "access": "access",
         "freeText": true,
         "sources": [
           {
@@ -118,7 +71,7 @@
         ]
       },
       "then": {
-        "message": "OpenRouterProvider '{id}' has no model; name one on the node or wire one in.",
+        "message": "OpenRouterModel '{id}' has no model; name one on the node or wire one in.",
         "level": "runtime",
         "field": "model"
       }

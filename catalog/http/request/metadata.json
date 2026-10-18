@@ -100,11 +100,13 @@
     {
       "name": "body",
       "type": "JsonDict | String",
+      "narrowable": true,
       "description": "A text response: a JSON object as a dict, anything else as its raw text. Absent when the response came out on `file`."
     },
     {
       "name": "file",
       "type": "File",
+      "narrowable": true,
       "description": "A response whose type is not text (or that names no type and does not read as text), stored whole. Absent for a text response."
     },
     {

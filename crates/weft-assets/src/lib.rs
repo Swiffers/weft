@@ -321,15 +321,23 @@ pub async fn sync_assets(
                 // The check reports only what is wrong with the bytes;
                 // the `@asset(...)` that declared them is this caller's
                 // to name, since this is the one place it is the source.
-                match weft_core::storage::check_declared_kind(&r.ty, &head)
+                // The stored type is the bytes' own, since identical bytes
+                // share one stored asset, except where the bytes hold either
+                // of two media kinds (WebM, MP4) and the declaration picked
+                // the other one (an audio clip in a video container).
+                match weft_core::storage::received_file(&head, None, &r.ty)
                     .map_err(|why| format!("@asset({:?}, {}): {why}", r.path, r.ty))
                 {
-                    Ok(()) => {
-                        let mime = weft_core::storage::sniff_mime(&head)
-                            .unwrap_or_else(|| weft_core::storage::mime_from_filename(&r.path));
+                    Ok((received, kind)) => {
+                        use weft_core::weft_type::FileKind;
+                        let mime = match weft_core::storage::sniff_mime(&head) {
+                            Some(sniffed) if kind != FileKind::Blob && FileKind::from_mime(sniffed) != kind => received,
+                            Some(sniffed) => sniffed.to_string(),
+                            None => weft_core::storage::mime_from_filename(&r.path).to_string(),
+                        };
                         hashed.push((
                             r,
-                            HashedFile { path: r.path.clone(), hash, size, mime: mime.to_string() },
+                            HashedFile { path: r.path.clone(), hash, size, mime },
                         ));
                     }
                     Err(e) => broken.push(format!("  {e}")),

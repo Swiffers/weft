@@ -59,7 +59,9 @@ function bigPipeline(): ProjectDefinition {
 		edges.push({ id: `${source}.${sourceHandle}->${target}.${targetHandle}`, source, target, sourceHandle, targetHandle });
 	};
 	node('db', 'PostgresDatabase', [], [{ name: 'access', portType: 'Access', required: false }], [], { requiresInfra: true });
-	node('llm', 'OpenRouterProvider', [], [{ name: 'provider', portType: 'LlmProvider', required: false }]);
+	node('llm_access', 'OpenRouterAccess', [], [{ name: 'access', portType: 'Access', required: false }]);
+	node('llm', 'OpenRouterModel', [access('access'), str('model')], [{ name: 'provider', portType: 'LlmProvider', required: false }]);
+	edge('llm_access', 'access', 'llm', 'access');
 	node('params', 'LlmParams', [], [{ name: 'params', portType: 'Dict[String, String]', required: false }]);
 	node('bot_name', 'Text', [], [str('value', false)]);
 	for (const program of ['msg', 'tick']) {

@@ -47,6 +47,7 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "Changed rows as stored."
     },
     {

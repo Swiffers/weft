@@ -1,7 +1,7 @@
 {
   "type": "FirstInOrder",
   "label": "First in order",
-  "description": "Emit the first wired input, in written order, that carried a value; nothing if none did. `checked: review.answer` above `quick: draft.answer` prefers the checked one when both arrive.",
+  "description": "Emit the first wired input, in written order, that carried a value; nothing if none did. `checked: review.answer` above `quick: draft.answer` prefers the checked one when both arrive. A join: its inputs are optional and it needs no gate, since \"the first of these branches\" is when it runs.",
   "tags": [
     "flow",
     "join",
@@ -22,7 +22,7 @@
   "features": {
     "pure": true,
     "canAddInputPorts": true,
-    "optionalCustomInputs": true,
+    "join": true,
     "customInputType": "T"
   }
 }

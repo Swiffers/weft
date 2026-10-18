@@ -812,6 +812,24 @@ pub fn ports_read_by(project: &ProjectDefinition, place: &Located, runs: &BTreeS
         .collect()
 }
 
+/// Every wire at every place it runs: `(wire, source place, target
+/// place)`, a wire inside an included file once per site that reaches
+/// it, and a wire into or out of a file's body only for the site it
+/// belongs to. What resolves and checks types per place reads.
+pub fn located_wires(project: &ProjectDefinition) -> Vec<(&Edge, Located, Located)> {
+    let g = ProjectGraph::new(project);
+    let index: std::collections::HashMap<&str, &Edge> = project.edges.iter().map(|e| (e.id.as_str(), e)).collect();
+    let mut wires = Vec::new();
+    for at in every_place_in(&g) {
+        for (edge, source, _) in incoming(&g, &at) {
+            if let Some(edge) = index.get(edge.id.as_str()) {
+                wires.push((*edge, source, at.clone()));
+            }
+        }
+    }
+    wires
+}
+
 /// Every place in the program: the top-level nodes, and each included
 /// file's nodes once per site that reaches it, however deep.
 pub fn every_place(project: &ProjectDefinition) -> BTreeSet<Located> {

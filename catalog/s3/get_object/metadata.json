@@ -32,7 +32,8 @@
   "outputs": [
     {
       "name": "file",
-      "type": "File"
+      "type": "File",
+      "narrowable": true
     },
     {
       "name": "filename",

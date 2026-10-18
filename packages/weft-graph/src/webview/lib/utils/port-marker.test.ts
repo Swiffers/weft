@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filledMarkerStyle, portLooksRequired, portMarkerStyle } from './port-marker';
+import { filledMarkerStyle, portMarkerStyle, requirednessNote } from './port-marker';
 import type { PortDefinition } from '../types';
 
 const port = (over: Partial<PortDefinition> = {}): PortDefinition =>
@@ -48,19 +48,37 @@ describe('port markers', () => {
 	});
 });
 
-describe('portLooksRequired', () => {
-	it('draws a required input required and an optional one optional, wired or not', () => {
+describe('the marker follows the three requiredness states', () => {
+	const full = portMarkerStyle(port({ required: true }), none, none, '#0af', 'input');
+	const empty = portMarkerStyle(port({ optional: true }), none, none, '#0af', 'input');
+
+	it('draws a required input full, wired or not', () => {
 		for (const wired of [false, true]) {
-			expect(portLooksRequired(port({ required: true }), wired)).toBe(true);
-			expect(portLooksRequired(port(), wired)).toBe(false);
+			expect(portMarkerStyle(port({ required: true }), none, none, '#0af', 'input', '', wired)).toEqual(full);
 		}
 	});
 
-	it('draws an input required only once wired as optional unwired and required wired', () => {
-		const p = port({ requiredWhenWired: true });
-		expect(portLooksRequired(p, false)).toBe(false);
-		expect(portLooksRequired(p, true)).toBe(true);
-		expect(portMarkerStyle(p, none, none, '#0af', 'input', '', false)).toEqual(portMarkerStyle(port(), none, none, '#0af', 'input'));
-		expect(portMarkerStyle(p, none, none, '#0af', 'input', '', true)).toEqual(portMarkerStyle(port({ required: true }), none, none, '#0af', 'input'));
+	it('draws an input the program wrote `x?:` empty, wired or not', () => {
+		for (const wired of [false, true]) {
+			expect(portMarkerStyle(port({ optional: true }), none, none, '#0af', 'input', '', wired)).toEqual(empty);
+		}
+	});
+
+	it('draws an input with neither flag empty while unwired and full once wired', () => {
+		expect(full).not.toEqual(empty);
+		expect(portMarkerStyle(port(), none, none, '#0af', 'input', '', false)).toEqual(empty);
+		expect(portMarkerStyle(port(), none, none, '#0af', 'input', '', true)).toEqual(full);
+	});
+});
+
+describe('requirednessNote', () => {
+	it('says nothing for a required input', () => {
+		expect(requirednessNote(port({ required: true }), true)).toBeNull();
+	});
+
+	it('names each of the other two states for what a missing value does', () => {
+		expect(requirednessNote(port({ optional: true }), true)).toContain('runs without it');
+		expect(requirednessNote(port(), false)).toMatch(/^value: optional while unwired; once wired, required/);
+		expect(requirednessNote(port(), true)).toMatch(/^value: required while wired/);
 	});
 });

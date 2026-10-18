@@ -6,11 +6,11 @@
 #   POST front   the top-level route, answered by a Reply
 #   POST door    the route inside lib/door.weft, included at site `one`
 
-front = Route -> (text: String) { path: "__E2E_PATH__/front", method: "POST" }
+front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST" }
 front_body = ExecPython(text: String) -> (body: JsonDict) {
   code: "return {'body': {'heard': text, 'where': 'front'}}"
 }
-front_body.text = front.text
+front_body.text = front.body.text
 front_answer = Reply
 front_answer.body = front_body.body
 

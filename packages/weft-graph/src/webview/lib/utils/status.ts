@@ -34,13 +34,6 @@ export function getStatusBadgeColor(status: NodeFiringStatus): string | undefine
 	}
 }
 
-/// Why a firing did not run, in words. A DECISION (its `_should_flow`
-/// said no) reads differently from a CONSEQUENCE (an input it needed
-/// never arrived), and the inspector says which.
-///
-/// An event that carries no reason predates this field: the run is
-/// older than the journal shape, so the honest answer is that we do not
-/// know rather than a guessed one.
 /// The tail a reason's text grows when the closure it names carried a
 /// failure: the same words as the Rust `Display`.
 function afterFailure(failure: Failure | undefined): string {
@@ -52,6 +45,14 @@ function failureText(failure: Failure): string {
 	return `'${failure.node}' failed: ${failure.error}`;
 }
 
+/// Why a firing did not run, in words. A DECISION (its `_should_flow`
+/// said no) reads differently from a CONSEQUENCE (an input it needed
+/// never arrived), and the inspector says which.
+///
+/// An event that carries no reason predates this field: the run is
+/// older than the journal shape, so the honest answer is that we do not
+/// know rather than a guessed one.
+/// SYNC: skipReasonText <-> crates/weft-core/src/run/skip.rs `Display for SkipReason`
 export function skipReasonText(reason: SkipReason | undefined): string {
 	if (!reason) return 'reason not recorded';
 	switch (reason.kind) {
@@ -62,7 +63,7 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 			return `what its \`_should_not_flow\` watches did not finish (${failureText(reason.failure)}), which is not the absence this node runs on`;
 		case 'required_input_closed':
 			return `the required input '${reason.port}' closed${afterFailure(reason.failure)}`;
-		case 'every_input_closed': return `every input closed${afterFailure(reason.failure)}`;
+		case 'nothing_joined': return `none of the branches it joins delivered${afterFailure(reason.failure)}`;
 		case 'one_of_group_closed':
 			return `every input of the group (${reason.ports.join(', ')}) closed${afterFailure(reason.failure)}`;
 		case 'scope_skipped': return `the scope '${reason.scope}' it lives in did not run`;

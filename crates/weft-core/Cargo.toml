@@ -24,6 +24,7 @@ sha2 = { workspace = true }
 # `from_url` resource-source patterns are validated at metadata load, so
 # a typo'd extractor fails the node's metadata parse, not a later paste.
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 # Runtime-only deps, gated behind the `runtime` feature (default on). The
 # language TYPE layer (project/node/weft_type/...) that the compiler's
 # parse+validate path needs does NOT use any of these, so a parse-only consumer

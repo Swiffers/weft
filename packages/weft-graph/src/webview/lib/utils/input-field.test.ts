@@ -97,7 +97,7 @@ describe('accepts', () => {
 		expect(acceptsWire(literalOnly)).toBe(false);
 		expect(acceptsLiteral(literalOnly)).toBe(true);
 		// A locally-added port pre-round-trip carries no list: both.
-		const fresh = { name: 'a', portType: 'MustOverride', required: false };
+		const fresh = { name: 'a', portType: 'T__a', declaredType: '', required: false };
 		expect(acceptsWire(fresh)).toBe(true);
 		expect(acceptsLiteral(fresh)).toBe(true);
 	});

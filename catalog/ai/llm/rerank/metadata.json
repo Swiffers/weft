@@ -14,7 +14,7 @@
       "name": "provider",
       "type": "LlmProvider",
       "required": true,
-      "description": "Wire an OpenRouterProvider whose model names a rerank model."
+      "description": "Wire an OpenRouter Model node whose model names a rerank model."
     },
     {
       "name": "query",

@@ -321,8 +321,9 @@ fn ready_group_at(
 
     let received = firing_input(node, &effective_refs, wired, frames, program_idx);
 
-    // Group/Loop boundary skip rules: only In-boundary skips; Out
-    // forwards whatever came through.
+    // An Out boundary never skips: it forwards whatever came through,
+    // closures and their failures included. An In boundary is decided
+    // like any node.
     let is_out_boundary = node
         .group_boundary
         .as_ref()
@@ -340,9 +341,7 @@ fn ready_group_at(
         // (`kicked_group` runs `check_flow_permission`).
         None
     } else {
-        let mut filled = literal_filled.clone();
-        filled.extend(effective.iter().filter(|p| p.backup && !p.closed).map(|p| p.target_port.as_str()));
-        check_should_skip(node, &effective_refs, required, wired, &filled)
+        check_should_skip(node, &effective_refs, required, wired, &filled_ports(literal_filled.clone(), &effective))
     };
 
     let pulse_ids: Vec<uuid::Uuid> = group_pulses.iter().map(|p| p.id).collect();
@@ -379,7 +378,7 @@ pub fn kicked_group(
     let effective = effective_input_pulses(node, &[], &wired, project, program_idx, run_id, frames);
     let effective_refs: Vec<_> = effective.iter().collect();
     let received = if kick.firing {
-        let (input, errors) = build_kicked_input(node, kick.port_snapshot.as_ref());
+        let (input, errors) = build_kicked_input(node, frames, kick.port_snapshot.as_ref());
         FiringInput { input, type_errors: errors, ..Default::default() }
     } else {
         firing_input(node, &effective_refs, &wired, frames, program_idx)
@@ -393,7 +392,7 @@ pub fn kicked_group(
         None if kick.firing => check_flow_permission(node, &[]),
         None => check_should_skip(node, &effective_refs,
             &required_inputs(node, &wired, frames, program_idx),
-            &wired, &literal_filled_ports(node, &wired, frames, program_idx)),
+            &wired, &filled_ports(literal_filled_ports(node, &wired, frames, program_idx), &effective)),
     };
     ReadyGroup {
         frames: frames.clone(),
@@ -487,7 +486,7 @@ pub fn firing_input(
     // (see `check_input`). A mismatch on a required port aggregates
     // into `type_errors` (the node fails loudly); a mismatch on an
     // optional port nulls the port and the node proceeds.
-    let type_errors = check_bag(node, wired, &mut obj);
+    let type_errors = check_bag(node, frames, wired, &mut obj);
 
     let mut closed_ports: Vec<String> = wired
         .iter()
@@ -528,11 +527,23 @@ pub fn firing_input(
 /// not data: `_should_flow` takes any value and only a `false` says
 /// no (`check_flow_permission` is its one rule), so it is never held
 /// to a type here.
-fn check_bag(node: &NodeDefinition, wired: &HashSet<&str>, obj: &mut InputBag) -> Vec<String> {
+fn check_bag(node: &NodeDefinition, frames: &LoopFrames, wired: &HashSet<&str>, obj: &mut InputBag) -> Vec<String> {
     let mut errors = Vec::new();
+    // Each port held to its type at the place this firing runs (a node
+    // inside an included file has the types its site gave it).
+    let place = crate::frames::call_path(frames);
+    let types = node.types_at(&place);
     for port in node.inputs.iter().filter(|p| !crate::run::skip::is_gate_port(&p.name)) {
         let Some(value) = obj.get(&port.name) else {
             continue;
+        };
+        let placed;
+        let port = match types.input(&port.name) {
+            Some(here) if *here != port.port_type => {
+                placed = crate::project::InputDefinition { port: crate::project::PortDefinition { port_type: here.clone(), ..port.port.clone() }, ..port.clone() };
+                &placed
+            }
+            _ => port,
         };
         match check_input(port, value, wired.contains(port.name.as_str())) {
             InputCheck::Ok => {}
@@ -604,9 +615,10 @@ pub fn fill_input_from_literals(
 }
 
 /// The inputs whose closure skips `node` at this point (rule 1 of
-/// `check_should_skip`): the required ones, and those required only once
-/// wired (`requiredWhenWired`) that a wire feeds here. Only ports the
-/// run reads count.
+/// `check_should_skip`): the required ones, and the ones a wire feeds
+/// here that are not `optional` (an input the node's metadata calls
+/// optional is required once wired, unless the program wrote `?`). Only
+/// ports the run reads count.
 pub fn required_inputs<'a>(
     node: &'a NodeDefinition,
     wired: &HashSet<&str>,
@@ -615,9 +627,23 @@ pub fn required_inputs<'a>(
 ) -> HashSet<&'a str> {
     node.inputs
         .iter()
+        // The gates are rule 0's alone: a closure on one is never a
+        // required input closing.
+        .filter(|p| !crate::run::skip::is_gate_port(&p.name))
         .filter(|p| p.is_required(wired.contains(p.name.as_str())) && program_idx.includes_port(node, frames, &p.name))
         .map(|p| p.name.as_str())
         .collect()
+}
+
+/// The ports that hold a value without a wire delivering it: the
+/// literals ([`literal_filled_ports`]) and the values a carved run hands
+/// in for wires outside its selection (the open backup pulses). The skip
+/// rules read this on the pulse path and on a kicked root alike, so a
+/// join or a `@require_one_of` handed its values is never taken for one
+/// that has none.
+fn filled_ports<'a>(mut filled: HashSet<&'a str>, effective: &'a [Pulse]) -> HashSet<&'a str> {
+    filled.extend(effective.iter().filter(|p| p.backup && !p.closed).map(|p| p.target_port.as_str()));
+    filled
 }
 
 /// The unwired ports a written constant fills at `frames`: what keeps a
@@ -673,6 +699,7 @@ pub fn port_admits_null(node: &NodeDefinition, port: &str) -> bool {
 /// don't need to be merged here.
 pub fn build_kicked_input(
     node: &NodeDefinition,
+    frames: &LoopFrames,
     port_snapshot: Option<&Value>,
 ) -> (InputBag, Vec<String>) {
     let mut obj = InputBag::new();
@@ -697,7 +724,7 @@ pub fn build_kicked_input(
     // poll interval of zero, a fractional one that would truncate), and
     // skipping the check here meant those rules bound nothing on the
     // one path that uses them.
-    let errors = check_bag(node, &HashSet::new(), &mut obj);
+    let errors = check_bag(node, frames, &HashSet::new(), &mut obj);
     (obj, errors)
 }
 
@@ -725,7 +752,7 @@ fn check_input(port: &crate::project::InputDefinition, value: &Value, wired: boo
         return InputCheck::Ok;
     }
     let declared = port.port_type.port_value_type();
-    if declared.is_unresolved() || declared.accepts_runtime_value(value) {
+    if declared.accepts_runtime_value(value) {
         // The type fits. What is left is the widget's declared domain (a
         // number's range and step), and a value outside it FAILS whether
         // the port is required or not. Nulling it instead would hand the
@@ -832,12 +859,13 @@ mod tests {
         assert_eq!(out.dropped.len(), 1);
     }
 
-    /// An input required only once wired: wired and closed, the node
-    /// skips as for a required input; unwired, or wired with a value,
-    /// it runs. A wired null fails it, as on a required input, instead
-    /// of reading as "nothing arrived".
+    /// An input the metadata calls optional is required once wired: wired
+    /// and closed, the node skips as for a required input; unwired, or
+    /// wired with a value, it runs. A wired null fails it, as on a
+    /// required input, instead of reading as "nothing arrived". One the
+    /// program wrote `?` runs on a closed wire.
     #[test]
-    fn an_input_required_when_wired_skips_only_when_its_wire_closes() {
+    fn an_optional_input_skips_only_when_its_wire_closes_unless_written_optional() {
         let project = |wire_instance: bool| -> ProjectDefinition {
             let mut edges = vec![json!({ "id": "e1", "source": "src", "target": "n",
                 "sourceHandle": "data", "targetHandle": "data" })];
@@ -856,7 +884,7 @@ mod tests {
                       "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
                     { "id": "n", "nodeType": "N", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
                       "inputs": [
-                          { "name": "instance", "portType": "String", "required": false, "requiredWhenWired": true },
+                          { "name": "instance", "portType": "String", "required": false },
                           { "name": "data", "portType": "String", "required": false }],
                       "outputs": [],
                       "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
@@ -889,6 +917,11 @@ mod tests {
         let null = ready(&wired, Some(data(run_id, vec![], "n", "instance", json!(null))));
         assert_eq!(null.skip, None);
         assert_eq!(null.received.type_errors.len(), 1, "a wired null is not 'nothing arrived': {:?}", null.received.type_errors);
+
+        let mut written_optional = project(true);
+        written_optional.nodes[1].inputs[0].optional = true;
+        let closed = ready(&written_optional, Some(Pulse::closure(uuid::Uuid::new_v4(), run_id, vec![], "n", "instance")));
+        assert_eq!(closed.skip, None, "`?` runs the node on a closed wire");
 
         let unwired = ready(&project(false), None);
         assert_eq!(unwired.skip, None, "unwired, the node runs without it");
@@ -985,7 +1018,7 @@ mod tests {
             serde_json::from_value(json!({ "name": "plain", "portType": "String", "required": false })).unwrap(),
         ];
         let node = kicked_node("X", inputs, json!({ "maybe": null, "plain": null }));
-        let (input, _) = build_kicked_input(&node, None);
+        let (input, _) = build_kicked_input(&node, &vec![], None);
         assert_eq!(input.get("maybe").map(|v| &**v), Some(&json!(null)), "null is data on a nullable port");
         assert!(!input.contains_key("plain"), "null on a plain port is no value");
     }
@@ -1098,7 +1131,7 @@ mod tests {
         assert_eq!(check_input(&sheet, &json!("1AbC"), false), InputCheck::Ok);
         assert!(matches!(check_input(&sheet, &json!(7), false), InputCheck::Fail(_)));
         let node = kicked_node("SlackAccess", vec![account], json!({ "account": handle.clone() }));
-        let (input, refusals) = build_kicked_input(&node, None);
+        let (input, refusals) = build_kicked_input(&node, &vec![], None);
         assert!(refusals.is_empty(), "{refusals:?}");
         assert_eq!(input.get("account").map(|v| &**v), Some(&handle), "the handle reaches the bag intact");
     }
@@ -1110,7 +1143,7 @@ mod tests {
     fn an_instance_filled_literal_waits_for_the_instances_value() {
         let marker = crate::instance::instance_filled_literal(Some(json!("0 0 3 * * *")));
         let node = kicked_node("Cron", vec![port("String", true)], json!({ "p": marker }));
-        let (input, refusals) = build_kicked_input(&node, None);
+        let (input, refusals) = build_kicked_input(&node, &vec![], None);
         assert!(refusals.is_empty(), "{refusals:?}");
         assert!(!input.contains_key("p"));
     }
@@ -1128,7 +1161,7 @@ mod tests {
             "widget": { "kind": "number", "min": 1, "step": 1 }
         })).unwrap();
         let node = kicked_node("Poll", vec![interval], json!({ "intervalSecs": 1.5 }));
-        let (input, refusals) = build_kicked_input(&node, None);
+        let (input, refusals) = build_kicked_input(&node, &vec![], None);
         assert_eq!(refusals.len(), 1, "{refusals:?}");
         assert!(refusals[0].contains("intervalSecs"), "{refusals:?}");
         assert_eq!(input.get("intervalSecs").map(|v| &**v), Some(&json!(null)));
@@ -1138,6 +1171,8 @@ mod tests {
         NodeDefinition {
             id: "k".into(),
             node_type: node_type.into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -1217,6 +1252,40 @@ mod tests {
         assert!(!group.received.input.contains_key("p"), "the marker waits for the instance's value");
     }
 
+    /// A join a carved run starts at, its branches handed in for wires
+    /// outside the selection, runs on those values: a handed-in branch
+    /// delivers, the same on a kicked root as on the pulse path.
+    #[test]
+    fn a_kicked_join_handed_its_branches_runs() {
+        let branch = |name: &str| -> InputDefinition {
+            // A join's branches run without a value, as the compiler marks them.
+            serde_json::from_value(json!({ "name": name, "portType": "String", "required": false, "optional": true })).expect("port")
+        };
+        let mut node = kicked_node("Join", vec![branch("a"), branch("b")], json!({}));
+        node.features.join = true;
+        let mut source = kicked_node("X", vec![], json!({}));
+        source.id = "source".into();
+        let project = ProjectDefinition {
+            id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
+            edges: vec![
+                serde_json::from_value(json!({"id":"wa", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"a"})).unwrap(),
+                serde_json::from_value(json!({"id":"wb", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"b"})).unwrap(),
+            ],
+            groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
+        };
+        let mut selection = crate::project::selection::RunSelection::whole(&project);
+        selection.nodes.remove(&Located::top("source"));
+        selection.input.entry(Located::top("k")).or_default().insert("a".into(), json!("handed in"));
+        let index = ProgramIndex::selected(&project, selection);
+        let kick = crate::primitive::KickedNode {
+            firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
+        };
+        let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index);
+        assert!(group.skip.is_none(), "{:?}", group.skip);
+        assert_eq!(*group.received.input["a"], json!("handed in"));
+    }
+
     #[test]
     fn backups_wait_for_real_input_and_only_replace_absence() {
         let node = kicked_node("X", vec![port("String", true)], json!({}));
@@ -1283,7 +1352,7 @@ mod tests {
             })).unwrap(),
         ];
         let node = kicked_node("Range", inputs, json!({ "from": 0, "to": 10, "step": 2 }));
-        let (input, _) = build_kicked_input(&node, None);
+        let (input, _) = build_kicked_input(&node, &vec![], None);
         assert_eq!(Value::Object(super::owned_bag(&input)), json!({ "from": 0, "to": 10, "step": 2 }));
     }
 
@@ -1304,7 +1373,7 @@ mod tests {
         ];
         let node = kicked_node("Recv", inputs, json!({ "mode": "media" }));
         let snapshot = json!({ "endpointUrl": "http://bridge", "ghost": 1 });
-        let (input, _) = build_kicked_input(&node, Some(&snapshot));
+        let (input, _) = build_kicked_input(&node, &vec![], Some(&snapshot));
         assert_eq!(Value::Object(super::owned_bag(&input)), json!({ "endpointUrl": "http://bridge", "mode": "media" }));
     }
 
@@ -1321,7 +1390,7 @@ mod tests {
         ];
         let node = kicked_node("Recv", inputs, json!({ "endpointUrl": "http://from-the-body" }));
         let snapshot = json!({ "endpointUrl": "http://registered" });
-        let (input, errors) = build_kicked_input(&node, Some(&snapshot));
+        let (input, errors) = build_kicked_input(&node, &vec![], Some(&snapshot));
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             Value::Object(super::owned_bag(&input)),

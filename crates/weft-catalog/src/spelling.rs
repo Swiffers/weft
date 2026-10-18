@@ -211,7 +211,7 @@ fn walk_map<'a>(out: &mut Vec<String>, path: &mut Vec<&'a str>, map: &'a Map<Str
 /// inside a declared type that copies a third party.
 fn check_record_fields(out: &mut Vec<String>, ty: &WeftType, declaration: bool) {
     match ty {
-        WeftType::Record(fields) => {
+        WeftType::Record { fields, .. } => {
             for field in fields {
                 check(out, Casing::Camel, "record field", &field.name);
                 check_record_fields(out, &field.ty, false);
@@ -226,10 +226,8 @@ fn check_record_fields(out: &mut Vec<String>, ty: &WeftType, declaration: bool) 
                 check_record_fields(out, body, false);
             }
         }
-        WeftType::List(inner) | WeftType::Generator(inner) => check_record_fields(out, inner, false),
-        WeftType::Dict(k, v) => {
-            check_record_fields(out, k, false);
-            check_record_fields(out, v, false);
+        WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => {
+            check_record_fields(out, inner, false)
         }
         WeftType::Union(members) => {
             for m in members {

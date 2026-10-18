@@ -405,7 +405,6 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         description: Some(description.to_string()),
         requires_scopes: None,
         requires_values: None,
-        required_when_wired: false,
     }
 }
 
@@ -798,8 +797,8 @@ struct FakeState {
     /// real granted set can also be unknowable); a declared set is
     /// checked against the access's required permissions.
     connection_permissions: Mutex<BTreeMap<String, Vec<String>>>,
-    /// Declared-output-type overrides: what the compiler resolves for
-    /// a `MustOverride` output port in a real graph.
+    /// Declared output types: what a program declares on a narrowable
+    /// output (or an added one) in a real graph.
     output_types: Mutex<HashMap<String, WeftType>>,
     /// Output ports the case wires downstream (`FakeRig::wire_output`),
     /// what the compiled graph supplies in production.
@@ -1216,10 +1215,11 @@ impl FakeRig {
         Access::new("fake-connection", service, None).to_value()
     }
 
-    /// Declare the resolved type of an output port, what the compiler
-    /// supplies for a `MustOverride` declaration in a real graph
-    /// (`ctx.output_type` reads it). Ports with a concrete metadata
-    /// type need no declaration.
+    /// Declare the type of an output port, what a program declares on a
+    /// narrowable output (`-> (response: Verdict)`) or an added one in a
+    /// real graph (`ctx.output_type` reads it). Held to the same rule the
+    /// compiler applies, so an output that is not narrowable takes only
+    /// its own type.
     pub fn output_type(&self, port: &str, ty: WeftType) {
         self.state.output_types.lock().unwrap().insert(port.to_string(), ty);
     }
@@ -1526,13 +1526,7 @@ impl FakeRig {
     ) -> WeftResult<(CaptureBox, RunContext, RegisteredFeeds)> {
         let manifest = node.manifest();
         let custom = self.state.input_types.lock().unwrap().clone();
-        let (mut bag, feeds) = manifest_input_bag(manifest, &custom, inputs)?;
-        // A case's declared created ports are part of what the node
-        // declares, whether or not the case delivered on them. The
-        // compiler supplies both halves in production; here the case does.
-        for (port, _) in &custom {
-            bag.declare_port(port.clone());
-        }
+        let (bag, feeds) = manifest_input_bag(manifest, &custom, inputs)?;
         let wake = self.state.wake.lock().unwrap().take();
         // The same gate production applies before a trigger's body
         // runs: a firing payload has to be exactly what the node
@@ -1547,17 +1541,15 @@ impl FakeRig {
                     .map_err(WeftError::NodeFailed)?;
             }
         }
-        // Declared overrides play the compiler's role for MustOverride
-        // ports; concrete metadata types stand as-is. The output map is
+        // Declared types play the program's role for narrowable and
+        // added ports; the metadata's types stand otherwise. The output map is
         // derived from the BAG (defaults applied), never the raw case
         // inputs: the node reads the bag, so a `portsFromConfig` field
         // with a manifest default must shape the outputs the same way
         // it shapes the run.
         let config = Value::Object(bag.object()?.clone());
         let mut outputs = declared_output_map(manifest, &config);
-        for (port, ty) in self.state.output_types.lock().unwrap().iter() {
-            outputs.insert(port.clone(), ty.clone());
-        }
+        declare_output_types(manifest, &config, &mut outputs, &self.state.output_types.lock().unwrap())?;
         // A resume loads the body's journal, exactly as the run
         // driver seeds a firing's awaited sequence from the fold: in
         // call-index order, whatever order the records landed in (two
@@ -1903,6 +1895,48 @@ fn declared_input_map(manifest: &NodeMetadata, custom: &[(String, WeftType)]) ->
     declared
 }
 
+/// Lay the output types a case declared over the node's own, each held
+/// to what the compiler would let a program declare there
+/// ([`NodeMetadata::output_declaration_fits`]; an added output needs a
+/// node that takes them, and on a node whose added outputs read its
+/// path's captures, a capture of the case's path typed as text), so a
+/// case cannot test a type no program could give the port. Both rigs go
+/// through it.
+fn declare_output_types(
+    manifest: &NodeMetadata,
+    config: &Value,
+    outputs: &mut HashMap<String, WeftType>,
+    declared: &HashMap<String, WeftType>,
+) -> WeftResult<()> {
+    for (port, ty) in declared {
+        let fits = match outputs.get(port) {
+            Some(current) => manifest.output_declaration_fits(port, current, ty),
+            None if manifest.features.can_add_output_ports => added_output_fits(manifest, config, port, ty),
+            None => Err("but the node has no such output and takes no added ones".to_string()),
+        };
+        fits.map_err(|why| WeftError::NodeFailed(format!("the case declares output '{port}' as {ty}, {why}")))?;
+        outputs.insert(port.clone(), ty.clone());
+    }
+    Ok(())
+}
+
+/// An added output, held to the node's rule for its added ports: on a
+/// node whose added outputs read its path's captures, the case's path
+/// (the `claimsRoute.pathField` input) has to capture it as text.
+fn added_output_fits(manifest: &NodeMetadata, config: &Value, port: &str, ty: &WeftType) -> Result<(), String> {
+    let Some(claims) = manifest.claims_route.as_ref().filter(|c| c.captures_are_outputs) else {
+        return Ok(());
+    };
+    let raw = config.get(&claims.path_field).and_then(Value::as_str).ok_or_else(|| {
+        format!("but its added ports read the captures of '{}', which the case does not set", claims.path_field)
+    })?;
+    let pattern = crate::route::RoutePattern::parse(raw)?;
+    match pattern.capture_port_problem(port, ty) {
+        Some(problem) => Err(format!("which its path refuses: the case {problem}")),
+        None => Ok(()),
+    }
+}
+
 /// Every output port a run may emit on: the manifest's own, plus the
 /// ones this node DERIVES from its config (a form's fields, a switch's
 /// cases). `config` is the case's inputs, which is where a rig run
@@ -1985,7 +2019,8 @@ impl Capture {
         let mut streams = self.stream_outputs.lock().unwrap();
         let closed = self.closed_ports.lock().unwrap();
         // Gate order mirrors production's `pulse_downstream`: all
-        // ports declared, then the runtime output-type check, then the
+        // ports declared, then the wire cap and the runtime output-type
+        // check, then the
         // one-emission-per-port claim (generator ports accept repeats,
         // but never past a close), so a multi-fault emission errors on
         // the same gate here and there.
@@ -2004,16 +2039,22 @@ impl Capture {
         // whatever the firing already sent stays sent. Generator ports
         // check each ITEM against the element type, again as
         // production does.
-        for (port, value) in &output.outputs {
-            let declared = self.declared[port].port_value_type();
-            if !declared.accepts_runtime_value(value) {
-                return Err(WeftError::NodeFailed(format!(
+        // An open record drops the keys it does not declare, as there.
+        let mut conformed = NodeOutput::new();
+        for (port, value) in output.outputs {
+            crate::storage::check_wire_value("the node under test", &port, &value)
+                .map_err(WeftError::NodeFailed)?;
+            let declared = self.declared[&port].port_value_type();
+            let value = declared.conform_value(value).map_err(|why| {
+                WeftError::NodeFailed(format!(
                     "the node emitted a value on port '{port}' that its declared type \
-                     '{declared}' does not accept; nothing was sent and the port is still \
-                     open, so this emission can be retried with a value that fits"
-                )));
-            }
+                     '{declared}' does not accept ({why}); nothing was sent and the port is \
+                     still open, so this emission can be retried with a value that fits"
+                ))
+            })?;
+            conformed.outputs.insert(port, value);
         }
+        let output = conformed;
         for port in output.outputs.keys() {
             let is_generator = self.declared[port].as_generator().is_some();
             if closed.iter().any(|p| p == port) {
@@ -3090,8 +3131,8 @@ impl LiveRig {
     }
 
     /// Declare an output port's type for the runs that follow, as
-    /// [`FakeRig::output_type`] does on the fake tier: a created output
-    /// port, or the resolved type of a `MustOverride` one.
+    /// [`FakeRig::output_type`] does on the fake tier: an added output
+    /// port, or what a program declares on a narrowable one.
     pub fn output_type(&self, port: &str, ty: WeftType) {
         self.output_types.lock().unwrap().insert(port.to_string(), ty);
     }
@@ -3244,8 +3285,8 @@ impl LiveRig {
             }
         };
         let mut outputs_by_name = declared_output_map(manifest, &config);
-        for (port, ty) in self.output_types.lock().unwrap().iter() {
-            outputs_by_name.insert(port.clone(), ty.clone());
+        if let Err(e) = declare_output_types(manifest, &config, &mut outputs_by_name, &self.output_types.lock().unwrap()) {
+            return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None };
         }
         let inner = match (self.factory)(
             HandleRole::NodeUnderTest { node_type: &manifest.node_type },

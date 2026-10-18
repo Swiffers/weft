@@ -135,6 +135,8 @@
         let loop_in = NodeDefinition {
             id: loop_in_id.clone(),
             node_type: "LoopIn".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: loop_in_cfg.clone(),
             position: Position { x: 0.0, y: 0.0 },
@@ -193,6 +195,8 @@
         let loop_out = NodeDefinition {
             id: loop_out_id.clone(),
             node_type: "LoopOut".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: loop_out_cfg,
             position: Position { x: 0.0, y: 0.0 },
@@ -248,6 +252,8 @@
         let body = NodeDefinition {
             id: body_id.clone(),
             node_type: "Echo".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -291,6 +297,8 @@
         let consumer = NodeDefinition {
             id: consumer_id.clone(),
             node_type: "Sink".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -1041,6 +1049,8 @@
         let producer = NodeDefinition {
             id: "producer".into(),
             node_type: "Producer".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -1105,7 +1115,7 @@
             "carry": ["acc"],
         });
         let loop_in = NodeDefinition {
-            id: loop_in_id.clone(), node_type: "LoopIn".into(), label: None,
+            id: loop_in_id.clone(), node_type: "LoopIn".into(), type_params: Vec::new(), place_types: Vec::new(), label: None,
             config: loop_cfg.clone(), position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: Some(GroupBoundary { group_id: group_id.clone(), role: GroupBoundaryRole::In }),
@@ -1130,7 +1140,7 @@
         // LoopOut carries only `{"parentId": ...}` (matches compiler).
         let loop_out_cfg = serde_json::json!({"parentId": group_id});
         let loop_out = NodeDefinition {
-            id: loop_out_id.clone(), node_type: "LoopOut".into(), label: None,
+            id: loop_out_id.clone(), node_type: "LoopOut".into(), type_params: Vec::new(), place_types: Vec::new(), label: None,
             config: loop_out_cfg, position: Position { x: 0.0, y: 0.0 },
             scope: vec![],
             group_boundary: Some(GroupBoundary { group_id: group_id.clone(), role: GroupBoundaryRole::Out }),
@@ -1153,7 +1163,7 @@
             file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let body = NodeDefinition {
-            id: body_id.clone(), node_type: "Concat".into(), label: None,
+            id: body_id.clone(), node_type: "Concat".into(), type_params: Vec::new(), place_types: Vec::new(), label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
             scope: vec![group_id.clone()], group_boundary: None,
@@ -1179,7 +1189,7 @@
             file_refs: Default::default(), include_path: None, include_contents: None, source_file: None,
         };
         let consumer = NodeDefinition {
-            id: consumer_id.clone(), node_type: "Sink".into(), label: None,
+            id: consumer_id.clone(), node_type: "Sink".into(), type_params: Vec::new(), place_types: Vec::new(), label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 }, scope: vec![], group_boundary: None,
             inputs: inputs_of(vec![

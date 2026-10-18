@@ -8,10 +8,11 @@
 //! really answers, the meter really resolves a real number from the real
 //! response, and that number reaches the cost trail.
 //!
-//! Two scenarios drive the SAME graph through the OpenRouterProvider node's
+//! Two scenarios drive the SAME graph through the OpenRouterAccess node's
 //! connection picker, exactly as a user picks a connection in the editor
-//! (the pick lives on the PROVIDER node; the inference node just consumes
-//! the wired provider value):
+//! (the pick lives on the ACCESS node, wired into the OpenRouterModel node
+//! that names the model; the inference node just consumes the wired
+//! provider value):
 //!   - `platform`: a shared-door connection, so the call is made on the
 //!     runtime's configured key (the shared-credentials `api_key` entry),
 //!     which the worker never holds directly.
@@ -65,13 +66,13 @@ async fn openrouter_node_measures_a_call_on_the_runtime_key() -> anyhow::Result<
     let disp = ensure::up().await?;
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/llm", "openrouter")?,
+        catalog_spec("ai/llm", "openrouter_access")?,
         "shared",
         serde_json::json!({}),
     )
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    set_account(&project, "prov", conn.handle()).await?;
+    set_account(&project, "openrouter", conn.handle()).await?;
     assert_metered(&mut project, "platform").await?;
     project.finish().await?;
     conn.finish().await
@@ -84,19 +85,19 @@ async fn openrouter_node_measures_a_call_on_the_users_own_key() -> anyhow::Resul
     let Some(key) = ensure::env_or_skip("OPENROUTER_API_KEY") else { return Ok(()) };
     let disp = ensure::up().await?;
     // Connect the user's own key as its own connection, exactly as the
-    // editor's "Your own" page does; the provider node's config stores
+    // editor's "Your own" page does; the access node's config stores
     // only the handle, never the key itself. The inference node
     // consumes the wired LlmProvider object (connection, model, and
     // routing); sampling settings ride the wired LlmParams object.
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/llm", "openrouter")?,
+        catalog_spec("ai/llm", "openrouter_access")?,
         "own",
         serde_json::json!({ "key": key }),
     )
     .await?;
     let mut project = Project::prepare("openrouter", disp).await?;
-    set_account(&project, "prov", conn.handle()).await?;
+    set_account(&project, "openrouter", conn.handle()).await?;
     assert_metered(&mut project, "author").await?;
     project.finish().await?;
     conn.finish().await

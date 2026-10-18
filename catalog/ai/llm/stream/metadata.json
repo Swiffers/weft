@@ -35,7 +35,7 @@
       "type": "LlmProvider",
       "required": true,
       "accepts": ["wire"],
-      "description": "Which service, model, and credential: wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output."
+      "description": "Which service, model, and credential: wire an OpenRouter Model, Anthropic Model, OpenAI Model, or Custom Provider node's output."
     },
     {
       "name": "params",

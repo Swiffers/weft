@@ -47,7 +47,7 @@ does it and listens
 `Route` claims an address and starts a run when somebody calls it.
 
 ```weft
-post = Route -> (body: JsonDict, photo: File) {
+post = Route -> (body: JsonDict) {
   path: "cards"
   method: "POST"
 }
@@ -61,7 +61,23 @@ The caller is held open while your program works, and `Reply` is what answers
 them. For streaming an answer as it is produced, and for the Rust side, go and
 read [talking to a live caller](../nodes/live-callers.md).
 
-A path can capture: `cards/{id}` puts `id` where your node can read it.
+If you want part of the path as a value, capture it with `{name}` and declare
+an output of the same name:
+
+```weft
+card = Route -> (id: String) {
+  path: "cards/{id}"
+  method: "GET"
+}
+```
+
+A call to `cards/42` puts `"42"` on `card.id`. Every other output you add to a
+`Route` has to be a capture of its path, typed `String`, or the build stops
+with `route-output-not-a-capture`. Declaring one of `Route`'s own outputs,
+like `body` above, is fine. A capture can't share a name with one of
+`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`, `caller`,
+`fired`), so `cards/{body}` is a compile error asking you to rename the
+capture.
 
 **Two routes that one call could reach, where neither is more specific, is an
 error.** `cards/count` beside `cards/{id}` is fine, because the first is more

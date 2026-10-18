@@ -890,8 +890,8 @@ fn update_node_ports_drops_body_driver_on_removed_input() {
 
 #[test]
 fn update_node_ports_round_trips_an_unparseable_declared_type() {
-    // The parser keeps a typo'd type as recoverable (MustOverride + a
-    // squiggle), so a gesture on such a node round-trips the verbatim
+    // The parser keeps a typo'd type as recoverable (the port's own type
+    // variable + a squiggle), so a gesture on such a node round-trips the verbatim
     // spelling: refusing it would block the whole gesture, rewriting it
     // would erase the author's text and the diagnostic pointing at it.
     let src = "n = Debug(data?: Strng)\n";
@@ -908,21 +908,20 @@ fn update_node_ports_round_trips_an_unparseable_declared_type() {
 }
 
 #[test]
-fn update_node_ports_canonicalizes_a_bare_declared_port() {
-    // A declared port with no annotation (`(x)`) parses as the
-    // MustOverride placeholder; a header rewrite spells that out
-    // (`x?: MustOverride`), the deliberate canonicalization the
-    // `ParsedPort::type_text` doc pins: same parse, made explicit,
-    // never dropped as undeclared.
+fn update_node_ports_keeps_a_bare_declared_port_bare() {
+    // A declared port with no annotation (`(x)`) has the empty declared
+    // spelling; a header rewrite writes it back as the bare name, never
+    // dropped as undeclared and never given a type the author did not write.
     let src = "n = Text(x?)\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("MustOverride".into()) }],
+        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("".into()) }],
         outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
         removed_inputs: vec![],
         removed_outputs: vec![],
     }]);
-    assert!(out.contains("x?: MustOverride"), "bare port canonicalized, not dropped: {out}");
+    assert!(out.contains("Text(x?) ->"), "bare port written back bare, not dropped: {out}");
+    assert!(!out.contains("x?:"), "no type written for a port declared without one: {out}");
     parse_ok(&out);
 }
 
@@ -1795,7 +1794,7 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
         .unwrap_err();
         assert!(matches!(err, EditError::InvalidArgument(_)), "port type {harmful:?}: {err:?}");
     }
-    for ok in ["String | Null", "List[Number]", "Dict[String, Number]", "MustOverride"] {
+    for ok in ["String | Null", "List[Number]", "Dict[String, Number]"] {
         assert!(
             apply_edits(
                 two,
@@ -2667,7 +2666,7 @@ fn move_loop_scope_rejects_group_target() {
 
 #[test]
 fn set_config_multiline_array_replaces_in_place() {
-    let src = "my = Loop(test?: MustOverride) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
+    let src = "my = Loop(test?) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
     let out = apply(src, vec![EditOp::SetLoopConfig {
         loop_id: "my".into(),
         key: "carry".into(),
@@ -2750,7 +2749,7 @@ fn set_config_node_same_key_twice_in_batch() {
 fn end_to_end_recover_broken_loop_file() {
     // The broken file Quentin saw: duplicate over/carry from a pre-fix
     // race. A single set_config per key collapses its duplicates.
-    let src = "MyLoop = Loop(test?: MustOverride) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
+    let src = "MyLoop = Loop(test?) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
     let out = apply(src, vec![
         EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[\n  \"test\"\n]".into() },
     ]);
@@ -2800,7 +2799,7 @@ fn update_ports_inside_loop_body_keeps_layout() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2808,7 +2807,7 @@ fn update_ports_inside_loop_body_keeps_layout() {
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython(number?: MustOverride) {}"), "2-space indent preserved: {out}");
+    assert!(out.contains("\n  exec_python_1 = ExecPython(number?) {}"), "2-space indent preserved: {out}");
     assert!(out.ends_with("MyLoop.numbers = range_1.values\n"), "trailing connection intact: {out}");
 }
 
@@ -2825,7 +2824,7 @@ fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
         EditOp::UpdateNodePorts {
             node: "exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2847,7 +2846,7 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2863,7 +2862,7 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -3994,4 +3993,31 @@ fn set_per_instance_refuses_what_cannot_carry_it() {
     assert!(err.contains("set_per_instance"), "{err}");
     let err = apply_err("d = Debug {\n  data: Text { value: \"x\" }.value\n}\n", vec![set_per_instance("d__data", true)]);
     assert!(err.contains("its own line"), "{err}");
+}
+
+/// A port gesture on a group keeps the type parameters its ports still
+/// use and drops the ones nothing uses any more (the build refuses an
+/// unused one), along with the brackets when none is left.
+#[test]
+fn update_group_ports_keeps_used_type_params_and_drops_the_rest() {
+    let src = "g = Group[T: Image | Video | Audio, T2: List[T]](file: T) -> (out: T2) {\n  x = Debug\n}\n";
+    let sig = |name: &str, ty: &str| PortSig { name: name.into(), required: true, port_type: ty.into() };
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("file", "Image")],
+        outputs: vec![sig("out", "T2")],
+    }]);
+    assert!(out.starts_with("g = Group[T: Image | Video | Audio, T2: List[T]](file: Image) -> (out: T2)"), "{out}");
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("file", "T")],
+        outputs: vec![sig("out", "Image")],
+    }]);
+    assert!(out.starts_with("g = Group[T: Image | Video | Audio](file: T) -> (out: Image)"), "{out}");
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("file", "Image")],
+        outputs: vec![sig("out", "Image")],
+    }]);
+    assert!(out.starts_with("g = Group(file: Image) -> (out: Image)"), "{out}");
 }

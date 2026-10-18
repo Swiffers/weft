@@ -36,13 +36,31 @@ For an ordinary node:
 
 | What happened | What the node does |
 |---|---|
-| A required input closed | Skips |
-| A wired input the node's metadata marks required once wired (`requiredWhenWired`) closed | Skips, as for a required one. Left unwired, it is optional |
-| An optional input closed | Nothing. The other inputs decide |
-| Every input closed | Skips |
+| An input it needs closed (the table below says which) | Skips |
+| An input you declared `x?: T` closed | Nothing. It runs without that input |
 | Every `@require_one_of` input closed | Skips |
 | `_should_flow` is `false`, or closed | Skips |
 | It was waiting on a person, who skipped the question | Skips |
+
+Which inputs a node needs comes from its metadata and from what your program
+writes on the port:
+
+| What the node's metadata says | What the program writes | Result |
+|---|---|---|
+| required | nothing | always required |
+| required | `x?: T` | compile error naming the port: the node's code needs it |
+| optional | nothing | unwired: runs without it. Wired: waits for it, and skips if the wire closes |
+| optional | `x: T` (no `?`) | always required |
+| optional | `x?: T` | runs without it even when wired and the wire closed, whether nothing arrived or the source failed |
+
+So by default a node skips when a wired input closes, and writing `?` on that
+input lets it run without it. For an example of each, go and read
+[optional and required inputs](syntax.md#optional-and-required-inputs).
+
+If every input wired into a node is written with `?`, nothing says when it
+should run, and the compiler stops with `run-undecided`: gate it with
+`_should_flow`, drop the `?` from the input it cannot do without, or add
+`@require_one_of`.
 
 A skipped node closes its own outputs, which can skip the next node, and the
 next, until the closures reach something that can carry on with what it has.

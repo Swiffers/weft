@@ -39,6 +39,7 @@
     {
       "name": "row",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The row as stored. If a rule or trigger discards the insert, the node fails instead of emitting nothing."
     }
   ],

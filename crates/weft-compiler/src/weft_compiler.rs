@@ -89,21 +89,20 @@ pub(crate) struct ParsedPort {
     /// Never set on a user-declared port; never set on a non-loop group.
     synthesized_from_carry: bool,
     /// A non-fatal type error: the port was declared with an invalid / unknown
-    /// type. The port is KEPT (as `MustOverride`, rendered red) so it doesn't
-    /// vanish; this carries the diagnostic the caller records as a squiggle.
-    /// `None` for a well-typed port.
+    /// type. The port is KEPT (typed with its own variable, `T__in__x`) so it
+    /// doesn't vanish; this carries the diagnostic the caller records as a
+    /// squiggle. `None` for a well-typed port.
     type_error: Option<String>,
     /// The VERBATIM type annotation the source header spells (no `?`), which
     /// becomes the port's `declared_type`. Never a re-print of the parsed
     /// type: re-printing expands a registry alias (`Thing` becomes
-    /// `Thing={...}`) and turns an unparseable annotation into the
-    /// `MustOverride` placeholder, and the editor writes the header back from
-    /// this, so a re-print would overwrite what the author typed. The one
-    /// deliberate exception: a declared port with NO annotation (`(x)`) is
-    /// stamped with the default type's spelling, so a header rewrite
-    /// canonicalizes it to `x: MustOverride` (same parse, made explicit)
-    /// rather than dropping it as undeclared. `None` only for a port no
-    /// header line declares (a carry-synthesized ghost).
+    /// `Thing={...}`) and turns an unparseable annotation into the port's
+    /// own variable, and the editor writes the header back from this, so a
+    /// re-print would overwrite what the author typed. A declared port with
+    /// NO annotation (`(x)`) is stamped with the empty spelling, which a
+    /// header rewrite writes back as the bare name, rather than dropping it
+    /// as undeclared. `None` only for a port no header line declares (a
+    /// carry-synthesized ghost).
     type_text: Option<String>,
 }
 
@@ -116,6 +115,9 @@ struct ParsedNode {
     parent_id: Option<String>,
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
+    /// `[T: Media]` written after the node's type name: bounds on the
+    /// type variables its header ports use.
+    type_params: Vec<weft_core::weft_type::TypeParam>,
     one_of_required: Vec<Vec<String>>,
     /// The body says `@per_instance`: this node exists once per instance.
     per_instance: bool,
@@ -215,6 +217,10 @@ struct ParsedGroup {
     kind: GroupKind,
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
+    /// `[T: Media]` written after `Group` / `Loop`: bounds on the type
+    /// variables its ports use. Both boundary nodes carry them, and the
+    /// two share their variables.
+    type_params: Vec<weft_core::weft_type::TypeParam>,
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     child_groups: Vec<ParsedGroup>,
@@ -798,6 +804,7 @@ fn resolve_one_include(
                     .map(|mut p| { p.type_text = None; p }).collect(),
                 out_ports: group.out_ports.iter().cloned()
                     .map(|mut p| { p.type_text = None; p }).collect(),
+                type_params: group.type_params.clone(),
                 one_of_required: Vec::new(),
                 per_instance: false,
                 span: Some(inc.span),
@@ -868,6 +875,7 @@ fn resolve_one_include(
                 kind: GroupKind::Call { body: body_id },
                 in_ports: body.in_ports.clone(),
                 out_ports: body.out_ports.clone(),
+                type_params: body.type_params.clone(),
                 nodes: Vec::new(),
                 connections: Vec::new(),
                 child_groups: Vec::new(),
@@ -1652,9 +1660,14 @@ fn lower_port_sig(
                 }
                 // The culprit is this port decl, not the whole header.
                 let span = li.span_of(&n);
-                match try_parse_port_decl(text) {
+                let side = if direction == "out" {
+                    weft_core::weft_type::PortSide::Output
+                } else {
+                    weft_core::weft_type::PortSide::Input
+                };
+                match try_parse_port_decl(text, side) {
                     Ok(mut p) => {
-                        // A bad / unknown port TYPE is kept (as MustOverride, red in
+                        // A bad / unknown port TYPE is kept (typed with its own variable, in
                         // the editor) but still surfaced as a squiggle, so the port
                         // never silently vanishes from the canvas.
                         if let Some(type_err) = &p.type_error {
@@ -1780,6 +1793,41 @@ pub(crate) fn read_loop_port_list_vetted(
         .unwrap_or_default()
 }
 
+/// The `[T: Media]` type parameters written on a HEADER (or an inline
+/// expression, which carries its signatures directly). Empty when none
+/// are written; a malformed list is reported on its brackets and lowers
+/// to none. `ports` is the whole port list when the header holds it (a
+/// group's, a loop's), and every parameter must bound a variable one of
+/// them uses; a node's own type adds ports of its own, so enrich asks
+/// that question for a node once it knows them (`None` here).
+fn lower_type_params(
+    owner: &crate::cst::SyntaxNode,
+    ports: Option<(&[ParsedPort], &[ParsedPort])>,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> Vec<weft_core::weft_type::TypeParam> {
+    use weft_core::weft_type::TypeParam;
+    let Some(params) = owner.children().find(|n| n.kind() == crate::cst::SyntaxKind::TYPE_PARAMS) else {
+        return Vec::new();
+    };
+    let span = li.span_of(&params);
+    let checked = TypeParam::parse_list(&params.to_string()).and_then(|parsed| {
+        TypeParam::check_declarations(&parsed)?;
+        if let Some((in_ports, out_ports)) = ports {
+            let mut used = std::collections::BTreeSet::new();
+            for port in in_ports.iter().chain(out_ports) {
+                port.port_type.collect_type_vars(&mut used);
+            }
+            TypeParam::check_used(&parsed, &used)?;
+        }
+        Ok(parsed)
+    });
+    checked.unwrap_or_else(|why| {
+        errors.push(CompileError::at(span, why));
+        Vec::new()
+    })
+}
+
 /// Read the input/output port signatures off a HEADER,
 /// returning (in_ports, out_ports, one_of_required).
 fn lower_header_ports(
@@ -1837,6 +1885,7 @@ fn lower_node(
     }
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
+    let type_params = lower_type_params(header.syntax(), None, li, errors);
 
     let mut body_out = LoweredBody::default();
     let mut one_of_required = one_of_required;
@@ -1856,6 +1905,7 @@ fn lower_node(
         parent_id: parent.map(|p| p.to_string()),
         in_ports,
         out_ports,
+        type_params,
         one_of_required,
         per_instance: body_out.per_instance,
         span: Some(li.span_of(n.syntax())),
@@ -2075,6 +2125,7 @@ fn lower_inline_expr(
     // Ports: the inline expr's PORT_SIG_IN / PORT_SIG_OUT live directly under
     // the INLINE_EXPR (no HEADER sub-node), so read them off the node itself.
     let (in_ports, out_ports, one_of_required) = lower_header_ports(inline_node, li, errors);
+    let type_params = lower_type_params(inline_node, None, li, errors);
 
     // Body config (recurses for nested inline exprs via lower_config_body). The
     // nested host is THIS anon node (raw `anon_id`), and it shares this node's
@@ -2105,6 +2156,7 @@ fn lower_inline_expr(
         parent_id: parent_id.map(|s| s.to_string()),
         in_ports,
         out_ports,
+        type_params,
         one_of_required,
         per_instance: body_out.per_instance,
         span: Some(li.span_of(inline_node)),
@@ -2468,6 +2520,7 @@ fn lower_group(
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("group", &id, &one_of_required, header_span, errors);
+    let type_params = lower_type_params(header.syntax(), Some((&in_ports, &out_ports)), li, errors);
 
     let mut group = ParsedGroup {
         id: id.clone(),
@@ -2475,6 +2528,7 @@ fn lower_group(
         source_file: None,
         in_ports: Vec::new(),
         out_ports,
+        type_params,
         nodes: Vec::new(),
         connections: Vec::new(),
         child_groups: Vec::new(),
@@ -2515,6 +2569,7 @@ fn lower_loop(
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("loop", &id, &one_of_required, header_span, errors);
+    let type_params = lower_type_params(header.syntax(), Some((&in_ports, &out_ports)), li, errors);
 
     let mut group = ParsedGroup {
         id: id.clone(),
@@ -2522,6 +2577,7 @@ fn lower_loop(
         source_file: None,
         in_ports: Vec::new(),
         out_ports,
+        type_params,
         nodes: Vec::new(),
         connections: Vec::new(),
         child_groups: Vec::new(),
@@ -3052,7 +3108,7 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 /// `name?: Type` (optional). The `?` sits on the NAME, the one place it
 /// means "may be absent" everywhere in the language (a record field
 /// spells it the same way); `name: Type?` is refused naming the spelling.
-pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
+pub(crate) fn try_parse_port_decl(trimmed: &str, side: weft_core::weft_type::PortSide) -> Result<ParsedPort, String> {
     let s = trimmed.trim();
     let rest = s;
     let (name, port_type, optional, type_text) = if let Some(colon_pos) = rest.find(':') {
@@ -3069,40 +3125,38 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
             ));
         }
 
-        match WeftType::parse(type_str) {
-            Some(pt) => (name, pt, optional, Some(type_str.to_string())),
-            // An invalid / unknown type is RECOVERABLE: keep the port (with the
-            // `MustOverride` placeholder, which the editor renders red as
-            // "needs a type") and surface the bad type as a diagnostic, rather
-            // than dropping the port so it silently vanishes from the canvas.
-            // Mirrors the same keep-and-flag rule enrich applies to a custom port
-            // left at `MustOverride`. The error text rides on the returned port
-            // via `type_error` so the caller records the squiggle.
-            None => return Ok(ParsedPort {
+        match WeftType::try_parse(type_str) {
+            Ok(pt) => (name, pt, optional, Some(type_str.to_string())),
+            // An invalid / unknown type is RECOVERABLE: keep the port (typed
+            // with its own variable, as an untyped port is) and surface the
+            // bad type as a diagnostic, rather than dropping the port so it
+            // silently vanishes from the canvas. The error text rides on the
+            // returned port via `type_error` so the caller records the
+            // squiggle.
+            Err(why) => return Ok(ParsedPort {
                 name: name.to_string(),
-                port_type: WeftType::MustOverride,
+                port_type: WeftType::port_var(side, name),
                 required: !optional,
                 synthesized_from_carry: false,
-                type_error: Some(format!("Invalid port type '{}' on port '{}'", type_str, name)),
+                type_error: Some(format!("Invalid port type '{type_str}' on port '{name}': {why}")),
                 // The unparseable annotation stays the declared spelling:
                 // the editor rewrites headers from it, and stamping the
-                // placeholder here would overwrite the author's typo (and
-                // the squiggle pointing at it) on the next ports gesture.
+                // port's variable here would overwrite the author's typo
+                // (and the squiggle pointing at it) on the next ports gesture.
                 type_text: Some(type_str.to_string()),
             }),
         }
     } else {
-        // No type annotation. The name is validated once, by the
-        // shared check below, the same as the typed branch's. The
-        // header still DECLARES the port, so it gets a declared
-        // spelling (the default type's), or the editor's next ports
-        // gesture would treat it as catalog-provided and drop it.
+        // No type annotation: the port takes its type from what is wired
+        // to it, through its own variable. The name is validated once, by
+        // the shared check below, the same as the typed branch's. The
+        // header still DECLARES the port, so it gets a declared spelling
+        // (the empty one, written back as the bare name), or the editor's
+        // next ports gesture would treat it as catalog-provided and drop it.
         let name = rest.trim();
         let optional = name.ends_with('?');
         let name = if optional { name[..name.len() - 1].trim() } else { name };
-        let default = WeftType::default();
-        let text = default.wire_string();
-        (name, default, optional, Some(text))
+        (name, WeftType::port_var(side, name), optional, Some(String::new()))
     };
 
     // Validate port name
@@ -3769,6 +3823,7 @@ fn flatten_group(
             // field's contract. Only NODE decl ports carry one.
             declared_type: None,
         })
+        .with_optional(!boundary_required)
     }).collect();
     // A group or loop takes `_should_flow` like any node, on its IN
     // boundary: a closure or a `false` there skips the boundary, and the
@@ -3781,7 +3836,7 @@ fn flatten_group(
         name: weft_core::run::skip::SHOULD_FLOW_PORT.to_string(),
         // Its OWN type variable, never a `T` the group's ports might
         // also use.
-        port_type: weft_core::weft_type::WeftType::type_var("T__should_flow"),
+        port_type: weft_core::weft_type::WeftType::port_var(weft_core::weft_type::PortSide::Input, weft_core::run::skip::SHOULD_FLOW_PORT),
         required: false,
         description: Some(
             "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn."
@@ -3789,7 +3844,7 @@ fn flatten_group(
         ),
         synthesized_from_carry: false,
         declared_type: None,
-    }));
+    }).with_optional(true));
     // The same gate read the other way round, on the same boundary: a
     // whole subgraph that runs when the thing wired here did NOT happen.
     // Both spellings exist on every node, so they exist here too, or a
@@ -3797,7 +3852,7 @@ fn flatten_group(
     // on an absence.
     in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
         name: weft_core::run::skip::SHOULD_NOT_FLOW_PORT.to_string(),
-        port_type: weft_core::weft_type::WeftType::type_var("T__should_not_flow"),
+        port_type: weft_core::weft_type::WeftType::port_var(weft_core::weft_type::PortSide::Input, weft_core::run::skip::SHOULD_NOT_FLOW_PORT),
         required: false,
         description: Some(
             "Whether this group runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it."
@@ -3805,7 +3860,7 @@ fn flatten_group(
         ),
         synthesized_from_carry: false,
         declared_type: None,
-    }));
+    }).with_optional(true));
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
         let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
             elem_type(&p.port_type)
@@ -3872,6 +3927,8 @@ fn flatten_group(
         inputs: in_pt_inputs,
         outputs: in_pt_outputs,
         features: in_features,
+        type_params: group.type_params.clone(),
+        place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
         requires_infra: false, per_instance: None,
@@ -3926,6 +3983,7 @@ fn flatten_group(
             synthesized_from_carry: false,
             declared_type: None,
         })
+        .with_optional(!required)
     }).collect();
     // Implicit `self.done: Boolean` for loops. Skip if the user declared a
     // port named `done` (validate reports the reserved-name collision);
@@ -3938,7 +3996,7 @@ fn flatten_group(
             description: None,
             synthesized_from_carry: false,
             declared_type: None,
-        }));
+        }).with_optional(true));
     }
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -3964,6 +4022,8 @@ fn flatten_group(
         inputs: out_pt_inputs,
         outputs: out_pt_outputs,
         features: NodeFeatures::default(),
+        type_params: group.type_params.clone(),
+        place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
         requires_infra: false, per_instance: None,
@@ -4056,6 +4116,8 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
             // the parsed type (see `ParsedPort::type_text`).
             declared_type: p.type_text.clone(),
         })
+        // The header's `?`: runs without it even when its wire closed.
+        .with_optional(!p.required)
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -4082,6 +4144,8 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         inputs,
         outputs,
         features,
+        type_params: pn.type_params.clone(),
+        place_types: Vec::new(),
         scope,
         group_boundary: None,
         requires_infra: false,

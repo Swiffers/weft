@@ -1,7 +1,7 @@
 {
   "type": "Cast",
   "label": "Cast",
-  "description": "Convert a value to the type declared on its output: parse text into a number, boolean or JSON, stringify data, or validate an object against a custom type. An impossible conversion is a compile error; a value that does not fit fails the node naming the offending field.",
+  "description": "Convert a value to the type of its output: parse text into a number, boolean or JSON, stringify data, or validate an object against a custom type. The output takes the type you declare on it (`-> (value: Signup)`), or, undeclared, the type of the port it feeds. An impossible conversion is a compile error; a value that does not fit fails the node naming the offending field.",
   "tags": [
     "cast",
     "convert",
@@ -23,7 +23,8 @@
   "outputs": [
     {
       "name": "value",
-      "type": "MustOverride"
+      "type": "T2",
+      "description": "The value in the type declared here, or in the type of the port it feeds."
     }
   ],
   "features": {

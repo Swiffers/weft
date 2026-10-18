@@ -99,6 +99,7 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "With a header, {column: value} each; without, {c0, c1, ...}."
     }
   ],

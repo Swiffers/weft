@@ -40,6 +40,13 @@ enum PortDirection {
 }
 
 impl PortDirection {
+    fn side(self) -> weft_core::weft_type::PortSide {
+        match self {
+            PortDirection::Input => weft_core::weft_type::PortSide::Input,
+            PortDirection::Output => weft_core::weft_type::PortSide::Output,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Input => "input",
@@ -81,25 +88,42 @@ fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
 /// hold one [`PortDefinition`], and the source-vs-catalog merge is one
 /// rule over that struct's fields; this hands the merge that struct so
 /// a new port field never needs a second accessor list.
+/// The program's `?` rides along: on an input it is `optional`, on an
+/// output it means nothing.
 trait AsPort: Clone {
     fn port(&self) -> &PortDefinition;
     fn port_mut(&mut self) -> &mut PortDefinition;
+    fn optional(&self) -> bool;
+    fn set_optional(&mut self, optional: bool);
 }
 
 impl AsPort for InputDefinition {
     fn port(&self) -> &PortDefinition { &self.port }
     fn port_mut(&mut self) -> &mut PortDefinition { &mut self.port }
+    fn optional(&self) -> bool { self.optional }
+    fn set_optional(&mut self, optional: bool) { self.optional = optional; }
 }
 
 impl AsPort for PortDefinition {
     fn port(&self) -> &PortDefinition { self }
     fn port_mut(&mut self) -> &mut PortDefinition { self }
+    fn optional(&self) -> bool { false }
+    fn set_optional(&mut self, _: bool) {}
 }
 
+/// Whether a type the source declares on a catalog port may replace the
+/// catalog's: `Err` says why not. An input narrows to anything that fits
+/// in the catalog's type; an output is the node's contract, so it takes
+/// another type only where the node lets the program say what it holds
+/// (a narrowable output, within its bound) or a type variable is pinned.
+type DeclarationFits<'a> = &'a dyn Fn(&PortDefinition, &WeftType) -> Result<(), String>;
+
+#[allow(clippy::too_many_arguments)]
 fn merge_ports<T: AsPort>(
     catalog_ports: &[T],
     weft_ports: &[T],
     can_add: bool,
+    fits: DeclarationFits<'_>,
     node_id: &str,
     span: Span,
     file: Option<&str>,
@@ -122,24 +146,26 @@ fn merge_ports<T: AsPort>(
             let (cp_port, wp_port) = (cp.port(), wp.port());
             let mut merged = cp.clone();
             merged.port_mut().required = wp_port.required;
+            merged.set_optional(wp.optional());
             // The catalog clone has no declared stamp; the header DOES
             // declare this port, so the editor's round-trip needs the
             // authored spelling carried onto the merged result.
             merged.port_mut().declared_type = wp_port.declared_type.clone();
-            if !wp_port.port_type.is_must_override() {
-                if cp_port.port_type.is_must_override()
-                    || WeftType::is_compatible(&wp_port.port_type, &cp_port.port_type)
-                {
-                    merged.port_mut().port_type = wp_port.port_type.clone();
-                } else {
-                    errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
-                        "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
-                        node_id,
-                        direction.as_str(),
-                        cp_port.name,
-                        wp_port.port_type,
-                        cp_port.port_type,
-                    )});
+            // A port the header names with no type keeps the catalog's.
+            if !wp_port.is_untyped(direction.side()) {
+                match fits(cp_port, &wp_port.port_type) {
+                    Ok(()) => merged.port_mut().port_type = wp_port.port_type.clone(),
+                    Err(why) => errors.push(EnrichError {
+                        span,
+                        file: file.map(str::to_string),
+                        message: format!(
+                            "node '{}': {} port '{}' is declared {}, {why}",
+                            node_id,
+                            direction.as_str(),
+                            cp_port.name,
+                            wp_port.port_type,
+                        ),
+                    }),
                 }
             }
             merged
@@ -167,20 +193,6 @@ fn merge_ports<T: AsPort>(
                 direction.as_str(),
             )});
             continue;
-        }
-        // A user-added port with the placeholder `MustOverride` type is the
-        // graph editor's default for "I added a port but haven't set the
-        // type yet". Keep the port in the materialized list so the UI shows
-        // it (the user just added it), and surface the missing-type as an
-        // error diagnostic instead. Without this, the round-trip silently
-        // ate the port and it vanished from the canvas.
-        if wp.port().port_type.is_must_override() {
-            errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
-                "node '{}': custom {} port '{}' needs a concrete type",
-                node_id,
-                direction.as_str(),
-                wp.port().name,
-            )});
         }
         result.push(wp.clone());
     }
@@ -255,7 +267,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
                 // Its OWN type variable, never the node's `T`: a join whose
                 // branches carry Strings must not also force its permission
                 // to be a String.
-                port_type: WeftType::type_var("T__should_flow"),
+                port_type: WeftType::port_var(weft_core::weft_type::PortSide::Input, SHOULD_FLOW_PORT),
                 // Optional: unwired and unset, the node runs. The skip rule
                 // reads this port itself, so a closure on it does not need
                 // the required-input rule to bite.
@@ -271,7 +283,9 @@ fn gate_inputs() -> [InputDefinition; 2] {
             // Both, and never switchable: `_should_flow` is the
             // language's gate, and validate types its constant itself.
             accepts: Accepts::both(),
-            required_when_wired: false,
+            // The skip rules read the gate themselves (rule 0); a closure
+            // on it is never the required-input rule's to act on.
+            optional: true,
             widget: None,
             default: None,
             label: None,
@@ -283,7 +297,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
         InputDefinition {
             port: PortDefinition {
                 name: SHOULD_NOT_FLOW_PORT.to_string(),
-                port_type: WeftType::type_var("T__should_not_flow"),
+                port_type: WeftType::port_var(weft_core::weft_type::PortSide::Input, SHOULD_NOT_FLOW_PORT),
                 required: false,
                 description: Some(
                     "Whether this node runs, read the other way round. A value here skips \
@@ -294,7 +308,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
                 declared_type: None,
             },
             accepts: Accepts::both(),
-            required_when_wired: false,
+            optional: true,
             widget: None,
             default: None,
             label: None,
@@ -425,7 +439,9 @@ pub fn enrich_collecting(
                     declared_type: None,
                 },
                 accepts: spec.effective_accepts(meta.is_compiler_read(&spec.name)),
-                required_when_wired: spec.required_when_wired,
+                // Optional in the metadata is required once wired, until
+                // the program writes otherwise.
+                optional: false,
                 // The DECLARED widget only; the type-derived default is
                 // stamped after TypeVar resolution (see the final pass),
                 // so a `T` input resolved to Image gets a file picker.
@@ -533,26 +549,32 @@ pub fn enrich_collecting(
             }
         }
 
-        // An input required only once wired has its requiredness decided
-        // by its wiring, so a header line making it required always would
-        // quietly turn "unwired: the node runs without it" into a compile
-        // error. Declaring it optional (`name?: Type`) says nothing new and
-        // stays legal.
+        // A program may make an input its node calls optional required
+        // (`x: T`) or optional even when wired (`x?: T`), but never make a
+        // required one optional: the node's code is written to need it.
         for wp in &weft_inputs {
-            if wp.required && catalog_inputs.iter().any(|cp| cp.name == wp.name && cp.required_when_wired) {
+            if !wp.required && catalog_inputs.iter().any(|cp| cp.name == wp.name && cp.required) {
                 errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
-                    "node '{}': input '{}' of node type {} is required only when wired, so its \
-                     wiring decides whether it is required; declare it `{}?` or drop it from \
-                     the node's inputs",
-                    node.id, wp.name, node.node_type, wp.name,
+                    "node '{}': input '{}' of node type {} is required, and its code needs it: \
+                     declare it `{}: {}` without `?`, or drop it from the node's inputs",
+                    node.id, wp.name, node.node_type, wp.name, wp.port_type,
                 )});
             }
         }
 
+        // SYNC: input_fits <-> packages/weft-graph/src/webview/lib/projection/header-ports.ts declarationRule
+        let input_fits = |catalog: &PortDefinition, declared: &WeftType| {
+            if WeftType::is_compatible(declared, &catalog.port_type) {
+                Ok(())
+            } else {
+                Err(format!("which does not fit in its type {}", catalog.port_type))
+            }
+        };
         let inputs = merge_ports(
             &catalog_inputs,
             &weft_inputs,
             meta.features.can_add_input_ports,
+            &input_fits,
             &node.id,
             node_span,
             node.source_file.as_deref(),
@@ -577,10 +599,14 @@ pub fn enrich_collecting(
                 )});
             }
         }
+        let output_fits = |catalog: &PortDefinition, declared: &WeftType| {
+            meta.output_declaration_fits(&catalog.name, &catalog.port_type, declared)
+        };
         let outputs = merge_ports(
             &catalog_outputs,
             &weft_outputs,
             meta.features.can_add_output_ports,
+            &output_fits,
             &node.id,
             node_span,
             node.source_file.as_deref(),
@@ -590,6 +616,25 @@ pub fn enrich_collecting(
 
         node.inputs = inputs;
         node.outputs = outputs;
+        // The node's bounds: its type's, then the ones the program wrote
+        // after the type name (`KeepFile[T: Image]`), which hold on top.
+        // A written one must bound a variable the node's ports use, which
+        // only now, with the type's own ports in, can be asked.
+        let written_params = std::mem::take(&mut node.type_params);
+        let mut used = std::collections::BTreeSet::new();
+        for ty in node.inputs.iter().map(|p| &p.port_type).chain(node.outputs.iter().map(|p| &p.port_type)) {
+            ty.collect_type_vars(&mut used);
+        }
+        if let Err(why) = weft_core::weft_type::TypeParam::check_used(&written_params, &used) {
+            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!("node '{}': {why}", node.id) });
+        }
+        node.type_params = meta.type_param_list();
+        node.type_params.extend(written_params);
+        // Each list is acyclic on its own; together they may not be
+        // (the type bounds `T` by `T2`, the program `T2` by `T`).
+        if let Err(why) = weft_core::weft_type::TypeParam::check_cycles(&node.type_params) {
+            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!("node '{}': {why}", node.id) });
+        }
         // A declared port that narrows a catalog typevar narrows it
         // EVERYWHERE on this node: `Wait(value: String)` pins the `T`
         // that `value` carries in and out, so the pass-through output
@@ -646,6 +691,14 @@ pub fn enrich_collecting(
         for group in own_one_of {
             if !node.features.one_of_required.contains(&group) {
                 node.features.one_of_required.push(group);
+            }
+        }
+        // A member of a one-of group is decided by its group: the node
+        // skips when every member closed, not when one wired member did.
+        // A member the program wrote required stays required.
+        for input in node.inputs.iter_mut() {
+            if !input.required && node.features.one_of_required.iter().any(|g| g.contains(&input.name)) {
+                input.optional = true;
             }
         }
         node.requires_infra = meta.requires_infra;
@@ -761,6 +814,10 @@ pub fn enrich_collecting(
 
     // Effective-widget stamping, AFTER TypeVar resolution so a `T` input
     // resolved to Image gets the file picker its concrete type implies.
+    // A node whose places resolve apart (`place_types`) is stamped from
+    // its own types: the widget is what the editor draws, and the editor
+    // never sees an included file's places; a widget derived from a type
+    // adds no rule the run checks (only a declared one does).
     // Declared widgets are already in place from the catalog mapping;
     // everything still blank (type-derived inputs, user-added ports,
     // form-derived inputs) fills from the RESOLVED instance type. Runs
@@ -842,8 +899,8 @@ pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
 /// (`config-type-mismatch`). Every constant is a candidate, whatever
 /// spelling wrote it; a marker's type is the type it declares (see
 /// `file_ref::literal_type`), so a file marker never looks like a
-/// String to cast. A port whose type is still open (`MustOverride`, an
-/// unbound variable) has nothing to cast toward yet.
+/// String to cast. A port whose type is still open (an unbound
+/// variable) has nothing to cast toward yet.
 fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
     for input in &node.inputs {
         if input.port_type.is_unresolved() {
@@ -871,38 +928,119 @@ fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
     }
 }
 
-fn resolve_type_vars(project: &mut ProjectDefinition) {
-    loop {
-        let mut changed = false;
+/// Whether `Empty` (the item type of an empty list or object) sits
+/// anywhere in `ty`: a type read off such a constant says nothing about
+/// what that place holds.
+fn holds_empty(ty: &WeftType) -> bool {
+    match ty {
+        WeftType::Primitive(weft_core::weft_type::WeftPrimitive::Empty) => true,
+        WeftType::List(inner) | WeftType::Dict(inner) | WeftType::Generator(inner) => holds_empty(inner),
+        WeftType::Union(members) => members.iter().any(holds_empty),
+        WeftType::Record { fields, .. } => fields.iter().any(|f| holds_empty(&f.ty)),
+        WeftType::Named { body, .. } => holds_empty(body),
+        _ => false,
+    }
+}
 
-        let snapshot: Vec<(String, String, WeftType, String, String, WeftType)> = project
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                let src_port = edge.source_handle.as_deref()?;
-                let tgt_port = edge.target_handle.as_deref()?;
-                // What the wire DELIVERS: the source port's type with
-                // the edge's path read off it. A path that does not fit
-                // binds nothing; validate names the problem.
-                let src_type = weft_core::deref::wire_source_type(project, edge)?.ok()?;
-                let tgt_type = project
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == edge.target)
-                    .and_then(|n| n.inputs.iter().find(|p| p.name == tgt_port))
-                    .map(|p| p.port_type.clone())?;
+/// Work out every type variable from what is connected, at every place
+/// a node runs. A node inside an included file runs once per site that
+/// includes it (however deep), and each place resolves its variables on
+/// its own: `blur` included once for an Image and once for a Video holds
+/// `T = Image` at one place and `T = Video` at the other. The node stays
+/// one node; where its places disagree, it carries each place's types
+/// ([`weft_core::project::NodeDefinition::place_types`]).
+fn resolve_type_vars(project: &mut ProjectDefinition) {
+    use weft_core::frames::Located;
+    let position: std::collections::HashMap<String, usize> =
+        project.nodes.iter().enumerate().map(|(at, n)| (n.id.clone(), at)).collect();
+    // Each place's own copy of what resolution changes: the port types and
+    // the type parameters, nothing else of the node.
+    let mut typed: std::collections::BTreeMap<Located, PlacePorts> = weft_core::project::selection::every_place(project)
+        .into_iter()
+        .filter_map(|at| {
+            let node = &project.nodes[*position.get(&at.id)?];
+            Some((at, PlacePorts::of(node)))
+        })
+        .collect();
+    let wires: Vec<(String, String, Vec<String>, Located, Located)> =
+        weft_core::project::selection::located_wires(project)
+            .into_iter()
+            .filter_map(|(edge, source, target)| {
                 Some((
-                    edge.source.clone(),
-                    src_port.to_string(),
-                    src_type,
-                    edge.target.clone(),
-                    tgt_port.to_string(),
-                    tgt_type,
+                    edge.source_handle.clone()?,
+                    edge.target_handle.clone()?,
+                    edge.path.clone(),
+                    source,
+                    target,
                 ))
             })
             .collect();
+    // The sibling half of a group's boundary, at the same place.
+    let sibling = |at: &Located| -> Option<Located> {
+        let boundary = project.nodes[*position.get(&at.id)?].group_boundary.as_ref()?;
+        let id = match boundary.role {
+            weft_core::project::GroupBoundaryRole::In => weft_core::project::boundary_out_id(&boundary.group_id),
+            weft_core::project::GroupBoundaryRole::Out => weft_core::project::boundary_in_id(&boundary.group_id),
+        };
+        Some(Located::new(id, at.path.clone()))
+    };
+    let substitute = |typed: &mut std::collections::BTreeMap<Located, PlacePorts>, at: &Located, var: &str, concrete: &WeftType| {
+        let mut changed = typed.get_mut(at).is_some_and(|ports| ports.substitute(var, concrete));
+        if let Some(ports) = sibling(at).and_then(|other| typed.get_mut(&other)) {
+            changed |= ports.substitute(var, concrete);
+        }
+        changed
+    };
 
-        for (src_node, _src_port, src_type, tgt_node, _tgt_port, tgt_type) in snapshot {
+    // A constant written on a port pins the variables of its type the
+    // way a wire would (`KeepFile { file: @asset("cat.png", Image) }`
+    // makes `T` an Image, so the `T` it hands out is one too): the
+    // constant IS what arrives. A value each instance or install fills
+    // later says nothing yet, and neither does an empty list or object
+    // about its items (`[]` pins no `T` in `List[T]`; a wire may still).
+    let mut literal_bindings: Vec<(Located, String, WeftType)> = Vec::new();
+    for (at, ports) in &typed {
+        let node = &project.nodes[position[&at.id]];
+        for (name, port_type) in &ports.inputs {
+            if !port_type.contains_unresolved_leaf() {
+                continue;
+            }
+            let Some(value) = node.port_literals.get(name) else { continue };
+            if weft_core::picks::fills_later(value) {
+                continue;
+            }
+            let literal = crate::file_ref::literal_type(value);
+            if !literal.contains_unresolved_leaf() {
+                let mut bindings = Vec::new();
+                collect_type_var_bindings(port_type, &literal, &mut bindings);
+                literal_bindings.extend(
+                    bindings
+                        .into_iter()
+                        .filter(|(_, ty)| !holds_empty(ty))
+                        .map(|(name, ty)| (at.clone(), name, ty)),
+                );
+            }
+        }
+    }
+    for (at, name, concrete) in &literal_bindings {
+        substitute(&mut typed, at, name, concrete);
+    }
+    loop {
+        let mut changed = false;
+        for (source_port, target_port, path, source, target) in &wires {
+            // What the wire DELIVERS: the source port's type with the
+            // edge's path read off it. A path that does not fit binds
+            // nothing; validate names the problem.
+            let Some(src_type) = typed
+                .get(source)
+                .and_then(|ports| ports.output(source_port))
+                .and_then(|ty| weft_core::deref::walk_path(ty, path).ok())
+            else {
+                continue;
+            };
+            let Some(tgt_type) = typed.get(target).and_then(|ports| ports.input(target_port)).cloned() else {
+                continue;
+            };
             // Bind typevars at ANY depth (a `List[T]` port wired to a
             // `List[Number]` binds `T = Number`), matching what the
             // validator counts as unresolved; a bare-`T`-only binder
@@ -910,22 +1048,80 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
             let mut bindings = Vec::new();
             collect_type_var_bindings(&tgt_type, &src_type, &mut bindings);
             for (name, concrete) in &bindings {
-                if substitute_type_var(project, &tgt_node, name, concrete) {
-                    changed = true;
-                }
+                changed |= substitute(&mut typed, target, name, concrete);
             }
             let mut bindings = Vec::new();
             collect_type_var_bindings(&src_type, &tgt_type, &mut bindings);
             for (name, concrete) in &bindings {
-                if substitute_type_var(project, &src_node, name, concrete) {
-                    changed = true;
-                }
+                changed |= substitute(&mut typed, source, name, concrete);
             }
         }
-
         if !changed {
             break;
         }
+    }
+
+    // Back onto the nodes: one set of types where every place agrees,
+    // and each place's where they do not.
+    let mut by_node: std::collections::HashMap<String, Vec<(Located, PlacePorts)>> = std::collections::HashMap::new();
+    for (at, ports) in typed {
+        by_node.entry(at.id.clone()).or_default().push((at, ports));
+    }
+    for node in project.nodes.iter_mut() {
+        let Some(places) = by_node.remove(&node.id) else { continue };
+        let first = &places[0].1;
+        for (input, (_, resolved)) in node.inputs.iter_mut().zip(&first.inputs) {
+            input.port_type = resolved.clone();
+        }
+        for (output, (_, resolved)) in node.outputs.iter_mut().zip(&first.outputs) {
+            output.port_type = resolved.clone();
+        }
+        node.type_params = first.type_params.clone();
+        node.place_types = if places.iter().all(|(_, ports)| ports == first) {
+            Vec::new()
+        } else {
+            places
+                .into_iter()
+                .map(|(at, ports)| weft_core::project::PlaceTypes {
+                    place: at.path,
+                    inputs: ports.inputs.into_iter().collect(),
+                    outputs: ports.outputs.into_iter().collect(),
+                    type_params: ports.type_params,
+                })
+                .collect()
+        };
+    }
+}
+
+/// One place's copy of what type resolution works out: a node's port
+/// types, in the node's port order, and its type parameters.
+#[derive(Clone, PartialEq)]
+struct PlacePorts {
+    inputs: Vec<(String, WeftType)>,
+    outputs: Vec<(String, WeftType)>,
+    type_params: Vec<weft_core::weft_type::TypeParam>,
+}
+
+impl PlacePorts {
+    fn of(node: &weft_core::project::NodeDefinition) -> Self {
+        Self {
+            inputs: node.inputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            outputs: node.outputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            type_params: node.type_params.clone(),
+        }
+    }
+
+    fn input(&self, port: &str) -> Option<&WeftType> {
+        self.inputs.iter().find(|(name, _)| name == port).map(|(_, ty)| ty)
+    }
+
+    fn output(&self, port: &str) -> Option<&WeftType> {
+        self.outputs.iter().find(|(name, _)| name == port).map(|(_, ty)| ty)
+    }
+
+    fn substitute(&mut self, var_name: &str, concrete: &WeftType) -> bool {
+        let types = self.inputs.iter_mut().chain(self.outputs.iter_mut()).map(|(_, ty)| ty);
+        substitute_in(types, &mut self.type_params, var_name, concrete)
     }
 }
 
@@ -938,6 +1134,8 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
 /// to descend one, because a declared body is concrete by
 /// construction (the registry and the wire parser both refuse a type
 /// variable inside one).
+// SYNC: collect_type_var_bindings <-> packages/weft-graph/src/webview/lib/types/index.ts collectTypeVarBindings,
+// packages/weft-graph/src/webview/lib/projection/header-ports.ts pinnedBoundProblem
 fn collect_type_var_bindings(
     port: &WeftType,
     other: &WeftType,
@@ -970,11 +1168,8 @@ fn collect_type_var_bindings(
         (WeftType::Generator(a), WeftType::Generator(b)) => {
             collect_type_var_bindings(a, b, out)
         }
-        (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => {
-            collect_type_var_bindings(ak, bk, out);
-            collect_type_var_bindings(av, bv, out);
-        }
-        (WeftType::Record(af), WeftType::Record(bf)) => {
+        (WeftType::Dict(a), WeftType::Dict(b)) => collect_type_var_bindings(a, b, out),
+        (WeftType::Record { fields: af, .. }, WeftType::Record { fields: bf, .. }) => {
             for fa in af {
                 if let Some(fb) = bf.iter().find(|f| f.name == fa.name) {
                     collect_type_var_bindings(&fa.ty, &fb.ty, out);
@@ -985,76 +1180,41 @@ fn collect_type_var_bindings(
     }
 }
 
-fn substitute_type_var(
-    project: &mut ProjectDefinition,
-    node_id: &str,
-    var_name: &str,
-    concrete: &WeftType,
-) -> bool {
-    let Some(node) = project.nodes.iter_mut().find(|n| n.id == node_id) else {
-        return false;
-    };
-    substitute_type_var_on(node, var_name, concrete)
-}
-
 /// Replace every occurrence of `var_name` on ONE node's ports, at any
 /// depth, and say whether anything moved. The single substitution
 /// step: the edge-driven fixed point above and the declared-narrowing
-/// pass in `enrich_collecting` both go through it.
+/// pass in `enrich_collecting` both go through it. A bound on the
+/// variable records what it resolved to, and every bound naming it
+/// gets it substituted, so validate holds each bound to its variable
+/// with the others already in.
 fn substitute_type_var_on(
     node: &mut weft_core::project::NodeDefinition,
     var_name: &str,
     concrete: &WeftType,
 ) -> bool {
-    let mut changed = false;
-    for input in node.inputs.iter_mut() {
-        changed |= replace_in_type(&mut input.port_type, var_name, concrete);
-    }
-    for output in node.outputs.iter_mut() {
-        changed |= replace_in_type(&mut output.port_type, var_name, concrete);
-    }
-    changed
+    let types = node.inputs.iter_mut().map(|p| &mut p.port.port_type).chain(node.outputs.iter_mut().map(|p| &mut p.port_type));
+    substitute_in(types, &mut node.type_params, var_name, concrete)
 }
 
-fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bool {
-    match ty {
-        WeftType::TypeVar(n) if n == var_name => {
-            *ty = concrete.clone();
-            true
-        }
-        WeftType::List(inner) | WeftType::Generator(inner) => {
-            replace_in_type(inner, var_name, concrete)
-        }
-        WeftType::Dict(key, val) => {
-            let a = replace_in_type(key, var_name, concrete);
-            let b = replace_in_type(val, var_name, concrete);
-            a || b
-        }
-        WeftType::Union(members) => {
-            let mut any = false;
-            for m in members.iter_mut() {
-                any |= replace_in_type(m, var_name, concrete);
-            }
-            any
-        }
-        // Substitution rewrites every shape a typevar can OCCUR in,
-        // a superset of the shapes collection binds through: collection
-        // never descends a union, but a union member's `T` is the same
-        // node-scoped variable a sibling port binds, so it must be
-        // rewritten here or the port stays half-resolved and validate
-        // reports unresolved-typevar on an edge that already
-        // determined the type. No `Named` arm: the registry refuses a
-        // declared body carrying a type variable, so an alias body
-        // never holds one.
-        WeftType::Record(fields) => {
-            let mut any = false;
-            for f in fields.iter_mut() {
-                any |= replace_in_type(&mut f.ty, var_name, concrete);
-            }
-            any
-        }
-        _ => false,
+/// The substitution step over a set of port types and the type
+/// parameters beside them.
+fn substitute_in<'a>(
+    types: impl Iterator<Item = &'a mut WeftType>,
+    type_params: &mut [weft_core::weft_type::TypeParam],
+    var_name: &str,
+    concrete: &WeftType,
+) -> bool {
+    let mut changed = false;
+    for ty in types {
+        changed |= ty.substitute_var(var_name, concrete);
     }
+    for param in type_params.iter_mut() {
+        if param.name == var_name && param.resolved.is_none() {
+            param.resolved = Some(concrete.clone());
+        }
+        param.bound.substitute_var(var_name, concrete);
+    }
+    changed
 }
 
 /// One wire arriving at a node: which of its ports it feeds, and where
@@ -1203,7 +1363,7 @@ fn created_input_ports(
             // Required unless the node type says its created inputs are
             // optional by nature, or this key carries the `?` marker.
             let required =
-                !features.optional_custom_inputs && !node.optional_ports.contains(&name);
+                !features.join && !node.optional_ports.contains(&name);
             InputDefinition::from_wire_port(PortDefinition {
                 name,
                 port_type,
@@ -1214,6 +1374,9 @@ fn created_input_ports(
                 // round-trip into the signature.
                 declared_type: None,
             })
+            // A key's `?` (or a join's branch) runs without it even when
+            // its wire closed.
+            .with_optional(!required)
         })
         .collect()
 }
@@ -1263,44 +1426,5 @@ mod binding_tests {
         let mut out = Vec::new();
         collect_type_var_bindings(&parse("T"), &feed, &mut out);
         assert!(out.is_empty(), "a whole stream never instantiates a typevar: {out:?}");
-    }
-}
-
-#[cfg(test)]
-mod substitution_tests {
-    use super::*;
-
-    fn parse(s: &str) -> WeftType {
-        weft_core::weft_type::WeftType::parse(s).expect("type parses")
-    }
-
-    /// Layer-1 invariant: substitution rewrites every shape a typevar
-    /// can occur in, so a collected binding never leaves a port
-    /// half-resolved. (No Named case: the registry refuses a declared
-    /// body carrying a type variable, so an alias body never holds
-    /// one.)
-    #[test]
-    fn substitution_rewrites_every_shape_a_typevar_can_occur_in() {
-        // A record field carrying the var.
-        let mut rec = parse("{a: T, b: String}");
-        assert!(replace_in_type(&mut rec, "T", &parse("Number")));
-        assert_eq!(rec, parse("{a: Number, b: String}"));
-
-        // A generator element carrying the var.
-        let mut gen = parse("Generator[T]");
-        assert!(replace_in_type(&mut gen, "T", &parse("Number")));
-        assert_eq!(gen, parse("Generator[Number]"));
-
-        // A union member carrying the var: collection never binds
-        // THROUGH a union, but the var is node-scoped, so a sibling
-        // port's binding must resolve it here too.
-        let mut union = parse("T | Null");
-        assert!(replace_in_type(&mut union, "T", &parse("Number")));
-        assert_eq!(union, parse("Number | Null"));
-
-        // A dict value carrying the var.
-        let mut dict = parse("Dict[String, T]");
-        assert!(replace_in_type(&mut dict, "T", &parse("Number")));
-        assert_eq!(dict, parse("Dict[String, Number]"));
     }
 }

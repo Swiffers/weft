@@ -212,6 +212,12 @@ pub fn evaluate(cond: &Condition, node: &NodeDefinition, cx: &RuleContext, custo
             Written::Unknown => None,
         },
         Condition::CustomOutputsDeclared {} => Some(!custom_outputs.is_empty()),
+        Condition::OutputTypeFits { port, within } => Some(
+            node.outputs
+                .iter()
+                .find(|output| output.name == *port)
+                .is_some_and(|output| crate::weft_type::WeftType::fits_within(&output.port_type, within)),
+        ),
         Condition::All { of } => settle(of, false, |c| evaluate(c, node, cx, custom_outputs)),
         Condition::Any { of } => settle(of, true, |c| evaluate(c, node, cx, custom_outputs)),
         Condition::Not { of } => evaluate(of, node, cx, custom_outputs).map(|b| !b),

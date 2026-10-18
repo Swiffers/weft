@@ -57,8 +57,9 @@ answer = Reply { status: 201, body: hello.name }
 ```
 
 A [route]'s fixed output ports carry the request as the gateway saw it: the
-method, the path as called, the captures, the query, the headers, and who
-the [gate] let in. Its metadata lists them.
+method, the path as called, the query, the headers, and who the [gate] let
+in. Its metadata lists them. A path capture has no fixed port: you declare an
+output of its name (below).
 
 What you DECLARE on the arrow is how the body reaches the graph, and the
 rule depends on the body shape the [route] is set to (`dataType` in the
@@ -76,16 +77,18 @@ source, "Body shape" in the editor):
 - a binary body: it is stored, and the [stored-file value] arrives on the
   one port you declare.
 
-Names can collide, and the order is fixed: a fixed port beats a body key of
-the same name, and a declared port named like a path capture reads the
-capture on every body shape. It never counts as the text or binary body's one
-port either, so a bytes or text route still reads its captures: on
-`session/preview/{view}`, `-> (view: String)` is the capture, and the body
-lands on whatever else you declare.
+Declare the capture as an output, and read it as `card.id`:
 
 ```weft
-card = Route -> (id: String) { path: "cards/{id}", method: "POST" }
+card = Route -> (id: String) { path: "cards/{id}", method: "GET" }
 ```
+
+Every output you add to a `Route` must be a capture of its path, typed
+`String`; the compiler refuses anything else with
+`route-output-not-a-capture`. A capture may not share a name with one of
+`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`,
+`caller`, `fired`): `cards/{body}` is `route-capture-shadows-output`, asking
+you to rename the capture.
 
 The first thing the program sends commits the status line. A `Reply` on a
 branch with `status: 404` works. A `Reply` or a second `Stream` after a
@@ -126,15 +129,15 @@ methods.
 
 ## Request-response
 
-The graph decides the status. A Python node reading `params` and `query`
-returns the body and the status together:
+The graph decides the status. A Python node reading the `id` capture and
+`query` returns the body and the status together:
 
 ```weft
-user = Route { path: "users/{id}", method: "GET" }
-lookup = ExecPython(params: Dict[String, String], query: Dict[String, String]) -> (body: JsonDict, status: Number) {
-  params: user.params
+user = Route -> (id: String) { path: "users/{id}", method: "GET" }
+lookup = ExecPython(uid: String, query: Dict[String, String]) -> (body: JsonDict, status: Number) {
+  uid: user.id
   query: user.query
-  code: "uid = params['id']\nif uid == '42':\n    return {'body': {'id': uid, 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
+  code: "if uid == '42':\n    return {'body': {'id': uid, 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
 }
 found = Reply { body: lookup.body, status: lookup.status }
 ```
@@ -158,10 +161,10 @@ wiring. So the shape for "do this, and if it did not work, stop here" is a
 and status already written on it, the passing case gating the rest.
 
 ```weft
-sweep = Route { path: "sweep/{what}", method: "DELETE" }
-clear = ExecPython(params: Dict[String, String]) -> (removed: Number) {
-  params: sweep.params
-  code: "return {'removed': 3 if params['what'] == 'cards' else 0}"
+sweep = Route -> (what: String) { path: "sweep/{what}", method: "DELETE" }
+clear = ExecPython(what: String) -> (removed: Number) {
+  what: sweep.what
+  code: "return {'removed': 3 if what == 'cards' else 0}"
 }
 outcome = Switch {
   value: clear.removed

@@ -1,5 +1,5 @@
-//! LlmModerate self-tests: the moderation call, a chat-model provider
-//! lending only its connection, and the flagged-category extraction.
+//! LlmModerate self-tests: the moderation call on the wired OpenAI
+//! connection, the model setting, and the flagged-category extraction.
 
 use serde_json::json;
 
@@ -10,8 +10,8 @@ use super::LlmModerateNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("flags_and_extracts_the_flagged_categories", flags),
-        NodeTest::fake("a_chat_model_provider_lends_only_its_connection", chat_model_provider),
-        NodeTest::fake("a_non_openai_provider_is_refused", wrong_kind),
+        NodeTest::fake("the_model_setting_names_the_moderation_model", model_setting),
+        NodeTest::fake("a_connection_of_another_service_is_refused", wrong_service),
         NodeTest::fake("a_result_without_a_verdict_never_passes_as_safe", missing_verdict),
         NodeTest::live("one_real_moderation_verdict", "openai", live_moderation),
     ]
@@ -22,11 +22,7 @@ async fn live_moderation(rig: LiveRig) -> WeftResult<()> {
         .run(
             &LlmModerateNode,
             json!({
-                "provider": {
-                    "kind": "openai",
-                    "model": "omni-moderation-latest",
-                    "account": rig.access("openai"),
-                },
+                "access": rig.access("openai"),
                 "text": "I brought flowers to my neighbor this morning.",
             }),
         )
@@ -36,10 +32,6 @@ async fn live_moderation(rig: LiveRig) -> WeftResult<()> {
     assert!(!flagged, "benign text is not flagged");
     assert_eq!(outcome.output("categories")?, &json!([]));
     Ok(())
-}
-
-fn provider(rig: &FakeRig, model: &str) -> serde_json::Value {
-    json!({ "kind": "openai", "model": model, "account": rig.access("openai") })
 }
 
 async fn flags(rig: FakeRig) -> WeftResult<()> {
@@ -55,7 +47,7 @@ async fn flags(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
             &LlmModerateNode,
-            json!({ "provider": provider(&rig, "omni-moderation-latest"), "text": "bad words" }),
+            json!({ "access": rig.access("openai"), "text": "bad words" }),
         )
         .await
         .ok()?;
@@ -65,7 +57,7 @@ async fn flags(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn chat_model_provider(rig: FakeRig) -> WeftResult<()> {
+async fn model_setting(rig: FakeRig) -> WeftResult<()> {
     rig.respond(
         "POST",
         "/v1/moderations",
@@ -74,7 +66,7 @@ async fn chat_model_provider(rig: FakeRig) -> WeftResult<()> {
     rig.run(
         &LlmModerateNode,
         json!({
-            "provider": provider(&rig, "gpt-4o-mini"),
+            "access": rig.access("openai"),
             "model": "text-moderation-latest",
             "text": "hi",
         }),
@@ -99,7 +91,7 @@ async fn missing_verdict(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
             &LlmModerateNode,
-            json!({ "provider": provider(&rig, "omni-moderation-latest"), "text": "hi" }),
+            json!({ "access": rig.access("openai"), "text": "hi" }),
         )
         .await;
     let err = outcome.result.expect_err("a missing verdict must refuse").to_string();
@@ -107,21 +99,12 @@ async fn missing_verdict(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn wrong_kind(rig: FakeRig) -> WeftResult<()> {
+async fn wrong_service(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
-        .run(
-            &LlmModerateNode,
-            json!({
-                "provider": {
-                    "kind": "openrouter",
-                    "model": "x",
-                    "account": rig.access("openrouter"),
-                },
-                "text": "hi",
-            }),
-        )
+        .run(&LlmModerateNode, json!({ "access": rig.access("openrouter"), "text": "hi" }))
         .await;
-    let err = outcome.result.expect_err("openrouter kind must refuse").to_string();
-    assert!(err.contains("OpenAIProvider"), "{err}");
+    let err = outcome.result.expect_err("an openrouter connection must refuse").to_string();
+    assert!(err.contains("OpenAIAccess") && err.contains("openrouter"), "{err}");
+    assert!(rig.requests().is_empty(), "refused before anything is sent");
     Ok(())
 }

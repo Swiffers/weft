@@ -15,7 +15,22 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("project_scope_copies_the_file_and_emits_the_copy", copies_into_project),
         NodeTest::fake("ttl_days_gives_the_project_copy_a_lifetime", ttl_in_project),
         NodeTest::fake("ttl_days_sets_how_long_a_kept_run_file_lives", ttl_in_run),
+        NodeTest::fake("a_video_stays_a_video_whichever_scope", video_stays_video),
     ]
+}
+
+/// The output is the input's own kind (`T: File`): a Video kept or
+/// copied comes out as a Video, which a port typed `Video` downstream
+/// takes. Held to `Video` here as such a program would declare it.
+async fn video_stays_video(rig: FakeRig) -> WeftResult<()> {
+    let video = rig.store_file("clip.mp4", "video/mp4", b"\x00\x00\x00\x18ftypmp42".to_vec());
+    rig.output_type("file", weft::WeftType::parse("Video").expect("parses"));
+    for scope in ["run", "project"] {
+        let outcome = rig.run(&KeepFileNode, json!({ "file": video.clone(), "scope": scope })).await.ok()?;
+        let out = &outcome.outputs["file"];
+        assert!(out.get("__weft_video__").is_some(), "{scope}: still a video: {out}");
+    }
+    Ok(())
 }
 
 async fn keeps(rig: FakeRig) -> WeftResult<()> {

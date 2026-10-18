@@ -211,6 +211,43 @@ pub struct LiveRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveResponse {
     pub live: crate::live::LiveFeed,
+    /// For a run's wait: the last answer it saw from outside (a poll of a
+    /// job's status), for a reader that parses it (`GetNodeState`'s
+    /// `live`). `None` before the first one, and for a kind with no answer
+    /// to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<LastAnswer>,
+}
+
+/// What a run's wait keeps of the last answer it saw from outside: the
+/// answer as it came, unparsed, or only its size when it is past what a
+/// wait keeps, so a reader is told it is missing rather than handed part
+/// of it or nothing. A program reads it through `crate::program::NodeState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LastAnswer {
+    Kept(String),
+    /// Its size in bytes.
+    TooLarge(u64),
+}
+
+/// Body for `POST /cancel_call` on the listener: send the last call of a
+/// wait whose run was cancelled (`crate::signal::cancel_call`). The wait's
+/// row is gone by now (the cancel took it down), so everything the call
+/// needs rides here: the spec carries the call and the connection it is
+/// sent as.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelCallRequest {
+    /// The token the wait was registered under. The broker answers where
+    /// an infra address in the call is reached for it while the call is
+    /// queued.
+    pub token: String,
+    pub tenant_id: String,
+    /// Whose run waited, when it was an instance's: its connection is
+    /// read through that instance's alone, as the wait's polls were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_instance: Option<crate::instance::InstanceScope>,
+    pub spec: SignalSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +449,21 @@ mod tests {
         let back: StartRequest =
             serde_json::from_value(serde_json::json!({ "token": "t", "mode": "restore" })).unwrap();
         assert_eq!(back.mode, StartMode::Restore);
+    }
+
+    /// A cancel call carries the wait's whole spec across: the call
+    /// itself and the connection it is sent as, since the row is gone.
+    #[test]
+    fn a_cancel_call_request_carries_the_call_and_its_connection() {
+        let mut spec = SignalSpec::of_kind("poll_endpoint", serde_json::json!({ "url": "https://x/status" }));
+        spec.access = Some(crate::primitive::AccessRef { id: "a1".into(), service: "fal".into(), required_values: Vec::new() });
+        spec.on_cancel = Some(crate::signal::CancelCall::put("https://x/cancel"));
+        let req = CancelCallRequest { token: "t".into(), tenant_id: "acme".into(), for_instance: None, spec };
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["spec"]["onCancel"], serde_json::json!({ "url": "https://x/cancel", "method": "put" }));
+        let back: CancelCallRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.spec.on_cancel, Some(crate::signal::CancelCall::put("https://x/cancel")));
+        assert_eq!(back.spec.access.map(|a| a.id), Some("a1".to_string()));
     }
 
     /// `ProcessTarget` is serialized over the fire path; every variant

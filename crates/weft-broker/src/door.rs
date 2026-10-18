@@ -394,10 +394,23 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_co
     // before it let go, goes on its record now, and the run is queued to
     // carry on with it.
     let resolved = weft_journal::record::resolve_handed_in(&mut tx, run_id, &locked, worker.replica).await?;
-    if why == LetGo::HandedBack && !resolved {
-        weft_journal::record::notify_queued_in(&mut tx, worker.project).await?;
+    match why {
+        LetGo::HandedBack if !resolved => weft_journal::record::notify_queued_in(&mut tx, worker.project).await?,
+        // Parked for good, not queued again at once with an answer it was
+        // handed: whoever follows the run hears that it now waits (`weft
+        // wait --waiting-for-input`), which no record row would tell them.
+        LetGo::Parked if !resolved => notify_parked_in(&mut tx, worker.project, run_id).await?,
+        LetGo::HandedBack | LetGo::Parked => {}
     }
     tx.commit().await?;
     weft_task_store::announce::committed(pool);
     Ok(true)
+}
+
+/// Announce on the caller's transaction that `run_id` of `project` parked
+/// (`DispatcherEvent::RunParked`), so it is heard only if the park
+/// commits. Every dispatcher pushes it to whoever follows the project.
+async fn notify_parked_in(conn: &mut sqlx::PgConnection, project: uuid::Uuid, run_id: weft_core::RunId) -> anyhow::Result<()> {
+    let parked = weft_core::live_event::DispatcherEvent::RunParked { run_id, project_id: project };
+    weft_task_store::runs::announce_event(conn, &weft_core::live_event::IdentifiedEvent::transient(parked)).await
 }

@@ -44,7 +44,7 @@
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { canBePerInstance, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
+	import { bodyFeedOf, canBePerInstance, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -2166,14 +2166,15 @@
 					// read: node ids come off the wire, and a node literally named
 					// 'constructor' would otherwise resolve a prototype function
 					// as its display.
-					const bodyFeed = nodeHasDisplay({
-						nodeType,
-						requiresInfra: n.data.requiresInfra as boolean | undefined,
-						features: n.data.features as
-							{ isTrigger?: boolean; liveEndpoint?: string } | undefined,
-					})
-						? ownValue(ctx.displayByNode, n.id)
-						: undefined;
+					const bodyFeed = bodyFeedOf(
+						{
+							nodeType,
+							requiresInfra: n.data.requiresInfra as boolean | undefined,
+							features: n.data.features as
+								{ isTrigger?: boolean; liveEndpoint?: string } | undefined,
+						},
+						ownValue(ctx.displayByNode, n.id),
+					);
 
 					// Subgraph highlight wins the class slot while active; the
 					// run-status class paints otherwise.

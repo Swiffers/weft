@@ -2034,8 +2034,8 @@ pub enum Condition {
 
 /// What the names of an `input_names` condition name, and what each
 /// must be: `{"node": {"role": "infra", "perInstance": true}}` or
-/// `{"field": {"instanceFilled": true}}`. Each narrowing is optional
-/// (`{"node": {}}` is any node).
+/// `{"field": {"instanceFilled": true}}`, or `{"state": {}}`. Each
+/// narrowing is optional (`{"node": {}}` is any node).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Named {
@@ -2054,6 +2054,10 @@ pub enum Named {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance_filled: Option<bool>,
     },
+    /// A place whose state a run can tell (`GetNodeState`): a node
+    /// outside every loop, or a loop
+    /// (`crate::project::selection::state_place`).
+    State {},
 }
 
 /// What kind of node `input_names` with `{"node": {"role": ..}}` requires.

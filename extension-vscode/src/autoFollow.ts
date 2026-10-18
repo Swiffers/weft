@@ -178,6 +178,9 @@ export class AutoFollowController {
       // A deleted run was preserved state until now (a run parked on a
       // question counts), so the verb set moves with it.
       ev.kind === 'run_deleted' ||
+      // A parked run reads waiting from here on, and the status's
+      // running set leaves waiting runs out.
+      ev.kind === 'run_parked' ||
       ev.kind === 'infra_status_changed' ||
       ev.kind === 'infra_flaky' ||
       ev.kind === 'infra_recovered' ||

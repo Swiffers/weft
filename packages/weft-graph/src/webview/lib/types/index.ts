@@ -75,7 +75,7 @@ export function bareRecord<T>(...sources: (Record<string, T> | undefined)[]): Re
  *  objects carry `Object.prototype`, so a key literally named
  *  'constructor' or 'toString' (a legal weft identifier) would
  *  otherwise resolve a prototype function instead of `undefined`. */
-export function ownValue(record: Record<string, unknown> | undefined, key: string): unknown {
+export function ownValue<T>(record: Record<string, T> | undefined, key: string): T | undefined {
 	if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return undefined;
 	return record[key];
 }

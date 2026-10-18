@@ -100,6 +100,12 @@ async fn generates(rig: FakeRig) -> WeftResult<()> {
             weft::signal::Predicate::neq("status", "IN_PROGRESS"),
         ]
     );
+    // Cancelling the run cancels the request on fal, at the app's route
+    // like the status.
+    assert_eq!(
+        awaited[0].on_cancel,
+        Some(weft::signal::CancelCall::put("https://queue.fal.run/fal-ai/flux/requests/req-1/cancel"))
+    );
     Ok(())
 }
 

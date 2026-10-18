@@ -955,6 +955,104 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool)
     assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
 }
 
+/// A cancel queues the last call of each wait that carries one, in its own
+/// commit: one `cancel_call` task per wait, carrying the call and the
+/// connection it is sent as, deduplicated on the wait, and none for a wait
+/// that carries no call.
+#[sqlx::test]
+async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let run = queued_run(&journal, id).await;
+    sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(run).execute(&pool).await.unwrap();
+    seed_wait(&journal, "tok-plain", id, run).await;
+    let mut calling = entry_signal("tok-calling", id);
+    calling.node_id = "render".into();
+    calling.is_resume = true;
+    calling.run_id = Some(run);
+    let mut spec = weft_core::primitive::SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://queue.example/requests/7/status" }));
+    spec.on_cancel = Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel"));
+    calling.spec_json = serde_json::to_string(&spec).unwrap();
+    journal.signal_insert(&calling).await.expect("seed the wait with a last call");
+
+    let written = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    assert_eq!((written.removed.len(), written.cancel_calls), (2, 1));
+    let tasks: Vec<(String, Option<String>, Option<Uuid>, serde_json::Value)> =
+        sqlx::query_as("SELECT kind, dedup_key, run_id, payload FROM task WHERE kind = 'cancel_call'").fetch_all(&pool).await.unwrap();
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    let (_, dedup, task_run, payload) = &tasks[0];
+    assert_eq!(dedup.as_deref(), Some(weft_task_store::kinds::cancel_call_key("tok-calling").as_str()));
+    assert_eq!(*task_run, Some(run));
+    let call: weft_core::signal::listener_protocol::CancelCallRequest = serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(call.token, "tok-calling");
+    assert_eq!(call.spec.on_cancel, Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel")));
+
+    let again = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    assert_eq!((again.removed.len(), again.cancel_calls), (0, 0), "the waits went with the first cancel");
+
+    // A run a worker drives, asked to cancel while one of its nodes was
+    // still registering its wait: the wait lands after the cancel, and
+    // the removal at the run's ending sends its call all the same.
+    let driven = queued_run(&journal, id).await;
+    claim(&pool, driven, id, "worker-a").await;
+    assert!(journal.cancel_run(driven, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    let mut late = calling.clone();
+    late.token = "tok-late".into();
+    late.run_id = Some(driven);
+    journal.signal_insert(&late).await.expect("a wait registered after the cancel");
+    // Its worker saw the cancel and ended the run so.
+    sqlx::query("UPDATE run SET state = 'ended', outcome = 'cancelled', owner = NULL WHERE run_id = $1").bind(driven).execute(&pool).await.unwrap();
+    // As `run_ends` calls it: holding the run's row in a transaction of its
+    // own, so the removal must not wait on that row.
+    let mut holding = pool.begin().await.unwrap();
+    weft_journal::record::lock_in(&mut holding, driven).await.unwrap();
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(10), journal.signal_remove_for_run_id(driven))
+        .await
+        .expect("the removal never waits on the run's row")
+        .unwrap();
+    holding.commit().await.unwrap();
+    assert_eq!(removed.len(), 1);
+    let queued: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT dedup_key FROM task WHERE kind = 'cancel_call' AND run_id = $1").bind(driven).fetch_all(&pool).await.unwrap();
+    assert_eq!(queued, vec![Some(weft_task_store::kinds::cancel_call_key("tok-late"))]);
+
+    // A run that ended any other way takes its waits down without a call,
+    // even one asked to cancel that finished before its worker saw it.
+    let finished = queued_run(&journal, id).await;
+    let mut kept = calling.clone();
+    kept.token = "tok-kept".into();
+    kept.run_id = Some(finished);
+    journal.signal_insert(&kept).await.expect("a wait of a run that ends on its own");
+    sqlx::query("UPDATE run SET state = 'ended', outcome = 'completed', cancel_requested = '\"user\"'::jsonb WHERE run_id = $1")
+        .bind(finished)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(journal.signal_remove_for_run_id(finished).await.unwrap().len(), 1);
+    let none: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE kind = 'cancel_call' AND run_id = $1").bind(finished).fetch_one(&pool).await.unwrap();
+    assert_eq!(none, 0);
+
+    // Removing the project cuts short a run whose worker never wrote the
+    // cancel: its wait goes with the project, and its call is queued and
+    // kept with it.
+    let cut = queued_run(&journal, id).await;
+    claim(&pool, cut, id, "worker-b").await;
+    assert!(journal.cancel_run(cut, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    let mut stranded = calling.clone();
+    stranded.token = "tok-stranded".into();
+    stranded.run_id = Some(cut);
+    journal.signal_insert(&stranded).await.expect("a wait registered after the cancel");
+    projects.remove(id).await.unwrap().expect("the project was there");
+    let kept: Vec<Option<String>> = sqlx::query_scalar("SELECT dedup_key FROM task WHERE kind = 'cancel_call' ORDER BY dedup_key")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(kept.contains(&Some(weft_task_store::kinds::cancel_call_key("tok-stranded"))), "{kept:?}");
+    assert!(kept.contains(&Some(weft_task_store::kinds::cancel_call_key("tok-calling"))), "a queued call outlives the project: {kept:?}");
+    assert!(!kept.contains(&Some(weft_task_store::kinds::cancel_call_key("tok-kept"))), "{kept:?}");
+}
+
 /// A charge an earlier drive opened and no response priced is booked
 /// unknown when the dispatcher cancels the parked run: one `CostReported`
 /// closing it, before the ending, in the same write.

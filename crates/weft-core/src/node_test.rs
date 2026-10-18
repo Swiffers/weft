@@ -521,6 +521,10 @@ pub struct RigOutcome {
     /// The declared infrastructure, on a `run_provision_infra`
     /// outcome. `None` on the ctx-driven verbs (run / setup_trigger).
     pub infra_spec: Option<crate::infra::InfraSpec>,
+    /// The run id the body's ctx carried (`ctx.run_id`), minted fresh for
+    /// each run; `None` when no body ran with a ctx (`run_provision_infra`,
+    /// or inputs refused before the body).
+    pub run_id: Option<crate::RunId>,
 }
 
 impl RigOutcome {
@@ -1455,11 +1459,12 @@ impl FakeRig {
         let (handle, ctx, _feeds_alive) = match self.build_ctx(node, RUN_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
+        let run_id = ctx.run_id;
         let result = node.run(ctx).await;
-        handle.into_outcome(result)
+        RigOutcome { run_id: Some(run_id), ..handle.into_outcome(result) }
     }
 
     /// Run an infra node's `provision_infra` body with throwaway
@@ -1471,6 +1476,7 @@ impl FakeRig {
             outputs: Default::default(),
             closed_ports: Vec::new(),
             infra_spec: None,
+            run_id: None,
         };
         // Keeps the run's generator feeds registered (see `run`).
         let (bag, _feeds_alive) = match manifest_input_bag(node.manifest(), &self.state.input_types.lock().unwrap(), inputs) {
@@ -1495,11 +1501,12 @@ impl FakeRig {
         let (handle, ctx, _feeds_alive) = match self.build_ctx(node, SETUP_TRIGGER_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
+        let run_id = ctx.run_id;
         let result = node.setup_trigger(ctx).await;
-        handle.into_outcome(result)
+        RigOutcome { run_id: Some(run_id), ..handle.into_outcome(result) }
     }
 
     /// The journal a body of `node` replays and records: what
@@ -2133,6 +2140,7 @@ impl Capture {
             outputs,
             closed_ports: self.closed_ports.into_inner().unwrap(),
             infra_spec: None,
+            run_id: None,
         }
     }
 }
@@ -3222,7 +3230,7 @@ impl LiveRig {
         let (bag, _feeds_alive) = match manifest_input_bag(manifest, &custom, inputs) {
             Ok(pair) => pair,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
         let has_generator_input = manifest.has_generator_input();
@@ -3232,7 +3240,7 @@ impl LiveRig {
         let config = match bag.object() {
             Ok(obj) => Value::Object(obj.clone()),
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
         let mut outputs_by_name = declared_output_map(manifest, &config);
@@ -3246,7 +3254,7 @@ impl LiveRig {
         ) {
             Ok(handle) => handle,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
         let handle = Arc::new(CapturingHandle {
@@ -3259,8 +3267,9 @@ impl LiveRig {
             declared_inputs: declared_input_map(manifest, &custom),
         });
         let ctx = test_context(manifest, bag, None, handle.clone());
+        let run_id = ctx.run_id;
         let result = node.run(ctx).await;
-        CaptureBox::Live(handle).into_outcome(result)
+        RigOutcome { run_id: Some(run_id), ..CaptureBox::Live(handle).into_outcome(result) }
     }
 }
 

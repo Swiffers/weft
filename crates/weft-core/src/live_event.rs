@@ -100,6 +100,15 @@ pub enum DispatcherEvent {
     /// lists and re-reads the project's verbs, because a run parked on
     /// a question counted as preserved state until now.
     RunDeleted { run_id: RunId, project_id: uuid::Uuid },
+    /// The run parked: every firing still open waits on a signal (a
+    /// person, an outside job, a timer), and no worker drives it until an
+    /// answer comes. Its listing reads `waiting_for_input` from here on.
+    /// Rides NOTIFY like `RunDeleted`: parking writes no record row
+    /// (`weft_broker::door::let_go` publishes it in the transaction that
+    /// parks the run). A run's replay ends with it when the run is parked
+    /// at the time of the read, which is where it stands rather than a
+    /// moment of its history.
+    RunParked { run_id: RunId, project_id: uuid::Uuid },
     /// Every node event carries `inherited_from` when the firing was
     /// not this run's own but taken from the run it was seeded from
     /// (`weft run --seed`): the row is the seed's, painted here so the
@@ -383,6 +392,7 @@ impl DispatcherEvent {
             | Self::RunCancelled { project_id, .. }
             | Self::RunTagged { project_id, .. }
             | Self::RunDeleted { project_id, .. }
+            | Self::RunParked { project_id, .. }
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
@@ -442,6 +452,7 @@ impl DispatcherEvent {
             | Self::RunCancelled { .. }
             | Self::RunTagged { .. }
             | Self::RunDeleted { .. }
+            | Self::RunParked { .. }
             | Self::LoopInstantiated { .. }
             | Self::LoopIterationLaunched { .. }
             | Self::LoopOutFired { .. }
@@ -486,6 +497,7 @@ impl DispatcherEvent {
             | Self::RunCancelled { run_id, .. }
             | Self::RunTagged { run_id, .. }
             | Self::RunDeleted { run_id, .. }
+            | Self::RunParked { run_id, .. }
             | Self::NodeStarted { run_id, .. }
             | Self::NodeSuspended { run_id, .. }
             | Self::NodeResumed { run_id, .. }

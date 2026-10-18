@@ -1328,8 +1328,8 @@ export type LiveDataType = (typeof LIVE_DATA_TYPES)[number];
 /// One line of a node's display: what it shows about itself while it
 /// runs. Two things produce one, and both serve it on `GET /live` in
 /// this shape: an infra node's own container, and the listener kind
-/// holding a trigger's signal. One channel (`nodeDisplay`) carries
-/// both, keyed by node id.
+/// holding a signal (a trigger's, or a wait's in a run). One channel
+/// (`nodeDisplay`) carries all of them, keyed by node id.
 // SYNC: LiveDataItem <-> crates/weft-core/src/live.rs LiveItem, crates/weft-e2e/src/display.rs
 export interface LiveDataItem {
   /// - `text`: plain copyable string in a code-style box.
@@ -1987,8 +1987,9 @@ export type HostMessage =
   /// behind a collapsed disclosure.
   | { kind: 'journalCorruption'; site: CorruptionSite; reason: string }
   /// What one node is showing, off its `/live`: the container's for an
-  /// infra node, the listener kind's for a trigger. Routed to that
-  /// node's body panel.
+  /// infra node, the listener kind's for a trigger, and for any other
+  /// node the listener kind's holding its wait in the followed run.
+  /// Routed to that node's body panel.
   | ({ kind: 'nodeDisplay'; nodeId: string } & NodeFeedState)
   | { kind: 'followStatus'; status: FollowStatus }
   /// The live run SSE stream ended or broke before the

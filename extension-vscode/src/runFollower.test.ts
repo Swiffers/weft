@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DispatcherClient } from './dispatcher';
-import { RunFollower, MAX_REPLAY_BUFFER_BYTES, type DispatcherEvent } from './runFollower';
+import { RunFollower, MAX_REPLAY_BUFFER_BYTES, type DispatcherEvent, type LiveRun } from './runFollower';
 import type { HostMessage } from '../../packages/weft-graph/src/protocol';
 import type { LivePause } from './presence';
 
@@ -208,5 +208,79 @@ describe('pausing while the person is away', () => {
     pause.set(true);
     pause.set(false);
     expect(client.subscriptions).toHaveLength(1);
+  });
+});
+
+describe('which followed run has not ended', () => {
+  const live: LiveRun = { runId: 'a', projectId: 'p' };
+
+  function ended(runId: string): DispatcherEvent {
+    return { eventId: `event:end:${runId}`, kind: 'run_completed', runId, projectId: 'p', outputs: {}, atUnix: 2 };
+  }
+
+  /** Follow `runId` with `history` as its replay, recording what the
+   *  live-run listeners hear. */
+  async function follow(history: DispatcherEvent[]) {
+    const r = rig();
+    const heard: Array<LiveRun | undefined> = [];
+    r.follower.onLiveRun((run) => heard.push(run));
+    const following = r.follower.replay('a');
+    r.client.subscriptions[0].handlers.onOpen?.();
+    await Promise.resolve();
+    expect(heard).toEqual([]);
+    r.client.reads[0].resolve(history);
+    await following;
+    return { ...r, heard };
+  }
+
+  it('names a run once its history is applied, and drops it when the run ends', async () => {
+    const { client, follower, heard } = await follow([completed('n')]);
+    expect(heard).toEqual([live]);
+    client.subscriptions[0].send(JSON.stringify(ended('a')));
+    expect(heard).toEqual([live, undefined]);
+    follower.stop();
+    expect(heard).toEqual([live, undefined]);
+  });
+
+  it('names a run whose history held no event once a live one says its project', async () => {
+    const { client, follower, heard } = await follow([]);
+    expect(heard).toEqual([]);
+    client.subscriptions[0].send(JSON.stringify(completed('n')));
+    expect(heard).toEqual([live]);
+    follower.stop();
+  });
+
+  it('never names a run whose history already holds its end', async () => {
+    const { follower, heard } = await follow([completed('n'), ended('a')]);
+    expect(heard).toEqual([]);
+    follower.stop();
+  });
+
+  it('drops the run when the follow is lost or stopped', async () => {
+    const lost = await follow([completed('n')]);
+    lost.client.subscriptions[0].handlers.onClosed?.();
+    expect(lost.heard).toEqual([live, undefined]);
+    const stopped = await follow([completed('n')]);
+    stopped.follower.stop();
+    expect(stopped.heard).toEqual([live, undefined]);
+  });
+
+  it('drops the run the moment another one is followed', async () => {
+    const { client, follower, heard } = await follow([completed('n')]);
+    void follower.replay('b');
+    expect(heard).toEqual([live, undefined]);
+    client.subscriptions[1].handlers.onOpen?.();
+    await Promise.resolve();
+    expect(heard).toEqual([live, undefined]);
+    follower.stop();
+  });
+
+  it('paints nothing for a parked run', async () => {
+    const { client, follower, posted, heard } = await follow([completed('n')]);
+    const before = posted.length;
+    client.subscriptions[0].send(JSON.stringify({ eventId: 'live:1', kind: 'run_parked', runId: 'a', projectId: 'p' }));
+    expect(posted).toHaveLength(before);
+    expect(heard).toEqual([live]);
+    follower.stop();
   });
 });

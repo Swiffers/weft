@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use weft::storage::{StorageScope, StoredFile};
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult, WeftType};
 
+use minillmlib::Reasoning;
+
 use super::super::call::{empty_reply_message, reasoning_config};
 use super::super::chat::{answer_unanswered_tool_calls, auto_cache_marks, has_cache_mark, UNANSWERED_TOOL_CALL};
 use super::LlmInferenceNode;
@@ -21,7 +23,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("a_tool_call_left_unanswered_is_answered_cancelled", unanswered_tool_calls),
         NodeTest::fake("a_stopped_tool_round_sends_a_whole_conversation_and_saves_no_synthetic_answer", unanswered_on_the_wire),
         NodeTest::fake("reasoning_off_sends_none", reasoning_off_on_the_wire),
-        NodeTest::fake("unwritten_params_are_off_and_send_no_max_tokens", unset_sends_nothing),
+        NodeTest::fake("unwritten_params_send_nothing", unset_sends_nothing),
         NodeTest::fake("a_refused_reasoning_off_says_what_to_change", reasoning_refused),
         NodeTest::fake("a_server_error_mentioning_reasoning_stays_catchable", reasoning_transient),
         NodeTest::fake("auto_cache_tracks_each_request_without_marking_saved_history", auto_cache_on_the_wire),
@@ -46,9 +48,10 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 fn reasoning_states() -> WeftResult<()> {
-    assert_eq!(reasoning_config(false, Some("high")).effort.as_deref(), Some("none"), "off is off, whatever effort sits beside it");
-    assert_eq!(reasoning_config(true, None).effort.as_deref(), Some("low"), "on with no effort picked is the cheap one");
-    assert_eq!(reasoning_config(true, Some("high")).effort.as_deref(), Some("high"));
+    assert_eq!(reasoning_config(None, Some("high")), None, "unset sends nothing, whatever effort sits beside it");
+    assert_eq!(reasoning_config(Some(false), Some("high")), Some(Reasoning::Off), "off is off, whatever effort sits beside it");
+    assert_eq!(reasoning_config(Some(true), None), Some(Reasoning::On(None)), "on with no effort picked is the provider's lowest");
+    assert_eq!(reasoning_config(Some(true), Some("high")), Some(Reasoning::On(Some("high".to_string()))));
     Ok(())
 }
 
@@ -167,9 +170,10 @@ async fn unset_sends_nothing(rig: FakeRig) -> WeftResult<()> {
     let sent = rig.requests();
     let unset = sent[0].body.as_ref().expect("body");
     assert!(unset.get("max_completion_tokens").is_none(), "no maxTokens, none sent: {unset}");
-    // Nothing written for `reasoning` is the same state as off: no model
-    // runs at a default nobody wrote down.
-    assert_eq!(unset["reasoning"]["effort"], json!("none"), "unwritten reasoning is off: {unset}");
+    assert!(unset.get("temperature").is_none(), "no temperature, none sent: {unset}");
+    // Nothing written for `reasoning` sends nothing: the provider's own
+    // default applies, as for every other setting.
+    assert!(unset.get("reasoning").is_none(), "unwritten reasoning sends nothing: {unset}");
     Ok(())
 }
 

@@ -16,7 +16,7 @@
 
 use minillmlib::{
     ChatNode, CompletionParameters, GeneratorInfo, Message, MiniLLMError, NodeCompletionParameters,
-    ProviderSettings, ReasoningConfig, ToolChoice, ToolDefinition,
+    OpenRouterRouting, Reasoning, ToolChoice, ToolDefinition,
 };
 use serde_json::Value;
 
@@ -56,14 +56,14 @@ pub struct LlmCall {
     /// closing the connection). Decides whether a missing finish
     /// reason is proof of truncation.
     announces_finish: bool,
-    /// Reasoning is off (the default): a provider refusing the call is
-    /// then most likely refusing to switch reasoning off, and the
-    /// error says what to change.
+    /// Reasoning was set off: a provider refusing the call is then most
+    /// likely refusing to switch reasoning off, and the error says what
+    /// to change.
     reasoning_off: bool,
 }
 
 impl LlmCall {
-    /// The error a failed call surfaces. With reasoning off, a provider
+    /// The error a failed call surfaces. With reasoning set off, a provider
     /// REFUSING the request (a client error: 4xx other than 408 and 429,
     /// which are transient) whose message is about reasoning is told in
     /// the author's terms: the model always reasons, so the switch has to
@@ -75,7 +75,7 @@ impl LlmCall {
         if self.reasoning_off && refuses_reasoning_off(&err) {
             return WeftError::Config(format!(
                 "llm: {err}. This model always reasons; set `reasoning: true` on its params \
-                 (low effort unless you pick one)"
+                 (the provider's lowest effort unless you pick one)"
             ));
         }
         weft::node_error(format!("llm: {err}"))
@@ -83,11 +83,11 @@ impl LlmCall {
 }
 
 /// Whether `err` is the provider refusing the request over reasoning:
-/// an API error carrying a client status (the lib unwraps to the last
-/// attempt when it retried) whose provider message names reasoning.
+/// an API error carrying a client status whose provider message names
+/// reasoning. weft never asks the lib to retry, so the error is the
+/// provider's own answer.
 fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
     match err {
-        MiniLLMError::MaxRetriesExceeded(last) => refuses_reasoning_off(last),
         MiniLLMError::Api { status, message } => {
             (400..500).contains(status)
                 && *status != 408
@@ -128,15 +128,6 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     // here ALL auth is the connection's, so the generator's own auth is
     // cleared explicitly rather than relied on to be overridden.
     generator = generator.with_auth(minillmlib::Auth::None);
-    // The generator's own defaults fill every parameter the call leaves
-    // unset, and the lib's carries a `maxTokens`. weft sends one only
-    // when the author wrote it, so the provider's default applies
-    // otherwise (the native Anthropic wire, which requires the field,
-    // fills it itself).
-    generator = generator.with_default_params(CompletionParameters {
-        max_tokens: None,
-        ..CompletionParameters::default()
-    });
 
     // The connection: every provider node embeds the picked Access
     // marker in the object it emits; only a custom endpoint may run
@@ -164,35 +155,32 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     };
 
     // The `params` input carries ONE plain object (the wired LlmParams
-    // node's output); absent = every setting at its default. The lib
-    // takes the flat camelCase fields directly and skips keys it
-    // doesn't know. `reasoning` is the params node's own shape (a bool
-    // plus `reasoningEffort`), so it is removed before the lib sees the
+    // node's output); absent = every setting unset. The lib takes the
+    // flat camelCase fields directly, skips keys it doesn't know, and
+    // sends only what is set, so an unwritten setting is the provider's
+    // own default (a wire that requires `maxTokens`, the native
+    // Anthropic one, fills the model's largest output itself).
+    // `reasoning` is the params node's own shape (an optional bool plus
+    // `reasoningEffort`), so it is removed before the lib sees the
     // object.
     let params = ctx.inputs.nested("params")?;
-    let reasoning: bool = params.get_or("reasoning", false)?;
+    let reasoning: Option<bool> = params.opt("reasoning")?;
     let mut fields = params.object()?.clone();
     fields.remove("reasoning");
-    let wrote_max_tokens = fields.contains_key("maxTokens");
     let mut cp: CompletionParameters =
         serde_json::from_value(Value::Object(fields))
             .map_err(|e| WeftError::Input(format!("completion parameters: {e}")))?;
-    // The lib fills a `maxTokens` of its own for an absent key; weft
-    // sends one only when the author wrote it, so the provider's own
-    // default applies otherwise (a wire that requires the field, the
-    // native Anthropic one, fills it itself).
-    if !wrote_max_tokens {
-        cp.max_tokens = None;
-    }
     let effort: Option<String> = params.opt("reasoningEffort")?;
-    cp = cp.with_reasoning(reasoning_config(reasoning, effort.as_deref()));
-    let reasoning_off = !reasoning;
+    if let Some(reasoning) = reasoning_config(reasoning, effort.as_deref()) {
+        cp = cp.with_reasoning(reasoning);
+    }
+    let reasoning_off = reasoning == Some(false);
 
     // OpenRouter routing rides the provider object (it is a fact of
     // WHERE the call is served, not of how the model samples); the lib
     // attaches it under the request's `provider` key and other wires
     // ignore it.
-    let mut routing = ProviderSettings::new();
+    let mut routing = OpenRouterRouting::new();
     if let Some(pin) = provider.opt::<String>("servingProvider")? {
         routing = routing.with_order(vec![pin]);
     }
@@ -388,18 +376,20 @@ pub async fn finish(
     Ok(output)
 }
 
-/// What the `reasoning` checkbox sends, in its two states. Off (the
-/// default) sends effort `none`, the lib's spelling for "off", which
-/// every wire translates so that a model that is off stays off and one
-/// that cannot switch off refuses the request loudly; that refusal is
-/// the answer (see [`LlmCall::call_error`]). On sends the chosen
-/// effort, `low` when none was picked: the checkbox IS the intent to
-/// reason, and the cheap, fast effort is the one you get without
-/// asking for more. There is no third state: a model never runs at a
-/// default nobody wrote down.
-pub fn reasoning_config(reasoning: bool, effort: Option<&str>) -> ReasoningConfig {
-    let effort = if reasoning { effort.unwrap_or("low") } else { "none" };
-    ReasoningConfig { effort: Some(effort.to_string()), max_tokens: None, exclude: None }
+/// What the `reasoning` setting sends, in its three states. Unset (the
+/// default) sends nothing, so the provider's own default applies, as for
+/// every other setting. Off asks for no reasoning, which every wire
+/// translates into its own "off", so a model that is off stays off and
+/// one that cannot switch off refuses the request loudly; that refusal is
+/// the answer (see [`LlmCall::call_error`]). On sends the chosen effort as
+/// written, or the provider's lowest effort when none was picked: on IS
+/// the intent to reason, and the cheapest effort is the one you get
+/// without asking for more.
+pub fn reasoning_config(reasoning: Option<bool>, effort: Option<&str>) -> Option<Reasoning> {
+    match reasoning? {
+        false => Some(Reasoning::Off),
+        true => Some(Reasoning::On(effort.map(str::to_string))),
+    }
 }
 
 /// A reply with neither text, nor tool calls, nor media answered

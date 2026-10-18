@@ -2340,9 +2340,9 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minillmlib"
-version = "0.5.11"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56634e7ed4b9464dfa2e90e367def6d566813c3b4ea9e009b9b992d2758428"
+checksum = "f85262cc3414ba4c4c64e05a295bafe451594e06dd9d7ec8c4fcb20aa36ccd4e"
 dependencies = [
  "base64",
  "dotenvy",

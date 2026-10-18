@@ -22,19 +22,19 @@ Everything here is about the model's behaviour, which no metadata file
 can tell you: what a setting DOES to an answer, what it costs, and how
 the pieces interact across a chain of calls.
 
-## Reasoning is off unless you turn it on
+## Reasoning: unset, off or on
 
-`reasoning` on [params] has two positions: off (unset, or `false`),
-or on with the `reasoningEffort` you picked, `low` (the fast, cheap
-effort) when you picked none.
+`reasoning` on [params] has three states. Unset sends nothing, so the
+model runs at its provider's default, which for many models is to reason
+and bill for it. `false` asks for no reasoning. `true` reasons at the
+`reasoningEffort` you picked, sent as written, and at the provider's
+lowest effort (the fast, cheap one) when you picked none.
 
-- **Off** sends no reasoning request; a plain model runs as it always
-  does. A model that cannot switch reasoning off refuses on the providers
-  that spell the off position, and the failure reads ``This model always
-  reasons; set `reasoning: true` on its params (low effort unless you pick
-  one)``. On the OpenAI and Anthropic wires nothing is sent for off, so
-  such a model reasons at its own default and bills you for it: the call
-  that takes four seconds takes forty-five.
+- **Off** asks the provider for no reasoning, on every provider; a plain
+  model runs as it always does. A model that cannot switch reasoning off
+  refuses the call, and the failure reads ``This model always reasons;
+  set `reasoning: true` on its params (the provider's lowest effort
+  unless you pick one)``.
 - **On** sends the effort. A model that has no reasoning fails with its
   provider's own raw error, or ignores the setting; when the model says it
   cannot reason, you set `false`.

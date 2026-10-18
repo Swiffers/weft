@@ -347,7 +347,10 @@ when needed and ignored otherwise.
 Worker images are shared between projects, so no level of `weft rm` reclaims
 them. `weft clean --images` is what does, and `weft clean --images --all` also
 removes every older builder base, runtime and standard worker image left by
-earlier weft versions. You only need it by hand for those: the runtime already
+earlier weft versions, and the build caches of installs no longer on your
+machine, along with those an older weft made before each install had its own
+(`weft daemon remove` drops an install's caches as it goes). You
+only need it by hand for those: the runtime already
 reclaims the images no project uses each time a build registers a version
 and each time a project is removed, and on your machine also when an infra
 container stops or is replaced. A local install also holds the docker build

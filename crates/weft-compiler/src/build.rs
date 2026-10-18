@@ -626,8 +626,8 @@ pub(crate) fn stamp_mtime(dst: &Path, modified: std::time::SystemTime) {
 
 /// Stage the builder-base docker build CONTEXT into
 /// `<weft_root>/.weft-base-context/` (see [`stage_builder_base_context_at`]).
-pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
-    stage_builder_base_context_at(weft_root, &weft_root.join(worker_image::BASE_CONTEXT_DIR))
+pub fn stage_builder_base_context(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<PathBuf> {
+    stage_builder_base_context_at(weft_root, &weft_root.join(worker_image::BASE_CONTEXT_DIR), install)
 }
 
 /// Stage the builder-base docker build CONTEXT at `ctx`, holding exactly what
@@ -664,24 +664,26 @@ pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
 /// compile cache; a project compiles only the packages it edited or added
 /// and its thin top crate.
 ///
-/// The Dockerfile is RENDERED, not copied: `{{target_cache_key}}` becomes a
-/// hash of Cargo.lock + rust-toolchain.toml, so a dependency or toolchain
-/// change starts a fresh compile cache instead of inheriting (and baking into
-/// the image) every artifact ever built; `{{worker_binary}}` names the binary
+/// The Dockerfile is RENDERED, not copied: `{{target_cache_key}}` becomes
+/// [`install_cache_key`] for `install`, so another branch's install never
+/// shares the compile cache and a dependency or toolchain change starts a
+/// fresh one instead of inheriting (and baking into the image) every
+/// artifact ever built; `{{worker_binary}}` names the binary
 /// the cache sweep keeps; `{{install_build_system_packages}}` and
 /// `{{build_env_lines}}` are what the stdlib packages need to compile
 /// (`StockProject::builder_stage`), the same lines a project's builder stage
 /// would carry, which is why a project FROMing the base installs only what
 /// lies beyond them. The base hash keeps covering the SOURCE template and the
 /// packages' `deps.toml`; the rendered values are pure functions of files it
-/// already covers.
+/// already covers, but for the cache key's install, which only picks the
+/// cache a build compiles in and never what the image holds.
 ///
 /// Regenerated wholesale on every call (it is a derived artifact): a stale
 /// leftover crate from a previous closure would otherwise linger in the
 /// context and the baked image. Callers only invoke this when the
 /// content-addressed base tag is absent, so the staging cost is paid exactly
 /// once per base rebuild.
-pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileResult<PathBuf> {
+pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &weft_core::infra::Install) -> CompileResult<PathBuf> {
     if ctx.exists() {
         std::fs::remove_dir_all(ctx).map_err(CompileError::Io)?;
     }
@@ -707,7 +709,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
     let template_path = weft_root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
     let mut rendered = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
     for (token, value) in [
-        ("{{target_cache_key}}", target_cache_key(weft_root)?),
+        ("{{target_cache_key}}", install_cache_key(weft_root, install)?),
         ("{{worker_binary}}", sanitize_crate_name(WORKER_CRATE_NAME)),
         ("{{install_build_system_packages}}", install_packages),
         ("{{build_env_lines}}", env_lines),
@@ -715,7 +717,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
         if !rendered.contains(token) {
             return Err(CompileError::Build(format!(
                 "{} lost its {token} token; the base would stop keying its compile cache \
-                 on the lock + toolchain, stop sweeping it, or stop installing what the \
+                 on the install, lock and toolchain, stop sweeping it, or stop installing what the \
                  stock worker compiles with",
                 template_path.display()
             )));
@@ -738,11 +740,30 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
     Ok(ctx.to_path_buf())
 }
 
-/// The builder-base compile-cache key: a short hash of `Cargo.lock` +
-/// `rust-toolchain.toml`. Exactly the inputs whose change makes previous
-/// cache contents dead weight (new dependency versions, new toolchain);
-/// engine source edits keep the key, so they stay incremental.
-fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
+/// What the id of the builder base's compile cache mount starts with,
+/// before [`install_cache_key`]. The runtime image's has its own prefix
+/// (`weft-cargo-target-runtime-`, kept by the CLI that builds it).
+// SYNC: BUILDER_BASE_CACHE_MOUNT_ID_PREFIX <-> deploy/docker/worker-builder-base.Dockerfile (weft-builder-base-target-{{target_cache_key}})
+pub const BUILDER_BASE_CACHE_MOUNT_ID_PREFIX: &str = "weft-builder-base-target-";
+
+/// The key of a compile cache that builds weft's own crates (the builder
+/// base's, the runtime image's) for `install`: its label (`default`, or
+/// its name), then a short hash of `Cargo.lock` and `rust-toolchain.toml`,
+/// `<install>-<hash>`.
+///
+/// The install, because cargo tells a crate's sources changed by their
+/// modification times alone, and every checkout's crates sit at the same
+/// path inside the build: two branches' installs sharing one cache each
+/// find the other's newer artifacts fresh for their own older sources, and
+/// an image tagged with one branch's content carries the other's code.
+/// Each branch has an install of its own, built from its one checkout, so
+/// the install is the cache's owner too: `weft daemon remove` drops its
+/// caches, and `weft clean --images --all` those of installs no longer on
+/// the machine ([`install_of_cache_key`]). The lock and the toolchain,
+/// because their change makes everything cached dead weight (new
+/// dependency versions, new toolchain). Source edits keep the key, so they
+/// stay incremental.
+pub fn install_cache_key(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for rel in ["Cargo.lock", "rust-toolchain.toml"] {
@@ -750,12 +771,16 @@ fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
             std::fs::read(weft_root.join(rel)).map_err(CompileError::Io)?,
         );
     }
-    let digest = hasher.finalize();
-    Ok(digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+    let hash: String = hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{}-{hash}", install.label_value()))
+}
+
+/// The install (its label) a key of [`install_cache_key`] is for. `None`
+/// for a key with no install in it, made before each install had caches
+/// of its own: no install builds in one any more.
+pub fn install_of_cache_key(key: &str) -> Option<&str> {
+    // A label holds no `-` (`Install::named`), and the hash none either.
+    key.split_once('-').map(|(install, _)| install)
 }
 
 /// Recursive directory copy with a simple exclude list matched on
@@ -1136,6 +1161,28 @@ pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
 mod tests {
     use super::sanitize_crate_name;
 
+    /// Two installs on the same lock and toolchain never share a compile
+    /// cache, and each key says whose it is; an install keeps its cache
+    /// across source edits, and moves to a fresh one when its lock does.
+    #[test]
+    fn each_install_compiles_in_a_cache_of_its_own() {
+        use weft_core::infra::Install;
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(checkout.path().join("Cargo.lock"), "lock").unwrap();
+        std::fs::write(checkout.path().join("rust-toolchain.toml"), "[toolchain]\nchannel = \"1.94.0\"\n").unwrap();
+        let key = |install: &Install| super::install_cache_key(checkout.path(), install).unwrap();
+        let (deploy, main) = (Install::named("deploy").unwrap(), Install::default_install());
+        assert_ne!(key(&deploy), key(&main));
+        assert_eq!(super::install_of_cache_key(&key(&deploy)), Some("deploy"));
+        assert_eq!(super::install_of_cache_key(&key(&main)), Some("default"));
+        assert_eq!(super::install_of_cache_key("0123456789abcdef"), None, "a key from before caches had an install");
+        let before = key(&deploy);
+        std::fs::write(checkout.path().join("lib.rs"), "fn edited() {}").unwrap();
+        assert_eq!(key(&deploy), before, "a source edit keeps the cache");
+        std::fs::write(checkout.path().join("Cargo.lock"), "bumped").unwrap();
+        assert_ne!(key(&deploy), before, "a dependency change starts a fresh one");
+    }
+
     /// A platform starts the node-test image with no arguments, so the
     /// image itself must start the test server, after the worker recipe
     /// whether or not that ends its last line.
@@ -1158,7 +1205,7 @@ mod tests {
     fn the_builder_base_context_carries_the_stock_worker_and_the_stdlib() {
         let weft_root = super::resolve_weft_root().expect("resolve weft root");
         let dir = tempfile::tempdir().unwrap();
-        let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx")).expect("stage");
+        let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx"), &weft_core::infra::Install::default_install()).expect("stage");
         let crate_root = ctx.join(crate::worker_image::WARMUP_CRATE_DIR);
         let manifest = std::fs::read_to_string(crate_root.join("Cargo.toml")).unwrap();
         assert!(manifest.contains("pkg_format = { path = \"./pkg_format-"), "{manifest}");

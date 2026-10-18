@@ -385,7 +385,8 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
 
     // Where the loops run: for the life of the process, or once per tick.
     // A role that scales to zero also runs one pass as its process starts,
-    // for what came due while no process of it was up.
+    // for what came due while no process of it was up, and to give each
+    // loop that gave up one more try (`weft_task_store::drain::Pass::Start`).
     let mut first_passes: Vec<server::Tick> = Vec::new();
     let limits = if serverless {
         Some(platform::serverless_limits(&config).context("this install's platform places no role serverless")?)
@@ -394,9 +395,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     };
     for (role, l) in loops {
         if let Some(limits) = limits {
-            let run: Arc<
-                dyn Fn(weft_task_store::drain::TickBody) -> futures::future::BoxFuture<'static, Result<(), weft_task_store::drain::PassFailed>> + Send + Sync,
-            > = match l {
+            let run: server::PassRun = match l {
                 // When each loop is due lives in the database, shared by
                 // every instance of the role, since a tick may land on any.
                 Loops::Drain(loops) => {
@@ -430,16 +429,16 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     // write made while the watch is quiet would be
                     // announced to nobody.
                     let listen = signals.clone();
-                    Arc::new(move |call| {
+                    Arc::new(move |call, pass| {
                         let (loops, booking, listen) = (loops.clone(), booking.clone(), listen.clone());
                         Box::pin(async move {
-                            weft_task_store::drain::drain_due(&booking, &loops, &call, limits.tick_slice, listen.as_deref()).await
+                            weft_task_store::drain::drain_due(&booking, &loops, &call, pass, limits.tick_slice, listen.as_deref()).await
                         })
                     })
                 }
                 // The supervisor's one pass covers everything it does; its
                 // next look is booked by the broker it reports to.
-                Loops::Supervisor(state) => Arc::new(move |_call| {
+                Loops::Supervisor(state) => Arc::new(move |_call, _pass| {
                     let state = state.clone();
                     Box::pin(async move {
                         weft_infra_supervisor::tick(&state).await;
@@ -518,7 +517,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let app = public.merge(internal);
             for t in first_passes {
                 tokio::spawn(async move {
-                    if let Err(e) = t.pass(weft_task_store::drain::TickBody::default()).await {
+                    if let Err(e) = t.pass(weft_task_store::drain::TickBody::default(), weft_task_store::drain::Pass::Start).await {
                         tracing::error!(
                             target: "weft_runtime", role = %t.role, error = %format!("{e:#}"),
                             "the first pass failed; what it left runs at its loops' next wake or ring"

@@ -1102,6 +1102,18 @@ CREATE TABLE public.infra_node (
 
 
 --
+-- Name: holder_pool; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.holder_pool (
+    one boolean DEFAULT true NOT NULL,
+    copies bigint NOT NULL,
+    CONSTRAINT holder_pool_one_check CHECK (one),
+    CONSTRAINT holder_pool_pkey PRIMARY KEY (one)
+);
+
+
+--
 -- Name: infra_owner; Type: TABLE; Schema: public; Owner: -
 --
 

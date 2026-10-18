@@ -276,7 +276,8 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
             // nothing else, so the baked image (and the docker tarball)
             // carry exactly what the base hash covers. See
             // `build::stage_builder_base_context`.
-            let ctx = weft_compiler::build::stage_builder_base_context(&root)
+            let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
+            let ctx = weft_compiler::build::stage_builder_base_context(&root, &install)
                 .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
             docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[], &[]).await?;
         }
@@ -353,6 +354,16 @@ pub fn runtime_image_ref() -> Result<String> {
 const PREBUILT_CONTEXT: &str = "weft-prebuilt";
 const PREBUILT_BINARY: &str = "weft-runtime";
 
+/// The build arg naming the compile cache a runtime compiled in the image
+/// builds in: the install's own (`weft_compiler::build::install_cache_key`).
+// SYNC: TARGET_CACHE_ARG <-> deploy/docker/runtime.Dockerfile (WEFT_TARGET_CACHE)
+const TARGET_CACHE_ARG: &str = "WEFT_TARGET_CACHE";
+
+/// What the id of the runtime's compile cache mount starts with, before
+/// its [`TARGET_CACHE_ARG`].
+// SYNC: RUNTIME_CACHE_MOUNT_ID_PREFIX <-> deploy/docker/runtime.Dockerfile (weft-cargo-target-runtime-${WEFT_TARGET_CACHE})
+const RUNTIME_CACHE_MOUNT_ID_PREFIX: &str = "weft-cargo-target-runtime-";
+
 /// Make the runtime image exist locally under `image_ref`: present ->
 /// done; pull -> done; build `deploy/docker/runtime.Dockerfile`.
 /// `rebuild` skips straight to the build, for when a present image is
@@ -377,7 +388,9 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Opti
     let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(RUNTIME_DOCKERFILE);
     let Some(binary) = prebuilt else {
-        return docker_build(image_ref, &dockerfile, &root, &[], &[], &[]).await;
+        let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
+        let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the runtime's compile cache key: {e}"))?;
+        return docker_build(image_ref, &dockerfile, &root, &[], &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await;
     };
     // Its own context holding only the binary, under the name the
     // Dockerfile copies, whatever the file was called on disk.
@@ -559,6 +572,50 @@ pub struct CompileCacheRecord {
 
 /// Every worker compile cache mount on this host.
 pub async fn worker_compile_caches() -> Result<Vec<CompileCacheRecord>> {
+    Ok(compile_caches_in(&buildx_du().await?))
+}
+
+/// One BuildKit record of a cache mount that compiles weft's own crates
+/// for one install (the runtime image's, the builder base's), keyed by
+/// `weft_compiler::build::install_cache_key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallCacheRecord {
+    pub id: String,
+    /// The label of the install it is for (`default`, or its name);
+    /// `None` for a mount from before each install had caches of its own.
+    pub install: Option<String>,
+    pub size: String,
+    /// Whether BuildKit may drop it now: `false` while a build mounts it.
+    pub reclaimable: bool,
+}
+
+/// Every cache mount on this host that compiles weft's own crates for an
+/// install.
+pub async fn install_build_caches() -> Result<Vec<InstallCacheRecord>> {
+    Ok(install_caches_in(&buildx_du().await?))
+}
+
+/// Drop every cache mount compiling weft's own crates for `install`
+/// ([`install_build_caches`]): the caches of an install being taken off
+/// this machine. Each failure is said, and the call fails naming them all.
+pub async fn drop_install_build_caches(install: &weft_core::infra::Install) -> Result<()> {
+    let mut failures = Vec::new();
+    for cache in install_build_caches().await?.iter().filter(|c| c.install.as_deref() == Some(install.label_value())) {
+        if !cache.reclaimable {
+            failures.push(format!("a build mounts the compile cache {} right now; run this again once it ends", cache.id));
+            continue;
+        }
+        println!("dropping the compile cache of install '{}' ({})", install.label_value(), cache.size);
+        if let Err(error) = prune_build_record(&cache.id).await {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+/// `docker buildx du --verbose`: every BuildKit record on this host.
+async fn buildx_du() -> Result<String> {
     let output = docker().args(["buildx", "du", "--verbose"]).output().await?;
     anyhow::ensure!(
         output.status.success(),
@@ -566,7 +623,7 @@ pub async fn worker_compile_caches() -> Result<Vec<CompileCacheRecord>> {
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    Ok(compile_caches_in(&String::from_utf8_lossy(&output.stdout)))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Drop one BuildKit record by id (`docker buildx prune --filter id=`),
@@ -582,39 +639,84 @@ pub async fn prune_build_record(id: &str) -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     anyhow::ensure!(
-        worker_compile_caches().await?.iter().all(|cache| cache.id != id),
+        !buildx_du().await?.lines().filter_map(|line| line.strip_prefix("ID:")).any(|listed| listed.trim() == id),
         "docker buildx prune left record {id} in place; `docker buildx prune --all` removes it by hand"
     );
     Ok(())
 }
 
-/// The worker compile cache records in `docker buildx du --verbose`
-/// output: blank-line separated `Key: value` blocks whose description
-/// names a mount id starting with `WORKER_CACHE_MOUNT_ID_PREFIX`.
-fn compile_caches_in(du_verbose: &str) -> Vec<CompileCacheRecord> {
-    let wanted = format!("with id \"/{}", weft_compiler::worker_image::WORKER_CACHE_MOUNT_ID_PREFIX);
+/// One record of `docker buildx du --verbose` output whose description
+/// names a cache mount id starting with a prefix: what follows the prefix
+/// in the id, and the record's own fields.
+struct MountRecord<'a> {
+    id: String,
+    mount: &'a str,
+    size: String,
+    idle_days: u64,
+    reclaimable: bool,
+}
+
+/// The records of `du_verbose` (blank-line separated `Key: value` blocks)
+/// whose mount id starts with `prefix`.
+fn mount_records_in<'a>(du_verbose: &'a str, prefix: &str) -> Vec<MountRecord<'a>> {
+    let wanted = format!("with id \"/{prefix}");
     du_verbose.split("\n\n").filter_map(|record| {
         let field = |key: &str| record.lines().find_map(|line| line.strip_prefix(key)).map(str::trim);
         let description = field("Description:")?;
-        let key_start = description.find(&wanted)? + wanted.len();
+        let start = description.find(&wanted)? + wanted.len();
+        Some(MountRecord {
+            id: field("ID:")?.to_string(),
+            mount: description[start..].split('"').next()?,
+            size: field("Size:")?.to_string(),
+            idle_days: idle_days(field("Last used:").unwrap_or("")),
+            reclaimable: field("Reclaimable:") != Some("false"),
+        })
+    }).collect()
+}
+
+/// The worker compile cache records in `docker buildx du --verbose`
+/// output: those whose mount id starts with `WORKER_CACHE_MOUNT_ID_PREFIX`.
+fn compile_caches_in(du_verbose: &str) -> Vec<CompileCacheRecord> {
+    mount_records_in(du_verbose, weft_compiler::worker_image::WORKER_CACHE_MOUNT_ID_PREFIX).into_iter().map(|record| {
         // `<key>-<lane>`; the key is hex, so the first dash ends it.
-        let id = description[key_start..].split('"').next()?;
-        let (key, lane, unreadable_lane) = match id.split_once('-') {
+        let (key, lane, unreadable_lane) = match record.mount.split_once('-') {
             Some((key, suffix)) => match suffix.parse() {
                 Ok(lane) => (key.to_string(), Some(lane), None),
                 Err(_) => (key.to_string(), None, Some(suffix.to_string())),
             },
-            None => (id.to_string(), None, Some(String::new())),
+            None => (record.mount.to_string(), None, Some(String::new())),
         };
-        Some(CompileCacheRecord {
-            id: field("ID:")?.to_string(),
-            key,
-            lane,
-            unreadable_lane,
-            size: field("Size:")?.to_string(),
-            idle_days: idle_days(field("Last used:").unwrap_or("")),
-        })
+        CompileCacheRecord { id: record.id, key, lane, unreadable_lane, size: record.size, idle_days: record.idle_days }
     }).collect()
+}
+
+/// The records in `docker buildx du --verbose` output of the cache mounts
+/// that compile weft's own crates for an install: the runtime's and the
+/// builder base's, each mount id ending in its
+/// `weft_compiler::build::install_cache_key`. The runtime's mount from
+/// before it had a key at all is the prefix without its dash.
+fn install_caches_in(du_verbose: &str) -> Vec<InstallCacheRecord> {
+    let runtime = mount_records_in(du_verbose, RUNTIME_CACHE_MOUNT_ID_PREFIX.trim_end_matches('-'))
+        .into_iter()
+        .filter_map(|record| match record.mount {
+            "" => Some((record, "")),
+            mount => mount.strip_prefix('-').map(|key| (record, key)),
+        });
+    let base = mount_records_in(du_verbose, weft_compiler::build::BUILDER_BASE_CACHE_MOUNT_ID_PREFIX)
+        .into_iter()
+        .map(|record| {
+            let key = record.mount;
+            (record, key)
+        });
+    runtime
+        .chain(base)
+        .map(|(record, key)| InstallCacheRecord {
+            install: weft_compiler::build::install_of_cache_key(key).map(str::to_string),
+            id: record.id,
+            size: record.size,
+            reclaimable: record.reclaimable,
+        })
+        .collect()
 }
 
 /// Whole days in a BuildKit "Last used" phrase ("56 minutes ago", "3
@@ -653,7 +755,11 @@ pub(crate) async fn docker_build(
     // We DO want docker's layer cache: combined with the buildkit
     // cargo cache mounts the Dockerfiles declare, an unchanged crate
     // set short-circuits to seconds. Deeper source changes are
-    // caught by cargo's own fingerprinting inside the cache mount.
+    // caught by cargo's own fingerprinting inside the cache mount, which
+    // holds one install's build of weft's crates only
+    // (`weft_compiler::build::install_cache_key`), or content-keyed ones:
+    // cargo goes by modification times, which another branch's artifacts
+    // fool.
     let mut cmd = docker();
     cmd.env("DOCKER_BUILDKIT", "1")
         .args(["build", "-t", image_ref, "-f"])
@@ -930,6 +1036,34 @@ mod tests {
         assert_eq!(idle_days("3 days ago"), 3);
         assert_eq!(idle_days("2 months ago"), 60);
         assert_eq!(idle_days("Never"), 0);
+    }
+
+    /// The caches that compiled weft's own crates are read with the
+    /// install their key names, or none for a mount from before each
+    /// install had its own (the runtime's unkeyed one, a builder base's
+    /// keyed by the lock alone); a worker cache and a mount that only
+    /// starts like the runtime's are not among them.
+    #[test]
+    fn every_install_cache_is_read_with_its_install() {
+        let record = |id: &str, mount: &str, reclaimable: bool| {
+            format!("ID:           {id}\nReclaimable:  {reclaimable}\nSize:         1GB\nDescription:  cached mount /x from exec /bin/sh -c cargo build with id \"/{mount}\"\nLast used:    2 days ago\n")
+        };
+        let du = [
+            record("r1", "weft-cargo-target-runtime-gcpfixe0499b-0011223344556677", false),
+            record("r2", "weft-cargo-target-runtime", true),
+            record("r3", "weft-cargo-target-runtimes", true),
+            record("b1", "weft-builder-base-target-default-0011223344556677", true),
+            record("b2", "weft-builder-base-target-0011223344556677", true),
+            record("w1", "weft-worker-target-9af3f2c5f9da6eaa-2", true),
+        ]
+        .join("\n");
+        let read: Vec<(String, Option<String>, bool)> = install_caches_in(&du).into_iter().map(|c| (c.id, c.install, c.reclaimable)).collect();
+        assert_eq!(read, vec![
+            ("r1".to_string(), Some("gcpfixe0499b".to_string()), false),
+            ("r2".to_string(), None, true),
+            ("b1".to_string(), Some("default".to_string()), true),
+            ("b2".to_string(), None, true),
+        ]);
     }
 
     /// The ref is `<registry>/<repo>:<tag>` and drops to a bare

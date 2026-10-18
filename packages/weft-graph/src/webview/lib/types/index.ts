@@ -657,6 +657,10 @@ export interface NodeInstance {
 	// Set on an opaque `@include` node: the included `.weft` file path. The
 	// editor renders it as an expandable group that navigates into the file.
 	includePath?: string;
+	/// Set on an included file's own top-level group (the wire's
+	/// `GroupDefinition.anonymous`): it draws open until a person closes it
+	/// (`expandedOf` in `layout.ts`).
+	anonymous?: boolean;
 }
 
 // =============================================================================

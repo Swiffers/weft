@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { SvelteFlow, Controls, Background, useSvelteFlow, useUpdateNodeInternals, type Node, type Edge, type Connection, SelectionMode, ConnectionLineType, MarkerType } from "@xyflow/svelte";
+	import { SvelteFlow, Controls, Background, useSvelteFlow, useUpdateNodeInternals, type Node, type Edge, type Connection, type Viewport, type Rect, type XYPosition, type Dimensions, SelectionMode, ConnectionLineType, MarkerType } from "@xyflow/svelte";
 	import { untrack, tick, onDestroy } from "svelte";
 	import "@xyflow/svelte/dist/style.css";
 	import { browser } from "$app/environment";
@@ -13,6 +13,7 @@
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
 	import { pruneTargets, runTargetFacts } from "../../run-targets";
 	import { containerStatus } from "../../utils/container-status";
+	import { clampZoom, isOnScreen, zoomAfterCollapse, zoomAfterExpand, zoomAround, zoomFrame, MAX_ZOOM, MIN_ZOOM, ZOOM_ANIMATION_MS } from "../../utils/group-zoom";
 	import { derefKeys, derefType } from '../../utils/deref-menu';
 	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
@@ -29,7 +30,7 @@
 	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
-	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
+	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, expandedOf, expandedToWrite, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_SQUARE_PX, SIMPLIFIED_CARD_MAX_W_PX } from "../../constants/simplified-view";
 	import { Boxes } from "@lucide/svelte";
 	import { formatConfigValue } from "../../value-format";
@@ -325,7 +326,7 @@
 		return (layout) => updateLayoutEntry(layout, key,
 			node.position.x, node.position.y,
 			w, h,
-			cfg?.expanded as boolean | undefined ?? undefined,
+			expandedToWrite(cfg?.expanded as boolean | undefined, node.data as { anonymous?: boolean }),
 			cfg?.configOpen as boolean | undefined ?? undefined,
 			verb);
 	}
@@ -477,9 +478,66 @@
 		// NOTE: Do NOT set markerEnd here - it overrides individual edge settings
 	});
 
-	// Get the SvelteFlow instance for screenToFlowPosition and fitView
-	const { screenToFlowPosition, fitView, getViewport, setViewport, zoomIn, zoomOut } = useSvelteFlow();
+	// Get the SvelteFlow instance for screenToFlowPosition and the viewport
+	const { screenToFlowPosition, getViewport, setViewport } = useSvelteFlow();
 	const updateNodeInternals = useUpdateNodeInternals();
+
+	// The canvas: every viewport computation measures it, and a viewport's
+	// x/y are relative to its top-left corner.
+	let canvasEl = $state<HTMLDivElement>();
+	function canvasSize(): Dimensions | null {
+		const rect = canvasEl?.getBoundingClientRect();
+		return rect && rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : null;
+	}
+
+	// The zoom a group toggle plays, while it plays. Anything else that moves
+	// the view (the person's wheel or pointer, a fit) stops it first.
+	let groupZoomFrame: number | null = null;
+	function stopGroupZoom(): void {
+		if (groupZoomFrame !== null) {
+			cancelAnimationFrame(groupZoomFrame);
+			groupZoomFrame = null;
+		}
+	}
+	/// Spring the view from `from` to `target`'s zoom around `anchor`, one
+	/// frame at a time, so the point under the pointer stays under it all the
+	/// way (`zoomFrame`); the last frame lands on `target`.
+	function playGroupZoom(from: Viewport, anchor: XYPosition, target: Viewport): void {
+		stopGroupZoom();
+		const start = performance.now();
+		const step = (now: number) => {
+			const t = Math.min(1, (now - start) / ZOOM_ANIMATION_MS);
+			setViewport(zoomFrame(from, anchor, target.zoom, t), { duration: 0 });
+			groupZoomFrame = t < 1 ? requestAnimationFrame(step) : null;
+		};
+		groupZoomFrame = requestAnimationFrame(step);
+	}
+	/// Once a group has opened or closed and the layout has made room, zoom
+	/// so what is on screen reads (`zoomAfterExpand` / `zoomAfterCollapse`),
+	/// centered on the pointer. `viewport` is the view the layout left.
+	/// Nothing moves while the person holds the pointer, and with the pointer
+	/// outside the window there is nothing to center on.
+	function zoomForToggledGroup(group: Node, viewport: Viewport): void {
+		const canvas = canvasEl?.getBoundingClientRect();
+		const screen = canvasSize();
+		if (!canvas || !screen || !lastPointer || pointerHeld) return;
+		const mouse = { x: lastPointer.clientX - canvas.left, y: lastPointer.clientY - canvas.top };
+		const rectOf = (n: Node): Rect => ({ ...getAbsolutePosition(n), ...getNodeRect(n) });
+		// What there is to read: every drawn node, never an open box.
+		const readable = nodes.filter(n => !n.hidden && n.type !== 'group');
+		const target = group.type === 'group'
+			? zoomAfterExpand(
+				viewport, screen, rectOf(group),
+				readable.filter(n => isDescendantOf(n.id, group.id)).map(rectOf),
+				mouse,
+			)
+			: zoomAfterCollapse(
+				viewport, screen,
+				readable.map(rectOf).filter(r => isOnScreen(r, viewport, screen)),
+				mouse,
+			);
+		if (target.zoom !== viewport.zoom) playGroupZoom(viewport, mouse, target);
+	}
 
 	// Track whether Ctrl is actually pressed on the keyboard (vs synthetic from pinch)
 	let realCtrlDown = false;
@@ -496,6 +554,9 @@
 	function handleWheel(e: WheelEvent) {
 		// Skip events we redispatched ourselves (see delta-mode normalization below).
 		if ((e as WheelEvent & { __weftNormalized?: boolean }).__weftNormalized) return;
+		// The person's own zoom or scroll wins over a group toggle's zoom,
+		// whose frames would otherwise undo the pan as it goes.
+		stopGroupZoom();
 		if (e.ctrlKey || e.metaKey) {
 			e.preventDefault();
 			e.stopPropagation();
@@ -503,14 +564,10 @@
 			// Pinch: amplify aggressively. Mouse wheel: gentle.
 			const multiplier = realCtrlDown ? 0.002 : 0.03;
 			const zoomDelta = -e.deltaY * multiplier;
-			let newZoom = viewport.zoom * (1 + zoomDelta);
-			newZoom = Math.max(0.05, Math.min(2, newZoom));
+			const newZoom = clampZoom(viewport.zoom * (1 + zoomDelta));
 			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-			const mouseX = e.clientX - rect.left;
-			const mouseY = e.clientY - rect.top;
-			const newX = mouseX - (mouseX - viewport.x) * (newZoom / viewport.zoom);
-			const newY = mouseY - (mouseY - viewport.y) * (newZoom / viewport.zoom);
-			setViewport({ x: newX, y: newY, zoom: newZoom }, { duration: 0 });
+			const mouse = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+			setViewport(zoomAround(viewport, mouse, newZoom), { duration: 0 });
 			return;
 		}
 		// Normalize line/page delta modes to pixels. After a page reload or when
@@ -802,8 +859,11 @@
 			}
 
 			// Expand/collapse: run ELK, then adjust viewport so the toggled node's
-			// top-right corner stays at the same screen position (no node shifting).
+			// top-right corner stays at the same screen position (no node shifting),
+			// then, for a group, zoom so what is on screen reads.
 			if (isExpandToggle) {
+				// A zoom still playing from the last toggle would fight the pin.
+				stopGroupZoom();
 				const pinnedNodeId = nodeId;
 				// Capture the top-right corner in flow coordinates before toggle
 				const currentNode = nodes.find(n => n.id === nodeId);
@@ -831,10 +891,15 @@
 									const newAbsTopRight = { x: postAbs.x + postRect.width, y: postAbs.y };
 									// Adjust viewport so the top-right stays at the same screen position
 									const currentVp = getViewport();
-									const newVpX = oldScreenX - newAbsTopRight.x * currentVp.zoom;
-									const newVpY = oldScreenY - newAbsTopRight.y * currentVp.zoom;
-									if (Math.abs(newVpX - currentVp.x) > 1 || Math.abs(newVpY - currentVp.y) > 1) {
-										setViewport({ x: newVpX, y: newVpY, zoom: currentVp.zoom });
+									const pinned = {
+										x: oldScreenX - newAbsTopRight.x * currentVp.zoom,
+										y: oldScreenY - newAbsTopRight.y * currentVp.zoom,
+										zoom: currentVp.zoom,
+									};
+									const moves = Math.abs(pinned.x - currentVp.x) > 1 || Math.abs(pinned.y - currentVp.y) > 1;
+									if (moves) setViewport(pinned);
+									if (isContainerNodeType(postNode.data.nodeType)) {
+										zoomForToggledGroup(postNode, moves ? pinned : currentVp);
 									}
 								}
 
@@ -914,11 +979,15 @@
 				// miss the entry (read undefined -> every dim looks "changed" -> a spurious
 				// layout write + history churn on a keystroke).
 				const layoutEntry = liveNode ? parseLayoutCode(layoutCode, layoutVerb)[getLayoutKey(liveNode)] : undefined;
+				// `expanded` compares against what the node draws with, the
+				// default included: an included file's group is open with no
+				// entry written, and an edit re-sending that `expanded: true`
+				// has not changed it.
 				const persistedDim = (key: string): unknown =>
 					key === 'width' ? layoutEntry?.w
 						: key === 'height' ? layoutEntry?.h
 						: key === 'configOpen' ? layoutEntry?.configOpen
-						: layoutEntry?.expanded;
+						: expandedOf(layoutEntry?.expanded, (liveNode?.data ?? {}) as { anonymous?: boolean });
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
 					if (['width', 'height', 'expanded', 'configOpen'].includes(key)) {
@@ -1225,19 +1294,21 @@
 		// this view-state) plus the layout file produce one merged node list. The
 		// rest of buildNodes (visibility walk, sizing, the returned config) reads the
 		// merged config, and the ancestor-collapse walk sees merged `expanded` too.
+		// `expanded` is the entry's flag else the node's default (`expandedOf`),
+		// so a node with no entry yet (an included file opened for the first
+		// time) still draws in its default state.
 		// Position is applied per-node below (also from the layout entry).
-		if (layoutMap) {
-			projectNodes = projectNodes.map(n => {
-				const e = layoutMap[n.id];
-				if (!e) return n;
-				const cfg = { ...(n.config as Record<string, unknown>) };
-				if (e.w !== undefined) cfg.width = e.w;
-				if (e.h !== undefined) cfg.height = e.h;
-				if (e.expanded !== undefined) cfg.expanded = e.expanded;
-				if (e.configOpen !== undefined) cfg.configOpen = e.configOpen;
-				return { ...n, config: cfg };
-			}) as typeof projectNodes;
-		}
+		projectNodes = projectNodes.map(n => {
+			const e = layoutMap?.[n.id];
+			const expanded = expandedOf(e?.expanded, n);
+			if (!e && expanded === undefined) return n;
+			const cfg = { ...(n.config as Record<string, unknown>) };
+			if (e?.w !== undefined) cfg.width = e.w;
+			if (e?.h !== undefined) cfg.height = e.h;
+			if (expanded !== undefined) cfg.expanded = expanded;
+			if (e?.configOpen !== undefined) cfg.configOpen = e.configOpen;
+			return { ...n, config: cfg };
+		}) as typeof projectNodes;
 		// An access node with no connection picked is pinned open: the
 		// Connect button lives in the expanded body. The pin is VIEW
 		// state only, computed here and carried on node DATA, never in
@@ -1527,6 +1598,9 @@
 					pinnedOpen: pinnedIds.has(n.id),
 					placeOf,
 					includePath: (n as typeof n & { includePath?: string }).includePath,
+					// An included file's own group: what `expandedOf` reads for
+					// its default, here and when an update is checked against it.
+					anonymous: n.anonymous,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
 					onToggleGate: createGateToggleHandler(n.id),
@@ -2231,7 +2305,19 @@
 	// a check that lands waits for the release.
 	let pointerHeld = false;
 	let resizeCheckAfterRelease = false;
-	const holdPointer = () => { pointerHeld = true; };
+	// Where the pointer last was, in window coordinates: what a group toggle's
+	// zoom is centered on. Null while the pointer is outside the window (or
+	// before it first came in), so a zoom never centers on where it left.
+	let lastPointer: { clientX: number; clientY: number } | null = null;
+	const trackPointer = (e: PointerEvent) => { lastPointer = { clientX: e.clientX, clientY: e.clientY }; };
+	// `pointerout` with nothing it moved into is the pointer leaving the window.
+	const forgetPointer = (e: PointerEvent) => { if (!e.relatedTarget) lastPointer = null; };
+	const holdPointer = (e: PointerEvent) => {
+		pointerHeld = true;
+		trackPointer(e);
+		// The person took hold of the canvas: a group toggle's zoom stops where it is.
+		stopGroupZoom();
+	};
 	const releasePointer = () => {
 		pointerHeld = false;
 		if (resizeCheckAfterRelease) { resizeCheckAfterRelease = false; scheduleResizeCheck(); }
@@ -2239,10 +2325,14 @@
 	// Capture phase, so a node that stops the event from bubbling still counts.
 	$effect(() => {
 		window.addEventListener('pointerdown', holdPointer, true);
+		window.addEventListener('pointermove', trackPointer, true);
+		window.addEventListener('pointerout', forgetPointer, true);
 		window.addEventListener('pointerup', releasePointer, true);
 		window.addEventListener('pointercancel', releasePointer, true);
 		return () => {
 			window.removeEventListener('pointerdown', holdPointer, true);
+			window.removeEventListener('pointermove', trackPointer, true);
+			window.removeEventListener('pointerout', forgetPointer, true);
 			window.removeEventListener('pointerup', releasePointer, true);
 			window.removeEventListener('pointercancel', releasePointer, true);
 		};
@@ -2250,6 +2340,7 @@
 	onDestroy(() => {
 		destroyed = true;
 		if (resizeCheckTimer) { clearTimeout(resizeCheckTimer); resizeCheckTimer = null; }
+		stopGroupZoom();
 	});
 	/// Debounced so a burst of streaming updates (and the frames a resize takes to
 	/// settle) triggers one check, not dozens.
@@ -2523,7 +2614,9 @@
 	}
 
 	/// The drawn expanded state: the unconnected-access pin wins, then
-	/// config, else collapsed (containers too: every group and loop starts closed). THE one rule for every sizing
+	/// config, which `buildNodes` filled from the layout entry or the node's
+	/// default (`expandedOf`: closed, except an included file's own group),
+	/// else collapsed. THE one rule for every sizing
 	/// and containment reader, so no path can draw a pinned node
 	/// collapsed under its open body (ProjectNode's render derived is
 	/// the same expression over `data.pinnedOpen`).
@@ -2562,35 +2655,18 @@
 
 
 	function doFitView(padding = 0.2) {
-		const flowContainer = document.querySelector('.svelte-flow');
-		if (!flowContainer) return;
-		const rect = flowContainer.getBoundingClientRect();
-		const containerW = rect.width;
-		const containerH = rect.height;
-		if (containerW === 0 || containerH === 0) return;
+		const screen = canvasSize();
+		if (!screen) return;
+		const containerW = screen.width;
+		const containerH = screen.height;
 
 		// Compute bounding box of visible, measured nodes (using absolute positions)
 		const visibleNodes = nodes.filter(n => !n.hidden && n.measured?.width && n.measured?.height);
 		if (visibleNodes.length === 0) return;
 
-		// For child nodes, compute absolute position by walking up parentId chain
-		function getAbsPos(node: Node): { x: number; y: number } {
-			let x = node.position.x;
-			let y = node.position.y;
-			if (node.parentId) {
-				const parent = nodes.find(n => n.id === node.parentId);
-				if (parent) {
-					const parentAbs = getAbsPos(parent);
-					x += parentAbs.x;
-					y += parentAbs.y;
-				}
-			}
-			return { x, y };
-		}
-
 		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 		for (const n of visibleNodes) {
-			const abs = getAbsPos(n);
+			const abs = getAbsolutePosition(n);
 			minX = Math.min(minX, abs.x);
 			minY = Math.min(minY, abs.y);
 			maxX = Math.max(maxX, abs.x + (n.measured!.width ?? 0));
@@ -2603,17 +2679,16 @@
 
 		const padW = containerW * padding;
 		const padH = containerH * padding;
-		const zoom = Math.min(
+		const clampedZoom = clampZoom(Math.min(
 			(containerW - padW) / contentW,
 			(containerH - padH) / contentH,
-			2  // maxZoom
-		);
-		const clampedZoom = Math.max(0.05, Math.min(zoom, 2));
+		));
 		const centerX = (minX + maxX) / 2;
 		const centerY = (minY + maxY) / 2;
 		const x = containerW / 2 - centerX * clampedZoom;
 		const y = containerH / 2 - centerY * clampedZoom;
 
+		stopGroupZoom();
 		setViewport({ x, y, zoom: clampedZoom });
 	}
 
@@ -3219,9 +3294,8 @@
 	}
 
 	function getViewportCenter(): { x: number; y: number } {
-		const flowContainer = document.querySelector('.svelte-flow');
-		if (flowContainer) {
-			const rect = flowContainer.getBoundingClientRect();
+		if (canvasEl) {
+			const rect = canvasEl.getBoundingClientRect();
 			return screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
 		}
 		return { x: 250, y: 150 };
@@ -4182,7 +4256,7 @@
 				</button>
 			</div>
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="svelte-flow-wrapper" style="width: 100%; height: 100%;" onwheelcapture={handleWheel}>
+			<div class="svelte-flow-wrapper" style="width: 100%; height: 100%;" bind:this={canvasEl} onwheelcapture={handleWheel}>
 			<!-- The `...Key={UNBOUND_KEY}` props below DISABLE xyflow's built-in
 			     key bindings (delete is ours via the KEYMAP in handleKeyDown;
 			     zoom/pan need no modifier). See UNBOUND_KEY for why we don't
@@ -4211,8 +4285,8 @@
 				onedgeclick={onEdgeClick}
 				onedgecontextmenu={onEdgeContextMenu}
 				bind:viewport={currentViewport}
-				minZoom={0.05}
-				maxZoom={2}
+				minZoom={MIN_ZOOM}
+				maxZoom={MAX_ZOOM}
 				deleteKey={UNBOUND_KEY}
 				selectionKey="Shift"
 				multiSelectionKey="Shift"

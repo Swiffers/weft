@@ -569,6 +569,7 @@ export interface Edge {
   sourceFile?: string;
 }
 
+// SYNC: GroupDefinition <-> crates/weft-core/src/project.rs GroupDefinition
 // SYNC: GroupDefinition (kind + loopConfig) <-> crates/weft-core/src/project.rs GroupKind
 export interface GroupDefinition {
   id: string;
@@ -595,11 +596,14 @@ export interface GroupDefinition {
   parentGroupId: string | null;
   childGroupIds: string[];
   nodeIds: string[];
+  /// True for an included file's own top-level group, written `Group(...)`
+  /// with no `name =`: the only group allowed to go unnamed, so the only
+  /// one that is a whole file. The editor opens it by default.
+  anonymous: boolean;
   span?: Span;
   headerSpan?: Span;
   /// The group's description: the plain `# ...` comment on the first body
   /// line of the group (text without the `# `).
-  // SYNC: GroupDefinition <-> crates/weft-core/src/project.rs GroupDefinition
   description?: string | null;
   /// Literals written on the container's interface ports: `g.x = "hi"` from
   /// outside, or `_should_flow: false` in the braces. A wired value is an

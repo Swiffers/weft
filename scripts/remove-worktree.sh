@@ -3,7 +3,8 @@
 # the worktree itself. The counterpart of scripts/add-worktree.sh.
 #
 # The install goes whole (`weft daemon remove`): its runtime, its projects,
-# workers and infra, its database, its buckets. Running this is the
+# workers and infra, its database, its buckets, and the build caches its
+# runtime and builder base compiled weft's crates in. Running this is the
 # confirmation, so it asks nothing. The git branch stays: delete it
 # yourself once it is merged (git branch -d <branch>).
 #

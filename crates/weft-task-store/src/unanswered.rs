@@ -297,7 +297,8 @@ impl Failed {
                  that stays busy) tries every queued run afresh"
             }
             Failed::Loop { .. } => {
-                "weft tries it again a few times by itself, then stops; after that, the next change that concerns it tries it again"
+                "weft tries it again a few times by itself, then stops; after that, the next change that concerns it tries it again, \
+                 and so does the next start of that weft service"
             }
             Failed::Infra => "the error says whether it tries again by itself; `weft infra look` makes it look again",
             Failed::Commands => "issue the command again; this clears once the ending of a later infra command of the project is written",

@@ -44,11 +44,20 @@ pub struct GcsObjectStore {
 impl GcsObjectStore {
     /// The store on `bucket`, as the account the metadata server names.
     /// Fails at boot, naming the cause, when the bucket cannot be reached.
+    /// A refusal is asked again for a few minutes first
+    /// ([`GRANT_APPLIES_AT_BOOT`](crate::accounts::GRANT_APPLIES_AT_BOOT)):
+    /// on a fresh install the grant on the bucket exists, but Google may
+    /// still be applying it. Those tries are this one boot's, nothing
+    /// outlives it.
     pub async fn new(google: Google, bucket: String) -> Result<Self> {
         let account = google.tokens().account_email().await?;
         let store = Self { google, bucket, account, signed: AtomicBool::new(false) };
-        let probe = store.request(Method::GET, &format!("https://{HOST}/storage/v1/b/{}", store.bucket), &[]).await;
-        if let Err(e) = Self::ok("reach the object-store bucket", probe?).await {
+        let url = format!("https://{HOST}/storage/v1/b/{}", store.bucket);
+        let reached = crate::accounts::until_settled_within(&crate::accounts::GRANT_APPLIES_AT_BOOT, |e| is_status(e, 403), || async {
+            Self::ok("reach the object-store bucket", store.request(Method::GET, &url, &[]).await?).await
+        })
+        .await;
+        if let Err(e) = reached {
             let advice = if is_status(&e, 403) {
                 format!(
                     ": grant {} roles/storage.objectAdmin and roles/storage.legacyBucketReader on it",

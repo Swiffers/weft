@@ -112,9 +112,14 @@ COPY crates ./crates
 #     separately and stays a cached layer while the lock holds.
 #
 # `{{target_cache_key}}` is substituted by the staging step
-# (`build::stage_builder_base_context`) with a hash of Cargo.lock +
-# rust-toolchain.toml: a lock or toolchain change starts a FRESH cache
-# instead of inheriting the old one. Without the key, the cache (and
+# (`build::stage_builder_base_context_at`) with
+# `build::install_cache_key`: the install it is built for, then a hash
+# of Cargo.lock and rust-toolchain.toml. The install, because cargo goes
+# by modification times: a cache shared with another branch's install on
+# this machine would hand this base that branch's newer artifacts for the
+# engine crates; an install's caches go with it (`weft daemon remove`,
+# `weft clean --images --all`). A lock or toolchain change starts a FRESH
+# cache instead of inheriting the old one. Without the key, the cache (and
 # therefore the baked layer, since the whole cache is copied in)
 # accumulates every dependency version and toolchain ever built:
 # cargo never removes superseded artifacts, so the image would grow
@@ -144,6 +149,7 @@ COPY .weft-warmup /work
 COPY project-nodes /weft/project-nodes
 COPY worker-builder-base-split.sh /usr/local/bin/weft-split-artifacts
 {{build_env_lines}}
+# SYNC: weft-builder-base-target- <-> crates/weft-compiler/src/build.rs (BUILDER_BASE_CACHE_MOUNT_ID_PREFIX)
 RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-builder-base-target-{{target_cache_key}},target=/cache/target,sharing=locked \
     cp /weft/Cargo.lock /work/Cargo.lock \

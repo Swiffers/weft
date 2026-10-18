@@ -318,7 +318,11 @@ If a piece of background work itself fails on a cloud install, weft books
 it again 1 second later, then 5, then 20. If the fourth try
 fails too, it stops trying and writes the error to `weft status`, under
 `waiting on weft:`. It runs again the next time weft writes work for it,
-and the line goes once a try works. Each failed try still answers Cloud
+and once more each time a copy of its service starts, and the line goes
+once a try works. That last one is for a fresh install, where Google takes
+a minute or two to apply the permissions the install was just given: work
+that failed in that window runs again the next time something wakes the
+service. Each failed try still answers Cloud
 Tasks' call as handled, so the queue does not call it again on its own.
 Cloud Tasks only retries a call whose failure could not even be written
 down, because the database did not answer. On your machine a failed piece

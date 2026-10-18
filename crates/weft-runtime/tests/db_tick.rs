@@ -10,13 +10,13 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use weft_platform_traits::CoreRole;
 use weft_runtime::server::Tick;
-use weft_task_store::drain::TickBody;
+use weft_task_store::drain::{Pass, TickBody};
 use weft_task_store::unanswered::{self, Callee};
 
 fn tick(pool: &PgPool) -> Tick {
     Tick {
         role: CoreRole::Dispatcher,
-        run: Arc::new(|_| Box::pin(async { Ok(()) })),
+        run: Arc::new(|_, _| Box::pin(async { Ok(()) })),
         alarm: Arc::new(weft_platform_traits::FakeAlarm::new()),
         pool: Some(pool.clone()),
     }
@@ -39,9 +39,9 @@ async fn only_the_tick_of_a_ring_the_alarm_carried_answers_it(pool: PgPool) {
     unanswered::failed(&pool, Callee::Role("dispatcher"), None, "connection refused").await.unwrap().log();
     unanswered::failed(&pool, Callee::Role("supervisor"), None, "connection refused").await.unwrap().log();
     let t = tick(&pool);
-    t.pass(TickBody { loops: vec!["delivery".into()], ..TickBody::default() }).await.unwrap();
+    t.pass(TickBody { loops: vec!["delivery".into()], ..TickBody::default() }, Pass::Tick).await.unwrap();
     assert_eq!(written(&pool).await, vec!["role:dispatcher".to_string(), "role:supervisor".to_string()], "a plain tick answers nothing");
-    t.pass(TickBody { loops: vec!["delivery".into()], after_failed_ring: true, ..TickBody::default() }).await.unwrap();
+    t.pass(TickBody { loops: vec!["delivery".into()], after_failed_ring: true, ..TickBody::default() }, Pass::Tick).await.unwrap();
     assert_eq!(written(&pool).await, vec!["role:supervisor".to_string()], "the carried ring is answered, for this role only");
 }
 
@@ -52,11 +52,11 @@ async fn a_carried_ring_whose_pass_failed_stays_written_down(pool: PgPool) {
     setup(&pool).await;
     unanswered::failed(&pool, Callee::Role("dispatcher"), None, "connection refused").await.unwrap().log();
     let t = Tick {
-        run: Arc::new(|_| {
+        run: Arc::new(|_, _| {
             Box::pin(async { Err(weft_task_store::drain::PassFailed { loops: vec!["delivery".into()], error: "the database is down".into() }) })
         }),
         ..tick(&pool)
     };
-    t.pass(TickBody { loops: vec!["delivery".into()], after_failed_ring: true, ..TickBody::default() }).await.unwrap_err();
+    t.pass(TickBody { loops: vec!["delivery".into()], after_failed_ring: true, ..TickBody::default() }, Pass::Tick).await.unwrap_err();
     assert_eq!(written(&pool).await, vec!["role:dispatcher".to_string()]);
 }

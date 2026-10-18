@@ -45,6 +45,8 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &crate::journal::postgres::GROUP,
     // The exclusive infra ownership leases.
     &crate::infra_owner::GROUP,
+    // How many holders the platform's pool was last set to run.
+    &crate::holders::GROUP,
     &weft_task_store::tasks::GROUP,
     &crate::infra_node::GROUP,
     &crate::infra_event::GROUP,

@@ -23,7 +23,7 @@
 //! The worker calls the broker with a token the install signed for
 //! exactly its project.
 //!
-//! One copy per project, image and settings serves every execution: a laptop has
+//! One copy per project, image and settings serves every run: a laptop has
 //! one machine, so `max_instances` changes nothing here, and
 //! `concurrency` is the worker's own business.
 
@@ -45,12 +45,12 @@ const WORKER_PORT: u16 = 8080;
 
 /// How long a started worker gets to answer its health check. The
 /// worker's own start is weft's code (the user's nodes run later, per
-/// execution), so a worker that does not answer by then is broken.
+/// run), so a worker that does not answer by then is broken.
 const START_DEADLINE: Duration = Duration::from_secs(120);
 
 /// How long a worker being replaced (a front giving way to the next, one
 /// that stopped answering) gets to let its runs go (`weft_engine::worker`:
-/// five seconds for a step to end, then its record written) before it is
+/// five seconds for a firing to end, then its record written) before it is
 /// killed.
 const WORKER_STOP_GRACE_SECS: u64 = 10;
 

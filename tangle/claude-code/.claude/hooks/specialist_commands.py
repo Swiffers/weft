@@ -6,7 +6,7 @@ read-only specialist could otherwise run anything Tangle may run. This hook
 gives each specialist its own list instead, kept in specialist_commands.json
 beside it: a key per agent name (the `name` in its .claude/agents/ file), and
 under it the commands that agent may run, each as the words a command starts
-with ("weft events" allows `weft events <run id> --node x`).
+with ("weft events" allows `weft events <run-id> --node x`).
 
 A Bash call from inside a subagent (the hook input carries `agent_type`) is
 answered here, before any permission check:

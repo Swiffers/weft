@@ -43,7 +43,7 @@ pub async fn run(
             kind: weft_task_store::TaskKind::RunNodeTest,
             project_id: Some(id),
             dedup_key: None,
-            execution_id: None,
+            run_id: None,
             tenant_id: caller.0 .0.clone(),
             payload: serde_json::to_value(&payload)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,

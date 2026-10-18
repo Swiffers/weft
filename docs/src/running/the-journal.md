@@ -65,14 +65,14 @@ inspector shows how many there are.
 
 In a run that has ended, a hole only spoils the replay view. In a run that has
 to resume, a hole stops the resume with an error, because a run rebuilt from
-part of its record could run steps that already ran.
+part of its record could run nodes that already ran.
 
-## The execution guarantee
+## When a worker dies mid-firing
 
-A node's completion is written after the node finishes, so a step whose worker
+A node's completion is written after it finishes, so one whose worker
 died before that has no completion on record. For what weft does with such a
-step, in a fast run and in a durable one, go and read [surviving a
-restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step).
+node, in a fast run and in a durable one, go and read [surviving a
+restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
 ## When a run waits for its writes
 
@@ -84,16 +84,16 @@ A fast run (the default) waits for its writes only where something else is
 about to act on its record: when it pauses, when an answer it was waiting for
 arrives, when its worker is stopping and hands it to another one, and before it
 asks weft for something on its behalf (a connection or an endpoint it does not
-already hold, anything on its stored files, a tag through `ctx.tag_execution`,
+already hold, anything on its stored files, a tag through `ctx.tag_run`,
 a stop through `ctx.stop_tagged`, a call on its own program such as starting
-its infra). If a step calls a paid service and that call reports a cost, the cost is
+its infra). If a node calls a paid service and that call reports a cost, the cost is
 written in the background, and the run hands over its ending only once that
 cost is written. Once it has handed its ending over, the run is gone from the worker's memory straight away. The ending
 is written after every event the run handed over before it, so a run is never
 reported finished before the rest of its record.
 
-A durable run also waits before each step of a node that is not
-[pure](../nodes/metadata.md#features), before an answer leaves for its caller,
+A durable run also waits before each node that is not
+[pure](../nodes/metadata.md#features) starts, before an answer leaves for its caller,
 and for its ending. One fired by an event also waits for its start to be
 written before the event counts as delivered. When the answer is the last thing the run does, its ending
 goes in the same write, so the answer costs no extra wait. A durable route that

@@ -220,7 +220,7 @@ fn publish_body(news: &[RunNews]) -> Value {
             json!({
                 "attributes": {
                     "project": news.project.to_string(),
-                    "execution": news.execution.to_string(),
+                    "run": news.run.to_string(),
                     "kind": kind_name(news.kind),
                 },
             })
@@ -234,7 +234,7 @@ fn news_in(message: &Value) -> Option<RunNews> {
     let attribute = |name: &str| message.get("attributes")?.get(name)?.as_str();
     Some(RunNews {
         project: attribute("project")?.parse().ok()?,
-        execution: attribute("execution")?.parse().ok()?,
+        run: attribute("run")?.parse().ok()?,
         kind: kind_named(attribute("kind")?)?,
     })
 }
@@ -357,7 +357,7 @@ mod tests {
     use crate::api::ApiError;
 
     fn news(kind: NewsKind) -> RunNews {
-        RunNews { project: uuid::Uuid::from_u128(1), execution: uuid::Uuid::from_u128(2), kind }
+        RunNews { project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(2), kind }
     }
 
     #[test]

@@ -7,14 +7,14 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::bus::BusOptions;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct TickBusNode;
 
 #[async_trait]
 impl Node for TickBusNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bus = ctx.open_bus("ticks", BusOptions::default(), "ticker").await?;
         for delta in ["t1", "t2", "t3"] {
             bus.send("delta", json!(delta)).node_err("tick send")?;

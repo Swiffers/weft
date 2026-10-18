@@ -108,7 +108,7 @@ does, with the address the token was minted at), pass it as
 `new InstanceDoor(token, { base: dispatcherUrl })`.
 
 `InstanceSettings` lists every field the program gives each instance its own
-value for (the ones it writes `@instance_filled`), grouped by step, each with
+value for (the ones it writes `@instance_filled`), grouped by node, each with
 its own control: the connection picker for a connection, the searchable list
 and the provider's chooser for a list field, a plain input for anything else.
 It stores what is given for that instance, and when a value it changed is one
@@ -116,10 +116,10 @@ a live trigger of that instance reads, the trigger is set up again before the
 save answers and the page says so. An instance's page never sees the shared
 key: it spends the program author's credit.
 
-Each step is titled with the program's own label and each field with the
-node's own name for it (a text step's field reads "Value"), both written for
+Each node is titled with the program's own label and each field with the
+node's own name for it (a text node's field reads "Value"), both written for
 the program's author. Name what your visitors read in your own words with
-`labels`, keyed by a step's id for its title and by `step.field` for a field;
+`labels`, keyed by a node's id for its title and by `node.field` for a field;
 anything you leave out keeps the program's label:
 
 ```svelte
@@ -128,7 +128,7 @@ anything you leave out keeps the program's label:
 
 If you build your own page instead, `door.fields()` lists the fields,
 `door.setValues(set, clear)` stores values, and `ResourceSelect` with
-`door.resources(step, field)` draws one list field.
+`door.resources(node, field)` draws one list field.
 
 ## How it looks
 

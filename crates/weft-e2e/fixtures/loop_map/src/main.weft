@@ -10,8 +10,8 @@
 # `factor` sits inside the loop with no wire into it: a node like that
 # starts with each iteration and nowhere else. Before the fix the run's
 # pre-run root list kicked it once more at the loop's own level, where
-# `step` waited for an `n` that never comes, and the run ended stuck
-# after every iteration had finished. The rig asserts `step` and
+# `double` waited for an `n` that never comes, and the run ended stuck
+# after every iteration had finished. The rig asserts `double` and
 # `factor` each fired exactly five times.
 
 src = ExecPython() -> (items: List[Number]) {
@@ -25,12 +25,12 @@ doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   factor = ExecPython() -> (by: Number) {
     code: "return {'by': 2}"
   }
-  step = ExecPython(n: Number, by: Number) -> (out: Number) {
+  double = ExecPython(n: Number, by: Number) -> (out: Number) {
     code: "return {'out': n * by}"
   }
-  step.n = self.values
-  step.by = factor.by
-  self.results = step.out
+  double.n = self.values
+  double.by = factor.by
+  self.results = double.out
 }
 doubler.values = src.items
 

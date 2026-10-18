@@ -31,13 +31,13 @@ export function runPreflight(
   // Fold the batch op-by-op: each scope/cycle check runs against the state the
   // op will ACTUALLY apply to (the prior ops already applied), and the fold
   // doubles as the dry-run apply (a semantic failure reads exactly like the
-  // server rejection it predicts). Checking every addEdge against the original
+  // server rejection it predicts). Checking every add_edge against the original
   // `visible` instead missed cyclic batches like `[A->B, B->A]` (each edge
   // alone is acyclic) and skipped checks on an edge to a node added earlier in
   // the same batch.
   let working = visible;
   for (const op of ops) {
-    if (op.op === 'addEdge') {
+    if (op.op === 'add_edge') {
       const scopeCheck = checkSameScope(op, working);
       if (scopeCheck) return { ok: false, reason: scopeCheck };
       if (createsCycle(op, working)) {
@@ -74,7 +74,7 @@ function endpointId(
  *  is its parent container; a container's `self` (inner) side IS the
  *  container's body scope. */
 function checkSameScope(
-  op: Extract<EditOp, { op: 'addEdge' }>,
+  op: Extract<EditOp, { op: 'add_edge' }>,
   visible: ProjectDefinition,
 ): string | null {
   const src = endpointId(op.source, visible, op.scopeGroup);
@@ -94,7 +94,7 @@ function checkSameScope(
  *  `__inner`-handled edges are group interface pass-throughs (data flowing
  *  through the group), not dependencies, so they don't participate. */
 function createsCycle(
-  op: Extract<EditOp, { op: 'addEdge' }>,
+  op: Extract<EditOp, { op: 'add_edge' }>,
   visible: ProjectDefinition,
 ): boolean {
   const src = endpointId(op.source, visible, op.scopeGroup);

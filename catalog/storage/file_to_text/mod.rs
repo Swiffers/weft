@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::weft_type::FileKind;
-use weft::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct FileToTextNode;
@@ -24,9 +24,9 @@ impl Node for FileToTextNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let file: FileHandle = ctx.inputs.get("file")?;
-        let (meta, bytes) = ctx.storage(weft::storage::StorageScope::Execution).get_bytes(&file).await?;
+        let (meta, bytes) = ctx.storage(weft::storage::StorageScope::Run).get_bytes(&file).await?;
         let text = text_of(&meta.filename, &meta.mime_type, bytes.to_vec())?;
         ctx.pulse_downstream(NodeOutput::new().set("text", text)).await
     }

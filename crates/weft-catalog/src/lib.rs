@@ -38,7 +38,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use weft_core::is_rust_identifier;
+use weft_core::access::spec::{Acquisition, AppRegistration};
 use weft_core::node::{MetadataCatalog, NodeMetadata};
+
+mod spelling;
 
 /// Entry names that are never part of a node's source tree: build
 /// outputs, VCS/dependency caches, local secrets and databases. The
@@ -185,6 +188,35 @@ pub struct CatalogProblem {
     pub error: CatalogError,
 }
 
+/// One line of [`FsCatalog::warnings`]. Never a failure on its own.
+/// Serialized as `{kind, message}` in `weft validate` and `weft
+/// describe-nodes` JSON, so a reader picks a kind without parsing the line.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CatalogWarning {
+    pub kind: WarningKind,
+    /// The line as a person reads it.
+    pub message: String,
+}
+
+/// What a [`CatalogWarning`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningKind {
+    /// A node or package left out of the catalog: one that failed to
+    /// load, a node not ready yet, a package with no node in it yet.
+    LeftOut,
+    /// A name a node spells off the weft way (see `spelling`). The node
+    /// loads as usual; the line names the node, its file, and the
+    /// spelling that fits.
+    Spelling,
+}
+
+impl std::fmt::Display for CatalogWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 #[derive(Debug)]
 pub struct FsCatalog {
     entries: HashMap<String, CatalogEntry>,
@@ -193,9 +225,10 @@ pub struct FsCatalog {
     packages: HashMap<PathBuf, Package>,
     /// Every node or package that failed to load, with its error.
     problems: Vec<CatalogProblem>,
-    /// One line per thing left out: each problem, each node not ready
-    /// yet (see `pending`), each package with no node in it yet.
-    warnings: Vec<String>,
+    /// One line per thing left out (each problem, each node not ready
+    /// yet, see `pending`, each package with no node in it yet), and one
+    /// per name a node spells off the weft way, which leaves nothing out.
+    warnings: Vec<CatalogWarning>,
     /// Nodes seen but left out: a folder with a `metadata.json` and no
     /// `mod.rs` yet (a specialist writes the description before the
     /// code). Type name to the folder. A build never references such a
@@ -282,9 +315,12 @@ impl FsCatalog {
         }
     }
 
-    /// One line per thing left out of the catalog: every problem, every
-    /// node not ready yet, every package with no node in it yet.
-    pub fn warnings(&self) -> &[String] {
+    /// One line per thing left out of the catalog (every problem, every
+    /// node not ready yet, every package with no node in it yet), and one
+    /// per name a node spells off the weft way (a port in snake_case, a
+    /// node type not in PascalCase), whose node still loads. `kind` tells
+    /// the two apart.
+    pub fn warnings(&self) -> &[CatalogWarning] {
         &self.warnings
     }
 
@@ -737,6 +773,13 @@ struct Unit {
     entries: Vec<CatalogEntry>,
     shared_rs: Vec<PathBuf>,
     package_deps: Option<toml::Table>,
+    /// The apps a package root's defaults declare under `accessApps`,
+    /// checked once against the root's file (`settle`). Empty for a bare
+    /// node and for a root that declares none.
+    root_apps: BTreeMap<String, AppRegistration>,
+    /// The members whose `accessApps` is the root's (their own file sets
+    /// none): a refused root app leaves exactly these out.
+    inheriting_apps: BTreeSet<String>,
 }
 
 /// Discovery state threaded through the traversal: the catalog being
@@ -766,15 +809,44 @@ impl DiscoverCtx<'_> {
     /// an error in anyone's build), recorded so the compiler can name it
     /// when a program asks for it.
     fn leave_pending(&mut self, node_type: String, dir: PathBuf) {
-        self.cat.warnings.push(pending_reason(&node_type, &dir));
+        self.warn(WarningKind::LeftOut, pending_reason(&node_type, &dir));
         self.cat.pending.insert(node_type, dir);
     }
 
     /// A node or package that failed to load: left out, with its error,
     /// under the types it claims.
     fn record(&mut self, node_types: Vec<String>, error: CatalogError) {
-        self.cat.warnings.push(error.to_string());
+        self.warn(WarningKind::LeftOut, error.to_string());
         self.cat.problems.push(CatalogProblem { node_types, error });
+    }
+
+    fn warn(&mut self, kind: WarningKind, message: String) {
+        self.cat.warnings.push(CatalogWarning { kind, message });
+    }
+
+    /// The names a node or a package's defaults spell off the weft way,
+    /// one line each, naming `subject` and the `metadata.json` they are in.
+    fn warn_spelling(&mut self, subject: &str, file: &Path, messages: Vec<String>) {
+        for message in messages {
+            self.warn(WarningKind::Spelling, format!("{subject} ({}): {message}", file.display()));
+        }
+    }
+
+    /// What loading a node folder found, its spelling lines included:
+    /// the entry, and whether its `accessApps` is its package root's.
+    fn take_loaded(&mut self, loaded: Loaded, dir: &Path) -> Option<(CatalogEntry, bool)> {
+        let file = dir.join("metadata.json");
+        match loaded {
+            Loaded::Ready { entry, misspelled, inherits_apps } => {
+                self.warn_spelling(&entry.node_type, &file, misspelled);
+                Some((*entry, inherits_apps))
+            }
+            Loaded::Pending { node_type, misspelled } => {
+                self.warn_spelling(&node_type, &file, misspelled);
+                self.leave_pending(node_type, dir.to_path_buf());
+                None
+            }
+        }
     }
 
     /// Register every loaded unit, after leaving out each one that
@@ -785,8 +857,14 @@ impl DiscoverCtx<'_> {
     /// both find a service by name alone). Every claimant of a shared
     /// name is left out, told about all the others, because the walk's
     /// order is no reason for one folder to win.
+    ///
+    /// Every removal also notes, against the service the removed node
+    /// declared, why it went (`Withdrawn`): an app naming a service whose
+    /// declarers were all left out is then refused with that cause, never
+    /// with "no node declares it".
     fn settle(mut self) {
         let mut units = std::mem::take(&mut self.units);
+        let mut withdrawn = Withdrawn::new();
 
         // Package names: a clash takes the whole unit out.
         let mut by_name: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
@@ -802,21 +880,30 @@ impl DiscoverCtx<'_> {
         for entry in clashing.iter().chain(units_ok.iter()).flat_map(|u| &u.entries) {
             by_type.entry(entry.node_type.clone()).or_default().push(entry.source_dir.clone());
         }
+        let type_clashes: BTreeMap<String, CatalogError> = by_type
+            .into_iter()
+            .filter(|(_, dirs)| dirs.len() > 1)
+            .map(|(node_type, dirs)| (node_type.clone(), CatalogError::Collision { node_type, dirs }))
+            .collect();
+        for entry in clashing.iter().chain(units_ok.iter()).flat_map(|u| &u.entries) {
+            if let Some(error) = type_clashes.get(&entry.node_type) {
+                withdraw(&mut withdrawn, entry, error);
+            }
+        }
         for unit in clashing {
             let node_types = unit.entries.iter().map(|e| e.node_type.clone()).collect();
             let roots = by_name[&unit.name].clone();
-            self.record(node_types, CatalogError::PackageNameCollision { name: unit.name, roots });
-        }
-        for (node_type, dirs) in &by_type {
-            if dirs.len() > 1 {
-                self.record(
-                    vec![node_type.clone()],
-                    CatalogError::Collision { node_type: node_type.clone(), dirs: dirs.clone() },
-                );
+            let error = CatalogError::PackageNameCollision { name: unit.name, roots };
+            for entry in &unit.entries {
+                withdraw(&mut withdrawn, entry, &error);
             }
+            self.record(node_types, error);
         }
         for unit in &mut units_ok {
-            unit.entries.retain(|e| by_type[&e.node_type].len() == 1);
+            unit.entries.retain(|e| !type_clashes.contains_key(&e.node_type));
+        }
+        for (node_type, error) in type_clashes {
+            self.record(vec![node_type], error);
         }
 
         // Services, over what is left.
@@ -826,18 +913,78 @@ impl DiscoverCtx<'_> {
                 by_service.entry(service.service.clone()).or_default().push(entry.node_type.clone());
             }
         }
-        for (service, node_types) in &by_service {
-            if node_types.len() > 1 {
-                self.record(
-                    node_types.clone(),
-                    CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone() },
-                );
+        let service_clashes: BTreeMap<String, (Vec<String>, CatalogError)> = by_service
+            .into_iter()
+            .filter(|(_, node_types)| node_types.len() > 1)
+            .map(|(service, node_types)| {
+                let error = CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone() };
+                (service, (node_types, error))
+            })
+            .collect();
+        let clashing_service = |e: &CatalogEntry| {
+            e.metadata.service.as_ref().and_then(|s| service_clashes.get(&s.service)).map(|(_, error)| error)
+        };
+        for entry in units_ok.iter().flat_map(|u| &u.entries) {
+            if let Some(error) = clashing_service(entry) {
+                withdraw(&mut withdrawn, entry, error);
             }
         }
         for unit in &mut units_ok {
-            unit.entries.retain(|e| {
-                e.metadata.service.as_ref().is_none_or(|s| by_service[&s.service].len() == 1)
-            });
+            unit.entries.retain(|e| clashing_service(e).is_none());
+        }
+        for (node_types, error) in service_clashes.into_values() {
+            self.record(node_types, error);
+        }
+
+        // An app declared under `accessApps` is checked now that every
+        // service is known (a project's catalog holds the standard nodes, so
+        // every service weft ships is): it names a service this catalog
+        // declares, one whose connect takes an app, and it is held to every
+        // rule for a shipped app (`AppRegistration::check_shipped`). A root's
+        // app is checked once, against the root's file, and a refusal leaves
+        // out the members that inherit it; a member's own app, against the
+        // member's file. A refusal can take out the node declaring a service
+        // another app names, so the check repeats over what is left until a
+        // round refuses nothing.
+        loop {
+            let services: BTreeMap<&str, &weft_core::access::spec::AccessSpec> = units_ok
+                .iter()
+                .flat_map(|u| &u.entries)
+                .filter_map(|e| e.metadata.service.as_ref())
+                .map(|spec| (spec.service.as_str(), spec))
+                .collect();
+            // (unit index, whether it is the root's app, the types left out, the file, why)
+            let mut refused: Vec<(usize, bool, Vec<String>, PathBuf, String)> = Vec::new();
+            for (index, unit) in units_ok.iter().enumerate() {
+                if let Some(error) = refuse_apps(&services, &withdrawn, &unit.root_apps) {
+                    let inheriting = unit.entries.iter().filter(|e| unit.inheriting_apps.contains(&e.node_type));
+                    let node_types = inheriting.map(|e| e.node_type.clone()).collect();
+                    refused.push((index, true, node_types, unit.root.join("metadata.json"), error));
+                }
+                for entry in unit.entries.iter().filter(|e| !unit.inheriting_apps.contains(&e.node_type)) {
+                    if let Some(error) = refuse_apps(&services, &withdrawn, &entry.metadata.access_apps) {
+                        let file = entry.source_dir.join("metadata.json");
+                        refused.push((index, false, vec![entry.node_type.clone()], file, error));
+                    }
+                }
+            }
+            if refused.is_empty() {
+                break;
+            }
+            for (index, is_root, node_types, path, error) in refused {
+                let unit = &mut units_ok[index];
+                if is_root {
+                    // Reported once: a root with no member left to inherit
+                    // its app is not checked again.
+                    unit.root_apps.clear();
+                }
+                let error = CatalogError::Parse { path, error };
+                for entry in unit.entries.iter().filter(|e| node_types.contains(&e.node_type)) {
+                    withdraw(&mut withdrawn, entry, &error);
+                }
+                unit.entries.retain(|e| !node_types.contains(&e.node_type));
+                self.record(node_types, error);
+            }
         }
 
         // A unit whose every entry was taken out has nothing to serve;
@@ -860,6 +1007,51 @@ impl DiscoverCtx<'_> {
             );
         }
     }
+}
+
+/// Each service a node declared before `settle` left that node out,
+/// with every reason one of its declarers went.
+type Withdrawn = BTreeMap<String, BTreeSet<String>>;
+
+/// Notes `cause` against the service `entry` declares, if it declares one.
+fn withdraw(withdrawn: &mut Withdrawn, entry: &CatalogEntry, cause: &CatalogError) {
+    if let Some(spec) = &entry.metadata.service {
+        withdrawn.entry(spec.service.clone()).or_default().insert(cause.to_string());
+    }
+}
+
+/// The first app of `apps` (an `accessApps` map) a catalog declaring
+/// `services` refuses, as one line naming the app: a service whose every
+/// declarer was left out (naming why, from `withdrawn`), a service it does
+/// not declare, a service whose connect takes no app, or an app that
+/// breaks a rule of [`AppRegistration::check_shipped`].
+fn refuse_apps(
+    services: &BTreeMap<&str, &weft_core::access::spec::AccessSpec>,
+    withdrawn: &Withdrawn,
+    apps: &BTreeMap<String, AppRegistration>,
+) -> Option<String> {
+    apps.iter().find_map(|(service, app)| {
+        let refusal = match services.get(service.as_str()).map(|spec| &spec.acquisition) {
+            None => match withdrawn.get(service) {
+                Some(causes) => Err(format!(
+                    "every node declaring the '{service}' service was left out, so this app has no \
+                     service to belong to: {}",
+                    causes.iter().map(String::as_str).collect::<Vec<_>>().join("; and ")
+                )),
+                None => Err(format!(
+                    "no node in this project declares a service named '{service}' (it declares: {}), so \
+                     this app would never be used; name one of those, or remove the app",
+                    if services.is_empty() { "none".to_string() } else { services.keys().copied().collect::<Vec<_>>().join(", ") }
+                )),
+            },
+            Some(Acquisition::OAuth2 { registration_fields, .. }) => app.check_shipped(registration_fields),
+            Some(_) => Err(format!(
+                "the '{service}' service connects without an app (only a service that signs in through \
+                 OAuth takes one), so this app would never be used; remove it"
+            )),
+        };
+        refusal.err().map(|error| format!("accessApps.{service}: {error}"))
+    })
 }
 
 /// The node type a folder's `metadata.json` claims, read as plainly as
@@ -1158,8 +1350,10 @@ fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
 /// the whole story).
 fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
     let entry = match load_node_entry(dir, dir, None, &ctx.broken_files) {
-        Ok(Loaded::Ready(e)) => *e,
-        Ok(Loaded::Pending { node_type }) => return ctx.leave_pending(node_type, dir.to_path_buf()),
+        Ok(loaded) => match ctx.take_loaded(loaded, dir) {
+            Some((entry, _)) => entry,
+            None => return,
+        },
         Err(e) => return ctx.record(declared_type(dir).into_iter().collect(), e),
     };
     // The package name is the directory name. A non-UTF-8 name is a
@@ -1178,6 +1372,8 @@ fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
         entries: vec![entry],
         shared_rs: Vec::new(),
         package_deps: None,
+        root_apps: BTreeMap::new(),
+        inheriting_apps: BTreeSet::new(),
     });
 }
 
@@ -1211,6 +1407,24 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     } else {
         None
     };
+    // The defaults are checked once, here, against the file they are
+    // written in, keys and ports alike, so a default every member
+    // overrides is still checked and a member reports nothing it inherits.
+    if let Some(defaults) = &package_defaults {
+        let mut misspelled = Vec::new();
+        spelling::check_document(defaults, &mut misspelled);
+        spelling::check_defaults_ports(defaults, &mut misspelled);
+        let subject = format!("package '{}' defaults", parsed.package.name);
+        ctx.warn_spelling(&subject, &dir.join("metadata.json"), misspelled);
+    }
+    // The root's apps, checked once in `settle` against this file. One
+    // that does not parse is no app to check: every member inheriting it
+    // fails to load on that parse.
+    let root_apps: BTreeMap<String, AppRegistration> = package_defaults
+        .as_ref()
+        .and_then(|d| d.get("accessApps"))
+        .and_then(|apps| serde_json::from_value(apps.clone()).ok())
+        .unwrap_or_default();
 
     // Auto-detect members: every immediate subdir whose own
     // `read_node_dir` view contains a `metadata.json`. Shared `.rs` files live at the
@@ -1218,6 +1432,7 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     // package's `entries` plus each member's), so a package's tree is
     // seen identically by discovery, staging, and hashing.
     let mut loaded: Vec<CatalogEntry> = Vec::new();
+    let mut inheriting_apps: BTreeSet<String> = BTreeSet::new();
     let mut shared_rs: Vec<PathBuf> = Vec::new();
     let mut members_seen = 0usize;
     for entry in entries {
@@ -1235,8 +1450,14 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
                 }
                 members_seen += 1;
                 match load_node_entry(&path, dir, package_defaults.as_ref(), &ctx.broken_files) {
-                    Ok(Loaded::Ready(entry)) => loaded.push(*entry),
-                    Ok(Loaded::Pending { node_type }) => ctx.leave_pending(node_type, path),
+                    Ok(found) => {
+                        if let Some((entry, inherits_apps)) = ctx.take_loaded(found, &path) {
+                            if inherits_apps {
+                                inheriting_apps.insert(entry.node_type.clone());
+                            }
+                            loaded.push(entry);
+                        }
+                    }
                     Err(e) => ctx.record(declared_type(&path).into_iter().collect(), e),
                 }
             }
@@ -1257,7 +1478,7 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     // name is claimed all the same, so a healthy package elsewhere under
     // that name is a collision rather than the quiet winner.
     if members_seen == 0 {
-        ctx.cat.warnings.push(format!(
+        ctx.warn(WarningKind::LeftOut, format!(
             "package '{}' at {} has no node in it yet (no subfolder with a metadata.json); it is \
              left out until it does",
             parsed.package.name,
@@ -1271,6 +1492,8 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
         entries: loaded,
         shared_rs,
         package_deps: Some(parsed.dependencies),
+        root_apps,
+        inheriting_apps,
     });
 }
 
@@ -1303,6 +1526,10 @@ fn load_package_defaults(
             error: "package-level metadata.json must be a JSON object".into(),
         });
     };
+    // A key the language dropped or renamed, refused against this file
+    // rather than once per member that inherits it.
+    weft_core::node::refuse_removed_metadata_keys(&serde_json::Value::Object(obj.clone()))
+        .map_err(|error| CatalogError::Parse { error: stale_copy_hint(&path, error), path: path.clone() })?;
     // Refuse an identity key ONCE here, where the offending file is known, so
     // the author is pointed at the package root rather than at whichever member
     // happened to be merged first. The merge itself re-checks (it is the shared
@@ -1322,10 +1549,15 @@ fn load_package_defaults(
 }
 
 /// What loading a node folder found: a node ready to catalog, or one
-/// whose description exists but whose code does not yet.
+/// whose description exists but whose code does not yet. Either way,
+/// `misspelled` holds what `spelling` found off in the names the node
+/// chooses, one message each (the node is named when they become
+/// warnings).
+/// `inherits_apps` is whether the node's `accessApps` came from its
+/// package root (its own file sets none).
 enum Loaded {
-    Ready(Box<CatalogEntry>),
-    Pending { node_type: String },
+    Ready { entry: Box<CatalogEntry>, misspelled: Vec<String>, inherits_apps: bool },
+    Pending { node_type: String, misspelled: Vec<String> },
 }
 
 /// Load a single node's metadata + form field specs.
@@ -1349,6 +1581,24 @@ fn load_node_entry(
             path: meta_path.clone(),
             error: e.to_string(),
         })?;
+    // The names this file spells, walked on the value already in memory
+    // and BEFORE the merge: an inherited key is the package root's to
+    // spell, and `register_package` checks that file once.
+    let mut misspelled = Vec::new();
+    if let Some(own) = value.as_object() {
+        spelling::check_document(own, &mut misspelled);
+    }
+    // A key the language dropped or renamed, refused against this file
+    // and on this file's own keys: the root's are refused once, against
+    // the root (`load_package_defaults`).
+    weft_core::node::refuse_removed_metadata_keys(&value)
+        .map_err(|error| CatalogError::Parse { error: stale_copy_hint(&meta_path, error), path: meta_path.clone() })?;
+    // The top-level keys this node takes from its package root: what
+    // they spell is the root's, checked once there.
+    let inherited: BTreeSet<String> = match (package_defaults, value.as_object()) {
+        (Some(defaults), Some(own)) => defaults.keys().filter(|k| !own.contains_key(*k)).cloned().collect(),
+        _ => BTreeSet::new(),
+    };
     if let Some(defaults) = package_defaults {
         // The node's own key wins wholesale (no deep merge). Same merge the
         // derive runs at compile time, so catalog metadata and the runtime
@@ -1363,19 +1613,7 @@ fn load_node_entry(
             CatalogError::Parse { path: package_key.join("metadata.json"), error }
         })?;
     }
-    weft_core::node::refuse_removed_metadata_keys(&value)
-        .map_err(|error| CatalogError::Parse { path: meta_path.clone(), error })?;
-    // A stale stdlib COPY is the common way to hold metadata this weft
-    // no longer accepts (a shape serde refuses, or a setting the
-    // language now owns); name the one-command re-sync.
-    let parse_error = |error: String| CatalogError::Parse {
-        path: meta_path.clone(),
-        error: if meta_path.components().any(|c| c.as_os_str() == "base_catalog") {
-            format!("{error} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
-        } else {
-            error
-        },
-    };
+    let parse_error = |error: String| CatalogError::Parse { error: stale_copy_hint(&meta_path, error), path: meta_path.clone() };
     let mut metadata: NodeMetadata =
         serde_json::from_value(value).map_err(|e| parse_error(e.to_string()))?;
     // The settings the language owns (how runs are kept, entry limits), added
@@ -1401,18 +1639,37 @@ fn load_node_entry(
         });
     }
 
+    spelling::check_node(&metadata, |key| inherited.contains(key), &mut misspelled);
+
     // The description is sound; the code may not be there yet. The
     // same `read_node_dir` view the walk and the staging use decides.
     if !has_node_file(&read_node_dir(node_dir)?, "mod.rs") {
-        return Ok(Loaded::Pending { node_type: metadata.node_type });
+        return Ok(Loaded::Pending { node_type: metadata.node_type, misspelled });
     }
 
-    Ok(Loaded::Ready(Box::new(CatalogEntry {
-        node_type: metadata.node_type.clone(),
-        metadata,
-        source_dir: node_dir.to_path_buf(),
-        package_key: package_key.to_path_buf(),
-    })))
+    Ok(Loaded::Ready {
+        entry: Box::new(CatalogEntry {
+            node_type: metadata.node_type.clone(),
+            metadata,
+            source_dir: node_dir.to_path_buf(),
+            package_key: package_key.to_path_buf(),
+        }),
+        misspelled,
+        inherits_apps: inherited.contains("accessApps"),
+    })
+}
+
+/// `error` about the `metadata.json` at `path`, with the one-command
+/// re-sync named when the file sits in a project's copy of the standard
+/// library: a stale `base_catalog` copy is the common way to hold
+/// metadata this weft no longer accepts (a shape serde refuses, a key
+/// dropped or renamed, a setting the language now owns).
+fn stale_copy_hint(path: &Path, error: String) -> String {
+    if path.components().any(|c| c.as_os_str() == "base_catalog") {
+        format!("{error} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
+    } else {
+        error
+    }
 }
 
 // ----- Errors --------------------------------------------------------
@@ -1677,7 +1934,7 @@ mod package_tests {
         assert!(reason.contains("is not ready yet") && reason.contains("no mod.rs yet") && reason.contains(&bare.display().to_string()), "{reason}");
         assert!(cat.unavailable("Nowhere").is_none());
         assert!(cat.problems().is_empty(), "not ready is no problem: {:?}", cat.problems());
-        assert_eq!(cat.warnings().iter().filter(|w| w.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
+        assert_eq!(cat.warnings().iter().filter(|w| w.message.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
         assert_eq!(cat.warnings().len(), 3, "nothing else complained: {:?}", cat.warnings());
     }
 
@@ -1697,7 +1954,339 @@ mod package_tests {
         assert!(cat.lookup("FirstInOrder").is_some());
         assert!(!cat.packages().any(|p| p.name == "fresh"));
         assert_eq!(cat.warnings().len(), 1, "{:?}", cat.warnings());
-        assert!(cat.warnings()[0].contains("has no node in it yet"), "{:?}", cat.warnings());
+        assert!(cat.warnings()[0].message.contains("has no node in it yet"), "{:?}", cat.warnings());
+    }
+
+    /// A project's own node is held to weft's spelling like the stdlib:
+    /// each name that is off is one warning naming the node, its file and
+    /// the fix, and the node still loads. The language's own `_should_flow`
+    /// (as an output: the loader refuses it as an input) and the keys of an
+    /// input's `default` (the node's data) are never flagged.
+    #[test]
+    fn a_project_node_spelled_off_the_weft_way_loads_with_one_warning_per_name() {
+        let root = tempfile::tempdir().expect("temp root");
+        let node = root.path().join("nodes/profile");
+        fs::create_dir_all(&node).expect("mkdir");
+        fs::write(
+            node.join("metadata.json"),
+            r#"{
+                "type": "Profile", "label": "Profile", "description": "d",
+                "inputs": [
+                    {"name": "user_id", "type": "String"},
+                    {"name": "prefs", "type": "JsonDict", "default": {"dark_mode": true}}
+                ],
+                "outputs": [{"name": "_should_flow", "type": "Boolean"}],
+                "features": {"isTrigger": true},
+                "firesWith": {"user_name": "String"}
+            }"#,
+        )
+        .expect("write");
+        fs::write(node.join("mod.rs"), "// impl\n").expect("write");
+
+        let cat = FsCatalog::discover(&root.path().join("nodes")).expect("catalog");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        assert!(cat.lookup("Profile").is_some(), "a spelling warning never leaves the node out");
+        let file = node.join("metadata.json").display().to_string();
+        let mut found: Vec<&str> = cat.warnings().iter().map(|w| w.message.as_str()).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                format!("Profile ({file}): fire payload field 'user_name' is not camelCase: write 'userName'"),
+                format!("Profile ({file}): input 'user_id' is not camelCase: write 'userId'"),
+            ]
+        );
+        assert!(cat.warnings().iter().all(|w| w.kind == WarningKind::Spelling), "{:?}", cat.warnings());
+    }
+
+    /// A package root's defaults are checked once, against the root's own
+    /// file, however many members inherit them.
+    #[test]
+    fn a_package_default_spelled_off_is_one_warning_on_the_package_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let pkg = root.path().join("tools");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"tools\"\n").expect("write");
+        fs::write(
+            pkg.join("metadata.json"),
+            r#"{"firesWith": {"user_name": "String"}, "inputs": [{"name": "user_id", "type": "{ first_name: String }"}]}"#,
+        )
+        .expect("write");
+        // `one` inherits the root's inputs, `two` declares its own (none):
+        // either way, the root's port warns once, on the root.
+        for (ty, own_inputs) in [("One", ""), ("Two", r#""inputs": [], "#)] {
+            let dir = pkg.join(ty.to_lowercase());
+            fs::create_dir_all(&dir).expect("mkdir");
+            fs::write(
+                dir.join("metadata.json"),
+                format!(r#"{{"type": "{ty}", "label": "{ty}", "description": "d", {own_inputs}"outputs": [], "features": {{"isTrigger": true}}}}"#),
+            )
+            .expect("write");
+            fs::write(dir.join("mod.rs"), "// impl\n").expect("write");
+        }
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        let file = pkg.join("metadata.json").display().to_string();
+        let found: Vec<&str> = cat.warnings().iter().map(|w| w.message.as_str()).collect();
+        assert_eq!(
+            found,
+            [
+                format!("package 'tools' defaults ({file}): fire payload field 'user_name' is not camelCase: write 'userName'"),
+                format!("package 'tools' defaults ({file}): input 'user_id' is not camelCase: write 'userId'"),
+                format!("package 'tools' defaults ({file}): record field 'first_name' is not camelCase: write 'firstName'"),
+            ]
+        );
+    }
+
+    /// An app declared under `accessApps` is held to every rule for a
+    /// shipped app and must name a service of this catalog that takes an
+    /// app. A package root's app is reported once, against the root's
+    /// file, and leaves out every member inheriting it; a node's own app
+    /// is reported against its own file. A public app loads.
+    #[test]
+    fn an_access_app_with_a_key_its_service_does_not_declare_is_left_out() {
+        let stdlib = stdlib_root().expect("stdlib root");
+        let load = |app: &str| {
+            let root = tempfile::tempdir().expect("temp root");
+            copy_dir(&stdlib.join("slack"), &root.path().join("slack"));
+            fs::write(root.path().join("slack/metadata.json"), format!(r#"{{"accessApps": {app}}}"#)).expect("write");
+            (FsCatalog::discover(root.path()).expect("catalog"), root)
+        };
+        // The one problem a refused root app makes: the root's file, every
+        // member named, none of them loaded.
+        let one_problem = |cat: &FsCatalog, root: &tempfile::TempDir| -> String {
+            assert_eq!(cat.problems().len(), 1, "{:?}", cat.problems());
+            let problem = &cat.problems()[0];
+            assert!(problem.node_types.len() > 1 && problem.node_types.iter().all(|t| cat.lookup(t).is_none()), "{problem:?}");
+            let file = root.path().join("slack/metadata.json").display().to_string();
+            let error = problem.error.to_string();
+            error.strip_prefix(&format!("parse: {file}: ")).unwrap_or_else(|| panic!("names the root's file: {error}")).to_string()
+        };
+
+        let (cat, root) = load(r#"{"slack": {"label": "Ours", "client_id": "c", "appTokn": "x"}}"#);
+        assert_eq!(
+            one_problem(&cat, &root),
+            "accessApps.slack: the app has a field 'appTokn' its service does not declare (known: label, client_id)"
+        );
+
+        // `appToken` is a field Slack marks secret: a shipped app is public.
+        let (cat, root) = load(r#"{"slack": {"label": "Ours", "client_id": "c", "appToken": "x"}}"#);
+        assert!(one_problem(&cat, &root).starts_with("accessApps.slack: 'appToken' is a secret"));
+
+        let (cat, root) = load(r#"{"slack": {"label": "", "client_id": "c"}}"#);
+        assert_eq!(one_problem(&cat, &root), "accessApps.slack: the app needs a name (shown in the connection list)");
+
+        let (cat, root) = load(r#"{"slak": {"label": "Ours", "client_id": "c"}}"#);
+        assert_eq!(
+            one_problem(&cat, &root),
+            "accessApps.slak: no node in this project declares a service named 'slak' (it declares: slack), so \
+             this app would never be used; name one of those, or remove the app"
+        );
+
+        let (cat, _root) = load(r#"{"slack": {"label": "Ours", "client_id": "c"}}"#);
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+
+        // A node's own app for a service that connects without one: its
+        // own file, itself left out.
+        let root = tempfile::tempdir().expect("temp root");
+        let node = root.path().join("keyed");
+        copy_dir(&stdlib.join("ai/elevenlabs/access"), &node);
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(node.join("metadata.json")).expect("read")).expect("json");
+        meta["accessApps"] = serde_json::json!({ "elevenlabs": { "label": "Ours", "client_id": "c" } });
+        fs::write(node.join("metadata.json"), meta.to_string()).expect("write");
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        let errors: Vec<String> = cat.problems().iter().map(|p| p.error.to_string()).collect();
+        assert_eq!(
+            errors,
+            [format!(
+                "parse: {}: accessApps.elevenlabs: the 'elevenlabs' service connects without an app (only a \
+                 service that signs in through OAuth takes one), so this app would never be used; remove it",
+                node.join("metadata.json").display()
+            )]
+        );
+    }
+
+    /// Copies the standard node at `from` (under the stdlib) to `to`, its
+    /// `metadata.json` changed by `edit`.
+    fn copy_node_editing(from: &str, to: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        copy_dir(&stdlib_root().expect("stdlib root").join(from), to);
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(to.join("metadata.json")).expect("read")).expect("json");
+        edit(&mut meta);
+        fs::write(to.join("metadata.json"), meta.to_string()).expect("write");
+    }
+
+    /// An app naming a service whose every declarer was left out by a
+    /// collision is left out too, told that collision, never "no node in
+    /// this project declares" a service the project does declare. Two
+    /// ways a copied access node takes its service out: as a verbatim copy
+    /// (its type clashes) and renamed (only its service clashes).
+    #[test]
+    fn an_access_app_whose_service_a_collision_took_out_names_that_collision() {
+        for rename in [false, true] {
+            let root = tempfile::tempdir().expect("temp root");
+            copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("slack"));
+            let file = root.path().join("slack/metadata.json");
+            fs::write(&file, r#"{"accessApps": {"slack": {"label": "Ours", "client_id": "c"}}}"#).expect("write");
+            copy_node_editing("slack/access", &root.path().join("slack_copy"), |meta| {
+                if rename {
+                    meta["type"] = "SlackAccessCopy".into();
+                }
+            });
+
+            let cat = FsCatalog::discover(root.path()).expect("catalog");
+            let problems = cat.problems();
+            assert_eq!(problems.len(), 2, "{problems:?}");
+            if rename {
+                assert!(matches!(problems[0].error, CatalogError::ServiceCollision { .. }), "{problems:?}");
+            } else {
+                assert!(matches!(problems[0].error, CatalogError::Collision { .. }), "{problems:?}");
+            }
+            assert_eq!(
+                problems[1].error.to_string(),
+                format!(
+                    "parse: {}: accessApps.slack: every node declaring the 'slack' service was left out, so \
+                     this app has no service to belong to: {}",
+                    file.display(),
+                    problems[0].error
+                )
+            );
+            let members = &problems[1].node_types;
+            assert!(members.contains(&"SlackSendMessage".to_string()), "{members:?}");
+            assert!(members.iter().all(|t| cat.lookup(t).is_none()), "{members:?}");
+        }
+    }
+
+    /// A refused app that takes out the node declaring a service takes out
+    /// every app elsewhere naming that service, each told the first
+    /// refusal: the app checks repeat over what is left until a round
+    /// refuses nothing, so an app is never let through against a service
+    /// that has already left the catalog.
+    #[test]
+    fn an_access_app_whose_service_a_refused_app_took_out_names_that_refusal() {
+        let root = tempfile::tempdir().expect("temp root");
+        copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("slack"));
+        // `SlackAccess` sets no `accessApps` of its own, so it inherits
+        // this bad one and leaves with the rest of the package.
+        fs::write(
+            root.path().join("slack/metadata.json"),
+            r#"{"accessApps": {"slack": {"label": "Ours", "client_id": "c", "appTokn": "x"}}}"#,
+        )
+        .expect("write");
+        let keyed = root.path().join("keyed");
+        copy_node_editing("ai/elevenlabs/access", &keyed, |meta| {
+            meta["accessApps"] = serde_json::json!({ "slack": { "label": "Ours", "client_id": "c" } });
+        });
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        let problems = cat.problems();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].node_types.contains(&"SlackAccess".to_string()), "{problems:?}");
+        assert!(problems[0].error.to_string().ends_with("its service does not declare (known: label, client_id)"));
+        let node_type = cat.problems()[1].node_types.clone();
+        assert!(node_type.len() == 1 && cat.lookup(&node_type[0]).is_none(), "{node_type:?}");
+        assert_eq!(
+            problems[1].error.to_string(),
+            format!(
+                "parse: {}: accessApps.slack: every node declaring the 'slack' service was left out, so \
+                 this app has no service to belong to: {}",
+                keyed.join("metadata.json").display(),
+                problems[0].error
+            )
+        );
+    }
+
+    /// A key still spelled the way it was before it became camelCase is
+    /// refused naming its new spelling, against the file it is written
+    /// in: a package root's once, a stale `base_catalog` copy's with the
+    /// re-sync named.
+    #[test]
+    fn a_renamed_metadata_key_is_refused_against_its_own_file_naming_the_new_spelling() {
+        let root = tempfile::tempdir().expect("temp root");
+        let pkg = root.path().join("tools");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"tools\"\n").expect("write");
+        fs::write(pkg.join("metadata.json"), r#"{"requires_infra": true}"#).expect("write");
+        for ty in ["One", "Two"] {
+            let dir = pkg.join(ty.to_lowercase());
+            fs::create_dir_all(&dir).expect("mkdir");
+            fs::write(
+                dir.join("metadata.json"),
+                format!(r#"{{"type": "{ty}", "label": "{ty}", "description": "d", "inputs": [], "outputs": []}}"#),
+            )
+            .expect("write");
+            fs::write(dir.join("mod.rs"), "// impl\n").expect("write");
+        }
+        let stale = root.path().join("base_catalog/old");
+        fs::create_dir_all(&stale).expect("mkdir");
+        fs::write(
+            stale.join("metadata.json"),
+            r#"{"type": "Old", "label": "Old", "description": "d", "inputs": [{"name": "x", "type": "String", "free_text": true}], "outputs": []}"#,
+        )
+        .expect("write");
+        fs::write(stale.join("mod.rs"), "// impl\n").expect("write");
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        let mut errors: Vec<(Vec<String>, String)> =
+            cat.problems().iter().map(|p| (p.node_types.clone(), p.error.to_string())).collect();
+        errors.sort();
+        assert_eq!(
+            errors,
+            [
+                (
+                    vec!["Old".to_string()],
+                    format!(
+                        "parse: {}: `free_text` (under `inputs.[]`) is spelled `freeText` now: every metadata.json key \
+                         is camelCase, and the old spelling is no longer read. Rename it (a stale base_catalog copy? \
+                         run `weft catalog update` in the project to re-sync it)",
+                        stale.join("metadata.json").display()
+                    ),
+                ),
+                (
+                    vec!["One".to_string(), "Two".to_string()],
+                    format!(
+                        "parse: {}: `requires_infra` is spelled `requiresInfra` now: every metadata.json key is \
+                         camelCase, and the old spelling is no longer read. Rename it",
+                        pkg.join("metadata.json").display()
+                    ),
+                ),
+            ]
+        );
+    }
+
+    /// A type the package root declares is checked where it is declared:
+    /// a field spelled off warns once, on the root, and the members whose
+    /// ports use the type add nothing.
+    #[test]
+    fn a_declared_types_field_spelled_off_warns_once_where_declared() {
+        let root = tempfile::tempdir().expect("temp root");
+        let pkg = root.path().join("tools");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"tools\"\n").expect("write");
+        fs::write(pkg.join("metadata.json"), r#"{"types": {"Place": "{ street_name: String }"}}"#).expect("write");
+        for ty in ["One", "Two"] {
+            let dir = pkg.join(ty.to_lowercase());
+            fs::create_dir_all(&dir).expect("mkdir");
+            fs::write(
+                dir.join("metadata.json"),
+                format!(
+                    r#"{{"type": "{ty}", "label": "{ty}", "description": "d", "inputs": [], "outputs": [{{"name": "place", "type": "Place"}}]}}"#
+                ),
+            )
+            .expect("write");
+            fs::write(dir.join("mod.rs"), "// impl\n").expect("write");
+        }
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        let file = pkg.join("metadata.json").display().to_string();
+        let found: Vec<&str> = cat.warnings().iter().map(|w| w.message.as_str()).collect();
+        assert_eq!(
+            found,
+            [format!("package 'tools' defaults ({file}): record field 'street_name' is not camelCase: write 'streetName'")]
+        );
     }
 
     /// A node whose metadata does not load is left out with its error,
@@ -1870,7 +2459,7 @@ mod package_tests {
     }
 
     /// The compact wiring view stamps each access node's access widget
-    /// with the service name and `connection_optional` from its own
+    /// with the service name and `connectionOptional` from its own
     /// recipe (the same stamp the compiler applies at enrich time),
     /// because the compact view drops the recipe itself and those two
     /// facts are what a wiring reader needs from it: which service,

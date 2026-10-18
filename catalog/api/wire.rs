@@ -6,7 +6,7 @@
 //!     string; `bytes` wants a stored file (weft's one representation
 //!     of bytes), whose content the node reads back.
 //!   - IN (`Route`, `Socket`): an [`InboundMessage`] becomes a port
-//!     value. A byte body is stored as an execution-scoped file and
+//!     value. A byte body is stored as a run-scoped file and
 //!     the stored-file value is what flows.
 //!
 //! Bytes never travel a wire: a picture a caller sends inside a JSON
@@ -24,7 +24,7 @@ use weft::caller::{InboundMessage, LiveRequest, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
 use weft::signal::DataType;
 use weft::storage::{FileHandle, StorageScope, StoredFile};
-use weft::{ExecutionContext, WeftError, WeftResult, WeftType};
+use weft::{RunContext, WeftError, WeftResult, WeftType};
 
 /// The fixed ports both triggers emit from the caller's opening
 /// request. A body key of the same name is shadowed by these (the
@@ -34,7 +34,7 @@ pub const REQUEST_PORTS: &[&str] = &["fired", "method", "path", "params", "query
 /// The opening request the trigger woke on, out of the wake payload.
 /// Both triggers read the same payload, so they read it here and a
 /// payload that is not a request is refused in the same words.
-pub fn opening_request(ctx: &ExecutionContext) -> WeftResult<LiveRequest> {
+pub fn opening_request(ctx: &RunContext) -> WeftResult<LiveRequest> {
     ctx.wake.record().and_then(|v| {
         serde_json::from_value(v)
             .map_err(|e| weft::node_error(format!("the wake payload is not a caller request: {e}")))
@@ -68,7 +68,7 @@ pub fn request_ports(request: &LiveRequest) -> Vec<(&'static str, Value)> {
 /// A port value as the wire wants it for `data_type`. A JSON value's
 /// stored files go out as links (see [`link_files`]).
 pub async fn chunk_for(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     data_type: DataType,
     value: Value,
 ) -> WeftResult<OutboundChunk> {
@@ -92,7 +92,7 @@ pub async fn chunk_for(
                 ))
             })?;
             let (_, bytes) = ctx
-                .storage(StorageScope::Execution)
+                .storage(StorageScope::Run)
                 .get_bytes(&FileHandle::Key(file.key))
                 .await?;
             Ok(OutboundChunk::Bytes(bytes.to_vec()))
@@ -100,7 +100,7 @@ pub async fn chunk_for(
     }
 }
 
-/// An inbound message as a port value. Bytes are stored (execution
+/// An inbound message as a port value. Bytes are stored (run
 /// scope, swept with the run) under `filename`, and the stored-file
 /// value is what flows.
 ///
@@ -117,7 +117,7 @@ pub async fn chunk_for(
 /// port takes the whole message. Bytes that are not that kind fail here,
 /// naming both kinds, rather than inside whatever node reads the file.
 pub async fn value_of(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     message: InboundMessage,
     content_type: Option<&str>,
     filename: &str,
@@ -138,7 +138,7 @@ pub async fn value_of(
                 .or(content_type)
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            ctx.storage(StorageScope::Execution).put(b, &mime, filename, None).await
+            ctx.storage(StorageScope::Run).put(b, &mime, filename, None).await
         }
     }
 }
@@ -146,7 +146,7 @@ pub async fn value_of(
 /// The declared ports of a trigger typed as a file kind (`File`,
 /// `Image`, `Video`, `Audio`, `Blob`, or a union of those): where a
 /// caller's inline bytes are stored on the way in.
-fn file_ports(ctx: &ExecutionContext) -> Vec<(String, WeftType)> {
+fn file_ports(ctx: &RunContext) -> Vec<(String, WeftType)> {
     // A socket's `inbound` is a stream of messages (`Generator[Image]`):
     // the element type is what each message is held to.
     let mut ports: Vec<(String, WeftType)> = ctx
@@ -167,9 +167,9 @@ fn file_ports(ctx: &ExecutionContext) -> Vec<(String, WeftType)> {
 /// they say nothing. The bytes are held to the port's declared kind
 /// (base64 of a video on an `Image` port fails loud). A value that is
 /// already a stored-file marker passes; anything else on a file port
-/// is refused by name. Files land at execution scope, swept with the
+/// is refused by name. Files land at run scope, swept with the
 /// run: the program keeps what it wants at project scope.
-pub async fn inline_files(ctx: &ExecutionContext, output: NodeOutput) -> WeftResult<NodeOutput> {
+pub async fn inline_files(ctx: &RunContext, output: NodeOutput) -> WeftResult<NodeOutput> {
     let mut out = output;
     for (port, declared) in file_ports(ctx) {
         let Some(value) = out.get(&port).cloned() else { continue };
@@ -188,7 +188,7 @@ pub async fn inline_files(ctx: &ExecutionContext, output: NodeOutput) -> WeftRes
                 weft::storage::check_declared_kind(&declared, &bytes).map_err(|why| {
                     weft::node_error(format!("port '{port}': the caller's bytes are not what the port declares: {why}"))
                 })?;
-                ctx.storage(StorageScope::Execution).put(bytes, &mime, &port, None).await?
+                ctx.storage(StorageScope::Run).put(bytes, &mime, &port, None).await?
             }
             Value::Object(_) => {
                 StoredFile::from_value(&value).map_err(|e| {
@@ -229,12 +229,12 @@ fn decode_inline(text: &str) -> Result<(Option<String>, Vec<u8>), String> {
 /// into an `<img>`). Walks lists and objects, so a file nested in a row
 /// is linked too. A file the install cannot mint a link for fails the
 /// node: an answer with no way to the bytes is not an answer.
-pub async fn link_files(ctx: &ExecutionContext, value: Value) -> WeftResult<Value> {
+pub async fn link_files(ctx: &RunContext, value: Value) -> WeftResult<Value> {
     match value {
         Value::Object(map) => {
             if let Ok(file) = StoredFile::from_value(&Value::Object(map.clone())) {
                 let url = ctx
-                    .storage(StorageScope::Execution)
+                    .storage(StorageScope::Run)
                     .caller_link(&FileHandle::Key(file.key.clone()), None)
                     .await?
                     .ok_or_else(|| {
@@ -272,7 +272,7 @@ pub async fn link_files(ctx: &ExecutionContext, value: Value) -> WeftResult<Valu
 /// `answerAs` when set, else the shape the trigger's `dataType` declares.
 /// Apart because what comes in and what goes out differ often: a GET has
 /// no body at all and may still answer a picture as bytes.
-pub fn answer_type(ctx: &ExecutionContext) -> WeftResult<DataType> {
+pub fn answer_type(ctx: &RunContext) -> WeftResult<DataType> {
     match ctx.inputs.opt::<String>("answerAs")?.filter(|raw| !raw.is_empty()) {
         Some(raw) => DataType::parse_field(&raw)
             .map_err(|_| WeftError::Input(format!("answerAs must be json, text or bytes, got '{raw}'"))),

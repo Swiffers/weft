@@ -228,7 +228,7 @@ fn connection(rig: &FakeRig) {
     rig.connection_value("postgres", "password", "secret");
 }
 
-async fn run_query(rig: &FakeRig) -> weft::RunOutcome {
+async fn run_query(rig: &FakeRig) -> weft::RigOutcome {
     rig.run(
         &PostgresExecuteQueryNode,
         json!({
@@ -413,7 +413,7 @@ fn shadowed_columns() -> WeftResult<()> {
 /// A database that hangs up on every connection, so the failure is the
 /// connection's, an outcome of this run, which is what both `error`
 /// tests read.
-async fn refused_query(rig: &FakeRig) -> weft::RunOutcome {
+async fn refused_query(rig: &FakeRig) -> weft::RigOutcome {
     connection(rig);
     rig.connection_value("postgres", "host", "127.0.0.1");
     rig.connection_value("postgres", "port", &rig.hang_up_server().to_string());

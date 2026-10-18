@@ -284,6 +284,7 @@ pub struct ActivateResponse {
 
 /// One address a listener answers on, for the trigger at `node_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivationUrl {
     pub node_id: String,
     pub url: String,
@@ -376,7 +377,7 @@ mod tests {
             "nodes": [
                 {"id": "cron", "nodeType": "T", "config": {}, "position": {"x": 0, "y": 0}, "features": {"isTrigger": true}},
                 {"id": "receive", "nodeType": "T", "config": {}, "position": {"x": 0, "y": 0}, "features": {"isTrigger": true}, "perInstance": "derived"},
-                {"id": "step", "nodeType": "T", "config": {}, "position": {"x": 0, "y": 0}},
+                {"id": "plain", "nodeType": "T", "config": {}, "position": {"x": 0, "y": 0}},
             ],
             "edges": [],
         }))
@@ -420,7 +421,7 @@ mod tests {
             .resolve(&project())
             .unwrap_err();
         assert!(err.contains("name no instance"), "{err}");
-        let err = ActivationScope { triggers: vec!["step".into()], instance: None }.resolve(&project()).unwrap_err();
+        let err = ActivationScope { triggers: vec!["plain".into()], instance: None }.resolve(&project()).unwrap_err();
         assert!(err.contains("not a trigger"), "{err}");
         let one = ActivationScope { triggers: vec!["cron".into()], instance: None }.resolve(&project()).unwrap();
         assert_eq!(one, vec![ActivationKey::new("cron", Owner::Shared)]);

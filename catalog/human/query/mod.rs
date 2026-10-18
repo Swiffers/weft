@@ -1,10 +1,10 @@
-//! HumanQuery: pauses mid-execution waiting for a human form
+//! HumanQuery: pauses mid-run waiting for a human form
 //! submission. Single body: `run` builds a Form signal with
 //! `is_resume=true`, awaits its fire, maps the submission to outputs.
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::form_helpers::{
     build_form, form_specs, map_response_to_ports, parse_form_fields,
@@ -23,7 +23,7 @@ impl Node for HumanQueryNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let raw_fields = parse_form_fields(ctx.inputs.object()?)?;
         let specs = form_specs(self.manifest())?;
 

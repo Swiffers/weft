@@ -87,7 +87,7 @@ pub fn fires(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, cus
 }
 
 /// The message a fired rule shows: `{id}`, `{port}`, `{field}` and
-/// `{custom_outputs}` replaced from the node; `{per_instance_reason}`
+/// `{customOutputs}` replaced from the node; `{perInstanceReason}`
 /// with why it is per instance ("it reads 'blender'", "it sits inside
 /// group 'work', which receives 'blender'"); `{names}` with the names
 /// its `input_names` conditions refuse, each with the full spelling it
@@ -102,11 +102,11 @@ pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, c
     if let Some(f) = &rule.then.field {
         s = s.replace("{field}", f);
     }
-    if s.contains("{custom_outputs}") {
-        s = s.replace("{custom_outputs}", &custom_outputs.join(", "));
+    if s.contains("{customOutputs}") {
+        s = s.replace("{customOutputs}", &custom_outputs.join(", "));
     }
-    if s.contains("{per_instance_reason}") {
-        s = s.replace("{per_instance_reason}", &per_instance_reasons(node, cx).join(", and "));
+    if s.contains("{perInstanceReason}") {
+        s = s.replace("{perInstanceReason}", &per_instance_reasons(node, cx).join(", and "));
     }
     if s.contains("{names}") || s.contains("{with}") {
         let (mut names, mut with_found) = (Vec::new(), Vec::new());
@@ -359,8 +359,8 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
         // `node.field` split at its last dot, the way the runtime reads it:
         // the node may be spelled through its call sites (`one.send.model`).
         Named::Field { instance_filled } => {
-            let Some((step, field)) = spelled.rsplit_once('.') else { return false };
-            let Some(found) = node_at(step).filter(|_| !field.is_empty()) else { return false };
+            let Some((at, field)) = spelled.rsplit_once('.') else { return false };
+            let Some(found) = node_at(at).filter(|_| !field.is_empty()) else { return false };
             let has_field = found.inputs.iter().any(|i| i.name == field) || found.written_value(field).is_some();
             let filled = crate::instance::instance_filled_fields(found).any(|(f, _)| f == field);
             has_field && instance_filled.is_none_or(|wanted| filled == wanted)
@@ -375,14 +375,14 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
 /// (`box` for `work.box`). A field name is matched on its node part.
 fn refused_name(name: &str, cx: &RuleContext, named: Named) -> String {
     let project = cx.project();
-    let (step, field) = match named {
+    let (at, field) = match named {
         Named::Field { .. } => match name.rsplit_once('.') {
-            Some((step, field)) => (step, Some(field)),
+            Some((at, field)) => (at, Some(field)),
             None => return format!("'{name}'"),
         },
         Named::Node { .. } => (name, None),
     };
-    let suffix = format!(".{step}");
+    let suffix = format!(".{at}");
     let meant: BTreeSet<String> = cx
         .places()
         .iter()
@@ -436,7 +436,7 @@ pub fn input_satisfied(node: &NodeDefinition, project: &impl GraphView, port: &s
 /// `null` (data on a nullable port, nothing anywhere else), so a port
 /// this rule calls filled is one the firing sees filled.
 pub fn literal_fills(node: &NodeDefinition, port: &str) -> bool {
-    node.port_literals.get(port).is_some_and(|v| crate::exec::ready::literal_is_data(node, port, v))
+    node.port_literals.get(port).is_some_and(|v| crate::run::ready::literal_is_data(node, port, v))
 }
 
 pub fn has_incoming_edge(node: &NodeDefinition, project: &impl GraphView, port: &str) -> bool {

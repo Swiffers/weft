@@ -1,7 +1,7 @@
 //! Prepare and save trigger settings without arming listeners. The
 //! setup runs on a worker, so a worker built from an older image is
 //! replaced on the way, and `--running-policy` says what happens to
-//! its running executions, exactly as on `weft activate`.
+//! its running runs, exactly as on `weft activate`.
 
 use super::ensure::{parse_running_choice, running_choice};
 use super::Ctx;
@@ -33,7 +33,7 @@ pub async fn run(
         progress.drain_wait(running_policy, drain_timeout);
         progress.dispatcher_call_start(&path);
         let result: serde_json::Value = client.post_json(&path, &serde_json::to_value(&body)?).await?;
-        progress.dispatcher_call_done(serde_json::json!({"project_id": id}));
+        progress.dispatcher_call_done(serde_json::json!({"projectId": id}));
         progress.complete_with("trigger settings saved", result);
         Ok(())
     }).await

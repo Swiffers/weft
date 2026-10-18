@@ -3,15 +3,15 @@
 // Wires together:
 //   - the dispatcher HTTP client (one per extension instance)
 //   - the graph webview that opens when a .weft file is viewed
-//   - the Weft activity-bar sidebar (Projects, Executions)
-//   - the execution follower that bridges dispatcher SSE events
+//   - the Weft activity-bar sidebar (Projects, Runs)
+//   - the run follower that bridges dispatcher SSE events
 //     into graph updates
 //   - the VS Code commands that the sidebar, context menus, and
 //     keybindings trigger
 //
 // One commandCenter owns the "what am I currently looking at" state:
 // a pinned project (derived from the active .weft file) and an
-// optional selected execution. The sidebar items and graph view
+// optional selected run. The sidebar items and graph view
 // talk to the center through shared callbacks.
 
 import * as vscode from 'vscode';
@@ -30,10 +30,10 @@ import { ActionBarStore } from './actionBarState';
 import { fetchRunningSource, installAccess, listTargets, onArgs, type InstallTarget } from './installs';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
-import { ExecutionsProvider, ExecutionNode, RunNode, VersionNode, type ExecutionSummary } from './sidebar/executions';
+import { RunsProvider, RunNode, VersionRunNode, VersionNode, type RunSummary } from './sidebar/runs';
 import { parseRunSearch } from './sidebar/runSearch';
 import { chooseCli, runWeftJson, spawnWeft, WeftCliError } from './cli';
-import { ExecutionFollower } from './execFollower';
+import { RunFollower } from './runFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
 import { Presence } from './presence';
@@ -47,7 +47,7 @@ import {
   parseStatusPayload,
   PROJECT_BEING_REMOVED,
 } from '../../packages/weft-graph/src/status';
-import type { RunningExecution } from '../../packages/weft-graph/src/status';
+import type { GoingRun } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
   // Which `weft` this window runs, and so which install it talks to:
@@ -77,14 +77,14 @@ export function activate(context: vscode.ExtensionContext) {
   const projectsProvider = new ProjectsProvider();
   // Its file watcher dies with the extension rather than outliving it.
   context.subscriptions.push(projectsProvider);
-  const executionsProvider = new ExecutionsProvider(dispatcher, () =>
+  const runsProvider = new RunsProvider(dispatcher, () =>
     pinnedProject ? onArgs(installOf(pinnedProject.id)) : [],
   );
 
   // Single source of truth for which project the UI is "looking at".
   // Sidebar and graph view both read/write through this so they stay
-  // in sync. Which EXECUTION is on screen lives in AutoFollowController
-  // (autoFollow.currentExecutionId()): every follow path updates it there,
+  // in sync. Which RUN is on screen lives in AutoFollowController
+  // (autoFollow.currentRunId()): every follow path updates it there,
   // so nothing shadows it here.
   let pinnedProject: WeftProject | undefined;
 
@@ -135,10 +135,10 @@ export function activate(context: vscode.ExtensionContext) {
     // And which version the followed run ran, for the same reason. A
     // click on "view in graph" for a project that was not open creates
     // this panel and posts that message before the webview is listening.
-    graphView.resendExecVersion();
+    graphView.resendRunVersion();
   });
 
-  const follower = new ExecutionFollower(
+  const follower = new RunFollower(
     dispatcher,
     (msg) => graphView.post(msg),
     presence,
@@ -148,36 +148,36 @@ export function activate(context: vscode.ExtensionContext) {
     follower,
     (msg) => {
       // Mirror autoFollow's followStatus into the action-bar
-      // store so the reducer can compute the watched-live execution.
+      // store so the reducer can compute the watched-live run.
       // Stop button shows iff the user is actually watching a
-      // running execution (pinned execution among the running runs, or
+      // running run (pinned run among the running runs, or
       // latest mode + something running).
       if (msg.kind === 'followStatus' && pinnedProject) {
-        actionBar.setFollow(pinnedProject.id, msg.status.mode, msg.status.executionId);
+        actionBar.setFollow(pinnedProject.id, msg.status.mode, msg.status.runId);
       }
       graphView.post(msg);
     },
     context.workspaceState,
     (ev) => {
-      if (ev.kind === 'execution_started') {
-        actionBar.markExecutionStarted(ev.project_id, ev.execution_id, ev.phase);
+      if (ev.kind === 'run_started') {
+        actionBar.markRunStarted(ev.projectId, ev.runId, ev.phase);
       } else if (
-        ev.kind === 'execution_completed' ||
-        ev.kind === 'execution_failed' ||
-        ev.kind === 'execution_cancelled'
+        ev.kind === 'run_completed' ||
+        ev.kind === 'run_failed' ||
+        ev.kind === 'run_cancelled'
       ) {
-        actionBar.markExecutionFinished(ev.project_id, ev.execution_id);
-      } else if (ev.kind === 'execution_deleted') {
+        actionBar.markRunFinished(ev.projectId, ev.runId);
+      } else if (ev.kind === 'run_deleted') {
         // Another window (or the CLI) erased a run. If it is the one on
         // screen, stop showing it; a run that no longer exists cannot
         // be followed. The local delete already did this before its
         // request went out, so this is a no-op for it.
-        actionBar.markExecutionFinished(ev.project_id, ev.execution_id);
-        if (autoFollow.currentExecutionId() === ev.execution_id) stopShowingRun();
+        actionBar.markRunFinished(ev.projectId, ev.runId);
+        if (autoFollow.currentRunId() === ev.runId) stopShowingRun();
       } else if (ev.kind === 'project_transition_changed') {
         // The event carries the transition; apply it directly so the
         // bar flips without waiting for the status round-trip.
-        actionBar.markTransition(ev.project_id, ev.transition);
+        actionBar.markTransition(ev.projectId, ev.transition);
       }
       scheduleStatusRefresh('sse');
     },
@@ -187,14 +187,14 @@ export function activate(context: vscode.ExtensionContext) {
   // forever (the dispatcher may not be up yet when the graph opens:
   // the first Run boots it; and it can restart mid-session), so a
   // failed first connection never permanently silences auto-follow,
-  // the executions tree, or the action bar. Events missed while the
+  // the runs tree, or the action bar. Events missed while the
   // stream was down are unrecoverable, so every (re)connect resyncs
-  // from authoritative state: refetch status, refetch the executions
-  // list, and hand auto-follow the newest still-running execution.
+  // from authoritative state: refetch status, refetch the runs
+  // list, and hand auto-follow the newest still-running run.
   const projectStream = new ProjectEventStream(dispatcher, presence);
   projectStream.onEvent((ev) => {
     autoFollow.handleEvent(ev);
-    executionsProvider.noteEvent();
+    runsProvider.noteEvent();
   });
   projectStream.onConnect(() => {
     void (async () => {
@@ -208,9 +208,9 @@ export function activate(context: vscode.ExtensionContext) {
       // only when it matches the CURRENT pin: on a mismatch the pin
       // change re-pointed the stream, and the new project's own
       // connect will run this resync correctly.
-      const settled = await executionsProvider.refresh();
+      const settled = await runsProvider.refresh();
       if (settled && settled === pinnedProject?.id) {
-        autoFollow.handleReconnect(executionsProvider.newestRunningFor(settled));
+        autoFollow.handleReconnect(runsProvider.newestRunningFor(settled));
       }
     })();
   });
@@ -277,11 +277,11 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   graphView.setRunHandler((targets) => runPinned(targets));
-  graphView.setNavHandler((group) => executionsProvider.setFocusedGroup(group));
+  graphView.setNavHandler((group) => runsProvider.setFocusedGroup(group));
   graphView.setFollowModeHandler((mode) => {
     autoFollow.setMode(mode);
     // Off takes the run off the canvas, and its version banner with it.
-    if (mode === 'off') graphView.forgetExecVersion();
+    if (mode === 'off') graphView.forgetRunVersion();
   });
 
   /// The run on screen was deleted (here or in another window): take
@@ -290,7 +290,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// back over an empty canvas.
   function stopShowingRun(): void {
     autoFollow.stopShowing();
-    graphView.forgetExecVersion();
+    graphView.forgetRunVersion();
   }
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
   graphView.setTreeVerbHandler((args) => treeVerb(args));
@@ -300,10 +300,10 @@ export function activate(context: vscode.ExtensionContext) {
     // The run on screen was the other install's: forget it before the
     // client moves, so the reconnect's resync lands on a clean follow.
     autoFollow.setProject(pinnedProject.id);
-    graphView.forgetExecVersion();
+    graphView.forgetRunVersion();
     backToLocal(pinnedProject.id);
     void refreshActionBarFromStatus();
-    void executionsProvider.refresh();
+    void runsProvider.refresh();
     postInstallView();
   });
   graphView.setCliStatusHandler(() => refreshActionBarFromStatus());
@@ -333,7 +333,7 @@ export function activate(context: vscode.ExtensionContext) {
     pinnedProject = project;
     void loadInstallTargets(project);
     watchPinnedProjectForDrift();
-    executionsProvider.setPinnedProject(project);
+    runsProvider.setPinnedProject(project);
     projectStream.setProject(project.id);
     autoFollow.setProject(project.id);
     // Tell the action-bar store which slot drives webview
@@ -434,7 +434,7 @@ export function activate(context: vscode.ExtensionContext) {
         // the client moves, so the reconnect's resync lands on a clean
         // follow.
         autoFollow.setProject(project.id);
-        graphView.forgetExecVersion();
+        graphView.forgetRunVersion();
         backToLocal(project.id);
         await graphView.showInstall(doc, project.id, undefined);
       } else {
@@ -449,14 +449,14 @@ export function activate(context: vscode.ExtensionContext) {
         const doc = await vscode.workspace.openTextDocument(entry);
         if (!stillPinned()) return;
         autoFollow.setProject(project.id);
-        graphView.forgetExecVersion();
+        graphView.forgetRunVersion();
         dispatcher.setInstall(access.url, access.operatorKey);
         install = { projectId: project.id, name, version: running.version, diskVersion: null, root: running.dir };
         await graphView.showInstall(doc, project.id, { name, root: running.dir });
         void refreshDiskVersion(project);
       }
       void refreshActionBarFromStatus();
-      void executionsProvider.refresh();
+      void runsProvider.refresh();
     } catch (err) {
       installError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -469,7 +469,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// `sidebar/runSearch` for what it reads). An empty answer shows every
   /// run again; one that does not read is said, and asked again.
   async function searchRuns(): Promise<void> {
-    let value = executionsProvider.currentSearch() ?? '';
+    let value = runsProvider.currentSearch() ?? '';
     for (;;) {
       const text = await vscode.window.showInputBox({
         title: `Search the runs on ${pinnedProject ? installOf(pinnedProject.id) : LOCAL_INSTALL}`,
@@ -478,7 +478,7 @@ export function activate(context: vscode.ExtensionContext) {
       });
       if (text === undefined) return;
       if (!text.trim()) {
-        executionsProvider.setSearch(undefined);
+        runsProvider.setSearch(undefined);
         return;
       }
       const read = parseRunSearch(text, Math.floor(Date.now() / 1000));
@@ -487,7 +487,7 @@ export function activate(context: vscode.ExtensionContext) {
         value = text;
         continue;
       }
-      executionsProvider.setSearch({ text: text.trim(), params: read.params });
+      runsProvider.setSearch({ text: text.trim(), params: read.params });
       return;
     }
   }
@@ -522,9 +522,9 @@ export function activate(context: vscode.ExtensionContext) {
     const name = installOf(project.id);
     if (name === LOCAL_INSTALL) return;
     try {
-      const tree = await runWeftJson<{ disk_version?: string | null }>([...onArgs(name), 'tree', '--json'], project.rootPath);
+      const tree = await runWeftJson<{ diskVersion?: string | null }>([...onArgs(name), 'tree', '--json'], project.rootPath);
       if (installOf(project.id) !== name) return;
-      install = { ...install, diskVersion: tree.disk_version ?? null };
+      install = { ...install, diskVersion: tree.diskVersion ?? null };
       postInstallView();
     } catch (err) {
       getWeftOutputChannel().append(`weft tree: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -548,8 +548,8 @@ export function activate(context: vscode.ExtensionContext) {
     if (found && pinnedProject?.id !== found.id) await pinProject(found);
   }
 
-  /// Bring a project on screen from outside its file (a sidebar row, an
-  /// execution row): its entry as a text tab in the first group and the
+  /// Bring a project on screen from outside its file (a sidebar row, a
+  /// run row): its entry as a text tab in the first group and the
   /// graph beside it, the same layout opening the file by hand gives.
   async function showProject(project: WeftProject): Promise<void> {
     if (pinnedProject?.id !== project.id) await pinProject(project);
@@ -588,7 +588,7 @@ export function activate(context: vscode.ExtensionContext) {
   ///   crash with no event  transitions to error (best-effort msg)
   ///
   /// On success we fire a status refetch to reconcile the bar with
-  /// backend ground truth (run started → execution_running).
+  /// backend ground truth (run started → run_running).
   /// Resolves to the picker intent when the dispatcher refused the verb
   /// for want of a trigger-deactivation choice (the bar is cleared, the
   /// caller opens the picker), and to `undefined` otherwise.
@@ -667,8 +667,8 @@ export function activate(context: vscode.ExtensionContext) {
       if (stopHandled()) return;
       // Pre-flight gate (PREFLIGHT_VERBS, the verbs that ship the project
       // somewhere): a runtime-mode validation of the saved entry file
-      // catches "not ready to run" findings (unpicked connections and the
-      // like) in seconds, before any build. Findings land on the action
+      // catches "not ready to run" findings (a provider with no model named,
+      // and the like) in seconds, before any build. Findings land on the action
       // bar's error banner and the verb is never sent. A gate that cannot
       // run refuses the verb too: running unchecked would hide the very
       // failures the gate exists to catch.
@@ -714,7 +714,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
     // Arm follow-latest for the verbs that start a lifecycle, HERE, past
     // every refusal above: an aborted click must not throw away the
-    // execution view the user had pinned.
+    // run view the user had pinned.
     if (
       verb === 'activate'
       || verb === 'resync'
@@ -738,21 +738,21 @@ export function activate(context: vscode.ExtensionContext) {
         // child wrote the line, so the bar can tell a late word from a
         // previous verb apart from the running one's.
         actionBar.cliEvent(projectId, ev.verb === undefined ? { ...ev, verb: verbTag } : ev);
-        // A run's dispatcher reply carries the fresh execution's
-        // execution: follow it from HERE, the run's own reply channel,
+        // A run's dispatcher reply carries the fresh run's
+        // run: follow it from HERE, the run's own reply channel,
         // never from the project SSE alone. On a brand-new project
-        // registration lands milliseconds before the execution
+        // registration lands milliseconds before the run
         // starts (the image builds first), so a subscriber that can
         // only attach after registration structurally misses the
-        // first run's execution_started event.
+        // first run's run_started event.
         if (
           verb === 'run' &&
           ev.phase === 'dispatcher_call_done' &&
-          typeof ev.detail?.execution_id === 'string' &&
-          ev.detail?.project_id === projectId &&
+          typeof ev.detail?.runId === 'string' &&
+          ev.detail?.projectId === projectId &&
           pinnedProject?.id === projectId
         ) {
-          autoFollow.followStartedByUser(ev.detail.execution_id);
+          autoFollow.followStartedByUser(ev.detail.runId);
         }
       }, (text) => actionBar.cliLog(projectId, verbTag, text));
     } catch (err) {
@@ -772,7 +772,7 @@ export function activate(context: vscode.ExtensionContext) {
       // when they pin back.
       void refreshActionBarFromStatus(projectId, projectRoot);
       if (pinnedProject?.id === projectId) {
-        void executionsProvider.refresh();
+        void runsProvider.refresh();
       }
     }
     return needsTriggerChoice ? triggerChoiceIntent(verbTag) : undefined;
@@ -872,10 +872,10 @@ export function activate(context: vscode.ExtensionContext) {
   ///   - A `weft <verb>` CLI is in flight (cli_running). Kill the
   ///     spawned CLI process group. cargo / docker / kind
   ///     grandchildren die with it.
-  ///   - A live execution exists on the project the user is
-  ///     watching (watched-live executionId). POST cancel for that
-  ///     execution. The dispatcher tears down the worker, journals
-  ///     ExecutionFailed { error: "cancelled" }, broadcasts on SSE.
+  ///   - A live run exists on the project the user is
+  ///     watching (watched-live runId). POST cancel for that
+  ///     run. The dispatcher tears down the worker, journals
+  ///     RunFailed { error: "cancelled" }, broadcasts on SSE.
   ///
   /// Both can be true simultaneously: `weft run` spawns a worker
   /// then keeps streaming logs. Stopping the CLI alone leaves the
@@ -902,22 +902,22 @@ export function activate(context: vscode.ExtensionContext) {
         actedOn = true;
       }
     }
-    const liveExecutionId = actionBar.watchedRunningExecutionId(projectId);
-    if (liveExecutionId) {
+    const liveRunId = actionBar.watchedRunningRunId(projectId);
+    if (liveRunId) {
       // HTTP cancel: lock the bar into "Cancelling..." until SSE
-      // confirms. The dispatcher enqueues a cancel_execution task;
-      // the worker fires its per-execution Notify; the loop driver
+      // confirms. The dispatcher enqueues a cancel_run task;
+      // the worker fires its per-run Notify; the loop driver
       // exits Failed { error: "cancelled" }; the journal bridge
-      // publishes ExecutionFailed to SSE; the store's
-      // markExecutionFinished clears pendingAction.
-      actionBar.setPending(projectId, 'run', 'Cancelling...', liveExecutionId);
-      channel.appendLine(`> cancel execution ${liveExecutionId}`);
-      dispatcher.post(`/executions/${liveExecutionId}/cancel`, {}).catch((err) => {
+      // publishes RunFailed to SSE; the store's
+      // markRunFinished clears pendingAction.
+      actionBar.setPending(projectId, 'run', 'Cancelling...', liveRunId);
+      channel.appendLine(`> cancel run ${liveRunId}`);
+      dispatcher.post(`/runs/${liveRunId}/cancel`, {}).catch((err) => {
         channel.appendLine(`! cancel failed: ${err}`);
         if (err instanceof HttpError && err.status === 409) {
           // The run had already ended (its terminal event never
           // reached us): it is finished, and the bar says so.
-          actionBar.markExecutionFinished(projectId, liveExecutionId);
+          actionBar.markRunFinished(projectId, liveRunId);
           return;
         }
         // Network failure: revert the pending state so the user
@@ -932,7 +932,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  /// Per-project CLI tracking. Keyed by project_id so concurrent
+  /// Per-project CLI tracking. Keyed by project id so concurrent
   /// verbs on different projects don't race each other's
   /// userKilled flag or process handle.
   /// Projects with a verb anywhere between the click and the CLI
@@ -983,11 +983,11 @@ export function activate(context: vscode.ExtensionContext) {
 
   interface StatusResult {
     snapshot: import('../../packages/weft-graph/src/protocol').ActionAvailability;
-    /// Every execution running right now, per the dispatcher. The
+    /// Every run running right now, per the dispatcher. The
     /// bar's running set is REPLACED with this: SSE drives the same
     /// transitions during a live session, the fetch is the truth
     /// that catches whatever the stream lost.
-    running: RunningExecution[];
+    running: GoingRun[];
   }
 
   /// Run `weft status --json` for a specific project root and
@@ -1070,7 +1070,7 @@ export function activate(context: vscode.ExtensionContext) {
       };
     }
     try {
-      // The remap lives in the shared package (`parseStatusPayload`)
+      // The parse lives in the shared package (`parseStatusPayload`)
       // so every host builds the exact same snapshot.
       const json = JSON.parse(out) as import('../../packages/weft-graph/src/status').RawStatusPayload;
       const result = {
@@ -1125,9 +1125,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   /// Refresh the action bar's view of backend ground truth for a
   /// specific project. One `weft status --json` call yields both
-  /// the snapshot (drift + available_actions + infra rollup) and
-  /// the active execution, so the bar can enter
-  /// execution_running on graph open / project pin without waiting
+  /// the snapshot (drift + availableActions + infra rollup) and
+  /// the active run, so the bar can enter
+  /// run_running on graph open / project pin without waiting
   /// for an SSE event.
   ///
   /// Defaults to the pinned project. Pass an explicit (id, root)
@@ -1418,14 +1418,14 @@ export function activate(context: vscode.ExtensionContext) {
     return weftOutputChannel;
   }
 
-  async function viewExecution(summary: Pick<ExecutionSummary, 'project_id' | 'execution_id'>, version?: string): Promise<void> {
-    // Find (or hint) the project that produced this execution and
+  async function viewRun(summary: Pick<RunSummary, 'projectId' | 'runId'>, version?: string): Promise<void> {
+    // Find (or hint) the project that produced this run and
     // switch the graph to it, then pin auto-follow on it. The
     // controller handles the replay itself.
-    const match = projectsProvider.projects().find((p) => p.id === summary.project_id);
+    const match = projectsProvider.projects().find((p) => p.id === summary.projectId);
     if (!match) {
       void vscode.window.showErrorMessage(
-        `Weft: the project this run belongs to (${summary.project_id || 'unknown'}) is not one of the ` +
+        `Weft: the project this run belongs to (${summary.projectId || 'unknown'}) is not one of the ` +
           'Weft projects open here, so there is no graph to show it on. Open its folder first.',
       );
       return;
@@ -1434,12 +1434,12 @@ export function activate(context: vscode.ExtensionContext) {
     // the pin changes, and puts the entry file and its graph in front
     // either way, so a closed or buried panel comes back.
     await showProject(match);
-    autoFollow.lockTo(summary.execution_id);
+    autoFollow.lockTo(summary.runId);
     // A run opened from the version tree tells the graph which version
     // it ran and which one the disk is, so it can say when they differ.
     if (version !== undefined) {
-      const tree = executionsProvider.currentTree();
-      graphView.setExecVersion(summary.execution_id, version, tree?.disk_version ?? null);
+      const tree = runsProvider.currentTree();
+      graphView.setRunVersion(summary.runId, version, tree?.diskVersion ?? null);
     }
   }
 
@@ -1456,7 +1456,7 @@ export function activate(context: vscode.ExtensionContext) {
         [...onArgs(installOf(pinnedProject.id)), ...args, '--json'],
         pinnedProject.rootPath,
       );
-      await executionsProvider.refresh();
+      await runsProvider.refresh();
       return out;
     } catch (err) {
       void vscode.window.showErrorMessage(`weft ${args.join(' ')}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1464,12 +1464,12 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  /// The version or run a tree item names (a version by id, a run by executionId).
-  function treeReference(n: VersionNode | RunNode): string {
-    return n instanceof VersionNode ? n.node.version.id : n.run.execution_id;
+  /// The version or run a tree item names (a version by id, a run by runId).
+  function treeReference(n: VersionNode | VersionRunNode): string {
+    return n instanceof VersionNode ? n.node.version.id : n.run.runId;
   }
 
-  async function branchHere(n: VersionNode | RunNode): Promise<void> {
+  async function branchHere(n: VersionNode | VersionRunNode): Promise<void> {
     const reference = treeReference(n);
     const out = await treeVerb(['branch', reference]);
     if (out) void vscode.window.showInformationMessage(`Weft: branched to ${reference.slice(0, 8)}; the files on disk are that version now.`);
@@ -1495,31 +1495,31 @@ export function activate(context: vscode.ExtensionContext) {
     await treeVerb(['prune', id, '--yes']);
   }
 
-  async function diffWithHead(n: RunNode): Promise<void> {
-    const head = executionsProvider.currentTree()?.head.head_run;
+  async function diffWithHead(n: VersionRunNode): Promise<void> {
+    const head = runsProvider.currentTree()?.head.headRun;
     if (!head) {
       void vscode.window.showInformationMessage('Weft: head has no run to diff against.');
       return;
     }
-    const out = await treeVerb(['diff', n.run.execution_id, head, '--full']);
+    const out = await treeVerb(['diff', n.run.runId, head, '--full']);
     if (!out) return;
     const channel = getWeftOutputChannel();
-    channel.appendLine(`weft diff ${n.run.execution_id.slice(0, 8)} ${head.slice(0, 8)}`);
+    channel.appendLine(`weft diff ${n.run.runId.slice(0, 8)} ${head.slice(0, 8)}`);
     channel.appendLine(JSON.stringify(out, null, 2));
     channel.show(true);
   }
 
-  async function freezeRun(n: RunNode): Promise<void> {
+  async function freezeRun(n: VersionRunNode): Promise<void> {
     const name = await vscode.window.showInputBox({ prompt: 'Example name (writes examples/<name>.json from this run)' });
     if (!name) return;
-    const out = await treeVerb(['freeze', name, n.run.execution_id]);
-    if (out) void vscode.window.showInformationMessage(`Weft: froze examples/${name}.json from ${n.run.execution_id.slice(0, 8)}.`);
+    const out = await treeVerb(['freeze', name, n.run.runId]);
+    if (out) void vscode.window.showInformationMessage(`Weft: froze examples/${name}.json from ${n.run.runId.slice(0, 8)}.`);
   }
 
   /** Returns true when the row is gone. False = the delete was
    *  blocked or failed and an error was already shown (clearAll uses
    *  this to stop instead of stacking one dialog per row). */
-  async function deleteExecution(summary: ExecutionSummary): Promise<boolean> {
+  async function deleteRun(summary: RunSummary): Promise<boolean> {
     if (summary.status.toLowerCase() === 'running') {
       // Cancel first so the runtime stops emitting new events and
       // drops pulses, then delete the journal. The cancel is the
@@ -1528,65 +1528,65 @@ export function activate(context: vscode.ExtensionContext) {
       // loudly instead. (A stale 'running' label on a run that has
       // ended answers 409: nothing to cancel, so the delete goes on.)
       try {
-        await dispatcher.post(`/executions/${summary.execution_id}/cancel`, {});
+        await dispatcher.post(`/runs/${summary.runId}/cancel`, {});
       } catch (err) {
         if (!(err instanceof HttpError && err.status === 409)) {
           void vscode.window.showErrorMessage(
-            `Could not cancel ${summary.execution_id}, so it was not deleted (it is still running): ${err}`,
+            `Could not cancel ${summary.runId}, so it was not deleted (it is still running): ${err}`,
           );
           return false;
         }
       }
     }
-    // If the graph is streaming exactly this execution, drop the
-    // follow through the controller (which owns the followed executionId)
+    // If the graph is streaming exactly this run, drop the
+    // follow through the controller (which owns the followed runId)
     // so its state and the webview's pill stay consistent.
-    if (autoFollow.currentExecutionId() === summary.execution_id) {
+    if (autoFollow.currentRunId() === summary.runId) {
       stopShowingRun();
     }
     let deleted = true;
     try {
-      await dispatcher.del(`/executions/${summary.execution_id}`);
+      await dispatcher.del(`/runs/${summary.runId}`);
     } catch (err) {
       void vscode.window.showErrorMessage(`Delete failed: ${err}`);
       deleted = false;
     }
-    // The dispatcher's execution_deleted event reaches every window,
+    // The dispatcher's run_deleted event reaches every window,
     // this one included; the direct re-reads are for this window to
     // see the result at once rather than after the stream's debounce.
     // The bar is part of it: a run parked on a question was preserved
     // state, and its Run button was hidden behind that until now.
-    await Promise.all([executionsProvider.refresh(), refreshActionBarFromStatus()]);
+    await Promise.all([runsProvider.refresh(), refreshActionBarFromStatus()]);
     return deleted;
   }
 
-  async function clearAllExecutions(): Promise<void> {
+  async function clearAllRuns(): Promise<void> {
     const confirm = await vscode.window.showWarningMessage(
-      'Delete all executions? Running ones will be cancelled first.',
+      'Delete all runs? Running ones will be cancelled first.',
       { modal: true },
       'Delete all',
     );
     if (confirm !== 'Delete all') return;
-    const all = executionsProvider.summaries();
+    const all = runsProvider.summaries();
     for (const s of all) {
       // Stop on the first failure: its dialog is already up, and
       // marching on would stack one more per remaining row.
-      if (!(await deleteExecution(s))) return;
+      if (!(await deleteRun(s))) return;
     }
   }
 
   // Register sidebar views + commands.
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('weft.projects', projectsProvider),
-    vscode.window.registerTreeDataProvider('weft.executions', executionsProvider),
-    // Close the executions tree's SSE subscription on extension
+    vscode.window.registerTreeDataProvider('weft.runs', runsProvider),
+    // Close the runs tree's SSE subscription on extension
     // shutdown so reloading VS Code doesn't pile up stale streams
     // against the dispatcher.
-    { dispose: () => executionsProvider.dispose() },
+    { dispose: () => runsProvider.dispose() },
     { dispose: () => projectStream.dispose() },
 
     vscode.commands.registerCommand('weft.refreshProjects', () => projectsProvider.refresh()),
-    vscode.commands.registerCommand('weft.refreshExecutions', () => executionsProvider.refresh()),
+    vscode.commands.registerCommand('weft.refreshRuns', () => runsProvider.refresh()),
     vscode.commands.registerCommand('weft.openInEditor', (p: ProjectNode | WeftProject) => {
       const project = 'project' in p ? p.project : p;
       return showProject(project);
@@ -1600,24 +1600,24 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('weft.stopProject', () => stopAction()),
 
-    vscode.commands.registerCommand('weft.viewExecution', (n: ExecutionNode | RunNode | ExecutionSummary) =>
-      n instanceof RunNode ? viewExecution(n.summary, n.versionId) : viewExecution('summary' in n ? n.summary : n),
+    vscode.commands.registerCommand('weft.viewRun', (n: RunNode | VersionRunNode | RunSummary) =>
+      n instanceof VersionRunNode ? viewRun(n.summary, n.versionId) : viewRun('summary' in n ? n.summary : n),
     ),
-    vscode.commands.registerCommand('weft.toggleExecutionsMode', () => executionsProvider.toggleMode()),
+    vscode.commands.registerCommand('weft.toggleRunsMode', () => runsProvider.toggleMode()),
     vscode.commands.registerCommand('weft.searchRuns', () => searchRuns()),
-    vscode.commands.registerCommand('weft.clearRunSearch', () => executionsProvider.setSearch(undefined)),
+    vscode.commands.registerCommand('weft.clearRunSearch', () => runsProvider.setSearch(undefined)),
     vscode.commands.registerCommand('weft.showRunsOn', () => showRunsOn()),
-    vscode.commands.registerCommand('weft.branchHere', (n: VersionNode | RunNode) => branchHere(n)),
+    vscode.commands.registerCommand('weft.branchHere', (n: VersionNode | VersionRunNode) => branchHere(n)),
     vscode.commands.registerCommand('weft.checkpointLabel', () => checkpointLabel()),
     vscode.commands.registerCommand('weft.pruneVersion', (n: VersionNode) => pruneVersion(n)),
-    vscode.commands.registerCommand('weft.diffWithHead', (n: RunNode) => diffWithHead(n)),
-    vscode.commands.registerCommand('weft.freezeRun', (n: RunNode) => freezeRun(n)),
-    vscode.commands.registerCommand('weft.deleteExecution', (n: ExecutionNode | ExecutionSummary) =>
-      deleteExecution('summary' in n ? n.summary : n),
+    vscode.commands.registerCommand('weft.diffWithHead', (n: VersionRunNode) => diffWithHead(n)),
+    vscode.commands.registerCommand('weft.freezeRun', (n: VersionRunNode) => freezeRun(n)),
+    vscode.commands.registerCommand('weft.deleteRun', (n: RunNode | RunSummary) =>
+      deleteRun('summary' in n ? n.summary : n),
     ),
-    vscode.commands.registerCommand('weft.clearExecutions', () => clearAllExecutions()),
-    vscode.commands.registerCommand('weft.loadMoreExecutions', () =>
-      executionsProvider.loadMore(),
+    vscode.commands.registerCommand('weft.clearRuns', () => clearAllRuns()),
+    vscode.commands.registerCommand('weft.loadMoreRuns', () =>
+      runsProvider.loadMore(),
     ),
 
     // The two title-bar buttons on a `.weft` text editor (package.json
@@ -1778,7 +1778,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Kick off first refreshes in the background.
   void projectsProvider.refresh();
-  void executionsProvider.refresh();
+  void runsProvider.refresh();
 }
 
 export function deactivate() {}

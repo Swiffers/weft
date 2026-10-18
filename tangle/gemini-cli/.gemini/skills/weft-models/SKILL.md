@@ -11,9 +11,9 @@ what it is given and what comes back. And [params], the node wired into
 an LLM node's `params` input, says how it thinks: everything below that
 is not about the prompt is a setting on it.
 
-If you need a real model id for the provider node, run `weft options <step>
+If you need a real model id for the provider node, run `weft options <node>
 model --search <text>` from the project, with the provider node's name as
-`<step>`. It prints one `id  label` line per matching model, the same list
+`<node>`. It prints one `id  label` line per matching model, the same list
 the editor's search shows, read through the connection picked on that node,
 and the id is what you write in `model`. Never guess an id, and never ask the
 provider's API yourself.
@@ -41,7 +41,7 @@ effort) when you picked none.
 
 There is no retry behind either failure: the fix is one edit on [params].
 Most modern models reason, so on a model you do not know you start with
-`true` and raise the effort only for the one step that needs
+`true` and raise the effort only for the one node that needs
 it.
 
 A prompt that asks the model for its thinking inside the answer (a
@@ -77,11 +77,11 @@ Rough magnitudes for choosing, never for billing:
 - A large model answers in several seconds and costs ten to fifty times
   more per token. You use it where the answer is the product.
 - A reasoning model at high effort takes tens of seconds to minutes and
-  bills every reasoning token. You use it for one hard step. If you catch
+  bills every reasoning token. You use it for one hard node. If you catch
   yourself wiring it into every turn of a conversation, stop and write:
-  "Wait. One hard step." Then give that one step its own [params] node.
+  "Wait. One hard node." Then give that one node its own [params] node.
 
-Two nodes wired to one [params] share every setting; a step that
+Two nodes wired to one [params] share every setting; a node that
 needs a different model or effort gets its own [params] node, with a
 comment saying why.
 

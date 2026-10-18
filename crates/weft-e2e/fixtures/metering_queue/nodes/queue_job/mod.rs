@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use weft_providers::providers::JsonBodyObservation;
 use weft_providers::{
     CallObservation, FollowUp, MeasuredCost, ObservedCall, Pricing, ProviderMeter, RouteClass,
@@ -44,7 +44,7 @@ pub struct QueueJobNode;
 
 #[async_trait]
 impl Node for QueueJobNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let read_back: bool = ctx.inputs.get_or("readBack", false)?;
         let account = ctx.inputs.get("connection")?;
         let conn = ctx.open(&account).await?;

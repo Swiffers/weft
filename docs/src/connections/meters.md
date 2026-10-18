@@ -1,7 +1,7 @@
 # Measuring what a call costs
 
 A node never states a cost. It never totals anything, never carries a running
-figure between steps, and never works out whose spend a call was.
+figure from one call to the next, and never works out whose spend a call was.
 
 A **meter** does that, once per provider, wrapped around the client your node
 already uses. All the care lives in one place so a node author can be careless:

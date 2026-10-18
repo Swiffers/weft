@@ -1,4 +1,4 @@
-//! Pub/sub for project and execution events. Two layers:
+//! Pub/sub for project and run events. Two layers:
 //!
 //!   - **Per-process broadcast** (`EventBus`): SSE handlers subscribe;
 //!     local publishers push directly. Tokio `broadcast::Sender` keyed
@@ -18,7 +18,7 @@
 //! each process publishes them to its own broadcast. The NOTIFY channel
 //! only carries the smaller cross-cutting events that have no row to read:
 //! ProjectRegistered, ProjectActivated, ProjectDeactivated,
-//! TriggerUrlChanged, ExecutionDeleted. These fit inside Postgres NOTIFY's
+//! TriggerUrlChanged, RunDeleted. These fit inside Postgres NOTIFY's
 //! 8000-byte payload cap with room to spare.
 
 use std::collections::HashMap;
@@ -97,9 +97,9 @@ impl EventBus {
     /// Push locally AND issue NOTIFY so sibling processes receive it.
     /// Used for the events that don't ride the journal:
     /// ProjectRegistered/Activated/Deactivated, TriggerUrlChanged and
-    /// ExecutionDeleted (the one execution event with no record row
+    /// RunDeleted (the one run event with no record row
     /// to ride, the record being what was deleted). Every other
-    /// execution event comes only through the live view, keeping its
+    /// run event comes only through the live view, keeping its
     /// identity across history and live delivery.
     pub async fn publish(&self, event: DispatcherEvent) {
         let event = IdentifiedEvent::transient(event);

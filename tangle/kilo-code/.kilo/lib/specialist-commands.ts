@@ -3,7 +3,7 @@
 // The lists live in `.kilo/specialist_commands.json`, a key per agent name
 // (the file name under `.kilo/agent/`), and under it the commands that agent
 // may run, each as the words a command starts with ("weft events" allows
-// `weft events <run id> --node x`). `.kilo/plugin/specialist-commands.ts`
+// `weft events <run-id> --node x`). `.kilo/plugin/specialist-commands.ts`
 // calls `refusal` before every shell command a specialist runs.
 //
 // The shapes refused for every specialist, whatever its list says:

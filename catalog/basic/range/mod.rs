@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use serde_json::{Number, Value};
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -28,7 +28,7 @@ impl Node for RangeNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // `from`/`step` declare metadata defaults, so the bag always
         // holds values; required reads keep each default in ONE place.
         let from: f64 = ctx.inputs.get("from")?;

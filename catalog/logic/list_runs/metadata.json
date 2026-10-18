@@ -5,7 +5,7 @@
   "tags": [
     "flow",
     "runs",
-    "executions",
+    "runs",
     "tag",
     "list"
   ],
@@ -63,7 +63,7 @@
     {
       "name": "runs",
       "type": "List[JsonDict]",
-      "description": "One entry per run, newest first: `{ execution_id, project_id, entry_node, status, phase, started_at, completed_at, tags, cancel_cause, error?, skipped_nodes, instance? }`. `status` is `running`, `waiting_for_input` (parked on a wait), `completed`, `failed` or `cancelled`; a `failed` run carries `error`, what failed it; times are unix seconds."
+      "description": "One entry per run, newest first: `{ runId, projectId, entryNode, status, phase, startedAt, completedAt, tags, cancelCause, error?, skippedNodes, instance? }`. `status` is `running`, `waiting_for_input` (parked on a wait), `completed`, `failed` or `cancelled`; a `failed` run carries `error`, what failed it; times are unix seconds."
     },
     {
       "name": "total",

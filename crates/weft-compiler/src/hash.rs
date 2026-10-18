@@ -31,7 +31,7 @@
 //!
 //!   NOT hashed: per-node config values, edges, node ids, positions.
 //!   Those live in the `ProjectDefinition` the worker fetches from
-//!   the broker at execution claim time; they no longer reach the
+//!   the broker at run claim time; they no longer reach the
 //!   binary via `include_str!`.
 //!
 //! - **`compute_definition_hash`**: hashes the runtime project
@@ -46,7 +46,7 @@
 //!
 //! - **`compute_infra_hash`**: hashes everything that affects the
 //!   running infrastructure. Drives the upgrade prompt. Scoped to
-//!   the infra closure (every `requires_infra` node + every node
+//!   the infra closure (every `requiresInfra` node + every node
 //!   upstream of one). Inputs:
 //!     - graph definition: the closure's slice of the canonical
 //!       `ProjectDefinition` (its nodes' configs + the edges among
@@ -432,7 +432,7 @@ mod fs_hashes {
     }
 
     /// Hash everything that affects the running infrastructure.
-    /// Scoped to the infra closure: every node where `requires_infra` is
+    /// Scoped to the infra closure: every node where `requiresInfra` is
     /// true plus every node upstream of one (the chain that produces the
     /// inputs the infra node consumes during InfraSetup).
     pub fn compute_infra_hash(
@@ -786,7 +786,7 @@ mod fs_hashes {
             let initial = hash(&graph);
             assert_eq!(hash(&graph), initial);
             graph.nodes[0].config = serde_json::json!({"value":"after"});
-            assert_eq!(hash(&graph), initial, "config belongs to the execution definition");
+            assert_eq!(hash(&graph), initial, "config belongs to the run definition");
             graph.nodes[0].node_type = "Format".into();
             assert_eq!(hash(&graph), initial, "all catalog implementations were already compiled");
         }
@@ -938,7 +938,7 @@ mod tests {
     /// hashed them verbatim, every CLI invocation would produce a
     /// different hash for the same source, the resync drift signal
     /// would always light, and the worker's per-hash definition
-    /// cache would miss on every execution. The hash must depend
+    /// cache would miss on every run. The hash must depend
     /// only on the semantic shape.
     #[test]
     fn definition_hash_is_stable_across_timestamps() {

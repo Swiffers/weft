@@ -376,7 +376,7 @@ async fn completion(rig: FakeRig) -> WeftResult<()> {
     assert!(!outcome.outputs.contains_key("toolCalls"), "no tools, no toolCalls pulse");
     // A one-shot call with nothing reading a conversation keeps none.
     assert!(!outcome.outputs.contains_key("historyFile"));
-    assert!(rig.stored_files(&StorageScope::Execution)?.is_empty(), "no file for a one-shot call");
+    assert!(rig.stored_files(&StorageScope::Run)?.is_empty(), "no file for a one-shot call");
 
     let sent = rig.requests();
     assert_eq!(sent.len(), 1);

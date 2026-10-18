@@ -262,11 +262,11 @@ impl ReadMessage {
 }
 
 /// Fetch one message (format=full) and decompose it: the best text
-/// body, and (optionally) every attachment pulled into execution
+/// body, and (optionally) every attachment pulled into run
 /// storage. Shared by the get node and the new-email trigger so the
 /// two emit identical shapes.
 pub async fn read_message(
-    ctx: &weft::ExecutionContext,
+    ctx: &weft::RunContext,
     http: &weft::reqwest_middleware::ClientWithMiddleware,
     id: &str,
     include_attachments: bool,
@@ -294,7 +294,7 @@ pub async fn read_message(
         // an attachmentId to fetch separately.
         let mut leaves = Vec::new();
         walk_parts(payload, &mut |leaf| leaves.push(leaf.clone()));
-        let storage = ctx.storage(weft::storage::StorageScope::Execution);
+        let storage = ctx.storage(weft::storage::StorageScope::Run);
         for leaf in leaves {
             let filename = leaf["filename"].as_str().unwrap_or_default();
             if filename.is_empty() {

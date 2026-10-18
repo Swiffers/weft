@@ -2083,7 +2083,7 @@ fn a_file_included_twice_compiles_once() {
 }
 
 /// Two calls of one file in a chain (`two.raw = one.cleaned`) are two
-/// steps, not a cycle, and the body's In taking one wire per site is not
+/// calls in a row, not a cycle, and the body's In taking one wire per site is not
 /// two drivers of one port: the strict pipeline accepts the program.
 #[test]
 fn chained_calls_of_one_file_validate() {
@@ -2496,7 +2496,7 @@ fn duplicate_config_key_is_loud() {
 /// field is lowered on its own, so the guard is the braces walk's.
 #[test]
 fn a_duplicate_setting_or_gate_in_a_containers_braces_is_loud() {
-    let loop_twice = "l = Loop(items: List[String]) -> (out: List[String | Null]) {\n  parallel: true\n  parallel: false\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\n";
+    let loop_twice = "l = Loop(items: List[String]) -> (out: List[String | Null]) {\n  parallel: true\n  parallel: false\n  echo = Text {}\n  echo.value = self.items\n  self.out = echo.value\n}\n";
     let (_p, errs) = compile_lenient(loop_twice, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs.iter().any(|e| e.message.contains("duplicate config field 'parallel'")), "two settings: {errs:?}");
 
@@ -2973,7 +2973,7 @@ fn a_value_lands_on_an_input_and_nowhere_else() {
         &["cannot carry a wire", "declare an input port per value"],
     );
     refused(
-        "s = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: s.value\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\n",
+        "s = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: s.value\n  echo = Text {}\n  echo.value = self.items\n  self.out = echo.value\n}\n",
         "wire on a loop knob",
         &["a setting in the braces takes a written value only", "l.<port> = ..."],
     );
@@ -3139,9 +3139,9 @@ fn should_flow_in_a_group_body_lands_on_the_in_boundary() {
 outer = Group(x: String) -> (y: String) {
     _should_flow: false
 
-    step = Template { template: "{{x}}" }
-    step.value = self.x
-    self.y = step.output
+    echo = Template { template: "{{x}}" }
+    echo.value = self.x
+    self.y = echo.output
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
@@ -3161,9 +3161,9 @@ check = Debug {}
 outer = Group(x: String) -> (y: String) {
     _should_flow: check.data
 
-    step = Template { template: "{{x}}" }
-    step.value = self.x
-    self.y = step.output
+    echo = Template { template: "{{x}}" }
+    echo.value = self.x
+    self.y = echo.output
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
@@ -3185,9 +3185,9 @@ each = Loop(items: List[String]) -> (out: List[String]) {
     over: ["items"]
     _should_flow: false
 
-    step = Template { template: "{{i}}" }
-    step.value = self.items
-    self.out = step.output
+    echo = Template { template: "{{i}}" }
+    echo.value = self.items
+    self.out = echo.output
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
@@ -3209,7 +3209,7 @@ fn every_written_form_of_should_flow() {
         ("node statement wired", "c = Debug {}\nt = Text { value: \"x\" }\nt._should_flow = c.data\nout = Debug {}\nout.data = t.value\n"),
         ("container from outside, wired", "c = Debug {}\ng = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\ng._should_flow = c.data\nout = Debug {}\nout.data = g.y\n"),
         ("group braces, wired", "c = Debug {}\ng = Group(x: String) -> (y: String) {\n  _should_flow: c.data\n  self.y = self.x\n}\nout = Debug {}\nout.data = g.y\n"),
-        ("loop from outside, wired", "c = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: [\"items\"]\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\nl.items = [\"a\"]\nl._should_flow = c.value\nout = Debug { data: l.out }\n"),
+        ("loop from outside, wired", "c = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: [\"items\"]\n  echo = Text {}\n  echo.value = self.items\n  self.out = echo.value\n}\nl.items = [\"a\"]\nl._should_flow = c.value\nout = Debug { data: l.out }\n"),
     ];
     for (name, src) in cases {
         let p = compile(src, uuid::Uuid::new_v4(), CompileFs::none())

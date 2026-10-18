@@ -47,7 +47,7 @@ pub const HEADER_PREFIX: &str = "header:";
 /// How a service reports events. Attached to the service recipe, so
 /// it travels with every connection made to that service.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventsSpec {
     /// The named facts of one event, each mapped to where it lives in
     /// the provider's payload (a dotted body path, or
@@ -72,7 +72,7 @@ pub struct EventsSpec {
 
 /// Which account an event concerns; see [`EventsSpec::account`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventAccount {
     /// The name of the stored value that identifies the account on a
     /// connection (Slack captures `team` at connect; a mailbox
@@ -89,6 +89,7 @@ pub struct EventAccount {
 /// No `deny_unknown_fields`: serde cannot combine it with `flatten`,
 /// so the shape rules live in [`EventsSpec::validate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SocketRecipe {
     /// The mint call, the capture carrying the address, and the
     /// acknowledgements the gateway demands. The `connect` call is
@@ -123,7 +124,7 @@ pub struct SocketRecipe {
 /// connection it concerns, and (when the provider needs telling where
 /// to send) how to ask for and keep the subscription.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WebhookRecipe {
     /// The one-off exchange a provider runs to prove the address is
     /// ours before it starts sending. Absent = it just starts.
@@ -136,7 +137,7 @@ pub struct WebhookRecipe {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub event_path: String,
     /// Where a push carries the subscription id weft minted; required
-    /// by (and only meaningful for) `route_by: subscription`.
+    /// by (and only meaningful for) `routeBy: subscription`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_path: Option<String>,
     /// Where a push carries the token weft minted; required by (and
@@ -163,7 +164,7 @@ pub struct WebhookRecipe {
 
 /// The address-proving exchange, in the three shapes providers use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Handshake {
     /// The first POST carries a challenge in its body; echo it back
     /// (Slack's `challenge`).
@@ -186,7 +187,7 @@ pub enum Handshake {
 /// that receives (operator configuration) or to the subscription weft
 /// minted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum VerifyKind {
     /// An HMAC over a declared concatenation of request parts,
     /// compared against a signature header. The shape most signing
@@ -208,7 +209,7 @@ pub enum VerifyKind {
         /// and the signature out of these keys. When several pairs
         /// carry the signature key (a rolled secret's overlap), any
         /// one matching verifies. Mutually exclusive with
-        /// `timestamp_header` and with `prefix`.
+        /// `timestampHeader` and with `prefix`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         packed: Option<PackedSignature>,
         /// The signed string, as a template over the request parts:
@@ -259,7 +260,7 @@ pub enum VerifyKind {
     /// header, verified against the named issuer's published keys and
     /// our expected audience (the queue-relay shape). The two
     /// addresses are templates over the connection's stored values
-    /// (`"{jwks_url}"`) when the scheme verifies CALLERS of a route
+    /// (`"{jwksUrl}"`) when the scheme verifies CALLERS of a route
     /// through an auth connection, and plain literals when it verifies
     /// a provider's pushes (there is no connection to read at push
     /// time, so a push recipe must spell them out).
@@ -323,8 +324,8 @@ impl VerifyKind {
     }
 
     /// The stored value names the scheme READS off a connection when
-    /// it verifies callers: the material it keys on (`signing_secret`,
-    /// `public_key`, `keys`) plus every placeholder its templates name.
+    /// it verifies callers: the material it keys on (`signingSecret`,
+    /// `publicKey`, `keys`) plus every placeholder its templates name.
     /// A recipe's paste page must declare each of them, checked at
     /// metadata load.
     pub fn required_value_names(&self) -> Result<Vec<String>, String> {
@@ -375,9 +376,9 @@ impl VerifyKind {
 }
 
 /// The stored value name an HMAC scheme keys on.
-pub const SIGNING_SECRET: &str = "signing_secret";
+pub const SIGNING_SECRET: &str = "signingSecret";
 /// The stored value name a public-key scheme verifies against.
-pub const PUBLIC_KEY: &str = "public_key";
+pub const PUBLIC_KEY: &str = "publicKey";
 /// The stored value name holding a caller's accepted keys, one per line.
 pub const API_KEYS: &str = "keys";
 /// The optional stored value name an identity-token scheme checks the
@@ -522,7 +523,7 @@ impl HmacAlgorithm {
 /// The `k=v` keys of a packed signature header; see
 /// [`VerifyKind::Hmac::packed`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackedSignature {
     /// The key carrying the unix timestamp ("t").
     pub timestamp: String,
@@ -561,7 +562,7 @@ pub enum RouteBy {
 
 /// Unwrap an event that arrives encoded inside an envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decode {
     /// Where the encoded event sits in the envelope: a body path for
     /// `base64_json`, a FORM FIELD NAME for `form_json` (that body is
@@ -583,7 +584,7 @@ pub enum Encoding {
 
 /// Asking the provider to send, and keeping that arrangement alive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubscriptionCalls {
     /// The call that asks the provider to start sending. Its values
     /// include the ones weft mints for this subscription (see
@@ -602,18 +603,18 @@ pub struct SubscriptionCalls {
 }
 
 /// The value name a subscribe call reads to learn the id weft minted
-/// for this subscription (what `route_by: subscription` matches on).
-pub const MINTED_ID: &str = "subscription_id";
+/// for this subscription (what `routeBy: subscription` matches on).
+pub const MINTED_ID: &str = "subscriptionId";
 /// The value name carrying the secret weft minted for this
 /// subscription (what [`VerifyKind::TokenEcho`] compares against).
-pub const MINTED_TOKEN: &str = "subscription_token";
+pub const MINTED_TOKEN: &str = "subscriptionToken";
 /// The value name carrying the address the provider should post to.
-pub const RECEIVER_URL: &str = "receiver_url";
+pub const RECEIVER_URL: &str = "receiverUrl";
 /// The capture name a subscribe call must use for the moment its
 /// subscription dies, when it declares a renewal margin. RFC3339 or
 /// epoch seconds (milliseconds are accepted too: Google answers
 /// epoch millis).
-pub const EXPIRES_AT: &str = "expires_at";
+pub const EXPIRES_AT: &str = "expiresAt";
 
 /// The value names weft supplies to a subscribe/unsubscribe call, on
 /// top of the connection's own stored values.
@@ -681,11 +682,11 @@ impl EventsSpec {
     }
 
     /// The account a socket FRAME concerns, on a socket marked
-    /// `multi_account`: the topic's account path, read from the
-    /// object the event sits in (`event_path` minus its last segment;
+    /// `multiAccount`: the topic's account path, read from the
+    /// object the event sits in (`eventPath` minus its last segment;
     /// the frame itself when the path is flat or empty). A socket
     /// frame nests the push body inside its own envelope and
-    /// `event_path` already names that nesting, so the one account
+    /// `eventPath` already names that nesting, so the one account
     /// concept ([`EventsSpec::account`]) serves every surface an
     /// event arrives on.
     pub fn socket_frame_account(&self, frame: &Value) -> Option<String> {
@@ -738,13 +739,13 @@ impl EventsSpec {
             if let Some(key) = socket.unknown.keys().next() {
                 return Err(format!(
                     "service '{service}' events.socket declares an unknown key '{key}'; \
-                     fix the spelling (the recipe's fields are connect, url_from, \
-                     replies, event_path, multi_account)"
+                     fix the spelling (the recipe's fields are connect, urlFrom, \
+                     replies, eventPath, multiAccount)"
                 ));
             }
             if socket.multi_account && self.account.path.starts_with(HEADER_PREFIX) {
                 return Err(format!(
-                    "service '{service}' marks its socket multi_account, but the account \
+                    "service '{service}' marks its socket multiAccount, but the account \
                      path '{}' reads a header and a socket frame has no headers; point \
                      the account path at a body field the frame carries",
                     self.account.path
@@ -776,13 +777,13 @@ impl WebhookRecipe {
         if self.route_by == RouteBy::Subscription && self.id_path.is_none() {
             return Err(format!(
                 "service '{service}' routes its events by the minted subscription id, so it \
-                 must say where a push carries it (`id_path`)"
+                 must say where a push carries it (`idPath`)"
             ));
         }
         if matches!(self.verify, VerifyKind::TokenEcho) && self.token_path.is_none() {
             return Err(format!(
                 "service '{service}' verifies pushes against the minted token, so it must \
-                 say where a push carries it (`token_path`)"
+                 say where a push carries it (`tokenPath`)"
             ));
         }
         // The echoed token is the one we minted at subscribe; with no
@@ -826,7 +827,7 @@ impl WebhookRecipe {
                 if packed.is_some() && timestamp_header.is_some() {
                     return Err(format!(
                         "service '{service}' declares an hmac verify with both `packed` and \
-                         `timestamp_header`; a packed header carries its own timestamp key"
+                         `timestampHeader`; a packed header carries its own timestamp key"
                     ));
                 }
                 if packed.is_some() && !prefix.is_empty() {
@@ -868,14 +869,14 @@ impl WebhookRecipe {
                 if self.verify.has_placeholders()? {
                     return Err(format!(
                         "service '{service}' declares an oidc push verify with a \
-                         placeholder; a push recipe names its issuers and jwks_url \
+                         placeholder; a push recipe names its issuers and jwksUrl \
                          literally (placeholders are for the `verify` block of an \
                          access recipe, which reads the connection)"
                     ));
                 }
                 if !jwks_url.0.starts_with("https://") {
                     return Err(format!(
-                        "service '{service}' declares an oidc verify whose jwks_url is not \
+                        "service '{service}' declares an oidc verify whose jwksUrl is not \
                          https; signing keys must come over TLS"
                     ));
                 }
@@ -1106,18 +1107,18 @@ mod tests {
                     "url": "https://slack.com/api/apps.connections.open",
                     "method": "POST",
                     "auth": [{ "kind": "header", "name": "Authorization",
-                               "value": "Bearer {app_token}" }],
+                               "value": "Bearer {appToken}" }],
                     "captures": [{ "name": "url", "path": "url" }]
                 },
-                "replies": [{ "when_field": "envelope_id",
+                "replies": [{ "whenField": "envelope_id",
                               "frame": "{\"envelope_id\":\"{value}\"}" }],
-                "event_path": "payload.event"
+                "eventPath": "payload.event"
             },
             "webhook": {
                 "handshake": { "kind": "echo_body_field", "path": "challenge" },
                 "verify": { "kind": "hmac",
-                            "signature_header": "X-Slack-Signature",
-                            "timestamp_header": "X-Slack-Request-Timestamp",
+                            "signatureHeader": "X-Slack-Signature",
+                            "timestampHeader": "X-Slack-Request-Timestamp",
                             "concat": "v0:{timestamp}:{body}",
                             "prefix": "v0=" }
             }
@@ -1135,32 +1136,32 @@ mod tests {
             "account": { "value": "account", "path": "header:X-Goog-Channel-Token" },
             "webhook": {
                 "verify": { "kind": "token_echo" },
-                "route_by": "subscription",
-                "id_path": "header:X-Goog-Channel-ID",
-                "token_path": "header:X-Goog-Channel-Token",
+                "routeBy": "subscription",
+                "idPath": "header:X-Goog-Channel-ID",
+                "tokenPath": "header:X-Goog-Channel-Token",
                 "subscribe": {
                     "subscribe": {
                         "url": "https://www.googleapis.com/drive/v3/files/{target}/watch",
                         "method": "POST",
                         "body": {
-                            "id": "{subscription_id}",
+                            "id": "{subscriptionId}",
                             "type": "web_hook",
-                            "address": "{receiver_url}",
-                            "token": "{subscription_token}"
+                            "address": "{receiverUrl}",
+                            "token": "{subscriptionToken}"
                         },
                         "auth": [{ "kind": "header", "name": "Authorization",
                                    "value": "Bearer {token}" }],
-                        "captures": [{ "name": "expires_at", "path": "expiration" },
-                                     { "name": "resource_id", "path": "resourceId" }]
+                        "captures": [{ "name": "expiresAt", "path": "expiration" },
+                                     { "name": "resourceId", "path": "resourceId" }]
                     },
                     "unsubscribe": {
                         "url": "https://www.googleapis.com/drive/v3/channels/stop",
                         "method": "POST",
-                        "body": { "id": "{subscription_id}", "resourceId": "{resource_id}" },
+                        "body": { "id": "{subscriptionId}", "resourceId": "{resourceId}" },
                         "auth": [{ "kind": "header", "name": "Authorization",
                                    "value": "Bearer {token}" }]
                     },
-                    "renew_margin_secs": 3600
+                    "renewMarginSecs": 3600
                 }
             }
         }))
@@ -1259,7 +1260,7 @@ mod tests {
         // A subscribe that never says where to send.
         let mut spec = drive_events();
         let calls = spec.webhook.as_mut().unwrap().subscribe.as_mut().unwrap();
-        calls.subscribe.body = Some(json!({ "id": "{subscription_id}" }));
+        calls.subscribe.body = Some(json!({ "id": "{subscriptionId}" }));
         let err = spec.validate("google").unwrap_err();
         assert!(err.contains(RECEIVER_URL), "{err}");
 
@@ -1267,7 +1268,7 @@ mod tests {
         let mut spec = drive_events();
         let calls = spec.webhook.as_mut().unwrap().subscribe.as_mut().unwrap();
         calls.subscribe.body = Some(json!({
-            "id": "{subscription_id}", "address": "{receiver_url}"
+            "id": "{subscriptionId}", "address": "{receiverUrl}"
         }));
         let err = spec.validate("google").unwrap_err();
         assert!(err.contains(MINTED_TOKEN), "{err}");
@@ -1295,7 +1296,7 @@ mod tests {
         let mut spec = drive_events();
         let calls = spec.webhook.as_mut().unwrap().subscribe.as_mut().unwrap();
         let unsub = calls.unsubscribe.as_mut().unwrap();
-        unsub.body = Some(json!({ "id": "{subscription_id}", "address": "{receiver_url}" }));
+        unsub.body = Some(json!({ "id": "{subscriptionId}", "address": "{receiverUrl}" }));
         let err = spec.validate("google").unwrap_err();
         assert!(err.contains(RECEIVER_URL) && err.contains("unsubscribe"), "{err}");
 
@@ -1303,7 +1304,7 @@ mod tests {
         let mut spec = drive_events();
         let calls = spec.webhook.as_mut().unwrap().subscribe.as_mut().unwrap();
         let unsub = calls.unsubscribe.as_mut().unwrap();
-        unsub.body = Some(json!({ "id": "{subscription_id}", "token": "{subscription_token}" }));
+        unsub.body = Some(json!({ "id": "{subscriptionId}", "token": "{subscriptionToken}" }));
         spec.validate("google").expect("minted id + token resolve at stop time");
     }
 
@@ -1357,21 +1358,21 @@ mod tests {
         };
 
         let err = webhook(json!({
-            "kind": "hmac", "signature_header": "X-Sig",
-            "timestamp_header": "X-Ts", "concat": "{body}"
+            "kind": "hmac", "signatureHeader": "X-Sig",
+            "timestampHeader": "X-Ts", "concat": "{body}"
         }))
         .unwrap_err();
         assert!(err.contains("never signs"), "{err}");
 
         let err = webhook(json!({
-            "kind": "hmac", "signature_header": "X-Sig",
+            "kind": "hmac", "signatureHeader": "X-Sig",
             "concat": "v0:{timestamp}:{body}"
         }))
         .unwrap_err();
         assert!(err.contains("no timestamp source"), "{err}");
 
         webhook(json!({
-            "kind": "hmac", "signature_header": "X-Hub-Signature-256",
+            "kind": "hmac", "signatureHeader": "X-Hub-Signature-256",
             "concat": "{body}", "prefix": "sha256=", "encoding": "base64"
         }))
         .expect("the body-only shape is valid");
@@ -1420,12 +1421,12 @@ mod tests {
 
     /// The frame's account is the topic's account path read from the
     /// object the event sits in: the envelope level for a nested
-    /// `event_path`, the frame itself for a flat one, and None when
+    /// `eventPath`, the frame itself for a flat one, and None when
     /// the frame carries nothing there.
     #[test]
     fn a_socket_frame_names_its_account_at_the_events_level() {
         let spec = slack_events();
-        // event_path is "payload.event": the account reads from
+        // eventPath is "payload.event": the account reads from
         // `payload`, beside the event, exactly where the push body's
         // fields sit.
         let frame = json!({
@@ -1439,7 +1440,7 @@ mod tests {
             "a frame naming no account answers None, never a guess"
         );
 
-        // A flat event_path reads the account off the frame itself.
+        // A flat eventPath reads the account off the frame itself.
         let mut flat = slack_events();
         flat.socket.as_mut().unwrap().event_path = "event".into();
         let frame = json!({ "team_id": "T3", "event": { "type": "message" } });

@@ -59,11 +59,11 @@ Two nodes with the same `type` fail loudly rather than one shadowing the other.
 ```rust
 #[async_trait]
 pub trait Node: NodeManifest + Send + Sync {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    async fn run(&self, ctx: RunContext) -> WeftResult<()>;
     // everything below has a default
     fn node_type(&self) -> &'static str;
     async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag) -> WeftResult<InfraSpec>;
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()>;
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()>;
     fn tests(&self) -> Vec<NodeTest>;
 }
 ```
@@ -72,8 +72,8 @@ pub trait Node: NodeManifest + Send + Sync {
 
 `provision_infra` and `setup_trigger` have defaults that fail loudly, naming
 your node, if your metadata said you implement them and you did not. So
-`requires_infra: true` without a `provision_infra` is an error you get told
-about, not a silent nothing.
+`requiresInfra: true` without a `provision_infra` is an error you get told
+about when the infra is provisioned, not a silent nothing.
 
 You never check which phase you are in. The engine reads your metadata and
 calls the right body. For a plain node that means `run` is called in every

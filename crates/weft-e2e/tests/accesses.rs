@@ -82,7 +82,7 @@ async fn a_forgotten_connection_leaves_its_node_unpicked() -> Result<()> {
         "{refused}"
     );
     anyhow::ensure!(
-        run::executions(project.dispatcher(), &project.id()).await?.is_empty(),
+        run::runs(project.dispatcher(), &project.id()).await?.is_empty(),
         "a refused run starts nothing"
     );
     project.finish().await
@@ -143,7 +143,7 @@ async fn telegram_bot_sends_a_real_message() -> Result<()> {
     conn.finish().await
 }
 
-/// Hand-made Slack bot token through the `own_page.paste` section of
+/// Hand-made Slack bot token through the `ownPage.paste` section of
 /// the ONE Slack service (the pasted token's permissions are CLAIMED,
 /// never verified, so the consumer's chat:write requirement is let
 /// through and this run proves the call itself).
@@ -321,7 +321,7 @@ async fn s3_sigv4_uploads_a_real_object() -> Result<()> {
         "own",
         json!({
             "endpoint": endpoint, "region": region,
-            "access_key_id": key_id, "secret_access_key": secret,
+            "accessKeyId": key_id, "secretAccessKey": secret,
         }),
     )
     .await?;

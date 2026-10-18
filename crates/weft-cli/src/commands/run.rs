@@ -43,7 +43,7 @@ pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<()> {
 }
 
 /// Load saved parameters, apply explicit edits, and omit accepted output
-/// evidence from the execution request. Graph validation sees the final edit.
+/// evidence from the run request. Graph validation sees the final edit.
 fn spec_for(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<Option<RunSpec>> {
     match (&args.spec, args.flags.is_empty()) {
         (Some(name), _) => {
@@ -107,12 +107,12 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     let path = format!("/projects/{}/versions/runs", handle.id);
     progress.dispatcher_call_start(&path);
     let started = start_run(&handle.client, &path, &body).await?;
-    let execution_id = started.execution_id;
-    progress.dispatcher_call_done(serde_json::json!({ "execution_id": execution_id, "project_id": handle.id }));
+    let run_id = started.run_id;
+    progress.dispatcher_call_done(serde_json::json!({ "runId": run_id, "projectId": handle.id }));
 
     let summary = summary_line(&started, spec.as_ref());
     if !ctx.json() {
-        println!("started execution {execution_id} on version {}", super::versions::short(&started.version));
+        println!("started run {run_id} on version {}", super::versions::short(&started.version));
     }
     // After the line that says the run started, because that is what
     // they are about ("this run started, but head moved ..."). One
@@ -124,14 +124,14 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     // human mode, so printing it above as well said it twice.
     progress.complete(&summary);
 
-    // --json implies --detach: the extension uses SSE for execution
+    // --json implies --detach: the extension uses SSE for run
     // events, so keeping the CLI alive to follow logs would just hold
     // the action-bar state machine in `cli_running` while the run is
-    // actually `execution_running`.
+    // actually `run_running`.
     if args.detach || ctx.json() {
         return Ok(());
     }
-    super::follow::follow_execution_id(&handle.client, ctx.on(), &execution_id.to_string(), Some(&definition)).await?;
+    super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&definition)).await?;
     Ok(())
 }
 
@@ -202,7 +202,7 @@ mod tests {
 
     fn started(seed: Option<&str>, inherited: &[&str], ran: &[&str]) -> RunStarted {
         RunStarted {
-            execution_id: uuid::Uuid::nil(),
+            run_id: uuid::Uuid::nil(),
             version: "v".into(),
             seed: seed.map(|s| format!("{s}-0000-0000-0000-000000000000").parse().expect("a uuid")),
             inherited: inherited.iter().map(|s| s.to_string()).collect(),

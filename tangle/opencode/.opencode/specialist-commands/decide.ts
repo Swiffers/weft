@@ -4,7 +4,7 @@
 //
 // A key per agent name (the file name of its `.opencode/agents/` file), and
 // under it the commands that agent may run, each as the words a command
-// starts with ("weft events" allows `weft events <run id> --node x`). Every
+// starts with ("weft events" allows `weft events <run-id> --node x`). Every
 // command in the line (split on &&, ||, ;, |, |& and &, outside quotes) must
 // start with one of them. Refused for every specialist, whatever its list:
 //   - a command built at run time (`$(...)`, `${...}`, backticks) or written

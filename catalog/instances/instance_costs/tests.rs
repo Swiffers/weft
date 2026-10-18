@@ -22,8 +22,8 @@ async fn totals_an_instances_costs(rig: FakeRig) -> WeftResult<()> {
     rig.answer_program_call(
         "weft.costs.list",
         json!([
-            { "run": run, "instance": "ada", "node": "reply", "service": "openrouter", "amount_usd": 0.25, "paid_by": "platform", "at_unix": 10 },
-            { "run": run, "instance": "ada", "node": "reply", "service": "openrouter", "amount_usd": null, "paid_by": "platform", "at_unix": 11 }
+            { "run": run, "instance": "ada", "node": "reply", "service": "openrouter", "amountUsd": 0.25, "paidBy": "platform", "atUnix": 10 },
+            { "run": run, "instance": "ada", "node": "reply", "service": "openrouter", "amountUsd": null, "paidBy": "platform", "atUnix": 11 }
         ]),
     );
     let outcome = rig

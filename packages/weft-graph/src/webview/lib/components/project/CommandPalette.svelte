@@ -51,7 +51,7 @@
 	);
 	
 	// VS Code embedding: save/run/export/import are handled by the
-	// extension (Ctrl+S writes the document, execution is an editor
+	// extension (Ctrl+S writes the document, run is an editor
 	// command). We keep only actions that map to the webview itself.
 	const actions: { id: string; label: string; icon: Component; shortcut?: string }[] = [
 		// No "Add Group" action: Group is a node type, so it already appears in

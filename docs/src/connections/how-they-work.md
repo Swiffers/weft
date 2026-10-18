@@ -24,17 +24,20 @@ a mail server.
   "__weft_access__": {
     "accessId": "11111111-2222-3333-4444-555555555555",
     "service": "slack",
-    "identity": "Q @ Acme",
-    "requiresPermissions": ["chat:write"],
-    "requiresValues": []
+    "identity": "Acme",
+    "requiresPermissions": ["chat:write"]
   }
 }
 ```
 
-The two `requires` lists are stamped on **per consuming node**, from what that
-node said it needed. So the same connection carries different requirements
-depending on which step is about to use it, and one that falls short is refused
-when that step opens it rather than halfway through a call.
+The runtime stamps the `requires` lists on **per consuming node**, from what
+that node's input said it needed: its `requiresScopes` becomes
+`requiresPermissions`, and its `requiresValues` stays `requiresValues`, each
+there only when the node asked for some. So the same connection
+carries different requirements depending on which node is about to use it.
+When that node opens it, a missing stored value is refused, and so is a missing
+permission on a verified connection (one whose provider said what it granted),
+rather than failing halfway through a call.
 
 ## Shared, or your own
 
@@ -53,7 +56,7 @@ resolution refuses it.
 
 ## An instance's own connections
 
-In a program with instances, an access step whose connection is written
+In a program with instances, an access node whose connection is written
 `account: @instance_filled` holds no connection in the source: each instance
 gets its own, and a run for that instance uses it. For how that works, go and
 read
@@ -77,19 +80,19 @@ unknown, lets the call through, because refusing would block every pasted key
 on every service that reports nothing.
 
 Stored values are simpler and have no unknown case: if a node needs
-`imap_host` and the connection has not got one, the node never starts.
+`imapHost` and the connection has not got one, the node never starts.
 
 Connecting also runs the service's own check, but **only when that check is
 free**. Anything paid, or ambiguous because it might bill depending on the
 account, is skipped, so a bad credential sometimes shows up for the first time
-when a step tries to use it.
+when a node tries to use it.
 
 One thing that is always checked: if you tick permissions and the provider
 hands back fewer, the connect is refused naming the one you did not get.
 
 ## Refreshing
 
-Lazily, when a step opens the connection, and only if the token expires within
+Lazily, when a node opens the connection, and only if the token expires within
 the next minute. There is no background keep-alive.
 
 Two things opening the same connection at once queue behind each other, so it
@@ -108,7 +111,7 @@ refresh it with.
 
 If the provider is busy or down when weft refreshes (it answers 408, 429 or
 a 5xx, or does not answer at all), nothing is wrong with the connection, so
-it never asks you to reconnect: the step fails with the provider's own
+it never asks you to reconnect: the node fails with the provider's own
 answer (`token endpoint answered 503 ...`, or `token endpoint unreachable:
 ...`), and the refresh is tried again the next time the connection is
 opened.

@@ -25,15 +25,15 @@ use crate::instance::InstanceId;
 use crate::infra::{InfraNodeStatus, TerminateDisks};
 use crate::instance_door::ValuesChanged;
 use crate::program::{
-    CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, ExecutionPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
+    CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, RunPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
     MintedInstanceToken, PaidBy, ProgramCall, RunFilter, RunsCounted, TokensRevoked, MAX_RUNS_PAGE,
 };
 use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::signal::timer::{Timer, TimerSpec};
 use crate::tag::StopSelf;
-use crate::ExecutionId;
+use crate::RunId;
 
-use super::ExecutionContext;
+use super::RunContext;
 
 /// The name an instance token's mint is journaled under. Only the token's id
 /// is recorded (never its value): a replay revokes that one and mints a
@@ -43,7 +43,7 @@ const MINT_JOURNAL_NAME: &str = "weft.tokens.mint";
 /// How long a start waits between looks at a copy coming up.
 const START_LOOK_AGAIN: Timer = Timer { spec: TimerSpec::After { duration_ms: 3_000 } };
 
-impl ExecutionContext {
+impl RunContext {
     /// One infra node's copies: the shared one, or an instance's copy of
     /// a node marked `@per_instance` (`.instance(id)`). The node is named
     /// the way the program writes it (`bridge`, or `one.bridge` inside the
@@ -115,7 +115,7 @@ impl ExecutionContext {
             }
         };
         serde_json::from_value(value)
-            .map_err(|e| WeftError::NodeExecution(format!("{name}: the runtime answered a shape this node cannot read: {e}")))
+            .map_err(|e| WeftError::NodeFailed(format!("{name}: the runtime answered a shape this node cannot read: {e}")))
     }
 }
 
@@ -131,9 +131,9 @@ fn required_instance(raw: &str) -> WeftResult<InstanceId> {
     InstanceId::new(raw).map_err(|e| WeftError::Input(format!("instance id: {e}")))
 }
 
-/// One infra node's copies. See [`ExecutionContext::infra`].
+/// One infra node's copies. See [`RunContext::infra`].
 pub struct InfraCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     node: String,
     instance: Option<String>,
 }
@@ -172,18 +172,18 @@ impl InfraCalls<'_> {
                 Some(InfraNodeStatus::Running) => return Ok(()),
                 Some(InfraNodeStatus::Failed) => {
                     let why = copy.and_then(|c| c.failure).unwrap_or_else(|| "no reason recorded".into());
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "infra '{node}' failed to start: {why}; `weft infra status` shows the copy"
                     )));
                 }
                 None => {
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "infra '{node}' did not come up: its start ended without a copy (the setup run failed \
-                         or was cancelled, or somebody terminated it); `weft executions` shows the setup run"
+                         or was cancelled, or somebody terminated it); `weft runs` shows the setup run"
                     )));
                 }
                 Some(stopped @ (InfraNodeStatus::Stopped | InfraNodeStatus::Stopping | InfraNodeStatus::Terminating)) => {
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "infra '{node}' is {stopped}: somebody took it down while this start waited for it"
                     )));
                 }
@@ -264,10 +264,10 @@ impl InfraCalls<'_> {
     }
 }
 
-/// Triggers' activations. See [`ExecutionContext::trigger`] and
-/// [`ExecutionContext::triggers`].
+/// Triggers' activations. See [`RunContext::trigger`] and
+/// [`RunContext::triggers`].
 pub struct TriggerCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     triggers: Vec<String>,
     instance: Option<String>,
 }
@@ -309,9 +309,9 @@ impl TriggerCalls<'_> {
     }
 }
 
-/// See [`ExecutionContext::connections`].
+/// See [`RunContext::connections`].
 pub struct ConnectionCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl<'a> ConnectionCalls<'a> {
@@ -323,7 +323,7 @@ impl<'a> ConnectionCalls<'a> {
 
 /// One instance's connections.
 pub struct InstanceConnections<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: String,
 }
 
@@ -343,9 +343,9 @@ impl InstanceConnections<'_> {
     }
 }
 
-/// See [`ExecutionContext::instances`].
+/// See [`RunContext::instances`].
 pub struct InstanceCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl InstanceCalls<'_> {
@@ -359,9 +359,9 @@ impl InstanceCalls<'_> {
     }
 }
 
-/// See [`ExecutionContext::values`].
+/// See [`RunContext::values`].
 pub struct ValueCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl<'a> ValueCalls<'a> {
@@ -375,25 +375,25 @@ impl<'a> ValueCalls<'a> {
 /// [`Self::set`] and [`Self::clear`] and make the change with
 /// [`Self::apply`].
 pub struct InstanceValueCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: String,
     set: Vec<crate::run_spec::InstanceValueInput>,
     clear: Vec<crate::run_spec::InstanceFieldRef>,
 }
 
 impl InstanceValueCalls<'_> {
-    /// What the instance gives, by step (named the way the program writes
+    /// What the instance gives, by node (named the way the program writes
     /// it) and field. A connection reads as its `{id, identity}` handle.
     pub async fn get(self) -> WeftResult<crate::instance::InstanceValues> {
         let call = ProgramCall::ValuesGet { instance: required_instance(&self.instance)? };
         self.ctx.program_call(call, StopSelf::Keep).await
     }
 
-    /// Give `value` for `field` of the step `step`, a field the program
+    /// Give `value` for `field` of the node `node`, a field the program
     /// writes `@instance_filled`. For a connection field the value is one
     /// of the instance's connections: `json!({ "id": <connection id> })`.
-    pub fn set(mut self, step: impl Into<String>, field: impl Into<String>, value: Value) -> Self {
-        self.set.push(crate::run_spec::InstanceValueInput { step: step.into(), field: field.into(), value });
+    pub fn set(mut self, node: impl Into<String>, field: impl Into<String>, value: Value) -> Self {
+        self.set.push(crate::run_spec::InstanceValueInput { node: node.into(), field: field.into(), value });
         self
     }
 
@@ -406,10 +406,10 @@ impl InstanceValueCalls<'_> {
         Ok(answer.rearmed)
     }
 
-    /// Forget the instance's value for `field` of `step`: the field then
+    /// Forget the instance's value for `field` of `node`: the field then
     /// falls back as if never given.
-    pub fn clear(mut self, step: impl Into<String>, field: impl Into<String>) -> Self {
-        self.clear.push(crate::run_spec::InstanceFieldRef { step: step.into(), field: field.into() });
+    pub fn clear(mut self, node: impl Into<String>, field: impl Into<String>) -> Self {
+        self.clear.push(crate::run_spec::InstanceFieldRef { node: node.into(), field: field.into() });
         self
     }
 
@@ -424,9 +424,9 @@ impl InstanceValueCalls<'_> {
     }
 }
 
-/// See [`ExecutionContext::costs`].
+/// See [`RunContext::costs`].
 pub struct CostQuery<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: Option<String>,
     filter: CostFilter,
 }
@@ -457,9 +457,9 @@ impl CostQuery<'_> {
         self
     }
 
-    /// Costs of one run (`ctx.execution_id` for this one).
-    pub fn run(mut self, execution_id: ExecutionId) -> Self {
-        self.filter.run = Some(execution_id);
+    /// Costs of one run (`ctx.run_id` for this one).
+    pub fn run(mut self, run_id: RunId) -> Self {
+        self.filter.run = Some(run_id);
         self
     }
 
@@ -475,9 +475,9 @@ impl CostQuery<'_> {
     }
 }
 
-/// See [`ExecutionContext::runs`].
+/// See [`RunContext::runs`].
 pub struct RunQuery<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: Option<String>,
     filter: RunFilter,
 }
@@ -509,7 +509,7 @@ impl RunQuery<'_> {
         self
     }
 
-    /// Runs carrying this tag (`ctx.tag_execution`), normalized the
+    /// Runs carrying this tag (`ctx.tag_run`), normalized the
     /// same way, so the value a run tagged itself with finds it. An
     /// empty tag is refused.
     pub fn tag(mut self, tag: &str) -> WeftResult<Self> {
@@ -536,7 +536,7 @@ impl RunQuery<'_> {
     /// The newest `limit` of them (1 to [`MAX_RUNS_PAGE`]), newest first,
     /// with how many match in all (`total`), so a listing that stopped
     /// short says so. A run parked on a wait reads `waiting_for_input`.
-    pub async fn list(mut self, limit: u32) -> WeftResult<ExecutionPage> {
+    pub async fn list(mut self, limit: u32) -> WeftResult<RunPage> {
         if !(1..=MAX_RUNS_PAGE).contains(&limit) {
             return Err(WeftError::Input(format!(
                 "runs list: a limit of {limit} is out of range; give 1 to {MAX_RUNS_PAGE}, and narrow the filters to reach older runs"
@@ -554,9 +554,9 @@ impl RunQuery<'_> {
     }
 }
 
-/// See [`ExecutionContext::tokens`].
+/// See [`RunContext::tokens`].
 pub struct TokenCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl<'a> TokenCalls<'a> {
@@ -578,7 +578,7 @@ impl<'a> TokenCalls<'a> {
         // mint leaves no record of a token that never existed.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| WeftError::NodeExecution(format!("the clock is before 1970: {e}")))?
+            .map_err(|e| WeftError::NodeFailed(format!("the clock is before 1970: {e}")))?
             .as_secs();
         crate::signal_token::expiry_at(now, expires_in.as_secs()).map_err(WeftError::Input)?;
         let (call_index, replayed) = self.ctx.handle.run_step(MINT_JOURNAL_NAME).await?;
@@ -587,7 +587,7 @@ impl<'a> TokenCalls<'a> {
                 .get("id")
                 .and_then(Value::as_str)
                 .and_then(|id| id.parse::<uuid::Uuid>().ok())
-                .ok_or_else(|| WeftError::NodeExecution(format!("the journaled instance token mint is unreadable: {recorded}")))?,
+                .ok_or_else(|| WeftError::NodeFailed(format!("the journaled instance token mint is unreadable: {recorded}")))?,
             None => {
                 let id = uuid::Uuid::new_v4();
                 self.ctx.handle.run_record(MINT_JOURNAL_NAME, call_index, &serde_json::json!({ "id": id })).await?;
@@ -605,7 +605,7 @@ impl<'a> TokenCalls<'a> {
 
 /// One instance's tokens.
 pub struct InstanceTokens<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: String,
 }
 

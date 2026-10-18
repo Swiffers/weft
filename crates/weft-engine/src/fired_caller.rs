@@ -29,7 +29,7 @@ use weft_core::caller::{
     InboundMessage, LiveRequest, OutboundChunk, ResponseHead,
 };
 use weft_core::signal::Protocol;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 use crate::caller_conn::{CallerJournalSink, CallerRecord};
 
@@ -57,7 +57,7 @@ impl FiredCaller {
     /// the trigger as its wake payload and is read there, by the node
     /// that knows which of its own fields that is.
     pub fn open(
-        execution_id: ExecutionId,
+        run_id: RunId,
         config: CallerRuntimeConfig,
         request: LiveRequest,
         journal: Arc<dyn CallerJournalSink>,
@@ -68,7 +68,7 @@ impl FiredCaller {
                 request,
                 body: InboundMessage::Json(serde_json::Value::Null),
             }),
-            record: CallerRecord::new(execution_id, journal),
+            record: CallerRecord::new(run_id, journal),
             started: AtomicBool::new(false),
             terminated: tokio::sync::watch::Sender::new(false),
         });
@@ -213,19 +213,19 @@ mod tests {
     struct Rows(Mutex<Vec<String>>);
 
     impl CallerJournalSink for Rows {
-        fn connected(&self, _: ExecutionId, at: u64, p: Protocol) {
+        fn connected(&self, _: RunId, at: u64, p: Protocol) {
             self.0.lock().unwrap().push(format!("{at} connected {}", p.as_wire_str()));
         }
-        fn inbound(&self, _: ExecutionId, at: u64, msg: &InboundMessage) {
+        fn inbound(&self, _: RunId, at: u64, msg: &InboundMessage) {
             self.0.lock().unwrap().push(format!("{at} inbound {msg:?}"));
         }
-        fn outbound(&self, _: ExecutionId, at: u64, chunk: &OutboundChunk, terminal: bool) {
+        fn outbound(&self, _: RunId, at: u64, chunk: &OutboundChunk, terminal: bool) {
             self.0.lock().unwrap().push(format!("{at} outbound {chunk:?} terminal={terminal}"));
         }
-        fn errored(&self, _: ExecutionId, at: u64, message: &str) {
+        fn errored(&self, _: RunId, at: u64, message: &str) {
             self.0.lock().unwrap().push(format!("{at} errored {message}"));
         }
-        fn disconnected(&self, _: ExecutionId, at: u64, reason: &str) {
+        fn disconnected(&self, _: RunId, at: u64, reason: &str) {
             self.0.lock().unwrap().push(format!("{at} disconnected {reason}"));
         }
 
@@ -236,7 +236,7 @@ mod tests {
 
     fn caller(rows: &Arc<Rows>) -> Arc<FiredCaller> {
         FiredCaller::open(
-            ExecutionId::nil(),
+            RunId::nil(),
             CallerRuntimeConfig::from_config(
                 &serde_json::from_value(serde_json::json!({ "path": "hello" }))
                     .expect("a route config with just a path"),

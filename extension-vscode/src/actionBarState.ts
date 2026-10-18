@@ -8,23 +8,23 @@
 //     the project's at-rest facts. Available verbs, drift bits,
 //     trigger/infra rollups, per-node infra status.
 //
-//   - Live executions: the currently-running executions on the project,
+//   - Live runs: the currently-running runs on the project,
 //     each with its phase (a run, or an infra / trigger setup).
 //     REPLACED by every status fetch's `running` (the
 //     reconciliation), mutated between fetches by SSE
-//     `execution_started/completed/failed/cancelled` (the fast path).
+//     `run_started/completed/failed/cancelled` (the fast path).
 //     A terminal event lost to a dropped stream is caught by the next
 //     fetch, so a Stop button never outlives its run.
 //
-//   - Follow state: which execution the user is watching, and in what
-//     mode (latest tracks the newest live exec; pinned holds on a
-//     specific execution the user picked from the right sidebar).
+//   - Follow state: which run the user is watching, and in what
+//     mode (latest tracks the newest live run; pinned holds on a
+//     specific run the user picked from the right sidebar).
 //
 // CLI in-flight + error overlay sit on top of all three.
 //
-// The reducer computes "watched-live execution" by intersecting follow
-// state with running executions. When that intersection is non-empty,
-// the bar shows Stop and cancels that execution; otherwise the bar
+// The reducer computes "watched-live run" by intersecting follow
+// state with running runs. When that intersection is non-empty,
+// the bar shows Stop and cancels that run; otherwise the bar
 // shows Run/Activate. Only runs of the graph count there: a setup is
 // never a run to stop. The trigger section reads the backend status
 // alone; the infra section also reads whether an infra setup is
@@ -44,7 +44,7 @@ import type {
   BarPhase,
   CliEvent,
   ErrorVerb,
-  ExecutionPhase,
+  RunPhase,
   FollowMode,
 } from '../../packages/weft-graph/src/protocol';
 import {
@@ -52,19 +52,19 @@ import {
   ACTIVITY_LINE_CHAR_CAP,
 } from '../../packages/weft-graph/src/protocol';
 import { backendFromSnapshot, emptyActionAvailability, parseTransition } from '../../packages/weft-graph/src/status';
-import type { RunningExecution } from '../../packages/weft-graph/src/status';
+import type { GoingRun } from '../../packages/weft-graph/src/status';
 
 interface FollowState {
   mode: FollowMode;
-  executionId: string | undefined;
+  runId: string | undefined;
 }
 
 interface Slot {
   backend: ActionAvailability | undefined;
-  /// Running executions in start order (a Map iterates in insertion
+  /// Running runs in start order (a Map iterates in insertion
   /// order), each with what it is for. Only `fire` ones are runs the
   /// bar can stop; the setups drive the infra and trigger slots.
-  running: Map<string, ExecutionPhase>;
+  running: Map<string, RunPhase>;
   follow: FollowState;
   cli: {
     verb: ActionVerb;
@@ -72,16 +72,16 @@ interface Slot {
     detail?: Record<string, unknown>;
   } | undefined;
   /// HTTP-driven verb awaiting confirmation. Currently only used
-  /// for Stop on a running execution: set when the user clicks
+  /// for Stop on a running run: set when the user clicks
   /// Stop, cleared when an SSE terminal event arrives for the
-  /// targeted execution (or when a status fetch reveals the execution is
+  /// targeted run (or when a status fetch reveals the run is
   /// no longer running).
   pendingAction: {
     verb: ActionVerb;
     message: string;
-    /// Execution id the verb targets. The pending state clears as soon
-    /// as `markExecutionFinished(executionId)` matches.
-    executionId: string;
+    /// Run id the verb targets. The pending state clears as soon
+    /// as `markRunFinished(runId)` matches.
+    runId: string;
   } | undefined;
   error: ActionBarError | undefined;
   /// Terminal output of the verb in `cli`, or of the verb that just
@@ -95,7 +95,7 @@ function emptySlot(): Slot {
   return {
     backend: undefined,
     running: new Map(),
-    follow: { mode: 'following', executionId: undefined },
+    follow: { mode: 'following', runId: undefined },
     cli: undefined,
     pendingAction: undefined,
     error: undefined,
@@ -127,39 +127,39 @@ export class ActionBarStore {
     return this.derive();
   }
 
-  /// An execution that is running right now on this project, or undefined
-  /// if the user is looking at a finished execution or nothing runs.
-  /// Stop button uses this; cancel POSTs against this execution.
-  watchedRunningExecutionId(projectId?: string): string | undefined {
+  /// A run that is running right now on this project, or undefined
+  /// if the user is looking at a finished run or nothing runs.
+  /// Stop button uses this; cancel POSTs against this run.
+  watchedRunningRunId(projectId?: string): string | undefined {
     const id = projectId ?? this.pinnedProjectId;
     if (!id) return undefined;
     const slot = this.slots.get(id);
     if (!slot) return undefined;
-    return computeWatchedRunningExecutionId(slot);
+    return computeWatchedRunningRunId(slot);
   }
 
   pushStatus(
     projectId: string,
     snapshot: ActionAvailability,
-    running: readonly RunningExecution[],
+    running: readonly GoingRun[],
   ): void {
     const slot = this.ensureSlot(projectId);
     slot.backend = snapshot;
-    // The fetch is the truth about what runs: executions it does not name
+    // The fetch is the truth about what runs: runs it does not name
     // are gone (their terminal event may have been lost to a dropped
-    // stream), executions it names and the set lacks are live.
+    // stream), runs it names and the set lacks are live.
     //
     // The fetch's ORDER is the truth too, and it replaces what was
     // here rather than being merged into it. The dispatcher sends them
-    // oldest first (see `ProjectExecutionsSummary::running`), so
+    // oldest first (see `ProjectRunsSummary::running`), so
     // taking the last is taking the newest. Keeping the old positions
     // and appending, which is what this used to do, mixed one ordering
     // into another and left "latest" following an arbitrary run.
-    slot.running = new Map(running.map((r) => [r.execution_id, r.phase]));
+    slot.running = new Map(running.map((r) => [r.runId, r.phase]));
     const next = slot.running;
     // A Stop waiting on a run the fetch no longer lists is over: the
     // run ended, whether or not its terminal event ever arrived.
-    if (slot.pendingAction && !next.has(slot.pendingAction.executionId)) {
+    if (slot.pendingAction && !next.has(slot.pendingAction.runId)) {
       slot.pendingAction = undefined;
     }
     this.notifyIfPinned(projectId);
@@ -178,23 +178,23 @@ export class ActionBarStore {
     this.notifyIfPinned(projectId);
   }
 
-  /// SSE `execution_started` arrived: that execution is now live.
-  markExecutionStarted(projectId: string, executionId: string, phase: ExecutionPhase): void {
+  /// SSE `run_started` arrived: that run is now live.
+  markRunStarted(projectId: string, runId: string, phase: RunPhase): void {
     const slot = this.ensureSlot(projectId);
-    slot.running.set(executionId, phase);
+    slot.running.set(runId, phase);
     this.notifyIfPinned(projectId);
   }
 
-  /// SSE `execution_completed` / `execution_failed` arrived: that
-  /// execution is no longer live.
-  markExecutionFinished(projectId: string, executionId: string): void {
+  /// SSE `run_completed` / `run_failed` arrived: that
+  /// run is no longer live.
+  markRunFinished(projectId: string, runId: string): void {
     const slot = this.slots.get(projectId);
     if (!slot) return;
-    slot.running.delete(executionId);
-    // If a pending action was targeting this execution, the backend
+    slot.running.delete(runId);
+    // If a pending action was targeting this run, the backend
     // has confirmed it: clear the pending state. The bar exits
     // "Cancelling..." into whatever the next derived state is.
-    if (slot.pendingAction?.executionId === executionId) {
+    if (slot.pendingAction?.runId === runId) {
       slot.pendingAction = undefined;
     }
     this.notifyIfPinned(projectId);
@@ -203,15 +203,15 @@ export class ActionBarStore {
   /// User clicked Stop (or another HTTP-driven action). Lock the
   /// bar into a transient "waiting for backend" state until SSE
   /// confirms the action took effect.
-  setPending(projectId: string, verb: ActionVerb, message: string, executionId: string): void {
+  setPending(projectId: string, verb: ActionVerb, message: string, runId: string): void {
     const slot = this.ensureSlot(projectId);
-    slot.pendingAction = { verb, message, executionId };
+    slot.pendingAction = { verb, message, runId };
     this.notifyIfPinned(projectId);
   }
 
   /// Clear pending action (e.g. POST failed and we want to revert
   /// to the previous derived state). On success, prefer letting
-  /// `markExecutionFinished` clear it via the execution match.
+  /// `markRunFinished` clear it via the run match.
   clearPending(projectId: string): void {
     const slot = this.slots.get(projectId);
     if (!slot || !slot.pendingAction) return;
@@ -248,11 +248,11 @@ export class ActionBarStore {
   }
 
   /// AutoFollow emitted a follow-state change for projectId.
-  /// Mirrors mode + execution into the slot so the reducer can compute
-  /// the watched-live execution.
-  setFollow(projectId: string, mode: FollowMode, executionId: string | undefined): void {
+  /// Mirrors mode + run into the slot so the reducer can compute
+  /// the watched-live run.
+  setFollow(projectId: string, mode: FollowMode, runId: string | undefined): void {
     const slot = this.ensureSlot(projectId);
-    slot.follow = { mode, executionId };
+    slot.follow = { mode, runId };
     this.notifyIfPinned(projectId);
   }
 
@@ -409,7 +409,7 @@ export class ActionBarStore {
   /// Overlay precedence (top wins):
   ///   1. cli set            -> cli_running    (CLI verb in flight)
   ///   2. pendingAction set  -> pending        (HTTP verb awaiting SSE)
-  ///   3. watched-live execution -> execution_running (live exec)
+  ///   3. watched-live run -> run_running (live run)
   ///   4. otherwise          -> idle
   ///
   /// Backend stays present in every overlay so the section that
@@ -453,18 +453,18 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
       message: slot.pendingAction.message,
     };
   }
-  const watchedLive = computeWatchedRunningExecutionId(slot);
+  const watchedLive = computeWatchedRunningRunId(slot);
   if (watchedLive && slot.backend) {
-    return { kind: 'execution_running', executionId: watchedLive };
+    return { kind: 'run_running', runId: watchedLive };
   }
   return { kind: 'idle' };
 }
 
-/// Pure function: which running execution does the bar act on for this slot?
+/// Pure function: which running run does the bar act on for this slot?
 ///
-///   locked: the locked execution, only if it's currently running.
+///   locked: the locked run, only if it's currently running.
 ///   off:    undefined; no run is on screen to stop.
-///   following: the most recently started of the running executions.
+///   following: the most recently started of the running runs.
 ///              Returns undefined when nothing runs.
 ///
 /// "Most recently started" is the last element of an insertion-ordered set, and that
@@ -473,16 +473,16 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
 /// the whole set with the dispatcher's own oldest-first list.
 ///
 /// Returns undefined when the user is looking at a finished
-/// execution (so the bar shows Run, not Stop), even if a different
-/// execution is running on the same project.
-function computeWatchedRunningExecutionId(slot: Slot): string | undefined {
+/// run (so the bar shows Run, not Stop), even if a different
+/// run is running on the same project.
+function computeWatchedRunningRunId(slot: Slot): string | undefined {
   // Only runs: a setup is its verb working, shown in its own slot.
-  const runs = [...slot.running].filter(([, phase]) => phase === 'fire').map(([executionId]) => executionId);
+  const runs = [...slot.running].filter(([, phase]) => phase === 'fire').map(([runId]) => runId);
   if (runs.length === 0) return undefined;
   if (slot.follow.mode === 'off') return undefined;
   if (slot.follow.mode === 'locked') {
-    return slot.follow.executionId && runs.includes(slot.follow.executionId)
-      ? slot.follow.executionId
+    return slot.follow.runId && runs.includes(slot.follow.runId)
+      ? slot.follow.runId
       : undefined;
   }
   // Following: the newest running run. Map iteration is
@@ -546,15 +546,12 @@ function errorFromCliEvent(verb: ActionVerb, ev: CliEvent): ActionBarError {
   const message = messageRaw ?? 'unknown error';
   const what = whatRaw ?? `Running '${ev.verb}'`;
   const stage = stageRaw ?? 'cli';
-  const rawField = (d.raw as string | undefined) ?? (d.stderr as string | undefined);
-  // Fold the full event into raw ONLY on real drift (missing message)
+  // The full event goes into raw ONLY on real drift (missing message)
   // so the user can see the actual payload. Cap the JSON dump at 4KB
   // so a runaway diagnostics array can't blow up the modal.
   const raw = !messageRaw
-    ? `${rawField ? `${rawField}\n\n` : ''}wire-shape drift: full event = ${truncateForModal(JSON.stringify(ev), 4096)}`
-    : rawField;
-  const exitCode = typeof d.exit_code === 'number' ? d.exit_code : undefined;
-  const command = (d.command as string | undefined);
+    ? `wire-shape drift: full event = ${truncateForModal(JSON.stringify(ev), 4096)}`
+    : undefined;
   // The message is what the modal has to show when the verb packed no
   // per-item diagnostics: "unknown node 'one.trim'" is the whole story,
   // and a modal saying "no further details" under it hid it.
@@ -565,8 +562,6 @@ function errorFromCliEvent(verb: ActionVerb, ev: CliEvent): ActionBarError {
     stage,
     diagnostics,
     ...(raw ? { raw } : {}),
-    ...(exitCode !== undefined ? { exitCode } : {}),
-    ...(command ? { command } : {}),
   };
   return { verb, message, details };
 }

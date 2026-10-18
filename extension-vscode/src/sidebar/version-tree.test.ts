@@ -1,4 +1,4 @@
-// The version tree the Executions view draws in "by version" mode is
+// The version tree the Runs view draws in "by version" mode is
 // folded from `weft tree --json` by pure functions, so the nesting, the
 // marks and the labels are pinned here without an editor process.
 
@@ -9,40 +9,48 @@ import {
   runScopedTo,
   versionLabel,
   versionMarks,
-  type RunSummary,
+  type VersionRun,
   type TreeJson,
   type VersionSummary,
 } from './version-tree';
 
 const version = (id: string, parent: string | null, at: number, changed: string[] = [], label: string | null = null): VersionSummary => ({
   id: `${id}00000000`,
-  parent_id: parent ? `${parent}00000000` : null,
+  parentId: parent ? `${parent}00000000` : null,
   label,
-  created_at: at,
+  createdAt: at,
   diff: { added: [], removed: [], changed },
   manifest: {},
 });
 
-const run = (executionId: string, version: string, at: number, extra: Partial<RunSummary> = {}): RunSummary => ({
-  execution_id: `${executionId}00000000`,
-  version_id: `${version}00000000`,
-  seed_execution_id: null,
+const run = (runId: string, version: string, at: number, extra: Partial<VersionRun> = {}): VersionRun => ({
+  runId: `${runId}00000000`,
+  versionId: `${version}00000000`,
+  seedRunId: null,
   stale: [],
   spec: null,
   example: null,
-  status: 'completed',
-  started_at: at,
-  completed_at: null,
+  startedAt: at,
+  listing: {
+    runId: `${runId}00000000`,
+    projectId: 'p',
+    entryNode: 'n',
+    status: 'completed',
+    phase: 'fire',
+    startedAt: at,
+    completedAt: null,
+    tags: [],
+  },
   ...extra,
 });
 
 const id = (n: string) => `${n}00000000`;
 const tree: TreeJson = {
-  head: { head_version: id('v2'), head_run: id('c2'), activated_versions: [id('v1')] },
-  disk_version: id('v3'),
+  head: { headVersion: id('v2'), headRun: id('c2'), activatedVersions: [id('v1')] },
+  diskVersion: id('v3'),
   // In the dispatcher's order: the order they were recorded.
   versions: [version('v1', null, 1, [], 'base'), version('v2', 'v1', 2, ['main.weft']), version('v3', 'v1', 3, ['prompts/p.txt'])],
-  runs: [run('c1', 'v1', 4), run('c2', 'v2', 5, { seed_execution_id: id('c1'), stale: ['b'] })],
+  runs: [run('c1', 'v1', 4), run('c2', 'v2', 5, { seedRunId: id('c1'), stale: ['b'] })],
 };
 
 describe('version tree', () => {
@@ -50,8 +58,8 @@ describe('version tree', () => {
     const roots = buildVersionTree(tree);
     expect(roots.map((r) => r.version.id)).toEqual([id('v1')]);
     expect(roots[0].children.map((c) => c.version.id)).toEqual([id('v2'), id('v3')]);
-    expect(roots[0].runs.map((r) => r.execution_id)).toEqual([id('c1')]);
-    expect(roots[0].children[0].runs.map((r) => r.execution_id)).toEqual([id('c2')]);
+    expect(roots[0].runs.map((r) => r.runId)).toEqual([id('c1')]);
+    expect(roots[0].children[0].runs.map((r) => r.runId)).toEqual([id('c2')]);
   });
 
   it('draws every version once, even in a cycle', () => {
@@ -129,9 +137,9 @@ describe('version tree', () => {
   });
 
   it("counts a version's trigger runs among its marks", () => {
-    const fired: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), trigger_runs: 1200 }], runs: [] };
+    const fired: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), triggerRuns: 1200 }], runs: [] };
     expect(versionMarks(buildVersionTree(fired)[0])).toEqual(['activated', '1200 trigger runs']);
-    const once: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), trigger_runs: 1 }], runs: [] };
+    const once: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), triggerRuns: 1 }], runs: [] };
     expect(versionMarks(buildVersionTree(once)[0])).toEqual(['activated', '1 trigger run']);
   });
 

@@ -25,5 +25,5 @@
       "description": "Fires true once the response has been sent."
     }
   ],
-  "requires_infra": false
+  "requiresInfra": false
 }

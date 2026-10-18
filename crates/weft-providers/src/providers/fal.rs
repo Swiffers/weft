@@ -92,7 +92,7 @@ impl FalMeter {
             .named(&format!("fal-price:{model}"), || async {
                 Self::fetch_price(model, follow_up.http)
                     .await
-                    .map_err(|e| weft_core::error::WeftError::NodeExecution(format!("{e:#}")))
+                    .map_err(|e| weft_core::error::WeftError::NodeFailed(format!("{e:#}")))
             })
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -267,7 +267,7 @@ impl ProviderMeter for FalMeter {
         // would record the spend as unknown for ever on a failure the
         // charge can survive, blaming fal for stating nothing when it
         // was never asked. The charge stays open for the read that does
-        // answer; if none ever comes, the execution's flush books it as
+        // answer; if none ever comes, the run's flush books it as
         // the unknown it then genuinely is.
         if !(200..300).contains(&observed.status) {
             return None;

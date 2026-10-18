@@ -1,6 +1,6 @@
 //! The `weft` CLI. A thin HTTP client of the dispatcher plus a
 //! front-end for `weft build`. Every lifecycle command maps to an
-//! HTTP call. The CLI never owns execution state.
+//! HTTP call. The CLI never owns run state.
 
 use clap::{Parser, Subcommand};
 
@@ -39,7 +39,7 @@ struct Cli {
     /// commands (build, run, activate, deactivate, resync, infra, rm,
     /// the cancels) stream progress as one {"phase", "detail"} object
     /// per line, which is how the VS Code extension drives its action
-    /// bar; the readers (status, ps, executions, events, logs, files,
+    /// bar; the readers (status, ps, runs, events, logs, files,
     /// token, stop, connect) print what the
     /// dispatcher answered; test-node prints its reports as one JSON
     /// array. The rest (new, follow, daemon, catalog, tangle, clean)
@@ -132,16 +132,16 @@ enum Cmd {
         #[command(flatten)]
         opts: commands::connect::ConnectOpts,
     },
-    /// List the choices a step's searchable field offers (a
+    /// List the choices a node's searchable field offers (a
     /// `remote_select`, like a model or a spreadsheet picker): the same
     /// list the graph editor shows when you search that field, through
-    /// the connection picked for the step. One `id  label` line each;
+    /// the connection picked for the node. One `id  label` line each;
     /// the id is what goes in the source.
     Options {
-        /// The step, by its id as written in the source (or
+        /// The node, by its id as written in the source (or
         /// `path/to/file.weft:id` when the id exists in several files).
-        step: String,
-        /// The field: the step's input port name.
+        node: String,
+        /// The field: the node's input port name.
         field: String,
         /// Narrow the list to this text, as typed in the editor's search box.
         #[arg(long)]
@@ -203,7 +203,7 @@ enum Cmd {
     /// Every run records the code it ran as a version in the project's
     /// tree (`weft tree`).
     ///
-    /// Rebuilding while executions are in flight is non-disruptive:
+    /// Rebuilding while runs are in flight is non-disruptive:
     /// in-flight work finishes on workers baked from its own image,
     /// and this run lands on a fresh current-image worker.
     Run {
@@ -240,7 +240,7 @@ enum Cmd {
         target: Vec<String>,
         /// Run what this node needs and NOT the node (repeatable). The
         /// way to run a program up to the act you do not want performed:
-        /// `--before post` runs everything the posting step needs and
+        /// `--before post` runs everything the posting node needs and
         /// stops there.
         #[arg(long, value_name = "node-id")]
         before: Vec<String>,
@@ -260,13 +260,13 @@ enum Cmd {
         fire: Vec<String>,
         /// Stand in for a node: node='{"port": value}' declares what it
         /// would have emitted, and the node itself does not run. The way
-        /// past a step whose act you do not want repeated (a trigger you
-        /// have not activated, an infra step), to get at what comes
+        /// past a node whose act you do not want repeated (a trigger you
+        /// have not activated, an infra node), to get at what comes
         /// after it.
         #[arg(long, value_name = "node=json")]
         emit: Vec<String>,
         /// Run inside this instance of the program: needed when the run
-        /// reaches a step that exists once per instance (`@per_instance`,
+        /// reaches a node that exists once per instance (`@per_instance`,
         /// or anything reading from one).
         #[arg(long, value_name = "id")]
         instance: Option<weft_core::instance::InstanceId>,
@@ -279,10 +279,10 @@ enum Cmd {
         /// Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
-        /// Carry the run on in another worker if its worker dies (a step
+        /// Carry the run on in another worker if its worker dies (a node
         /// caught halfway is failed, not run twice): what the run did is
-        /// written down before each step (except a node marked pure, which
-        /// does nothing outside the run), which makes the run slower. Unset, a run that fires a trigger is kept the way the
+        /// written down before each node starts (except a node marked pure,
+        /// which does nothing outside the run), which makes the run slower. Unset, a run that fires a trigger is kept the way the
         /// trigger says, and any other run is fast.
         #[arg(long, conflicts_with = "fast")]
         durable: bool,
@@ -313,11 +313,11 @@ enum Cmd {
         #[arg(long)]
         root: bool,
     },
-    /// Restore a version's files and move head there. Given an execution,
+    /// Restore a version's files and move head there. Given a run,
     /// the version it ran, and that run becomes the one the next `--seed`
     /// inherits from.
     Branch {
-        /// A version id or an execution id, or the start of either.
+        /// A version id or a run id, or the start of either.
         reference: String,
         /// Throw away uncommitted changes instead of refusing.
         #[arg(long)]
@@ -332,7 +332,7 @@ enum Cmd {
     /// The project's version tree: every version with what changed
     /// against its parent, its runs beneath, head marked.
     Tree,
-    /// Compare what two runs put on their wires. A ref is an execution (or
+    /// Compare what two runs put on their wires. A ref is a run (or
     /// the start of one) or `example:<name>`.
     Diff {
         left: String,
@@ -346,7 +346,7 @@ enum Cmd {
     /// accepted for review. Replaces an existing example in full.
     Freeze {
         name: String,
-        execution_id: Option<String>,
+        run_id: Option<String>,
         /// Emphasize these output nodes in later diffs. Repeat for several nodes.
         #[arg(long = "expect")]
         expect: Vec<String>,
@@ -363,7 +363,7 @@ enum Cmd {
     /// Resolve a pure time wait now. A wait that expects a value is
     /// refused, naming its kind.
     Wake {
-        execution_id: String,
+        run_id: String,
         node: String,
     },
     /// The project's own worker levers: copies kept warm, the most copies,
@@ -393,8 +393,8 @@ enum Cmd {
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
-    /// Cancel a running execution, named by its id or the start of it.
-    Stop { execution_id: String },
+    /// Stop a run that is still going, named by its id or the start of it.
+    Stop { run_id: String },
     /// Prepare and save trigger settings without listening for events.
     Bake {
         project: Option<String>,
@@ -422,7 +422,7 @@ enum Cmd {
     /// A worker built from an older image than the one being
     /// activated is replaced: `--running-policy cancel` (the default)
     /// cancels what it runs and replaces it now; `wait` lets its
-    /// in-flight executions land first, up to `--drain-timeout`.
+    /// in-flight runs land first, up to `--drain-timeout`.
     Activate {
         project: Option<String>,
         #[arg(long = "reactivate-choice", value_name = "choice")]
@@ -445,8 +445,8 @@ enum Cmd {
     /// back; hibernate does that for a grace window; wipe drops it all and
     /// cancels the runs waiting on the triggers.
     ///
-    /// `--running-policy` controls how in-flight executions are
-    /// handled: `cancel` (the default) kills running executions and
+    /// `--running-policy` controls how in-flight runs are
+    /// handled: `cancel` (the default) stops them and
     /// flips the project straight to inactive; `wait` leaves them to
     /// drain, parking new fires meanwhile, up to `--drain-timeout`.
     ///
@@ -482,7 +482,7 @@ enum Cmd {
     CancelBuild {
         project: Option<String>,
     },
-    /// Force-cancel running executions while a deactivate-with-wait
+    /// Force-cancel the runs still going while a deactivate-with-wait
     /// is draining. Idempotent: if the project isn't currently in
     /// `deactivating`, this is a no-op.
     #[command(name = "cancel-running")]
@@ -521,7 +521,7 @@ enum Cmd {
     /// cwd project is unregistered: the dispatcher deactivates it,
     /// terminates its infrastructure, erases its runs, and reclaims its
     /// stored data.
-    /// Add flags to escalate: `--journal` drops execution history,
+    /// Add flags to escalate: `--journal` drops run history,
     /// `--local` wipes this project's build artifacts, `--all`
     /// implies every flag. An explicit project id overrides the
     /// cwd discovery.
@@ -546,10 +546,10 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Tail logs. No arg → latest execution of the cwd project.
-    /// UUID arg → that specific execution.
+    /// Tail logs. No arg → latest run of the cwd project.
+    /// UUID arg → that specific run.
     Logs {
-        #[arg(value_name = "execution-id")]
+        #[arg(value_name = "run-id")]
         target: Option<String>,
         /// How many lines, counted from the END of the log: a run that
         /// wrote more than this shows its last lines, and says so.
@@ -558,10 +558,10 @@ enum Cmd {
         limit: Option<u32>,
     },
     /// Print a summary of the cwd project's current state.
-    /// Registration, listener, infra per-node, recent executions.
+    /// Registration, listener, infra per-node, recent runs.
     Status,
     /// Manage a local install (start, stop, status, restart, logs,
-    /// remove, which): the runtime that owns projects, executions, and
+    /// remove, which): the runtime that owns projects, runs, and
     /// infra; `weft run` and the VS Code extension talk to it over HTTP.
     /// Which install is where you stand: the branch of the weft checkout
     /// you are in (`main` is the default install), the default install
@@ -618,9 +618,10 @@ enum Cmd {
         file: Option<std::path::PathBuf>,
     },
     /// Validate weft source (read from stdin) against the project's
-    /// `nodes/` catalog and print diagnostics as JSON. The editor's
-    /// Problems-panel feedback. Strict: the full compile + enrich +
-    /// validate pipeline.
+    /// `nodes/` catalog and print diagnostics as JSON. The full check
+    /// before a project ships: the strict compile + enrich + validate
+    /// pipeline, runtime rules included (the editor runs the same
+    /// before Run, Activate and Resync).
     Validate {
         /// Path of the source file (see `parse --file`).
         #[arg(long)]
@@ -709,10 +710,10 @@ enum Cmd {
         #[command(subcommand)]
         action: TokenAction,
     },
-    /// List past executions (newest first): one line per run with its
+    /// List past runs (newest first): one line per run with its
     /// status, phase, start time, entry node and tags. `--json` prints
     /// the page as the dispatcher returns it.
-    Executions {
+    Runs {
         #[arg(long, default_value_t = 50)]
         limit: u32,
         /// Only this project's runs (a project id). Without it, every
@@ -749,7 +750,7 @@ enum Cmd {
         /// Only runs for this instance.
         #[arg(long, value_name = "id")]
         instance: Option<weft_core::instance::InstanceId>,
-        /// Only runs carrying this tag (`ctx.tag_execution`).
+        /// Only runs carrying this tag (`ctx.tag_run`).
         #[arg(long)]
         tag: Option<String>,
         /// Only finished runs in which this node fired, wherever it sits
@@ -767,20 +768,20 @@ enum Cmd {
         #[arg(long, value_name = "words")]
         search: Option<String>,
     },
-    /// Print a past execution's events in order, one line each:
+    /// Print a past run's events in order, one line each:
     /// time, kind, node, and a short summary of the value or error.
     /// Values are truncated so a long run stays readable; `--node`
     /// and `--kind` narrow it, `--full` opens the values, and `--json`
     /// prints the replay rows the graph view reads.
     Events {
-        execution_id: String,
+        run_id: String,
         /// Only events of this node, spelled the way the source reads:
         /// `auth.check` is the node `check` of the file the site `auth`
         /// includes, and only that use of it.
         #[arg(long)]
         node: Option<String>,
         /// Only events of this kind (`node_failed`, `node_completed`,
-        /// `node_skipped`, `execution_cancelled`, ...), or of every
+        /// `node_skipped`, `run_cancelled`, ...), or of every
         /// kind containing it (`failed` matches both failure kinds).
         #[arg(long)]
         kind: Option<String>,
@@ -797,43 +798,43 @@ enum Cmd {
         full: bool,
     },
     /// Browse + manage stored files (the tenant's runtime storage):
-    /// project files, shared spaces, past-execution survivors.
+    /// project files, shared spaces, past-run survivors.
     Files {
         #[command(subcommand)]
         action: FilesAction,
     },
     /// Remove stale state. Default subject is the journal: with no
-    /// flags, deletes executions older than --keep-days (30). Pass
-    /// a positional UUID to target one execution. Other subjects
+    /// flags, deletes runs older than --keep-days (30). Pass
+    /// a positional UUID to target one run. Other subjects
     /// are flag-driven and combinable.
     ///
     /// Subjects:
-    ///   (default)         journal cleanup (executions older than --keep-days)
-    ///   <UUID>            one execution
+    ///   (default)         journal cleanup (runs older than --keep-days)
+    ///   <UUID>            one run
     ///   --images          unreferenced worker images for the cwd project
     ///                     (use --all to span every project)
     ///   --images --build-plane
     ///                     the builder bases and node-test images no
     ///                     install on this machine uses
     ///   --build-cache     drop the docker buildkit cache and the node-test cache
-    ///   --all             with the journal subject: nuke every execution
+    ///   --all             with the journal subject: nuke every run
     ///                     with --images: every project's images
     ///   --project <id>    that project's runs, all of them.
     #[command(verbatim_doc_comment)]
     Clean {
-        /// Single execution UUID to delete. Mutually exclusive with --images / --build-cache.
-        #[arg(value_name = "execution-id")]
-        execution_id: Option<String>,
+        /// Single run UUID to delete. Mutually exclusive with --images / --build-cache.
+        #[arg(value_name = "run-id")]
+        run_id: Option<String>,
         /// Age cutoff in days for a sweep that names no subject
         /// (default 30). Naming a subject means you mean all of it, so
         /// this only applies to `--project` when you ask for it.
         #[arg(long, value_name = "days")]
         keep_days: Option<u32>,
-        /// Wipe ALL executions (with no other flags) OR span every project (with --images).
+        /// Wipe ALL runs (with no other flags) OR span every project (with --images).
         #[arg(long, default_value_t = false)]
         all: bool,
-        /// This project's executions. Takes all of them, like naming
-        /// one execution does; add --keep-days to spare the recent ones.
+        /// This project's runs. Takes all of them, like naming
+        /// one run does; add --keep-days to spare the recent ones.
         #[arg(long, value_name = "project-id")]
         project: Option<String>,
         /// Only runs for this instance.
@@ -866,7 +867,7 @@ enum Cmd {
         /// node-test images no install on this machine uses (kept whole
         /// while an install has not recorded its own). Needs no running
         /// install; setup.sh runs it after every start.
-        #[arg(long, requires = "images", conflicts_with_all = ["all", "build_cache", "execution_id"])]
+        #[arg(long, requires = "images", conflicts_with_all = ["all", "build_cache", "run_id"])]
         build_plane: bool,
         /// Drop every build cache: the docker BuildKit cache and the
         /// host's node-test cache (heavy: the next build and the next
@@ -1110,16 +1111,16 @@ impl From<TriggerDeactivationOpts> for commands::deactivate::TriggerChoiceFlags 
     }
 }
 
-/// The running-work choice: what happens to the executions running
+/// The running-work choice: what happens to the runs running
 /// right now when a verb needs them out of the way (a stale worker
 /// replaced by `weft activate`, `weft bake` or `weft infra start`; the
-/// infra an execution uses taken down by a stop, terminate or per-node
+/// infra a run uses taken down by a stop, terminate or per-node
 /// verb; the triggers taken down by a deactivate). The pair travels
 /// together: the cap only ever bounds a wait, and a verb that took one
 /// without the other could only refuse it.
 #[derive(Debug, clap::Args, Default, Clone)]
 struct RunningChoiceOpts {
-    /// What to do with the running executions: cancel (default) | wait.
+    /// What to do with the runs still going: cancel (default) | wait.
     #[arg(long = "running-policy", value_name = "cancel|wait")]
     running_policy: Option<String>,
     /// Cap in seconds on a `--running-policy wait` before the operation
@@ -1258,7 +1259,7 @@ enum InfraAction {
     Status,
     /// Cancel in-flight infra work: halt claimed lifecycle commands
     /// (the supervisor stops between platform calls), cancel unclaimed
-    /// ones outright, interrupt the provisioning execution. HALT, not
+    /// ones outright, interrupt the provisioning run. HALT, not
     /// rollback: per-node partial state stays visible; terminate or
     /// retry per-node from where it stopped. 412 if nothing is in
     /// flight.
@@ -1295,9 +1296,9 @@ enum InfraAction {
     /// project's infra untouched. Used from the graph's per-node menu
     /// (the trash icon's siblings).
     ///
-    /// Nothing records which running executions use this one piece, so
+    /// Nothing records which running runs use this one piece, so
     /// `--running-policy cancel` (the default) cancels every running
-    /// execution of the project before the piece goes; `wait` lets
+    /// run of the project before the piece goes; `wait` lets
     /// them land first, up to `--drain-timeout`.
     NodeStop {
         #[arg(value_name = "node")]
@@ -1337,7 +1338,7 @@ enum InfraAction {
 #[derive(Debug, Subcommand)]
 enum FilesAction {
     /// List stored files, organized by space (project files, shared
-    /// spaces, past-execution survivors). Optional prefix filter.
+    /// spaces, past-run survivors). Optional prefix filter.
     Ls {
         #[arg(value_name = "prefix")]
         prefix: Option<String>,
@@ -1891,8 +1892,8 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             commands::build::run_build_images(push, push_suffix, print, runtime_binary.as_deref()).await
         }
         Cmd::Connect { opts } => commands::connect::run(ctx, opts).await,
-        Cmd::Options { step, field, search } => {
-            commands::options::run(ctx, &step, &field, search.as_deref()).await
+        Cmd::Options { node, field, search } => {
+            commands::options::run(ctx, &node, &field, search.as_deref()).await
         }
         Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
@@ -1932,15 +1933,15 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::RunningSource { dir } => commands::running_source::run(ctx, dir).await,
         Cmd::Tree => commands::tree::run(ctx).await,
         Cmd::Diff { left, right, full } => commands::diff::run(ctx, left, right, full).await,
-        Cmd::Freeze { name, execution_id, expect } => commands::freeze::run(ctx, name, execution_id, expect).await,
+        Cmd::Freeze { name, run_id, expect } => commands::freeze::run(ctx, name, run_id, expect).await,
         Cmd::Examples => commands::examples::run(ctx).await,
         Cmd::Prune { version, yes } => commands::prune::run(ctx, version, yes).await,
-        Cmd::Wake { execution_id, node } => commands::wake::run(ctx, execution_id, node).await,
+        Cmd::Wake { run_id, node } => commands::wake::run(ctx, run_id, node).await,
         Cmd::Domain { action } => commands::domain::run(ctx, action.into()).await,
         Cmd::Frontend { action } => commands::frontend::run(ctx, action.into()).await,
         Cmd::Workers { action } => commands::workers::run(ctx, action.map(Into::into).unwrap_or(commands::workers::WorkersAction::Show)).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
-        Cmd::Stop { execution_id } => commands::stop::run(ctx, execution_id).await,
+        Cmd::Stop { run_id } => commands::stop::run(ctx, run_id).await,
         Cmd::Bake { project, referenced, running, scope } => {
             commands::bake::run(
                 ctx,
@@ -2037,24 +2038,24 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Login { target, key_stdin } => commands::target::login(ctx, target, key_stdin).await,
         Cmd::Logout { target } => commands::target::logout(ctx, target).await,
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
-        Cmd::Executions { limit, project, phase, node, since, offset, status, instance, tag, through, search } => {
-            commands::executions::list(
+        Cmd::Runs { limit, project, phase, node, since, offset, status, instance, tag, through, search } => {
+            commands::runs::list(
                 ctx,
-                commands::executions::ListFilter {
+                commands::runs::ListFilter {
                     limit, offset, project, phase, node, since, status, instance, tag, through, search,
                 },
             )
             .await
         }
-        Cmd::Events { execution_id, node, kind, iteration, full } => {
+        Cmd::Events { run_id, node, kind, iteration, full } => {
             let iteration = match iteration {
-                Some(text) => commands::executions::parse_iteration(&text)?,
+                Some(text) => commands::runs::parse_iteration(&text)?,
                 None => Vec::new(),
             };
-            commands::executions::events(
+            commands::runs::events(
                 ctx,
-                execution_id,
-                commands::executions::EventsFilter { node, call_path: Vec::new(), kind, iteration, full },
+                run_id,
+                commands::runs::EventsFilter { node, call_path: Vec::new(), kind, iteration, full },
             )
             .await
         }
@@ -2068,14 +2069,14 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
         Cmd::Clean {
-            execution_id, keep_days, all, images, build_plane, build_cache, project, instance, status, node, tag, cancel_running, yes,
+            run_id, keep_days, all, images, build_plane, build_cache, project, instance, status, node, tag, cancel_running, yes,
         } => {
             if build_plane {
-                return commands::executions::clean_build_plane().await;
+                return commands::runs::clean_build_plane().await;
             }
-            let narrow = commands::executions::CleanNarrowing { instance, status, node, tag, cancel_running };
-            commands::executions::clean(
-                ctx, execution_id, keep_days, all, images, build_cache, project, narrow, yes,
+            let narrow = commands::runs::CleanNarrowing { instance, status, node, tag, cancel_running };
+            commands::runs::clean(
+                ctx, run_id, keep_days, all, images, build_cache, project, narrow, yes,
             )
             .await
         }

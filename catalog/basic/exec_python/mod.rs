@@ -8,7 +8,7 @@
 //!       `foo = ExecPython(a: Number) -> (b: String) { code: "..." }`.
 //!   The compiler's `canAddInputPorts` / `canAddOutputPorts`
 //!   feature (handled by `merge_ports` in enrich.rs) materializes
-//!   those ports onto the node definition before execution.
+//!   those ports onto the node definition before run.
 //!
 //! - The `code` config field carries the Python source. Whatever
 //!   the user writes there is wrapped in a zero-arg closure whose
@@ -86,7 +86,7 @@ use weft::node::NodeOutput;
 use weft::storage::media::{media_slots, substitute_media};
 use weft::weft_type::FileKind;
 use weft::context::ERROR_PORT;
-use weft::{node_error, ExecutionContext, Node, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
+use weft::{node_error, RunContext, Node, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;
@@ -101,9 +101,9 @@ impl Node for ExecPythonNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        // An exception the script raises is a failure of the step,
-        // which the runtime puts on `error` when it is wired. A mistake
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        // An exception the script raises fails this firing, and the
+        // runtime puts it on `error` when it is wired. A mistake
         // in the program itself (the code does not compile, the answer
         // is not a dict of declared outputs of the right types) is an
         // input or type error, which fails the run whether or not

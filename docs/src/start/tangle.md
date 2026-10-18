@@ -21,11 +21,11 @@ clause, the one about ignoring text, is a branch in the finished graph.
 ## What it does without being asked
 
 **It looks things up rather than remembering.** The catalog on your disk is the
-truth, and Tangle reads a step's real inputs and outputs before wiring it. The
+truth, and Tangle reads a node's real inputs and outputs before wiring it. The
 language moves fast, so anything the model remembers is probably stale.
 
-**It writes missing steps.** A step's own logic is Rust, and if nothing in the
-catalog does what you need, Tangle designs the step's inputs and outputs and
+**It writes missing nodes.** A node's own logic is Rust, and if nothing in the
+catalog does what you need, Tangle designs the node's inputs and outputs and
 hands it to a helper agent that writes that Rust.
 
 **It writes the prompts.** When a model's answer decides what happens next,
@@ -39,7 +39,7 @@ if you name a different one, yours wins.
 
 **It tests as it goes.** Tangle runs one piece of the program on its own, with
 values it makes up or a real input you gave it. It reads what came out, fixes
-the step, then runs only what changed. When a case comes out right, Tangle
+the node, then runs only what changed. When a case comes out right, Tangle
 freezes it, and after a later change it runs that case again and reads what
 moved. You do not have to be there for any of that.
 
@@ -56,7 +56,7 @@ out, and when it is wrong, say what is wrong with it rather than restating the
 goal.
 
 > This email is asking for a replacement, but the extracted request says the
-> customer wants a refund. Fix the prompt for that step.
+> customer wants a refund. Fix the prompt for that node.
 
 Tangle builds one stage, runs it on your case, and shows you the result before
 writing the next one. For the longer version of that habit, go and read

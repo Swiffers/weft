@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::drive;
 
@@ -21,7 +21,7 @@ impl Node for GoogleDriveCopyNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let file_id: String = ctx.inputs.get("fileId")?;
         let name: Option<String> = ctx.inputs.opt("name")?;

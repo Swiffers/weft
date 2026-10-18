@@ -162,7 +162,7 @@ const READINESS_BREADCRUMB_INTERVAL: Duration = Duration::from_secs(30);
 /// the user terminates/retries per-node from where it stopped).
 #[derive(Debug)]
 pub(crate) struct CancelledByUser {
-    /// Where execution halted, for the outcome message.
+    /// Where run halted, for the outcome message.
     pub at: &'static str,
 }
 

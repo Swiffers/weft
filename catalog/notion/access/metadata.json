@@ -20,12 +20,12 @@
       "kind": "oauth2",
       "grant": {
         "kind": "authorization_code",
-        "auth_url": "https://api.notion.com/v1/oauth/authorize",
+        "authUrl": "https://api.notion.com/v1/oauth/authorize",
         "pkce": false
       },
-      "token_url": "https://api.notion.com/v1/oauth/token",
-      "token_auth": "basic",
-      "auth_params": {
+      "tokenUrl": "https://api.notion.com/v1/oauth/token",
+      "tokenAuth": "basic",
+      "authParams": {
         "owner": "user"
       },
       "captures": [
@@ -63,7 +63,7 @@
       "rung": "reports_validity",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "paste": {
         "fields": [
           {

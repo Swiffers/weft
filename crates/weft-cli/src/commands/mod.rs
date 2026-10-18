@@ -25,7 +25,7 @@ pub mod infra_env;
 pub mod catalog;
 pub mod describe_nodes;
 pub mod parse;
-pub mod executions;
+pub mod runs;
 pub mod status;
 pub mod test_node;
 pub mod tangle;
@@ -364,23 +364,23 @@ impl Ctx {
     }
 }
 
-/// The full execution an execution argument names. A whole uuid is taken
+/// The full run a run argument names. A whole uuid is taken
 /// as it is; anything shorter is the start of one, and the dispatcher
-/// answers the single execution of yours it starts (or says it starts
-/// none, or several). Every command that takes an execution goes through
+/// answers the single run of yours it starts (or says it starts
+/// none, or several). Every command that takes a run goes through
 /// here, so `weft events 3f2a` works the way `weft stop 3f2a` does.
-pub async fn resolve_execution_id(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
+pub async fn resolve_run_id(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
     if uuid::Uuid::parse_str(input).is_ok() {
         return Ok(input.to_string());
     }
     let resp = ctx
         .client()?
-        .get_json(&format!("/executions/resolve/{input}"))
+        .get_json(&format!("/runs/resolve/{input}"))
         .await
-        .map_err(|e| anyhow::anyhow!("'{input}' names no execution: {e}"))?;
-    let resolved: weft_core::program::ResolvedExecution =
-        serde_json::from_value(resp).map_err(|e| anyhow::anyhow!("read the resolved execution: {e}"))?;
-    Ok(resolved.execution_id.to_string())
+        .map_err(|e| anyhow::anyhow!("'{input}' names no run: {e}"))?;
+    let resolved: weft_core::program::ResolvedRun =
+        serde_json::from_value(resp).map_err(|e| anyhow::anyhow!("read the resolved run: {e}"))?;
+    Ok(resolved.run_id.to_string())
 }
 
 /// One node of the program, from the way a person spells it:

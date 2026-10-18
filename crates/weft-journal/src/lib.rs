@@ -1,4 +1,4 @@
-//! A run's record: its events (`ExecEvent`), how they are stored
+//! A run's record: its events (`RunEvent`), how they are stored
 //! (`stored`), carried (`frame`) and written and read (`record`), and how
 //! folding them over the program rebuilds the run (`fold`). Shared by the
 //! dispatcher, the engine and the broker, which all need the same events
@@ -17,7 +17,7 @@ pub mod tags;
 pub mod traits;
 pub mod unrecorded;
 
-pub use events::{redacted, ExecEvent, Seed};
+pub use events::{redacted, RunEvent, Seed};
 pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeBook, EndedWait, FiringView, Fold, FoldEffects, OpenedCharge};
 pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
 pub use traits::{BatchError, JournalClient, JournalRow, NoopJournal, Position, RecordClient};

@@ -37,8 +37,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "pageToken",
-              "cursor_path": "nextPageToken"
+              "cursorParam": "pageToken",
+              "cursorPath": "nextPageToken"
             }
           },
           {
@@ -48,7 +48,7 @@
             "grants": [
               "https://www.googleapis.com/auth/drive.file"
             ],
-            "mime_types": [
+            "mimeTypes": [
               "application/vnd.google-apps.spreadsheet"
             ]
           },
@@ -67,7 +67,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "depends_on": [
+        "dependsOn": [
           "spreadsheet"
         ],
         "sources": [

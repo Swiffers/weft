@@ -16,7 +16,7 @@
 //!     the version itself once they are built; this command follows it
 //!     until it is registered or failed. Nothing is built or loaded on this
 //!     machine, and nothing this machine computed is believed.
-//!   - Registering a build is UNCONDITIONAL even while executions run on
+//!   - Registering a build is UNCONDITIONAL even while runs run on
 //!     the previous image: every worker task is stamped with the image it
 //!     was enqueued for and only claimable by a process baked from it, so
 //!     in-flight work finishes on the old processes while new work flows to
@@ -31,9 +31,9 @@ use super::Ctx;
 use crate::client::DispatcherClient;
 use crate::progress::Progress;
 
-/// User's local choice for how to handle in-flight Fire executions
+/// User's local choice for how to handle in-flight Fire runs
 /// when a `run` lands with a stale binary or a `deactivate` lands with
-/// running execs. The type lives in weft-core (one definition shared
+/// running runs. The type lives in weft-core (one definition shared
 /// with the broker/dispatcher wire protocol); re-exported here so
 /// every CLI verb keeps importing it from the gate that consumes it.
 pub use weft_core::{RunningChoice, RunningPolicy};
@@ -545,7 +545,7 @@ pub async fn build_compiled(
             (built, following)
         }
     };
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
     progress.build_done(&project.manifest.package.name, &following.built);
     if let Some(note) = replaced_infra_images_note(&built.replaced_infra_images, ctx.on()) {
         progress.warn(&note);

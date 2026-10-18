@@ -1,4 +1,4 @@
-// Auto-follow controller: decides which execution the graph view is
+// Auto-follow controller: decides which run the graph view is
 // currently streaming. Three modes, picked on the graph's toggle:
 //
 //   - following: every run that starts takes the canvas. The default.
@@ -11,7 +11,7 @@
 //   - a run the person started from the editor (Run, Activate, Infra
 //     Start) goes back to following: clicking Run is asking to watch
 //     it. A run started anywhere else (a terminal, an assistant
-//     running the CLI) is only an execution_started on the stream,
+//     running the CLI) is only a run_started on the stream,
 //     so it follows the mode like any trigger fire.
 //   - "View in Graph" on a past run locks onto it.
 //
@@ -24,9 +24,9 @@
 // (ProjectEventStream: the extension feeds `handleEvent` /
 // `handleReconnect`). It has no UI of its own; it tells the webview
 // what to show via `kind: followStatus` messages and defers the
-// actual execution-event stream to ExecutionFollower.
+// actual run-event stream to RunFollower.
 
-import type { ExecutionFollower, DispatcherEvent } from './execFollower';
+import type { RunFollower, DispatcherEvent } from './runFollower';
 import type { FollowMode, FollowStatus, HostMessage } from '../../packages/weft-graph/src/protocol';
 
 export type { FollowMode, FollowStatus };
@@ -34,7 +34,7 @@ export type { FollowMode, FollowStatus };
 export type PostFn = (msg: HostMessage) => void;
 
 /// Fired on every project-SSE event that could change the
-/// dispatcher's `available_actions` list (executions starting /
+/// dispatcher's `availableActions` list (runs starting /
 /// finishing, project status changes). The extension uses this to
 /// debounce-trigger a `weft status --json` refetch.
 export type ActionableEventHandler = (ev: DispatcherEvent) => void;
@@ -50,7 +50,7 @@ const memoryKey = (projectId: string) => `weft.follow.jumpsToNewRuns.${projectId
 
 export class AutoFollowController {
   private mode: FollowMode = 'following';
-  private executionId: string | undefined;
+  private runId: string | undefined;
   private projectId: string | undefined;
   // Runs that started while not following; newest last so catching up
   // can take the most recent. The pending COUNT shown in the chip is
@@ -58,10 +58,10 @@ export class AutoFollowController {
   private pendingQueue: string[] = [];
 
   constructor(
-    private readonly follower: ExecutionFollower,
+    private readonly follower: RunFollower,
     private readonly post: PostFn,
     private readonly memory: FollowMemory,
-    /// Notified on events that shift available_actions (start /
+    /// Notified on events that shift availableActions (start /
     /// completion / failure). The extension debounces 500ms before
     /// re-fetching status, so a flurry of node events during a run
     /// doesn't hammer the dispatcher.
@@ -74,18 +74,18 @@ export class AutoFollowController {
   setProject(projectId: string): void {
     this.projectId = projectId;
     this.mode = this.memory.get(memoryKey(projectId)) === false ? 'off' : 'following';
-    this.executionId = undefined;
+    this.runId = undefined;
     this.pendingQueue = [];
     this.follower.stop();
     this.emitStatus();
   }
 
-  /** The execution the graph is currently streaming, if any. The ONE
-   *  place that answers "which execution is on screen": consumers (e.g.
+  /** The run the graph is currently streaming, if any. The ONE
+   *  place that answers "which run is on screen": consumers (e.g.
    *  the sidebar's delete action) read it here instead of shadowing
    *  it, since every follow path updates it. */
-  currentExecutionId(): string | undefined {
-    return this.executionId;
+  currentRunId(): string | undefined {
+    return this.runId;
   }
 
   /** The person picked a mode on the toggle, or clicked the "new runs"
@@ -107,7 +107,7 @@ export class AutoFollowController {
       case 'locked':
         // Locking holds the run on screen; with none there is nothing
         // to hold (the toggle disables the choice).
-        if (!this.executionId) return;
+        if (!this.runId) return;
         this.enter('locked');
         break;
       case 'off':
@@ -119,26 +119,26 @@ export class AutoFollowController {
   }
 
   /** The person started something from the editor: Run, Activate, or
-   *  Infra Start. We know the execution the dispatcher handed back (Run)
-   *  or we don't (Activate spawns an internal exec whose execution we
+   *  Infra Start. We know the run the dispatcher handed back (Run)
+   *  or we don't (Activate spawns an internal run whose run we
    *  learn via SSE). In the latter case the caller passes `undefined`
-   *  and we pick up the next ExecutionStarted. */
-  followStartedByUser(executionId: string | undefined): void {
-    console.log(`[weft/autoFollow] followStartedByUser(${executionId}): mode=${this.mode} executionId=${this.executionId}`);
+   *  and we pick up the next RunStarted. */
+  followStartedByUser(runId: string | undefined): void {
+    console.log(`[weft/autoFollow] followStartedByUser(${runId}): mode=${this.mode} runId=${this.runId}`);
     this.enter('following');
     // Race window: the dispatcher's /run response arrives on the CLI's
-    // HTTP path AND the same ExecutionStarted is broadcast on the
+    // HTTP path AND the same RunStarted is broadcast on the
     // project SSE. Whichever arrives first starts the replay; two
     // concurrent replays would double-deliver journaled events to the
-    // webview as the journal fills mid-execution.
-    if (executionId && this.executionId !== executionId) this.show(executionId);
+    // webview as the journal fills mid-run.
+    if (runId && this.runId !== runId) this.show(runId);
     this.emitStatus();
   }
 
   /** "View in Graph" on a past run: lock onto it. */
-  lockTo(executionId: string): void {
+  lockTo(runId: string): void {
     this.enter('locked');
-    this.show(executionId);
+    this.show(runId);
     this.emitStatus();
   }
 
@@ -153,31 +153,31 @@ export class AutoFollowController {
 
   /** The project stream (re)connected: events emitted while it was
    *  down are gone, so the extension hands us the freshly fetched
-   *  newest RUNNING execution (if any) to catch up on. It is treated
-   *  exactly as if its ExecutionStarted had arrived live. */
-  handleReconnect(runningExecutionId: string | undefined): void {
-    console.log(`[weft/autoFollow] reconnect resync: running=${runningExecutionId} mode=${this.mode} executionId=${this.executionId}`);
-    if (runningExecutionId) this.runStarted(runningExecutionId);
+   *  newest RUNNING run (if any) to catch up on. It is treated
+   *  exactly as if its RunStarted had arrived live. */
+  handleReconnect(runningRunId: string | undefined): void {
+    console.log(`[weft/autoFollow] reconnect resync: running=${runningRunId} mode=${this.mode} runId=${this.runId}`);
+    if (runningRunId) this.runStarted(runningRunId);
   }
 
   /** Every parsed event from the shared project stream. */
   handleEvent(ev: DispatcherEvent): void {
-    // Anything that shifts the dispatcher's `available_actions` list
+    // Anything that shifts the dispatcher's `availableActions` list
     // routes to the actionable-event handler so the action bar
     // refetches `weft status --json` and re-renders. Includes:
-    //   - execution lifecycle (run / cancel / complete change run state)
+    //   - run lifecycle (run / cancel / complete change run state)
     //   - infra lifecycle (status flips, transients, flaky/recovered);
     //     this is what makes Stop / Terminate's `stopping` /
     //     `terminating` transients visible in the UI. Without it the
     //     bar only re-reads on user action.
     if (
-      ev.kind === 'execution_started' ||
-      ev.kind === 'execution_completed' ||
-      ev.kind === 'execution_failed' ||
-      ev.kind === 'execution_cancelled' ||
+      ev.kind === 'run_started' ||
+      ev.kind === 'run_completed' ||
+      ev.kind === 'run_failed' ||
+      ev.kind === 'run_cancelled' ||
       // A deleted run was preserved state until now (a run parked on a
       // question counts), so the verb set moves with it.
-      ev.kind === 'execution_deleted' ||
+      ev.kind === 'run_deleted' ||
       ev.kind === 'infra_status_changed' ||
       ev.kind === 'infra_flaky' ||
       ev.kind === 'infra_recovered' ||
@@ -195,25 +195,25 @@ export class AutoFollowController {
       this.onActionable(ev);
     }
 
-    if (ev.kind !== 'execution_started') return;
-    console.log(`[weft/autoFollow] execution_started ${ev.execution_id}: mode=${this.mode} executionId=${this.executionId}`);
-    this.runStarted(ev.execution_id);
+    if (ev.kind !== 'run_started') return;
+    console.log(`[weft/autoFollow] run_started ${ev.runId}: mode=${this.mode} runId=${this.runId}`);
+    this.runStarted(ev.runId);
   }
 
   /** A run started (live, or found running on reconnect). Following
    *  shows it; locked and off count it. */
-  private runStarted(executionId: string): void {
+  private runStarted(runId: string): void {
     // Already on screen: the run command followed it from its own
     // reply and the stream is echoing the same start. A second replay
     // would re-apply the journal so far and double-render pulses.
-    if (this.executionId === executionId) return;
+    if (this.runId === runId) return;
     if (this.mode === 'following') {
-      this.show(executionId);
+      this.show(runId);
       this.emitStatus();
-    } else if (!this.pendingQueue.includes(executionId)) {
+    } else if (!this.pendingQueue.includes(runId)) {
       // Deduplicated, so a reconnect resync and the backlog's own
-      // execution_started for the same run never count twice.
-      this.pendingQueue.push(executionId);
+      // run_started for the same run never count twice.
+      this.pendingQueue.push(runId);
       this.emitStatus();
     }
   }
@@ -227,18 +227,18 @@ export class AutoFollowController {
     if (this.projectId) void this.memory.update(memoryKey(this.projectId), mode === 'following');
   }
 
-  /** Put `executionId` on the canvas. Replay, not follow: the run may have
+  /** Put `runId` on the canvas. Replay, not follow: the run may have
    *  emitted frames already or finished, and replay paints the
    *  journaled events before continuing live. */
-  private show(executionId: string): void {
-    this.executionId = executionId;
-    void this.follower.replay(executionId);
+  private show(runId: string): void {
+    this.runId = runId;
+    void this.follower.replay(runId);
   }
 
   private clearCanvas(): void {
-    this.executionId = undefined;
+    this.runId = undefined;
     this.follower.stop();
-    this.post({ kind: 'execCleared' });
+    this.post({ kind: 'runCleared' });
   }
 
   /** Post the current follow status to the webview. Public because a
@@ -247,7 +247,7 @@ export class AutoFollowController {
   emitStatus(): void {
     const status: FollowStatus = {
       mode: this.mode,
-      executionId: this.executionId,
+      runId: this.runId,
       pendingCount: this.pendingQueue.length,
     };
     this.post({ kind: 'followStatus', status });

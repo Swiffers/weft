@@ -25,11 +25,11 @@
       "kind": "oauth2",
       "grant": {
         "kind": "authorization_code",
-        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "authUrl": "https://accounts.google.com/o/oauth2/v2/auth",
         "pkce": true
       },
-      "token_url": "https://oauth2.googleapis.com/token",
-      "auth_params": {
+      "tokenUrl": "https://oauth2.googleapis.com/token",
+      "authParams": {
         "access_type": "offline",
         "prompt": "consent"
       }
@@ -94,7 +94,7 @@
         "description": "Create and edit Google Docs (the files-you-pick grant already covers picked docs)."
       }
     ],
-    "all_permissions_url": "https://developers.google.com/identity/protocols/oauth2/scopes",
+    "allPermissionsUrl": "https://developers.google.com/identity/protocols/oauth2/scopes",
     "verification": {
       "rung": "reports_permissions",
       "cost": "free"
@@ -110,13 +110,13 @@
       "url": "https://openidconnect.googleapis.com/v1/userinfo",
       "captures": [
         {
-          "name": "user_email",
+          "name": "userEmail",
           "path": "email"
         }
       ]
     },
-    "identity": "{user_email}",
-    "own_page": {
+    "identity": "{userEmail}",
+    "ownPage": {
       "guide": {
         "link": "https://console.cloud.google.com/apis/credentials",
         "steps": [
@@ -138,25 +138,25 @@
           "messageNumber": "header:X-Goog-Message-Number"
         },
         "account": {
-          "value": "user_email",
+          "value": "userEmail",
           "path": "header:X-Goog-Channel-Token"
         },
         "webhook": {
           "verify": {
             "kind": "token_echo"
           },
-          "route_by": "subscription",
-          "id_path": "header:X-Goog-Channel-ID",
-          "token_path": "header:X-Goog-Channel-Token",
+          "routeBy": "subscription",
+          "idPath": "header:X-Goog-Channel-ID",
+          "tokenPath": "header:X-Goog-Channel-Token",
           "subscribe": {
             "subscribe": {
               "url": "https://www.googleapis.com/drive/v3/files/{target}/watch?supportsAllDrives=true",
               "method": "POST",
               "body": {
-                "id": "{subscription_id}",
+                "id": "{subscriptionId}",
                 "type": "web_hook",
-                "address": "{receiver_url}",
-                "token": "{subscription_token}"
+                "address": "{receiverUrl}",
+                "token": "{subscriptionToken}"
               },
               "auth": [
                 {
@@ -167,11 +167,11 @@
               ],
               "captures": [
                 {
-                  "name": "expires_at",
+                  "name": "expiresAt",
                   "path": "expiration"
                 },
                 {
-                  "name": "resource_id",
+                  "name": "resourceId",
                   "path": "resourceId"
                 }
               ]
@@ -180,8 +180,8 @@
               "url": "https://www.googleapis.com/drive/v3/channels/stop",
               "method": "POST",
               "body": {
-                "id": "{subscription_id}",
-                "resourceId": "{resource_id}"
+                "id": "{subscriptionId}",
+                "resourceId": "{resourceId}"
               },
               "auth": [
                 {
@@ -191,7 +191,7 @@
                 }
               ]
             },
-            "renew_margin_secs": 600
+            "renewMarginSecs": 600
           }
         }
       }

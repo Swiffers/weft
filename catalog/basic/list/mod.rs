@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ListNode;
@@ -27,7 +27,7 @@ impl Node for ListNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // A List with no ports at all is a node somebody added and never
         // declared items on; an empty list from it would say nothing
         // about why. Every optional item staying silent is different: the

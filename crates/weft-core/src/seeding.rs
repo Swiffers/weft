@@ -9,24 +9,24 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde_json::Value;
 
-use crate::exec::NodeExecutionStatus;
+use crate::run::NodeFiringStatus;
 use crate::frames::{loop_indices, Located, LoopFrames};
-use crate::primitive::ExecutionSnapshot;
+use crate::primitive::RunSnapshot;
 use crate::project::{boundary_in_id, GroupBoundaryRole, GroupKind, ProjectDefinition};
 use crate::project::hash::ProgramIdentity;
 use crate::project::graph::{GraphView, ProjectGraph};
 use crate::project::selection::{enclosing_loops, every_place, is_body, members_in, source_place, RunSelection, SelectionBounds};
 use crate::run_spec::{OutputWire, RunSpec};
-use crate::ExecutionId;
+use crate::RunId;
 
 /// One complete result the parent retained. Its origin is already chosen;
 /// a failed newer attempt never falls through to an older successful one.
 #[derive(Debug, Clone)]
 pub struct SeedOutcome {
-    pub origin: ExecutionId,
+    pub origin: RunId,
     pub slice_hash: String,
     pub used_backups: BTreeMap<String, Value>,
-    pub backup_origins: BTreeMap<String, ExecutionId>,
+    pub backup_origins: BTreeMap<String, RunId>,
     pub absent_ports: BTreeSet<String>,
     /// Ordinary group ports actually evaluated under the origin's cut.
     pub boundary_ports: BTreeSet<String>,
@@ -43,12 +43,12 @@ pub enum FileNow {
     Gone,
 }
 
-/// Why a reused step's output cannot stand in for it any more, or
-/// `None` when it still can: the output names a stored `file` the step
+/// Why a reused node's output cannot stand in for it any more, or
+/// `None` when it still can: the output names a stored `file` the node
 /// left at one version, and the file is at another now (another run, or
-/// a later step, changed it), or is gone. `step` and `port` are spelled
+/// a later node, changed it), or is gone. `node` and `port` are spelled
 /// the way the program reads them. The reason names both ways out.
-pub fn moved_file_refusal(step: &str, port: &str, file: &crate::storage::StoredFile, now: FileNow) -> Option<String> {
+pub fn moved_file_refusal(node: &str, port: &str, file: &crate::storage::StoredFile, now: FileNow) -> Option<String> {
     let what = match now {
         FileNow::At(version) if version == file.version => return None,
         FileNow::At(version) => format!(
@@ -58,17 +58,17 @@ pub fn moved_file_refusal(step: &str, port: &str, file: &crate::storage::StoredF
         FileNow::Gone => "is gone (deleted, or expired with the run that made it)".to_string(),
     };
     Some(format!(
-        "--seed would reuse what '{step}' produced on '{port}', but the file it names, '{}', {what}, so \
-         the saved result no longer says what that step made. Hand the file in yourself \
-         (`--emit {step}='{{\"{port}\": ...}}'`), or run '{step}' again by keeping it out of the seed \
-         (`--seed-before {step}`).",
+        "--seed would reuse what '{node}' produced on '{port}', but the file it names, '{}', {what}, so \
+         the saved result no longer says what that node made. Hand the file in yourself \
+         (`--emit {node}='{{\"{port}\": ...}}'`), or run '{node}' again by keeping it out of the seed \
+         (`--seed-before {node}`).",
         file.filename
     ))
 }
 
 #[derive(Debug)]
 pub struct SeedPlan {
-    pub origins: BTreeMap<Located, ExecutionId>,
+    pub origins: BTreeMap<Located, RunId>,
     pub selection: RunSelection,
     pub warnings: Vec<String>,
 }
@@ -270,20 +270,20 @@ pub fn seed_plan(
             ));
         }
     }
-    let mut execution = selection.clone();
+    let mut run = selection.clone();
     for place in starting_inputs.keys().filter(|place| selection.nodes.contains(*place)) {
         if let Some(old) = outcomes.get(place).filter(|old| !old.used_backups.is_empty() && hashes.get(place) == Some(&old.slice_hash)) {
-            let inputs = execution.input.entry(place.clone()).or_default();
+            let inputs = run.input.entry(place.clone()).or_default();
             for (port, value) in &old.used_backups {
                 if !inputs.contains_key(port) {
                     inputs.insert(port.clone(), value.clone());
-                    execution.input_origins.entry(place.clone()).or_default().insert(port.clone(), old.backup_origins.get(port).copied().unwrap_or(old.origin));
+                    run.input_origins.entry(place.clone()).or_default().insert(port.clone(), old.backup_origins.get(port).copied().unwrap_or(old.origin));
                 }
             }
         }
     }
-    execution = execution.with_reused(project, &origins.keys().cloned().collect());
-    Ok(SeedPlan { origins, selection: execution, warnings })
+    run = run.with_reused(project, &origins.keys().cloned().collect());
+    Ok(SeedPlan { origins, selection: run, warnings })
 }
 
 
@@ -291,14 +291,14 @@ pub fn seed_plan(
 /// record the place has is Completed or Skipped (a node fired in three
 /// loop iterations must have settled in all three), and none is parked
 /// on a suspension. A place with no record never ran and is not here.
-pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &ExecutionSnapshot) -> HashSet<Located> {
+pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &RunSnapshot) -> HashSet<Located> {
     let graph = ProjectGraph::new(project);
     let mut eligible: HashSet<Located> = HashSet::new();
     let mut unfinished: HashSet<Located> = HashSet::new();
-    for (id, records) in &snapshot.executions {
+    for (id, records) in &snapshot.firings {
         for record in records {
             let place = Located::at(id, &record.frames);
-            if matches!(record.status, NodeExecutionStatus::Completed | NodeExecutionStatus::Skipped) {
+            if matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped) {
                 eligible.insert(place);
             } else {
                 unfinished.insert(place);
@@ -320,9 +320,9 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &ExecutionSnapsh
             if enclosing_loops(project, at).iter().any(|around| around.id != group.id) { continue; }
             let members = members_in(&graph, &group.id, &at.path);
             let complete = complete_loop(project, snapshot, &group.id, &at.frames())
-                && members.iter().all(|member| snapshot.executions.get(&member.id).is_none_or(|records|
+                && members.iter().all(|member| snapshot.firings.get(&member.id).is_none_or(|records|
                     records.iter().filter(|record| Located::at(&member.id, &record.frames) == *member)
-                        .all(|record| matches!(record.status, NodeExecutionStatus::Completed | NodeExecutionStatus::Skipped))));
+                        .all(|record| matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped))));
             for member in members {
                 if complete { eligible.insert(member); } else { eligible.remove(&member); }
             }
@@ -335,28 +335,28 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &ExecutionSnapsh
 /// scope, its own container for an Out boundary) was skipped at
 /// `frames`: the gate's In fired under a prefix of these frames and
 /// recorded a skip.
-fn skipped_scope(project: &ProjectDefinition, snapshot: &ExecutionSnapshot, place: &Located, frames: &LoopFrames) -> bool {
+fn skipped_scope(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located, frames: &LoopFrames) -> bool {
     let node = project.nodes.iter().find(|node| node.id == place.id);
     let gates = place.path.iter().cloned()
         .chain(node.iter().flat_map(|node| node.scope.iter().cloned()))
         .chain(node.iter().flat_map(|node| node.group_boundary.iter()
             .filter(|boundary| boundary.role == GroupBoundaryRole::Out).map(|boundary| boundary.group_id.clone())));
     gates.into_iter().any(|group| {
-        snapshot.executions.get(&boundary_in_id(&group)).is_some_and(|records| records.iter().any(|record|
-            frames.starts_with(&record.frames) && record.status == NodeExecutionStatus::Skipped))
+        snapshot.firings.get(&boundary_in_id(&group)).is_some_and(|records| records.iter().any(|record|
+            frames.starts_with(&record.frames) && record.status == NodeFiringStatus::Skipped))
     })
 }
 
 /// Whether the loop `group`, opened at `frames`, ran to a clean end
 /// with every iteration settled.
-fn complete_loop(project: &ProjectDefinition, snapshot: &ExecutionSnapshot, group: &str, frames: &LoopFrames) -> bool {
+fn complete_loop(project: &ProjectDefinition, snapshot: &RunSnapshot, group: &str, frames: &LoopFrames) -> bool {
     let Some(entry) = project.nodes.iter().find(|node| node.id == boundary_in_id(group)) else { return false };
     if skipped_scope(project, snapshot, &Located::at(&entry.id, frames), frames) { return true; }
-    let Some(records) = snapshot.executions.get(&entry.id) else { return false };
+    let Some(records) = snapshot.firings.get(&entry.id) else { return false };
     let Some(record) = records.iter().find(|record| &record.frames == frames) else { return false };
-    if record.status == NodeExecutionStatus::Skipped { return true; }
-    if record.status != NodeExecutionStatus::Completed { return false; }
-    let key = crate::primitive::LoopInstanceKey { group_id: group.into(), parent_frames: frames.clone(), execution_id: snapshot.execution_id };
+    if record.status == NodeFiringStatus::Skipped { return true; }
+    if record.status != NodeFiringStatus::Completed { return false; }
+    let key = crate::primitive::LoopInstanceKey { group_id: group.into(), parent_frames: frames.clone(), run_id: snapshot.run_id };
     let Some(instance) = snapshot.loop_runtime.get(&key) else { return false };
     if instance.terminated.is_none_or(|reason| matches!(reason,
         crate::primitive::LoopTerminationReason::Failed | crate::primitive::LoopTerminationReason::Cancelled)) { return false; }
@@ -382,11 +382,11 @@ fn frame_scope_of(project: &ProjectDefinition, node: &crate::project::NodeDefini
 /// checked here; a body's own halves fire at the call's frames and are
 /// checked here too; a loop's In fires at its parent's frames and is
 /// the parent's to check.
-fn scope_settled(project: &ProjectDefinition, snapshot: &ExecutionSnapshot, scope: &str, frames: &LoopFrames) -> bool {
+fn scope_settled(project: &ProjectDefinition, snapshot: &RunSnapshot, scope: &str, frames: &LoopFrames) -> bool {
     let kind_of = |group: &str| project.groups.iter().find(|g| g.id == group).map(|g| &g.kind);
     let is_body = is_body(project, scope);
-    let settled_at = |id: &str| snapshot.executions.get(id).is_some_and(|records| records.iter().any(|record|
-        &record.frames == frames && matches!(record.status, NodeExecutionStatus::Completed | NodeExecutionStatus::Skipped)));
+    let settled_at = |id: &str| snapshot.firings.get(id).is_some_and(|records| records.iter().any(|record|
+        &record.frames == frames && matches!(record.status, NodeFiringStatus::Completed | NodeFiringStatus::Skipped)));
     for node in &project.nodes {
         let own_half = node.group_boundary.as_ref().filter(|b| b.group_id == scope)
             .is_some_and(|b| is_body || b.role == GroupBoundaryRole::Out);
@@ -435,10 +435,10 @@ mod tests {
     }
 
     /// A reused output's file still stands in only at the version the
-    /// step left it at; a newer version or a missing file refuses,
-    /// naming the step, the port, the file and both ways out.
+    /// node left it at; a newer version or a missing file refuses,
+    /// naming the node, the port, the file and both ways out.
     #[test]
-    fn a_reused_file_must_be_where_the_step_left_it() {
+    fn a_reused_file_must_be_where_the_node_left_it() {
         assert_eq!(moved_file_refusal("ask", "historyFile", &chat_file(4), FileNow::At(4)), None);
         let moved = moved_file_refusal("ask", "historyFile", &chat_file(4), FileNow::At(6)).unwrap();
         for part in ["'ask'", "'historyFile'", "'chat.jsonl'", "version 4", "version 6", "--emit ask=", "--seed-before ask"] {
@@ -512,7 +512,7 @@ mod tests {
             (RunSpec { group: Some(("l".into(), BTreeMap::new())), ..RunSpec::whole("case") }, "c", "l__in"),
         ] {
             let authored = crate::run_spec::resolve_spec(&spec, &project, &Default::default()).unwrap().selection;
-            let planned = SeedPlan { origins: [(top(source), ExecutionId::nil())].into(), selection: authored.clone(), warnings: vec![] };
+            let planned = SeedPlan { origins: [(top(source), RunId::nil())].into(), selection: authored.clone(), warnings: vec![] };
             let history = vec![OutputWire { node: source.into(), port: "out".into(), value: json!("original input"), ..Default::default() }];
             let saved = starting_parameters(&project, &spec, &authored, &planned, &outcomes(&project), &history).unwrap();
             assert_eq!(saved.starting_inputs(&project)[&top(entry)]["in"], json!("original input"));
@@ -521,7 +521,7 @@ mod tests {
         }
         let whole = RunSpec::whole("whole");
         let authored = RunSelection::whole(&project);
-        let planned = SeedPlan { origins: [(top("a"), ExecutionId::nil())].into(), selection: authored.clone(), warnings: vec![] };
+        let planned = SeedPlan { origins: [(top("a"), RunId::nil())].into(), selection: authored.clone(), warnings: vec![] };
         let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!("intermediate"), ..Default::default() }];
         assert_eq!(starting_parameters(&project, &whole, &authored, &planned, &outcomes(&project), &history).unwrap(), whole);
     }
@@ -534,7 +534,7 @@ mod tests {
         project.edges[0].path = vec!["field".into()];
         let spec = RunSpec { from: [("b".into(), BTreeMap::new())].into(), ..RunSpec::whole("projected") };
         let authored = crate::run_spec::resolve_spec(&spec, &project, &Default::default()).unwrap().selection;
-        let planned = SeedPlan { origins: [(top("a"), ExecutionId::nil())].into(), selection: authored.clone(), warnings: vec![] };
+        let planned = SeedPlan { origins: [(top("a"), RunId::nil())].into(), selection: authored.clone(), warnings: vec![] };
         let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!({"field":"delivered"}), ..Default::default() }];
         let saved = starting_parameters(&project, &spec, &authored, &planned, &outcomes(&project), &history).unwrap();
         assert_eq!(saved.from["b"]["in"], json!("delivered"));
@@ -599,7 +599,7 @@ mod tests {
         }
         let mut old = outcomes(&project);
         old.get_mut(&at("@f.free")).unwrap().used_backups.insert("v".into(), json!("kept"));
-        let planned = SeedPlan { origins: roots.iter().map(|r| (r.clone(), ExecutionId::nil())).collect(), selection: authored.clone(), warnings: vec![] };
+        let planned = SeedPlan { origins: roots.iter().map(|r| (r.clone(), RunId::nil())).collect(), selection: authored.clone(), warnings: vec![] };
         let saved = starting_parameters(&project, &RunSpec::whole("case"), &authored, &planned, &old, &[]).unwrap();
         let spelled: BTreeSet<&str> = saved.from.keys().map(String::as_str).collect();
         assert_eq!(spelled, ["src", "s", "s.free", "s.g", "s.g.x"].into_iter().collect(), "{spelled:?}");
@@ -624,7 +624,7 @@ mod tests {
             } else {
                 previous.get_mut(&top("a")).unwrap().used_backups.insert("in".into(), json!("original input"));
             }
-            let planned = SeedPlan { origins: [(top("a"), ExecutionId::nil())].into(), selection: authored.clone(), warnings: Vec::new() };
+            let planned = SeedPlan { origins: [(top("a"), RunId::nil())].into(), selection: authored.clone(), warnings: Vec::new() };
             let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!("computed output"), ..Default::default() }];
             let saved = starting_parameters(&project, &spec, &authored, &planned, &previous, &history).unwrap();
             assert!(saved.from.contains_key("x"), "independent original root remains part of the run");
@@ -659,7 +659,7 @@ mod tests {
         let mut previous = outcomes(&project);
         previous.get_mut(&top("l__in")).unwrap().used_backups.insert("in".into(), json!("saved group input"));
         let planned = SeedPlan {
-            origins: [(top("l__in"), ExecutionId::nil())].into(),
+            origins: [(top("l__in"), RunId::nil())].into(),
             selection: authored.clone(),
             warnings: vec![],
         };
@@ -696,7 +696,7 @@ mod tests {
 
     fn outcomes(project: &ProjectDefinition) -> BTreeMap<Located, SeedOutcome> {
         identity(project).slice_hashes(project).unwrap().into_iter().map(|(place, slice_hash)| {
-            (place, SeedOutcome { origin: ExecutionId::nil(), slice_hash, used_backups: BTreeMap::new(), backup_origins: BTreeMap::new(), absent_ports: BTreeSet::new(), boundary_ports: BTreeSet::new(), emitted_live_handle: false, fire: None })
+            (place, SeedOutcome { origin: RunId::nil(), slice_hash, used_backups: BTreeMap::new(), backup_origins: BTreeMap::new(), absent_ports: BTreeSet::new(), boundary_ports: BTreeSet::new(), emitted_live_handle: false, fire: None })
         }).collect()
     }
 
@@ -816,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_and_inclusive_seed_caps_do_not_widen_the_execution_cut() {
+    fn exclusive_and_inclusive_seed_caps_do_not_widen_the_run_cut() {
         let p = program("b", WIRES);
         let selection = RunSelection::carve(&p, &SelectionBounds { target: vec!["c".into()], ..Default::default() }).unwrap();
         let old = outcomes(&p);
@@ -884,7 +884,7 @@ mod tests {
     fn a_loop_cannot_mix_results_from_different_origins() {
         let p = program("b", WIRES);
         let mut old = outcomes(&p);
-        old.get_mut(&top("body")).unwrap().origin = ExecutionId::new_v4();
+        old.get_mut(&top("body")).unwrap().origin = RunId::new_v4();
         let result = seed_plan(&p, &identity(&p), &RunSelection::whole(&p), &RunSpec::whole("test"), &old, &[], &[]).unwrap();
         for node in ["body", "l__in", "l__out", "d"] { assert!(result.selection.nodes.contains(&top(node))); }
     }

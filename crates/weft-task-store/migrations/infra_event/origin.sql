@@ -5,20 +5,16 @@ CREATE TABLE IF NOT EXISTS infra_event (
             node_id     TEXT,
             -- Whose copy of the node the event is about: NULL for the
             -- shared copy, or for a project-wide event.
-            member_id   TEXT,
+            instance_id   TEXT,
             kind        TEXT NOT NULL,
             payload     JSONB NOT NULL,
-            at_unix     BIGINT NOT NULL,
-            -- The transaction that wrote the row, the order the
-            -- bridge's cursor reads in (`crate::settled`).
-            writer_xid  XID8 NOT NULL DEFAULT pg_current_xact_id()
+            at_unix     BIGINT NOT NULL
         );
 CREATE INDEX IF NOT EXISTS idx_infra_event_chrono ON infra_event(id);
-CREATE INDEX IF NOT EXISTS idx_infra_event_settled ON infra_event(writer_xid, id);
 CREATE INDEX IF NOT EXISTS idx_infra_event_project ON infra_event(project_id);
 CREATE OR REPLACE FUNCTION infra_event_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_infra_event', NEW.id::text);
+                PERFORM pg_notify('weft_infra_event', NEW.project_id::text || ' ' || NEW.id::text);
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql;

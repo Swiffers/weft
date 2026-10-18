@@ -342,7 +342,7 @@ fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdenti
         tenant_id: "tenant-a".into(),
         node_id: "tick".into(),
         is_resume: false,
-        execution_id: None,
+        run_id: None,
         spec,
     }
 }
@@ -353,7 +353,7 @@ fn row(token: &str, spec: &weft_core::primitive::SignalSpec, kind_state: Value, 
         .is_some_and(|h| h.between_fires(spec, &kind_state).expect("a test row's state reads") == weft_listener::kinds::BetweenFires::Holds);
     json!({
         "token": token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "tick",
-        "spec_json": serde_json::to_string(spec).unwrap(), "is_resume": false, "execution_id": null,
+        "spec_json": serde_json::to_string(spec).unwrap(), "is_resume": false, "run_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
         "auth_config": null, "kind_state": kind_state, "kind_state_seq": seq, "holds": holds, "serving": null,
         "generation": 1
@@ -796,11 +796,11 @@ fn job_wait(url: &str) -> weft_core::primitive::SignalSpec {
 async fn register_wait(rig: &Rig, token: &str, spec: &weft_core::primitive::SignalSpec, asked_at_unix_ms: i64) -> anyhow::Result<()> {
     let mut who = identity(token, spec.clone());
     who.is_resume = true;
-    who.execution_id = Some(WAITING_RUN.parse().unwrap());
+    who.run_id = Some(WAITING_RUN.parse().unwrap());
     let prepared = prepare_signal(&rig.state, who, None, None, asked_at_unix_ms).await?;
     let mut written = row(token, spec, prepared.kind_state, 1);
     written["is_resume"] = json!(true);
-    written["execution_id"] = json!(WAITING_RUN);
+    written["run_id"] = json!(WAITING_RUN);
     rig.rows.lock().unwrap().insert(token.into(), written.clone());
     weft_listener::registry::hold(&rig.state, serde_json::from_value(written)?, StartMode::New).await
 }
@@ -830,7 +830,7 @@ async fn a_wait_on_a_job_already_done_resumes_at_once() {
 
     let outcome = weft_listener::kinds::process(&rig.state, "wait", json!({ "status": "COMPLETED" })).await.unwrap();
     assert!(
-        matches!(&outcome.target, weft_core::signal::listener_protocol::ProcessTarget::Resume { execution_id } if execution_id.to_string() == WAITING_RUN),
+        matches!(&outcome.target, weft_core::signal::listener_protocol::ProcessTarget::Resume { run_id } if run_id.to_string() == WAITING_RUN),
         "the fire resumes the parked run: {:?}",
         outcome.target
     );
@@ -1760,6 +1760,6 @@ impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
             anyhow::bail!("no worker answers at {address}");
         }
         self.fired.lock().unwrap().push(fire.clone());
-        Ok(weft_core::door_fire::Fired::Started { execution_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
+        Ok(weft_core::door_fire::Fired::Started { run_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
     }
 }

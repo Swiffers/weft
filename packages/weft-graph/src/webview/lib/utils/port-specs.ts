@@ -53,7 +53,7 @@ export function hasValue(draft: PortEntryDef, field: SpecField): boolean {
 }
 
 /** Is this field's value an empty CHOICE SET: an empty list where the
- *  list is the set of choices (`shape: valueList`, or `typed` with a
+ *  list is the set of choices (`shape: value_list`, or `typed` with a
  *  list valueType)? Choosing nothing satisfies no requirement, so the
  *  commit gate refuses it on a required field, matching the compiler.
  *  Where a list is one VALUE being matched (`equals: []`), emptiness
@@ -65,7 +65,7 @@ export function hasValue(draft: PortEntryDef, field: SpecField): boolean {
 export function isEmptyChoiceSet(draft: PortEntryDef, field: SpecField): boolean {
 	const v = draft[field.key];
 	if (!Array.isArray(v) || v.length > 0) return false;
-	if (field.shape === 'valueList') return true;
+	if (field.shape === 'value_list') return true;
 	if (field.shape !== 'typed') return false;
 	// STRUCTURAL, exactly like the Rust side's `WeftType::List(_)`
 	// match: a string test would call a union like `List[String] |
@@ -91,7 +91,7 @@ export function entryForSource(draft: PortEntryDef, spec: PortSpec, name: string
 }
 
 /** Is `key` a legal weft bare identifier (`[A-Za-z_][A-Za-z0-9_]*`)?
- *  A field key becomes a PORT NAME (`{key}_approved`, etc.), and the
+ *  A field key becomes a PORT NAME (`{key}Approved`, etc.), and the
  *  parser rejects any port name outside that grammar, so the add-field
  *  form gates on this: a key with spaces or punctuation (`what do you
  *  want?`) is refused before it can emit an unparseable port.

@@ -33,16 +33,13 @@ impl DiscoveredSignal {
     }
     /// The trigger node id.
     pub fn node_id(&self) -> Option<&str> {
-        self.0
-            .get("nodeId")
-            .or_else(|| self.0.get("node_id"))
-            .and_then(Value::as_str)
+        self.0.get("nodeId").and_then(Value::as_str)
     }
     /// The signal kind tag (`form`, `route`, `socket`, ...).
     pub fn kind(&self) -> Option<&str> {
         self.0.get("kind").and_then(Value::as_str)
     }
-    /// True for a RESUME signal (a one-shot reply to a paused execution), false
+    /// True for a RESUME signal (a one-shot reply to a paused run), false
     /// for an ENTRY trigger (fireable repeatedly to start a run). The consumer
     /// splits its list on this: "Triggers" vs "Tasks".
     pub fn is_resume(&self) -> Option<bool> {
@@ -142,7 +139,7 @@ pub async fn fire_token(disp: &Dispatcher, token: &str, body: &Value) -> Result<
     disp.post_empty(&format!("/signal/{token}"), body).await
 }
 
-/// Skip the waiting step behind `token` (its `/skip` door), as a person
+/// Skip the waiting node behind `token` (its `/skip` door), as a person
 /// declining the question does.
 pub async fn skip_token(disp: &Dispatcher, token: &str) -> Result<()> {
     disp.post_empty(&format!("/signal/{token}/skip"), &Value::Null).await

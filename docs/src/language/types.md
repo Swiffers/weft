@@ -113,9 +113,9 @@ to declare the type on the source port, or `Cast` it first.
 
 The interesting case is an optional field. If you read `?`-marked key and it is
 missing, or it is `null`, **the wire closes**. It does not deliver `null`. So
-the step you wired it into applies its own rules: a required input skips, an
+the node you wired it into applies its own rules: a required input skips, an
 optional one lets the others decide. For what a closure does, go and read
-[how a program runs](how-a-program-runs.md#how-a-branch-stops-the-steps-after-it).
+[how a program runs](how-a-program-runs.md#how-a-branch-stops-the-nodes-after-it).
 
 A required key that is missing is an error naming the key, never a quiet null.
 

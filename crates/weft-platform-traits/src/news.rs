@@ -27,11 +27,11 @@ pub enum NewsKind {
     Cancel,
 }
 
-/// One piece of news: run `execution` of `project` had something happen.
+/// One piece of news: run `run` of `project` had something happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunNews {
     pub project: uuid::Uuid,
-    pub execution: weft_core::ExecutionId,
+    pub run: weft_core::RunId,
     pub kind: NewsKind,
 }
 
@@ -142,7 +142,7 @@ mod tests {
     async fn a_listener_that_fell_behind_is_told_it_missed_some() {
         let (tx, rx) = broadcast::channel(1);
         let mut listening = Listening::from(rx);
-        let news = RunNews { project: uuid::Uuid::from_u128(1), execution: uuid::Uuid::from_u128(2), kind: NewsKind::Answer };
+        let news = RunNews { project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(2), kind: NewsKind::Answer };
         tx.send(NewsHeard::News(news)).unwrap();
         tx.send(NewsHeard::News(news)).unwrap();
         assert_eq!(listening.next().await.unwrap(), NewsHeard::MissedSome);

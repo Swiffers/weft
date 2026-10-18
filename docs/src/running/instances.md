@@ -120,8 +120,8 @@ a loop's or an included file's own port is refused too
 value. A key that is not one of the node's inputs cannot take the mark either
 (`instance-filled-not-an-input`).
 
-You do not mark the other steps: a step that reads an instance's value or copy,
-directly or through steps before it, runs per instance too. Above, `read` needs
+You do not mark the other nodes: a node that reads an instance's value or copy,
+directly or through nodes before it, runs per instance too. Above, `read` needs
 Google through the instance's connection, so it runs in that instance's runs.
 
 weft checks an instance's value against the node's own rules at three moments:
@@ -133,7 +133,7 @@ weft checks an instance's value against the node's own rules at three moments:
 - **when the value is given**: a value the node refuses is refused on the
   spot, with the node's own message, and nothing is stored;
 - **when a run starts**: the instance's values are read once, checked again
-  (the program may have changed since), and carried by the run, so every step
+  (the program may have changed since), and carried by the run, so every node
   of it sees the same values even if one changes mid-run.
 
 If an instance's value changes and a live trigger of that instance reads it
@@ -292,7 +292,7 @@ Saving a value never turns on a trigger that is off.
 ## Where an instance's values are filled in
 
 Each instance's values are filled in on its settings page. It lists every field
-your program marks `@instance_filled`, grouped by step, each with the control
+your program marks `@instance_filled`, grouped by node, each with the control
 the editor shows you: a connection picker for a connection, a searchable list
 for a list field (spreadsheets, say, read through the instance's own
 connection), and a plain input for anything else.
@@ -326,7 +326,7 @@ If your program should read or change an instance's values, `ctx.values()` does
 it, with the same checks, and sets affected triggers up again:
 
 ```rust
-let values = ctx.values().instance("user-42").get().await?; // by step, then field
+let values = ctx.values().instance("user-42").get().await?; // by node, then field
 let rearmed = ctx.values()
     .instance("user-42")
     .set("read", "spreadsheet", json!("1AbC..."))
@@ -386,7 +386,7 @@ program never reaches these files, even for the same instance id.
 ## Who paid for a call
 
 Every cost record says whose credential paid: the runtime's own key
-(`Platform`, when a step uses the shared key), yours (`Author`), or the
+(`Platform`, when a node uses the shared key), yours (`Author`), or the
 instance's own (`Instance`). `ctx.costs()` reads them, and you can narrow it by
 instance, node, service, run, who paid (`paid_by`) or `since` (unix seconds):
 
@@ -432,7 +432,7 @@ If you want to see which instances there are, `ctx.instances().list()` (or the
 many values, connections and live tokens it has, its infra copies, and its
 triggers. It never hands back a value or a secret.
 
-If you want to see an instance's runs, `weft executions --instance user-42`
+If you want to see an instance's runs, `weft runs --instance user-42`
 lists them. `weft clean` takes the same filters (instance, status, the node
 that started the run, tag), and so does a program's `ctx.runs()`:
 
@@ -510,7 +510,7 @@ weft cannot tell when an instance is no longer needed, so your backend says so.
 | `'bridge' exists once per instance, so this run needs to know which instance it is for` | The run reaches something per instance and nobody named one. Add `--instance`, or start the run through an instance's trigger, with an instance token, or with the `Weft-Instance` header on a gated route |
 | `instance 'user-42' has not filled 'read.spreadsheet'` | The run needs a value that instance never got. Fill it in on its settings page, or your program sets it with `SetInstanceValues` or `ctx.values()` |
 | `instance 'user-42' at 'digest': ...` | That instance's value breaks the node's own rule, which the rest of the message states. Change it on its settings page, or your program does with `SetInstanceValues` |
-| `connect your account at 'google' first: this list is read through it` | A list on the instance's settings page is read through its connection at that step, and none is connected yet. Connect it first, at that step |
+| `connect your account at 'google' first: this list is read through it` | A list on the instance's settings page is read through its connection at that node, and none is connected yet. Connect it first, at that node |
 | `infra not running for: bridge (instance 'user-42')` | That instance's copy is down. The message names the command that starts it |
 | `these triggers' infra is not running: ...` | You activated an instance's trigger before its copy was up. Run the command it names, then activate again |
 | `the Weft-Instance header is honoured only on a route gated by a connection` | You sent the header to an open route. Gate the route, or use an instance token |

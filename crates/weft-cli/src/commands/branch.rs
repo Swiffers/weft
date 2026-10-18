@@ -1,5 +1,5 @@
-//! `weft branch <version|execution_id>`: restore that version's files (an execution
-//! means its version) and move head. An execution sets head's run, so the
+//! `weft branch <version|run_id>`: restore that version's files (a run
+//! means its version) and move head. A run sets head's run, so the
 //! next `--seed` inherits from it; a version clears it. Refuses on a
 //! dirty tree naming the files; `--discard` overrides.
 
@@ -32,9 +32,9 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
         }
     }
 
-    // An execution means its version and becomes head's run.
+    // A run means its version and becomes head's run.
     let (body, version_id) = match resolve_run(&tree, &reference) {
-        Ok(run) => (HeadRequest { run: Some(run.execution_id), version: None }, run.version_id.clone()),
+        Ok(run) => (HeadRequest { run: Some(run.run_id), version: None }, run.version_id.clone()),
         Err(_) => {
             let version = resolve_version(&tree, &reference)?;
             (HeadRequest { version: Some(version.id.clone()), run: None }, version.id.clone())
@@ -72,7 +72,7 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
             format!(
                 "the files on disk ARE version {} now, but head could not be moved there. \
                  `{}` finishes the job, and it names {reference} \
-                 again rather than the version, because that is what you asked for and an execution \
+                 again rather than the version, because that is what you asked for and a run \
                  also sets head's run. Plain `{}` will refuse, because head \
                  is still the old version and reads the restored files as your own uncommitted \
                  changes; `--discard` overwrites the files with this version, which is what they \

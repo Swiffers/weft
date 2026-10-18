@@ -13,7 +13,7 @@ entry). An [api token] lets a [consumer] list the [signal]s it may see. A
 is one, for the form kind; anything that can send HTTP is another, for that
 kind or any kind that renders a consumer payload. A frontend under `front/`
 (the `weft-frontend` skill) is one more [consumer] of exactly these
-[door]s, for the human steps the program parks; the program's own `Route`
+[door]s, for the questions the program parks for people; the program's own `Route`
 nodes serve its ordinary data calls (the `weft-api` skill).
 
 ## The token
@@ -65,14 +65,14 @@ any kind: they list, fire, skip, cancel and link the same way whatever the
 |---|---|
 | `GET /signal-token/signals` | the [signal]s this [api token] may see and that render a consumer payload, one [entry] each (shape below) |
 | `POST /signal/{signal token}` | fire one [signal] with a JSON body: answer a question, start a trigger's run, deliver a webhook's payload. No bearer: the [signal token] is the credential |
-| `POST /signal/{signal token}/skip` | decline a question a waiting run asked: the step that asked ends skipped, its outputs close and what reads them skips. Refused (409) on a trigger's [signal], which asks nothing. No bearer, same rule as firing |
+| `POST /signal/{signal token}/skip` | decline a question a waiting run asked: the node that asked ends skipped, its outputs close and what reads them skips. Refused (409) on a trigger's [signal], which asks nothing. No bearer, same rule as firing |
 | `GET /signal-token/signals/{signal token}/files/{field}` | a fresh link for a stored file a [signal]'s field shows, good for an hour. You ask every time you render and never store the link |
 
 Two more, for a [consumer] that manages [signal]s:
 `DELETE /signal/{signal token}` cancels the run behind a [signal] (answers
 204), and
 `DELETE /signal-token/signals` cancels every run the [api token] sees and
-drops its triggers (answers `{ execution_ids_cancelled, entry_signals_dropped }`).
+drops its triggers (answers `{ runIdsCancelled, entrySignalsDropped }`).
 Both need an [api token] with **no tag scope** and full project view; a
 narrowed token gets 403, because a cancel reaches sibling questions of the
 same run that the token may not see. `GET /signal-token/health` answers
@@ -85,7 +85,7 @@ A [display] is what one node shows about itself while it runs. Three more
 
 | [door] | What it does |
 |---|---|
-| `GET /signal-token/displays` | the displays this token may watch: `{ project_id, project_name, node, node_type, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `none` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
+| `GET /signal-token/displays` | the displays this token may watch: `{ projectId, projectName, node, nodeType, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `none` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
 | `GET /signal-token/displays/{project}/{node}` | what that node is showing right now |
 | `POST /signal-token/displays/{project}/{node}/action` | press a button one of its items carried: `{ "kind": "<actionKind>", "payload": ... }`. Only an `infra` node has buttons; a `trigger`'s [display] is read-only and answers 400 |
 
@@ -183,7 +183,11 @@ rest is the kind's own payload, and `kind` says how to read it. `isResume`
 splits the list: a parked question disappears once answered (a second
 answer gets 404 once it is gone, 409 while the project is parked and the
 first answer waits in its queue); a trigger stays listed while the project
-is active and fires again and again, each fire a new run.
+is active and fires again and again, each fire a new run. Every field name
+weft writes in these answers is camelCase, and the value of a fixed-set
+field (`kind`, `consumerKind`, a display's `status`) is snake_case, so a
+client reads `entry.nodeId`, and checks
+`entry.consumerKind === "human_in_the_loop"`.
 
 **Which kinds appear.** A kind reaches the listing when its listener
 handler renders a consumer payload. Today the form kind is the only one that

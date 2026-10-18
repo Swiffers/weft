@@ -115,7 +115,7 @@ but what is inside is between the nodes talking.
 | Several live nodes talking to each other | A bus |
 | To fan one thing out to several readers | A bus |
 | Ordering and type checking on every item | A stream |
-| To survive the worker restarting | Neither. Use storage, or a step that ends |
+| To survive the worker restarting | Neither. Use storage, or a node that ends |
 
 For the Rust on both sides, go and read
 [streams and buses in Rust](../nodes/streams-and-buses.md).

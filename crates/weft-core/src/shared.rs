@@ -1,5 +1,5 @@
 //! Live things a worker holds for its runs to share
-//! (`ExecutionContext::shared`): an open pool of database connections, a
+//! (`RunContext::shared`): an open pool of database connections, a
 //! set of ready interpreter processes. Each is built the first time a run
 //! asks for it, handed to every run after that, let go once nothing used
 //! it for the project's `shared_idle_seconds` worker lever, and gone with
@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::access::{Access, OpenedConnection};
-use crate::context::ExecutionContext;
+use crate::context::RunContext;
 use crate::error::WeftResult;
 
 /// What a run asks for a shared thing by (see the module doc).
@@ -40,7 +40,7 @@ pub trait SharedKey {
 
     /// Where the thing is filed, what it is built from, and what the build
     /// gets, read through the run's own `ctx`.
-    fn resolve(self, ctx: &ExecutionContext) -> impl Future<Output = WeftResult<Resolved<Self::From>>> + Send;
+    fn resolve(self, ctx: &RunContext) -> impl Future<Output = WeftResult<Resolved<Self::From>>> + Send;
 }
 
 /// A key, resolved for one ask.
@@ -57,7 +57,7 @@ pub struct Resolved<F> {
 impl SharedKey for &Access {
     type From = OpenedConnection;
 
-    async fn resolve(self, ctx: &ExecutionContext) -> WeftResult<Resolved<OpenedConnection>> {
+    async fn resolve(self, ctx: &RunContext) -> WeftResult<Resolved<OpenedConnection>> {
         let opened = ctx.open(self).await?;
         Ok(Resolved {
             slot: format!("connection:{}", self.access_id()),
@@ -71,7 +71,7 @@ impl SharedKey for &Access {
 impl SharedKey for &str {
     type From = ();
 
-    async fn resolve(self, _ctx: &ExecutionContext) -> WeftResult<Resolved<()>> {
+    async fn resolve(self, _ctx: &RunContext) -> WeftResult<Resolved<()>> {
         Ok(Resolved { slot: named_slot(self), fingerprint: 0, from: () })
     }
 }
@@ -140,10 +140,10 @@ impl<T> std::ops::Deref for SharedHandle<T> {
     }
 }
 
-/// One run's ask for a shared thing (`ExecutionContext::shared`): awaited
+/// One run's ask for a shared thing (`RunContext::shared`): awaited
 /// as it is, or with a limit first.
 pub struct SharedAsk<'c, K, F> {
-    pub(crate) ctx: &'c ExecutionContext,
+    pub(crate) ctx: &'c RunContext,
     pub(crate) key: K,
     pub(crate) build: F,
     pub(crate) limit: Option<usize>,
@@ -328,7 +328,7 @@ mod tests {
     async fn a_failed_build_holds_nothing_and_an_idle_thing_goes() {
         let shared = Shared::new(Duration::from_secs(60));
         let failed = shared
-            .get_or_build::<usize, _, _>("db", 1, None, || async { Err(crate::error::WeftError::NodeExecution("no".into())) })
+            .get_or_build::<usize, _, _>("db", 1, None, || async { Err(crate::error::WeftError::NodeFailed("no".into())) })
             .await;
         assert!(failed.is_err());
         assert_eq!(*shared.get_or_build::<usize, _, _>("db", 1, None, || async { Ok(7) }).await.unwrap(), 7, "the next ask builds");

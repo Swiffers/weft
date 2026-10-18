@@ -8,14 +8,14 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::bus::BusOptions;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct QuietBusNode;
 
 #[async_trait]
 impl Node for QuietBusNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bus = ctx.open_bus("feed", BusOptions::default(), "quiet").await?;
         bus.send("delta", json!("first")).node_err("quiet send")?;
         std::future::pending::<()>().await;

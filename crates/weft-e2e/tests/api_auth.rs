@@ -31,7 +31,7 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
         &disp,
         catalog_spec("api", "hmac_auth")?,
         "own",
-        json!({ "signing_secret": "s3cret-e2e" }),
+        json!({ "signingSecret": "s3cret-e2e" }),
     )
     .await?;
     set_account(&project, "secret", secret.handle()).await?;

@@ -31,7 +31,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -51,7 +51,7 @@
       "default": "eleven_flash_v2_5",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "eleven_flash_v2_5",
           "eleven_flash_v2",

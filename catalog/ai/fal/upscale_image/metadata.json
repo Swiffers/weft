@@ -44,7 +44,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -53,8 +53,8 @@
             "label": "endpoint_id",
             "value": "endpoint_id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "next_cursor"
             },
             "public": true
           }

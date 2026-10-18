@@ -18,7 +18,7 @@ import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, CatalogWarning, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
@@ -88,7 +88,7 @@ export class GraphViewController {
   private storageOrigin = '';
   /// Include-navigation back-stack. Each frame records the doc the user came
   /// from and the include alias they clicked to descend (used to build the
-  /// execution-id prefix so sub-graph journal values render). `openInclude`
+  /// run-id prefix so sub-graph journal values render). `openInclude`
   /// pushes; Return pops. The bottom is the project's `src/main.weft`.
   private navStack: { doc: vscode.TextDocument; alias: string }[] = [];
   /// Set when the next parse is for a freshly-swapped file (navigation),
@@ -120,14 +120,14 @@ export class GraphViewController {
   // Host-side callbacks wired by extension.ts.
   private runHandler: ((targets: string[]) => void) | undefined;
   /// Told the group the user stands in (an include's alias chain, or
-  /// null at the top level) on every navigation, so the Executions view
+  /// null at the top level) on every navigation, so the Runs view
   /// marks the runs scoped to it.
   private navHandler: ((focusedGroup: string | null) => void) | undefined;
   private followModeHandler: ((mode: FollowMode) => void) | undefined;
   private openSourceHandler: ((location: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
-  /// process or POST /executions/{executionId}/cancel.
+  /// process or POST /runs/{runId}/cancel.
   private stopActionHandler: (() => void) | undefined;
   /// User dismissed the action-bar error banner. Extension.ts
   /// clears the slot's `error` field via `actionBar.clearError`.
@@ -222,10 +222,10 @@ export class GraphViewController {
    *  that is not open creates the panel and posts this immediately after,
    *  which the webview never saw, so the "this run is from older code"
    *  banner never appeared on exactly the path it was written for. */
-  setExecVersion(executionId: string, version: string | null, diskVersion: string | null): void {
-    this.execVersionFor = this.watchedProjectId;
-    this.lastExecVersion = { kind: 'execVersion', executionId, version, diskVersion };
-    void this.panel?.webview.postMessage(this.lastExecVersion satisfies HostMessage);
+  setRunVersion(runId: string, version: string | null, diskVersion: string | null): void {
+    this.runVersionFor = this.watchedProjectId;
+    this.lastRunVersion = { kind: 'runVersion', runId, version, diskVersion };
+    void this.panel?.webview.postMessage(this.lastRunVersion satisfies HostMessage);
   }
 
   /** Re-send the last version message, for a panel that has just mounted.
@@ -237,9 +237,9 @@ export class GraphViewController {
    *  starts). The project and not the file, because the banner is about
    *  the RUN: navigating into an include changes the file and follows the
    *  same run, so the banner has to survive that. */
-  resendExecVersion(): void {
-    if (this.lastExecVersion && this.execVersionFor === this.watchedProjectId) {
-      void this.panel?.webview.postMessage(this.lastExecVersion satisfies HostMessage);
+  resendRunVersion(): void {
+    if (this.lastRunVersion && this.runVersionFor === this.watchedProjectId) {
+      void this.panel?.webview.postMessage(this.lastRunVersion satisfies HostMessage);
     }
   }
 
@@ -250,26 +250,26 @@ export class GraphViewController {
    *  still showing the old project's banner and nothing else would ever
    *  clear it. A version of `null` is how the webview is told there is no
    *  followed run here. */
-  forgetExecVersion(): void {
-    if (!this.lastExecVersion) return;
-    const executionId = this.lastExecVersion.executionId;
-    this.lastExecVersion = undefined;
-    this.execVersionFor = undefined;
+  forgetRunVersion(): void {
+    if (!this.lastRunVersion) return;
+    const runId = this.lastRunVersion.runId;
+    this.lastRunVersion = undefined;
+    this.runVersionFor = undefined;
     void this.panel?.webview.postMessage({
-      kind: 'execVersion',
-      executionId,
+      kind: 'runVersion',
+      runId,
       version: null,
       diskVersion: null,
     } satisfies HostMessage);
   }
-  private lastExecVersion: { kind: 'execVersion'; executionId: string; version: string | null; diskVersion: string | null } | undefined;
-  /// Which project `lastExecVersion` describes a run of.
-  private execVersionFor: string | undefined;
+  private lastRunVersion: { kind: 'runVersion'; runId: string; version: string | null; diskVersion: string | null } | undefined;
+  /// Which project `lastRunVersion` describes a run of.
+  private runVersionFor: string | undefined;
   setFollowModeHandler(fn: (mode: FollowMode) => void): void { this.followModeHandler = fn; }
   setOpenSourceHandler(fn: (location: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
-  /// execution_running (POST /cancel) state.
+  /// run_running (POST /cancel) state.
   setStopActionHandler(fn: () => void): void { this.stopActionHandler = fn; }
   /// X-button on the action-bar error banner. Extension clears
   /// the pinned project's slot.error.
@@ -388,9 +388,9 @@ export class GraphViewController {
     this.treeVerbHandler = fn;
   }
 
-  /** Public so execFollower can push events into the panel. */
+  /** Public so runFollower can push events into the panel. */
   post(msg: HostMessage): void {
-    if (msg.kind === 'execReset') this.forgetExecVersion();
+    if (msg.kind === 'runReset') this.forgetRunVersion();
     this.panel?.webview.postMessage(msg);
   }
 
@@ -438,8 +438,8 @@ export class GraphViewController {
     this.watchedProjectId = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
     // A banner about another project's run goes now, before the graph
     // under it changes.
-    if (this.execVersionFor !== undefined && this.execVersionFor !== this.watchedProjectId) {
-      this.forgetExecVersion();
+    if (this.runVersionFor !== undefined && this.runVersionFor !== this.watchedProjectId) {
+      this.forgetRunVersion();
     }
     if (this.creating) {
       await this.creating;
@@ -961,7 +961,7 @@ export class GraphViewController {
     // (which carry the layout) post `parseResult`.
     if (layout) {
       // The place first, the graph second: a fresh mount looks its
-      // execution values up by the call path and gates what it draws on
+      // run values up by the call path and gates what it draws on
       // whether the view is a place at all, so both have to be current
       // when the graph lands, whichever way this file was opened.
       this.sendNavState();
@@ -1008,7 +1008,7 @@ export class GraphViewController {
     // reverse.
     // SYNC: role precedence <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts
     const isInfraNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
-      n.requiresInfra ?? response.catalog[n.nodeType]?.requires_infra ?? false;
+      n.requiresInfra ?? response.catalog[n.nodeType]?.requiresInfra ?? false;
     const isTriggerNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
       n.features?.isTrigger ?? response.catalog[n.nodeType]?.features?.isTrigger ?? false;
     const servesLive = (n: ParseResponse['project']['nodes'][number]): boolean =>
@@ -1257,7 +1257,7 @@ export class GraphViewController {
   private async dispatchVerb(verb: string, args: string[]): Promise<void> {
     // Follow-latest for the lifecycle verbs is armed by the host, past
     // every refusal (the in-flight guard, the pre-flight gate): an
-    // aborted click must not reset the user's pinned execution view.
+    // aborted click must not reset the user's pinned run view.
     //
     // Errors flow through the host's CLI runner: the spawned `weft
     // <verb> --json` emits an `error` phase event; the host's
@@ -1319,7 +1319,7 @@ export class GraphViewController {
         void this.applyEditTransaction(msg.requestId, { kind: 'edit', ops: msg.ops });
         break;
       case 'applyTextEdit':
-        void this.applyEditTransaction(msg.requestId, { kind: 'applyEdit', textEdit: msg.edit });
+        void this.applyEditTransaction(msg.requestId, { kind: 'apply_edit', textEdit: msg.edit });
         break;
       case 'resyncSource':
         void this.resyncSource(msg.requestId);
@@ -1497,10 +1497,10 @@ export class GraphViewController {
       case 'editActiveSource':
         void this.adoptActiveSource(msg.source);
         break;
-      case 'replayExecution':
-        // Intentionally ignored by the VS Code host: replaying a past execution
+      case 'replayRun':
+        // Intentionally ignored by the VS Code host: replaying a past run
         // onto the canvas is a web-host affordance (its RightPanel history picker
-        // emits this). VS Code surfaces past executions through its own history
+        // emits this). VS Code surfaces past runs through its own history
         // UI, so it never wires the canvas replay. Listed explicitly (not dropped
         // to default) so the exhaustive `never` check below stays a real guarantee
         // that no NEW kind is silently ignored.
@@ -1602,7 +1602,7 @@ export class GraphViewController {
         case 'POST': {
           const merged = {
             ...(body as Record<string, unknown>),
-            project_id: this.watchedProjectId ?? null,
+            projectId: this.watchedProjectId ?? null,
           };
           result = await this.client.post<unknown>(`/access/${path}`, merged);
           break;
@@ -1742,8 +1742,9 @@ export class GraphViewController {
 
   /// The project's STORED runtime files for the picker: the same listing door
   /// `weft files` uses (the dispatcher's tenant file list), filtered to THIS
-  /// project's `project/` + `asset/` scopes, keys handed back TENANT-LESS
-  /// (the short address a picked ref writes into source).
+  /// project's `project/` scope plus the tenant's assets (content-addressed
+  /// `asset/<sha256>`, shared by every project of the tenant), keys handed
+  /// back TENANT-LESS (the short address a picked ref writes into source).
   private async runListRuntimeFiles(requestId: number): Promise<void> {
     const pid = this.watchedProjectId;
     if (!pid) {
@@ -1763,7 +1764,7 @@ export class GraphViewController {
         const slash = f.key.indexOf('/');
         if (slash < 0) return [];
         const scopeKey = f.key.slice(slash + 1);
-        if (!scopeKey.startsWith(`project/${pid}/`) && !scopeKey.startsWith(`asset/${pid}/`)) {
+        if (!scopeKey.startsWith(`project/${pid}/`) && !scopeKey.startsWith('asset/')) {
           return [];
         }
         return [{ key: scopeKey, filename: f.filename, mimeType: f.mimeType, sizeBytes: f.sizeBytes }];
@@ -1991,7 +1992,7 @@ export class GraphViewController {
   /// and clobber it.
   private async applyEditTransaction(
     requestId: number,
-    req: { kind: 'edit'; ops: EditOp[] } | { kind: 'applyEdit'; textEdit: TextEdit },
+    req: { kind: 'edit'; ops: EditOp[] } | { kind: 'apply_edit'; textEdit: TextEdit },
   ): Promise<void> {
     const doc = this.watchedDoc;
     if (!doc) {
@@ -2281,7 +2282,7 @@ export class GraphViewController {
           ? await this.client.get<BakeSummary[]>(`/projects/${this.watchedProjectId}/trigger-bakes`)
           : [];
         result = await this.parseServer.request<ResolveSpecResponse>({
-          kind: 'resolveSpec',
+          kind: 'resolve_spec',
           source: doc.getText(),
           file: doc.uri.fsPath,
           spec,
@@ -2351,7 +2352,7 @@ export class GraphViewController {
 
   /// Write a spec to `examples/<name>.json`. It does NOT run: saving used
   /// to run it too, so writing down a spec you were not ready for started
-  /// a real execution.
+  /// a real run.
   ///
   /// The name becomes a file name and `weft run <name>` resolves it by
   /// file name, so it is checked here rather than joined blindly: a name
@@ -2394,7 +2395,7 @@ export class GraphViewController {
     }
     if (existed) {
       const saved = parseRunSpec(parseSuppliedJson(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path))).toString('utf8')));
-      if (saved.expected || saved.frozen_from) {
+      if (saved.expected || saved.frozenFrom) {
         void vscode.window.showErrorMessage(`Weft: examples/${clean}.json is frozen. Save under another name, or use weft freeze after accepting a new run.`);
         return;
       }
@@ -2457,7 +2458,7 @@ export class GraphViewController {
   }
 
   /// Push the current navigation depth, file name, and place (see
-  /// `viewPlace`) to the webview. The executions view is told the same
+  /// `viewPlace`) to the webview. The runs view is told the same
   /// place as a group address (`c.inner`).
   private sendNavState(): void {
     const fileName = this.watchedDoc?.uri.fsPath.split(/[\\/]/).pop() ?? '';
@@ -2482,7 +2483,7 @@ export class GraphViewController {
     try {
       const response = await runWeftJson<{
         catalog: Record<string, unknown>;
-        warnings?: string[];
+        warnings?: CatalogWarning[];
       }>(['describe-nodes'], docDirOf(this.watchedDoc));
       this.post({
         kind: 'catalogAll',
@@ -2548,8 +2549,8 @@ export class GraphViewController {
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
     this.watchedDoc = undefined;
-    this.lastExecVersion = undefined;
-    this.execVersionFor = undefined;
+    this.lastRunVersion = undefined;
+    this.runVersionFor = undefined;
   }
 
   private renderHtml(): string {

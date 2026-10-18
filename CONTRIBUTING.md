@@ -244,38 +244,81 @@ and what a meter has to do before we accept it, is in
 **No legacy, no compatibility shims.** weft is pre-1.0, so for now do not worry
 too much about backwards compatibility. Delete dead code.
 
-**Check for an existing concept before adding one.** If two structs have
-overlapping fields under different names, they are one concept split in two, try to merge them.
+**Check for an existing concept before adding one.** Before you add a type,
+look for one that already answers the same question, and if there is one,
+extend it. If you find two structs with overlapping fields under different
+names, they are one concept split in two, so try to merge them. Fields that
+only happen to match stay apart: a session's `user_id` says who signed in, and
+a request scope's `user_id` says whose data that one request may touch.
 
-**Fix root causes.** A fix at the source beats a workaround downstream, however
-much smaller the workaround looks.
+**Fix root causes.** If a bug shows up downstream of where it starts, fix it
+where it starts, even when a workaround further down would be a smaller
+change.
 
-**Same-language duplicates get merged.** One fact, one place: if you find
-it written twice in the same language, merge the copies.
+**One fact, one place.** If you find the same fact written twice where one
+copy could use the other, merge them. When it has to live in two places that
+cannot share it (a Rust type and its TypeScript mirror, or two crates that
+cannot depend on each other), each side carries a
+`// SYNC: <this> <-> <path> <other>` comment naming the other copy.
 
 **No fallbacks.** When something fails, fail loudly with an error the user can
 see, or a log that names it. A fallback that quietly returns a second-best value
-hides the bug and becomes debt. Design the aftermath too: say what broke and
-what the person can do next.
+hides the bug. Make the error say what broke and what the
+person can do next.
 
 **Name by contract, not mechanism.** A name says what the caller asks for and
-gets back, not how it is computed. `connect_db_and_login_and_hand_connection` is
-`db_connection`; a function that hands back shared `GeneratorInfo` is not
-`pricing_generator`, however much it happens to cache. Read the call site alone:
+gets back, not how it is computed. `connect_db_and_login_and_hand_connection`
+should be called `db_connection`. Read the call site alone:
 does the name say what the caller receives?
+
+**No em dashes**, in committed code and comments as much as in prose. Models
+reach for them far more than people do, so an em dash reads as a tell that
+nobody read the line again.
+
+**One casing per layer.** If you add a name that people type or read outside
+the Rust code (a node, a port, a `metadata.json` key, a JSON field, a flag, a
+setting), spell it the way this table says:
+
+| Spelling | For |
+|---|---|
+| PascalCase | Node types, custom types |
+| camelCase | Node names in a program, ports, settings, record fields, `metadata.json` keys, the names of the values a connection stores (`imapHost`), and every JSON field weft produces: API answers, live events, CLI `--json`, what a program call answers, the `examples/<name>.json` files `weft run --save` and `weft freeze` write |
+| snake_case | The values of a fixed set (statuses, kinds, the `kind` tag of a tagged event, and the event topics and `accessApps` keys a `metadata.json` names), `.weft` files and folders, `weft.toml` keys, SQL, URL query parameters, the language's own words (`@per_instance`, `@require_one_of`, the `_should_flow` gates) |
+| kebab-case | CLI commands and flags |
+| SCREAMING_SNAKE_CASE | Environment variables |
+
+If a Rust type goes out to a client, give it
+`#[serde(rename_all = "camelCase")]`, so `run_id` in Rust is `runId` on the
+wire. If it is a tagged enum, the tag values stay snake_case and only the
+fields inside each variant are renamed:
+`#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]`.
+If a type never leaves weft (task payloads, run records, the broker's wire), it
+keeps snake_case fields. A name a third party defines keeps its spelling (an
+OAuth parameter like `client_id`, a provider's field).
+
+If you add a node to the catalog, or add or rename any name in a node's
+`metadata.json`, run `cargo nextest run -p weft-catalog`. If any name is off,
+the `casing` test fails and lists every one with its node and file, and with
+the spelling to use whenever one can be worked out. If you write a key
+weft renamed in its old snake_case spelling (`requires_infra` instead of
+`requiresInfra`), the `casing` test does not catch it: the node fails to load
+with an error naming the new spelling, and `every_stdlib_node_loads_strict`
+fails. In a package root's `metadata.json` the error is reported against the
+root's file, and the package's members are left out.
+
+If you want to change what counts as camelCase, snake_case or any other
+spelling, edit `weft_core::casing`, which both the catalog's spelling check and
+the compiler's `not-camel-case` warning call. If you want to change which names
+get checked, edit the check itself: `crates/weft-catalog/src/spelling.rs` for
+the names in a `metadata.json`, or `check_name_casing` in
+`crates/weft-compiler/src/validate.rs` for the names in a `.weft` program.
 
 For the general principles behind weft's design, read
 [Design principles](https://weavemindai.github.io/weft/thinking/design-principles.html).
 
 Before building a feature, go and read
 [the three fronts](https://weavemindai.github.io/weft/thinking/how-we-decide.html):
-the levers, the defaults, and what the compiler refuses. A feature
-that answers two of the three is half built.
-
-**No em dashes**, in committed code and comments as much as in prose. Models
-reach for them far more than people do, so an em dash reads as a tell that
-nobody read the line again. Our review pass strips every one, so finding an em
-dash means the line skipped review.
+the levers, the defaults, and what weft refuses.
 
 ## Working on the database
 

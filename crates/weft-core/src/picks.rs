@@ -148,12 +148,12 @@ pub fn run_picks(
 }
 
 /// One pick the author asks the install to keep: the connection `connection`
-/// for `field` of the step at `step` (its place, spelled), a field that
+/// for `field` of the node at `node` (its place, spelled), a field that
 /// connects to `service`.
 // SYNC: PickInput <-> packages/weft-graph/src/protocol.ts PickInput
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickInput {
-    pub step: String,
+    pub node: String,
     pub field: String,
     pub connection: uuid::Uuid,
     pub service: String,
@@ -174,7 +174,7 @@ pub struct ChangePicks {
 /// connects to (the store holds the connection to it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedPick {
-    pub step: String,
+    pub node: String,
     pub field: String,
     pub connection: uuid::Uuid,
     pub service: String,
@@ -202,15 +202,15 @@ pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) ->
     let mut refusal = Refusal { errors: Vec::new() };
     let mut checked = Vec::new();
     for input in inputs {
-        if let Some(node) = known.get(&input.step) {
+        if let Some(node) = known.get(&input.node) {
             if !picked_fields(node).any(|field| field == input.field) {
-                refusal.errors.push(format!("'{}.{}' is no connection picked on the install", input.step, input.field));
+                refusal.errors.push(format!("'{}.{}' is no connection picked on the install", input.node, input.field));
                 continue;
             }
             if service_of(node, &input.field) != Some(input.service.as_str()) {
                 refusal.errors.push(format!(
                     "'{}.{}' connects to '{}', not '{}'",
-                    input.step,
+                    input.node,
                     input.field,
                     service_of(node, &input.field).unwrap_or("no service"),
                     input.service
@@ -219,7 +219,7 @@ pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) ->
             }
         }
         checked.push(CheckedPick {
-            step: input.step.clone(),
+            node: input.node.clone(),
             field: input.field.clone(),
             connection: input.connection,
             service: input.service.clone(),
@@ -234,7 +234,7 @@ pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) ->
 /// service when the value is a connection, else `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredField {
-    pub step: String,
+    pub node: String,
     pub field: String,
     pub service: Option<String>,
     pub instance: Option<crate::instance::InstanceId>,
@@ -246,7 +246,7 @@ pub struct StoredField {
 /// services, and nothing stored for them yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stranded {
-    pub step: String,
+    pub node: String,
     pub candidates: Vec<String>,
 }
 
@@ -263,7 +263,7 @@ impl Stranded {
         format!(
             "'{}' has connections or values stored on this install and is no longer in the program; \
              did you move it to '{first}'{others}? `weft connect --move {} {first}` carries them across",
-            self.step, self.step
+            self.node, self.node
         )
     }
 }
@@ -304,14 +304,14 @@ fn shared_tail(a: &str, b: &str) -> usize {
 /// first build.
 pub fn stranded(project: &ProjectDefinition, stored: &[StoredField]) -> Vec<Stranded> {
     let places = places_of(project);
-    let taken: BTreeSet<(&str, &str)> = stored.iter().map(|s| (s.step.as_str(), s.field.as_str())).collect();
-    let mut by_step: BTreeMap<&str, Vec<&StoredField>> = BTreeMap::new();
-    for s in stored.iter().filter(|s| !places.contains_key(&s.step)) {
-        by_step.entry(s.step.as_str()).or_default().push(s);
+    let taken: BTreeSet<(&str, &str)> = stored.iter().map(|s| (s.node.as_str(), s.field.as_str())).collect();
+    let mut by_node: BTreeMap<&str, Vec<&StoredField>> = BTreeMap::new();
+    for s in stored.iter().filter(|s| !places.contains_key(&s.node)) {
+        by_node.entry(s.node.as_str()).or_default().push(s);
     }
-    by_step
+    by_node
         .into_iter()
-        .filter_map(|(step, fields)| {
+        .filter_map(|(at, fields)| {
             let mut candidates: Vec<&String> = places
                 .iter()
                 .filter(|(place, node)| {
@@ -322,8 +322,8 @@ pub fn stranded(project: &ProjectDefinition, stored: &[StoredField]) -> Vec<Stra
             if candidates.is_empty() {
                 return None;
             }
-            candidates.sort_by_key(|place| std::cmp::Reverse(shared_tail(step, place)));
-            Some(Stranded { step: step.to_string(), candidates: candidates.into_iter().cloned().collect() })
+            candidates.sort_by_key(|place| std::cmp::Reverse(shared_tail(at, place)));
+            Some(Stranded { node: at.to_string(), candidates: candidates.into_iter().cloned().collect() })
         })
         .collect()
 }
@@ -353,6 +353,7 @@ pub struct MovePicks {
 
 /// What a move carried, and the triggers it set up again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PicksMoved {
     pub picks: u64,
     pub instance_values: u64,
@@ -373,14 +374,14 @@ pub fn check_move(project: &ProjectDefinition, stored: &[StoredField], request: 
     let Some(node) = places.get(to) else {
         return Err(format!(
             "'{to}' is no place of the program this install last built; build the program with the \
-             node there first, and name it the way the program spells it (`one.step` inside an included file)"
+             node there first, and name it the way the program spells it (`one.node` inside an included file)"
         ));
     };
-    let moving: Vec<&StoredField> = stored.iter().filter(|s| &s.step == from).collect();
+    let moving: Vec<&StoredField> = stored.iter().filter(|s| &s.node == from).collect();
     if moving.is_empty() {
         return Err(format!("nothing is stored at '{from}' on this install"));
     }
-    if stored.iter().any(|s| &s.step == to) {
+    if stored.iter().any(|s| &s.node == to) {
         return Err(format!(
             "'{to}' already has connections or values stored; a move never merges, so clear them first \
              (`weft connect --node {to} --disconnect`, and `--instance <id>` for an instance's)"
@@ -461,9 +462,9 @@ mod tests {
         node
     }
 
-    fn kept(step: &str, service: Option<&str>, instance: Option<&str>) -> StoredField {
+    fn kept(node: &str, service: Option<&str>, instance: Option<&str>) -> StoredField {
         StoredField {
-            step: step.into(),
+            node: node.into(),
             field: "access".into(),
             service: service.map(Into::into),
             instance: instance.map(|i| crate::instance::InstanceId::new(i).unwrap()),
@@ -476,7 +477,7 @@ mod tests {
         // `agent` has its pick; `studio_agent` lacks one and could take the old one.
         let stored = [kept("old.agent", Some("slack"), None), kept("agent", Some("slack"), None)];
         let found = stranded(&p, &stored);
-        assert_eq!(found, vec![Stranded { step: "old.agent".into(), candidates: vec!["studio_agent".into()] }]);
+        assert_eq!(found, vec![Stranded { node: "old.agent".into(), candidates: vec!["studio_agent".into()] }]);
         assert!(found[0].message().contains("weft connect --move old.agent studio_agent"), "{}", found[0].message());
     }
 
@@ -531,8 +532,8 @@ mod tests {
     #[test]
     fn a_pick_is_held_to_the_program_where_it_has_the_place() {
         let p = project(vec![access_node("slack", false)]);
-        let pick = |step: &str, field: &str, service: &str| PickInput {
-            step: step.into(),
+        let pick = |node: &str, field: &str, service: &str| PickInput {
+            node: node.into(),
             field: field.into(),
             connection: uuid::Uuid::nil(),
             service: service.into(),

@@ -1,5 +1,5 @@
 //! Outbound event source (3 of 3): a persistent BIDIRECTIONAL WebSocket the
-//! listener dials OUT and keeps alive, firing a fresh execution per inbound
+//! listener dials OUT and keeps alive, firing a fresh run per inbound
 //! frame. This is the shape a gateway-style integration needs (Discord,
 //! Slack socket mode): unlike [`super::SseSubscribe`] (receive-only) the
 //! listener must WRITE up the socket, both an initial handshake (auth /
@@ -94,7 +94,7 @@ impl FrameEscape {
 /// A placeholder in a text frame: `{name}` or `{name|escape}`.
 fn frame_placeholder() -> &'static regex::Regex {
     static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\{([a-z0-9_]+)(?:\|([a-z0-9_]+))?\}").expect("static regex")
+        regex::Regex::new(r"\{([A-Za-z0-9_]+)(?:\|([a-z0-9_]+))?\}").expect("static regex")
     });
     &PLACEHOLDER
 }
@@ -165,10 +165,10 @@ pub struct SocketListen {
     /// The minted-address machinery ([`MintedSocket`]): an optional
     /// `connect` call that mints the URL (the dynamic-gateway
     /// pattern: the provider hands out a short-lived, single-use
-    /// address, re-minted on every reconnect), `url_from` naming the
+    /// address, re-minted on every reconnect), `urlFrom` naming the
     /// capture that carries it, and the declarative `replies` a
     /// gateway that demands per-event acks needs. Flattened, so the
-    /// wire keeps the flat `connect` / `url_from` / `replies` fields.
+    /// wire keeps the flat `connect` / `urlFrom` / `replies` fields.
     #[serde(flatten)]
     pub minted: MintedSocket,
 
@@ -314,7 +314,7 @@ mod tests {
             body: None,
             auth: vec![crate::access::spec::AuthStep::Header {
                 name: "Authorization".into(),
-                value: Template::new("Bearer {app_token}"),
+                value: Template::new("Bearer {appToken}"),
             }],
             captures: vec![Capture { name: "url".into(), path: "url".into(), optional: false }],
         }

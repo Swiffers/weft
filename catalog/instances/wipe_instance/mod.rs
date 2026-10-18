@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use weft::storage::{FileHandle, StorageScope};
 use weft::{DeactivateSpec, DeactivationMode, RunningPolicy, StopSelf};
@@ -29,7 +29,7 @@ impl Node for WipeInstanceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let instance = instance(&ctx)?;
         let infra: Vec<String> = ctx.inputs.opt("infra")?.unwrap_or_default();
         let wipe = DeactivateSpec {

@@ -31,7 +31,7 @@
         "channels:history"
       ],
       "requiresValues": [
-        "app_token"
+        "appToken"
       ],
       "description": "Your own app's connection, with the xapp-... token pasted; needs channels:history on the installs."
     },

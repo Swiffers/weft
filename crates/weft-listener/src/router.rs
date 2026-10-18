@@ -101,7 +101,7 @@ async fn prepare(
             tenant_id: req.tenant_id,
             node_id: req.node_id,
             is_resume: req.is_resume,
-            execution_id: req.execution_id,
+            run_id: req.run_id,
             spec: req.spec,
         },
         for_instance,
@@ -275,12 +275,22 @@ async fn wake(
     }
 }
 
-async fn list_signals(State(state): State<ListenerState>) -> Json<Value> {
-    let rows: Vec<Value> = state
-        .registry
-        .list()
-        .into_iter()
-        .map(|(token, sig)| serde_json::json!({ "token": token, "node_id": sig.node_id, "kind": &sig.spec.kind }))
-        .collect();
-    Json(Value::Array(rows))
+/// One row of `GET /signals`: a connection this process holds.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeldSignal {
+    token: String,
+    node_id: String,
+    kind: String,
+}
+
+async fn list_signals(State(state): State<ListenerState>) -> Json<Vec<HeldSignal>> {
+    Json(
+        state
+            .registry
+            .list()
+            .into_iter()
+            .map(|(token, sig)| HeldSignal { token, node_id: sig.node_id, kind: sig.spec.kind })
+            .collect(),
+    )
 }

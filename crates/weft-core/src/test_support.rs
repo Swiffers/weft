@@ -6,7 +6,7 @@
 //! runtime. The same body running under N concurrent tasks on a
 //! shared multi-thread runtime surfaces races (notify-arm-vs-fire
 //! windows, scheduling-order assumptions, deadlock-detection
-//! deadlines) that one isolated execution would let slip through.
+//! deadlines) that one isolated run would let slip through.
 //!
 //! When to apply: stress-loop timing-sensitive tests BY CONSTRUCTION
 //! instead of relying on CI re-runs to trip races by accident. Rule

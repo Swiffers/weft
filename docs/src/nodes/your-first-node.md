@@ -1,7 +1,7 @@
 # Your first node
 
-Here is the smallest node in the catalog, whole. `Text` takes a string you
-typed and sends it on.
+Here is `Text`, one of the smallest nodes in the catalog, with the lines that
+hook up its tests left out. `Text` takes a string you typed and sends it on.
 
 `catalog/basic/text/metadata.json`:
 
@@ -9,7 +9,7 @@ typed and sends it on.
 {
   "type": "Text",
   "label": "Text",
-  "description": "Emit a literal string. Useful for prompts, labels, and config values.",
+  "description": "Emit a literal string (a prompt, a label, a config value).",
   "tags": ["literal", "string"],
   "icon": "Type",
   "color": "#64748b",
@@ -18,7 +18,7 @@ typed and sends it on.
       "required": true, "label": "Value" }
   ],
   "outputs": [ { "name": "value", "type": "String" } ],
-  "requires_infra": false
+  "features": { "pure": true }
 }
 ```
 
@@ -29,7 +29,7 @@ typed and sends it on.
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -37,7 +37,7 @@ pub struct TextNode;
 
 #[async_trait]
 impl Node for TextNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: String = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
@@ -86,7 +86,7 @@ nodes/word_count/
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -94,7 +94,7 @@ pub struct WordCountNode;
 
 #[async_trait]
 impl Node for WordCountNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let text: String = ctx.inputs.get("text")?;
 
         let words: Vec<&str> = text.split_whitespace().collect();

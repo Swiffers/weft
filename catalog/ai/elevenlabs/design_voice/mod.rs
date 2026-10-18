@@ -9,7 +9,7 @@ use base64::Engine as _;
 use serde_json::json;
 
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
 
 use super::flows::set_some;
 use super::voice_previews::{emit_previews, line_refusal, preview_request};
@@ -31,7 +31,7 @@ impl Node for ElevenLabsDesignVoiceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let description: String = ctx.inputs.get("description")?;
         let model: String = ctx.inputs.get("model")?;
@@ -55,7 +55,7 @@ impl Node for ElevenLabsDesignVoiceNode {
             body["should_enhance"] = json!(true);
         }
         if let Some(file) = &reference {
-            let (_, bytes) = ctx.storage(StorageScope::Execution).get_bytes(file).await?;
+            let (_, bytes) = ctx.storage(StorageScope::Run).get_bytes(file).await?;
             body["reference_audio_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
         }
         emit_previews(&ctx, &account, "design", &body, &output_format, "design the voice on ElevenLabs").await

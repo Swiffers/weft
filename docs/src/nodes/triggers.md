@@ -5,13 +5,13 @@ A trigger starts runs from outside. It has two bodies instead of one.
 ```rust
 #[async_trait]
 impl Node for CronNode {
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let expression: String = ctx.inputs.get("cron")?;
         let timezone: String = ctx.inputs.get("timezone")?;
         ctx.register_signal(Timer { spec: TimerSpec::Cron { expression, timezone } }).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         ctx.pulse_downstream(ctx.fan_declared(&ctx.wake.record()?)).await
     }
 }

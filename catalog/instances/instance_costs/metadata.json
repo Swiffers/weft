@@ -50,12 +50,12 @@
     {
       "name": "records",
       "type": "List[JsonDict]",
-      "description": "One entry per priced call: `{ run, instance, node, service, model?, amount_usd, paid_by, at_unix }`. `amount_usd` is null when the service's price could not be measured."
+      "description": "One entry per priced call: `{ run, instance, node, service, model?, amountUsd, paidBy, atUnix }`. `amountUsd` is null when the service's price could not be measured."
     },
     {
       "name": "totalUsd",
       "type": "Number",
-      "description": "Sum of every non-null `amount_usd`."
+      "description": "Sum of every non-null `amountUsd`."
     }
   ],
   "validate": [

@@ -88,7 +88,7 @@ async fn live_export(rig: LiveRig) -> WeftResult<()> {
     // Read-only: export the dedicated test spreadsheet (a sheet the
     // connected account can read; its first tab holds a header row
     // and at least one data row) through the default CSV export. The
-    // download lands in execution storage, which the runner discards.
+    // download lands in run storage, which the runner discards.
     let sheet = rig.fixture("GOOGLE_SHEET_ID")?;
     let outcome = rig
         .run(

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use weft_core::cancellation::CancellationFlag;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 /// How long an ask that failed waits before it is made again, at first and
 /// at most.
@@ -26,7 +26,7 @@ const CANCEL_SHARDS: usize = 16;
 /// up the run and fires its flag. Registered and removed inline, by the
 /// run's own drive ([`Registered`]).
 pub(crate) struct Cancels {
-    shards: [std::sync::Mutex<HashMap<ExecutionId, Arc<CancellationFlag>>>; CANCEL_SHARDS],
+    shards: [std::sync::Mutex<HashMap<RunId, Arc<CancellationFlag>>>; CANCEL_SHARDS],
     /// Poked whenever a run comes or goes, so the line watch holds the
     /// line open exactly while there are some.
     changed: tokio::sync::Notify,
@@ -49,29 +49,29 @@ impl Cancels {
         })
     }
 
-    fn shard(&self, execution_id: ExecutionId) -> &std::sync::Mutex<HashMap<ExecutionId, Arc<CancellationFlag>>> {
-        let tail = u64::from_be_bytes(execution_id.as_bytes()[8..16].try_into().expect("eight bytes"));
+    fn shard(&self, run_id: RunId) -> &std::sync::Mutex<HashMap<RunId, Arc<CancellationFlag>>> {
+        let tail = u64::from_be_bytes(run_id.as_bytes()[8..16].try_into().expect("eight bytes"));
         &self.shards[(tail % CANCEL_SHARDS as u64) as usize]
     }
 
-    /// `execution_id` is driven here from now on, under a fresh cancel,
+    /// `run_id` is driven here from now on, under a fresh cancel,
     /// until the answer is dropped; `None` when it already is. The one
     /// door a run takes onto this process, however it came (a claim, a
     /// caller, a fire, a node test): checked and taken in one step, so a
     /// run delivered twice at once is driven once, and a cancel announced
     /// from here on finds it.
-    pub(crate) fn claim(self: &Arc<Self>, execution_id: ExecutionId) -> Option<Registered> {
+    pub(crate) fn claim(self: &Arc<Self>, run_id: RunId) -> Option<Registered> {
         let flag = CancellationFlag::new_arc();
         {
-            let mut shard = self.shard(execution_id).lock().expect("cancel registry");
-            if shard.contains_key(&execution_id) {
+            let mut shard = self.shard(run_id).lock().expect("cancel registry");
+            if shard.contains_key(&run_id) {
                 return None;
             }
-            shard.insert(execution_id, flag.clone());
+            shard.insert(run_id, flag.clone());
         }
         self.changed.notify_one();
         (self.came)();
-        Some(Registered { cancels: self.clone(), execution_id, flag })
+        Some(Registered { cancels: self.clone(), run_id, flag })
     }
 
     /// [`Self::claim`] a queued run, once a drive of it on this worker has
@@ -80,36 +80,36 @@ impl Cancels {
     /// worker before the drive that let go of it has left. A second
     /// delivery of a run this worker drives waits out that drive the same
     /// way, and then finds nothing queued.
-    pub(crate) async fn claim_once_left(self: &Arc<Self>, execution_id: ExecutionId) -> Registered {
+    pub(crate) async fn claim_once_left(self: &Arc<Self>, run_id: RunId) -> Registered {
         loop {
             let left = self.left.notified();
             tokio::pin!(left);
             left.as_mut().enable();
-            if let Some(registered) = self.claim(execution_id) {
+            if let Some(registered) = self.claim(run_id) {
                 return registered;
             }
             left.await;
         }
     }
 
-    pub(crate) fn contains(&self, execution_id: ExecutionId) -> bool {
-        self.shard(execution_id).lock().expect("cancel registry").contains_key(&execution_id)
+    pub(crate) fn contains(&self, run_id: RunId) -> bool {
+        self.shard(run_id).lock().expect("cancel registry").contains_key(&run_id)
     }
 
-    /// Fire `execution_id`'s flag for `cause`. A run not driven here ended
+    /// Fire `run_id`'s flag for `cause`. A run not driven here ended
     /// on its own before the cancel landed (or another process drives it):
     /// nothing to do.
-    pub(crate) fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause) {
-        let flag = self.shard(execution_id).lock().expect("cancel registry").get(&execution_id).cloned();
+    pub(crate) fn cancel(&self, run_id: RunId, cause: weft_core::run::CancelCause) {
+        let flag = self.shard(run_id).lock().expect("cancel registry").get(&run_id).cloned();
         if let Some(flag) = flag {
-            tracing::info!(target: "weft_engine::line_watch", %execution_id, %cause, "firing the run's cancel");
+            tracing::info!(target: "weft_engine::line_watch", %run_id, %cause, "firing the run's cancel");
             flag.cancel_because(cause);
         }
     }
 
     /// Every run driven here with its flag, held still: no run comes or
     /// goes until the guards go.
-    pub(crate) fn held_still(&self) -> Vec<std::sync::MutexGuard<'_, HashMap<ExecutionId, Arc<CancellationFlag>>>> {
+    pub(crate) fn held_still(&self) -> Vec<std::sync::MutexGuard<'_, HashMap<RunId, Arc<CancellationFlag>>>> {
         self.shards.iter().map(|shard| shard.lock().expect("cancel registry")).collect()
     }
 
@@ -124,16 +124,16 @@ impl Cancels {
 /// same run may register its own the moment this one is released.
 pub(crate) struct Registered {
     cancels: Arc<Cancels>,
-    pub(crate) execution_id: ExecutionId,
+    pub(crate) run_id: RunId,
     pub(crate) flag: Arc<CancellationFlag>,
 }
 
 impl Drop for Registered {
     fn drop(&mut self) {
         // Never panics, even on a poisoned lock: this runs during unwinds.
-        if let Ok(mut shard) = self.cancels.shard(self.execution_id).lock() {
-            if shard.get(&self.execution_id).is_some_and(|flag| Arc::ptr_eq(flag, &self.flag)) {
-                shard.remove(&self.execution_id);
+        if let Ok(mut shard) = self.cancels.shard(self.run_id).lock() {
+            if shard.get(&self.run_id).is_some_and(|flag| Arc::ptr_eq(flag, &self.flag)) {
+                shard.remove(&self.run_id);
             }
         }
         self.cancels.changed.notify_one();
@@ -201,14 +201,14 @@ pub(crate) fn spawn_line_watch(watch: LineWatch) -> tokio::task::JoinHandle<()> 
                 {
                     // An event waiting for its trigger names its project
                     // alone: it is for no run.
-                    let Some((project, execution_id)) = weft_task_store::runs::parse_run_payload(&payload) else { continue };
-                    if project != watch.project_id || !watch.cancels.contains(execution_id) {
+                    let Some((project, run_id)) = weft_task_store::runs::parse_run_payload(&payload) else { continue };
+                    if project != watch.project_id || !watch.cancels.contains(run_id) {
                         continue;
                     }
                     if channel == weft_task_store::runs::CANCEL_CHANNEL {
                         look_again(&watch).await;
                     } else {
-                        let _ = watch.told.send(crate::context::RunTold::Answered(execution_id));
+                        let _ = watch.told.send(crate::context::RunTold::Answered(run_id));
                     }
                 }
                 // The line may have missed some (it was lost, or its copy
@@ -255,7 +255,7 @@ async fn look_again(watch: &LineWatch) {
 async fn look_again_once(watch: &LineWatch) -> Result<()> {
     let waiting = watch.runs.rechecked().await?;
     for cancel in waiting.cancels {
-        watch.cancels.cancel(cancel.execution_id, cancel.cause);
+        watch.cancels.cancel(cancel.run_id, cancel.cause);
     }
     if !waiting.answers.is_empty() {
         let _ = watch.told.send(crate::context::RunTold::Rechecked(Arc::new(waiting.answers)));
@@ -272,17 +272,17 @@ mod tests {
     #[tokio::test]
     async fn a_claim_waits_for_the_runs_last_drive_here_to_leave() {
         let cancels = Cancels::new(Box::new(|| {}));
-        let execution_id = weft_core::new_execution_id();
-        let leaving = cancels.claim(execution_id).expect("a fresh run");
+        let run_id = weft_core::new_run_id();
+        let leaving = cancels.claim(run_id).expect("a fresh run");
         let mut claiming = tokio::spawn({
             let cancels = cancels.clone();
-            async move { cancels.claim_once_left(execution_id).await }
+            async move { cancels.claim_once_left(run_id).await }
         });
         assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut claiming).await.is_err(), "the drive has not left");
         drop(leaving);
         let claimed = claiming.await.unwrap();
-        assert!(cancels.contains(execution_id));
+        assert!(cancels.contains(run_id));
         drop(claimed);
-        assert!(!cancels.contains(execution_id));
+        assert!(!cancels.contains(run_id));
     }
 }

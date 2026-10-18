@@ -1,6 +1,6 @@
 # The browser extension
 
-**Weft tasks** is where a person answers a program. When a step asks a question,
+**Weft tasks** is where a person answers a program. When a node asks a question,
 the run parks and the question shows up here as a card.
 
 Install it from
@@ -32,13 +32,13 @@ ends one.
 
 ### Scoping a token
 
-A token with no restrictions sees every waiting step in the tenant, and no node
-displays at all.
+A token with no restrictions sees every waiting node in the tenant, but none of
+your nodes' displays.
 
 | Flag | What it narrows to |
 |---|---|
 | `--projects <uuid>` | Only these projects. Repeatable |
-| `--tags <tag>` | Only steps carrying one of these tags. Repeatable |
+| `--tags <tag>` | Only nodes carrying one of these tags. Repeatable |
 | `--display <node>` | Also lets it read one node's display, and press the buttons on it |
 | `--displays` | Every node display in the token's projects |
 
@@ -57,22 +57,23 @@ granted, and a host it could not reach. A popup that said "Connected" while a
 runtime was down would be hiding tasks from you.
 
 **The task page** is one card at a time, with the count, and Previous and Next
-to move. The card shows whatever the step declared: values to read, text boxes,
+to move. The card shows whatever the node declared: values to read, text boxes,
 option buttons, approve and reject pairs, images and files.
 
 | Button | What it does |
 |---|---|
 | **Submit** | Answers a question inside a run already going |
 | **Fire** | Starts a new run, on a trigger |
-| **Skip** | Declines the question: the step that asked ends skipped, and the steps reading its answer skip too. The rest of the run carries on. Not shown on a trigger, which has no question to skip (weft refuses it) |
-| **Cancel run** | Ends the whole execution. Also not shown on a trigger |
+| **Skip** | Declines the question: the node that asked ends skipped, and the nodes reading its answer skip too. The rest of the run carries on. Not shown on a trigger, which has no question to skip (weft refuses it) |
+| **Cancel run** | Ends the whole run. Also not shown on a trigger |
 
-Approve and reject are labelled by whoever wrote the step, so they can read
-**Send it** and **Hold it** rather than the defaults.
+Approve and reject are labelled by whoever wrote the program (the field's
+`approveLabel` and `rejectLabel`), so they can read **Send it** and **Hold it**
+rather than the defaults.
 
 If a program's author gave you an instance token, **Your connections** (the
 link icon in the popup) is where you connect your own accounts. With the
-instance token added, it lists the steps that run on the instance's own
+instance token added, it lists the nodes that run on the instance's own
 account, and what you connect and pick there belongs to that instance alone.
 If the page says you have no instance token, add the one the program's author
 gave you; other tokens you have added are ignored there. For instance tokens
@@ -80,7 +81,8 @@ and what they reach, go and read [programs with instances](instances.md).
 
 After you submit, the card says `Submitted` for a moment and moves to the next.
 Back in the editor, the cyan ring on that box goes green and the rest of the
-program runs.
+program runs. On a trigger, **Fire** shows `Fired` instead: a run started, and
+the trigger stays so you can fire it again.
 
 ## What it can see
 
@@ -96,8 +98,8 @@ in the URL, so it does not land in anybody's logs.
 ## Writing your own instead
 
 The extension is one consumer, not the only possible one. It reads the same two
-addresses any client can, and it renders a form from what the step declared
-rather than knowing anything about particular steps. A Slack bot or an internal
+addresses any client can, and it renders a form from what the node declared
+rather than knowing anything about particular nodes. A Slack bot or an internal
 page would work the same way against the same addresses.
 
 If you want to build one, the token is the whole authentication story, and

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::API;
 use super::flows::set_some;
@@ -27,7 +27,7 @@ impl Node for ElevenLabsCreateVoiceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let name: String = ctx.inputs.get("name")?;
         let description: String = ctx.inputs.get("description")?;

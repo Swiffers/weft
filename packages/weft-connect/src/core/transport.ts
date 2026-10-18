@@ -46,8 +46,8 @@ export interface DirectConnect {
 	values: Record<string, string>;
 	label: string | null;
 	permissions: string[];
-	// SYNC: shared_app <-> crates/weft-core/src/access/wire.rs SharedDoorPick
-	shared_app: string | null;
+	// SYNC: sharedApp <-> crates/weft-core/src/access/wire.rs SharedDoorPick
+	sharedApp: string | null;
 	registration: AppRegistration | null;
 }
 
@@ -57,9 +57,9 @@ export interface ConsentStart {
 	spec: AccessSpecWire;
 	door: Door;
 	permissions: string[];
-	// SYNC: shared_app <-> crates/weft-core/src/access/wire.rs SharedDoorPick
-	shared_app: string | null;
-	upgrade_grant_id: string | null;
+	// SYNC: sharedApp <-> crates/weft-core/src/access/wire.rs SharedDoorPick
+	sharedApp: string | null;
+	upgradeGrantId: string | null;
 	registration: AppRegistration | null;
 }
 
@@ -225,13 +225,13 @@ export class InstanceDoor implements ConnectTransport {
 	}
 
 	/** The lists and chooser of one field the instance fills. */
-	resources(step: string, field: string): ResourceTransport {
+	resources(node: string, field: string): ResourceTransport {
 		const lookup = <T,>(body: InstanceLookupRequest) => this.call<T>('POST', 'lookup', body);
 		const picker = (body: InstancePickerRequest) => this.call<{ state: string; url: string }>('POST', 'picker', body);
 		return {
-			granted: (index) => lookup<LookupItem[]>({ step, field, source: index }),
-			list: (index, _source, query, parents, cursor) => lookup<LookupPage>({ step, field, source: index, query, parents, cursor }),
-			beginPicker: (index) => picker({ step, field, source: index }),
+			granted: (index) => lookup<LookupItem[]>({ node, field, source: index }),
+			list: (index, _source, query, parents, cursor) => lookup<LookupPage>({ node, field, source: index, query, parents, cursor }),
+			beginPicker: (index) => picker({ node, field, source: index }),
 			pickerOutcome: (state) => this.call('GET', `connections/status?state=${encodeURIComponent(state)}`),
 			openExternal: (url) => this.opener(url),
 		};

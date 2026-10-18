@@ -13,7 +13,7 @@
   "service": {
     "service": "http_header_key",
     "label": "HTTP header key",
-    "connection_optional": true,
+    "connectionOptional": true,
     "doors": [
       "own"
     ],
@@ -40,7 +40,7 @@
         "value": "{value}"
       }
     ],
-    "own_page": {
+    "ownPage": {
       "guide": {
         "steps": [
           "Name the header the API reads its key from (`Authorization` for most, `X-Api-Key` for some).",

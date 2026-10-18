@@ -45,7 +45,7 @@ prefix_rule(
 # Reads: the compiler, the catalog, and what runs and ran.
 prefix_rule(
     pattern = ["weft", [
-        "validate", "parse", "describe-nodes", "status", "ps", "executions",
+        "validate", "parse", "describe-nodes", "status", "ps", "runs",
         "events", "logs", "follow", "tree", "diff", "examples", "options",
         "node-test-hash",
     ]],

@@ -23,5 +23,5 @@
       "type": "Number"
     }
   ],
-  "requires_infra": false
+  "requiresInfra": false
 }

@@ -23,11 +23,11 @@ pub struct WithdrawSignalExecutor;
 impl TaskExecutor<DispatcherState> for WithdrawSignalExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: WithdrawSignalPayload = serde_json::from_value(task.payload.clone())?;
-        let removed: Vec<_> = state.journal.signal_withdraw(payload.execution_id, &payload.token).await?.into_iter().collect();
+        let removed: Vec<_> = state.journal.signal_withdraw(payload.run_id, &payload.token).await?.into_iter().collect();
         state.listener.unregister_many(&removed).await;
         tracing::info!(
             target: "weft_dispatcher::withdraw_signal",
-            execution_id = %payload.execution_id,
+            run_id = %payload.run_id,
             token = %payload.token,
             removed = removed.len(),
             "withdrew a wait its run gave up"

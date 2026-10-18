@@ -53,7 +53,8 @@
   "features": {
     "catchErrors": true,
     "canAddInputPorts": true,
-    "canAddOutputPorts": true
+    "canAddOutputPorts": true,
+    "addedPortsAreDataKeys": true
   },
   "validate": [
     {

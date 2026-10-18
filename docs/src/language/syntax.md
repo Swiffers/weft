@@ -1,6 +1,6 @@
 # Syntax
 
-A `.weft` file names some steps and connects them up. This program puts `HELLO`
+A `.weft` file names some nodes and connects them up. This program puts `HELLO`
 in front of you:
 
 ```weft
@@ -13,10 +13,10 @@ show = Debug { data: shout.text }
 ```
 
 `message`, `shout` and `show` are names you choose, unique where they sit.
-`Text`, `ExecPython` and `Debug` are kinds of step, from the project's `nodes/`
+`Text`, `ExecPython` and `Debug` are node types, from the project's `nodes/`
 folder.
 
-## Naming a step
+## Naming a node
 
 `name = NodeType`, and braces if you have anything to put inside:
 
@@ -24,11 +24,11 @@ folder.
 message = Text { value: "hello" }
 ```
 
-A step with nothing to configure can drop the braces, so `Debug` and `Debug {}`
-mean the same. You still have to supply whatever that step requires.
+A node with nothing to configure can drop the braces, so `Debug` and `Debug {}`
+mean the same. You still have to supply whatever that node requires.
 
 A name the catalog does not know is `unknown-type`. Writing a name does not
-bring a step into existence; the declaration has to be there.
+bring a node into existence; the declaration has to be there.
 
 ## Connecting things
 
@@ -72,7 +72,7 @@ message = Text {
 
 Some inputs only take arrows and some only take written values; the
 `input-accepts` diagnostic tells you which. Anything the compiler has to read
-to work out the step's shape, such as a form's field list, has to be written
+to work out the node's shape, such as a form's field list, has to be written
 inline: an arrow, `@file` or `@asset` cannot supply it.
 
 For text kept in another file, go and read
@@ -88,7 +88,7 @@ answer = ExecPython -> (value: Number) {
 }
 ````
 
-You can write a value into an **input**. **Outputs** are filled by the step
+You can write a value into an **input**. **Outputs** are filled by the node
 when it runs, so `answer.value = 42` in that example is the `value-on-output`
 error. The same holds inside a group: connect a child's output to
 `self.result`, and if you want a constant to come out, use something like
@@ -112,7 +112,7 @@ sends nothing at all. A key set to `None` sends a real null on an output whose
 type takes `Null` (`last: JsonDict | Null`), and nothing on any other output.
 
 If you want the program to carry on when the script raises (a request it
-makes fails, or it raises on purpose), wire the step's `error` output: the
+makes fails, or it raises on purpose), wire the node's `error` output: the
 exception's type, message and traceback come out there, and the other outputs
 send nothing. Left unwired, the exception fails the run. A mistake in the
 program fails the run either way: code that does not compile, a script that
@@ -120,7 +120,7 @@ ends without returning a dictionary, a key that is not one of its outputs, or a
 value of the wrong type for its output. `error` counts as a key it may not
 return, since weft fills it; to fail on purpose, raise.
 
-You can only declare the ports a step leaves open for you. Ports whose types
+You can only declare the ports a node leaves open for you. Ports whose types
 are already fixed keep them. Declare inputs, outputs, or both:
 
 ```weft
@@ -128,21 +128,21 @@ answer = LlmInference -> (response: String)
 convert = Cast -> (value: Boolean)
 ```
 
-Those are fragments: the steps still need their other required inputs before
+Those are fragments: the nodes still need their other required inputs before
 they can run.
 
 ### Extra inputs
 
-Some steps, `ExecPython` and `FirstInOrder` among them, let you invent input
+Some nodes, `ExecPython` and `FirstInOrder` among them, let you invent input
 names. Writing a key in the body creates that input and works out its type from
 what you put there:
 
 ```weft
-step = ExecPython -> (out: String) {
+summary = ExecPython -> (out: String) {
   text: draft.answer
   limit: 3
   notes?: review.notes
-  code: @file("assets/scripts/step.py")
+  code: @file("assets/scripts/summary.py")
 }
 ```
 
@@ -150,7 +150,7 @@ step = ExecPython -> (out: String) {
 bare `null` gives it nothing to work from, so that fails.
 
 The `?` on `notes?` makes it optional, so a closed arrow there does not skip
-the step. That spelling only works when you are creating the port; to make a
+the node. That spelling only works when you are creating the port; to make a
 port optional in a full signature, write `notes?: String` there instead.
 
 Extra inputs stay in the order you wrote them, which matters for
@@ -161,11 +161,11 @@ Extra inputs stay in the order you wrote them, which matters for
 | Key | What it does |
 |---|---|
 | `_label: "Review the draft"` | Puts a label on the box. A string literal only; it cannot come over a wire |
-| `_tags: ["support"]` | Tags the step, including for deciding which runs a stop reaches |
-| `_should_flow: decision.approved` | Decides whether the step runs. Takes true, false, or an arrow |
-| `_should_not_flow: decision.sent` | The same decision inverted: the step runs when the thing wired here did NOT happen |
+| `_tags: ["support"]` | Tags the node, including for deciding which runs a stop reaches |
+| `_should_flow: decision.approved` | Decides whether the node runs. Takes true, false, or an arrow |
+| `_should_not_flow: decision.sent` | The same decision inverted: the node runs when the thing wired here did NOT happen |
 
-<!-- SYNC: reserved keys <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT
+<!-- SYNC: reserved keys <-> crates/weft-core/src/run/skip.rs SHOULD_FLOW_PORT
      and SHOULD_NOT_FLOW_PORT, packages/weft-graph/src/protocol.ts
      SHOULD_FLOW_PORT and SHOULD_NOT_FLOW_PORT,
      packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README) -->
@@ -180,8 +180,8 @@ send = SlackSendMessage {
 }
 ```
 
-A step has one gate, and wiring both spellings is the `two-gates` error. For
-what each one does to the steps after it, go and read
+A node has one gate, and wiring both spellings is the `two-gates` error. For
+what each one does to the nodes after it, go and read
 [how a program runs](how-a-program-runs.md#choosing-a-branch-and-joining-back-up).
 
 ## Groups and loops
@@ -208,9 +208,9 @@ skips a group it skips everything in it.
 Loops work the same way with iteration settings of their own. Go and read
 [groups](groups.md) and [loops](loops.md).
 
-## Declaring a step where you use it
+## Declaring a node where you use it
 
-You can write a step straight into the place its value is wanted, ending with
+You can write a node straight into the place its value is wanted, ending with
 `.port` to say which output you mean:
 
 ```weft
@@ -219,12 +219,12 @@ show = Debug {
 }
 ```
 
-That makes the step and the arrow together, exactly as a named declaration
+That makes the node and the arrow together, exactly as a named declaration
 would. The `.port` on the end is required even when there is only one output.
 
 ## Needing one of several inputs
 
-`@require_one_of` says a step needs at least one out of a list:
+`@require_one_of` says a node needs at least one out of a list:
 
 ```weft
 lookup = SlackFindUser {
@@ -235,10 +235,10 @@ lookup = SlackFindUser {
 ```
 
 Every name in there has to be a real input. Supply none of them and the
-compiler says `require-one-of-unmet`. At run time, the step skips if they all
+compiler says `require-one-of-unmet`. At run time, the node skips if they all
 close without a value.
 
-It goes in a step's body or its inline signature. A step's author can bake the
+It goes in a node's body or its inline signature. A node's author can bake the
 same requirement into its metadata as `oneOfRequired`. Groups and loops reject
 it: put it on the child that needs the value.
 
@@ -268,6 +268,33 @@ The fallback can also be a file, read the way a written one is:
 `personality: @instance_filled(@file("prompts/default.md"))`.
 
 For what both do, go and read [programs with instances](../running/instances.md).
+
+## Spelling a name
+
+Every name you choose in a program is camelCase: what you call a node, a
+group, a loop or an `@include` (`sendReply`), and every port you declare on a
+node, a group or a loop, or in an included file's header
+(`maxRetries: Number`). A key you write in a node's body that creates a port
+counts too (`userId: 3` on `ExecPython`). A node type is spelled exactly as
+the catalog spells it, which is PascalCase (`ExecPython`).
+
+If you spell a name you chose any other way, the program still runs, and the
+compiler warns `not-camel-case`. When it can respell the name, the message says how:
+
+```text
+node 'send_reply' is not camelCase: write 'sendReply'
+```
+
+The gates, `_should_flow` and `_should_not_flow`, are the language's own names,
+so this warning skips them.
+
+If the ports you add are named after data from outside weft, you can keep that
+data's own spelling on a node built for it: `post = Route -> (user_id: String)`
+draws no `not-camel-case` warning for `user_id`, though the name you give the
+node, `post`, is still checked. A few nodes that ship with weft let you do this (`Route` for a request body's fields, `JsonObject` for the keys
+of the object it builds, among others), because each one sets
+`addedPortsAreDataKeys` in its `metadata.json`. For the full list, go and read
+[the `addedPortsAreDataKeys` row in the features table](../nodes/metadata.md#features).
 
 ## Comments
 

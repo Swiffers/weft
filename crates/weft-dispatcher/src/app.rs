@@ -56,7 +56,7 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &weft_task_store::parked_fires::GROUP,
     // The durable terminate-sweep queue (no FK; the dispatcher owns it and
     // the reaper drains it by asking the broker to sweep a terminated
-    // execution's files).
+    // run's files).
     &crate::storage::GROUP,
     // In the one list with everything else, so a mismatch anywhere
     // surfaces in ONE error naming every stale group together.
@@ -87,19 +87,7 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // weft's own calls that keep failing (a role it cannot wake, workers
     // it cannot hand a run to), for `weft status` to show.
     &weft_task_store::unanswered::GROUP,
-    &RETIRED_DISPATCHER_CURSOR,
-    &RETIRED_INFRA_EVENT_BRIDGE_CURSOR,
 ];
-
-/// The cursors the dispatcher once read the journal and the infra events
-/// with, before a run's own row and an event's notification carried what
-/// they tracked. Their tables are gone; each group stays listed, with
-/// none, so a database that still holds one is carried to its drop by the
-/// group's history (`migrations/<group>/`).
-static RETIRED_DISPATCHER_CURSOR: weft_task_store::SchemaGroup =
-    weft_task_store::SchemaGroup { name: "dispatcher_cursor", tables: &[], ddl: &[], seed: &[] };
-static RETIRED_INFRA_EVENT_BRIDGE_CURSOR: weft_task_store::SchemaGroup =
-    weft_task_store::SchemaGroup { name: "infra_event_bridge_cursor", tables: &[], ddl: &[], seed: &[] };
 
 /// The construction-time policies threaded into `build_state`: who a
 /// request authenticates as, which tenant owns a project, and how a

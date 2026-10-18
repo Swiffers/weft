@@ -43,11 +43,11 @@
           "action": "allow"
         },
         {
-          "pattern": "weft executions",
+          "pattern": "weft runs",
           "action": "allow"
         },
         {
-          "prefix": "weft executions ",
+          "prefix": "weft runs ",
           "action": "allow"
         },
         {

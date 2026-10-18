@@ -114,7 +114,7 @@ export function hasUnpickedAccess(
 	for (const input of inputs) {
 		if (input.widget?.kind !== 'access') continue;
 		// An optional connection (compiler-stamped from the recipe's
-		// `connection_optional`) never pins: the node runs without one.
+		// `connectionOptional`) never pins: the node runs without one.
 		if (input.widget.optional) continue;
 		const rendered = inputRendersField(input, {
 			wired: wiredInputPorts.has(input.name),
@@ -148,7 +148,7 @@ function fieldFromWidget(key: string, label: string, w: Widget): FieldDefinition
 		case 'select':
 		case 'multiselect':
 			field.options = w.options;
-			if (w.free_text) field.freeText = true;
+			if (w.freeText) field.freeText = true;
 			break;
 		case 'number':
 			if (w.min != null) field.min = w.min;
@@ -164,8 +164,8 @@ function fieldFromWidget(key: string, label: string, w: Widget): FieldDefinition
 		case 'remote_select':
 			field.access = w.access;
 			field.sources = w.sources;
-			if (w.depends_on) field.dependsOn = w.depends_on;
-			if (w.free_text) field.freeText = true;
+			if (w.dependsOn) field.dependsOn = w.dependsOn;
+			if (w.freeText) field.freeText = true;
 			break;
 		case 'file_drop':
 			if (w.accept) field.accept = w.accept;
@@ -196,14 +196,14 @@ export const LOOP_CONFIG_FIELDS: FieldDefinition[] = [
 		description: 'Run all iterations concurrently (incompatible with carry / self.done).',
 	},
 	{
-		key: 'max_iters',
+		key: 'maxIters',
 		label: 'Max iterations',
 		type: 'number',
 		min: 0,
 		description: 'Hard cap on iteration count. Leave blank for no cap.',
 	},
 	{
-		key: 'trim_on_mismatch',
+		key: 'trimOnMismatch',
 		label: 'Trim on length mismatch',
 		type: 'checkbox',
 		description: 'Zip iter inputs to the shortest length. Off = crash loud on mismatch.',

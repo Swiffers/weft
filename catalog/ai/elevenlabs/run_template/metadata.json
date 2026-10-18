@@ -33,7 +33,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -45,8 +45,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "next_cursor"
             }
           }
         ]
@@ -61,10 +61,10 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "depends_on": [
+        "dependsOn": [
           "template"
         ],
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -84,7 +84,8 @@
   "features": {
     "catchErrors": true,
     "canAddInputPorts": true,
-    "canAddOutputPorts": true
+    "canAddOutputPorts": true,
+    "addedPortsAreDataKeys": true
   },
   "validate": [
     {

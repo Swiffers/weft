@@ -29,9 +29,9 @@ weft_core::wire_enum! {
         /// connection to the dispatcher, so the trust seam stays at the
         /// broker.
         FireSignal = "fire_signal",
-        /// Stop every live execution of a project carrying a tag, on behalf
-        /// of one of its executions (`ctx.stop_tagged`). Producer = the
-        /// broker's `/v1/execution/stop_tagged` handler, which resolves the
+        /// Stop every live run of a project carrying a tag, on behalf
+        /// of one of its runs (`ctx.stop_tagged`). Producer = the
+        /// broker's `/v1/run/stop_tagged` handler, which resolves the
         /// ordering anchor at enqueue time; consumer = the dispatcher's
         /// executor, which cancels each match through the one cancel path.
         /// Rides the task table so the stop survives the asking worker dying
@@ -62,7 +62,7 @@ weft_core::wire_enum! {
 pub struct FireSignalPayload {
     pub token: String,
     /// The run the answer resolves.
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The answer, as the kind made it of the event.
     pub value: serde_json::Value,
     /// The holder a held connection picked the answer up under. The
@@ -73,11 +73,11 @@ pub struct FireSignalPayload {
 }
 
 /// Payload for `TaskKind::WithdrawSignal`: the wait `token` of run
-/// `execution_id`, given up. The broker takes it only when the wait is
+/// `run_id`, given up. The broker takes it only when the wait is
 /// that run's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawSignalPayload {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     pub token: String,
 }
 
@@ -113,8 +113,8 @@ pub struct ResyncPayload {
     pub driver: uuid::Uuid,
 }
 
-/// Payload for `TaskKind::StopTagged`: "stop every live execution of
-/// `project_id` carrying `tag`, asked by execution `by`". The broker
+/// Payload for `TaskKind::StopTagged`: "stop every live run of
+/// `project_id` carrying `tag`, asked by run `by`". The broker
 /// builds it when the worker calls `ctx.stop_tagged`, resolving
 /// `before_seq` THEN (synchronously with the node's call), so a stop
 /// that executes late can never reach a sibling that tagged itself
@@ -123,11 +123,11 @@ pub struct ResyncPayload {
 pub struct StopTaggedPayload {
     pub project_id: uuid::Uuid,
     pub tag: String,
-    /// The execution that asked. Excluded from the targets under
+    /// The run that asked. Excluded from the targets under
     /// `StopSelf::Keep`, named as the canceller on every stopped run.
-    pub by: weft_core::ExecutionId,
-    /// Only executions whose tag row has a sequence below this are
-    /// stopped. `None` means every live execution carrying the tag
+    pub by: weft_core::RunId,
+    /// Only runs whose tag row has a sequence below this are
+    /// stopped. `None` means every live run carrying the tag
     /// (the `Include` shape: no ordering, the whole batch goes).
     pub before_seq: Option<i64>,
     pub stop_self: weft_core::StopSelf,
@@ -184,13 +184,13 @@ mod tests {
     fn an_answer_round_trips() {
         let payload = FireSignalPayload {
             token: "t".into(),
-            execution_id: uuid::Uuid::from_u128(2),
+            run_id: uuid::Uuid::from_u128(2),
             value: serde_json::json!({ "approved": true }),
             held_by: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json.get("held_by").is_none());
         let back: FireSignalPayload = serde_json::from_value(json).unwrap();
-        assert_eq!((back.execution_id, back.value), (payload.execution_id, payload.value));
+        assert_eq!((back.run_id, back.value), (payload.run_id, payload.value));
     }
 }

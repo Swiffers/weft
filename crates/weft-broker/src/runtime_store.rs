@@ -36,14 +36,14 @@ use crate::entitlement::{lock_tenant_storage, EntitlementSource};
 /// `KeepTtl::Default` resolves to this; defined beside `KeepTtl` in core.
 pub use weft_core::storage::DEFAULT_KEEP_TTL_SECS;
 
-/// How long an UN-KEPT completed exec file lingers after its run terminates
+/// How long an UN-KEPT completed run file lingers after its run terminates
 /// before it expires. The terminate sweep stamps
 /// `expires_at_unix = now + this` instead of deleting outright, so a user can
 /// still open the files list and download a run's output right after the run
 /// ends. It reads as gone once the deadline passes and the expiry loop
 /// removes it then, and the stamped expiry is what the file lists surface as
 /// the remaining lifetime.
-pub const EXEC_LINGER_TTL_SECS: i64 = 5 * 60;
+pub const RUN_LINGER_TTL_SECS: i64 = 5 * 60;
 
 /// Default lifetime of a presigned URL when the caller doesn't choose one.
 pub const DEFAULT_PRESIGN_TTL_SECS: u64 = 15 * 60;
@@ -353,13 +353,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- which is what makes an in-flight upload unable to blow past the
             -- cap.
             status             TEXT NOT NULL DEFAULT 'active',
-            -- True iff this exec-scoped file is flagged to survive the
+            -- True iff this run-scoped file is flagged to survive the
             -- terminate sweep. Always false in the other scopes, which
             -- outlive runs without a flag. Set at begin; a PENDING kept
             -- row is still sweepable (only kept ACTIVE files are spared).
             keep               BOOLEAN NOT NULL DEFAULT FALSE,
             -- Unix seconds at which the file expires (access-bumped), in
-            -- any scope: a kept execution file, a project/shared/instance
+            -- any scope: a kept run file, a project/shared/instance
             -- file stored with a lifetime, a retired asset. NULL = no
             -- expiry. Set at complete, never on a pending row.
             expires_at_unix    BIGINT,
@@ -819,7 +819,7 @@ impl RuntimeStore {
                 "a file identity is a non-empty label of at most 512 characters".into(),
             ));
         }
-        // A lifetime applies in every scope a node writes: on an execution
+        // A lifetime applies in every scope a node writes: on a run
         // file it also spares it from the end-of-run sweep, on the others
         // (which outlive runs already) it is simply when the file expires.
         // The asset scope's lifetime belongs to the source that references
@@ -1028,9 +1028,9 @@ impl RuntimeStore {
             .bind(&tenant)
             .bind(mime)
             .bind(filename)
-            // The flag is the end-of-run sweep's exemption, which only an
-            // execution file needs; elsewhere a lifetime is just a ttl.
-            .bind(keep.is_some() && matches!(scope, StorageScope::Execution))
+            // The flag is the end-of-run sweep's exemption, which only a
+            // run file needs; elsewhere a lifetime is just a ttl.
+            .bind(keep.is_some() && matches!(scope, StorageScope::Run))
             .bind(ttl.map(|s| s as i64))
             .bind(now)
             .bind(&upload_id)
@@ -2273,8 +2273,8 @@ impl RuntimeStore {
     /// Flip a completed upload's row to active with its final size and drop
     /// its part rows. The expiry is stamped NOW (completion is when a kept
     /// file starts existing), unless the row already carries one: the
-    /// execution sweep's linger stamp on an upload still completing when
-    /// its run ended ([`Self::sweep_exec`]). `reserved_bytes` is set to the
+    /// run sweep's linger stamp on an upload still completing when
+    /// its run ended ([`Self::sweep_run`]). `reserved_bytes` is set to the
     /// final size so the tenant's charged sum is identical before and after
     /// the flip.
     async fn flip_active(
@@ -2934,8 +2934,8 @@ impl RuntimeStore {
         Ok(())
     }
 
-    /// Set how long a file lives from now on, access-renewed. On an
-    /// execution file this also flags it to survive the terminate sweep;
+    /// Set how long a file lives from now on, access-renewed. On a
+    /// run file this also flags it to survive the terminate sweep;
     /// in the scopes that outlive runs already it is only the lifetime
     /// (`KeepTtl::Never` there clears one). An asset's lifetime follows
     /// the source, so it is refused.
@@ -2945,7 +2945,7 @@ impl RuntimeStore {
                 "an asset's lifetime follows the source that references it; it takes no keep".into(),
             ));
         }
-        let exec = matches!(parsed.scope, weft_core::storage::key::KeyScope::Exec { .. });
+        let run_scoped = matches!(parsed.scope, weft_core::storage::key::KeyScope::Run { .. });
         let key = parsed.to_key();
         let ttl_secs = ttl.secs();
         let now = self.clock.now_unix();
@@ -2964,7 +2964,7 @@ impl RuntimeStore {
         .bind(ttl_secs.map(|s| s as i64))
         .bind(expires_at)
         .bind(&key)
-        .bind(exec)
+        .bind(run_scoped)
         .bind(now)
         .fetch_optional(&self.pool)
         .await
@@ -3157,11 +3157,11 @@ impl RuntimeStore {
         Ok(removed)
     }
 
-    /// Terminate sweep: close out an execution's un-kept exec files (the
-    /// `<tenant>/exec/<execution_id>/` prefix, kept files excepted).
+    /// Terminate sweep: close out a run's un-kept run files (the
+    /// `<tenant>/run/<run_id>/` prefix, kept files excepted).
     ///
     /// - A COMPLETED un-kept file is not deleted here: it gets
-    ///   `expires_at_unix = now + EXEC_LINGER_TTL_SECS` stamped, so the user
+    ///   `expires_at_unix = now + RUN_LINGER_TTL_SECS` stamped, so the user
     ///   can still list/download a run's output right after the run ends; the
     ///   expiry loop removes it once the linger passes (the stamp rings it,
     ///   [`Self::ring_for`]). The stamped deadline
@@ -3172,11 +3172,11 @@ impl RuntimeStore {
     ///   file). A leftover 'reaping' row whose claim lapsed is retried.
     ///
     /// Returns `(reaped, lingering)`: rows removed now vs stamped to expire.
-    pub async fn sweep_exec(&self, tenant: &str, execution_id: &str) -> Result<(u64, u64)> {
+    pub async fn sweep_run(&self, tenant: &str, run_id: &str) -> Result<(u64, u64)> {
         // Rendered through the key grammar (never hand-built): validates both
         // segments and keeps the scope tag single-sourced.
-        let prefix = weft_core::storage::key::exec_prefix(tenant, execution_id)
-            .map_err(|e| anyhow::anyhow!("sweep_exec: {e}"))?;
+        let prefix = weft_core::storage::key::run_prefix(tenant, run_id)
+            .map_err(|e| anyhow::anyhow!("sweep_run: {e}"))?;
         let mut reaped = 0;
         let mut lingering = 0;
         for entry in self.keys_under(&prefix).await? {
@@ -3191,7 +3191,7 @@ impl RuntimeStore {
                     tracing::error!(
                         target: "weft_broker::runtime_store",
                         key = %entry.key, error = %e,
-                        "an execution's completing upload did not land; it gets the linger \
+                        "a run's completing upload did not land; it gets the linger \
                          stamp now and the tenant's next upload lands it"
                     );
                 }
@@ -3216,7 +3216,7 @@ impl RuntimeStore {
                     expiry_honoring_links("$2")
                 ))
                 .bind(&entry.key)
-                .bind(self.clock.now_unix() + EXEC_LINGER_TTL_SECS)
+                .bind(self.clock.now_unix() + RUN_LINGER_TTL_SECS)
                 .fetch_optional(&self.pool)
                 .await
                 .context("linger stamp")?;

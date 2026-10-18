@@ -3,6 +3,7 @@
 	import { pickAsset } from '../../../host';
 	import { acceptForFileType, guessMime } from '../../utils/file-browser';
 	import { fileRefsOf, type WeftFileRefValue } from '../../value-format';
+	import { isScopeKey } from '../../utils/storage-key';
 	import FilePickerModal from './FilePickerModal.svelte';
 
 	// The file-drop config field. Its value is an `@asset("<path-or-url-or-key>",
@@ -32,7 +33,7 @@
 		/// row and no list.
 		multiple?: boolean;
 		// The value to set: one ref, a list of them when the port takes
-		// several, or null to clear (routes to removeConfig).
+		// several, or null to clear (routes to remove_config).
 		onUpdate: (ref: WeftFileRefValue | WeftFileRefValue[] | null) => void;
 	} = $props();
 
@@ -51,14 +52,8 @@
 	function isUrl(path: string): boolean {
 		return path.startsWith('http://') || path.startsWith('https://');
 	}
-	// A tenant-less storage key (`project/<id>/<file>` etc.): a stored runtime
-	// file picked from the project's storage, not a folder path.
-	// SYNC: key shape <-> crates/weft-core/src/storage/key.rs is_scope_key
-	function isStored(path: string): boolean {
-		return /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(path);
-	}
 	function originOf(path: string): string {
-		return isUrl(path) ? 'external URL' : isStored(path) ? 'stored file' : 'project asset';
+		return isUrl(path) ? 'external URL' : isScopeKey(path) ? 'stored file' : 'project asset';
 	}
 	function iconFor(path: string) {
 		const mime = guessMime(path);

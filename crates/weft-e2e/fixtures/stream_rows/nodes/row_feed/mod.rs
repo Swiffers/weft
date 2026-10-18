@@ -7,14 +7,14 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct RowFeedNode;
 
 #[async_trait]
 impl Node for RowFeedNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let rows: Vec<String> = ctx.inputs.get("rows")?;
         for row in rows {
             if row.starts_with('#') {

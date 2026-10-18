@@ -7,13 +7,13 @@
 //! then read the response. The wait is a parked poll, so no worker is
 //! held while fal generates, and there is no deadline: a generation the
 //! user asked for takes as long as it takes, and cancelling the
-//! execution cancels the wait.
+//! run cancels the wait.
 
 use serde_json::{Map, Value};
 
 use weft::access::client::{get_json, post_json};
 use weft::signal::{PollEndpoint, Predicate};
-use weft::{Access, ExecutionContext, NodeErrExt, WeftResult};
+use weft::{Access, RunContext, NodeErrExt, WeftResult};
 
 pub const API: &str = "https://queue.fal.run";
 
@@ -40,7 +40,7 @@ pub fn checked_model(model: &str) -> WeftResult<&str> {
 /// Submit `payload` to `model`'s queue, wait on the request, and hand
 /// back the completed response. `what` names the attempt in errors.
 pub async fn run_queued(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     account: &Access,
     http: &weft::reqwest_middleware::ClientWithMiddleware,
     model: &str,

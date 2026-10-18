@@ -6,14 +6,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use weft_core::project::selection::RecordedSelection;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_journal::frame::{BatchAnswer, BatchHead, RunHead};
 use weft_journal::record::{Fate, RawRecord, RunLogRow};
-use weft_journal::{BatchError, ExecEvent, RecordClient};
+use weft_journal::{BatchError, RunEvent, RecordClient};
 
 /// A batch as a lane sent it: each run's head and its events, read back
 /// with the selections the batch carried.
-pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<ExecEvent>)>) {
+pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<RunEvent>)>) {
     let batch = weft_journal::frame::decode(body).expect("a lane frames what it sends");
     let selections: HashMap<String, RecordedSelection> = batch
         .head
@@ -28,7 +28,7 @@ pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<ExecEve
         .zip(&batch.rows)
         .map(|(run, row)| {
             let selection = run.born.as_ref().and_then(|born| born.selection.as_ref()).map(|digest| &selections[digest]);
-            let events = weft_journal::stored::decode(run.execution_id, selection, row).expect("a lane writes rows that read back");
+            let events = weft_journal::stored::decode(run.run_id, selection, row).expect("a lane writes rows that read back");
             (run.clone(), events)
         })
         .collect();
@@ -39,16 +39,16 @@ pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<ExecEve
 #[derive(Debug, Default)]
 struct Run {
     last_seq: i32,
-    events: Vec<ExecEvent>,
+    events: Vec<RunEvent>,
 }
 
 #[derive(Default)]
 struct State {
-    runs: HashMap<ExecutionId, Run>,
+    runs: HashMap<RunId, Run>,
     heads: Vec<BatchHead>,
-    gave_up: Vec<(ExecutionId, String)>,
-    refused: HashSet<ExecutionId>,
-    born_elsewhere: HashSet<ExecutionId>,
+    gave_up: Vec<(RunId, String)>,
+    refused: HashSet<RunId>,
+    born_elsewhere: HashSet<RunId>,
     unanswered: usize,
     lost_answers: usize,
     refused_batches: usize,
@@ -77,14 +77,14 @@ impl FakeRecord {
         self.open.send_replace(true);
     }
 
-    /// Answer `Refused` for `execution_id`'s rows from now on.
-    pub(crate) fn refuse(&self, execution_id: ExecutionId) {
-        self.state.lock().unwrap().refused.insert(execution_id);
+    /// Answer `Refused` for `run_id`'s rows from now on.
+    pub(crate) fn refuse(&self, run_id: RunId) {
+        self.state.lock().unwrap().refused.insert(run_id);
     }
 
-    /// Answer `BornElsewhere` for the birth of `execution_id`.
-    pub(crate) fn born_elsewhere(&self, execution_id: ExecutionId) {
-        self.state.lock().unwrap().born_elsewhere.insert(execution_id);
+    /// Answer `BornElsewhere` for the birth of `run_id`.
+    pub(crate) fn born_elsewhere(&self, run_id: RunId) {
+        self.state.lock().unwrap().born_elsewhere.insert(run_id);
     }
 
     /// The next `calls` batches reach nothing and get no answer.
@@ -102,18 +102,18 @@ impl FakeRecord {
         self.state.lock().unwrap().refused_batches = calls;
     }
 
-    /// Every event on record of `execution_id`, in order.
-    pub(crate) fn events(&self, execution_id: ExecutionId) -> Vec<ExecEvent> {
-        self.state.lock().unwrap().runs.get(&execution_id).map(|run| run.events.clone()).unwrap_or_default()
+    /// Every event on record of `run_id`, in order.
+    pub(crate) fn events(&self, run_id: RunId) -> Vec<RunEvent> {
+        self.state.lock().unwrap().runs.get(&run_id).map(|run| run.events.clone()).unwrap_or_default()
     }
 
-    /// The node of every `NodeStarted` on record of `execution_id`, and the
+    /// The node of every `NodeStarted` on record of `run_id`, and the
     /// kind of every other event, in order.
-    pub(crate) fn log(&self, execution_id: ExecutionId) -> Vec<String> {
-        self.events(execution_id)
+    pub(crate) fn log(&self, run_id: RunId) -> Vec<String> {
+        self.events(run_id)
             .iter()
             .map(|event| match event {
-                ExecEvent::NodeStarted { node_id, .. } => node_id.clone(),
+                RunEvent::NodeStarted { node_id, .. } => node_id.clone(),
                 other => other.kind_str().to_string(),
             })
             .collect()
@@ -125,7 +125,7 @@ impl FakeRecord {
     }
 
     /// The runs ended through [`RecordClient::give_up`], with why.
-    pub(crate) fn gave_up(&self) -> Vec<(ExecutionId, String)> {
+    pub(crate) fn gave_up(&self) -> Vec<(RunId, String)> {
         self.state.lock().unwrap().gave_up.clone()
     }
 }
@@ -146,7 +146,7 @@ impl RecordClient for FakeRecord {
         let (head, runs) = decode_batch(&batch);
         let mut fates = Vec::new();
         for (run, events) in runs {
-            let id = run.execution_id;
+            let id = run.run_id;
             let fate = if state.refused.contains(&id) {
                 Fate::Refused
             } else if run.first_seq == 0 && state.born_elsewhere.contains(&id) {
@@ -174,13 +174,13 @@ impl RecordClient for FakeRecord {
         Ok(BatchAnswer { fates })
     }
 
-    async fn record_of(&self, execution_id: ExecutionId) -> anyhow::Result<RawRecord> {
-        let events = self.events(execution_id);
+    async fn record_of(&self, run_id: RunId) -> anyhow::Result<RawRecord> {
+        let events = self.events(run_id);
         Ok(RawRecord { selection: None, rows: vec![RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }] })
     }
 
-    async fn give_up(&self, execution_id: ExecutionId, why: String) -> Result<(), BatchError> {
-        self.state.lock().unwrap().gave_up.push((execution_id, why));
+    async fn give_up(&self, run_id: RunId, why: String) -> Result<(), BatchError> {
+        self.state.lock().unwrap().gave_up.push((run_id, why));
         Ok(())
     }
 }

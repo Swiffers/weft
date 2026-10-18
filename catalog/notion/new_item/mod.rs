@@ -8,7 +8,7 @@ use serde_json::json;
 
 use weft::node::NodeOutput;
 use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollMethod};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::notion::{data_source_id, API};
 
@@ -25,7 +25,7 @@ impl Node for NotionNewItemNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let database: String = ctx.inputs.get("database")?;
         let source: Option<String> = ctx.inputs.opt("source")?;
@@ -56,7 +56,7 @@ impl Node for NotionNewItemNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let wake = ctx.wake.record()?;
         let page = wake["item"].clone();
         let id = page["id"].as_str().node_err("the poll wake carries no page id")?.to_string();

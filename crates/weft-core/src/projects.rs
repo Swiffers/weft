@@ -37,7 +37,7 @@ crate::wire_enum! {
         /// Live; worker pool spawns on demand and fires execute.
         Active = "active",
         /// Transient: user clicked deactivate with runningPolicy=wait;
-        /// running executions are draining.
+        /// running runs are draining.
         Deactivating = "deactivating",
         /// Idle; gate refuses / parks fires per the lifecycle axes.
         Inactive = "inactive",
@@ -164,10 +164,11 @@ impl StatusQuery {
 pub const PROJECT_BEING_REMOVED: &str = "the project is being removed; run `weft rm` again to finish removing it";
 
 /// `GET /projects/{id}/status`: everything a client renders about one
-/// project in one answer (registration, listener, infra, executions,
+/// project in one answer (registration, listener, infra, runs,
 /// drift, and the verbs the dispatcher accepts right now).
 // SYNC: ProjectStatusResponse <-> packages/weft-graph/src/status.ts RawStatusPayload
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectStatusResponse {
     pub id: uuid::Uuid,
     pub name: String,
@@ -187,7 +188,7 @@ pub struct ProjectStatusResponse {
     /// grace window). `None` outside hibernate. Surfaced so the action
     /// bar can render a countdown.
     pub fires_deadline_unix: Option<i64>,
-    /// Count of running, non-suspended executions right now. Drives the
+    /// Count of running, non-suspended runs right now. Drives the
     /// deactivating-state UI: progress towards drain.
     pub running_count: usize,
     pub listener_running: bool,
@@ -197,7 +198,7 @@ pub struct ProjectStatusResponse {
     /// then says whether it is listening now.
     pub has_triggers: bool,
     pub infra: Vec<ProjectInfraEntry>,
-    pub executions: ProjectExecutionsSummary,
+    pub runs: ProjectRunsSummary,
     /// True when the project has any infra-typed nodes in its source:
     /// whether a client shows the infra controls at all.
     pub has_infra: bool,
@@ -252,7 +253,7 @@ pub struct ProjectStatusResponse {
     /// how many of those failed: the one trace a run kept unrecorded
     /// leaves when it goes well. Empty when no trigger started one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub runs: Vec<TriggerRuns>,
+    pub trigger_runs: Vec<TriggerRuns>,
     /// weft's own work the project's work waits on that keeps failing.
     /// Empty when none does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -265,6 +266,7 @@ pub struct ProjectStatusResponse {
 /// loops that gave up, the supervisor acting on the project's infra. This
 /// is what a person waiting is shown, until it is resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Unanswered {
     /// What fails, in a person's words, as a whole clause ("weft's
     /// supervisor, which starts and stops infra, cannot be reached").
@@ -275,13 +277,10 @@ pub struct Unanswered {
     pub then: String,
     /// The last error written down.
     pub error: String,
-    #[serde(rename = "sinceUnix")]
     pub since_unix: i64,
-    #[serde(rename = "lastUnix")]
     pub last_unix: i64,
     /// The install's clock when this was read, which the times above are
     /// on, so how long ago reads right whatever clock the reader has.
-    #[serde(rename = "asOfUnix")]
     pub as_of_unix: i64,
 }
 
@@ -319,15 +318,15 @@ pub struct ProjectRemoved {
 /// content.
 // SYNC: BuildInFlight <-> packages/weft-graph/src/status.ts RawStatusPayload.builds
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildInFlight {
     /// The image ref it pushes.
     pub image: String,
     /// The builder's own id for it.
     pub build: String,
-    #[serde(rename = "startedAtUnix")]
     pub started_at_unix: i64,
     /// Where its log is read, when the builder keeps one at an address.
-    #[serde(default, rename = "logUrl", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_url: Option<String>,
 }
 
@@ -347,6 +346,7 @@ pub enum BuildState {
 /// `state` is `None` when that build is no longer on record (a cleanup
 /// forgot its image, or another build of the same image replaced it).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildStateResponse {
     pub state: Option<BuildState>,
     /// Why it failed, once it did.
@@ -355,10 +355,10 @@ pub struct BuildStateResponse {
     /// The builder's own id for it, once the builder made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
-    #[serde(default, rename = "startedAtUnix", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_unix: Option<i64>,
     /// Where its log is read, when the builder keeps one at an address.
-    #[serde(default, rename = "logUrl", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_url: Option<String>,
 }
 
@@ -425,21 +425,22 @@ pub struct PreservationCounts {
     /// the "execute parked / drop parked / wipe" choice on reactivate.
     pub parked: usize,
     /// Resume signals with no submission yet: they stay across the
-    /// inactive window so their suspended execution can resume later.
+    /// inactive window so their suspended run can resume later.
     pub suspended: usize,
 }
 
 /// Desired vs running drift, one bit per thing that can lag.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectDrift {
     /// "Infra is stale relative to source." Drives the Upgrade button.
     pub infra_drift: bool,
     /// "Worker BINARY needs rebuilding." Flips on engine, node code,
     /// type-set or `weft.toml` edits; the dialog before running asks
-    /// about killing running executions when it is set.
+    /// about killing running runs when it is set.
     pub binary_drift: bool,
     /// "Project SHAPE has changed." A config or topology edit flips it
-    /// without flipping `binary_drift`; the next execution picks up the
+    /// without flipping `binary_drift`; the next run picks up the
     /// new definition.
     pub definition_drift: bool,
     /// "The listeners fire an older program." The registrations pin the
@@ -452,6 +453,7 @@ pub struct ProjectDrift {
 /// One infra place in the status answer.
 // SYNC: ProjectInfraEntry <-> packages/weft-graph/src/protocol.ts InfraPlacementStatus
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectInfraEntry {
     /// The node's placement, spelled the way the PROGRAM writes the node
     /// (`db`, or `one.db` inside the file the site `one` includes): what
@@ -469,9 +471,9 @@ pub struct ProjectInfraEntry {
     /// a `@per_instance` place, which has no shared copy.
     pub status: String,
     pub endpoint_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "failureStage")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_stage: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "failureMessage")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
     /// For a `per_instance` place: how many instances have a copy (each
     /// is listed in `instance_infra`).
@@ -483,9 +485,10 @@ pub struct ProjectInfraEntry {
     pub progress: Option<crate::infra::wire::ChangeProgress>,
 }
 
-// SYNC: ProjectExecutionsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.executions
+// SYNC: ProjectRunsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.runs
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectExecutionsSummary {
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRunsSummary {
     /// The program's own runs (fires and manual runs): what `weft tree`
     /// lists.
     pub total: usize,
@@ -494,9 +497,9 @@ pub struct ProjectExecutionsSummary {
     #[serde(default)]
     pub setup: usize,
     pub last_completed_at: Option<u64>,
-    pub last_execution_id: Option<String>,
+    pub last_run_id: Option<String>,
     pub last_status: Option<crate::program::RunStatus>,
-    /// Every execution running right now (suspended ones excluded), the
+    /// Every run running right now (suspended ones excluded), the
     /// same set `running_count` counts. The editor REPLACES its own
     /// running set with this on every status refresh, so a terminal event
     /// lost to a dropped stream never leaves a Stop button on a run that
@@ -510,13 +513,14 @@ pub struct ProjectExecutionsSummary {
     /// Each carries its phase: the setup an `infra start` or an
     /// activation runs is running too, and the editor shows it as that
     /// verb working instead of as a run with a Stop button.
-    pub running: Vec<RunningExecution>,
+    pub running: Vec<GoingRun>,
 }
 
-// SYNC: RunningExecution <-> packages/weft-graph/src/status.ts RunningExecution
+// SYNC: GoingRun <-> packages/weft-graph/src/status.ts GoingRun
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunningExecution {
-    pub execution_id: String,
+#[serde(rename_all = "camelCase")]
+pub struct GoingRun {
+    pub run_id: String,
     pub phase: crate::primitive::Phase,
 }
 

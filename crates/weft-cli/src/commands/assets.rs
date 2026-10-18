@@ -722,8 +722,8 @@ mod tests {
             let looks = looks.clone();
             async move {
                 let value = match uri.path() {
-                    "/storage/upload/begin" => serde_json::json!({"key":"asset/hash", "part_size":4, "resume":false}),
-                    "/storage/upload/parts" => serde_json::json!({"parts":[{"part_number":1,"size_bytes":4,"offset_bytes":0,"url":part_url}]}),
+                    "/storage/upload/begin" => serde_json::json!({"key":"asset/hash", "partSize":4, "resume":false}),
+                    "/storage/upload/parts" => serde_json::json!({"parts":[{"partNumber":1,"sizeBytes":4,"offsetBytes":0,"url":part_url}]}),
                     "/part" => return (StatusCode::OK, [("etag", "part-1")], "").into_response(),
                     "/storage/upload/part-done" => serde_json::json!({}),
                     "/storage/upload/complete" => {
@@ -763,8 +763,8 @@ mod tests {
                         return (StatusCode::NOT_FOUND, [("x-weft-not-found", "file")], "missing file").into_response();
                     }
                     let value = match uri.path() {
-                        "/storage/upload/begin" => serde_json::json!({"key":"asset/hash", "part_size":4, "resume":failed_path.ends_with("resume")}),
-                        "/storage/upload/parts" => serde_json::json!({"parts":[{"part_number":1,"size_bytes":4,"offset_bytes":0,"url":part_url}]}),
+                        "/storage/upload/begin" => serde_json::json!({"key":"asset/hash", "partSize":4, "resume":failed_path.ends_with("resume")}),
+                        "/storage/upload/parts" => serde_json::json!({"parts":[{"partNumber":1,"sizeBytes":4,"offsetBytes":0,"url":part_url}]}),
                         "/part" => return (StatusCode::OK, [("etag", "part-1")], "").into_response(),
                         "/storage/upload/part-done" => serde_json::json!({}),
                         "/storage/files/meta/asset/hash" => serde_json::json!({"key":"asset/hash","mimeType":"text/plain","sizeBytes":4,"filename":"test","keep":false,"createdAtUnix":0,"version":1}),
@@ -799,7 +799,7 @@ mod tests {
         let refs = [
             make_ref(own.clone()),
             make_ref("asset/logo.png".into()),
-            make_ref("exec/c/generated".into()),
+            make_ref("run/c/generated".into()),
         ];
         assert_eq!(asset_references(&project, refs.iter()).unwrap().keys, vec![own]);
         let empty = asset_references(&project, std::iter::empty()).unwrap();

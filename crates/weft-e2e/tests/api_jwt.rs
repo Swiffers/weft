@@ -56,7 +56,7 @@ async fn a_genuine_token_is_admitted_and_its_claims_reach_the_run() -> anyhow::R
     let mut project = Project::prepare("api_jwt", disp.clone()).await?;
     let base = project.unique_live_path()?;
 
-    let values = json!({ "issuer": issuer, "jwks_url": jwks_url, "audience": audience });
+    let values = json!({ "issuer": issuer, "jwksUrl": jwks_url, "audience": audience });
     let conn = connect_direct(&disp, catalog_spec("api", "jwt_auth")?, "own", values).await?;
     set_account(&project, "issuer", conn.handle()).await?;
     project.activate().await?;

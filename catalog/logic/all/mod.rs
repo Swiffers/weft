@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct AllNode;
@@ -39,7 +39,7 @@ impl Node for AllNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // "All of nothing" is true in logic and a mis-wiring in a
         // graph: a gate fed from here would be permanently open and
         // nothing on screen would say why. Refuse instead of guessing.

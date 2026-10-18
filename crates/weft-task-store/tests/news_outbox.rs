@@ -59,7 +59,7 @@ impl News for Flaky {
             anyhow::bail!("the bus is away");
         }
         let refused = *self.refuses.lock().unwrap();
-        if news.iter().any(|piece| Some(piece.execution) == refused) {
+        if news.iter().any(|piece| Some(piece.run) == refused) {
             anyhow::bail!("the bus will not take this");
         }
         self.told.lock().unwrap().push(news.to_vec());
@@ -75,9 +75,9 @@ impl News for Flaky {
     }
 }
 
-async fn tell(pool: &PgPool, execution: u128) -> RunNews {
-    let news = RunNews { project: uuid::Uuid::from_u128(1), execution: uuid::Uuid::from_u128(execution), kind: NewsKind::Cancel };
-    sqlx::query("SELECT weft_tell($1, $2, 'cancel')").bind(news.project).bind(news.execution).execute(pool).await.unwrap();
+async fn tell(pool: &PgPool, run: u128) -> RunNews {
+    let news = RunNews { project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(run), kind: NewsKind::Cancel };
+    sqlx::query("SELECT weft_tell($1, $2, 'cancel')").bind(news.project).bind(news.run).execute(pool).await.unwrap();
     news
 }
 
@@ -181,13 +181,13 @@ async fn refused(pool: &PgPool) -> i64 {
 async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: PgPool) {
     setup(&pool).await;
     let mut first = Vec::new();
-    for execution in 2..=101 {
-        first.push(tell(&pool, execution).await);
+    for run in 2..=101 {
+        first.push(tell(&pool, run).await);
     }
     let after = tell(&pool, 102).await;
     let bus = Flaky::failing(0);
     let poison = first[0];
-    *bus.refuses.lock().unwrap() = Some(poison.execution);
+    *bus.refuses.lock().unwrap() = Some(poison.run);
     weft_task_store::announce::tell_news_through(&pool, bus.clone());
     until("the news after the refused batch told", async || bus.told() == vec![vec![after]]).await;
     until("the refusal written down", async || refusal_written(&pool).await).await;
@@ -204,7 +204,7 @@ async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: PgPool) 
     assert_eq!(told[..2], [vec![after], vec![later]], "new news went out alone, before the refused news was tried");
     assert!(told[2..].iter().all(|call| call.len() == 1), "refused news is tried one piece per call");
     let mut retold: Vec<RunNews> = told[2..].iter().map(|call| call[0]).collect();
-    retold.sort_by_key(|piece| piece.execution);
+    retold.sort_by_key(|piece| piece.run);
     assert_eq!(retold, first[1..], "every refused piece but the one the bus will never take went out");
     assert!(refusal_written(&pool).await, "a refused piece is still waiting");
 
@@ -225,7 +225,7 @@ async fn a_look_with_nothing_refused_never_takes_the_refused_path(pool: PgPool) 
     sqlx::raw_sql(
         "CREATE TABLE refused_looks (n INT); \
          CREATE OR REPLACE FUNCTION weft_news_refused(p_limit BIGINT, p_skip BIGINT[], p_callee TEXT) \
-             RETURNS TABLE (seq BIGINT, project_id UUID, execution_id UUID, kind TEXT) AS $$ \
+             RETURNS TABLE (seq BIGINT, project_id UUID, run_id UUID, kind TEXT) AS $$ \
              BEGIN INSERT INTO refused_looks VALUES (1); RETURN; END; $$ LANGUAGE plpgsql",
     )
     .execute(&pool)

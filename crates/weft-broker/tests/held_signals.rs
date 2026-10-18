@@ -117,7 +117,7 @@ async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPo
     assert!(signal_held(&pool, "nothing").await.unwrap().is_none());
 }
 
-/// A run's wait comes back naming the run it answers: its `execution_id`
+/// A run's wait comes back naming the run it answers: its `run_id`
 /// is a real id on the wire, never text the listener has to parse.
 #[sqlx::test]
 async fn a_held_wait_names_its_run(pool: PgPool) {
@@ -125,7 +125,7 @@ async fn a_held_wait_names_its_run(pool: PgPool) {
     project(&pool, ACTIVE).await;
     let run = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO signal (token, tenant_id, project_id, execution_id, node_id, is_resume, spec_json, created_at) \
+        "INSERT INTO signal (token, tenant_id, project_id, run_id, node_id, is_resume, spec_json, created_at) \
          VALUES ('wait', 'local', $1, $2, 'hold', TRUE, '{}', 0)",
     )
     .bind(ACTIVE)
@@ -135,8 +135,8 @@ async fn a_held_wait_names_its_run(pool: PgPool) {
     .expect("wait row");
     let held = signal_held(&pool, "wait").await.expect("query").expect("held");
     assert!(held.is_resume);
-    assert_eq!(held.execution_id, Some(run));
-    assert_eq!(signals_held(&pool, Some(ACTIVE)).await.expect("query")[0].execution_id, Some(run));
+    assert_eq!(held.run_id, Some(run));
+    assert_eq!(signals_held(&pool, Some(ACTIVE)).await.expect("query")[0].run_id, Some(run));
 }
 
 #[sqlx::test]
@@ -228,7 +228,7 @@ async fn a_claim_lives_until_let_go_or_the_check(pool: PgPool) {
     assert!(lost.kept.is_empty() && lost.ended.is_empty(), "lost to another holder, not ended: {lost:?}");
     let fire = |held_by: Option<&str>| weft_task_store::kinds::FireSignalPayload {
         token: "sse".into(),
-        execution_id: weft_core::ExecutionId::from_u128(1),
+        run_id: weft_core::RunId::from_u128(1),
         value: serde_json::json!({}),
         held_by: held_by.map(str::to_string),
     };

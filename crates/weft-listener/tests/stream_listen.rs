@@ -227,7 +227,7 @@ async fn bring_up_mailbox(state: &ListenerState, sig_token: &str, peer_address: 
 
     let row = json!({
         "token": sig_token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
-        "spec_json": serde_json::to_string(&to_spec(kind)).unwrap(), "is_resume": false, "execution_id": null,
+        "spec_json": serde_json::to_string(&to_spec(kind)).unwrap(), "is_resume": false, "run_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
         "auth_config": null, "kind_state": {}, "kind_state_seq": 1, "holds": true, "serving": null
     });
@@ -354,6 +354,6 @@ impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
             anyhow::bail!("no worker answers at {address}");
         }
         self.fired.lock().unwrap().push(fire.clone());
-        Ok(weft_core::door_fire::Fired::Started { execution_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
+        Ok(weft_core::door_fire::Fired::Started { run_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
     }
 }

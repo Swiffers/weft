@@ -14,7 +14,7 @@
   "service": {
     "service": "custom_llm",
     "label": "Custom LLM endpoint",
-    "connection_optional": true,
+    "connectionOptional": true,
     "doors": ["own"],
     "acquisition": {
       "kind": "static",
@@ -37,7 +37,7 @@
       "rung": "silent",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "guide": {
         "steps": [
           "Paste the endpoint's API key below and name the connection.",

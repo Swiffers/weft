@@ -22,7 +22,7 @@ fn dispatcher_task(dedup: &str) -> tasks::NewTask {
         kind: weft_task_store::TaskKind::RunNodeTest,
         project_id: Some(Uuid::from_u128(0x1)),
         dedup_key: Some(dedup.to_string()),
-        execution_id: None,
+        run_id: None,
         tenant_id: "tenant-1".to_string(),
         payload: json!({}),
     }

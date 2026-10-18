@@ -1,5 +1,5 @@
 # Two routes that do not record their runs (`recorded: false`). The rig calls
-# each and asserts what the executions listing keeps.
+# each and asserts what the runs listing keeps.
 #
 #   GET status   answers every time; its runs leave nothing behind, and
 #                each one gives its at-once slot back as it ends
@@ -17,7 +17,7 @@ explode.path = broken.path
 never = Reply
 never.body = explode.body
 
-# GET silent   its one path to an answer closes (the step sends nothing),
+# GET silent   its one path to an answer closes (the node sends nothing),
 #              so the caller hears why and the run is written down failed
 silent = Route { path: "__E2E_PATH__/silent", method: "GET", recorded: false }
 quiet = ExecPython(path: String) -> (body: JsonDict) {

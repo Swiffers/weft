@@ -18,7 +18,7 @@
 //! After resolving ALL file references, the driver publishes the complete
 //! set of [`referenced_asset_keys`] to storage. An asset some project of the
 //! tenant references does not expire; one nothing references any more
-//! receives the usual access-renewed TTL. Old executions keep their original
+//! receives the usual access-renewed TTL. Old runs keep their original
 //! keys and may read those files until they expire.
 //!
 //! I/O is behind two traits so the sync's orchestration is contract-testable
@@ -95,7 +95,7 @@ pub trait AssetStore: Send + Sync {
 
 /// The tenant's assets the resolved definition uses, including nested file
 /// values and files selected by stored key instead of disk path.
-/// Execution/project/shared files keep their own lifetime rules.
+/// Run/project/shared files keep their own lifetime rules.
 pub fn referenced_asset_keys(project: &ProjectDefinition) -> Result<Vec<String>> {
     let mut keys = BTreeSet::new();
     for node in &project.nodes {
@@ -201,7 +201,7 @@ pub fn hash_files(paths: &[String], source: &dyn AssetSource) -> Result<Vec<Hash
 /// key: `content hash -> full storage key`. The content-addressed core
 /// every publisher shares (an `@asset` sync, a version snapshot): diff
 /// against what the store already holds, upload only the missing
-/// content, never delete an existing file (a paused execution may still
+/// content, never delete an existing file (a paused run may still
 /// need an earlier version). Each missing file is uploaded from a
 /// snapshot verified against its recorded hash first: parts are stored
 /// by number under a key that is the content's hash, so bytes that do
@@ -301,7 +301,7 @@ pub async fn publish_files(
 /// kind its `@asset` declared (an `Image` over an mp3), is collected and
 /// reported in ONE loud error (so a build with three broken refs names all
 /// three, not the first). Upload failures abort loudly. No existing file is
-/// deleted: a paused execution may still need an earlier version.
+/// deleted: a paused run may still need an earlier version.
 pub async fn sync_assets(
     refs: &[FileRef],
     source: &dyn AssetSource,

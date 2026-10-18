@@ -23,7 +23,7 @@ pair of boundary nodes and the runtime drives the iterations.
 
 They go in the body as ordinary lines. Anything else starting with a letter is
 a node, and anything else that looks like a setting is a hard error, because a
-typo like `max_itres: 10` silently running your loop uncapped is exactly what
+typo like `maxItres: 10` silently running your loop uncapped is exactly what
 the language refuses to allow.
 
 | Setting | Default | What it does |
@@ -31,8 +31,8 @@ the language refuses to allow.
 | `over: ["cards"]` | `[]` | Which inputs to iterate. Each has to be a `List[T]` or a `Generator[T]` |
 | `carry: ["total"]` | `[]` | Values threaded from one iteration to the next |
 | `parallel: true` | `false` | Launch every iteration at once, rather than one at a time |
-| `max_iters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
-| `trim_on_mismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
+| `maxIters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
+| `trimOnMismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
 
 ## The four kinds of port
 
@@ -86,7 +86,7 @@ last one wrote.
 ## How a loop ends
 
 - It runs out of items in `over`.
-- It hits `max_iters`.
+- It hits `maxIters`.
 - The body writes `self.done = true`, on a sequential loop.
 - A carried value is lost to a failure, and then the loop fails (see below).
 
@@ -95,7 +95,7 @@ A sequential loop with none of those is the
 left to run forever.
 
 With several `over` lists of different lengths, the default trims to the
-shortest. Set `trim_on_mismatch: false` and a mismatch fails the run instead,
+shortest. Set `trimOnMismatch: false` and a mismatch fails the run instead,
 naming the lengths.
 
 ## When an iteration fails
@@ -108,16 +108,16 @@ what a null means.
 If the failure means a carried value never got written, the loop stops there
 and fails. The next iteration would start from the same value and meet the
 same failure: an agent loop whose model call broke would otherwise pay for
-the same doomed call up to `max_iters` times, then hand on a stale history as
-if all went well. The loop's step fails with
+the same doomed call up to `maxIters` times, then hand on a stale history as
+if all went well. The loop fails with
 
 ```
 loop 'agent' stopped at iteration 4: its carried value 'history' could not be updated because 'ask' failed: <the error>
 ```
 
-where `ask` is the step that actually broke, even when other steps between it
+where `ask` is the node that actually broke, even when other nodes between it
 and the loop's end skipped because of it. Everything reading the loop's outputs
-sees a failure, the same as for any failed step, and `ask` shows as failed in
+sees a failure, the same as for any failed node, and `ask` shows as failed in
 that iteration too.
 
 A carried value that closed with no failure behind it, because a branch was not

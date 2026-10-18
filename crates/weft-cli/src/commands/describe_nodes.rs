@@ -20,10 +20,11 @@ struct NodesResponse<T> {
     // the values are the filtered wiring view instead, same envelope.
     catalog: BTreeMap<String, T>,
     /// Soft errors from scanning `nodes/` (malformed metadata.json,
-    /// duplicate types). Surfaced, not silent: a node mid-rename has a
-    /// transient parse error the editor should see but not crash on.
+    /// duplicate types), and names a loaded node spells off the weft way.
+    /// Surfaced, not silent: a node mid-rename has a transient parse
+    /// error the editor should see but not crash on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
+    warnings: Vec<weft_catalog::CatalogWarning>,
 }
 
 /// One row of `--list`: what a reader scanning for a node needs to
@@ -113,8 +114,9 @@ pub async fn run(
                 description: first_sentence(&metadata.description),
             })
             .collect();
-        // The scan warnings go out either way: a node mid-rename that
-        // dropped out of the listing has to say so, JSON or not.
+        // The scan warnings go out either way, JSON or not: a node
+        // mid-rename that dropped out of the listing has to say so, and so
+        // does a name a listed node spells off the weft way.
         for warning in cat.warnings() {
             eprintln!("warning: {warning}");
         }
@@ -187,7 +189,7 @@ fn language_construct(name: &str) -> Option<String> {
         "Loop" => ("a loop, written `name = Loop(...) { ... }`", "docs/src/language/loops.md"),
         "Include" => ("an include, written `name = @include(\"file.weft\")`", "docs/src/language/files-and-reuse.md"),
         weft_core::project::boundary_types::PASSTHROUGH | weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
-            "a step the compiler makes out of a group or a loop; you never write it",
+            "a node the compiler makes out of a group or a loop; you never write it",
             "docs/src/language/how-a-program-runs.md",
         ),
         _ => return None,

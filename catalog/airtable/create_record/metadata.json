@@ -37,8 +37,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "offset",
-              "cursor_path": "offset"
+              "cursorParam": "offset",
+              "cursorPath": "offset"
             }
           },
           {
@@ -57,7 +57,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "depends_on": [
+        "dependsOn": [
           "base"
         ],
         "sources": [

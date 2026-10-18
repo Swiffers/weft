@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued};
 
@@ -25,7 +25,7 @@ impl Node for FalEditImageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let model: String = ctx.inputs.get("model")?;
         let prompt: String = ctx.inputs.get("prompt")?;
@@ -40,7 +40,7 @@ impl Node for FalEditImageNode {
         // the other. A model that refuses the one it does not know is not
         // a dead end: `params: { "image_urls": null }` takes it back off,
         // which is what a null extra means.
-        let storage = ctx.storage(StorageScope::Execution);
+        let storage = ctx.storage(StorageScope::Run);
         let image_url = storage.external_url(&image).await?;
         let mut payload = json!({
             "prompt": prompt,
@@ -67,7 +67,7 @@ impl Node for FalEditImageNode {
 
         let ty = ctx.output_type("image")?;
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             // The edited image is the run's product: keep it past the
             // run (default 30-day access-bumped TTL).
             .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))

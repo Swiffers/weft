@@ -27,7 +27,7 @@
         "options": [
           "primary"
         ],
-        "free_text": true
+        "freeText": true
       }
     },
     {

@@ -50,7 +50,7 @@
       "Bash(weft build)",
       "Bash(weft run:*)",
       "Bash(weft describe-nodes:*)",
-      "Bash(weft executions:*)",
+      "Bash(weft runs:*)",
       "Bash(weft events:*)",
       "Bash(weft logs:*)",
       "Bash(weft status:*)",

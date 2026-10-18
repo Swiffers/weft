@@ -349,7 +349,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
     use sqlx::Row;
     // Claim predicate (shared with the broker's supervisor claim):
     // either no current claimer OR an expired lease. The lease lets
-    // a dispatcher that crashed mid-execution release the row
+    // a dispatcher that crashed mid-run release the row
     // automatically after `CLAIM_LEASE_TTL` instead of pinning it.
     //
     // A project's health verbs (`deactivate` / `reactivate`) run one at

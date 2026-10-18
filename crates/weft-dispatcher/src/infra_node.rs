@@ -12,7 +12,7 @@
 //! compiled id behind a place is never stored here. The supervisor
 //! writes status transitions as it executes a claimed
 //! `infra_lifecycle_command`, and writes runtime events (Flaky /
-//! Recovered) and may flip status as part of that execution.
+//! Recovered) and may flip status as part of that run.
 //!
 //! Workers read `endpoints_json` through the broker's
 //! `/v1/infra/endpoint_url` endpoint, which answers from
@@ -281,7 +281,7 @@ pub struct PendingOp {
     /// The setup run behind a start, when a setup run is what it is (a
     /// stop of the copy cancels it, so its applies never land after the
     /// stop).
-    pub setup: Option<weft_core::ExecutionId>,
+    pub setup: Option<weft_core::RunId>,
     /// When it was asked for (unix seconds): a command's
     /// `issued_at_unix`, a setup run's `started_at`. The change it makes
     /// counts its progress from it.
@@ -354,16 +354,16 @@ impl PendingOps {
     }
 
     /// The setup runs bringing this copy up.
-    pub fn setups_starting(&self, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Vec<weft_core::ExecutionId> {
-        let mut execution_ids: Vec<weft_core::ExecutionId> = self
+    pub fn setups_starting(&self, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Vec<weft_core::RunId> {
+        let mut run_ids: Vec<weft_core::RunId> = self
             .ops
             .iter()
             .filter(|op| op.node.as_deref() == Some(node) && op.copies.admits(instance))
             .filter_map(|op| op.setup)
             .collect();
-        execution_ids.sort();
-        execution_ids.dedup();
-        execution_ids
+        run_ids.sort();
+        run_ids.dedup();
+        run_ids
     }
 
     /// Every copy with no row that a start is bringing up, as
@@ -532,24 +532,24 @@ pub async fn pending_ops(
     // A setup run that has not ended brings up the infra places its
     // selection holds, for its instance.
     let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
-    /// execution_id, instance_id, started_at, selection.
+    /// run_id, instance_id, started_at, selection.
     type SetupRow =
-        (weft_core::ExecutionId, Option<String>, i64, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>);
+        (weft_core::RunId, Option<String>, i64, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>);
     let setups: Vec<SetupRow> = sqlx::query_as(
-        "SELECT r.execution_id, r.instance_id, r.started_at, s.selection FROM run r \
+        "SELECT r.run_id, r.instance_id, r.started_at, s.selection FROM run r \
          LEFT JOIN run_selection s ON s.digest = r.selection \
          WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    for (execution_id, instance, started_at, subgraph) in setups {
+    for (run_id, instance, started_at, subgraph) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("infra setup {execution_id} instance: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("infra setup {run_id} instance: {e}"))?;
         let Some(sqlx::types::Json(subgraph)) = subgraph else {
-            anyhow::bail!("infra setup {execution_id} was born without its selection; it cannot say what it brings up");
+            anyhow::bail!("infra setup {run_id} was born without its selection; it cannot say what it brings up");
         };
         for place in &subgraph.nodes {
             let spelled = weft_core::project::address_of(project, &place.id, &place.path);
@@ -559,7 +559,7 @@ pub async fn pending_ops(
                     node: Some(spelled),
                     copies: weft_core::instance::Copies::of(instance.clone()),
                     order: i64::MAX,
-                    setup: Some(execution_id),
+                    setup: Some(run_id),
                     asked_unix: started_at,
                 });
             }

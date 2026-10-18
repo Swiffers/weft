@@ -61,7 +61,7 @@
           {
             "key": "value",
             "label": "Values",
-            "shape": "valueList",
+            "shape": "value_list",
             "required": true
           }
         ],

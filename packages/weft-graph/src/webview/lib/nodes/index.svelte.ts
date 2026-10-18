@@ -53,12 +53,12 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		// Empty-array default keeps the command palette's
 		// `tags.some(...)` call safe for nodes that declare no tags.
 		tags: entry.tags ?? [],
-		// Mirror the catalog metadata's `requires_infra` flag onto
+		// Mirror the catalog X onto
 		// the template. The webview's infra-subgraph extractor +
 		// node-role helpers read this to decide which nodes are
 		// infra-backed. Without it the subgraph "eye" finds no
 		// seeds and shows an empty subgraph.
-		requiresInfra: entry.requires_infra ?? false,
+		requiresInfra: entry.requiresInfra ?? false,
 		defaultInputs: (entry.inputs ?? []).map(toInputPort),
 		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
 		features: entry.features,
@@ -166,7 +166,7 @@ function registerBuiltins(): void {
 			color: '#8b5cf6',
 			tags: ['loop', 'iterate', 'container', 'scope'],
 			requiresInfra: false,
-			// The loop-config knobs (parallel / max_iters / trim_on_mismatch)
+			// The loop-config knobs (parallel / maxIters / trimOnMismatch)
 			// are editor-only UI owned by GroupNode.svelte, not template data.
 			defaultInputs: [],
 			defaultOutputs: [],

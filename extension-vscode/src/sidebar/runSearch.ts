@@ -1,8 +1,8 @@
 // What a person types in the runs view's search, read as the listing's
-// filters (`GET /executions`). Each `name:value` narrows by one thing a
+// filters (`GET /runs`). Each `name:value` narrows by one thing a
 // run has, and every other word is searched for in what the finished run
 // recorded (the trigger's input, what each node sent on, an error, a
-// log line), the way `weft executions --search` does:
+// log line), the way `weft runs --search` does:
 //
 //   status:failed route:notes.list.door since:2h ada@example.com
 //
@@ -18,7 +18,7 @@
 /** The listing's query parameters a search stands for, or why it does not read. */
 export type RunSearch = { params: Record<string, string> } | { error: string };
 
-// SYNC: STATUSES <-> crates/weft-core/src/program.rs RunStatus, crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause)
+// SYNC: STATUSES <-> crates/weft-core/src/program.rs RunStatus, crates/weft-dispatcher/src/journal/postgres.rs list_runs (status clause)
 const STATUSES = ['running', 'waiting_for_input', 'completed', 'failed', 'cancelled'];
 
 const UNITS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };

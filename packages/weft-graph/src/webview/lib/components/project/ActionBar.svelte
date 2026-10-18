@@ -96,7 +96,7 @@
 		// Inactive-with-preserved-state path. Host opens the
 		// 3-option reactivate-choice dialog before posting activate.
 		onReactivate?: () => void;
-		// Mid-deactivate: cancel any still-running executions to
+		// Mid-deactivate: cancel any still-running runs to
 		// unblock the drain.
 		onCancelRunning?: () => void;
 		// Mid-deactivate: roll back to active. Anything that parked
@@ -111,7 +111,7 @@
 		onUpgradeInfra?: () => void;
 		// Generic Stop. The host inspects the bar overlay to decide
 		// whether to kill the CLI process group or POST cancel on
-		// the active execution.
+		// the active run.
 		onStop?: () => void;
 		// X-button on the error banner. Webview posts `dismissError`;
 		// the host clears the slot's error so the banner stops
@@ -225,7 +225,7 @@
 	// stray spinner in the middle slot NEXT TO the still-rendered Activate button.
 	const pendingVerb = $derived(overlay.kind === 'pending' ? overlay.verb : undefined);
 	const pendingMessage = $derived(overlay.kind === 'pending' ? overlay.message : undefined);
-	const isExecRunning = $derived(overlay.kind === 'execution_running');
+	const isRunRunning = $derived(overlay.kind === 'run_running');
 
 	/// Label for the CLI-running spinner.
 	///
@@ -267,13 +267,13 @@
 			case 'trigger_register_done': return 'Registering triggers...';
 			case 'drain_wait': {
 				// The bar would otherwise keep saying "Deactivating
-				// triggers..." for as long as the running executions
+				// triggers..." for as long as the running runs
 				// take, which is the exact stretch this event exists to
 				// explain. The cap is shown when the person set one, so
 				// a long wait reads as the wait they asked for.
 				const cap =
 					typeof detail?.capSeconds === 'number' ? ` (up to ${detail.capSeconds}s)` : '';
-				return `Waiting for running executions${cap}...`;
+				return `Waiting for the runs still going${cap}...`;
 			}
 			case 'warning': {
 				// Something the person should know that is not a failure:
@@ -362,7 +362,7 @@
 		| { kind: 'cli_working'; phase: BarPhase }
 		| { kind: 'building'; cancelling: boolean }
 		| { kind: 'pending'; message: string }
-		| { kind: 'stop_execution' }
+		| { kind: 'stop_run' }
 		// The one-click Run that fires every root. Off (slot absent) in a
 		// project whose triggers are the entry point: the trigger
 		// lifecycle is the button there, and the spec menu rides on THAT
@@ -417,7 +417,7 @@
 			rollup: backend.infraRollup,
 			canStart: !verbsBlocked && nodeCount > 0 && isVerbAvailable('infra_start'),
 			canStop: !verbsBlocked && isVerbAvailable('infra_stop'),
-			// Trust the dispatcher's available_actions verbatim (it's
+			// Trust the dispatcher's availableActions verbatim (it's
 			// the state machine). No redundant rollup re-gate: the old
 			// `rollup === running|stopped` check wrongly hid Terminate
 			// in `partial` (per-unit mixed state).
@@ -465,13 +465,13 @@
 		if (pendingVerb !== undefined && isMiddleVerb(pendingVerb) && pendingMessage !== undefined) {
 			return { kind: 'pending', message: pendingMessage };
 		}
-		// Currently following a live execution: show Stop Execution
+		// Currently following a live run: show Stop Run
 		// regardless of project shape (triggered projects still
-		// fire executions that the user may want to cancel).
-		if (isExecRunning) {
-			return { kind: 'stop_execution' };
+		// fire runs that the user may want to cancel).
+		if (isRunRunning) {
+			return { kind: 'stop_run' };
 		}
-		// No execution in flight: the one-click Run only when the
+		// No run in flight: the one-click Run only when the
 		// trigger slot is hidden. Whenever the trigger slot is visible
 		// (source has triggers, or backend still has them active /
 		// deactivating / preserved for a Reactivate), the trigger lifecycle is the
@@ -719,7 +719,7 @@
 			</div>
 		{/if}
 
-		<!-- ════════ MIDDLE SLOT (run / stop-exec / pending / cli) ════════ -->
+		<!-- ════════ MIDDLE SLOT (run / stop-run / pending / cli) ════════ -->
 		{#if middleSlot.kind !== 'absent'}
 			{#if infraSlot.kind !== 'absent'}
 				<div class="w-px h-6 bg-zinc-200 mx-1"></div>
@@ -838,7 +838,7 @@
 			<!-- Non-transient, non-running ('none', 'stopped',
 			     'partial', 'failed', 'flaky') all present "Start
 			     Infra" as the next step. The dispatcher's
-			     available_actions decides whether the button is
+			     availableActions decides whether the button is
 			     enabled; the rollup decides the rendering siblings
 			     (trash button visibility, drift dot). -->
 			<button
@@ -874,13 +874,13 @@
 		)}
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message, undefined)}
-	{:else if slot.kind === 'stop_execution'}
+	{:else if slot.kind === 'stop_run'}
 		<button
 			class="{btn} bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100"
 			onclick={onStop}
 		>
 			<Square class="w-3.5 h-3.5" />
-			<span class={labelCss}>Stop Execution</span>
+			<span class={labelCss}>Stop Run</span>
 		</button>
 	{:else if slot.kind === 'run' && onRun}
 		<div class="relative flex items-stretch">

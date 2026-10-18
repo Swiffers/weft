@@ -1,4 +1,4 @@
-//! What to do with in-flight Fire-phase executions of a targeted
+//! What to do with in-flight Fire-phase runs of a targeted
 //! project when an operation needs the running set out of the way:
 //! a lifecycle verb (stop / terminate / deactivate) on the
 //! broker/dispatcher side, the worker replacement inside an activate,
@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// A cap rather than an open-ended wait because the person doing this
 /// is answering "how long am I willing to hold", and past it the
-/// remaining executions are cancelled and the op lands, so a
+/// remaining runs are cancelled and the op lands, so a
 /// deactivate is never stuck behind one long run nobody is watching.
-/// A minute, because a program's executions usually land in seconds
+/// A minute, because a program's runs usually land in seconds
 /// and a wait nobody chose is the thing that reads as a hang; anyone
 /// with a longer run to protect passes `--drain-timeout`. (The
 /// `infra_lifecycle_command` column carries the same number as its DDL
@@ -45,7 +45,7 @@ pub fn default_drain_timeout_secs() -> u64 {
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum RunningPolicy {
-    /// Cancel running execs immediately, then proceed. The default
+    /// Cancel running runs immediately, then proceed. The default
     /// wherever a request does not say: nothing waits on somebody's
     /// running work unless they asked it to.
     #[default]
@@ -100,7 +100,7 @@ pub struct RunningChoice {
 }
 
 impl RunningChoice {
-    /// The one answer to "what about the running executions" for a
+    /// The one answer to "what about the running runs" for a
     /// request: the picker's answer when one was given (`asked`, the
     /// trigger-deactivation spec an active project's verb carries),
     /// otherwise what the request said, otherwise the shared default
@@ -193,7 +193,7 @@ pub struct DeactivateSpec {
     #[serde(rename = "runningPolicy")]
     pub running_policy: RunningPolicy,
     /// Cap in seconds on the `wait` drain: how long a deactivation
-    /// sits in `Deactivating` before the remaining executions are
+    /// sits in `Deactivating` before the remaining runs are
     /// cancelled and it lands. The user picks it with the wait choice
     /// (same "wait at most N, then proceed" as the infra drains);
     /// absent = `DEFAULT_DRAIN_TIMEOUT_SECS`. Ignored with
@@ -244,7 +244,7 @@ impl DeactivateSpec {
         Ok(())
     }
 
-    /// Whether this deactivation waits for the running executions
+    /// Whether this deactivation waits for the running runs
     /// before it lands, which ends by cancelling whatever is still
     /// running at the cap.
     ///
@@ -298,7 +298,7 @@ mod tests {
 
     /// The person's answer governs the infra side too. Terminate used
     /// to cancel whatever the picker said, so somebody who asked to
-    /// wait watched their executions die anyway.
+    /// wait watched their runs die anyway.
     #[test]
     fn the_picker_beats_the_body() {
         let body = RunningChoice { running_policy: Some(RunningPolicy::Cancel), drain_timeout_secs: None };

@@ -88,7 +88,7 @@ impl TaskStoreClient for PostgresTaskStoreClient {
 #[async_trait]
 pub trait InfraReader: Send + Sync {
     /// Where the endpoint `infra` names answers, for the run
-    /// `execution_id`. `None` when the node is not Running or declares no
+    /// `run_id`. `None` when the node is not Running or declares no
     /// endpoint by that name. Backs `ctx.endpoint(name)` and
     /// `ctx.endpoint_of(&handle)` in node code. The project is the
     /// broker's to resolve from the run, and a handle naming an instance
@@ -99,19 +99,19 @@ pub trait InfraReader: Send + Sync {
     /// worker keys what it keeps by it (`weft_engine`'s `held`).
     async fn endpoint_address(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         run_instance: Option<&weft_core::instance::InstanceId>,
         infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>>;
 
     /// What the copy of the infra node at `place` (spelled) saved for its
     /// baked outputs (`weft_core::infra::bake`), port to value, for the
-    /// run `execution_id` that runs it: the shared copy (`copy` `None`) or
+    /// run `run_id` that runs it: the shared copy (`copy` `None`) or
     /// the run's own instance's. Empty when it saved nothing. The broker
     /// checks the copy against the run, like an endpoint's.
     async fn baked_outputs(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         run_instance: Option<&weft_core::instance::InstanceId>,
         place: &str,
         copy: Option<&weft_core::instance::InstanceId>,

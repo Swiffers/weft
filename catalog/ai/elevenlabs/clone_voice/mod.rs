@@ -1,6 +1,6 @@
 //! ElevenLabsCloneVoice: mint a durable voice on the account from
 //! sample recordings (instant voice clone). The minted voice_id is an
-//! ACCOUNT ASSET: it outlives this execution and works in every speak
+//! ACCOUNT ASSET: it outlives this run and works in every speak
 //! node from then on.
 
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use serde_json::json;
 use weft::access::client::{json_call, Multipart};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -28,7 +28,7 @@ impl Node for ElevenLabsCloneVoiceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let name: String = ctx.inputs.get("name")?;
         let samples: Vec<FileHandle> = ctx.inputs.list("samples")?;
@@ -42,7 +42,7 @@ impl Node for ElevenLabsCloneVoiceNode {
             ));
         }
 
-        let storage = ctx.storage(StorageScope::Execution);
+        let storage = ctx.storage(StorageScope::Run);
         let mut form = Multipart::form_data().text("name", &name);
         for sample in &samples {
             let (meta, bytes) = storage.get_bytes(sample).await?;

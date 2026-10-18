@@ -11,9 +11,9 @@
   import { registerCatalog, setCatalog } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
-  import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
+  import type { ProjectDefinition as V1Project, NodeFiring, RunState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
+  import type { ActionBarState, CatalogWarning, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
   import { credentialOwnerKind } from '../protocol';
@@ -55,7 +55,7 @@
   // failure (catalogError.error) or per-node soft warnings. Lives on
   // its own so a successful parse can't erase a live catalog problem.
   let catalogError: string | null = $state(null);
-  let catalogWarnings: string[] = $state([]);
+  let catalogWarnings: CatalogWarning[] = $state([]);
   // The in-canvas problems pill: parse + catalog problems folded into
   // one surface, each entry a short collapsed label plus the full text
   // for the expanded view.
@@ -65,8 +65,8 @@
       ? [{ label: 'node catalog error', text: catalogError, severity: 'error' as const }]
       : []),
     ...catalogWarnings.map((w) => ({
-      label: 'node catalog warning',
-      text: w,
+      label: w.kind === 'spelling' ? 'node spelling warning' : 'node catalog warning',
+      text: w.message,
       severity: 'warning' as const,
     })),
   ]);
@@ -217,9 +217,9 @@
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let editorRef: any = $state();
 
-  // Live execution state fed by the host's exec follower.
+  // Live run state fed by the host's run follower.
   // nodeOutputs snapshots the last-observed output per node;
-  // nodeExecutions tracks the rolling history per node.
+  // nodeFirings tracks the rolling history per node.
   //
   // busLogByBus is the source of truth for bus conversations: every
   // bus event ever observed (live or replay), keyed by busId. The
@@ -229,9 +229,9 @@
   // from the first BusParticipant edge the dispatcher derives from
   // the bus marker JSON.
   /// A canvas with no run painted on it. `isRunning` is true while a
-  /// run is about to be replayed onto it (`execReset`), false when
-  /// there is simply nothing to show (startup, `execCleared`).
-  function emptyExecutionState(isRunning: boolean): ExecutionState {
+  /// run is about to be replayed onto it (`runReset`), false when
+  /// there is simply nothing to show (startup, `runCleared`).
+  function emptyRunState(isRunning: boolean): RunState {
     return {
       isRunning,
       scope: undefined,
@@ -239,7 +239,7 @@
       version: undefined,
       tags: [],
       nodeOutputs: bareRecord(),
-      nodeExecutions: bareRecord(),
+      nodeFirings: bareRecord(),
       busLogByBus: bareRecord(),
       busMetaByBus: bareRecord(),
       busParticipantsByBus: bareRecord(),
@@ -248,23 +248,23 @@
       callerLog: [],
     };
   }
-  let executionState = $state<ExecutionState>(emptyExecutionState(false));
+  let runState = $state<RunState>(emptyRunState(false));
   // The run this view paints: the followed one, or nothing when the view
   // is no place (a run's rows belong to a call, and a file opened on its
   // own names none). ONE gate, here, so the editor, the toolbar's follow
   // controls, the caller panel and the slot context all read the same
   // answer instead of each checking for itself.
-  const shownExecutionState = $derived(interactive ? executionState : emptyExecutionState(false));
+  const shownRunState = $derived(interactive ? runState : emptyRunState(false));
 
-  // Dedup keys for append-only inspector logs. The execution follower
+  // Dedup keys for append-only inspector logs. The run follower
   // subscribes to the live SSE stream BEFORE replaying the journal
   // snapshot, so an event can arrive via BOTH the replay and the live
-  // buffer (the overlap window). Node executions are idempotent (keyed
+  // buffer (the overlap window). Node firings are idempotent (keyed
   // by (nodeId, framesKey), mutated in place), but bus and loop logs
   // are append-only, so without dedup the same chat line / loop
   // iteration would render twice. Bus events carry a per-bus `offset`;
   // loop events are keyed by (groupId, kind, parentFrames, index).
-  // Reset on execReset (a fresh follow). Kept OUTSIDE `executionState`
+  // Reset on runReset (a fresh follow). Kept OUTSIDE `runState`
   // ($state) since they're pure bookkeeping, not rendered.
   let seenBusKeys = new Set<string>();
   let seenLoopKeys = new Set<string>();
@@ -277,11 +277,11 @@
   //   - a node with a display (infra serving /live, or a trigger)
   //     → displayByNode
   //   - debug nodes (features.showDebugPreview)
-  //     → executionState.nodeOutputs
+  //     → runState.nodeOutputs
   //   - everything else → no body panel; modal inspector only.
   //
   // Each entry is `NodeFeedState`: ok with items, absent, or error
-  // with a message. NEVER a fallback to execution data.
+  // with a message. NEVER a fallback to run data.
   let displayByNode = $state<Record<string, NodeFeedState>>(bareRecord());
 
   // Source-derived flags: does the project DECLARE infra / trigger
@@ -306,7 +306,7 @@
   // Auto-follow state. The host-side controller owns the actual
   // decisions; we just render the badge and forward clicks.
   let followMode = $state<FollowMode>('following');
-  let followExecutionId = $state<string | undefined>(undefined);
+  let followRunId = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
   /// Why the followed run cannot be painted whole, when it cannot: the
   /// code it ran is no longer recorded, so the rows are all there and
@@ -314,7 +314,7 @@
   /// canvas with nothing on it and no reason for it reads as a broken
   /// viewer and sends people looking for a bug that is not there.
   const runNotPainted = $derived(
-    executionState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
+    runState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
   );
   /// Whether the caller panel is showing. Closed on every load: it is a
   /// thing you go and look at, not a thing that takes up the canvas
@@ -465,25 +465,25 @@
         catalogWarnings = msg.warnings ?? [];
         return;
       }
-      if (msg.kind === 'execReset' || msg.kind === 'execCleared') {
-        executionState = emptyExecutionState(msg.kind === 'execReset');
+      if (msg.kind === 'runReset' || msg.kind === 'runCleared') {
+        runState = emptyRunState(msg.kind === 'runReset');
         seenBusKeys = new Set();
         seenLoopKeys = new Set();
         seenCallerOffsets = new Set();
         return;
       }
-      if (msg.kind === 'execScope') {
+      if (msg.kind === 'runScope') {
         // The run's birth: what it is held to, and what it inherits.
-        executionState.scope = msg.subgraph;
-        executionState.seed = msg.seed;
+        runState.scope = msg.subgraph;
+        runState.seed = msg.seed;
         return;
       }
-      if (msg.kind === 'execVersion') {
-        if (followExecutionId && msg.executionId !== followExecutionId) return;
+      if (msg.kind === 'runVersion') {
+        if (followRunId && msg.runId !== followRunId) return;
         // Both null means there is no followed run here any more (the
         // graph moved to another project), so the banner goes rather
         // than reading as "this run matches disk".
-        executionState.version =
+        runState.version =
           msg.version === null && msg.diskVersion === null
             ? undefined
             : { version: msg.version, diskVersion: msg.diskVersion };
@@ -493,8 +493,8 @@
         specs = msg.specs;
         return;
       }
-      if (msg.kind === 'execTerminal') {
-        // The dispatcher reached ExecutionCompleted / ExecutionFailed.
+      if (msg.kind === 'runTerminal') {
+        // The dispatcher reached RunCompleted / RunFailed.
         // Whatever the per-node tally says, the run is over: hide
         // the Stop button. Close EVERY non-terminal row (in case a
         // NodeCompleted slipped through SSE, a parallel-loop iteration
@@ -502,21 +502,21 @@
         // `waiting_for_input` when the run was cancelled): only
         // completed/failed/skipped/cancelled are terminal, so anything
         // else (running, waiting_for_input) must be force-closed to the
-        // execution's terminal state, not just the last `running` row.
-        executionState.isRunning = false;
+        // run's terminal state, not just the last `running` row.
+        runState.isRunning = false;
         // Keep how it ended: a cancel's cause is what tells a run a
         // sibling stopped (through `ctx.stop_tagged`) apart from one a
         // person stopped, and the inspector shows it on the run.
-        executionState.terminal = { state: msg.state, reason: msg.reason, cause: msg.cause };
+        runState.terminal = { state: msg.state, reason: msg.reason, cause: msg.cause };
         // The journal's stamp, so a replayed run closes its rows at the
         // time it really ended, not at the time it was opened. A row
         // journaled after the terminal (a node that started in the same
         // second the cancel landed) closes at its own start, never
         // before it.
         const now = msg.atUnix * 1000;
-        const isTerminal = (s: NodeExecution['status']) =>
+        const isTerminal = (s: NodeFiring['status']) =>
           s === 'completed' || s === 'failed' || s === 'skipped' || s === 'cancelled';
-        const rows = bareRecord(executionState.nodeExecutions);
+        const rows = bareRecord(runState.nodeFirings);
         for (const [nodeId, history] of Object.entries(rows)) {
           if (history.some((r) => !isTerminal(r.status))) {
             rows[nodeId] = history.map((r) =>
@@ -526,10 +526,10 @@
             );
           }
         }
-        executionState.nodeExecutions = rows;
+        runState.nodeFirings = rows;
         return;
       }
-      if (msg.kind === 'execCost') {
+      if (msg.kind === 'runCost') {
         // One metered call's cost, added onto the matching firing's total.
         // Dedup by the record's stable identity: the dispatcher re-streams
         // journal events on every follow/reconnect (replay + live overlap),
@@ -537,7 +537,7 @@
         // sets the firing's costUnknown flag so it renders as "unknown",
         // never disappearing into a $0-looking total.
         const framesKey = JSON.stringify(msg.frames);
-        const rows = executionState.nodeExecutions[msg.nodeId];
+        const rows = runState.nodeFirings[msg.nodeId];
         const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
         if (!rows || idx < 0) {
           // The firing's row must already exist (node_started precedes any
@@ -551,7 +551,7 @@
         if (seen.includes(msg.costId)) {
           return;
         }
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+        runState.nodeFirings = bareRecord(runState.nodeFirings, {
           [msg.nodeId]: rows.map((r, i) =>
             i === idx
               ? {
@@ -587,7 +587,7 @@
         // the file's key and the version the change produced: the same
         // journal row arrives twice when replay and live overlap.
         const framesKey = JSON.stringify(msg.frames);
-        const rows = executionState.nodeExecutions[msg.nodeId];
+        const rows = runState.nodeFirings[msg.nodeId];
         const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
         if (!rows || idx < 0) {
           // node_started precedes every edit on both paths: a miss is an
@@ -599,15 +599,15 @@
         if (seen.some((f) => f.key === msg.edit.key && f.toVersion === msg.edit.toVersion)) {
           return;
         }
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+        runState.nodeFirings = bareRecord(runState.nodeFirings, {
           [msg.nodeId]: rows.map((r, i) => (i === idx ? { ...r, fileEdits: [...seen, msg.edit] } : r)),
         });
         return;
       }
-      if (msg.kind === 'execEvent') {
+      if (msg.kind === 'firingEvent') {
         const e = msg.event;
         const state = e.state;
-        // One execution row per (nodeId, framesKey). The dispatcher
+        // One run row per (nodeId, framesKey). The dispatcher
         // produces state events (running/waiting_for_input/completed/
         // failed/skipped/cancelled) on the same record; we mutate
         // the existing row, not append. A fresh dispatch after a
@@ -615,7 +615,7 @@
         // per (node, frames)). Rows are stamped with the journal's own
         // time, so a replay reads as when it happened.
         const now = e.atUnix * 1000;
-        const rows = executionState.nodeExecutions[e.nodeId] ?? [];
+        const rows = runState.nodeFirings[e.nodeId] ?? [];
         // Key the record by frame stack: each firing
         // at a distinct frame stack gets its own card so parallel fan-outs
         // don't cross-correlate. `lane` is a structured array;
@@ -623,7 +623,7 @@
         // needs.
         const framesKey = JSON.stringify(e.frames);
         const idx = rows.findIndex((r) => r.framesKey === framesKey);
-        let nextRows: NodeExecution[];
+        let nextRows: NodeFiring[];
         if (idx < 0) {
           // First event for this (node, frames). Open the record.
           nextRows = [
@@ -631,7 +631,7 @@
             {
               id: `${e.nodeId}-${framesKey}-${now}`,
               nodeId: e.nodeId,
-              status: state as NodeExecution['status'],
+              status: state as NodeFiring['status'],
               pulseId: `${e.nodeId}-${framesKey}-${now}`,
               startedAt: now,
               completedAt:
@@ -641,7 +641,7 @@
               error: e.error,
               costUsd: 0,
               logs: [],
-              executionId: '',
+              runId: '',
               frames: e.frames,
               framesKey,
               input: e.input,
@@ -658,7 +658,7 @@
           // Existing record: mutate in place per state.
           nextRows = rows.map((r, i) => {
             if (i !== idx) return r;
-            const updated: NodeExecution = { ...r, status: state as NodeExecution['status'] };
+            const updated: NodeFiring = { ...r, status: state as NodeFiring['status'] };
             if (state === 'completed' || state === 'failed' || state === 'skipped' || state === 'cancelled') {
               updated.completedAt = now;
               if (e.output !== undefined) updated.output = e.output;
@@ -687,16 +687,16 @@
             return updated;
           });
         }
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+        runState.nodeFirings = bareRecord(runState.nodeFirings, {
           [e.nodeId]: nextRows,
         });
         // Debug preview (`features.showDebugPreview`) reads its
-        // last output from `executionState.nodeOutputs[id]`. Update
+        // last output from `runState.nodeOutputs[id]`. Update
         // it on completion. Earlier this rode the liveData channel;
-        // now it taps the exec event directly so a node's display
+        // now it taps the firing event directly so a node's display
         // cannot interfere.
         if (state === 'completed' && e.output !== undefined) {
-          executionState.nodeOutputs = bareRecord(executionState.nodeOutputs, {
+          runState.nodeOutputs = bareRecord(runState.nodeOutputs, {
             [e.nodeId]: e.output,
           });
         }
@@ -714,14 +714,14 @@
         const busKey = `${busId}:${msg.event.offset}`;
         if (seenBusKeys.has(busKey)) return;
         seenBusKeys.add(busKey);
-        const log = executionState.busLogByBus[busId] ?? [];
-        executionState.busLogByBus = bareRecord(executionState.busLogByBus, {
+        const log = runState.busLogByBus[busId] ?? [];
+        runState.busLogByBus = bareRecord(runState.busLogByBus, {
           [busId]: [...log, msg.event],
         });
         return;
       }
       if (msg.kind === 'callerEvent') {
-        // One caller per execution: a flat ordered log. Dedup on the
+        // One caller per run: a flat ordered log. Dedup on the
         // row's own position (an offset for a lifecycle row, the span
         // for a window of messages) because the replay snapshot and the
         // live stream overlap during a replay follow.
@@ -731,7 +731,7 @@
             : `caller:${msg.event.offset}`;
         if (seenCallerOffsets.has(callerKey)) return;
         seenCallerOffsets.add(callerKey);
-        executionState.callerLog = [...executionState.callerLog, msg.event];
+        runState.callerLog = [...runState.callerLog, msg.event];
         return;
       }
       if (msg.kind === 'loopEvent') {
@@ -745,28 +745,28 @@
         const loopKey = `${gid}:${msg.event.kind}:${JSON.stringify(msg.event.parentFrames)}:${idx}`;
         if (seenLoopKeys.has(loopKey)) return;
         seenLoopKeys.add(loopKey);
-        const log = executionState.loopEventsByGroup[gid] ?? [];
-        executionState.loopEventsByGroup = {
-          ...executionState.loopEventsByGroup,
+        const log = runState.loopEventsByGroup[gid] ?? [];
+        runState.loopEventsByGroup = {
+          ...runState.loopEventsByGroup,
           [gid]: [...log, msg.event],
         };
         return;
       }
-      if (msg.kind === 'execTags') {
+      if (msg.kind === 'runTags') {
         // The run tagged itself. Accumulate the set in claim order; the
         // same tag can arrive twice (replay then live, or a body re-run
         // re-tagging), so it is deduplicated here.
-        const seen = new Set(executionState.tags);
+        const seen = new Set(runState.tags);
         const fresh = msg.tags.filter((t) => !seen.has(t));
-        if (fresh.length > 0) executionState.tags = [...executionState.tags, ...fresh];
+        if (fresh.length > 0) runState.tags = [...runState.tags, ...fresh];
         return;
       }
       if (msg.kind === 'journalCorruption') {
         // One-shot at replay: append. The inspector aggregates these
-        // into a muted "N journal rows corrupted" line per execution.
+        // into a muted "N journal rows corrupted" line per run.
         // Not alarming; the user only sees it if they look.
-        executionState.journalCorruptions = [
-          ...executionState.journalCorruptions,
+        runState.journalCorruptions = [
+          ...runState.journalCorruptions,
           { site: msg.site, reason: msg.reason },
         ];
         return;
@@ -779,11 +779,11 @@
         // bus also seeds `busMetaByBus[busId]` from the dispatcher-
         // derived mode, so the inspector renders the panel header
         // badge from the same source as participation.
-        const set = executionState.busParticipantsByBus[msg.busId] ?? new Set<string>();
+        const set = runState.busParticipantsByBus[msg.busId] ?? new Set<string>();
         if (!set.has(msg.nodeId)) {
           const next = new Set(set);
           next.add(msg.nodeId);
-          executionState.busParticipantsByBus = bareRecord(executionState.busParticipantsByBus, {
+          runState.busParticipantsByBus = bareRecord(runState.busParticipantsByBus, {
             [msg.busId]: next,
           });
         }
@@ -793,7 +793,7 @@
         // silently mutate a known-good state with a known-bad one.
         // Log loud so the bug is visible in the dev tools without
         // corrupting the UI.
-        const prevMeta = executionState.busMetaByBus[msg.busId];
+        const prevMeta = runState.busMetaByBus[msg.busId];
         if (prevMeta) {
           if (prevMeta.ephemeral !== msg.meta.ephemeral) {
             console.warn(
@@ -801,7 +801,7 @@
             );
           }
         } else {
-          executionState.busMetaByBus = bareRecord(executionState.busMetaByBus, {
+          runState.busMetaByBus = bareRecord(runState.busMetaByBus, {
             [msg.busId]: msg.meta,
           });
         }
@@ -809,22 +809,22 @@
       }
       if (msg.kind === 'followStatus') {
         followMode = msg.status.mode;
-        followExecutionId = msg.status.executionId;
+        followRunId = msg.status.runId;
         followPendingCount = msg.status.pendingCount;
         return;
       }
       if (msg.kind === 'followLost') {
-        // The live SSE link to this execution ended or broke. Stop
+        // The live SSE link to this run ended or broke. Stop
         // presenting the run as live (hide the Stop button) WITHOUT
         // falsely marking nodes completed: the per-node rows keep
         // their last known state, we just aren't following anymore.
-        // (execTerminal is the run actually finishing; this is the
+        // (runTerminal is the run actually finishing; this is the
         // link dying with the run possibly still in flight.)
-        executionState.isRunning = false;
+        runState.isRunning = false;
         toast.warning(
           msg.reason === 'error'
-            ? 'Lost the live connection to this execution. Re-open it to reconnect.'
-            : 'The live execution stream ended. Re-open the execution to reconnect.',
+            ? 'Lost the live connection to this run. Re-open it to reconnect.'
+            : 'The live run stream ended. Re-open the run to reconnect.',
         );
         return;
       }
@@ -960,8 +960,8 @@
   }
   // Stop is generic now: the host inspects the bar's current
   // state and either kills the spawned CLI process group
-  // (cli_running) or POSTs /executions/{executionId}/cancel
-  // (execution_running). One verb, state-aware behavior.
+  // (cli_running) or POSTs /runs/{runId}/cancel
+  // (run_running). One verb, state-aware behavior.
   function onStop() { send({ kind: 'stopAction' }); }
   function onDismissError() { send({ kind: 'dismissError' }); }
   function onActivate() {
@@ -1047,7 +1047,7 @@
   }
 
   // The context handed to the panel slots. Getters (not a snapshot) so each read
-  // is reactive: a slot consumer that reads `ctx.activeSource` / `ctx.executionState`
+  // is reactive: a slot consumer that reads `ctx.activeSource` / `ctx.runState`
   // re-renders when those change, while the object identity stays stable. `send`
   // / `onMessage` are the editor's own host channel, exposed verbatim so a panel
   // can drive the system however it wants.
@@ -1057,7 +1057,7 @@
     get activeFileName() { return navFileName; },
     get navDepth() { return navDepth; },
     get callPath() { return callPath; },
-    get executionState() { return shownExecutionState; },
+    get runState() { return shownRunState; },
     get error() { return error; },
     get diagnostics() { return diagnostics; },
     editActiveSource(source: string) { send({ kind: 'editActiveSource', source }); },
@@ -1125,7 +1125,7 @@
         <div class="relative min-w-0 flex-1">
           <GraphToolbar
             mode={followMode}
-            executionId={followExecutionId}
+            runId={followRunId}
             pendingCount={followPendingCount}
             notPainted={runNotPainted}
             onSetMode={(mode) => send({ kind: 'followSetMode', mode })}
@@ -1146,7 +1146,7 @@
                    than inside a node's inspector: there is one caller per
                    run and the exchange is the same whichever node you
                    open. Nothing is drawn for a run that had no caller. -->
-              {#if shownExecutionState.callerLog.length > 0}
+              {#if shownRunState.callerLog.length > 0}
                 <button
                   type="button"
                   onclick={() => (callerPanelOpen = !callerPanelOpen)}
@@ -1162,10 +1162,10 @@
               {/if}
             {/snippet}
           </GraphToolbar>
-          {#if callerPanelOpen && shownExecutionState.callerLog.length > 0}
+          {#if callerPanelOpen && shownRunState.callerLog.length > 0}
             <div class="absolute top-24 left-3 z-30 pointer-events-auto">
               <CallerPanel
-                events={shownExecutionState.callerLog}
+                events={shownRunState.callerLog}
                 onClose={() => (callerPanelOpen = false)}
               />
             </div>
@@ -1241,7 +1241,7 @@
       infraNodes={statusSnapshot?.infraNodes}
       {hasInfraInGraph}
       {hasTriggersInGraph}
-      executionState={shownExecutionState}
+      runState={shownRunState}
       {displayByNode}
     />
     </svelte:boundary>

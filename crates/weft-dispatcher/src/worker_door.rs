@@ -43,12 +43,12 @@ pub(crate) use lost_run;
 pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) -> Result<Vec<crate::lapses::RepairFailed>> {
     let lapsed_before = now - lost_margin_secs();
     let mut failed = Vec::new();
-    let mut after: Option<weft_core::ExecutionId> = None;
+    let mut after: Option<weft_core::RunId> = None;
     loop {
-        let lost: Vec<(weft_core::ExecutionId, uuid::Uuid, String)> = sqlx::query_as(concat!(
-            "SELECT r.execution_id, r.project_id, r.keeping FROM run r WHERE ",
+        let lost: Vec<(weft_core::RunId, uuid::Uuid, String)> = sqlx::query_as(concat!(
+            "SELECT r.run_id, r.project_id, r.keeping FROM run r WHERE ",
             lost_run!("$1"),
-            " AND ($3::UUID IS NULL OR r.execution_id > $3) ORDER BY r.execution_id LIMIT $2"
+            " AND ($3::UUID IS NULL OR r.run_id > $3) ORDER BY r.run_id LIMIT $2"
         ))
         .bind(lapsed_before)
         .bind(LOST_BATCH)
@@ -57,7 +57,7 @@ pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) ->
         .await
         .context("find runs whose worker went away")?;
         let full = lost.len() as i64 == LOST_BATCH;
-        after = lost.last().map(|(execution_id, _, _)| *execution_id);
+        after = lost.last().map(|(run_id, _, _)| *run_id);
         let_go_of(state, lost, lapsed_before, &mut failed).await;
         if !full {
             return Ok(failed);
@@ -69,32 +69,32 @@ pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) ->
 /// `failed`.
 async fn let_go_of(
     state: &crate::state::DispatcherState,
-    lost: Vec<(weft_core::ExecutionId, uuid::Uuid, String)>,
+    lost: Vec<(weft_core::RunId, uuid::Uuid, String)>,
     lapsed_before: i64,
     failed: &mut Vec<crate::lapses::RepairFailed>,
 ) {
-    for (execution_id, project_id, keeping) in lost {
+    for (run_id, project_id, keeping) in lost {
         // Only a fast run's ending folds its per-node cancels.
         let program = match keeping == weft_core::run_settings::Keeping::Durable.as_str() {
             true => Ok(None),
-            false => crate::api::execution::program_for_cancel(state, execution_id).await,
+            false => crate::api::run::program_for_cancel(state, run_id).await,
         };
         let let_go = match program {
-            Ok(program) => state.journal.let_go_of_lost(execution_id, lapsed_before, program.as_deref()).await,
+            Ok(program) => state.journal.let_go_of_lost(run_id, lapsed_before, program.as_deref()).await,
             Err(e) => Err(e),
         };
         match let_go {
             Ok(crate::journal::Lost::NotLost) => {}
-            Ok(lost) => tracing::warn!(target: "weft_dispatcher::worker_door", %execution_id, ?lost, "a run whose worker went away was let go of"),
+            Ok(lost) => tracing::warn!(target: "weft_dispatcher::worker_door", %run_id, ?lost, "a run whose worker went away was let go of"),
             Err(e) => {
                 tracing::warn!(
                     target: "weft_dispatcher::worker_door",
-                    %execution_id, error = %format!("{e:#}"),
+                    %run_id, error = %format!("{e:#}"),
                     "could not let go of a run whose worker went away"
                 );
                 failed.push(crate::lapses::RepairFailed {
                     project_id,
-                    error: format!("run {execution_id}, whose worker went away, could not be let go of: {e:#}"),
+                    error: format!("run {run_id}, whose worker went away, could not be let go of: {e:#}"),
                 });
             }
         }

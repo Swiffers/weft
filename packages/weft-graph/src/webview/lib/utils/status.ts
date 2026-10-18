@@ -1,13 +1,13 @@
-// Node statuses (mirror Rust `weft_core::exec::NodeExecutionStatus`):
+// Node statuses (mirror Rust `weft_core::run::NodeFiringStatus`):
 // running, waiting_for_input, completed, skipped, failed, cancelled.
-// The TS union (`NodeExecutionStatus` in protocol.ts) is the
+// The TS union (`NodeFiringStatus` in protocol.ts) is the
 // single source of truth for the closed set; helpers here only need
 // to handle those values.
 
-import type { NodeExecutionStatus } from '../types';
+import type { NodeFiringStatus } from '../types';
 import type { Failure, SkipReason } from '../../../protocol';
 
-export function getStatusIcon(status: NodeExecutionStatus): string {
+export function getStatusIcon(status: NodeFiringStatus): string {
 	switch (status) {
 		case 'completed': return '✓';
 		case 'running': return '●';
@@ -23,7 +23,7 @@ export function getStatusIcon(status: NodeExecutionStatus): string {
 /// from completed/failed which carry semantic glyph coloring
 /// elsewhere. Returns `undefined` for statuses that should keep the
 /// node's own color.
-export function getStatusBadgeColor(status: NodeExecutionStatus): string | undefined {
+export function getStatusBadgeColor(status: NodeFiringStatus): string | undefined {
 	switch (status) {
 		case 'waiting_for_input':
 			return '#06b6d4';
@@ -77,7 +77,7 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 	}
 }
 
-export function displayStatus(status: NodeExecutionStatus): string {
+export function displayStatus(status: NodeFiringStatus): string {
 	switch (status) {
 		case 'completed': return 'Completed';
 		case 'running': return 'Running';

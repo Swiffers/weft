@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct CurrentInstanceNode;
@@ -19,7 +19,7 @@ impl Node for CurrentInstanceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let output = match ctx.instance() {
             Some(instance) => NodeOutput::new().set("instance", instance.as_str()),
             None => NodeOutput::new().set("nobody", true),

@@ -77,7 +77,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
 default = ["runtime"]
-# The runtime layer: the execution context, buses, storage streaming, caller
+# The runtime layer: the run context, buses, storage streaming, caller
 # connections, cancellation, timer signals, and signed routing tokens. Pulls
 # tokio/futures/bytes (no wasm32 support). Default on; the WASM parse build is
 # the only consumer that turns it off (it needs only the pure type layer).

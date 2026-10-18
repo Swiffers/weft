@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use weft_providers::providers::openrouter::OPENROUTER;
 use weft_providers::{CallObservation, FollowUp, MeasuredCost, ObservedCall, ProviderMeter, RouteClass};
 
@@ -29,7 +29,7 @@ pub struct AskCustomNode;
 
 #[async_trait]
 impl Node for AskCustomNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let prompt: String = ctx.inputs.get("prompt")?;
         let system_prompt: String = ctx.inputs.get_or("systemPrompt", String::new())?;
         // `model` declares a metadata default, so the bag always holds

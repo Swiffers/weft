@@ -19,7 +19,7 @@ use weft::access::client::{json_call, Multipart};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{detected_entity, store_json, text_input, API};
 
@@ -70,7 +70,7 @@ struct Settings {
 }
 
 impl Settings {
-    fn read(ctx: &ExecutionContext) -> WeftResult<Self> {
+    fn read(ctx: &RunContext) -> WeftResult<Self> {
         Ok(Self {
             model: ctx.inputs.get("model")?,
             language: text_input(ctx, "language")?,
@@ -581,7 +581,7 @@ impl Node for ElevenLabsTranscribeFileNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let audio: Option<FileHandle> = ctx.inputs.opt("audio")?;
         let source_url = text_input(&ctx, "sourceUrl")?;
@@ -606,7 +606,7 @@ impl Node for ElevenLabsTranscribeFileNode {
 
         let form = match recording {
             Recording::File(file) => {
-                let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
+                let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
                 Multipart::form_data().file("file", &meta.filename, &meta.mime_type, bytes)
             }
             Recording::Url(url) => Multipart::form_data().text("source_url", &url),
@@ -639,8 +639,8 @@ enum Recording {
 /// Emit a parsed answer on the ports: the transcript and the exports as
 /// stored files, the small facts about the recording as values, and a
 /// log line for what ElevenLabs could not produce.
-async fn emit(ctx: &ExecutionContext, answer: Answer) -> WeftResult<()> {
-    let storage = ctx.storage(StorageScope::Execution);
+async fn emit(ctx: &RunContext, answer: Answer) -> WeftResult<()> {
+    let storage = ctx.storage(StorageScope::Run);
     let mut out = NodeOutput::new();
     if let Some(id) = &answer.transcription_id {
         out = out.set("transcriptionId", id.as_str());

@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{audio_file_type, emit_audio_with_id, API};
 use super::flows::set_some;
@@ -31,7 +31,7 @@ impl Node for ElevenLabsMusicNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let output_format: String = ctx.inputs.get("outputFormat")?;
         let body = request_body(&ctx)?;
@@ -51,7 +51,7 @@ impl Node for ElevenLabsMusicNode {
 /// The JSON body from the node's inputs: every setting it was given,
 /// and nothing for one left empty or off, so ElevenLabs applies its own
 /// default there.
-fn request_body(ctx: &ExecutionContext) -> WeftResult<Value> {
+fn request_body(ctx: &RunContext) -> WeftResult<Value> {
     let prompt: Option<String> = ctx.inputs.opt("prompt")?;
     let plan: Option<Value> = ctx.inputs.opt("compositionPlan")?;
     let model: String = ctx.inputs.get("model")?;

@@ -36,14 +36,14 @@
     "test": {
       "url": "https://api.exa.ai/search",
       "method": "POST",
-      "expect_status": 400
+      "expectStatus": 400
     },
     "identity": "exa",
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "guide": {
         "link": "https://dashboard.exa.ai/api-keys",
         "steps": [

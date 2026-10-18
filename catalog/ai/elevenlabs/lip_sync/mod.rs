@@ -6,7 +6,7 @@ use serde_json::json;
 
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::flows::{generate, set_some, Media, References};
 
@@ -23,7 +23,7 @@ impl Node for ElevenLabsLipSyncNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let image: FileHandle = ctx.inputs.get("image")?;
         let audio: FileHandle = ctx.inputs.get("audio")?;

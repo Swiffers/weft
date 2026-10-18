@@ -8,19 +8,19 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use weft_core::frames::Located;
-use weft_core::primitive::ExecutionSnapshot;
+use weft_core::primitive::RunSnapshot;
 use weft_core::project::ProjectDefinition;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
-use crate::events::{ExecEvent, Seed};
+use crate::events::{RunEvent, Seed};
 use crate::fold::{Fold, FoldEffects};
 
 /// Full original context, including the birth row and unselected history.
 #[derive(Debug, Clone)]
 pub struct Ancestor {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub project: Arc<ProjectDefinition>,
-    pub rows: Vec<ExecEvent>,
+    pub rows: Vec<RunEvent>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,9 +29,9 @@ pub struct SeedChain {
     pub ancestors: Vec<Ancestor>,
 }
 
-pub fn seed_of(rows: &[ExecEvent]) -> Option<&Seed> {
+pub fn seed_of(rows: &[RunEvent]) -> Option<&Seed> {
     rows.iter().find_map(|event| match event {
-        ExecEvent::ExecutionStarted { seed, .. } => seed.as_ref(),
+        RunEvent::RunStarted { seed, .. } => seed.as_ref(),
         _ => None,
     })
 }
@@ -40,10 +40,10 @@ impl SeedChain {
     pub fn is_empty(&self) -> bool { self.ancestors.is_empty() }
 
     /// Materialize ancestors once, retaining their source outputs for reuse.
-    pub fn materialize(&self) -> Result<BTreeMap<ExecutionId, Fold>> {
+    pub fn materialize(&self) -> Result<BTreeMap<RunId, Fold>> {
         let mut sources = BTreeMap::new();
         for ancestor in &self.ancestors {
-            let mut fold = Fold::new(ancestor.execution_id, ancestor.project.clone()).with_output_history();
+            let mut fold = Fold::new(ancestor.run_id, ancestor.project.clone()).with_output_history();
             apply_history(&mut fold, ancestor.rows.iter(), &sources)?;
             // An ancestor is a finished run being read for its outputs:
             // a row its own program refuses means those outputs cannot
@@ -53,10 +53,10 @@ impl SeedChain {
             anyhow::ensure!(
                 fold.snapshot().corruptions.is_empty(),
                 "seed ancestor {} has corrupt history: {:?}",
-                fold.execution_id(),
+                fold.run_id(),
                 fold.snapshot().corruptions
             );
-            sources.insert(ancestor.execution_id, fold);
+            sources.insert(ancestor.run_id, fold);
         }
         Ok(sources)
     }
@@ -65,8 +65,8 @@ impl SeedChain {
 
 /// Import from already reconstructed runs, so callers painting several
 /// ancestors do not reconstruct the same history once per ancestor.
-pub fn import_origins(fold: &mut Fold, seed: &Seed, sources: &BTreeMap<ExecutionId, Fold>, at_unix: u64) -> Result<FoldEffects> {
-    let mut by_origin: BTreeMap<ExecutionId, BTreeSet<Located>> = BTreeMap::new();
+pub fn import_origins(fold: &mut Fold, seed: &Seed, sources: &BTreeMap<RunId, Fold>, at_unix: u64) -> Result<FoldEffects> {
+    let mut by_origin: BTreeMap<RunId, BTreeSet<Located>> = BTreeMap::new();
     for (place, origin) in &seed.origins { by_origin.entry(*origin).or_default().insert(place.clone()); }
     let mut effects = FoldEffects::default();
     for (origin, nodes) in by_origin {
@@ -82,11 +82,11 @@ pub fn import_origins(fold: &mut Fold, seed: &Seed, sources: &BTreeMap<Execution
 
 fn apply_history<'a>(
     fold: &mut Fold,
-    mut rows: impl Iterator<Item = &'a ExecEvent>,
-    sources: &BTreeMap<ExecutionId, Fold>,
+    mut rows: impl Iterator<Item = &'a RunEvent>,
+    sources: &BTreeMap<RunId, Fold>,
 ) -> Result<()> {
-    let birth = rows.next().filter(|event| matches!(event, ExecEvent::ExecutionStarted { .. }))
-        .ok_or_else(|| anyhow::anyhow!("run {} has no initial ExecutionStarted row", fold.execution_id()))?;
+    let birth = rows.next().filter(|event| matches!(event, RunEvent::RunStarted { .. }))
+        .ok_or_else(|| anyhow::anyhow!("run {} has no initial RunStarted row", fold.run_id()))?;
     fold.apply(birth);
     if let Some(seed) = seed_of(std::slice::from_ref(birth)) { import_origins(fold, seed, sources, birth.at_unix())?; }
     for row in rows { fold.apply(row); }
@@ -96,48 +96,48 @@ fn apply_history<'a>(
 /// Read original graphs by the immutable identity on each ancestor's birth.
 /// An absent ancestor or cyclic chain is an error, never a fresh-run fallback.
 pub async fn seed_chain<F, Fut, D, Def>(
-    child_rows: &[ExecEvent],
+    child_rows: &[RunEvent],
     fetch_rows: F,
     fetch_definition: D,
 ) -> Result<SeedChain>
 where
-    F: Fn(ExecutionId) -> Fut,
-    Fut: Future<Output = Result<Vec<ExecEvent>>>,
+    F: Fn(RunId) -> Fut,
+    Fut: Future<Output = Result<Vec<RunEvent>>>,
     D: Fn(uuid::Uuid, String) -> Def,
     Def: Future<Output = Result<Arc<ProjectDefinition>>>,
 {
     let Some(seed) = seed_of(child_rows) else { return Ok(SeedChain::default()) };
     let mut next = Some(seed.parent);
     let mut seen = HashSet::new();
-    if let Some(birth) = child_rows.first() { seen.insert(birth.execution_id()); }
+    if let Some(birth) = child_rows.first() { seen.insert(birth.run_id()); }
     let mut nearest_first = Vec::new();
-    while let Some(execution_id) = next {
-        if !seen.insert(execution_id) { bail!("the seed chain loops back to {execution_id}"); }
-        let rows = fetch_rows(execution_id).await.with_context(|| format!("read seed run {execution_id}"))?;
-        anyhow::ensure!(!rows.is_empty(), "seed run {execution_id} has no journal rows; choose another seed or run without --seed");
+    while let Some(run_id) = next {
+        if !seen.insert(run_id) { bail!("the seed chain loops back to {run_id}"); }
+        let rows = fetch_rows(run_id).await.with_context(|| format!("read seed run {run_id}"))?;
+        anyhow::ensure!(!rows.is_empty(), "seed run {run_id} has no journal rows; choose another seed or run without --seed");
         let (project_id, hash) = match rows.first() {
-            Some(ExecEvent::ExecutionStarted { project_id, definition_hash: Some(hash), .. }) => (*project_id, hash.clone()),
-            _ => bail!("seed run {execution_id} has no initial program identity"),
+            Some(RunEvent::RunStarted { project_id, definition_hash: Some(hash), .. }) => (*project_id, hash.clone()),
+            _ => bail!("seed run {run_id} has no initial program identity"),
         };
-        anyhow::ensure!(rows.iter().all(|row| row.execution_id() == execution_id), "seed run {execution_id} contains another run's rows");
-        let project = fetch_definition(project_id, hash.clone()).await.with_context(|| format!("read original program of seed {execution_id}"))?;
+        anyhow::ensure!(rows.iter().all(|row| row.run_id() == run_id), "seed run {run_id} contains another run's rows");
+        let project = fetch_definition(project_id, hash.clone()).await.with_context(|| format!("read original program of seed {run_id}"))?;
         anyhow::ensure!(weft_core::project::hash::compute_definition_hash(&project)? == hash,
-            "original program of seed {execution_id} does not match its recorded definition hash");
+            "original program of seed {run_id} does not match its recorded definition hash");
         next = seed_of(&rows).map(|seed| seed.parent);
-        nearest_first.push(Ancestor { execution_id, project, rows });
+        nearest_first.push(Ancestor { run_id, project, rows });
     }
     nearest_first.reverse();
     Ok(SeedChain { ancestors: nearest_first })
 }
 
 pub fn fold_seeded(
-    execution_id: ExecutionId,
+    run_id: RunId,
     project: Arc<ProjectDefinition>,
     chain: &SeedChain,
-    rows: &[ExecEvent],
-) -> Result<ExecutionSnapshot> {
+    rows: &[RunEvent],
+) -> Result<RunSnapshot> {
     let sources = chain.materialize()?;
-    let mut fold = Fold::new(execution_id, project);
+    let mut fold = Fold::new(run_id, project);
     apply_history(&mut fold, rows.iter(), &sources)?;
     Ok(fold.into_snapshot())
 }
@@ -157,13 +157,13 @@ pub struct LiveFold {
 impl LiveFold {
     /// Fold `events` (the run's record from its birth) over `project`.
     pub fn start(
-        execution_id: ExecutionId,
+        run_id: RunId,
         project: Arc<ProjectDefinition>,
         chain: &SeedChain,
-        events: &[ExecEvent],
+        events: &[RunEvent],
     ) -> Result<Self> {
         let sources = chain.materialize()?;
-        let mut fold = Fold::new(execution_id, project);
+        let mut fold = Fold::new(run_id, project);
         apply_history(&mut fold, events.iter(), &sources)?;
         Ok(Self { fold, folded: events.len() })
     }
@@ -171,7 +171,7 @@ impl LiveFold {
     /// Fold what `record`, the run's whole record as it stands now, holds
     /// past what is folded already. A record shorter than what was folded
     /// is not this run's record.
-    pub fn catch_up(&mut self, record: &[ExecEvent]) -> Result<()> {
+    pub fn catch_up(&mut self, record: &[RunEvent]) -> Result<()> {
         let Some(new) = record.get(self.folded..) else {
             anyhow::bail!("the run's record holds {} events, fewer than the {} its fold already took", record.len(), self.folded);
         };
@@ -183,13 +183,13 @@ impl LiveFold {
     }
 
     /// The run's state as the events so far say.
-    pub fn snapshot(&self) -> ExecutionSnapshot {
+    pub fn snapshot(&self) -> RunSnapshot {
         self.fold.current_snapshot()
     }
 
     /// What the firing at `(node, frames)` handed out so far
     /// (`Fold::firing_output`).
-    pub fn firing_output(&self, node_id: &str, frames: &weft_core::frames::LoopFrames) -> Option<&weft_core::exec::postprocess::OutputBag> {
+    pub fn firing_output(&self, node_id: &str, frames: &weft_core::frames::LoopFrames) -> Option<&weft_core::run::postprocess::OutputBag> {
         self.fold.firing_output(node_id, frames)
     }
 }
@@ -202,7 +202,7 @@ mod tests {
     use uuid::Uuid;
     use weft_core::project::selection::{RunSelection, SelectionBounds};
 
-    fn execution_id(n: u8) -> ExecutionId { Uuid::from_bytes([n; 16]) }
+    fn run_id(n: u8) -> RunId { Uuid::from_bytes([n; 16]) }
 
     fn program() -> Arc<ProjectDefinition> {
         Arc::new(serde_json::from_value(json!({
@@ -220,52 +220,52 @@ mod tests {
         })).unwrap())
     }
 
-    fn birth(execution_id: ExecutionId, seed: Option<Seed>, from: &str) -> ExecEvent {
+    fn birth(run_id: RunId, seed: Option<Seed>, from: &str) -> RunEvent {
         let mut selection = RunSelection::carve(&program(), &SelectionBounds { from: vec![from.into()], ..Default::default() }).unwrap();
         if let Some(seed) = &seed {
             selection.nodes.retain(|place| !seed.origins.contains_key(place));
             selection.suppliers.extend(seed.origins.keys().cloned());
         }
-        ExecEvent::ExecutionStarted {
-            execution_id, project_id: Uuid::nil(), entry_node: from.into(),
+        RunEvent::RunStarted {
+            run_id, project_id: Uuid::nil(), entry_node: from.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some(weft_core::project::hash::compute_definition_hash(&program()).unwrap()),
-            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, selection: Some(weft_core::project::selection::RecordedSelection::new(selection)), seed, instance: None, stand_in: None, fired_trigger: None, settings: Default::default(), instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, selection: Some(weft_core::project::selection::RecordedSelection::new(selection)), seed, instance: None, stand_in: None, fired_trigger: None, settings: Default::default(), instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         }
     }
 
-    fn result(execution_id: ExecutionId, node: &str, value: &str) -> Vec<ExecEvent> {
+    fn result(run_id: RunId, node: &str, value: &str) -> Vec<RunEvent> {
         vec![
-            ExecEvent::NodeStarted { execution_id, node_id:node.into(), frames:vec![], at_unix:1 },
-            ExecEvent::PortEmitted { execution_id, emission_id:Uuid::new_v4(), node_id:node.into(), frames:vec![],
+            RunEvent::NodeStarted { run_id, node_id:node.into(), frames:vec![], at_unix:1 },
+            RunEvent::PortEmitted { run_id, emission_id:Uuid::new_v4(), node_id:node.into(), frames:vec![],
                 port:"out".into(), value:Arc::new(json!(value)), provided:false, at_unix:2 },
-            ExecEvent::NodeCompleted { execution_id, node_id:node.into(), frames:vec![], at_unix:3 },
+            RunEvent::NodeCompleted { run_id, node_id:node.into(), frames:vec![], at_unix:3 },
         ]
     }
 
-    async fn chain(rows: &[ExecEvent], runs: &HashMap<ExecutionId, Vec<ExecEvent>>) -> Result<SeedChain> {
-        seed_chain(rows, |execution_id| async move { Ok(runs.get(&execution_id).cloned().unwrap_or_default()) },
+    async fn chain(rows: &[RunEvent], runs: &HashMap<RunId, Vec<RunEvent>>) -> Result<SeedChain> {
+        seed_chain(rows, |run_id| async move { Ok(runs.get(&run_id).cloned().unwrap_or_default()) },
             |_, _| async { Ok(program()) }).await
     }
 
     #[tokio::test]
     async fn history_before_the_child_cut_survives_and_only_the_frontier_is_pending() {
-        let (parent, child) = (execution_id(1), execution_id(2));
+        let (parent, child) = (run_id(1), run_id(2));
         let mut parent_rows = vec![birth(parent, None, "a")];
         parent_rows.extend(result(parent, "a", "A"));
         parent_rows.extend(result(parent, "b", "B"));
         let rows = vec![birth(child, Some(Seed { parent, origins:BTreeMap::from([(Located::top("a"), parent),(Located::top("b"), parent)]) }), "c")];
         let chain = chain(&rows, &HashMap::from([(parent,parent_rows)])).await.unwrap();
-        assert!(matches!(chain.ancestors[0].rows[0], ExecEvent::ExecutionStarted { .. }));
+        assert!(matches!(chain.ancestors[0].rows[0], RunEvent::RunStarted { .. }));
         let snapshot = fold_seeded(child, program(), &chain, &rows).unwrap();
-        assert_eq!(snapshot.executions["a"][0].inherited_from, Some(parent));
-        assert_eq!(snapshot.executions["b"][0].received.input["in"].as_ref(), &json!("A"));
+        assert_eq!(snapshot.firings["a"][0].inherited_from, Some(parent));
+        assert_eq!(snapshot.firings["b"][0].received.input["in"].as_ref(), &json!("A"));
         assert!(!snapshot.pulses.contains_key("a") && !snapshot.pulses.contains_key("b"));
         assert_eq!(snapshot.pulses["c"][0].value.as_ref(), &json!("B"));
     }
 
     #[tokio::test]
     async fn explicit_origins_reconstruct_a_grandchild_without_replaying_parent_inputs() {
-        let (a,b,c) = (execution_id(1),execution_id(2),execution_id(3));
+        let (a,b,c) = (run_id(1),run_id(2),run_id(3));
         let mut a_rows = vec![birth(a,None,"a")];
         a_rows.extend(result(a,"a","A"));
         let mut b_rows = vec![birth(b,Some(Seed { parent:a, origins:BTreeMap::from([(Located::top("a"), a)]) }),"b")];
@@ -273,22 +273,22 @@ mod tests {
         let rows = vec![birth(c,Some(Seed { parent:b, origins:BTreeMap::from([(Located::top("a"), a),(Located::top("b"), b)]) }),"c")];
         let chain = chain(&rows,&HashMap::from([(a,a_rows),(b,b_rows)])).await.unwrap();
         let snapshot = fold_seeded(c,program(),&chain,&rows).unwrap();
-        assert_eq!(snapshot.executions["a"][0].inherited_from,Some(a));
-        assert_eq!(snapshot.executions["b"][0].inherited_from,Some(b));
-        assert_eq!(snapshot.executions["b"][0].received.input["in"].as_ref(),&json!("A"));
+        assert_eq!(snapshot.firings["a"][0].inherited_from,Some(a));
+        assert_eq!(snapshot.firings["b"][0].inherited_from,Some(b));
+        assert_eq!(snapshot.firings["b"][0].received.input["in"].as_ref(),&json!("A"));
     }
 
     #[tokio::test]
     async fn absent_and_cyclic_ancestors_are_refused() {
-        let rows = vec![birth(execution_id(2),Some(Seed { parent:execution_id(1), origins:BTreeMap::new() }),"a")];
+        let rows = vec![birth(run_id(2),Some(Seed { parent:run_id(1), origins:BTreeMap::new() }),"a")];
         assert!(chain(&rows,&HashMap::new()).await.unwrap_err().to_string().contains("no journal rows"));
-        let ancestor = vec![birth(execution_id(1),Some(Seed { parent:execution_id(2), origins:BTreeMap::new() }),"a")];
-        assert!(chain(&rows,&HashMap::from([(execution_id(1),ancestor)])).await.unwrap_err().to_string().contains("loops"));
+        let ancestor = vec![birth(run_id(1),Some(Seed { parent:run_id(2), origins:BTreeMap::new() }),"a")];
+        assert!(chain(&rows,&HashMap::from([(run_id(1),ancestor)])).await.unwrap_err().to_string().contains("loops"));
     }
 
     #[tokio::test]
     async fn a_fresh_run_reads_no_ancestors() {
-        let rows = vec![birth(execution_id(1),None,"a")];
+        let rows = vec![birth(run_id(1),None,"a")];
         let chain = seed_chain(&rows, |_| async { bail!("unexpected journal read") },
             |_,_| async { bail!("unexpected definition read") }).await.unwrap();
         assert!(chain.is_empty());
@@ -296,21 +296,21 @@ mod tests {
 
     #[tokio::test]
     async fn chosen_failed_result_is_refused_without_searching_for_older_success() {
-        let parent = execution_id(1);
+        let parent = run_id(1);
         let mut parent_rows = vec![birth(parent,None,"a")];
-        parent_rows.push(ExecEvent::NodeStarted {execution_id:parent,node_id:"a".into(),frames:vec![],at_unix:1});
-        parent_rows.push(ExecEvent::NodeFailed {execution_id:parent,node_id:"a".into(),frames:vec![],error:"failed".into(),gave_up_wait:false,at_unix:2});
-        let rows = vec![birth(execution_id(2),Some(Seed {parent,origins:BTreeMap::from([(Located::top("a"), parent)])}),"b")];
+        parent_rows.push(RunEvent::NodeStarted {run_id:parent,node_id:"a".into(),frames:vec![],at_unix:1});
+        parent_rows.push(RunEvent::NodeFailed {run_id:parent,node_id:"a".into(),frames:vec![],error:"failed".into(),gave_up_wait:false,at_unix:2});
+        let rows = vec![birth(run_id(2),Some(Seed {parent,origins:BTreeMap::from([(Located::top("a"), parent)])}),"b")];
         let chain = chain(&rows,&HashMap::from([(parent,parent_rows)])).await.unwrap();
-        assert!(fold_seeded(execution_id(2),program(),&chain,&rows).err().unwrap().to_string().contains("no complete reusable result"));
+        assert!(fold_seeded(run_id(2),program(),&chain,&rows).err().unwrap().to_string().contains("no complete reusable result"));
     }
 
     /// What a snapshot says, in a form two folds can be compared by
     /// (pulse and record ids are minted by the fold, so they are left
     /// out).
-    fn said(snap: &ExecutionSnapshot) -> serde_json::Value {
-        let mut executions = serde_json::to_value(&snap.executions).unwrap();
-        for records in executions.as_object_mut().unwrap().values_mut() {
+    fn said(snap: &RunSnapshot) -> serde_json::Value {
+        let mut firings = serde_json::to_value(&snap.firings).unwrap();
+        for records in firings.as_object_mut().unwrap().values_mut() {
             for record in records.as_array_mut().unwrap() {
                 record.as_object_mut().unwrap().remove("id");
             }
@@ -321,7 +321,7 @@ mod tests {
             .map(|(node, bucket)| (node, bucket.iter().map(|p| (&p.target_port, p.value.as_ref(), p.closed)).collect()))
             .collect();
         json!({
-            "executions": executions,
+            "firings": firings,
             "pulses": serde_json::to_value(pulses).unwrap(),
             "corruptions": snap.corruptions.len(),
             "kicked": snap.kicked.len(),
@@ -333,25 +333,25 @@ mod tests {
     /// a seeded one.
     #[tokio::test]
     async fn a_start_then_the_rest_folds_like_the_whole_record() {
-        let parent = execution_id(1);
+        let parent = run_id(1);
         let mut parent_rows = vec![birth(parent, None, "a")];
         parent_rows.extend(result(parent, "a", "A"));
         let fresh = {
-            let mut rows = vec![birth(execution_id(2), None, "a")];
-            rows.extend(result(execution_id(2), "a", "A"));
-            rows.extend(result(execution_id(2), "b", "B"));
-            rows.extend(result(execution_id(2), "c", "C"));
+            let mut rows = vec![birth(run_id(2), None, "a")];
+            rows.extend(result(run_id(2), "a", "A"));
+            rows.extend(result(run_id(2), "b", "B"));
+            rows.extend(result(run_id(2), "c", "C"));
             rows
         };
         let seeded = {
-            let mut rows = vec![birth(execution_id(3), Some(Seed { parent, origins: BTreeMap::from([(Located::top("a"), parent)]) }), "b")];
-            rows.extend(result(execution_id(3), "b", "B"));
-            rows.extend(result(execution_id(3), "c", "C"));
+            let mut rows = vec![birth(run_id(3), Some(Seed { parent, origins: BTreeMap::from([(Located::top("a"), parent)]) }), "b")];
+            rows.extend(result(run_id(3), "b", "B"));
+            rows.extend(result(run_id(3), "c", "C"));
             rows
         };
         let runs = HashMap::from([(parent, parent_rows)]);
         for events in [fresh, seeded] {
-            let run = events[0].execution_id();
+            let run = events[0].run_id();
             let chain = chain(&events, &runs).await.unwrap();
             let whole = said(&fold_seeded(run, program(), &chain, &events).unwrap());
             for split in 1..=events.len() {

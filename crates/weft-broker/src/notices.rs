@@ -39,8 +39,8 @@ pub struct Notices {
 
 #[derive(Default)]
 struct Pending {
-    run_log: BTreeMap<uuid::Uuid, BTreeSet<weft_core::ExecutionId>>,
-    run_ended: BTreeSet<weft_core::ExecutionId>,
+    run_log: BTreeMap<uuid::Uuid, BTreeSet<weft_core::RunId>>,
+    run_ended: BTreeSet<weft_core::RunId>,
     /// The earliest erase time of the runs ended since the last notice.
     keep_until: Option<i64>,
     /// Writers that bore a run running with no live lease of their own
@@ -66,8 +66,8 @@ impl Notices {
     /// it, so the run is noticed if the worker dies before its first tick.
     pub fn tell(
         &self,
-        logged: impl IntoIterator<Item = (uuid::Uuid, weft_core::ExecutionId)>,
-        ended: impl IntoIterator<Item = weft_core::ExecutionId>,
+        logged: impl IntoIterator<Item = (uuid::Uuid, weft_core::RunId)>,
+        ended: impl IntoIterator<Item = weft_core::RunId>,
         kept: impl IntoIterator<Item = i64>,
         unwatched: Option<&str>,
     ) {
@@ -226,7 +226,7 @@ mod tests {
             .expect("a lazy pool");
         let alarm = Arc::new(weft_platform_traits::alarm::fake::FakeAlarm::default());
         let notices = Notices::start(pool, Some(alarm.clone()));
-        notices.tell([], [weft_core::ExecutionId::from_u128(1)], [], Some("worker-1"));
+        notices.tell([], [weft_core::RunId::from_u128(1)], [], Some("worker-1"));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while alarm.wakes().is_empty() {
             assert!(tokio::time::Instant::now() < deadline, "no wake was handed to the alarm");

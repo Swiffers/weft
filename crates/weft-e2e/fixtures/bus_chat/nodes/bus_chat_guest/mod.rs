@@ -20,7 +20,7 @@ use serde_json::json;
 
 use weft::bus::BusEntryKind;
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BusChatGuestNode;
@@ -34,7 +34,7 @@ const GUEST_LINES: &[&str] = &["hey there", "not much, you?", "later"];
 
 #[async_trait]
 impl Node for BusChatGuestNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bus = ctx.join_bus("channel", "guest")?;
         bus.wait_for("host").await.node_err("guest waiting for host")?;
 

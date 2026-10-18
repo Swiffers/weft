@@ -21,23 +21,23 @@ async fn human_query_resumes_with_approval() -> anyhow::Result<()> {
     project.substitute_in_main("__E2E_FAKE_URL__", &feed.url())?;
     project.activate().await?;
 
-    // Snapshot existing executions (activation creates a TriggerSetup run) so we
-    // can identify the genuine Fire execution the event creates.
-    let before = run::executions(&disp, &pid).await?;
+    // Snapshot existing runs (activation creates a TriggerSetup run) so we
+    // can identify the genuine Fire run the event creates.
+    let before = run::runs(&disp, &pid).await?;
 
-    // Push an event to START a fresh execution; it runs to HumanQuery and
+    // Push an event to START a fresh run; it runs to HumanQuery and
     // suspends. (Brief settle so the listener's SSE connect is live first.)
     tokio::time::sleep(Duration::from_secs(2)).await;
     feed.push_event("go", &json!({ "value": "the change" }).to_string());
-    let execution_id =
-        run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let run_id =
+        run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
 
     // Play the human: wait for the query form, approve it.
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
 
     // The suspended run resumes and completes; approval flows to Debug as true.
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!(true))?;
 
@@ -48,23 +48,23 @@ async fn human_query_resumes_with_approval() -> anyhow::Result<()> {
 /// approve/reject field included), its outputs close, what reads them
 /// skips, and the run still completes.
 #[tokio::test]
-async fn a_skipped_question_skips_its_step_and_the_run_completes() -> anyhow::Result<()> {
+async fn a_skipped_question_skips_its_node_and_the_run_completes() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("human_form", disp.clone()).await?;
     let pid = project.id();
     let feed = SseFake::start().await?;
     project.substitute_in_main("__E2E_FAKE_URL__", &feed.url())?;
     project.activate().await?;
-    let before = run::executions(&disp, &pid).await?;
+    let before = run::runs(&disp, &pid).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     feed.push_event("go", &json!({ "value": "the change" }).to_string());
-    let execution_id =
-        run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let run_id =
+        run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
 
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
     human::skip_form(&disp, &review).await?;
 
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_skip_reason("review", "wait_skipped")?;
     settled.assert_skipped("out")?;

@@ -6,7 +6,7 @@
       "Shell(weft:build)",
       "Shell(weft:run*)",
       "Shell(weft:describe-nodes*)",
-      "Shell(weft:executions*)",
+      "Shell(weft:runs*)",
       "Shell(weft:events*)",
       "Shell(weft:logs*)",
       "Shell(weft:status*)",

@@ -65,36 +65,36 @@ impl HeldInfra {
 impl InfraReader for HeldInfra {
     async fn endpoint_address(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         run_instance: Option<&InstanceId>,
         infra: &InfraHandle,
     ) -> anyhow::Result<Option<EndpointAddress>> {
         // A handle naming another instance's copy is the broker's to
         // refuse, every time.
         if infra.instance().is_some() && infra.instance() != run_instance {
-            return self.inner.endpoint_address(execution_id, run_instance, infra).await;
+            return self.inner.endpoint_address(run_id, run_instance, infra).await;
         }
         let address = self
             .addresses
-            .get_or_load(infra.clone(), || self.inner.endpoint_address(execution_id, run_instance, infra))
+            .get_or_load(infra.clone(), || self.inner.endpoint_address(run_id, run_instance, infra))
             .await?;
         Ok((*address).clone())
     }
 
     async fn baked_outputs(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         run_instance: Option<&InstanceId>,
         place: &str,
         copy: Option<&InstanceId>,
     ) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
         // Another instance's copy is the broker's to refuse, every time.
         if copy.is_some() && copy != run_instance {
-            return self.inner.baked_outputs(execution_id, run_instance, place, copy).await;
+            return self.inner.baked_outputs(run_id, run_instance, place, copy).await;
         }
         let saved = self
             .saved
-            .get_or_load((place.to_string(), copy.cloned()), || self.inner.baked_outputs(execution_id, run_instance, place, copy))
+            .get_or_load((place.to_string(), copy.cloned()), || self.inner.baked_outputs(run_id, run_instance, place, copy))
             .await?;
         Ok((*saved).clone())
     }
@@ -258,7 +258,7 @@ mod tests {
     impl InfraReader for Counting {
         async fn endpoint_address(
             &self,
-            _execution_id: weft_core::ExecutionId,
+            _run_id: weft_core::RunId,
             _run_instance: Option<&InstanceId>,
             _infra: &InfraHandle,
         ) -> anyhow::Result<Option<EndpointAddress>> {
@@ -268,7 +268,7 @@ mod tests {
 
         async fn baked_outputs(
             &self,
-            _execution_id: weft_core::ExecutionId,
+            _run_id: weft_core::RunId,
             _run_instance: Option<&InstanceId>,
             _place: &str,
             _copy: Option<&InstanceId>,
@@ -295,7 +295,7 @@ mod tests {
     async fn an_address_is_kept_until_its_project_says_it_changed() {
         let counting = Arc::new(Counting { reads: AtomicUsize::new(0) });
         let (held, changes) = held_over(counting.clone());
-        let run = weft_core::ExecutionId::new_v4();
+        let run = weft_core::RunId::new_v4();
         let shared = InfraHandle::new("db", "sql", None);
         held.endpoint_address(run, None, &shared).await.unwrap();
         held.endpoint_address(run, None, &shared).await.unwrap();
@@ -382,7 +382,7 @@ mod tests {
 
     fn resolve() -> ResolveConnectionRequest {
         ResolveConnectionRequest {
-            execution_id: uuid::Uuid::nil(),
+            run_id: uuid::Uuid::nil(),
             node_id: "n".into(),
             frames: Default::default(),
             node_type: "T".into(),
@@ -430,7 +430,7 @@ mod tests {
         }))
         .unwrap();
         let publish = |password: &str| PublishAccessRequest {
-            execution_id: uuid::Uuid::nil(),
+            run_id: uuid::Uuid::nil(),
             node_id: "db".into(),
             service: "postgres".into(),
             spec: spec.clone(),

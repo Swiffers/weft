@@ -1,7 +1,7 @@
 //! The wake-and-drain loop every role's background work runs.
 //!
 //! The loops that use it (the dispatcher's task picker, its delivery of
-//! executions, the lifecycle claimer, the reapers; the broker's expiry of
+//! runs, the lifecycle claimer, the reapers; the broker's expiry of
 //! stored files) all have the same shape: sleep until a write they care
 //! about is announced on the process's [`PgSignalWatch`] (see
 //! [`crate::pg_signal`]), then run their drain body until it reports the

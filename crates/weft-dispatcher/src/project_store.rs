@@ -89,7 +89,7 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>>;
 
     /// The program identity a run names by its two hashes (its
-    /// `ExecutionStarted`'s `definition_hash` and `binary_hash`): the
+    /// `RunStarted`'s `definition_hash` and `binary_hash`): the
     /// implementation fingerprints are stored once per worker binary with
     /// the project, never copied into a run. `None` when this project
     /// never registered that binary.
@@ -475,7 +475,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     //     edits; selects the image when spawning a fresh process.
     //   - running_definition_hash: identifies the runtime project
     //     shape (topology + configs). Workers fetch the
-    //     definition at execution claim time keyed by
+    //     definition at run claim time keyed by
     //     `(project_id, definition_hash)`.
     //   - running_infra_hash: drives the Upgrade button when the
     //     CLI's freshly-computed infra hash drifts.
@@ -627,7 +627,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             WHEN (NEW.project_json IS DISTINCT FROM OLD.project_json)
             EXECUTE FUNCTION project_declared_infra_notify()"#,
         // Append-only definition-version history. Workers fetch by
-        // (project_id, definition_hash) so a suspended execution
+        // (project_id, definition_hash) so a suspended run
         // can always resume on the EXACT shape it was started on,
         // even after the user has edited and re-registered. Without
         // this, the `project.project_json` column would only carry
@@ -967,7 +967,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // (`weft_record_batch`, `weft_journal::record::insert_queued_in`
         // refuse both), so none outlives the project.
         let (erased, mut signals) = crate::journal::postgres::erase_project_runs(&mut tx, id).await?;
-        tracing::info!(target: "weft_dispatcher::project", project_id = %id, executions = erased, "erasing the project's runs");
+        tracing::info!(target: "weft_dispatcher::project", project_id = %id, runs = erased, "erasing the project's runs");
         // What the project's runs needed and its triggers ran on: nothing
         // reads them any more. Work queued for it goes too, a task being
         // run included (its claimant finds its claim gone and stands down).

@@ -38,7 +38,7 @@ pub struct DoorFire {
 }
 
 /// How a call to carry on one queued run ended, as the worker answers
-/// `/_weft/run/<execution_id>` and the dispatcher reads it.
+/// `/_weft/run/<run_id>` and the dispatcher reads it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "ended", rename_all = "snake_case")]
 pub enum RunAnswer {
@@ -56,7 +56,7 @@ pub enum RunAnswer {
 #[serde(tag = "fired", rename_all = "snake_case")]
 pub enum Fired {
     /// Born and going; the rest of the answer stays open until it ends.
-    Started { execution_id: crate::ExecutionId },
+    Started { run_id: crate::RunId },
     /// Born already: the same event was handed over before.
     AlreadyBorn,
     /// Put in the trigger's queue (`parked_fire`) to run later, and
@@ -254,7 +254,7 @@ const FIRE_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x9c4a_e6a4_0b3f_4e8e_a
 
 /// The run fire `fire_id` starts: the same however often the fire is
 /// handed over, so one fire never starts two runs.
-pub fn run_of_fire(fire_id: uuid::Uuid) -> crate::ExecutionId {
+pub fn run_of_fire(fire_id: uuid::Uuid) -> crate::RunId {
     uuid::Uuid::new_v5(&FIRE_NAMESPACE, fire_id.as_bytes())
 }
 
@@ -275,7 +275,7 @@ mod wire_tests {
         let back: DoorFire = serde_json::from_value(serde_json::to_value(&fire).unwrap()).unwrap();
         assert_eq!(back, fire);
         for answer in [
-            Fired::Started { execution_id: uuid::Uuid::nil() },
+            Fired::Started { run_id: uuid::Uuid::nil() },
             Fired::AlreadyBorn,
             Fired::Parked { reason: "parked".into(), on: WaitsOn::Instance },
             Fired::Dropped { reason: "gone".into() },

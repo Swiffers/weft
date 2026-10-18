@@ -87,7 +87,7 @@ async fn seed_slack_grant(
     .bind(&spec)
     .bind(&recipe_hash)
     .bind(weft_access_store::seal_json(
-        &json!({ "token": "xoxb-never-used", "team_id": "T0E2E" }),
+        &json!({ "token": "xoxb-never-used", "teamId": "T0E2E" }),
     )?)
     .execute(pool)
     .await?;
@@ -129,7 +129,7 @@ async fn post_signed(
 /// A signed synthetic Slack event lands at the public events
 /// receiver: it is verified against the operator's app, routed to the
 /// seeded connection's workspace, filtered by the node's channel, and
-/// fires an execution carrying the message's named fields. A
+/// fires a run carrying the message's named fields. A
 /// TAMPERED copy of the same push is refused with 401 and fires
 /// nothing extra.
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     let pid = project.id();
     weft_e2e::access::set_account(&project, "ws", &json!({ "id": grant_id.to_string() })).await?;
     project.activate().await?;
-    let before = run::executions(&disp, &pid).await?;
+    let before = run::runs(&disp, &pid).await?;
 
     // The synthetic push, signed exactly as Slack signs (v0 scheme
     // over the raw bytes).
@@ -181,10 +181,10 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     let status = post_signed(&http, &events_url, &signing_secret, &body).await?;
     anyhow::ensure!(status.is_success(), "the signed push was refused: {status}");
 
-    // The execution fires with the message's named fields.
-    let execution_id =
-        run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    // The run fires with the message's named fields.
+    let run_id =
+        run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!("hello from the events e2e"))?;
 
@@ -209,7 +209,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
 
     // Prove "fired nothing" by a POSITIVE bound rather than a timer: a
     // second VALIDLY signed push goes in AFTER the tampered one; the
-    // pipeline is ordered, so its execution arriving proves everything
+    // pipeline is ordered, so its run arriving proves everything
     // sent before it (the tampered push included) has drained.
     let body2 = json!({
         "team_id": "T0E2E",
@@ -225,16 +225,16 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     let status = post_signed(&http, &events_url, &signing_secret, &body2).await?;
     anyhow::ensure!(status.is_success(), "the second signed push was refused: {status}");
     let mut known = before.clone();
-    known.insert(execution_id);
-    let execution_id2 =
-        run::wait_for_triggered_execution(&disp, &pid, &known, Duration::from_secs(60)).await?;
-    SettledRun::observe(&disp, execution_id2).await?.completed()?;
+    known.insert(run_id);
+    let run_id2 =
+        run::wait_for_triggered_run(&disp, &pid, &known, Duration::from_secs(60)).await?;
+    SettledRun::observe(&disp, run_id2).await?.completed()?;
 
     // Exactly the two valid pushes fired: the baseline plus two.
-    let after = run::executions(&disp, &pid).await?;
+    let after = run::runs(&disp, &pid).await?;
     anyhow::ensure!(
         after.len() == before.len() + 2,
-        "the tampered push must fire nothing: saw {} executions, expected {} (the two \
+        "the tampered push must fire nothing: saw {} runs, expected {} (the two \
          validly signed pushes only)",
         after.len(),
         before.len() + 2
@@ -283,7 +283,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     // or fire; the provider answers them), so they never enumerate.
     // The row itself is the park marker, read through the same pool
     // the grant was seeded with.
-    let execution_id = run::start(&mut project).await?;
+    let run_id = run::start(&mut project).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let parked: Option<(String,)> = sqlx::query_as(
@@ -343,9 +343,9 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
         resp.text().await.unwrap_or_default()
     );
 
-    // The SAME run resumes (no new execution) and completes with the
+    // The SAME run resumes (no new run) and completes with the
     // clicked action mapped through the topic's fields.
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!("approve"))?;
 
@@ -390,7 +390,7 @@ async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
     let conn = weft_e2e::access::connect_paste(
         &disp,
         catalog_spec("slack", "access")?,
-        json!({ "token": bot_token, "app_token": app_token }),
+        json!({ "token": bot_token, "appToken": app_token }),
     )
     .await?;
 
@@ -401,7 +401,7 @@ async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
     // by default (a workflow must not trigger itself unasked).
     project.set_node_config("recv", "includeBots", "true")?;
     project.activate().await?;
-    let before = run::executions(&disp, &pid).await?;
+    let before = run::runs(&disp, &pid).await?;
 
     // Wait until the listener has actually dialed the socket (its own
     // log line), then post a real message AS THE BOT (its own posts
@@ -429,9 +429,9 @@ async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
         "chat.postMessage refused: {resp}"
     );
 
-    let execution_id =
-        run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(90)).await?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let run_id =
+        run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(90)).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     let text = settled
         .input_of("out")
@@ -446,7 +446,7 @@ async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
 /// The gate between the two patterns: a BOT-pattern connection (a
 /// pasted bot token, no app-level token) cannot open the app-wide
 /// firehose. The trigger declares it needs the connection's
-/// `app_token`, and the register-time resolve refuses to arm it, so
+/// `appToken`, and the register-time resolve refuses to arm it, so
 /// ACTIVATION fails loudly naming the missing value instead of
 /// minting a dead trigger. The values live on the store's grant
 /// row, so nothing a client sends can fake the token's presence.
@@ -467,7 +467,7 @@ async fn a_bot_pattern_connection_cannot_open_the_app_firehose() -> Result<()> {
     weft_e2e::access::set_account(&project, "ws", conn.handle()).await?;
     let output = project.activate_refused().await?;
     anyhow::ensure!(
-        output.contains("needs the connection's 'app_token'"),
+        output.contains("needs the connection's 'appToken'"),
         "the refusal must name the missing app_token; activate said:\n{output}"
     );
 
@@ -492,7 +492,7 @@ async fn the_shared_door_offers_each_registered_app_with_fixed_permissions() -> 
     let spec = catalog_spec("slack", "access")?;
     let doors: Value = disp.post_json("/access/doors", &json!({ "spec": spec })).await?;
 
-    if let Some(blocked) = doors.get("consent_blocked").and_then(Value::as_str) {
+    if let Some(blocked) = doors.get("consentBlocked").and_then(Value::as_str) {
         anyhow::ensure!(
             blocked.contains("https"),
             "the consent block must teach the https fix: {blocked}"
@@ -502,7 +502,7 @@ async fn the_shared_door_offers_each_registered_app_with_fixed_permissions() -> 
     }
 
     let apps = doors
-        .get("shared_apps")
+        .get("sharedApps")
         .and_then(Value::as_array)
         .cloned()
         .context("doors answered no shared_apps")?;
@@ -526,13 +526,13 @@ async fn the_shared_door_offers_each_registered_app_with_fixed_permissions() -> 
     let started: Value = disp
         .post_json(
             "/access/connect/begin",
-            &json!({ "spec": spec, "door": "shared", "shared_app": label,
-                     "permissions": [], "project_id": null,
-                     "upgrade_grant_id": null, "registration": null }),
+            &json!({ "spec": spec, "door": "shared", "sharedApp": label,
+                     "permissions": [], "projectId": null,
+                     "upgradeGrantId": null, "registration": null }),
         )
         .await?;
     let consent = started
-        .get("consent_url")
+        .get("consentUrl")
         .and_then(Value::as_str)
         .context("begin answered no consent_url")?;
     anyhow::ensure!(consent.contains(&client_id), "the consent must pin the app: {consent}");
@@ -558,9 +558,9 @@ async fn the_shared_door_offers_each_registered_app_with_fixed_permissions() -> 
     let err = disp
         .post_json::<Value>(
             "/access/connect/begin",
-            &json!({ "spec": spec, "door": "shared", "shared_app": "no-such-app",
-                     "permissions": [], "project_id": null,
-                     "upgrade_grant_id": null, "registration": null }),
+            &json!({ "spec": spec, "door": "shared", "sharedApp": "no-such-app",
+                     "permissions": [], "projectId": null,
+                     "upgradeGrantId": null, "registration": null }),
         )
         .await
         .err()

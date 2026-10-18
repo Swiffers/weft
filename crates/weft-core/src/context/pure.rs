@@ -2,7 +2,7 @@
 //! [`crate::node::NodeFeatures::pure`]). A pure body does nothing outside
 //! its run that weft does not put on record first, which is what lets a
 //! durable run start it without first putting what came before on record,
-//! and run it again when its worker died mid-step. So every call that
+//! and run it again when its worker died while it ran. So every call that
 //! reaches outside on its own (the network, a connection, a wait,
 //! `ctx.run`, the broker's steering, storage beyond this run) fails here,
 //! naming the flag: a node marked pure by mistake fails loudly at its
@@ -129,7 +129,7 @@ impl ContextHandle for PureHandle {
         self.inner.log(level, message).await
     }
 
-    async fn tag_execution(&self, _tags: Vec<String>) -> WeftResult<()> {
+    async fn tag_run(&self, _tags: Vec<String>) -> WeftResult<()> {
         self.refused("tag its run")
     }
 
@@ -204,7 +204,7 @@ impl ContextHandle for PureHandle {
         declared_size: Option<u64>,
     ) -> WeftResult<Value> {
         match (scope, keep) {
-            (crate::storage::StorageScope::Execution, None) => {
+            (crate::storage::StorageScope::Run, None) => {
                 self.inner.storage_put(scope, identity, data, mime_type, filename, keep, declared_size).await
             }
             _ => self.refused("store a file beyond this run"),

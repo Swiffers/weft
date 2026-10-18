@@ -24,11 +24,11 @@ async fn a_timer_fires_across_a_runtime_restart() -> anyhow::Result<()> {
     let mut project = Project::prepare("wait_format", disp.clone()).await?;
     project.set_node_config("hold", "seconds", "30")?;
 
-    let execution_id = run::start(&mut project).await?;
-    run::wait_for_status(&disp, execution_id, "waiting_for_input").await?;
+    let run_id = run::start(&mut project).await?;
+    run::wait_for_status(&disp, run_id, "waiting_for_input").await?;
     cell.restart().await?;
 
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!("Hi quentin, you have 3 left"))?;
 
@@ -55,10 +55,10 @@ async fn a_held_connection_trigger_listens_again_after_a_runtime_restart() -> an
     // new runtime's listener.
     feed.wait_for_subscriber(Duration::from_secs(60)).await?;
 
-    let before = run::executions(&disp, &pid).await?;
+    let before = run::runs(&disp, &pid).await?;
     feed.push_event("tick", &json!({ "value": 7 }).to_string());
-    let execution_id = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let run_id = run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!(7))?;
 

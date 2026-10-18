@@ -170,10 +170,10 @@ impl DispatcherState {
     /// way back to them.
     pub async fn run_program_identity(
         &self,
-        events: &[weft_journal::ExecEvent],
+        events: &[weft_journal::RunEvent],
     ) -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
-        let Some(weft_journal::ExecEvent::ExecutionStarted {
-            execution_id,
+        let Some(weft_journal::RunEvent::RunStarted {
+            run_id,
             project_id,
             definition_hash: Some(definition_hash),
             binary_hash: Some(binary_hash),
@@ -185,7 +185,7 @@ impl DispatcherState {
         self.projects
             .program_identity(*project_id, definition_hash, binary_hash)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("run {execution_id} ran on worker {binary_hash}, which its project no longer records"))
+            .ok_or_else(|| anyhow::anyhow!("run {run_id} ran on worker {binary_hash}, which its project no longer records"))
     }
 }
 

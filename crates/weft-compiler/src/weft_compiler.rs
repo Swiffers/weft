@@ -3,7 +3,7 @@
 //! The compiler:
 //! 1. Parses Weft syntax (nodes, groups, connections with assignment syntax)
 //! 2. Flattens groups by injecting Passthrough nodes at group boundaries
-//! 3. Produces a flat ProjectDefinition ready for execution
+//! 3. Produces a flat ProjectDefinition ready for run
 //!
 //! This is a pure function: `&str -> Result<ProjectDefinition, Vec<CompileError>>`
 
@@ -220,8 +220,8 @@ struct ParsedGroup {
     child_groups: Vec<ParsedGroup>,
     anonymous: bool,
     includes: Vec<ParsedInclude>,
-    /// Loop-only config block: `parallel`, `over`, `carry`, `max_iters`,
-    /// `trim_on_mismatch`. None for regular groups.
+    /// Loop-only config block: `parallel`, `over`, `carry`, `maxIters`,
+    /// `trimOnMismatch`. None for regular groups.
     loop_config: Option<serde_json::Map<String, serde_json::Value>>,
     /// Source spans of the loop's config fields (`parallel`, `over`, ...).
     /// The validate pass uses these so a diagnostic like `parallel-with-carry`
@@ -895,7 +895,7 @@ fn resolve_one_include(
 /// trigger or only infra node lives in one had no Activate button and no
 /// infra controls.
 ///
-/// Types, not roles: `requires_infra` and `has_trigger` come back FALSE
+/// Types, not roles: `requiresInfra` and `has_trigger` come back FALSE
 /// from here whatever the file holds, because deciding what a type means
 /// takes the catalog and the parser has none. `enrich` settles them from
 /// the types (`enrich::enrich_collecting`), so between parse and enrich
@@ -1342,7 +1342,7 @@ fn container_port_declared(
     span: Span,
     errors: &mut Vec<CompileError>,
 ) -> bool {
-    if in_ports.iter().any(|p| p.name == port) || weft_core::exec::skip::is_gate_port(port) {
+    if in_ports.iter().any(|p| p.name == port) || weft_core::run::skip::is_gate_port(port) {
         return true;
     }
     errors.push(CompileError::at(
@@ -1562,8 +1562,8 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
 pub const RESERVED_CONFIG_KEYS: &[&str] = &[
     "_label",
     weft_core::tag::TAGS_CONFIG_KEY,
-    weft_core::exec::skip::SHOULD_FLOW_PORT,
-    weft_core::exec::skip::SHOULD_NOT_FLOW_PORT,
+    weft_core::run::skip::SHOULD_FLOW_PORT,
+    weft_core::run::skip::SHOULD_NOT_FLOW_PORT,
 ];
 
 /// The canonical list of type names the language reserves. The SINGLE
@@ -2641,7 +2641,7 @@ fn lower_grouplike_body_in_scope(
                 let wired_flow = tmp_inline
                     .connections
                     .iter()
-                    .any(|c| weft_core::exec::skip::is_gate_port(&c.target_port));
+                    .any(|c| weft_core::run::skip::is_gate_port(&c.target_port));
                 if wired_flow {
                     group.nodes.extend(std::mem::take(&mut tmp_inline.nodes));
                     group.connections.extend(std::mem::take(&mut tmp_inline.connections));
@@ -2682,7 +2682,7 @@ fn lower_grouplike_body_in_scope(
                         ));
                         continue;
                     }
-                    if weft_core::exec::skip::is_gate_port(key.as_str()) {
+                    if weft_core::run::skip::is_gate_port(key.as_str()) {
                         group.port_literal_spans
                             .insert(key.clone(), ConfigFieldSpan::inline(field_span));
                         group.port_literals.insert(key, value);
@@ -2733,7 +2733,7 @@ fn lower_grouplike_body_in_scope(
                     // `port_literal_spans` above; a loop-config span for
                     // it would show the editor a knob with no value.
                     if matches!(group.kind, GroupKind::Loop)
-                        && !weft_core::exec::skip::is_gate_port(key.as_str())
+                        && !weft_core::run::skip::is_gate_port(key.as_str())
                     {
                         group.loop_config_spans.insert(key, span);
                     }
@@ -3778,7 +3778,7 @@ fn flatten_group(
     // here. The Out boundary never takes one: it forwards whatever
     // reached it, and a group that did not run has nothing to forward.
     in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
-        name: weft_core::exec::skip::SHOULD_FLOW_PORT.to_string(),
+        name: weft_core::run::skip::SHOULD_FLOW_PORT.to_string(),
         // Its OWN type variable, never a `T` the group's ports might
         // also use.
         port_type: weft_core::weft_type::WeftType::type_var("T__should_flow"),
@@ -3796,7 +3796,7 @@ fn flatten_group(
     // group would be the one thing in the language that cannot be gated
     // on an absence.
     in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
-        name: weft_core::exec::skip::SHOULD_NOT_FLOW_PORT.to_string(),
+        name: weft_core::run::skip::SHOULD_NOT_FLOW_PORT.to_string(),
         port_type: weft_core::weft_type::WeftType::type_var("T__should_not_flow"),
         required: false,
         description: Some(
@@ -3851,7 +3851,7 @@ fn flatten_group(
             // `parallel` defaults to false (sequential): materialized
             // HERE so the flattened config always carries one explicit
             // value and the runtime never holds its own default. The
-            // other knobs default by absence (`max_iters` = no cap,
+            // other knobs default by absence (`maxIters` = no cap,
             // `over`/`carry` = empty).
             obj.entry("parallel")
                 .or_insert(serde_json::Value::Bool(false));
@@ -3951,7 +3951,7 @@ fn flatten_group(
     }).collect();
 
     // The OUT boundary carries only the parent pointer. Loop config
-    // (parallel, over, carry, max_iters, trim_on_mismatch) is authoritative
+    // (parallel, over, carry, maxIters, trimOnMismatch) is authoritative
     // on LoopIn; mirroring it on LoopOut would create two sources of truth
     // for the same fields.
     let out_cfg = serde_json::json!({"parentId": group.id});
@@ -4009,7 +4009,7 @@ fn flatten_group(
     // the site's Out. The body's In is wired from EVERY site that calls
     // it and its Out to every site; the call frame a site's In pushes is
     // what keeps the calls apart, and the frame is what picks the site a
-    // result returns to (`weft_core::exec::postprocess::frames_across`).
+    // result returns to (`weft_core::run::postprocess::frames_across`).
     if let GroupKind::Call { body } = &group.kind {
         let body_in = weft_core::project::boundary_in_id(body);
         let body_out = weft_core::project::boundary_out_id(body);

@@ -1701,14 +1701,14 @@ mod tests {
                 with: SignKind::SigV4 {
                     service: "s3".into(),
                     region: Template::new("{region}"),
-                    access_key_id: Template::new("{access_key_id}"),
-                    secret_access_key: Template::new("{secret_access_key}"),
+                    access_key_id: Template::new("{accessKeyId}"),
+                    secret_access_key: Template::new("{secretAccessKey}"),
                 },
             }],
             &values(&[
                 ("region", "us-east-1"),
-                ("access_key_id", "AKIDEXAMPLE"),
-                ("secret_access_key", "shh"),
+                ("accessKeyId", "AKIDEXAMPLE"),
+                ("secretAccessKey", "shh"),
             ]),
         )
         .unwrap();
@@ -1777,8 +1777,8 @@ mod tests {
     fn signing_covers_prior_transforms() {
         let vals = values(&[
             ("region", "r"),
-            ("access_key_id", "id"),
-            ("secret_access_key", "sec"),
+            ("accessKeyId", "id"),
+            ("secretAccessKey", "sec"),
             ("token", "tok"),
         ]);
         let steps = resolve_steps(
@@ -1787,8 +1787,8 @@ mod tests {
                     with: SignKind::SigV4 {
                         service: "s3".into(),
                         region: Template::new("{region}"),
-                        access_key_id: Template::new("{access_key_id}"),
-                        secret_access_key: Template::new("{secret_access_key}"),
+                        access_key_id: Template::new("{accessKeyId}"),
+                        secret_access_key: Template::new("{secretAccessKey}"),
                     },
                 },
                 AuthStep::PathPrefix { value: Template::new("/p{token}") },

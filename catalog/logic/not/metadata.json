@@ -1,7 +1,7 @@
 {
   "type": "Not",
   "label": "Not",
-  "description": "Flip a Boolean, e.g. to run a step on `false` through `_should_flow`. Only a Boolean is accepted (checked at compile time); a closed input gives a closed output.",
+  "description": "Flip a Boolean, e.g. to run a node on `false` through `_should_flow`. Only a Boolean is accepted (checked at compile time); a closed input gives a closed output.",
   "tags": [
     "flow",
     "logic",

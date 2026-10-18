@@ -8,7 +8,7 @@
 //! | (none)      | unregister: the dispatcher deactivates the project,     |
 //! |             | terminates its infra containers and disks, erases its   |
 //! |             | runs, reclaims its stored data, and drops the row       |
-//! | `--journal` | also drop this project's execution + log rows           |
+//! | `--journal` | also drop this project's run + log rows           |
 //! | `--local`   | also wipe this project's build artifacts on the host    |
 //! | `--all`     | implies the two levels above                            |
 //!
@@ -72,7 +72,7 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     if !yes {
         let mut levels = vec!["unregister it (triggers wiped, runs cancelled and erased, infra terminated, stored data reclaimed)"];
         if journal {
-            levels.push("drop its execution and log rows");
+            levels.push("drop its run and log rows");
         }
         if local {
             levels.push("wipe .weft/target/ here");
@@ -89,7 +89,7 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         let ctx = ctx_inner;
         let client = ctx.client()?;
 
-        // Journal rows BEFORE unregistering: deleting an execution is
+        // Journal rows BEFORE unregistering: deleting a run is
         // authorized through its project row, so once the project is
         // unregistered its rows become undeletable until the project
         // re-registers.
@@ -99,7 +99,7 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
 
         // ONE call is the whole dispatcher-side teardown: the dispatcher
         // deactivates the project (wipes its signals, cancels running
-        // executions), terminates its infra processes, reclaims its stored
+        // runs), terminates its infra processes, reclaims its stored
         // data, then drops the row. `--force` flips on the dispatcher's
         // skip-the-wait switch: without it, the dispatcher waits up to
         // 120s for the supervisor to confirm the terminate command
@@ -137,17 +137,17 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     .await
 }
 
-/// One page of the project's journal listing: the executions on the first
+/// One page of the project's journal listing: the runs on the first
 /// page, newest first.
 async fn journal_page(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<Vec<String>> {
-    let page: weft_core::program::ExecutionPage = serde_json::from_value(
-        client.get_json(&format!("/executions?project_id={project_id}")).await.context("list executions")?,
+    let page: weft_core::program::RunPage = serde_json::from_value(
+        client.get_json(&format!("/runs?project_id={project_id}")).await.context("list runs")?,
     )
-    .context("read the executions listing")?;
-    Ok(page.executions.iter().map(|e| e.execution_id.to_string()).collect())
+    .context("read the runs listing")?;
+    Ok(page.runs.iter().map(|e| e.run_id.to_string()).collect())
 }
 
 async fn drop_journal_rows(
@@ -155,16 +155,16 @@ async fn drop_journal_rows(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<()> {
-    // Walk the execution list and delete executions individually (the
+    // Walk the run list and delete runs individually (the
     // dispatcher has no bulk DELETE for a project's journal rows).
     // Deleting shifts offsets, so re-fetch the FIRST page after each
     // batch until it comes back empty. Termination is structural:
-    // every round must list at least one execution we have not deleted
-    // yet; a page of only already-deleted executions means DELETE
+    // every round must list at least one run we have not deleted
+    // yet; a page of only already-deleted runs means DELETE
     // reported success while the row survived, so bail loudly
     // instead of spinning. (Progress is measured on the drained set,
     // never on the live total: a run started mid-drop is just a new
-    // execution the next round deletes.)
+    // run the next round deletes.)
     let mut dropped: HashSet<String> = HashSet::new();
     loop {
         let rows = journal_page(client, project_id).await?;
@@ -174,14 +174,14 @@ async fn drop_journal_rows(
         let fresh: Vec<&String> = rows.iter().filter(|c| !dropped.contains(*c)).collect();
         if fresh.is_empty() {
             anyhow::bail!(
-                "journal drop stalled: the dispatcher still lists {} execution_ids whose \
+                "journal drop stalled: the dispatcher still lists {} run_ids whose \
                  DELETE already reported success",
                 rows.len()
             );
         }
         if dropped.is_empty() {
             // Quiesce before the first delete: a run still going would
-            // keep appending events to an execution mid-erase. The dispatcher
+            // keep appending events to a run mid-erase. The dispatcher
             // wipes every trigger and cancels EVERY live run of the
             // project (started by a trigger, by hand, or unrecorded),
             // and answers only once none is live. Only reached when
@@ -201,12 +201,12 @@ async fn drop_journal_rows(
                 ))?;
             progress.dispatcher_call_done(serde_json::json!({ "step": "quiesce" }));
         }
-        for execution_id in fresh {
+        for run_id in fresh {
             client
-                .delete(&format!("/executions/{execution_id}"))
+                .delete(&format!("/runs/{run_id}"))
                 .await
-                .with_context(|| format!("delete execution {execution_id}"))?;
-            dropped.insert(execution_id.clone());
+                .with_context(|| format!("delete run {run_id}"))?;
+            dropped.insert(run_id.clone());
         }
     }
     progress.dispatcher_call_done(serde_json::json!({

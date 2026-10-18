@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::json_call;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::notion::API;
 
@@ -23,7 +23,7 @@ impl Node for NotionUpdateItemNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let page: String = ctx.inputs.get("pageId")?;
         let properties: Option<Value> = ctx.inputs.opt("properties")?;

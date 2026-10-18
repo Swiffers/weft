@@ -128,15 +128,15 @@ async fn a_signed_body_admits_with_the_stored_secret(pool: PgPool) {
     schema(&pool).await;
     let spec = auth_spec(
         "hmac_auth",
-        &["signing_secret"],
+        &["signingSecret"],
         json!({
             "kind": "hmac",
-            "signature_header": "X-Signature",
-            "timestamp_header": "X-Timestamp",
+            "signatureHeader": "X-Signature",
+            "timestampHeader": "X-Timestamp",
             "concat": "{timestamp}.{body}"
         }),
     );
-    let id = store(&pool, TENANT, spec, &[("signing_secret", "s3cret")]).await;
+    let id = store(&pool, TENANT, spec, &[("signingSecret", "s3cret")]).await;
     let now = 1_700_000_000;
     let body = br#"{"text":"hi"}"#;
     let signature = weft_core::access::verify::hmac_signature(

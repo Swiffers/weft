@@ -6,7 +6,7 @@ makes what runs match it: Docker containers on your machine, or a Compute
 Engine machine of its own on a cloud install.
 
 ```json
-"requires_infra": true,
+"requiresInfra": true,
 "images": ["images/credential"],
 "publishes": "postgres"
 ```
@@ -29,8 +29,8 @@ async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag)
 }
 ```
 
-Declaring `requires_infra: true` without writing `provision_infra` is an error
-naming your node, rather than a silent nothing.
+Declaring `requiresInfra: true` without writing `provision_infra` is an error
+naming your node when the infra is provisioned, rather than a silent nothing.
 
 ## The spec
 

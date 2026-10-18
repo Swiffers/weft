@@ -53,8 +53,8 @@ async fn email_roundtrip_sends_over_smtp_and_the_imap_trigger_fires() -> Result<
         "own",
         json!({
             "user": user, "password": password,
-            "imap_host": imap_host, "imap_port": imap_port,
-            "smtp_host": smtp_host, "smtp_port": smtp_port,
+            "imapHost": imap_host, "imapPort": imap_port,
+            "smtpHost": smtp_host, "smtpPort": smtp_port,
         }),
     )
     .await?;
@@ -66,7 +66,7 @@ async fn email_roundtrip_sends_over_smtp_and_the_imap_trigger_fires() -> Result<
     set_account(&receiver, "mb", conn.handle()).await?;
     receiver.set_node_config("recv", "subjectContains", &format!("{marker:?}"))?;
     receiver.activate().await?;
-    let before = run::executions(&disp, &rid).await?;
+    let before = run::runs(&disp, &rid).await?;
 
     let mut sender = Project::prepare("email_send", disp.clone()).await?;
     set_account(&sender, "mb", conn.handle()).await?;
@@ -77,9 +77,9 @@ async fn email_roundtrip_sends_over_smtp_and_the_imap_trigger_fires() -> Result<
 
     // Provider delivery to the same mailbox is usually seconds; the
     // generous window absorbs a slow one.
-    let execution_id =
-        run::wait_for_triggered_execution(&disp, &rid, &before, Duration::from_secs(180)).await?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let run_id =
+        run::wait_for_triggered_run(&disp, &rid, &before, Duration::from_secs(180)).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     let subject = settled
         .input_of("out")
@@ -105,7 +105,7 @@ async fn a_send_only_connection_cannot_arm_the_mail_trigger() -> Result<()> {
         "own",
         json!({
             "user": "e2e@example.invalid", "password": "unused",
-            "smtp_host": "smtp.example.invalid", "smtp_port": "465",
+            "smtpHost": "smtp.example.invalid", "smtpPort": "465",
         }),
     )
     .await?;
@@ -119,7 +119,7 @@ async fn a_send_only_connection_cannot_arm_the_mail_trigger() -> Result<()> {
     platform
         .wait_for_runtime_log(
             "the listener to refuse the send-only connection (imap_host shortfall in its log)",
-            "needs the connection's 'imap_host'",
+            "needs the connection's 'imapHost'",
             Duration::from_secs(240),
         )
         .await?;

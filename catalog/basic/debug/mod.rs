@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use weft::bus::BusEntryKind;
 use weft::context::LogLevel;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult, WeftType};
+use weft::{RunContext, Node, NodeManifest, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct DebugNode;
@@ -29,7 +29,7 @@ impl Node for DebugNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let data = ctx.inputs.raw("data").cloned().unwrap_or(Value::Null);
         let label = ctx.node_label.as_deref().unwrap_or(&ctx.node_id).to_string();
 

@@ -1,15 +1,16 @@
--- Durable terminate-sweep queue: a row per terminated execution whose
-        -- un-kept exec files still need sweeping. Inserted by the journal
-        -- bridge (the durable observer of terminate), deleted by the sweep
+-- Durable terminate-sweep queue: a row per ended run that stored
+        -- files of its own, whose un-kept run files still need sweeping.
+        -- Inserted by the write that ends the run (`weft_record_batch`,
+        -- `weft_journal::record::append_locked_in`), deleted by the sweep
         -- reaper once the broker confirmed the sweep.
         CREATE TABLE IF NOT EXISTS storage_sweep (
-            execution_id TEXT PRIMARY KEY,
+            run_id UUID PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
 CREATE OR REPLACE FUNCTION storage_sweep_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_storage_sweep', NEW.execution_id);
+                PERFORM weft_announce('weft_storage_sweep', '');
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql;

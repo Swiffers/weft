@@ -86,7 +86,7 @@
 		infraNodes,
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
-		executionState,
+		runState,
 		autoOrganizeOnMount = false,
 		displayByNode,
 		onOpenInclude = () => {},
@@ -125,7 +125,7 @@
 		// file, or a file walked into from it). A file opened on its own
 		// is no place: a node in it may run under several calls, so no
 		// action bar is drawn, no run can be started or aimed from here,
-		// and the host hands in an empty `executionState` and polls no
+		// and the host hands in an empty `runState` and polls no
 		// trigger display. The graph itself stays editable.
 		interactive?: boolean;
 		// Resolved content of @file targets, keyed by the marker's relative
@@ -191,10 +191,10 @@
 		// no infra nodes).
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
-		// Per-execution state for graph decorations: which edges
+		// Per-run state for graph decorations: which edges
 		// are pulsing right now, last-observed node outputs, etc.
 		// Independent of action-bar state.
-		executionState?: import('../../types').ExecutionState;
+		runState?: import('../../types').RunState;
 		autoOrganizeOnMount?: boolean;
 		/// What each node is showing, keyed by node id. Read for the
 		/// nodes that have a display (an infra node serving `/live`, a
@@ -205,7 +205,7 @@
 	// VS Code embedding: dashboard chrome (right sidebar, code
 	// panel, mobile notice, export dialog) is removed. The text
 	// editor is the .weft tab in column 2; node inspection is the
-	// magnifier on each node card, which opens ExecutionInspector.
+	// magnifier on each node card, which opens FiringInspector.
 
 	// ── The projection engine ──────────────────────────────────────────────
 	// The visible graph is a pure function of (truth, pendingOps, layoutCode),
@@ -362,9 +362,9 @@
 		// their kind in data.nodeType, so the dispatch is total.
 		const op: EditOp = isContainer
 			? (containerKindOf(node.data?.nodeType) === 'Loop'
-				? { op: 'moveLoopScope', loopId: node.id, targetGroup: targetGroupId ?? null }
-				: { op: 'moveGroupScope', group: node.id, targetGroup: targetGroupId ?? null })
-			: { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupId ?? null };
+				? { op: 'move_loop_scope', loopId: node.id, targetGroup: targetGroupId ?? null }
+				: { op: 'move_group_scope', group: node.id, targetGroup: targetGroupId ?? null })
+			: { op: 'move_node_scope', node: node.id, targetGroup: targetGroupId ?? null };
 		const localId = node.id.split('.').pop()!;
 		const newKey = scopedLayoutKey(localId, targetGroupId);
 		recordEdit([op], (layout) => {
@@ -637,22 +637,22 @@
 
 	/** Navigate into an `@include`d file: the host opens that file's graph in
 	 *  this panel and pushes the current view onto the back-stack. `alias` is
-	 *  the include node id, accumulated into the execution-id prefix. */
+	 *  the include node id, accumulated into the run-id prefix. */
 	function openInclude(path: string, alias: string) {
 		onOpenInclude(path, alias);
 	}
 
-	/** A node's execution-journal key: its id, in every view. An included
+	/** A node's run-journal key: its id, in every view. An included
 	 *  file's nodes are journaled under the file's own id (`C.strip`), which
 	 *  is the id this view gives them, so no prefix is added; which CALL a
 	 *  row belongs to is its call frames, split in `readOverlayCtx`
 	 *  (`rowsByCallPath`). */
-	function execKey(localId: string): string {
+	function firingKey(localId: string): string {
 		return localId;
 	}
 
 	/** Whose key a group's members spent, folded for the group's synthetic
-	 *  execution row: one distinct origin passes through, disagreeing
+	 *  run row: one distinct origin passes through, disagreeing
 	 *  members read 'mixed', no cost records means no origin. */
 	function groupCredentialOwner(
 		members: { credentialOwner?: CredentialOwnerKind | 'mixed' }[],
@@ -667,8 +667,8 @@
 	/// Flip a node's gate between `_should_flow` and `_should_not_flow`.
 	///
 	/// Both spellings are ordinary ports, so the flip is the ops that
-	/// already exist: a wire moves with removeEdge + addEdge, a written
-	/// value with removeConfig + setConfig. Nothing new on the wire and
+	/// already exist: a wire moves with remove_edge + add_edge, a written
+	/// value with remove_config + set_config. Nothing new on the wire and
 	/// nothing new in Rust, which is also why it undoes like any other
 	/// edit.
 	///
@@ -694,7 +694,7 @@
 			if (wire) {
 				const scopeGroup = (wire as { data?: { scopeGroup?: string | null } }).data?.scopeGroup ?? null;
 				ops.push({
-					op: 'removeEdge',
+					op: 'remove_edge',
 					source: wire.source,
 					sourcePort: wire.sourceHandle ?? 'default',
 					target: nodeId,
@@ -702,7 +702,7 @@
 					scopeGroup,
 				});
 				ops.push({
-					op: 'addEdge',
+					op: 'add_edge',
 					source: wire.source,
 					sourcePort: wire.sourceHandle ?? 'default',
 					target: nodeId,
@@ -949,8 +949,8 @@
 					// push.
 					const kind = containerKindOf(node?.data?.nodeType);
 					ops.push(kind === 'Loop'
-						? { op: 'renameLoop', loopId: nodeId, newLabel: updates.label as string }
-						: { op: 'renameGroup', group: nodeId, newLabel: updates.label as string });
+						? { op: 'rename_loop', loopId: nodeId, newLabel: updates.label as string }
+						: { op: 'rename_group', group: nodeId, newLabel: updates.label as string });
 					// Re-key the group's layout subtree (its own entry + descendants) from
 					// the old scoped address to the new one. Same exact, non-compounding
 					// re-key a move uses; a rename only changes the last path segment.
@@ -960,7 +960,7 @@
 					mutateLayout = (layout) => renameLayoutSubtree(layout, nodeId, newPrefix);
 					hasLayout = true;
 				} else {
-					ops.push({ op: 'setLabel', node: nodeId, label: (updates.label as string | null) ?? null });
+					ops.push({ op: 'set_label', node: nodeId, label: (updates.label as string | null) ?? null });
 				}
 			}
 			if ('config' in updates) {
@@ -1040,7 +1040,7 @@
 			}
 			if ('portValueForm' in updates && updates.portValueForm) {
 				const { key, form } = updates.portValueForm;
-				ops.push({ op: 'setValueForm', node: nodeId, key, form });
+				ops.push({ op: 'set_value_form', node: nodeId, key, form });
 			}
 			if ('inputs' in updates || 'outputs' in updates) {
 				// Everything the emit READS comes from the PROJECTION (the
@@ -1073,9 +1073,9 @@
 						const inputs = toPortSigs(nextInputs, 'input');
 						const outputs = toPortSigs(nextOutputs, 'output');
 						if (kind === 'Loop') {
-							ops.push({ op: 'updateLoopPorts', loopId: nodeId, inputs, outputs });
+							ops.push({ op: 'update_loop_ports', loopId: nodeId, inputs, outputs });
 						} else {
-							ops.push({ op: 'updateGroupPorts', group: nodeId, inputs, outputs });
+							ops.push({ op: 'update_group_ports', group: nodeId, inputs, outputs });
 						}
 					} else {
 						// A NODE's header declares only the custom/overridden
@@ -1150,12 +1150,12 @@
 						const spans = foldPorts.portLiteralSpans;
 						for (const name of remIns.removed) {
 							if (literals && name in literals) {
-								ops.push({ op: 'removeConfig', node: nodeId, key: name, form: spans?.[name]?.origin });
+								ops.push({ op: 'remove_config', node: nodeId, key: name, form: spans?.[name]?.origin });
 							}
 						}
 						const revertedInputs = [...gateRevertedIns, ...remIns.reverted];
 						const revertedOutputs = [...gateRevertedOuts, ...remOuts.reverted];
-						// An op that carries nothing is not sent: `updateNodePorts`
+						// An op that carries nothing is not sent: `update_node_ports`
 						// de-inlines an inline node and rewrites its header before
 						// it looks at the payload, so an empty op is not a no-op
 						// on the Rust side (a config-list tweak on an inline
@@ -1164,7 +1164,7 @@
 							|| remIns.removed.length || remOuts.removed.length
 							|| revertedInputs.length || revertedOutputs.length) {
 							ops.push({
-								op: 'updateNodePorts',
+								op: 'update_node_ports',
 								node: nodeId,
 								inputs: sigInputs,
 								outputs: sigOutputs,
@@ -1563,7 +1563,7 @@
 				zIndex: sizing.zIndex,
 				...(sizing.width !== undefined ? { width: sizing.width } : {}),
 				...(sizing.height !== undefined ? { height: sizing.height } : {}),
-				// Dynamic per-node data (fileContents, infra badges, execution
+				// Dynamic per-node data (fileContents, infra badges, run
 				// state, body feeds) is painted by `decorate`, the ONE decoration
 				// pass; buildNodes carries only the structural fields.
 				data: {
@@ -1774,7 +1774,7 @@
 					// self-guard on `simplified` as defense. (Svelte Flow has no
 					// per-edge `reconnectable` field, unlike React Flow, so the anchor
 					// is the real lever.) Without this, dragging a merged edge's end
-					// would record a removeEdge against the SYNTHETIC `__simp_*` handle.
+					// would record a remove_edge against the SYNTHETIC `__simp_*` handle.
 					selectable: false,
 					deletable: false,
 					data: { simplified: true },
@@ -1830,9 +1830,9 @@
 	// `busParticipantsByBus` is replaced by reference only when a new
 	// participant lands (see App.svelte's bus_participant handler), so
 	// reference equality with the prior tick means the inversion is
-	// unchanged. Without this, every nodeOutputs/nodeExecutions tick
+	// unchanged. Without this, every nodeOutputs/nodeFirings tick
 	// (which happens on every SSE event) re-inverts and re-allocates
-	// the whole nodes array, quadratic with execution age.
+	// the whole nodes array, quadratic with run age.
 	let busesByNodeCache: { ref: unknown; value: Record<string, string[]> } = {
 		ref: undefined,
 		value: {},
@@ -1860,19 +1860,19 @@
 		/// The followed run's rows around this view's call path: `here` by
 		/// node id for the rows at this level, `inside` by include site for
 		/// everything that ran under one (see `rowsByCallPath`).
-		rows: RowsByCallPath<import('../../types').NodeExecution>;
+		rows: RowsByCallPath<import('../../types').NodeFiring>;
 		busLogByBus: Record<string, import('../../../../protocol').BusInspectorEvent[]>;
 		busesByNode: Record<string, string[]>;
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
 		loopEventsByGroup: Record<string, import('../../../../protocol').LoopInspectorEvent[]>;
 		journalCorruptions: Array<{ site: import('../../../../protocol').CorruptionSite; reason: string }>;
-		/// The run's own tags (`ctx.tag_execution`), painted onto every
+		/// The run's own tags (`ctx.tag_run`), painted onto every
 		/// node so any node's inspector can show them.
-		executionTags: string[];
+		runTags: string[];
 		/// How the run ended (state plus, for a cancel, why), painted
 		/// onto every node so a node card or inspector can name who
 		/// stopped the run.
-		runTerminal: import('../../types').ExecutionTerminal | undefined;
+		runTerminal: import('../../types').RunTerminal | undefined;
 		infraNodes: typeof infraNodes;
 		fileContents: typeof fileContents;
 		displayByNode: typeof displayByNode;
@@ -1891,7 +1891,7 @@
 	};
 
 	function readOverlayCtx(): OverlayCtx {
-		const state = executionState;
+		const state = runState;
 		const busParticipantsByBus = state?.busParticipantsByBus || {};
 		let busesByNode: Record<string, string[]>;
 		if (busesByNodeCache.ref === busParticipantsByBus) {
@@ -1911,13 +1911,13 @@
 		}
 		return {
 			nodeOutputs: state?.nodeOutputs || {},
-			rows: rowsByCallPath(state?.nodeExecutions || {}, callPath),
+			rows: rowsByCallPath(state?.nodeFirings || {}, callPath),
 			busLogByBus: state?.busLogByBus || {},
 			busesByNode,
 			busMetaByBus: state?.busMetaByBus ?? {},
 			loopEventsByGroup: state?.loopEventsByGroup ?? {},
 			journalCorruptions: state?.journalCorruptions ?? [],
-			executionTags: state?.tags ?? [],
+			runTags: state?.tags ?? [],
 			runTerminal: state?.terminal,
 			infraNodes,
 			fileContents,
@@ -1925,9 +1925,9 @@
 			showInfraSubgraph,
 			showTriggerSubgraph,
 			runTargets,
-			runScope: executionState?.scope === undefined ? undefined
-				: executionState.scope === null ? null
-				: new Set(executionState.scope),
+			runScope: runState?.scope === undefined ? undefined
+				: runState.scope === null ? null
+				: new Set(runState.scope),
 			// Read in the tracked region so a navigation that only changes the
 			// call path re-decorates (the rows above are filtered by it).
 			// Untrack the projection: the STRUCTURAL effect already owns
@@ -1939,7 +1939,7 @@
 		};
 	}
 
-	/** Paint every dynamic decoration (execution state, infra badges, file
+	/** Paint every dynamic decoration (run state, infra badges, file
 	 *  contents, body feeds, subgraph highlight) onto a node/edge array.
 	 *  Pure: spreads each node, never reorders or repositions. Used by BOTH
 	 *  the structural rebuild and the overlay-tick refresh, so the two render
@@ -1954,9 +1954,9 @@
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
 			nodeOutputs, busLogByBus, busesByNode, busMetaByBus,
-			loopEventsByGroup, journalCorruptions, executionTags, runTerminal,
+			loopEventsByGroup, journalCorruptions, runTags, runTerminal,
 		} = ctx;
-		const nodeExecutions = ctx.rows.here;
+		const nodeFirings = ctx.rows.here;
 		// Subgraph highlight classes are computed over the CURRENT arrays so
 		// highlighted/dimmed always reflects what is on screen.
 		let subgraphNodeIds: Set<string> | null = null;
@@ -1996,22 +1996,22 @@
 					// Debug-style preview: show the node's output if
 					// it has one; otherwise (Debug, any future sink)
 					// show what flowed IN, since that's what makes
-					// the preview meaningful. Read the latest exec
+					// the preview meaningful. Read the latest firing
 					// row's input payload when no outputs exist on
 					// the node type.
 					let debugData: unknown = undefined;
 					if (nodeTypeConfig?.features?.showDebugPreview) {
 						const hasOutputs = (nodeTypeConfig.defaultOutputs?.length ?? 0) > 0;
 						if (hasOutputs) {
-							debugData = nodeOutputs[execKey(n.id)];
+							debugData = nodeOutputs[firingKey(n.id)];
 						} else {
-							const rows = nodeExecutions[execKey(n.id)];
+							const rows = nodeFirings[firingKey(n.id)];
 							const latest = rows?.[rows.length - 1];
 							debugData = latest?.input;
 						}
 					}
 
-					let executions: import('../../types').NodeExecution[];
+					let firings: import('../../types').NodeFiring[];
 
 					if (isBoundaryBoxNodeType(nodeType)) {
 						const groupId = n.id;
@@ -2021,25 +2021,25 @@
 						// here around its members; an include's are its call site's
 						// halves, which fire here in the caller's frames, while the
 						// body runs one call frame deeper.
-						const inExecs = nodeExecutions[execKey(boundaryInId(groupId))] || [];
-						const outExecs = nodeExecutions[execKey(boundaryOutId(groupId))] || [];
+						const inFirings = nodeFirings[firingKey(boundaryInId(groupId))] || [];
+						const outFirings = nodeFirings[firingKey(boundaryOutId(groupId))] || [];
 
 						// Everything that ran inside the box: its members at this level
 						// (via scope, against the CURRENT projected nodes, not the stale
 						// initial prop), and every row that ran under a call site that is
 						// the box itself or one of its members, however deep the calls
 						// below go (`ctx.rows.inside` is keyed by the site at this level).
-						const internalExecs: import('../../types').NodeExecution[] = [];
+						const internalFirings: import('../../types').NodeFiring[] = [];
 						if (isIncludeNodeType(nodeType)) {
-							internalExecs.push(...(ctx.rows.inside[groupId] ?? []));
+							internalFirings.push(...(ctx.rows.inside[groupId] ?? []));
 						}
 						for (const projNode of ctx.projectNodes) {
 							if (!projNode.scope?.includes(groupId)) continue;
-							internalExecs.push(...(nodeExecutions[execKey(projNode.id)] ?? []));
-							internalExecs.push(...(ctx.rows.inside[projNode.id] ?? []));
+							internalFirings.push(...(nodeFirings[firingKey(projNode.id)] ?? []));
+							internalFirings.push(...(ctx.rows.inside[projNode.id] ?? []));
 						}
 
-						// Pair the __out boundary execution to its __in by
+						// Pair the __out boundary run to its __in by
 						// FRAME STACK, not array index. A parallel loop fires
 						// many iterations whose __in / __out events interleave
 						// and arrive out of order, so the i-th __in is not the
@@ -2047,46 +2047,46 @@
 						// in to its own out. (Sequential loops and plain groups
 						// happen to line up by index, but framesKey is correct
 						// for all of them.)
-						const outByFrames = new Map(outExecs.map((e) => [e.framesKey, e]));
+						const outByFrames = new Map(outFirings.map((e) => [e.framesKey, e]));
 
-						// Build synthetic execution: one per __in execution
-						executions = inExecs.map((inExec) => {
-							const outExec = outByFrames.get(inExec.framesKey);
+						// Build synthetic run: one per __in run
+						firings = inFirings.map((inFiring) => {
+							const outFiring = outByFrames.get(inFiring.framesKey);
 							// Derive status and cost from THIS iteration's rows only:
 							// the boundary pair at its frames and every internal
 							// row at those frames or deeper (a nested loop's
 							// iterations). A parallel loop's other iterations are
 							// sibling cards, not this one's children.
-							const allRelated = [...internalExecs, ...inExecs, ...outExecs]
-								.filter((e) => withinFrames(e.frames, inExec.frames));
-							const status = containerStatus(inExec.status, allRelated);
+							const allRelated = [...internalFirings, ...inFirings, ...outFirings]
+								.filter((e) => withinFrames(e.frames, inFiring.frames));
+							const status = containerStatus(inFiring.status, allRelated);
 
 							return {
 								// Frame-stack-keyed id so an iteration's card keeps
 								// a stable identity across ticks even as sibling
 								// iterations' events interleave (index would shuffle).
-								id: `${groupId}-synth-${inExec.framesKey}`,
+								id: `${groupId}-synth-${inFiring.framesKey}`,
 								nodeId: groupId,
 								status,
-								pulseId: inExec.pulseId,
-								error: outExec?.error ?? inExec.error,
-								startedAt: inExec.startedAt,
-								completedAt: outExec?.completedAt ?? inExec.completedAt,
-								input: inExec.output, // __in output = what flows into the group
-								output: outExec?.output, // __out output = what the group produces
+								pulseId: inFiring.pulseId,
+								error: outFiring?.error ?? inFiring.error,
+								startedAt: inFiring.startedAt,
+								completedAt: outFiring?.completedAt ?? inFiring.completedAt,
+								input: inFiring.output, // __in output = what flows into the group
+								output: outFiring?.output, // __out output = what the group produces
 								// Closed input ports surface from the `__in` boundary
 								// (its own `closedPorts` is the set of group-level
 								// inputs that arrived as closures). Without this, a
 								// group inspector with closed inputs renders a
 								// blank Input panel where the per-node inspector
 								// shows `port: (closed)` rows.
-								closedPorts: inExec.closedPorts,
+								closedPorts: inFiring.closedPorts,
 								// A reused input boundary alone does not mean its body was reused.
-								inheritedFrom: allRelated.every((e) => e.inheritedFrom === inExec.inheritedFrom)
-									? inExec.inheritedFrom : undefined,
-								providedPorts: inExec.providedPorts,
-								backupPorts: inExec.backupPorts,
-								inheritedPorts: inExec.inheritedPorts,
+								inheritedFrom: allRelated.every((e) => e.inheritedFrom === inFiring.inheritedFrom)
+									? inFiring.inheritedFrom : undefined,
+								providedPorts: inFiring.providedPorts,
+								backupPorts: inFiring.backupPorts,
+								inheritedPorts: inFiring.inheritedPorts,
 								costUsd: allRelated.reduce((sum, e) => sum + (e.costUsd || 0), 0),
 								inheritedCostUsd: allRelated.reduce((sum, e) => sum + (e.inheritedFrom ? e.costUsd : 0), 0),
 								inheritedCostUnknown: allRelated.some((e) => e.inheritedFrom && e.costUnknown),
@@ -2095,18 +2095,18 @@
 								costUnknown: allRelated.some((e) => e.costUnknown),
 								credentialOwner: groupCredentialOwner(allRelated),
 								logs: [],
-								executionId: inExec.executionId,
-								frames: inExec.frames,
-								framesKey: inExec.framesKey,
+								runId: inFiring.runId,
+								frames: inFiring.frames,
+								framesKey: inFiring.framesKey,
 							};
 						});
 					} else {
-						executions = nodeExecutions[execKey(n.id)] || [];
+						firings = nodeFirings[firingKey(n.id)] || [];
 					}
 
-					// Derive SvelteFlow wrapper class from the latest execution status
-					const latestExec = executions[executions.length - 1];
-					const execStatus = latestExec?.status;
+					// Derive SvelteFlow wrapper class from the latest run status
+					const latestFiring = firings[firings.length - 1];
+					const firingStatus = latestFiring?.status;
 					// A node outside the followed run's scope is "not in this run":
 					// dimmed, no status class, never skipped or empty. One more
 					// case of the dimming the subgraph highlight already paints.
@@ -2114,19 +2114,19 @@
 					// container, an include) is never one, its In boundary is.
 					const placeId = isBoundaryBoxNodeType(nodeType) ? boundaryInId(n.id) : n.id;
 					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
-						&& !ctx.runScope.has(locatedKey(placeId, ctx.callPath)) && executions.length === 0;
+						&& !ctx.runScope.has(locatedKey(placeId, ctx.callPath)) && firings.length === 0;
 					// Inheritance is NOT one of these: it is orthogonal to
 					// status, and the node components paint it themselves
-					// (`node-inherited-glow`, from `latestExecution.inheritedFrom`).
+					// (`node-inherited-glow`, from `latestFiring.inheritedFrom`).
 					// Branching on it here cost an inherited node its status
 					// class, so an inherited group lost `node-completed`, which
 					// is what `GroupNode`'s own styling keys off, and the class
 					// it gained instead (`node-inherited`) is defined nowhere.
 					const nodeClass = notInRun ? 'run-dimmed'
-						: execStatus === 'running' ? 'node-running'
-						: execStatus === 'waiting_for_input' ? 'node-waiting'
-						: execStatus === 'failed' ? 'node-failed'
-						: execStatus === 'completed' || execStatus === 'skipped' ? 'node-completed'
+						: firingStatus === 'running' ? 'node-running'
+						: firingStatus === 'waiting_for_input' ? 'node-waiting'
+						: firingStatus === 'failed' ? 'node-failed'
+						: firingStatus === 'completed' || firingStatus === 'skipped' ? 'node-completed'
 						: '';
 
 					// Bus panels: for an ordinary node, the buses this node
@@ -2134,11 +2134,11 @@
 					// every internal node's bus participation (so the
 					// group's modal shows the conversations its members
 					// had with each other or with the outside).
-					const busIdsForNode = new Set<string>(busesByNode[execKey(n.id)] ?? []);
+					const busIdsForNode = new Set<string>(busesByNode[firingKey(n.id)] ?? []);
 					if (isContainerNodeType(n.data?.nodeType)) {
 						for (const projNode of ctx.projectNodes) {
 							if (projNode.scope?.includes(n.id)) {
-								for (const busId of busesByNode[execKey(projNode.id)] ?? []) {
+								for (const busId of busesByNode[firingKey(projNode.id)] ?? []) {
 									busIdsForNode.add(busId);
 								}
 							}
@@ -2155,7 +2155,7 @@
 					}));
 
 					const loopEvents = isLoopNodeType(n.data?.nodeType)
-						? (loopEventsByGroup[execKey(n.id)] ?? [])
+						? (loopEventsByGroup[firingKey(n.id)] ?? [])
 						: [];
 
 					// Per-node infra badge (status snapshot from the host): the
@@ -2176,7 +2176,7 @@
 						: undefined;
 
 					// Subgraph highlight wins the class slot while active; the
-					// execution-status class paints otherwise.
+					// run-status class paints otherwise.
 					const cls = subgraphNodeIds
 						? (subgraphNodeIds.has(n.id) ? highlightedClass : dimmedClass)
 						: nodeClass;
@@ -2187,11 +2187,11 @@
 							...n.data,
 							runTarget: ctx.runTargets.has(n.id),
 							debugData,
-							executions,
+							firings,
 							busLogs,
 							loopEvents,
 							journalCorruptions,
-							executionTags,
+							runTags,
 							runTerminal,
 							fileContents: ctx.fileContents,
 							bodyFeed,
@@ -2259,7 +2259,7 @@
 		});
 	});
 
-	// OVERLAY refresh: when any dynamic source ticks (execution SSE, infra
+	// OVERLAY refresh: when any dynamic source ticks (run SSE, infra
 	// badges, file contents, body feeds, subgraph toggles), re-decorate the
 	// CURRENT arrays in place (positions, selection, mid-gesture state are
 	// preserved because decorate only spreads).
@@ -2364,7 +2364,7 @@
 		// differ from, and a removed one leaves nothing to overlap.
 		const resized = base !== undefined && [...now].some(([id, size]) => base.has(id) && base.get(id) !== size);
 		if (!resized) { laidOutFor.set(layoutVerb, now); return; }
-		// No fitView (don't yank the camera mid-execution); non-undoable (an
+		// No fitView (don't yank the camera mid-run); non-undoable (an
 		// automatic re-flow is not a user action, must not pollute the undo stack).
 		void runAutoOrganize(false, false);
 	}
@@ -2462,14 +2462,14 @@
 	});
 	/// The followed run's version differs from the files on disk.
 	const versionMismatch = $derived.by(() => {
-		const v = executionState?.version;
+		const v = runState?.version;
 		if (!v || !v.version) return null;
 		return v.version !== v.diskVersion ? v.version : null;
 	});
 	// An OPEN node menu closes itself when its target can no longer fill it:
 	// the node vanished from the graph (deleted from the text tab in another
 	// column while the menu was open), or, in simplified view, its only menu
-	// content (infra lifecycle actions) disappeared mid-execution. Same
+	// content (infra lifecycle actions) disappeared mid-run. Same
 	// predicates that gate rendering the items, so open-time and stay-open
 	// agree and an empty popover shell can never linger. The empty-area menu
 	// (no nodeId) always has Undo/Redo, never empties.
@@ -2488,7 +2488,7 @@
 	let tagEditor = $state<{ nodeId: string; x: number; y: number } | null>(null);
 
 	// Apply a `_tags` change to a node through the SAME edit path config edits
-	// use (createNodeUpdateHandler diffs it into a setConfig op + autosave).
+	// use (createNodeUpdateHandler diffs it into a set_config op + autosave).
 	function setNodeTags(nodeId: string, next: string[]) {
 		// Read the CURRENT config from projection truth (`fold`), NOT the render
 		// `nodes` array. `_tags` is a source key, so it only repaints into `nodes`
@@ -2500,7 +2500,7 @@
 		if (!node) return;
 		// An empty tag list means "no tags", i.e. REMOVE the key, not `_tags: []`
 		// (which would leave a `_tags = []` cruft line in source). diffConfigOps
-		// emits a removeConfig only for a key that is PRESENT-but-undefined in the
+		// emits a remove_config only for a key that is PRESENT-but-undefined in the
 		// update (a key merely absent is never visited), so pass `undefined` for the
 		// empty case rather than omitting or writing `[]`.
 		const config = {
@@ -2741,7 +2741,7 @@
 	// `undoable`: a user-initiated organize (palette button, collapse/expand,
 	// first-show) records an undo entry; an AUTOMATIC re-flow (a node resized
 	// because live-display content arrived) persists without one, so a streaming
-	// execution can't bury the user's real edits under reflow frames.
+	// run can't bury the user's real edits under reflow frames.
 	// Outcome of an organize: it APPLIED, or it bailed because the active view
 	// CHANGED mid-run (the new view's own rebuild organizes it if it needs
 	// it), or because the component was DESTROYED, or ELK FAILED (nothing
@@ -3048,7 +3048,7 @@
 					.filter(e => !doomed.has(e.source) && !doomed.has(e.target))
 					.map(e => {
 						const ref = toWeftEdgeRef(e.source, e.sourceHandle || 'value', e.target, e.targetHandle || 'value');
-						return { op: 'removeEdge' as const, source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+						return { op: 'remove_edge' as const, source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
 					});
 				contextMenu = null;
 				transaction(() => {
@@ -3200,8 +3200,8 @@
 		const oldRef = toWeftEdgeRef(oldEdge.source, oldEdge.sourceHandle || 'value', oldEdge.target, oldEdge.targetHandle || 'value');
 		const newRef = toWeftEdgeRef(newConnection.source, newConnection.sourceHandle || 'value', newConnection.target, newConnection.targetHandle || 'value');
 		recordEdit([
-			{ op: 'removeEdge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
-			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
+			{ op: 'remove_edge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
+			{ op: 'add_edge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
 		]);
 	}
 
@@ -3210,10 +3210,10 @@
 		reconnectingPath = [];
 		if (simplified) return; // no wiring edits in simplified view
 		// Reconnect dropped on empty space = remove the edge (the gesture's
-		// meaning, expressed as the same removeEdge op a delete uses).
+		// meaning, expressed as the same remove_edge op a delete uses).
 		if (!reconnectSuccessful) {
 			const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
-			recordEdit([{ op: 'removeEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
+			recordEdit([{ op: 'remove_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
 		}
 		reconnectSuccessful = false;
 	}
@@ -3289,7 +3289,7 @@
 		// through the one rollback path. Returning null tells xyflow not to add
 		// its own optimistic edge (the projection's re-derive paints it).
 		const ref = toWeftEdgeRef(connection.source!, connection.sourceHandle || 'value', connection.target!, connection.targetHandle || 'value');
-		recordEdit([{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
+		recordEdit([{ op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
 		return null;
 	}
 
@@ -3329,10 +3329,10 @@
 		nodes = nodes.map(n => (n.selected ? { ...n, selected: false } : n));
 		selectedNodeId = id;
 		const op: EditOp = isLoop
-			? { op: 'addLoop', label: containerLabel!, parentGroup: null }
+			? { op: 'add_loop', label: containerLabel!, parentGroup: null }
 			: isGroup
-				? { op: 'addGroup', label: containerLabel!, parentGroup: null }
-				: { op: 'addNode', id, nodeType: type, parentGroup: null };
+				? { op: 'add_group', label: containerLabel!, parentGroup: null }
+				: { op: 'add_node', id, nodeType: type, parentGroup: null };
 		// A connection drag dropped on empty canvas opened this menu: finish
 		// the gesture by wiring the picked node to the drag's origin in the
 		// SAME batch (one gesture, one undo unit). The wire lands on the first
@@ -3362,14 +3362,14 @@
 					);
 					if (input) {
 						const ref = toWeftEdgeRef(wire.nodeId, wire.handle || 'value', id, input.name);
-						edgeOp = { op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+						edgeOp = { op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
 					}
 				} else if (!vetoLiteralDrivenTarget(wire.nodeId, wire.handle)) {
 					// Dragged backwards from an input: the new node drives it.
 					const output = (template?.defaultOutputs ?? []).find(p => compatible(p.portType, originType));
 					if (output) {
 						const ref = toWeftEdgeRef(id, output.name, wire.nodeId, wire.handle || 'value');
-						edgeOp = { op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+						edgeOp = { op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
 					}
 				}
 			}
@@ -3392,9 +3392,9 @@
 	function deleteNodes(nodeIds: string[]) {
 		if (nodeIds.length === 0) return;
 
-		// Classify each id: containers route by kind (`removeLoop` vs
-		// `removeGroup`; the Rust side rejects a mismatch loudly), everything
-		// else is `removeNode`. Projection-built containers always carry their
+		// Classify each id: containers route by kind (`remove_loop` vs
+		// `remove_group`; the Rust side rejects a mismatch loudly), everything
+		// else is `remove_node`. Projection-built containers always carry their
 		// kind in data.nodeType. The visual removal (and a removed group's
 		// children climbing into the parent scope) comes from the projection.
 		const containers = new Map<string, 'Group' | 'Loop'>();
@@ -3416,14 +3416,14 @@
 		const layoutKeysToDrop: string[] = [];
 		for (const nodeId of nodeIds) {
 			if (!containers.has(nodeId)) {
-				ops.push({ op: 'removeNode', node: nodeId });
+				ops.push({ op: 'remove_node', node: nodeId });
 				layoutKeysToDrop.push(nodeId);
 			}
 		}
 		// Container removals DEEPEST-FIRST: ungrouping a container re-keys its
 		// children (a nested `outer.inner` becomes `inner` when `outer`
 		// dissolves), so removing the parent first would leave a later
-		// `removeGroup outer.inner` unresolvable ("node not found"). Removing the
+		// `remove_group outer.inner` unresolvable ("node not found"). Removing the
 		// deepest container first never touches a shallower one's id (children
 		// climb INTO the shallower container, whose id is unchanged), so every op
 		// resolves and the final ids match computeUngroupLayoutMoves' mapping.
@@ -3431,7 +3431,7 @@
 			(a, b) => b[0].split('.').length - a[0].split('.').length,
 		);
 		for (const [nodeId, kind] of containersDeepFirst) {
-			ops.push(kind === 'Loop' ? { op: 'removeLoop', loopId: nodeId } : { op: 'removeGroup', group: nodeId });
+			ops.push(kind === 'Loop' ? { op: 'remove_loop', loopId: nodeId } : { op: 'remove_group', group: nodeId });
 			layoutKeysToDrop.push(nodeId);
 		}
 		// A removed container UNGROUPS: every node under it climbs out, its
@@ -3597,7 +3597,7 @@
 	// Right-click on a wire: read a key off the value it carries. The menu
 	// lists the fields one level below the wire's current path (a record
 	// type on the source port), and picking one rewrites the wire as
-	// removeEdge + addEdge with the longer path.
+	// remove_edge + add_edge with the longer path.
 	let edgeMenu = $state<{ x: number; y: number; edgeId: string } | null>(null);
 
 	function onEdgeContextMenu({ edge, event }: { edge: Edge; event: MouseEvent | TouchEvent }) {
@@ -3627,11 +3627,11 @@
 
 	function rewireWithPath(edge: import('../../types').Edge, path: string[]) {
 		const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
-		// One op: addEdge replaces the port's driver in place, so the wire
+		// One op: add_edge replaces the port's driver in place, so the wire
 		// keeps the spelling it was written in (braces or statement).
-		// A removeEdge first would erase that spelling before the add saw it.
+		// A remove_edge first would erase that spelling before the add saw it.
 		recordEdit([
-			{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
+			{ op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
 		]);
 		edgeMenu = null;
 	}
@@ -3999,8 +3999,8 @@
 				// null (unset = key absent), and formatConfigValue throws
 				// loudly if that invariant ever breaks.
 				ops.push(isLoop
-					? { op: 'setLoopConfig', loopId: scopedId, key, value: formatConfigValue(value) }
-					: { op: 'setConfig', node: scopedId, key, value: formatConfigValue(value) });
+					? { op: 'set_loop_config', loopId: scopedId, key, value: formatConfigValue(value) }
+					: { op: 'set_config', node: scopedId, key, value: formatConfigValue(value) });
 			}
 		};
 		// Copy a decl's written PORT values onto its copy, each in the form
@@ -4041,8 +4041,8 @@
 					newIds.push(scopedId);
 					const cfg = config as Record<string, number> | undefined;
 					ops.push(isLoop
-						? { op: 'addLoop', label, parentGroup: parentId ?? null }
-						: { op: 'addGroup', label, parentGroup: parentId ?? null });
+						? { op: 'add_loop', label, parentGroup: parentId ?? null }
+						: { op: 'add_group', label, parentGroup: parentId ?? null });
 					// Copy the container's boundary SIGNATURE: it is part of the decl,
 					// and a Loop's `over`/`carry` config references its ports, so the
 					// shell must declare them or the next build hard-errors
@@ -4054,8 +4054,8 @@
 					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs), 'output');
 					if (sigInputs.length > 0 || sigOutputs.length > 0) {
 						ops.push(isLoop
-							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
-							: { op: 'updateGroupPorts', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
+							? { op: 'update_loop_ports', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
+							: { op: 'update_group_ports', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
 					}
 					if (isLoop) {
 						copyConfig(config, scopedId, true);
@@ -4063,14 +4063,14 @@
 						// A group's description rides its `config` on the node
 						// data (host-bridge puts it there for the card) and has
 						// its own op; a loop's travels with its settings above.
-						ops.push({ op: 'setGroupDescription', group: scopedId, description: config.description });
+						ops.push({ op: 'set_group_description', group: scopedId, description: config.description });
 					}
 					copyPortLiterals(orig, scopedId, nodeType);
 					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y, cfg?.width, cfg?.height));
 				} else {
 					const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
 					newIds.push(scopedId);
-					ops.push({ op: 'addNode', id: localId, nodeType, parentGroup: parentId ?? null });
+					ops.push({ op: 'add_node', id: localId, nodeType, parentGroup: parentId ?? null });
 					// Copy the DECLARED port surface (custom ports, type
 					// overrides): the config copy below carries the
 					// config-created ports, but header-declared ones live
@@ -4086,7 +4086,7 @@
 					const declOutputs = copiedPortSigs(renderedOut, nodeDefaults?.defaultOutputs);
 					if (declInputs.length > 0 || declOutputs.length > 0) {
 						ops.push({
-							op: 'updateNodePorts',
+							op: 'update_node_ports',
 							node: scopedId,
 							inputs: declInputs,
 							outputs: declOutputs,
@@ -4100,7 +4100,7 @@
 					copyConfig(config, scopedId, false);
 					copyPortLiterals(orig, scopedId, nodeType);
 					if (orig.data.label) {
-						ops.push({ op: 'setLabel', node: scopedId, label: orig.data.label as string });
+						ops.push({ op: 'set_label', node: scopedId, label: orig.data.label as string });
 					}
 				}
 			}
@@ -4357,7 +4357,7 @@
 		     if infra is running + drifted the button is Upgrade; if
 		     it's stopped + drifted the button is Start (Start re-applies
 		     the changed spec and reaps orphans on the way up). Keyed on
-		     `available_actions` so banner text and button agree. -->
+		     `availableActions` so banner text and button agree. -->
 		{#if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_upgrade')}
 			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
 				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
@@ -4379,7 +4379,7 @@
 		     `state.backend` for at-rest facts and `state.overlay`
 		     for the in-flight user-action; `drift` lights
 		     Resync/Upgrade indicators. -->
-		{#if versionMismatch && executionState?.seed !== undefined}
+		{#if versionMismatch && runState?.seed !== undefined}
 			<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg mb-1">
 				<span>This run is from version {versionMismatch.slice(0, 8)}; your code differs.</span>
 				{#if onBranchTo}
@@ -4545,7 +4545,7 @@
 									title={marked
 										? 'Make this node one shared node again: every instance uses the same one.'
 										: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerInstance', node: id, perInstance: !marked }]); }}
+									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'set_per_instance', node: id, perInstance: !marked }]); }}
 								>
 									<span class="text-muted-foreground text-xs">@</span>
 									<span>{marked ? 'Share across instances' : 'One per instance'}</span>

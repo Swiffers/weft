@@ -37,7 +37,7 @@ The pipeline is self-verifying at both seams, because no actor in it is
 trusted on its word. The compiler side: a `tool.execute.after` plugin
 re-runs the fast validate after every edit to a `.weft` file or anything
 under `nodes/`, and feeds the structural errors (and the `level-too-large`
-warning) back to the model automatically (the same feedback loop a language
+and spelling warnings) back to the model automatically (the same feedback loop a language
 server gives a human, delivered to the agent). The specialist side: Tangle
 re-runs the tests itself, diffs the delivered metadata against the report,
 and reads every test asking how it would fail, with a named catalog of the
@@ -60,21 +60,21 @@ commands are the expert's hand on the same loop.
 | File | Loaded when | Job |
 |---|---|---|
 | `.kilo/agent/tangle.md` | every session (the default agent, set by `kilo.json`) | the orchestrator persona: the loop, ground truth discipline, autonomy, hard rules |
-| `.kilo/skills/weft-language/` | on demand, before writing weft | the language surface: syntax, types, groups, loops, the pulse model, every error slug |
+| `.kilo/skills/weft-language/` | on demand, before writing weft | the language surface: syntax, how names are spelled, types, groups, loops, the pulse model, every error slug |
 | `.kilo/skills/weft-catalog/` | on demand, before picking nodes | reading `metadata.json`, node families, the recurring wiring patterns |
 | `.kilo/skills/weft-gaps/` | on demand, when no node can honestly deliver what is needed | the tracker search, the issue templates and their exact field ids, and the pre-filled issue URL handed to the user |
 | `.kilo/skills/weft-models/` | on demand, before wiring an LLM call | reasoning on or off, `maxTokens`, an empty reply, what a model costs, prompt caching |
 | `.kilo/skills/weft-safety/` | on demand, when a program talks to a model or acts on the world | the swiss cheese model, the free layers built by default (a defensive prompt, one more key on the call already being made, limits at the interface), the layers that add a call or a person offered once when the stakes are real, the gate and human-check wiring |
 | `.kilo/skills/weft-node-authoring/` | on demand, around dispatches | the dispatch protocol and review checklist for Tangle, and the authoring manual the specialist reads |
 | `.kilo/skills/weft-running/` | on demand, when running | the CLI map, the daemon, the build and run flow, the deactivate modes, the infra verbs, how long each command takes |
-| `.kilo/skills/weft-debugging/` | on demand, when a run failed or did the wrong thing | reading a run (executions, logs, events), every skip and cancel reason, the debugging playbook |
+| `.kilo/skills/weft-debugging/` | on demand, when a run failed or did the wrong thing | reading a run (runs, logs, events), every skip and cancel reason, the debugging playbook |
 | `.kilo/skills/weft-sdp/` | on demand, when growing a program stage by stage | seeded runs, specs that run one piece with values handed in, firing a trigger without activating, the version tree, freezing and checking examples, every refusal and the verb that answers it |
 | `.kilo/skills/weft-editor/` | on demand, about the VS Code interface | the graph view: toolbar, action bar, palette, gestures, groups and loops, inspector, labels verbatim |
 | `.kilo/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, what each banner means |
 | `.kilo/skills/weft-people-in-the-loop/` | on demand, when a person answers the program | how a waiting question reaches people, the browser extension, task tokens |
 | `.kilo/skills/weft-public-address/` | on demand, when the internet must reach weft or the project's site | the public URL, the activation error that asks for one, tunnels, and hosting the site from this computer behind an address of the user's |
 | `.kilo/skills/weft-consumers/` | on demand, when building a consumer of a program's signals | the api token, the dispatcher doors, the listing and form shapes, how a new kind reaches consumers, the reference extension |
-| `.kilo/skills/weft-frontend/` | on demand, when the user wants a page, app, or site | the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes as its API, the signal doors for human steps, sharing one Postgres, the build |
+| `.kilo/skills/weft-frontend/` | on demand, when the user wants a page, app, or site | the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes as its API, the signal doors for the people in the loop, sharing one Postgres, the build |
 | `.kilo/skills/weft-api/` | on demand, when the program is an HTTP API or a WebSocket service | the `Route` and `Socket` triggers, `Reply`, `Stream` and `Close`, gating a route with an auth connection, the shapes that need a custom node, trying it with curl and a socket client |
 | `.kilo/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.kilo/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
@@ -89,7 +89,7 @@ commands are the expert's hand on the same loop.
 | `.kilo/scripts/specialist_quiet.py` | when Tangle looks at a specialist out for twenty minutes | takes one task id (`ses_...`, nothing else), runs one fixed read-only query through `kilo db` and prints how many minutes ago that session, or one it started, last wrote anything |
 | `.kilo/scripts/try_prompt.py` | when the prompt-engineer tries a prompt | runs one prompt on one input through `kilo run`, with a one-off agent it builds itself (the prompt file as its prompt, no tools, the project's own config and `AGENTS.md` left out), and prints the answer; it takes `--model`, `--prompt` and `--input`, or `--models` alone, and refuses anything else |
 | `.kilo/agent/run-digger.md` | when dispatched | post-mortem only: walks journals, logs, source, and stored files, compares good runs against bad ones, reports the finding with quoted evidence; read-only, never fixes |
-| `.kilo/agent/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue steps, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
+| `.kilo/agent/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue nodes, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
 | `.kilo/agent/group-builder.md` | when dispatched, one per included file | builds one included file under `src/`, inside the `Group(...) -> (...)` line Tangle wrote (adding the ports it needs, and listing them for Tangle to wire), and proves it alone with `weft run --group`; never touches `src/main.weft` or another file |
 | `.kilo/agent/node-smith.md` | when dispatched | builds and proves exactly one node, unsupervised, web access for service docs, local test tiers green, live tests written but not run |
 | `.kilo/agent/frontend-builder.md` | when dispatched | builds and proves the project's frontend under `front/`, unsupervised: the pages, the server-held api token, the client that calls the program's own routes and signals, on the default stack unless the user named their own; starts the designer first |

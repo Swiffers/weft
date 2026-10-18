@@ -22,7 +22,7 @@ start_x = HumanTrigger {
   fields: [{ "kind": "approve_reject", "key": "go" }]
 }
 gate_x = Cast -> (value: String) {
-  _should_flow: start_x.go_approved
+  _should_flow: start_x.goApproved
   value: shared.value
 }
 out_x = Debug
@@ -36,7 +36,7 @@ start_y = HumanTrigger {
   fields: [{ "kind": "approve_reject", "key": "go" }]
 }
 gate_y = Cast -> (value: String) {
-  _should_flow: start_y.go_approved
+  _should_flow: start_y.goApproved
   value: shared.value
 }
 out_y = Debug

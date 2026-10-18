@@ -36,7 +36,7 @@ impl SettledRun {
         let mut ids: Vec<String> = self
             .replay
             .by_kind("bus_joined")
-            .filter_map(|e| e.str_field("bus_id").map(str::to_string))
+            .filter_map(|e| e.str_field("busId").map(str::to_string))
             .collect();
         ids.sort();
         ids.dedup();
@@ -47,7 +47,7 @@ impl SettledRun {
     pub fn bus_participants(&self, bus_id: &str) -> Vec<String> {
         self.replay
             .by_kind("bus_joined")
-            .filter(|e| e.str_field("bus_id") == Some(bus_id))
+            .filter(|e| e.str_field("busId") == Some(bus_id))
             .filter_map(|e| e.str_field("name").map(str::to_string))
             .collect()
     }
@@ -56,7 +56,7 @@ impl SettledRun {
     pub fn bus_messages(&self, bus_id: &str) -> Vec<BusMessage> {
         self.replay
             .by_kind("bus_window")
-            .filter(|e| e.str_field("bus_id") == Some(bus_id))
+            .filter(|e| e.str_field("busId") == Some(bus_id))
             .flat_map(|e| {
                 e.field("messages")
                     .and_then(Value::as_array)
@@ -67,7 +67,7 @@ impl SettledRun {
                 bus_id: bus_id.to_string(),
                 from: m.get("from").and_then(Value::as_str).unwrap_or_default().to_string(),
                 msg_kind: m
-                    .get("msg_kind")
+                    .get("msgKind")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
@@ -86,7 +86,7 @@ impl SettledRun {
     pub fn bus_closed(&self, bus_id: &str) -> bool {
         self.replay
             .by_kind("bus_closed")
-            .any(|e| e.str_field("bus_id") == Some(bus_id))
+            .any(|e| e.str_field("busId") == Some(bus_id))
     }
 
     /// Assert a bus conversation happened: at least one bus, with at least
@@ -101,7 +101,7 @@ impl SettledRun {
         let Some(bus_id) = self.bus_ids().into_iter().next() else {
             bail!(
                 "expected a bus conversation, but no bus_joined events in run {}",
-                self.execution_id
+                self.run_id
             );
         };
         let parts = self.bus_participants(&bus_id);

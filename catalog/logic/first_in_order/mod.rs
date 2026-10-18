@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct FirstInOrderNode;
@@ -32,7 +32,7 @@ impl Node for FirstInOrderNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // `in_order` walks the node's ports in the order they were
         // written and yields only the ones that DELIVERED: a branch
         // that closed is absent, so the first pair is the winner.

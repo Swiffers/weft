@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use weft_broker::door::{let_go, DoorWorker};
 use weft_broker_client::protocol::LetGo;
 use weft_dispatcher::journal::Journal;
-use weft_journal::ExecEvent;
+use weft_journal::RunEvent;
 
 const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
 const TENANT: &str = "t1";
@@ -35,17 +35,17 @@ fn worker(replica: &str) -> DoorWorker<'_> {
 }
 
 /// A run driven by `owner`: queued, then claimed by it.
-async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::ExecutionId {
-    let execution_id = weft_core::new_execution_id();
-    let birth = ExecEvent::ExecutionStarted {
-        execution_id,
+async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
+    let run_id = weft_core::new_run_id();
+    let birth = RunEvent::RunStarted {
+        run_id,
         project_id: PROJECT,
         entry_node: "route".into(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
         binary_hash: Some("bin-1".into()),
         source_version: None,
-        run_kind: weft_core::exec::RunKind::Execution,
+        run_kind: weft_core::run::RunKind::Project,
         selection: None,
         seed: None,
         instance: None,
@@ -68,14 +68,14 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::ExecutionId {
     };
     assert!(journal.queue_run(queued, false).await.expect("queue the run"));
     let mut conn = pool.acquire().await.unwrap();
-    weft_journal::record::claim(&mut conn, execution_id, PROJECT, owner).await.unwrap().expect("claimed");
-    execution_id
+    weft_journal::record::claim(&mut conn, run_id, PROJECT, owner).await.unwrap().expect("claimed");
+    run_id
 }
 
 /// The run's state and owner.
-async fn standing(pool: &PgPool, execution_id: weft_core::ExecutionId) -> (String, Option<String>) {
-    sqlx::query_as("SELECT state, owner FROM run WHERE execution_id = $1")
-        .bind(execution_id)
+async fn standing(pool: &PgPool, run_id: weft_core::RunId) -> (String, Option<String>) {
+    sqlx::query_as("SELECT state, owner FROM run WHERE run_id = $1")
+        .bind(run_id)
         .fetch_one(pool)
         .await
         .expect("the run's row")
@@ -84,40 +84,40 @@ async fn standing(pool: &PgPool, execution_id: weft_core::ExecutionId) -> (Strin
 #[sqlx::test]
 async fn a_run_handed_back_is_queued_for_another_worker(pool: PgPool) {
     schema(&pool).await;
-    let execution_id = driven_by(&pool, "w1").await;
-    assert!(let_go(&pool, worker("w1"), execution_id, LetGo::HandedBack).await.unwrap());
-    assert_eq!(standing(&pool, execution_id).await, ("queued".into(), None));
+    let run_id = driven_by(&pool, "w1").await;
+    assert!(let_go(&pool, worker("w1"), run_id, LetGo::HandedBack).await.unwrap());
+    assert_eq!(standing(&pool, run_id).await, ("queued".into(), None));
 }
 
 #[sqlx::test]
 async fn only_its_owner_lets_go_of_a_run(pool: PgPool) {
     schema(&pool).await;
-    let execution_id = driven_by(&pool, "w1").await;
-    assert!(!let_go(&pool, worker("w2"), execution_id, LetGo::HandedBack).await.unwrap());
-    assert!(!let_go(&pool, worker("w2"), execution_id, LetGo::Parked).await.unwrap());
-    assert_eq!(standing(&pool, execution_id).await, ("running".into(), Some("w1".into())));
+    let run_id = driven_by(&pool, "w1").await;
+    assert!(!let_go(&pool, worker("w2"), run_id, LetGo::HandedBack).await.unwrap());
+    assert!(!let_go(&pool, worker("w2"), run_id, LetGo::Parked).await.unwrap());
+    assert_eq!(standing(&pool, run_id).await, ("running".into(), Some("w1".into())));
 }
 
 #[sqlx::test]
 async fn a_run_parked_waits_with_no_owner(pool: PgPool) {
     schema(&pool).await;
-    let execution_id = driven_by(&pool, "w1").await;
-    assert!(let_go(&pool, worker("w1"), execution_id, LetGo::Parked).await.unwrap());
-    assert_eq!(standing(&pool, execution_id).await, ("parked".into(), None));
+    let run_id = driven_by(&pool, "w1").await;
+    assert!(let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap());
+    assert_eq!(standing(&pool, run_id).await, ("parked".into(), None));
 }
 
 /// A run that ended is nobody's to let go of.
 #[sqlx::test]
 async fn a_run_that_ended_meanwhile_is_left_alone(pool: PgPool) {
     schema(&pool).await;
-    let execution_id = driven_by(&pool, "w1").await;
-    sqlx::query("UPDATE run SET state = 'ended', owner = NULL, outcome = 'cancelled', ended_at = 1 WHERE execution_id = $1")
-        .bind(execution_id)
+    let run_id = driven_by(&pool, "w1").await;
+    sqlx::query("UPDATE run SET state = 'ended', owner = NULL, outcome = 'cancelled', ended_at = 1 WHERE run_id = $1")
+        .bind(run_id)
         .execute(&pool)
         .await
         .unwrap();
-    assert!(!let_go(&pool, worker("w1"), execution_id, LetGo::HandedBack).await.unwrap());
-    assert_eq!(standing(&pool, execution_id).await.0, "ended");
+    assert!(!let_go(&pool, worker("w1"), run_id, LetGo::HandedBack).await.unwrap());
+    assert_eq!(standing(&pool, run_id).await.0, "ended");
 }
 
 /// A letting go asked again after its answer was lost finds the run let go
@@ -125,10 +125,10 @@ async fn a_run_that_ended_meanwhile_is_left_alone(pool: PgPool) {
 #[sqlx::test]
 async fn a_let_go_asked_again_is_answered_the_same(pool: PgPool) {
     schema(&pool).await;
-    let execution_id = driven_by(&pool, "w1").await;
-    assert!(let_go(&pool, worker("w1"), execution_id, LetGo::HandedBack).await.unwrap());
-    assert!(let_go(&pool, worker("w1"), execution_id, LetGo::HandedBack).await.unwrap());
-    assert!(!let_go(&pool, worker("w1"), execution_id, LetGo::Parked).await.unwrap(), "it was queued, not parked");
+    let run_id = driven_by(&pool, "w1").await;
+    assert!(let_go(&pool, worker("w1"), run_id, LetGo::HandedBack).await.unwrap());
+    assert!(let_go(&pool, worker("w1"), run_id, LetGo::HandedBack).await.unwrap());
+    assert!(!let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap(), "it was queued, not parked");
 }
 
 /// An answer handed to the run while its worker drove it, and not taken
@@ -137,19 +137,19 @@ async fn a_let_go_asked_again_is_answered_the_same(pool: PgPool) {
 #[sqlx::test]
 async fn an_answer_handed_to_a_run_that_parks_reaches_its_record(pool: PgPool) {
     schema(&pool).await;
-    let execution_id = driven_by(&pool, "w1").await;
+    let run_id = driven_by(&pool, "w1").await;
     let mut tx = pool.begin().await.unwrap();
-    weft_task_store::parked_fires::hand_answer_in(&mut tx, "form", execution_id, &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap();
+    weft_task_store::parked_fires::hand_answer_in(&mut tx, "form", run_id, &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap();
     tx.commit().await.unwrap();
-    assert!(let_go(&pool, worker("w1"), execution_id, LetGo::Parked).await.unwrap());
-    assert_eq!(standing(&pool, execution_id).await, ("queued".into(), None));
+    assert!(let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap());
+    assert_eq!(standing(&pool, run_id).await, ("queued".into(), None));
     let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
-    let events = journal.events_log(execution_id).await.unwrap();
+    let events = journal.events_log(run_id).await.unwrap();
     assert!(
-        matches!(events.last(), Some(ExecEvent::SuspensionResolved { token, .. }) if token == "form"),
+        matches!(events.last(), Some(RunEvent::SuspensionResolved { token, .. }) if token == "form"),
         "{events:?}"
     );
-    assert!(weft_task_store::parked_fires::answers_for(&pool, execution_id).await.unwrap().is_empty(), "taken once");
+    assert!(weft_task_store::parked_fires::answers_for(&pool, run_id).await.unwrap().is_empty(), "taken once");
 }
 
 /// After its line may have missed some, a worker reads the cancels and the
@@ -161,9 +161,9 @@ async fn one_recheck_reads_the_cancels_and_answers_of_every_run_a_worker_drives(
     let cancelled = driven_by(&pool, "w1").await;
     let answered = driven_by(&pool, "w1").await;
     let elsewhere = driven_by(&pool, "w2").await;
-    sqlx::query("UPDATE run SET cancel_requested = $2 WHERE execution_id = $1")
+    sqlx::query("UPDATE run SET cancel_requested = $2 WHERE run_id = $1")
         .bind(cancelled)
-        .bind(sqlx::types::Json(weft_core::exec::CancelCause::User))
+        .bind(sqlx::types::Json(weft_core::run::CancelCause::User))
         .execute(&pool)
         .await
         .unwrap();
@@ -176,8 +176,8 @@ async fn one_recheck_reads_the_cancels_and_answers_of_every_run_a_worker_drives(
 
     let rechecked = weft_broker::records::rechecked(&pool, "w1", PROJECT).await.unwrap();
     assert_eq!(rechecked.cancels.len(), 1);
-    assert_eq!((rechecked.cancels[0].execution_id, &rechecked.cancels[0].cause), (cancelled, &weft_core::exec::CancelCause::User));
-    let answers: Vec<_> = rechecked.answers.iter().map(|a| (a.execution_id, a.token.as_str())).collect();
+    assert_eq!((rechecked.cancels[0].run_id, &rechecked.cancels[0].cause), (cancelled, &weft_core::run::CancelCause::User));
+    let answers: Vec<_> = rechecked.answers.iter().map(|a| (a.run_id, a.token.as_str())).collect();
     assert_eq!(answers, vec![(answered, "first"), (answered, "second")], "its own, oldest first; nothing of w2's");
 }
 
@@ -191,9 +191,9 @@ async fn a_previous_release_worker_still_reads_its_cancels(pool: PgPool) {
     driven_by(&pool, "w1").await;
     let elsewhere = driven_by(&pool, "w2").await;
     for run in [cancelled, elsewhere] {
-        sqlx::query("UPDATE run SET cancel_requested = $2 WHERE execution_id = $1")
+        sqlx::query("UPDATE run SET cancel_requested = $2 WHERE run_id = $1")
             .bind(run)
-            .bind(sqlx::types::Json(weft_core::exec::CancelCause::User))
+            .bind(sqlx::types::Json(weft_core::run::CancelCause::User))
             .execute(&pool)
             .await
             .unwrap();
@@ -201,6 +201,6 @@ async fn a_previous_release_worker_still_reads_its_cancels(pool: PgPool) {
 
     let cancels = weft_broker::records::previous_release_cancels(&pool, "w1", PROJECT).await.unwrap();
     let wire = serde_json::to_value(&cancels).unwrap();
-    let expected = vec![weft_broker_client::protocol::RunCancel { execution_id: cancelled, cause: weft_core::exec::CancelCause::User }];
+    let expected = vec![weft_broker_client::protocol::RunCancel { run_id: cancelled, cause: weft_core::run::CancelCause::User }];
     assert_eq!(wire, serde_json::json!({ "cancels": serde_json::to_value(&expected).unwrap() }));
 }

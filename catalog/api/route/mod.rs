@@ -2,7 +2,7 @@
 //! outside caller hits the route at the project's live URL; the
 //! dispatcher matches the path and method, checks the caller against
 //! the route's auth, holds the connection open and routes it to a
-//! worker; this trigger fires a fresh execution with the request on its
+//! worker; this trigger fires a fresh run with the request on its
 //! ports.
 //!
 //!   - `setup_trigger`: build a `Route` signal from the node's fields
@@ -28,7 +28,7 @@ use serde_json::Value;
 use weft::caller::InboundMessage;
 use weft::node::NodeOutput;
 use weft::signal::{DataType, LiveConnectionConfig, Route};
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::wire::{self, REQUEST_PORTS};
 
@@ -45,13 +45,13 @@ impl Node for RouteNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let fields = ctx.inputs.object()?;
         let common = LiveConnectionConfig::from_node_fields(fields).map_err(weft::node_error)?;
         ctx.register_signal(Route { common }).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let request = wire::opening_request(&ctx)?;
         let http = ctx.http_caller().await?;
         let parts = http.request_parts()?;
@@ -160,7 +160,7 @@ impl Node for RouteNode {
 /// path's captures: where the body lands. A port named like a capture
 /// reads the capture, so a `GET preview/{view}` on a bytes route can
 /// read `view` and still answer bytes.
-fn declared_body_ports(ctx: &ExecutionContext, captures: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+fn declared_body_ports(ctx: &RunContext, captures: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let mut ports: Vec<String> = ctx
         .declared_outputs()
         .keys()
@@ -184,7 +184,7 @@ fn declared_body_ports(ctx: &ExecutionContext, captures: &std::collections::BTre
 /// refused by the fire payload contract before this runs, against the
 /// type the metadata declares, so a bytes route is not fireable: its
 /// body has no declared type a fire payload can carry.
-fn fired_body(ctx: &ExecutionContext) -> WeftResult<InboundMessage> {
+fn fired_body(ctx: &RunContext) -> WeftResult<InboundMessage> {
     let Some(body) = ctx.wake.opt::<Value>("body")? else {
         return Ok(InboundMessage::Json(Value::Null));
     };

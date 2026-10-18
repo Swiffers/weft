@@ -118,14 +118,64 @@ Unknown keys are a loud parse error. Top level:
 | `inputs` | one list for wired data and design-time config |
 | `outputs` | output ports |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `catchErrors` (the node reaches outside; weft adds the `error` output and catches the body's failures onto it), `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do) |
+| `features` | flags: `catchErrors` (the node reaches outside; weft adds the `error` output and catches the body's failures onto it), `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `addedPortsAreDataKeys` (under Spelling) |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
-| `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name |
+| `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name. On a node without `features.isTrigger`, or with a type weft cannot parse, the node fails to load |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
 | `validate` | declarative rules: `{ "when": {...}, "then": {message, level: "structural"\|"runtime", field} }` |
-| `requires_infra`, `images`, `publishes` | infra nodes |
+| `requiresInfra`, `images`, `publishes` | infra nodes |
 | `service` | access nodes only, the connection recipe |
-| `accessApps` | project-shipped OAuth apps |
+| `claimsRoute` | a node that claims a public address: `pathField` names the input holding the route pattern, and the optional `methodField` the input holding the HTTP method. Leave `methodField` out and the node serves every method; with it set, a program that leaves that input empty serves every method too. Naming an input the node does not declare fails the load |
+| `accessApps` | project-shipped OAuth apps, keyed by service name (`google`); what an entry may hold is below the table |
+
+An `accessApps` entry holds `label`, `client_id` and the service's
+`registrationFields` that it marks `"secret": false` (a field is secret unless
+marked otherwise). The entry ships to everyone who uses the node, so a
+`client_secret` or a secret registration field in it fails the node's load.
+The load also fails when the key names no service in the project's catalog,
+or a service that does not sign in through OAuth, or a service that needs a
+secret field in every app. It fails too when `label`, `client_id` or a
+registration field the service does not mark `optional` is missing or empty,
+and when the entry has a key the service does not declare.
+
+### Spelling
+
+The `type`, and any type you declare under `types`, is PascalCase
+(`WordCount`). Every key weft defines is camelCase (`requiresInfra`,
+`freeText`, `dependsOn`, `connectionOptional`), and so is every port, setting
+and record field you name, each field under `firesWith`, the names under each
+event's `fields` in a service's `events`, and each name of a value a
+connection stores (`imapHost`), both where a service declares it (`fields`,
+`captures`, `registrationFields`) and where an input asks for it
+(`requiresValues`). Two kinds of key are snake_case: an event topic
+(`drive_changes`) and a key under `accessApps` (`google`). They are
+snake_case because a node also writes them as values (a trigger picks a topic
+by name, and a node names its service as `"service": "google"`), and every
+value from a fixed list weft defines is snake_case (a widget's `kind`, a
+rule's `kind`). The `options` of a select you write keep whatever spelling
+the values have (`Africa/Abidjan`). A
+name somebody else chose keeps their spelling: an OAuth parameter under
+`authParams` (`access_type`), `client_id` in an `accessApps` entry, a field
+of a body you send a provider.
+
+A key weft used to spell in snake_case (`requires_infra`) fails the load,
+and the error names the new spelling (``requires_infra` is spelled
+`requiresInfra` now``); in a package root's defaults, the whole package is
+left out. A snake_case key weft never had is an unknown key: on a node it
+fails the load, and in a package root's defaults the root gets a warning
+instead and every member that inherits it fails to load. Any other name in
+the wrong casing loads, with a catalog warning:
+`weft describe-nodes --list` and `weft validate < src/main.weft` print it on
+stderr as `warning: <NodeType> (<path>): <message>` (a package root's
+defaults as `warning: package '<name>' defaults (<path>): ...`), and the
+graph view lists it as "node spelling warning". Clear every one on a node you
+write.
+
+If the ports a program adds to your node are named after data from outside
+weft (a request body's fields, a query's parameters, a table's columns, a
+template's ids), set `features.addedPortsAreDataKeys`. The compiler's
+`not-camel-case` warning then leaves the ports a program adds alone, and still
+checks the name the program gives the node.
 
 Input entry: `name`, `type`, `required`, `requiredWhenWired`, `accepts`,
 `widget`, `default`, `label`, `placeholder`, `description`, `requiresScopes`,
@@ -144,7 +194,7 @@ then refuses a connection that lacks it, naming the permission.
 A `select` or `multiselect` widget's `options` are a closed list: a program
 writing anything else fails with `literal-not-an-option`. Keep it closed when
 your code matches on the value. When the list is only the ones you know of
-and a provider can add more (model ids, voices), add `"free_text": true` to
+and a provider can add more (model ids, voices), add `"freeText": true` to
 the widget, and the options become suggestions.
 A `code` widget's `language` is one of `python`, `javascript`, `sql`, `json`;
 any other word fails to load. `json` also fits a `JsonDict` input
@@ -175,13 +225,13 @@ nodes by a feature they declare, with `with: {feature: value}`.
 - `input_names` (`port`, `names`): every name written in that input (a
   String, each String of a list, or each key of an object) is something of
   this program. `names: {"node": {}}` is a node, narrowed with optional
-  `role: "infra"` or `"trigger"` and `per_instance: true/false`;
+  `role: "infra"` or `"trigger"` and `perInstance: true/false`;
   `names: {"field": {}}` is a field written `node.field`, narrowed with
-  optional `instance_filled: true/false`. Wrap it in `not` to refuse a bad
+  optional `instanceFilled: true/false`. Wrap it in `not` to refuse a bad
   name. A wired name is not known yet, so the rule does not fire on it.
 
-`{with}`, `{per_instance_reason}` and `{names}` in the message name what the
-check found (`{per_instance_reason}` says why, path included: "it reads
+`{with}`, `{perInstanceReason}` and `{names}` in the message name what the
+check found (`{perInstanceReason}` says why, path included: "it reads
 'bridge'", "it sits inside group 'work', which receives 'bridge'"). Copy a real rule from `Route`, `Reply` or `StartInfra`
 before writing your own.
 
@@ -205,7 +255,7 @@ A minimal, real example (the catalog's `Text`):
 {
   "type": "Text",
   "label": "Text",
-  "description": "Emit a literal string. Useful for prompts, labels, and config values.",
+  "description": "Emit a literal string (a prompt, a label, a config value).",
   "tags": ["literal", "string"],
   "icon": "Type",
   "color": "#64748b",
@@ -216,7 +266,7 @@ A minimal, real example (the catalog's `Text`):
   "outputs": [
     { "name": "value", "type": "String" }
   ],
-  "requires_infra": false
+  "features": { "pure": true }
 }
 ```
 
@@ -227,7 +277,7 @@ A minimal, real example (the catalog's `Text`):
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -241,7 +291,7 @@ impl Node for MyThingNode {
     #[cfg(feature = "node-tests")]
     fn tests(&self) -> Vec<weft::NodeTest> { tests::tests() }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: String = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("out", value)).await
     }
@@ -330,11 +380,11 @@ user-added output ports use `ctx.fan_declared(...)`.
 
 **Share what is slow to build**: a client pool, a process. `ctx.shared(&access, |opened| async move { .. })` builds it the first time a run asks and hands every later run on that worker the same one; it is built again when the connection's values change, or after nobody used it for the project's idle window (300 seconds by default, `weft workers set --shared-idle-seconds`). The closure returns a `WeftResult` of the thing and you get a handle you use as the thing. `ctx.shared("name", |()| async { .. })` is the same when nothing is built from a connection, and `.with_limit(n)` before the `.await` lets at most `n` runs of a worker hold it at once (a pool kept under a database's connection limit). A database client opened on every run pays the connection each time; for a worked pool, go and read `nodes/base_catalog/postgres/postgres.rs`.
 
-If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the step: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `catchErrors` and `error` wired, that failure goes to `error` like any other. A node marked `pure` is the exception: a step of it that had sent nothing on and read no stream runs again, since it did nothing anyone could see. The one other body weft starts again on purpose is one parked on `ctx.await_signal`, which replays from the top when its answer comes, so the work before the wait goes through `ctx.run(...)`, which
+If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the node: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `catchErrors` and `error` wired, that failure goes to `error` like any other. A node marked `pure` is the exception: a firing of it that had sent nothing on and read no stream runs again, since it did nothing anyone could see. The one other body weft starts again on purpose is one parked on `ctx.await_signal`, which replays from the top when its answer comes, so the work before the wait goes through `ctx.run(...)`, which
 gives back the recorded result. An emit on a port already sent before the wait does nothing on the replay, so a node can send `stats` at once, wait, then send `image`; what it cannot do is wait after yielding on or closing a stream output, which is refused. In a run that cannot pause (a route's caller on the line, `recorded: false`, a bus open), `ctx.await_signal` holds in your call instead and returns the answer without a replay; if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp`, which your node may match and handle (test it with `rig.signal_given_up()`).
 
 **Stopping is cooperative, and a node that ignores it cannot be stopped.**
-Nothing kills a node mid-call: a cancelled execution (the caller left, a
+Nothing kills a node mid-call: a cancelled run (the caller left, a
 person pressed stop, a newer run stopped this one) only trips a flag, and
 the node is what acts on it. So anything that does not return promptly by
 itself watches that flag and returns when it trips:
@@ -359,7 +409,7 @@ you catch yourself writing a loop with no cancellation arm, stop and write:
 Any node can stop other runs of its project from inside its own body, and
 two ctx calls are the whole of it (`TagRun` and `StopTagged` are thin
 wrappers over exactly these, with no privilege yours lacks):
-`ctx.tag_execution([tag, ...]).await?`
+`ctx.tag_run([tag, ...]).await?`
 puts tags on this run; `ctx.stop_tagged(tag, StopSelf::Keep).await?` stops
 every older run of the project carrying the tag, waiting ones included (a
 run parked on a person or a timer never wakes); `StopSelf::Include` stops
@@ -372,7 +422,7 @@ as a tag, a chat id or an email included: the ctx keeps a valid tag
 (`[A-Za-z0-9_-]{1,64}`) as it is and turns anything else into one (other
 characters become `_`, plus a short fingerprint of the original), the same
 way in both calls, so never clean a tag yourself. Only an empty tag fails. In the `fake` tier nothing is stopped:
-`rig.execution_tags()` and `rig.stops()` record what the node asked for, so
+`rig.run_tags()` and `rig.stops()` record what the node asked for, so
 you assert on those.
 
 A program with instances (separate running copies of part of it, each under
@@ -388,8 +438,8 @@ and end in one call:
 | `.status()` | `Option<InfraCopy>`: `{ node, instance, status, failure }`, `None` when there is no container |
 | `ctx.infra(node).copies()` | `Vec<InfraCopy>`, the shared container and each instance's |
 | `ctx.triggers().instance(id).activate()` / `.deactivate(spec, stop_self)` | `()`; `.only([..])` narrows to named triggers |
-| `ctx.values().instance(id).get()` | `InstanceValues`: step -> field -> value, what was given for the instance's `@instance_filled` fields |
-| `ctx.values().instance(id).set(step, field, value).clear(step, field).apply()` | `Vec<String>`, the instance's triggers set up again; each value is checked against its node first, all or none |
+| `ctx.values().instance(id).get()` | `InstanceValues`: node -> field -> value, what was given for the instance's `@instance_filled` fields |
+| `ctx.values().instance(id).set(node, field, value).clear(node, field).apply()` | `Vec<String>`, the instance's triggers set up again; each value is checked against its node first, all or none |
 | `ctx.values().instance(id).forget()` | `Vec<String>`, as `apply()` |
 | `ctx.connections().instance(id).list()` / `.forget()` | `Vec<GrantSummary>` / `u64` forgotten |
 | `ctx.costs().instance(id).service(s).node(n).paid_by(p).since(unix).list()` | `Vec<CostRecord>`: `{ run, instance, node, service, model, amount_usd: Option<f64>, paid_by, at_unix }` |
@@ -420,20 +470,20 @@ permission with `"always": true` and it is asked for on every connection
 section has the rules). Credentials live sealed in the runtime's access store,
 never in the project. The compiler synthesizes the runtime
 "no connection picked" rule from the `service` block; a hand-written one is
-a finding. `"connection_optional": true` inside the service block is
+a finding. `"connectionOptional": true` inside the service block is
 reserved for a node that genuinely runs unconnected. That node is the one
 access shape the macro cannot serve (`access_node!` on a
-`connection_optional` service fails loudly at run time): it writes its own
+`connectionOptional` service fails loudly at run time): it writes its own
 body and reads the pick with `ctx.inputs.access("<picker input>")?`, which
 returns `None` when nothing is picked.
 
-**Infra node**: `"requires_infra": true`, plus `images` (dirs with a
+**Infra node**: `"requiresInfra": true`, plus `images` (dirs with a
 Dockerfile the CLI builds) and `publishes` (the service name it hands out).
 Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`
 returning the desired-state spec; the engine applies it, then calls `run`.
 
 **Bake every output that holds as long as the infra does** (an address, a
-connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A step that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
+connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A node that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
 
 Every field of the `InfraSpec` (the machine and its GPU, containers, probes, disks,
 endpoints), long jobs, kept files and the rig calls for all of it are in
@@ -502,7 +552,7 @@ and the node reading the answer fails on it). A silent failure fails
 ### Infra node reference
 
 Every type below is in `weft::infra`. The spec exists only in Rust, as what
-`provision_infra` returns; `metadata.json` carries just `requires_infra` and
+`provision_infra` returns; `metadata.json` carries just `requiresInfra` and
 `images`. A whole spec for one container on a GPU, from the e2e fixture
 `infra_gpu`:
 
@@ -690,20 +740,20 @@ by giving up on a job whose status nobody has asked for in a few intervals
 terminating the infra stops it with everything else. To test the node, queue
 the answer with `rig.signal(json!({ "status": "done", "result": ... }))`.
 
-**Keeping a file past the run**: a file stored in `StorageScope::Execution`
+**Keeping a file past the run**: a file stored in `StorageScope::Run`
 with no keep is swept shortly after the run ends. If the file is what the
 node produced, pass a keep when you store it, the way a speech node does:
 
 ```rust
 use weft::storage::{KeepTtl, StorageScope};
 
-let file = ctx.storage(StorageScope::Execution)
+let file = ctx.storage(StorageScope::Run)
     .put(bytes, "audio/mpeg", "speech.mp3", Some(KeepTtl::Default))
     .await?;
 ```
 
 or keep one you already hold with
-`ctx.storage(StorageScope::Execution).keep(&file, KeepTtl::Default).await?`
+`ctx.storage(StorageScope::Run).keep(&file, KeepTtl::Default).await?`
 (a keep cannot be taken back). `KeepTtl::Default` is 30 days,
 `KeepTtl::Secs { secs }` is a number of seconds, and both start again at every
 access; `KeepTtl::Never` lasts until `weft files rm` or `weft clean`. Files in
@@ -789,7 +839,7 @@ is the stored-file marker (`__weft_image__`, `__weft_video__`,
 Python snippet, a provider's API) reads it straight off. A Rust node takes
 the input as a `FileHandle` (`let file: FileHandle =
 ctx.inputs.get("file")?;`) and reads it with
-`ctx.storage(StorageScope::Execution).get_bytes(&file).await?`, which hands
+`ctx.storage(StorageScope::Run).get_bytes(&file).await?`, which hands
 back `(meta, bytes)`: `meta.filename` and `meta.mime_type` are the file's
 details. If you want the details without the bytes,
 `StoredFile::from_value(&value)?` reads the value into `.key`, `.mime_type`,
@@ -842,7 +892,7 @@ bus closed.
 
 Do every bus read and wait on your own task, and never move a handle or a
 cursor into a `tokio::spawn`. The engine works out "everyone is stuck, close
-the buses" by watching what each node execution waits on, a wait on a task you
+the buses" by watching what each node's firing waits on, a wait on a task you
 spawned is invisible to it, and it then tears down a live conversation or
 hangs. If you need concurrency, that is another node exchanging over the bus.
 

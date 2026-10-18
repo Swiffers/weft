@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use weft::access::client::required_str;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -23,7 +23,7 @@ impl Node for SlackFindChannelNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let name: String = ctx.inputs.get("name")?;
         let wanted = name.trim_start_matches('#').to_string();

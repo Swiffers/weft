@@ -13,22 +13,22 @@ purpose, so a stray trackpad gesture cannot throw your whole graph off screen.
 
 Hold **Shift** and drag to select several boxes at once.
 
-## Add a step
+## Add a node
 
 Press **Ctrl+P** (**Cmd+P** on a Mac) and search. Right-clicking empty canvas
 and picking **Add Node...** opens the same list.
 ![The palette, opened with Ctrl+P](../img/graph-add-node.png)
 
 
-The list holds every step your project knows about, and `Group` and `Loop` are
-in there with the rest, because a group is a kind of step.
+The list holds every node your project knows about, and `Group` and `Loop` are
+in there too.
 
 It also holds the plain actions, so you can find them without remembering a
 chord: Undo, Redo, Duplicate Selected, Delete Selected, Select All Nodes, Fit
 View, and Auto Organize Layout, which tidies the whole canvas.
 
 If you already know what should come next, drag out of a dot and let go over
-empty canvas. The list opens, and the step you pick arrives with the arrow
+empty canvas. The list opens, and the node you pick arrives with the arrow
 already drawn. One **Ctrl+Z** takes away both.
 
 If the text of the file changes outside the graph (you type in the code tab,
@@ -36,7 +36,7 @@ or an AI writes the file), the graph forgets its undo history, because what it
 remembered no longer matches the text. Undo those earlier graph edits in the
 text editor instead. The graph never writes over a change made to the text.
 
-## Connect two steps
+## Connect two nodes
 
 Drag from a dot on one box's right edge to a dot on another box's left edge.
 The line takes the colour of the dot it started from.
@@ -58,13 +58,13 @@ arrow. You get the keys inside it with their types, and clicking one narrows
 the arrow to that key. **Up one level** goes back and **Read the whole value**
 undoes it.
 
-## Change what a step does
+## Change what a node does
 
 The small arrow in a box's header opens its body, where its fields are: text
 boxes, dropdowns, tickboxes, code editors, file pickers. A field fed by an
 arrow hides itself, because the arrow is now the source of that value.
 
-Under the inputs there is a **+ input** button, and **+ output** under the
+Under the inputs there is a **+ input** button, and **output +** under the
 outputs. A port you add starts with the type `MustOverride`, which is weft
 saying nobody has decided this yet, and the build stops until you do.
 Right-click the new dot and pick the **Type:** row to set it.
@@ -83,7 +83,7 @@ If you want each instance to get its own value for a field (an account, a
 spreadsheet, a schedule), click the ⧉ button beside the field's name, or
 right-click the field and pick **Let each instance fill this** (the same entry
 is on the right-click menu of the field's input port). The field then shows
-**Filled by each instance** instead of a control, and the node a **filled per
+**Filled per instance** instead of a control, and the node a **filled per
 instance** badge. If you had already written a value, an instance that gets
 none gets that one. Click ⧉ again, or pick **Stop letting each instance fill this**,
 and that value becomes the one value for everyone again, or the field goes back
@@ -107,7 +107,7 @@ target again offers **Unset target**.
 The same thing from a terminal:
 
 ```bash
-weft run --target daily_report
+weft run --target dailyReport
 ```
 
 The walk stops when it reaches a trigger, and a box that two branches share
@@ -126,7 +126,7 @@ are in [versions, seeds and frozen examples](../running/versions.md).
 
 **Run Project** is at the bottom of the canvas, or press **Ctrl+Enter** with
 the graph focused. While a run is going, that button becomes **Stop
-Execution**. The bar follows what happens whoever started it: an `infra start`
+Run**. The bar follows what happens whoever started it: an `infra start`
 typed in a terminal, or asked for by Tangle, shows as **Starting infra...** on
 the infrastructure buttons, and an activation as **Activating...**, each with
 its Cancel, the same as clicking them.
@@ -144,11 +144,11 @@ Each box gets a glow and a small mark:
 | Purple glow | Reused from an earlier run instead of run again |
 | Dimmed, no glow | Outside the part of the graph this run covered |
 
-Click the magnifying glass in a box's header, **Inspect execution**, for what
+Click the magnifying glass in a box's header, **Inspect run**, for what
 went in, what came out, how long it took and what it cost. A failed box shows
 its error there. A skipped box says why in words, such as
 `its _should_flow said no` or `the required input 'x' closed`, and you follow
-the arrows backwards from there to find the step that decided. If a step
+the arrows backwards from there to find the node that decided. If a node
 changed a stored file in place (added a turn to a conversation, say), its panel
 lists each change under **Files edited**: the file, the versions it moved
 between, and the lines added and removed.
@@ -175,7 +175,7 @@ follows again. A run started from a terminal, yours or an assistant's, never
 changes the mode. Each project remembers whether you left it following.
 
 For a run from yesterday, click the **Weft** icon in the side strip.
-**Executions** lists every run of the project you last opened, newest first,
+**Runs** lists every run of the project you last opened, newest first,
 and each row has **View in Graph**, which puts that run back on the canvas with
 its values in place and locks the toggle onto it. A replayed run looks exactly
 like a live one.
@@ -191,7 +191,7 @@ is shut. The wiring outside does not change either way.
 ![One group collapsed, then expanded with the same outside connections](../img/graph-groups.png)
 
 
-To make a group, add a `Group` step and drag boxes into it. weft decides where
+To make a group, add a `Group` from the list (**Ctrl+P**) and drag boxes into it. weft decides where
 a box landed from its centre, so drag it until its middle is inside. To undo
 that, delete the group: every box inside climbs out one level and keeps its
 position.

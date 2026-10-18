@@ -39,7 +39,7 @@ const unlocked: LockState = { codeEditLockUntil: null, lockGraphLogic: false };
 const NOW = 1_000_000;
 
 const addEdge = (source: string, target: string, scopeGroup: string | null = null): EditOp =>
-  ({ op: 'addEdge', source, sourcePort: 'value', target, targetPort: 'data', scopeGroup });
+  ({ op: 'add_edge', source, sourcePort: 'value', target, targetPort: 'data', scopeGroup });
 
 describe('lock state', () => {
   it('auto-lock engages until the deadline and expires on its own', () => {
@@ -57,14 +57,14 @@ describe('lock state', () => {
 
   it('rejects any source op while locked, with the lock reason', () => {
     const lock: LockState = { codeEditLockUntil: NOW + 1000, lockGraphLogic: false };
-    const r = runPreflight([{ op: 'removeNode', node: 'a' }], fixture(), lock, catalog, NOW);
+    const r = runPreflight([{ op: 'remove_node', node: 'a' }], fixture(), lock, catalog, NOW);
     expect(r).toEqual({ ok: false, reason: 'Graph logic locked (Weft code is being edited)' });
   });
 
   it("another install's program refuses every source op, whatever else is released", () => {
     const lock: LockState = { codeEditLockUntil: null, lockGraphLogic: false, installReadOnly: 'prod' };
     expect(isLogicLocked(lock, NOW)).toBe(true);
-    const r = runPreflight([{ op: 'removeNode', node: 'a' }], fixture(), lock, catalog, NOW);
+    const r = runPreflight([{ op: 'remove_node', node: 'a' }], fixture(), lock, catalog, NOW);
     expect(r).toEqual({ ok: false, reason: expect.stringMatching(/what prod runs, read-only; switch to local/) });
   });
 
@@ -111,7 +111,7 @@ describe('cycle rule', () => {
 describe('scope rule', () => {
   it('rejects a connection across scopes', () => {
     const r = runPreflight(
-      [{ op: 'addEdge', source: 'G.a', sourcePort: 'value', target: 'b', targetPort: 'data', scopeGroup: null }],
+      [{ op: 'add_edge', source: 'G.a', sourcePort: 'value', target: 'b', targetPort: 'data', scopeGroup: null }],
       fixture(), unlocked, catalog, NOW,
     );
     expect(r.ok).toBe(false);
@@ -120,13 +120,13 @@ describe('scope rule', () => {
 
   it('accepts self wiring from a child inside the scope group, rejects it from outside', () => {
     const inside = runPreflight(
-      [{ op: 'addEdge', source: 'a', sourcePort: 'value', target: 'self', targetPort: 'out', scopeGroup: 'G' }],
+      [{ op: 'add_edge', source: 'a', sourcePort: 'value', target: 'self', targetPort: 'out', scopeGroup: 'G' }],
       fixture(), unlocked, catalog, NOW,
     );
     // `a` resolves to G.a inside scopeGroup G; self is G's body: same scope.
     expect(inside.ok).toBe(true);
     const outside = runPreflight(
-      [{ op: 'addEdge', source: 'b', sourcePort: 'value', target: 'self', targetPort: 'out', scopeGroup: 'G' }],
+      [{ op: 'add_edge', source: 'b', sourcePort: 'value', target: 'self', targetPort: 'out', scopeGroup: 'G' }],
       fixture(), unlocked, catalog, NOW,
     );
     // `b` only exists at top level: inside G it resolves through the outer-ref
@@ -138,20 +138,20 @@ describe('scope rule', () => {
 
 describe('dry-run apply (the semantic backstop)', () => {
   it('rejects a move that would orphan connections, with the server wording', () => {
-    const r = runPreflight([{ op: 'moveNodeScope', node: 'a', targetGroup: 'G' }], fixture(), unlocked, catalog, NOW);
+    const r = runPreflight([{ op: 'move_node_scope', node: 'a', targetGroup: 'G' }], fixture(), unlocked, catalog, NOW);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/connections/);
   });
 
   it('rejects a duplicate id before the round-trip', () => {
-    const r = runPreflight([{ op: 'addNode', id: 'a', nodeType: 'Text', parentGroup: null }], fixture(), unlocked, catalog, NOW);
+    const r = runPreflight([{ op: 'add_node', id: 'a', nodeType: 'Text', parentGroup: null }], fixture(), unlocked, catalog, NOW);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/already exists/);
   });
 
   it('passes a clean batch through', () => {
     const r = runPreflight([
-      { op: 'addNode', id: 'd', nodeType: 'Text', parentGroup: null },
+      { op: 'add_node', id: 'd', nodeType: 'Text', parentGroup: null },
       addEdge('d', 'c'),
     ], fixture(), unlocked, catalog, NOW);
     expect(r.ok).toBe(true);

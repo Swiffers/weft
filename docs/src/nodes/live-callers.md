@@ -89,7 +89,7 @@ This is the thing to hold on to. A caller is a socket in one worker. It is not
 written down and it cannot be rebuilt.
 
 So a run holding one keeps its worker alive, and a node in that run cannot
-park for a week the way a human step does. If your program needs both, do the
+park for a week the way a node waiting on a person does. If your program needs both, do the
 long wait in a different run and answer the caller with something it can come
 back for.
 

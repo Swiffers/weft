@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmToolNode;
@@ -26,7 +26,7 @@ impl Node for LlmToolNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let name: String = ctx.inputs.get("name")?;
         let description: Option<String> = ctx.inputs.opt("description")?;
         // The schema arrives as a JSON object (the port's type holds it

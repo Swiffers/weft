@@ -1047,7 +1047,7 @@ fn set_config(
         // error, never a port value. Every other port is written as a
         // `g.key = value` statement, and on an include alias, which has
         // no braces, the gate is too.
-        if !weft_core::exec::skip::is_gate_port(key) || matches!(decl, Decl::Include(_)) {
+        if !weft_core::run::skip::is_gate_port(key) || matches!(decl, Decl::Include(_)) {
             // Only a DECLARED in-port may be written as `g.key = value`:
             // anything else would emit source the compiler then rejects.
             // Loop knobs (`over`, `parallel`, ...) are not ports and ride
@@ -1253,11 +1253,11 @@ fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), 
     // A `_label` field is only valid on a Node (an inline node included:
     // its label is just a body field). The merged group/loop lowering
     // rejects a label field in a container body as a compile error, so
-    // a setLabel targeting a Group/Loop would author an uncompilable
+    // a set_label targeting a Group/Loop would author an uncompilable
     // file. Fail at edit time with the honest kind error instead
-    // (containers are renamed via renameGroup / renameLoop).
+    // (containers are renamed via rename_group / rename_loop).
     if !matches!(decl, Decl::Node(_) | Decl::InlineNode(_)) {
-        return Err(kind_mismatch("setLabel", node_id, "Node", &decl));
+        return Err(kind_mismatch("set_label", node_id, "Node", &decl));
     }
     match label.filter(|l| !l.is_empty()) {
         Some(l) => set_or_insert_field(&decl, "_label", &format_string(l)?),
@@ -1282,7 +1282,7 @@ fn set_per_instance(view: &FileView, node_id: &str, on: bool) -> Result<(), Edit
                  first, then mark it per instance"
             )));
         }
-        other => return Err(kind_mismatch("setPerInstance", node_id, "Node", other)),
+        other => return Err(kind_mismatch("set_per_instance", node_id, "Node", other)),
     }
     let existing: Vec<SyntaxNode> = decl
         .body()
@@ -1854,7 +1854,7 @@ fn set_value_form(
 }
 
 /// Set or insert a loop config field (`parallel: true`, `over: [...]`,
-/// `carry: [...]`, `max_iters: 100`, `trim_on_mismatch: false`). The
+/// `carry: [...]`, `maxIters: 100`, `trimOnMismatch: false`). The
 /// value is a pre-formatted source token. Replaces in place if present.
 fn set_loop_config(view: &FileView, loop_id: &str, key: &str, value: &str) -> Result<(), EditError> {
     let lp = resolve_loop(view, loop_id)?;

@@ -39,7 +39,7 @@ review = HumanQuery {
 }
 
 allowed = FirstInOrder {
-  approved: review.send_approved
+  approved: review.sendApproved
   automatic: route.goAhead
 }
 

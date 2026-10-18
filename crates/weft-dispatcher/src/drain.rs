@@ -22,10 +22,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use weft_core::activation::ActivationKey;
-use weft_core::exec::CancelCause;
+use weft_core::run::CancelCause;
 use weft_core::instance::Copies;
 use weft_core::running_policy::RunningPolicy;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
 use crate::state::DispatcherState;
@@ -38,7 +38,7 @@ pub struct DrainScope<'a> {
     /// The run that asked for the drain (a program taking its own infra
     /// down): it is waited for like any other, but never cancelled by the
     /// drain; its own `StopSelf` decides its fate.
-    pub except: Option<ExecutionId>,
+    pub except: Option<RunId>,
 }
 
 /// What the work a drain waits on reaches.
@@ -163,7 +163,7 @@ impl Reaching<'_> {
             Self::Triggers(_) => "its trigger was taken down, and the wait for running work to finish reached its cap",
             Self::Copies(_) => "the infra it may use is going down, and the wait for running work to finish reached its cap",
             Self::OtherImages(_) => {
-                "this execution ran on an older image of the program, and the wait for it reached its cap after a new one went live"
+                "this run ran on an older image of the program, and the wait for it reached its cap after a new one went live"
             }
         };
         CancelCause::Runtime { detail: detail.into() }
@@ -179,9 +179,9 @@ pub async fn going(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Resul
 /// driven, but the one that asked, for `cause`.
 pub(crate) async fn cancel_left(state: &DispatcherState, scope: &DrainScope<'_>, cause: &CancelCause) -> anyhow::Result<()> {
     let runs = on_record(&state.pg_pool, scope).await?;
-    let targets: Vec<(ExecutionId, &CancelCause)> =
+    let targets: Vec<(RunId, &CancelCause)> =
         runs.iter().filter(|id| Some(**id) != scope.except).map(|id| (*id, cause)).collect();
-    crate::api::execution::cancel_execution_ids(state, &targets).await?;
+    crate::api::run::cancel_run_ids(state, &targets).await?;
     Ok(())
 }
 
@@ -260,9 +260,9 @@ async fn driven_by_workers(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyho
 
 /// The runs on record `scope` reaches that are queued for a worker or
 /// being driven by one.
-async fn on_record(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Result<Vec<ExecutionId>> {
+async fn on_record(pool: &sqlx::PgPool, scope: &DrainScope<'_>) -> anyhow::Result<Vec<RunId>> {
     let filter = scope.reaching.filter();
-    let sql = format!("SELECT r.execution_id FROM run r WHERE r.project_id = $1 AND {GOING} AND {}", filter.runs);
+    let sql = format!("SELECT r.run_id FROM run r WHERE r.project_id = $1 AND {GOING} AND {}", filter.runs);
     Ok(bound(sqlx::query_scalar(&sql), scope, &filter).fetch_all(pool).await?)
 }
 

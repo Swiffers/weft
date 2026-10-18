@@ -23,14 +23,14 @@ use serde_json::{json, Value};
 
 use weft::caller::{InboundMessage, OutboundChunk};
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LiveWsEchoNode;
 
 #[async_trait]
 impl Node for LiveWsEchoNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let ws = ctx.ws_caller().await?;
 
         let mut turn: u64 = 0;

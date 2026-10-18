@@ -1,12 +1,12 @@
-//! The execution event stream, as the rig reads it.
+//! The run event stream, as the rig reads it.
 //!
-//! `GET /executions/{execution_id}/replay` returns a JSON array of
+//! `GET /runs/{run_id}/replay` returns a JSON array of
 //! `weft_core::live_event::LiveEvent` (a `{ "kind": "...", ... }` tagged
 //! union). The fetch decodes every row as that type first, so a shape the
 //! dispatcher and weft-core disagree on fails there. An [`Event`] is then a
 //! thin accessor over the row's JSON: it exposes `kind()` and reads the
 //! handful of fields the assertions need by name (the node is `node`, NOT
-//! `node_id`; execution outputs are on `execution_completed.outputs`;
+//! `node_id`; run outputs are on `run_completed.outputs`;
 //! per-node values on `node_completed.output`), and a failed read carries
 //! the real JSON.
 
@@ -17,7 +17,7 @@ use serde_json::Value;
 pub struct Event(pub Value);
 
 impl Event {
-    /// The variant tag (`execution_completed`, `node_skipped`, ...). Empty
+    /// The variant tag (`run_completed`, `node_skipped`, ...). Empty
     /// string if the row has no `kind` (which would itself be a server bug the
     /// assertions then flag).
     pub fn kind(&self) -> &str {
@@ -67,7 +67,7 @@ impl Event {
     }
 }
 
-/// The full ordered replay for one execution. The rig's single read-back
+/// The full ordered replay for one run. The rig's single read-back
 /// surface: every assertion folds or scans this.
 #[derive(Debug, Clone)]
 pub struct Replay {
@@ -75,7 +75,7 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// Parse the JSON array returned by `/executions/{execution_id}/replay`.
+    /// Parse the JSON array returned by `/runs/{run_id}/replay`.
     pub fn from_array(raw: Vec<Value>) -> Self {
         Self {
             events: raw.into_iter().map(Event).collect(),
@@ -98,15 +98,15 @@ impl Replay {
         self.events.iter().filter(move |e| e.is_node(node))
     }
 
-    /// True once the run has ended: some event is an execution's ending,
-    /// by the one rule weft-core keeps (`DispatcherEvent::is_execution_terminal`).
+    /// True once the run has ended: some event is a run's ending,
+    /// by the one rule weft-core keeps (`DispatcherEvent::is_run_terminal`).
     /// A row that does not decode as a `LiveEvent` is an error, never "not
     /// ended": a changed replay shape must fail by name, not time out.
     pub fn has_terminal(&self) -> anyhow::Result<bool> {
         for e in &self.events {
             let live: weft_core::live_event::LiveEvent = serde_json::from_value(e.0.clone())
                 .map_err(|err| anyhow::anyhow!("a replay row does not decode as a LiveEvent ({err}): {}", e.0))?;
-            if live.event.is_execution_terminal() {
+            if live.event.is_run_terminal() {
                 return Ok(true);
             }
         }

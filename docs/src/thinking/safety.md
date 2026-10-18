@@ -63,7 +63,7 @@ system is made of model.
 Push that all the way and you get something like a
 [CoEm](https://www.conjecture.dev/cognitive-emulation), where the capability
 comes from a structure you wrote rather than from one unbounded thing. Most
-programs will sit short of that and I think that is fine. A step can stay
+programs will sit short of that and I think that is fine. A node can stay
 agentic wherever nothing irreversible happens off the back of it alone:
 an implementation pass over a plan you already settled, a literature review, ...
 
@@ -72,11 +72,11 @@ so anything you want to be true about a run is something you are hoping it keeps
 doing. Here it is written down, and the compiler checked it before anything
 started.
 
-A node also only gets what you wired to it, so anything you put around a step
+A node also only gets what you wired to it, so anything you put around it
 sits outside it: a filter on its answer, a second model that checks it, a
 fact-checker that starts from a clean context, a person, ...
 
-The step can't see any of that and can't reach it. It doesn't know whether it is
+The node can't see any of that and can't reach it. It doesn't know whether it is
 being checked, so it spends no tokens on that, and the check runs because the
 graph says so rather than because the model chose to.
 
@@ -111,7 +111,7 @@ node that's an autonomous agent says so. A node that verifies something says
 what strength of verification it gives you.
 
 Then the compiler can check claims across the whole graph: every path from an
-autonomous step to a high-stakes action goes through a verification of at least
+autonomous node to a high-stakes action goes through a verification of at least
 this strength, or a critical action has three separate human approvals in front
 of it. If the program doesn't hold up, it doesn't build.
 

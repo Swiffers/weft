@@ -7,7 +7,7 @@
 # with a figure on it and a spend the trail must record as unknown.
 #
 # `readBack` is what the rig flips. Left false, the job is submitted and
-# never read: real money out, no figure anywhere, and the execution's end
+# never read: real money out, no figure anywhere, and the run's end
 # is the only thing that can write that down.
 
 job = QueueJob -> (requestId: String) {

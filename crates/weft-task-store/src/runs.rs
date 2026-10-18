@@ -47,19 +47,19 @@ macro_rules! in_flight_sql {
     };
 }
 
-/// Whether a worker is driving `execution_id` right now
+/// Whether a worker is driving `run_id` right now
 /// ([`in_flight_sql!`]).
-pub async fn in_flight<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(concat!("SELECT EXISTS (SELECT 1 FROM run r WHERE r.execution_id = $1 AND ", in_flight_sql!("r"), ")"))
-        .bind(execution_id)
+pub async fn in_flight<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(concat!("SELECT EXISTS (SELECT 1 FROM run r WHERE r.run_id = $1 AND ", in_flight_sql!("r"), ")"))
+        .bind(run_id)
         .fetch_one(executor)
         .await?)
 }
 
-/// Whether `execution_id` has ended (or is gone).
-pub async fn ended<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
-    Ok(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM run WHERE execution_id = $1 AND state <> 'ended')")
-        .bind(execution_id)
+/// Whether `run_id` has ended (or is gone).
+pub async fn ended<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<bool> {
+    Ok(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1 AND state <> 'ended')")
+        .bind(run_id)
         .fetch_one(executor)
         .await?)
 }
@@ -82,16 +82,16 @@ pub const RUN_QUEUED_CHANNEL: &str = "weft_run_queued";
 // SYNC: CANCEL_CHANNEL <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-broker/src/line.rs (audience)
 pub const CANCEL_CHANNEL: &str = "weft_cancel";
 
-/// How an announcement names a run: `<project id> <execution id>`.
+/// How an announcement names a run: `<project id> <run id>`.
 // SYNC: run_payload <-> parked_fire_notify in crates/weft-task-store/src/parked_fires.rs (GROUP)
-pub fn run_payload(project_id: uuid::Uuid, execution_id: weft_core::ExecutionId) -> String {
-    format!("{project_id} {execution_id}")
+pub fn run_payload(project_id: uuid::Uuid, run_id: weft_core::RunId) -> String {
+    format!("{project_id} {run_id}")
 }
 
-/// The project and execution a [`run_payload`] names.
-pub fn parse_run_payload(payload: &str) -> Option<(uuid::Uuid, weft_core::ExecutionId)> {
-    let (project, execution) = payload.split_once(' ')?;
-    Some((project.parse().ok()?, execution.parse().ok()?))
+/// The project and run a [`run_payload`] names.
+pub fn parse_run_payload(payload: &str) -> Option<(uuid::Uuid, weft_core::RunId)> {
+    let (project, run) = payload.split_once(' ')?;
+    Some((project.parse().ok()?, run.parse().ok()?))
 }
 
 #[cfg(test)]

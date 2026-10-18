@@ -8,7 +8,7 @@
 //! and (2) durably drive the terminate sweep: a worker can stall-then-die before
 //! its eager sweep runs, so the write that ends a run that stored files of
 //! its own enqueues a row, and this reaper drains it by asking the broker to
-//! sweep the run's un-kept exec files.
+//! sweep the run's un-kept run files.
 
 use anyhow::{Context, Result};
 use weft_task_store::drain::DrainStep;
@@ -16,7 +16,7 @@ use weft_task_store::drain::DrainStep;
 use weft_core::storage::{
     AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, ListFilesResponse, PartDoneRequest,
     PresignRequest, PresignResult,
-    StoredFileMeta, SweepExecRequest, SweepExecResponse, Tenanted, TenantScopeRequest, TenantUsage,
+    StoredFileMeta, SweepRunRequest, SweepRunResponse, Tenanted, TenantScopeRequest, TenantUsage,
     UploadAbortRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
     UploadPartsResponse, UploadResumeRequest, UploadResumeResponse, WipePrefixRequest,
     WipePrefixResponse,
@@ -48,7 +48,7 @@ impl std::fmt::Display for StorageNotFound {
 impl std::error::Error for StorageNotFound {}
 
 /// A broker 4xx other than 404: the broker understood the request and REFUSED
-/// it (bad tenant/execution/key shape, denied scope). Terminal for the request as
+/// it (bad tenant/run/key shape, denied scope). Terminal for the request as
 /// sent; retrying the identical request can never succeed. Carried typed through
 /// the anyhow chain so retry loops (the sweep queue) can tell a dead request
 /// from a transient broker fault.
@@ -332,14 +332,14 @@ pub async fn wipe_prefix(state: &DispatcherState, prefix: &str) -> Result<u64> {
     Ok(out.wiped)
 }
 
-/// Terminate-sweep an execution's un-kept exec files: the broker reaps crashed
+/// Terminate-sweep a run's un-kept run files: the broker reaps crashed
 /// uploads now and stamps completed files with the post-run linger expiry.
-async fn sweep_exec(state: &DispatcherState, tenant: &str, execution_id: &str) -> Result<SweepExecResponse> {
+async fn sweep_run(state: &DispatcherState, tenant: &str, run_id: &str) -> Result<SweepRunResponse> {
     post_admin(
         state,
-        "/v1/storage/admin/sweep-exec",
-        "sweep-exec",
-        &SweepExecRequest { tenant: tenant.to_string(), execution_id: execution_id.to_string() },
+        "/v1/storage/admin/sweep-run",
+        "sweep-run",
+        &SweepRunRequest { tenant: tenant.to_string(), run_id: run_id.to_string() },
     )
     .await
 }
@@ -466,17 +466,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     tables: &["storage_sweep"],
     ddl: &[r#"
         -- Durable terminate-sweep queue: a row per ended run that stored
-        -- files of its own, whose un-kept exec files still need sweeping.
+        -- files of its own, whose un-kept run files still need sweeping.
         -- Inserted by the write that ends the run (`weft_record_batch`,
         -- `weft_journal::record::append_locked_in`), deleted by the sweep
         -- reaper once the broker confirmed the sweep.
         CREATE TABLE IF NOT EXISTS storage_sweep (
-            execution_id UUID PRIMARY KEY,
+            run_id UUID PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
         "#,
-        // Wake the sweep reaper when an execution is queued, through the
+        // Wake the sweep reaper when a run is queued, through the
         // announcement outbox like every other wake (`weft_task_store::announce`):
         // sent once the write commits, one wake for every row a flush
         // takes, since the reaper reads the whole queue.
@@ -496,8 +496,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     seed: &[],
 };
 
-/// Sweep-queue reaper: ask the broker to sweep each pending execution's un-kept
-/// exec files. A row is removed only after the broker confirmed; a TRANSIENT
+/// Sweep-queue reaper: ask the broker to sweep each pending run's un-kept
+/// run files. A row is removed only after the broker confirmed; a TRANSIENT
 /// broker error (unreachable, 5xx) leaves the row and fails the pass once
 /// every row was tried, so the loop tries again shortly a few times and then
 /// writes the failure down for `weft status` (`weft_task_store::drain`); the
@@ -506,40 +506,40 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// rejected the request) is loud + dead-lettered: retrying the identical
 /// request every tick forever would be a silent infinite loop over a row the
 /// user can neither see nor clear, so the row is dropped with an error log
-/// naming the execution (the files, if any, remain reclaimable via `weft files`).
+/// naming the run (the files, if any, remain reclaimable via `weft files`).
 pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
-    let rows: Vec<(weft_core::ExecutionId, String)> =
-        sqlx::query_as("SELECT execution_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
+    let rows: Vec<(weft_core::RunId, String)> =
+        sqlx::query_as("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
             .fetch_all(&state.pg_pool)
             .await?;
     let mut deferred = Vec::new();
-    for (execution_id, tenant) in rows {
-        match sweep_exec(&state, &tenant, &execution_id.to_string()).await {
+    for (run_id, tenant) in rows {
+        match sweep_run(&state, &tenant, &run_id.to_string()).await {
             Ok(out) => {
                 if out.swept > 0 || out.lingering > 0 {
                     tracing::info!(
                         target: "weft_dispatcher::storage",
-                        %execution_id, tenant = %tenant, swept = out.swept, lingering = out.lingering,
+                        %run_id, tenant = %tenant, swept = out.swept, lingering = out.lingering,
                         "terminate sweep: reaped crashed uploads, stamped completed \
-                         un-kept exec files with the post-run linger expiry"
+                         un-kept run files with the post-run linger expiry"
                     );
                 }
-                sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
-                    .bind(execution_id)
+                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
+                    .bind(run_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
             Err(e) if e.downcast_ref::<StorageNotFound>().is_some() => {
                 // 404 from the broker means there was nothing to sweep for this
-                // execution (its files are already gone). That is terminal SUCCESS, not
+                // run (its files are already gone). That is terminal SUCCESS, not
                 // a rejection: drop the row quietly (debug, not error).
                 tracing::debug!(
                     target: "weft_dispatcher::storage",
-                    %execution_id, tenant = %tenant,
+                    %run_id, tenant = %tenant,
                     "terminate sweep found nothing to remove; clearing the queue row"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
-                    .bind(execution_id)
+                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
+                    .bind(run_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
@@ -547,17 +547,17 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                 // The broker understood and permanently refuses this request (bad
                 // shape / denied / over quota). Retrying it every tick forever would
                 // be a silent infinite loop over a row nobody can clear, so drop it
-                // with a loud error naming the execution (any files stay reclaimable via
+                // with a loud error naming the run (any files stay reclaimable via
                 // `weft files`).
                 tracing::error!(
                     target: "weft_dispatcher::storage",
-                    %execution_id, tenant = %tenant, error = format!("{e:#}"),
+                    %run_id, tenant = %tenant, error = format!("{e:#}"),
                     "terminate sweep REJECTED by the broker; dropping the queue row \
-                     (any remaining files for this execution stay listable/deletable via \
+                     (any remaining files for this run stay listable/deletable via \
                      the storage API)"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
-                    .bind(execution_id)
+                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
+                    .bind(run_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
@@ -566,10 +566,10 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                 // 5xx): keep the row, and fail the pass once the others went.
                 tracing::warn!(
                     target: "weft_dispatcher::storage",
-                    %execution_id, tenant = %tenant, error = %e,
+                    %run_id, tenant = %tenant, error = %e,
                     "terminate sweep deferred (transient broker/control-plane fault)"
                 );
-                deferred.push(format!("{execution_id}: {e:#}"));
+                deferred.push(format!("{run_id}: {e:#}"));
             }
         }
     }

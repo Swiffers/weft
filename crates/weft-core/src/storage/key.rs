@@ -2,7 +2,7 @@
 //!
 //! A key IS the fully-qualified path of a file. The FIRST segment is
 //! the owning tenant; the rest encodes the scope:
-//!   `<tenant>/exec/<execution_id>/<id>`        execution scratch (swept unless kept)
+//!   `<tenant>/run/<run_id>/<id>`        run scratch (swept unless kept)
 //!   `<tenant>/project/<project_id>/<id>`   per-project persistent
 //!   `<tenant>/shared/<name>/<id>`       tenant-shared by agreed name
 //!   `<tenant>/instance/<project_id>/<instance>/<id>`  one instance's, in one project
@@ -13,7 +13,7 @@
 //! bucket is SHARED across every tenant (one bucket, keys namespaced by
 //! the tenant prefix), so the tenant segment is the outer wall: a caller
 //! can only ever reach keys under ITS OWN broker-verified tenant, and
-//! within that, only prefixes it is proven to own (its own execution, its
+//! within that, only prefixes it is proven to own (its own run, its
 //! own project) or has opted into by naming (shared). The broker is the
 //! only thing that signs bucket requests, so these functions ARE the wall.
 
@@ -21,7 +21,7 @@ use super::StorageScope;
 
 /// Verified caller identity, as resolved by the broker from the
 /// presented token (which names the tenant and project), then, for a
-/// claimed execution, that execution's row (its project and owner).
+/// claimed run, that run's row (its project and owner).
 /// Nothing here is self-claimed; everything was checked against the DB
 /// by the broker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,14 +30,14 @@ pub enum CallerAuth {
     /// project (verified via its token), or the dispatcher acting for the
     /// tenant's editor session on the admin upload surface (the dispatcher
     /// vouches for the tenant, the broker re-checks the key against it).
-    /// `execution_id` is the execution being driven (verified: the execution's owning
-    /// process is the caller); None when no execution claim was presented (then
-    /// execution-scoped keys are unreachable).
+    /// `run_id` is the run being driven (verified: the run's owning
+    /// process is the caller); None when no run claim was presented (then
+    /// run-scoped keys are unreachable).
     Worker {
         tenant: String,
         project_id: String,
-        execution_id: Option<String>,
-        /// Who the run behind `execution_id` is for (verified with it); what a
+        run_id: Option<String>,
+        /// Who the run behind `run_id` is for (verified with it); what a
         /// instance-scoped handle with no instance named falls back to.
         instance: Option<String>,
     },
@@ -45,7 +45,7 @@ pub enum CallerAuth {
     /// (the admin upload surface: a version snapshot, a pre-build asset
     /// sync, the install's standard-library preload). The dispatcher
     /// vouches for the tenant; the wall then admits the tenant's
-    /// content-addressed assets and nothing else, so no project, execution
+    /// content-addressed assets and nothing else, so no project, run
     /// or shared file is reachable through it.
     Tenant { tenant: String },
     /// The dispatcher (install control plane). Used only by the
@@ -57,7 +57,7 @@ pub enum CallerAuth {
 /// A parsed storage key: scope wall + file id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyScope {
-    Exec { execution_id: String },
+    Run { run_id: String },
     Project { project_id: String },
     Shared { name: String },
     /// `asset/<sha256>`: one of the TENANT's content-addressed files, the
@@ -93,7 +93,7 @@ pub struct ParsedKey {
 /// or renamed scope is changed in exactly one place. Keep this in sync with
 /// the `KeyScope` variants + `KeyScope::tag`.
 // SYNC: SCOPE_TAGS <-> weavemind/website/src/lib/graph/runtime-files.ts Tier
-pub const SCOPE_TAGS: [&str; 5] = ["exec", "project", "shared", "asset", "instance"];
+pub const SCOPE_TAGS: [&str; 5] = ["run", "project", "shared", "asset", "instance"];
 
 /// Is `s` a TENANT-LESS runtime storage key (`<scope>/<owner>/<id>`, every
 /// segment in the wall's grammar)? The short address a human writes in source
@@ -104,6 +104,7 @@ pub const SCOPE_TAGS: [&str; 5] = ["exec", "project", "shared", "asset", "instan
 /// (`instance/<project>/<instance>/<id>`), and 2 for the asset scope, whose
 /// id must be a content hash (`asset/<sha256>`), so a project folder named
 /// `asset` is never mistaken for one.
+// SYNC: is_scope_key <-> packages/weft-graph/src/webview/lib/utils/storage-key.ts isScopeKey
 pub fn is_scope_key(s: &str) -> bool {
     let parts: Vec<&str> = s.split('/').collect();
     match parts.as_slice() {
@@ -154,17 +155,17 @@ impl KeyScope {
     /// `owned_scope` build them by shape.
     fn from_tag(tag: &str, owner: &str) -> Option<Self> {
         match tag {
-            "exec" => Some(KeyScope::Exec { execution_id: owner.to_string() }),
+            "run" => Some(KeyScope::Run { run_id: owner.to_string() }),
             "project" => Some(KeyScope::Project { project_id: owner.to_string() }),
             "shared" => Some(KeyScope::Shared { name: owner.to_string() }),
             _ => None,
         }
     }
 
-    /// The on-wire scope tag (`exec`/`project`/`shared`/`asset`).
+    /// The on-wire scope tag (`run`/`project`/`shared`/`asset`).
     fn tag(&self) -> &'static str {
         match self {
-            KeyScope::Exec { .. } => "exec",
+            KeyScope::Run { .. } => "run",
             KeyScope::Project { .. } => "project",
             KeyScope::Shared { .. } => "shared",
             KeyScope::Asset => "asset",
@@ -172,11 +173,11 @@ impl KeyScope {
         }
     }
 
-    /// The owner segments (execution / project id / shared name; project id
+    /// The owner segments (run / project id / shared name; project id
     /// and instance for the instance scope; none for the tenant's assets).
     fn owner_segments(&self) -> Vec<&str> {
         match self {
-            KeyScope::Exec { execution_id } => vec![execution_id],
+            KeyScope::Run { run_id } => vec![run_id],
             KeyScope::Project { project_id } => vec![project_id],
             KeyScope::Shared { name } => vec![name],
             KeyScope::Asset => vec![],
@@ -263,7 +264,7 @@ impl std::fmt::Display for ParsedKey {
 }
 
 /// A path segment that is safe inside a bucket key: no
-/// separators, no traversal, no empties. Executions are UUIDs, project
+/// separators, no traversal, no empties. Runs are UUIDs, project
 /// ids are UUIDs, ids are UUIDs; shared names are user-chosen and
 /// the reason this check exists.
 // SYNC: valid_segment <-> packages/weft-graph/src/run-spec.ts INSTANCE_ID_PATTERN, crates/weft-core/src/instance.rs InstanceId::new
@@ -326,13 +327,13 @@ pub fn parse_key(key: &str) -> Result<ParsedKey, String> {
 /// Validate that `prefix` is one of the two scope-anchored boundaries
 /// `wipe_prefix` may delete, each ending in `/`:
 ///   - `<tenant>/<scope>/<owner>/` (any tag in [`SCOPE_TAGS`]) : one owner's space
-///     (the dispatcher's `weft rm` / `weft clean <execution_id>` / project-delete).
+///     (the dispatcher's `weft rm` / `weft clean <run_id>` / project-delete).
 ///   - `<tenant>/` : the WHOLE tenant (a tenant-delete wiping every
 ///     object under the tenant's prefix).
 /// Both are real prefix boundaries. A raw `starts_with` on an unanchored
-/// string (empty, or `exec` without a slash) would wipe across tenants or
-/// across owner boundaries (one execution's `t/exec/c1` also matching
-/// `t/exec/c1abc`); validating the trailing slash + the segment grammar
+/// string (empty, or `run` without a slash) would wipe across tenants or
+/// across owner boundaries (one run's `t/run/c1` also matching
+/// `t/run/c1abc`); validating the trailing slash + the segment grammar
 /// here keeps that out of the data path entirely. It does NOT allow a bare
 /// `<tenant>/<scope>/` (no owner): that would let a caller wipe every
 /// owner under one scope, which no verb wants.
@@ -389,7 +390,7 @@ pub fn validate_wipe_prefix(prefix: &str) -> Result<(), String> {
 /// under `scope`. THE one place the wall's construction rules live, shared by
 /// `key_for_put` and `prefix_for_list` so neither can forget a check (an
 /// earlier `prefix_for_list` validated the tenant + shared name but NOT the
-/// execution / project id, so a malformed owner could produce a list prefix that
+/// run / project id, so a malformed owner could produce a list prefix that
 /// escaped the intended owner boundary; routing both through here makes the
 /// two paths validate identically by construction).
 ///
@@ -397,12 +398,12 @@ pub fn validate_wipe_prefix(prefix: &str) -> Result<(), String> {
 /// built from it is always one `parse_key` would also accept: the "a
 /// ParsedKey is the proof a key passed the grammar" invariant holds by
 /// CONSTRUCTION, not by the accident that the broker happens to supply UUIDs.
-/// Errors when the caller is not a worker, an Execution scope carries no
-/// execution, an Instance scope names no instance in a run for no instance, or any segment is
+/// Errors when the caller is not a worker, a Run scope carries no
+/// run, an Instance scope names no instance in a run for no instance, or any segment is
 /// not the wall's grammar.
 fn owned_scope(caller: &CallerAuth, scope: &StorageScope) -> Result<(String, KeyScope), String> {
-    let (tenant, project_id, execution_id, instance) = match caller {
-        CallerAuth::Worker { tenant, project_id, execution_id, instance } => (tenant, project_id, execution_id, instance),
+    let (tenant, project_id, run_id, instance) = match caller {
+        CallerAuth::Worker { tenant, project_id, run_id, instance } => (tenant, project_id, run_id, instance),
         CallerAuth::Tenant { tenant } => {
             if !matches!(scope, StorageScope::Asset) {
                 return Err("a caller acting for the tenant reaches only the tenant's assets".into());
@@ -429,12 +430,12 @@ fn owned_scope(caller: &CallerAuth, scope: &StorageScope) -> Result<(String, Key
     // not look up).
     let tenant = owned("tenant", tenant)?;
     let scope = match scope {
-        StorageScope::Execution => {
-            let execution_id = execution_id.as_deref().ok_or(
-                "execution-scoped access requires a verified execution and the caller \
+        StorageScope::Run => {
+            let run_id = run_id.as_deref().ok_or(
+                "run-scoped access requires a verified run and the caller \
                  presented none",
             )?;
-            KeyScope::Exec { execution_id: owned("execution_id", execution_id)? }
+            KeyScope::Run { run_id: owned("run_id", run_id)? }
         }
         StorageScope::Project => KeyScope::Project { project_id: owned("project", project_id)? },
         StorageScope::Shared { name } => KeyScope::Shared { name: owned("shared-space name", name)? },
@@ -459,8 +460,8 @@ fn owned_scope(caller: &CallerAuth, scope: &StorageScope) -> Result<(String, Key
 }
 
 /// Build the `ParsedKey` for a fresh put under `scope` by `caller`.
-/// Errors when the caller can't own the scope (no execution claim for
-/// Execution scope, control-plane writes) or any segment is not the
+/// Errors when the caller can't own the scope (no run claim for
+/// Run scope, control-plane writes) or any segment is not the
 /// wall's grammar. Every segment (including the `id`) is validated via
 /// `owned_scope` + the explicit `id` check below.
 pub fn key_for_put(caller: &CallerAuth, scope: &StorageScope, id: &str) -> Result<ParsedKey, String> {
@@ -483,21 +484,21 @@ pub fn prefix_for_list(caller: &CallerAuth, scope: &StorageScope) -> Result<Stri
     Ok(format!("{tenant}/{}/", scope.path()))
 }
 
-/// The prefix covering one execution's files (`<tenant>/exec/<execution_id>/`), for
-/// control-plane sweeps that act on an execution with no caller identity in hand.
+/// The prefix covering one run's files (`<tenant>/run/<run_id>/`), for
+/// control-plane sweeps that act on a run with no caller identity in hand.
 /// Both segments are validated and the scope tag is rendered through the one
-/// grammar (`KeyScope::tag`), so no caller ever hand-builds an exec prefix that
+/// grammar (`KeyScope::tag`), so no caller ever hand-builds an run prefix that
 /// could drift from `SCOPE_TAGS` or smuggle a separator through an unvalidated
 /// segment.
-pub fn exec_prefix(tenant: &str, execution_id: &str) -> Result<String, String> {
+pub fn run_prefix(tenant: &str, run_id: &str) -> Result<String, String> {
     if !valid_segment(tenant) {
-        return Err(format!("invalid tenant segment '{tenant}' for an exec prefix"));
+        return Err(format!("invalid tenant segment '{tenant}' for an run prefix"));
     }
-    if !valid_segment(execution_id) {
-        return Err(format!("invalid execution segment '{execution_id}' for an exec prefix"));
+    if !valid_segment(run_id) {
+        return Err(format!("invalid run segment '{run_id}' for an run prefix"));
     }
-    let tag = KeyScope::Exec { execution_id: execution_id.to_string() }.tag();
-    Ok(format!("{tenant}/{tag}/{execution_id}/"))
+    let tag = KeyScope::Run { run_id: run_id.to_string() }.tag();
+    Ok(format!("{tenant}/{tag}/{run_id}/"))
 }
 
 /// Can `caller` touch the file at `key` (get/delete/keep/presign)?
@@ -505,8 +506,8 @@ pub fn exec_prefix(tenant: &str, execution_id: &str) -> Result<String, String> {
 /// tenants' keys under one prefix space), then the key's own scope
 /// decides. Deny reasons are specific.
 pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), String> {
-    let (tenant, project_id, execution_id) = match caller {
-        CallerAuth::Worker { tenant, project_id, execution_id, .. } => (tenant, project_id, execution_id),
+    let (tenant, project_id, run_id) = match caller {
+        CallerAuth::Worker { tenant, project_id, run_id, .. } => (tenant, project_id, run_id),
         // Acting for a tenant reaches that tenant's assets, nothing else.
         CallerAuth::Tenant { tenant } => {
             if &parsed.tenant != tenant {
@@ -537,14 +538,14 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), S
         ));
     }
     match &parsed.scope {
-        KeyScope::Exec { execution_id: key_execution_id } => match execution_id {
-            Some(c) if c == key_execution_id => Ok(()),
+        KeyScope::Run { run_id: key_run_id } => match run_id {
+            Some(c) if c == key_run_id => Ok(()),
             Some(_) => Err(
-                "denied: execution-scoped file belongs to a different execution (executions are \
+                "denied: run-scoped file belongs to a different run (runs are \
                  walled per run; use Project scope for files that outlive a run)"
                     .into(),
             ),
-            None => Err("denied: caller presented no verified execution".into()),
+            None => Err("denied: caller presented no verified run".into()),
         },
         KeyScope::Project { project_id: key_project } => {
             if key_project == project_id {
@@ -582,11 +583,11 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), S
 mod tests {
     use super::*;
 
-    fn worker(execution_id: Option<&str>) -> CallerAuth {
+    fn worker(run_id: Option<&str>) -> CallerAuth {
         CallerAuth::Worker {
             tenant: "t1".into(),
             project_id: "p1".into(),
-            execution_id: execution_id.map(String::from),
+            run_id: run_id.map(String::from),
             instance: None,
         }
     }
@@ -614,7 +615,7 @@ mod tests {
         let ada = CallerAuth::Worker {
             tenant: "t1".into(),
             project_id: "p1".into(),
-            execution_id: Some("c1".into()),
+            run_id: Some("c1".into()),
             instance: Some("ada".into()),
         };
         let own = key_for_put(&ada, &StorageScope::Instance { of: None }, "f").unwrap();
@@ -632,7 +633,7 @@ mod tests {
     #[test]
     fn is_scope_key_accepts_tenant_less_keys_only() {
         let sha = "a".repeat(64);
-        for ok in ["exec/c1/f1", "project/p1/f2", "shared/team/f3", &format!("asset/{sha}"), "instance/p1/ada/f5"] {
+        for ok in ["run/c1/f1", "project/p1/f2", "shared/team/f3", &format!("asset/{sha}"), "instance/p1/ada/f5"] {
             assert!(is_scope_key(ok), "{ok}");
         }
         for no in [
@@ -652,7 +653,7 @@ mod tests {
     #[test]
     fn to_key_is_the_exact_inverse_of_parse() {
         let asset = format!("t1/asset/{}", "a".repeat(64));
-        for k in ["t1/exec/c1/f1", "t1/project/p1/f2", "t1/shared/team/f3", &asset] {
+        for k in ["t1/run/c1/f1", "t1/project/p1/f2", "t1/shared/team/f3", &asset] {
             assert_eq!(parse_key(k).unwrap().to_key(), k, "round-trip {k}");
         }
     }
@@ -681,7 +682,7 @@ mod tests {
         let other_project = CallerAuth::Worker {
             tenant: "t1".into(),
             project_id: "p2".into(),
-            execution_id: None,
+            run_id: None,
             instance: None,
         };
         assert!(check_key_access(&other_project, &asset).is_ok());
@@ -710,10 +711,10 @@ mod tests {
     #[test]
     fn parse_round_trips_each_scope() {
         assert_eq!(
-            parse_key("t1/exec/c1/f1").unwrap(),
+            parse_key("t1/run/c1/f1").unwrap(),
             ParsedKey {
                 tenant: "t1".into(),
-                scope: KeyScope::Exec { execution_id: "c1".into() },
+                scope: KeyScope::Run { run_id: "c1".into() },
                 id: "f1".into()
             }
         );
@@ -726,21 +727,21 @@ mod tests {
             KeyScope::Shared { name: "team".into() }
         );
         // The tenant segment is carried through verbatim.
-        assert_eq!(parse_key("TenantMixedCase/exec/c1/f1").unwrap().tenant, "TenantMixedCase");
+        assert_eq!(parse_key("TenantMixedCase/run/c1/f1").unwrap().tenant, "TenantMixedCase");
     }
 
     #[test]
     fn parse_rejects_malformed() {
         for bad in [
             "",
-            "t1/exec/c1",      // 3 segments (the old grammar)
-            "t1/exec/c1/f1/x", // 5 segments
+            "t1/run/c1",      // 3 segments (the old grammar)
+            "t1/run/c1/f1/x", // 5 segments
             "t1/bogus/c1/f1",
-            "t1/exec//f1",
-            "t1/exec/../f1",
+            "t1/run//f1",
+            "t1/run/../f1",
             "t1/shared/na me/f1",
-            "t1/exec/c1/",
-            "/exec/c1/f1", // empty tenant
+            "t1/run/c1/",
+            "/run/c1/f1", // empty tenant
         ] {
             assert!(parse_key(bad).is_err(), "should reject {bad:?}");
         }
@@ -750,27 +751,27 @@ mod tests {
     fn put_builds_caller_owned_prefixes_only() {
         let w = worker(Some("c1"));
         // The tenant (t1, from the verdict) is the first segment.
-        assert_eq!(key_for_put(&w, &StorageScope::Execution, "id").unwrap().to_key(), "t1/exec/c1/id");
+        assert_eq!(key_for_put(&w, &StorageScope::Run, "id").unwrap().to_key(), "t1/run/c1/id");
         assert_eq!(key_for_put(&w, &StorageScope::Project, "id").unwrap().to_key(), "t1/project/p1/id");
         assert_eq!(
             key_for_put(&w, &StorageScope::Shared { name: "team".into() }, "id").unwrap().to_key(),
             "t1/shared/team/id"
         );
-        // No execution claim -> no exec writes.
-        assert!(key_for_put(&worker(None), &StorageScope::Execution, "id").is_err());
+        // No run claim -> no run writes.
+        assert!(key_for_put(&worker(None), &StorageScope::Run, "id").is_err());
         // Control plane never puts.
         assert!(key_for_put(&CallerAuth::ControlPlane, &StorageScope::Project, "id").is_err());
         // EVERY segment is validated, so key_for_put can only mint a
         // ParsedKey that parse_key would also accept (the invariant).
         // A bad shared name, id, owner, OR tenant is rejected.
         assert!(key_for_put(&w, &StorageScope::Shared { name: "a/b".into() }, "id").is_err());
-        assert!(key_for_put(&w, &StorageScope::Execution, "bad/id").is_err());
-        assert!(key_for_put(&w, &StorageScope::Execution, "..").is_err());
-        assert!(key_for_put(&worker(Some("c/d")), &StorageScope::Execution, "id").is_err());
+        assert!(key_for_put(&w, &StorageScope::Run, "bad/id").is_err());
+        assert!(key_for_put(&w, &StorageScope::Run, "..").is_err());
+        assert!(key_for_put(&worker(Some("c/d")), &StorageScope::Run, "id").is_err());
         let bad_tenant = CallerAuth::Worker {
             tenant: "a/b".into(),
             project_id: "p1".into(),
-            execution_id: Some("c1".into()),
+            run_id: Some("c1".into()),
             instance: None,
         };
         assert!(key_for_put(&bad_tenant, &StorageScope::Project, "id").is_err());
@@ -782,7 +783,7 @@ mod tests {
         // accepts and renders back identically (the two paths agree).
         let w = worker(Some("0188-c0102"));
         for scope in [
-            StorageScope::Execution,
+            StorageScope::Run,
             StorageScope::Project,
             StorageScope::Shared { name: "team.alpha".into() },
         ] {
@@ -795,7 +796,7 @@ mod tests {
     #[test]
     fn list_prefixes_are_tenant_anchored() {
         let w = worker(Some("c1"));
-        assert_eq!(prefix_for_list(&w, &StorageScope::Execution).unwrap(), "t1/exec/c1/");
+        assert_eq!(prefix_for_list(&w, &StorageScope::Run).unwrap(), "t1/run/c1/");
         assert_eq!(prefix_for_list(&w, &StorageScope::Project).unwrap(), "t1/project/p1/");
         assert_eq!(
             prefix_for_list(&w, &StorageScope::Shared { name: "team".into() }).unwrap(),
@@ -806,17 +807,17 @@ mod tests {
     #[test]
     fn access_walls_per_tenant_then_scope() {
         let w = worker(Some("c1")); // tenant t1
-                                    // Own execution under own tenant: allowed.
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Exec { execution_id: "c1".into() })).is_ok());
-        // Another execution: denied.
-        assert!(check_key_access(&w, &pk("t1", KeyScope::Exec { execution_id: "c2".into() })).is_err());
+                                    // Own run under own tenant: allowed.
+        assert!(check_key_access(&w, &pk("t1", KeyScope::Run { run_id: "c1".into() })).is_ok());
+        // Another run: denied.
+        assert!(check_key_access(&w, &pk("t1", KeyScope::Run { run_id: "c2".into() })).is_err());
         // Own project: allowed. Another project: denied.
         assert!(check_key_access(&w, &pk("t1", KeyScope::Project { project_id: "p1".into() })).is_ok());
         assert!(check_key_access(&w, &pk("t1", KeyScope::Project { project_id: "p2".into() })).is_err());
         // Shared under own tenant: naming is the opt-in.
         assert!(check_key_access(&w, &pk("t1", KeyScope::Shared { name: "x".into() })).is_ok());
-        // No execution claim cannot reach ANY exec key.
-        assert!(check_key_access(&worker(None), &pk("t1", KeyScope::Exec { execution_id: "c1".into() })).is_err());
+        // No run claim cannot reach ANY run key.
+        assert!(check_key_access(&worker(None), &pk("t1", KeyScope::Run { run_id: "c1".into() })).is_err());
         // Control plane is rejected on the data path.
         assert!(check_key_access(
             &CallerAuth::ControlPlane,
@@ -828,12 +829,12 @@ mod tests {
     /// THE load-bearing isolation proof on the shared bucket: a worker of one
     /// tenant can reach NOTHING under another tenant's prefix, even a key
     /// whose inner scope it would otherwise own (same project id, same
-    /// execution, or a shared name). The tenant wall is checked first.
+    /// run, or a shared name). The tenant wall is checked first.
     #[test]
     fn access_denies_cross_tenant_even_when_inner_scope_matches() {
-        let w = worker(Some("c1")); // tenant t1, project p1, execution c1
-                                    // Another tenant's exec key with the SAME execution: denied by tenant.
-        assert!(check_key_access(&w, &pk("t2", KeyScope::Exec { execution_id: "c1".into() })).is_err());
+        let w = worker(Some("c1")); // tenant t1, project p1, run c1
+                                    // Another tenant's run key with the SAME run: denied by tenant.
+        assert!(check_key_access(&w, &pk("t2", KeyScope::Run { run_id: "c1".into() })).is_err());
         // Another tenant's project key with the SAME project id: denied.
         assert!(check_key_access(&w, &pk("t2", KeyScope::Project { project_id: "p1".into() })).is_err());
         // Another tenant's shared space (naming is no opt-in across tenants).
@@ -849,7 +850,7 @@ mod tests {
         // Whole tenant.
         assert!(validate_wipe_prefix("t1/").is_ok());
         // Owner boundary within a tenant.
-        assert!(validate_wipe_prefix("t1/exec/c1/").is_ok());
+        assert!(validate_wipe_prefix("t1/run/c1/").is_ok());
         assert!(validate_wipe_prefix("t1/project/p1/").is_ok());
         assert!(validate_wipe_prefix("t1/shared/team/").is_ok());
         // Rejected: no trailing slash, empty, a bare scope (no owner),
@@ -858,31 +859,31 @@ mod tests {
             "t1",
             "",
             "/",
-            "t1/exec/",     // scope without owner: would wipe all executions
+            "t1/run/",     // scope without owner: would wipe all runs
             "t1/bogus/c1/",
-            "t1/exec/../",
-            "exec/c1/",     // the old (tenant-less) owner boundary
+            "t1/run/../",
+            "run/c1/",     // the old (tenant-less) owner boundary
         ] {
             assert!(validate_wipe_prefix(bad).is_err(), "should reject {bad:?}");
         }
     }
 
-    /// A worker with a MALFORMED owner segment (an execution/project that contains a
+    /// A worker with a MALFORMED owner segment (a run/project that contains a
     /// slash or `..`) must be rejected by BOTH construction paths, not just
     /// key_for_put. Before the shared `owned_scope_segments`, prefix_for_list
-    /// skipped the execution/project check, so a malformed owner produced a list
+    /// skipped the run/project check, so a malformed owner produced a list
     /// prefix that escaped the owner boundary.
     #[test]
     fn prefix_for_list_rejects_malformed_owner_like_key_for_put() {
-        // Malformed execution.
-        let bad_execution_id = worker(Some("../shared/team"));
-        assert!(prefix_for_list(&bad_execution_id, &StorageScope::Execution).is_err());
-        assert!(key_for_put(&bad_execution_id, &StorageScope::Execution, "f").is_err());
+        // Malformed run.
+        let bad_run_id = worker(Some("../shared/team"));
+        assert!(prefix_for_list(&bad_run_id, &StorageScope::Run).is_err());
+        assert!(key_for_put(&bad_run_id, &StorageScope::Run, "f").is_err());
         // Malformed project id.
         let bad_project = CallerAuth::Worker {
             tenant: "t1".into(),
             project_id: "..".into(),
-            execution_id: None,
+            run_id: None,
             instance: None,
         };
         assert!(prefix_for_list(&bad_project, &StorageScope::Project).is_err());
@@ -891,11 +892,11 @@ mod tests {
         let bad_tenant = CallerAuth::Worker {
             tenant: "a/b".into(),
             project_id: "p1".into(),
-            execution_id: Some("c1".into()),
+            run_id: Some("c1".into()),
             instance: None,
         };
-        assert!(prefix_for_list(&bad_tenant, &StorageScope::Execution).is_err());
-        assert!(key_for_put(&bad_tenant, &StorageScope::Execution, "f").is_err());
+        assert!(prefix_for_list(&bad_tenant, &StorageScope::Run).is_err());
+        assert!(key_for_put(&bad_tenant, &StorageScope::Run, "f").is_err());
         // A shared name with a slash.
         let bad_shared = StorageScope::Shared { name: "a/b".into() };
         assert!(prefix_for_list(&worker(None), &bad_shared).is_err());
@@ -907,8 +908,8 @@ mod tests {
     #[test]
     fn prefix_for_list_happy_path_unchanged() {
         assert_eq!(
-            prefix_for_list(&worker(Some("c1")), &StorageScope::Execution).unwrap(),
-            "t1/exec/c1/"
+            prefix_for_list(&worker(Some("c1")), &StorageScope::Run).unwrap(),
+            "t1/run/c1/"
         );
         assert_eq!(
             prefix_for_list(&worker(None), &StorageScope::Project).unwrap(),
@@ -938,11 +939,11 @@ mod tests {
     }
 
     /// The wall is total for the control plane on the data path: a control-plane
-    /// caller is denied every scope (exec/project/shared), not just project.
+    /// caller is denied every scope (run/project/shared), not just project.
     #[test]
     fn check_key_access_denies_control_plane_for_every_scope() {
         for scope in [
-            KeyScope::Exec { execution_id: "c1".into() },
+            KeyScope::Run { run_id: "c1".into() },
             KeyScope::Project { project_id: "p1".into() },
             KeyScope::Shared { name: "team".into() },
         ] {

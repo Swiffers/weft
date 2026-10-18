@@ -29,7 +29,7 @@ export const editorConnect: ConnectTransport = {
 	async connectDirect(request) {
 		// The host stamps the active project into the body; the editor's
 		// connections are the author's, so it names none of its own.
-		const done = await accessCall<CompletedConnect>('POST', 'connect/direct', { ...request, project_id: null });
+		const done = await accessCall<CompletedConnect>('POST', 'connect/direct', { ...request, projectId: null });
 		invalidateGrants(request.spec.service);
 		return done;
 	},
@@ -55,7 +55,7 @@ export function editorResources(accessRef: { accessId: string; service: string }
 	return {
 		granted: (_index, source) =>
 			accessCall<LookupItem[]>('POST', 'granted', {
-				access_id: signed().accessId,
+				accessId: signed().accessId,
 				service: signed().service,
 				from: source.from,
 				label: source.label,
@@ -66,7 +66,7 @@ export function editorResources(accessRef: { accessId: string; service: string }
 			// A public list signs with nothing: no connection, and no service
 			// to name, so both are left out.
 			return accessCall<LookupPage>('POST', 'lookup', {
-				...(accessRef ? { access_id: accessRef.accessId, service: accessRef.service } : {}),
+				...(accessRef ? { accessId: accessRef.accessId, service: accessRef.service } : {}),
 				lookup,
 				query,
 				parents,
@@ -75,11 +75,11 @@ export function editorResources(accessRef: { accessId: string; service: string }
 		},
 		beginPicker: (_index, source) =>
 			accessCall<{ state: string; url: string }>('POST', 'picker/begin', {
-				access_id: signed().accessId,
+				accessId: signed().accessId,
 				service: signed().service,
 				script: source.script,
 				code: source.code,
-				mime_types: source.mime_types ?? [],
+				mimeTypes: source.mimeTypes ?? [],
 				grants: source.grants ?? [],
 			}),
 		pickerOutcome: (state) => accessCall<PickerOutcome>('GET', `connect/status?state=${encodeURIComponent(state)}`),

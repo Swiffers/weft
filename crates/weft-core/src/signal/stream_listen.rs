@@ -217,7 +217,7 @@ pub struct StreamReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamListen {
     /// `host:port`, usually with `{placeholders}` resolved from the
-    /// connection ("{imap_host}:{imap_port}").
+    /// connection ("{imapHost}:{imapPort}").
     pub address: String,
 
     /// Wrap the pipe in TLS (the default; almost nothing worth
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn an_imap_shaped_config_round_trips() {
-        let s = StreamListen::new("{imap_host}:{imap_port}", crlf(), r"^\* \d+ (EXISTS|RECENT)")
+        let s = StreamListen::new("{imapHost}:{imapPort}", crlf(), r"^\* \d+ (EXISTS|RECENT)")
             .step(
                 SocketFrame::Text { body: "a1 LOGIN {user} {password}\r\n".into() },
                 "^a1 OK",

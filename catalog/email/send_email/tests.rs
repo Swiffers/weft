@@ -27,12 +27,12 @@ pub fn tests() -> Vec<NodeTest> {
 fn connection(rig: &FakeRig) {
     rig.connection_value("email", "user", "sender@example.com");
     rig.connection_value("email", "password", "secret");
-    rig.connection_value("email", "smtp_host", "smtp.example.com");
+    rig.connection_value("email", "smtpHost", "smtp.example.com");
 }
 
 async fn bad_address(rig: FakeRig) -> WeftResult<()> {
     connection(&rig);
-    rig.connection_value("email", "smtp_port", "587");
+    rig.connection_value("email", "smtpPort", "587");
     let outcome = rig
         .run(
             &SendEmailNode,
@@ -52,7 +52,7 @@ async fn bad_address(rig: FakeRig) -> WeftResult<()> {
 
 async fn bad_port(rig: FakeRig) -> WeftResult<()> {
     connection(&rig);
-    rig.connection_value("email", "smtp_port", "not-a-port");
+    rig.connection_value("email", "smtpPort", "not-a-port");
     let outcome = rig
         .run(
             &SendEmailNode,
@@ -74,8 +74,8 @@ async fn bad_port(rig: FakeRig) -> WeftResult<()> {
 fn unreachable_server(rig: &FakeRig) {
     rig.connection_value("email", "user", "sender@example.com");
     rig.connection_value("email", "password", "secret");
-    rig.connection_value("email", "smtp_host", "127.0.0.1");
-    rig.connection_value("email", "smtp_port", &rig.hang_up_server().to_string());
+    rig.connection_value("email", "smtpHost", "127.0.0.1");
+    rig.connection_value("email", "smtpPort", &rig.hang_up_server().to_string());
 }
 
 fn send_inputs(rig: &FakeRig, to: &str) -> serde_json::Value {

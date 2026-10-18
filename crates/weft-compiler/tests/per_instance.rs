@@ -81,7 +81,7 @@ g.access = slack.access
     assert_eq!(per_instance(&project, "g.d"), Some(PerInstance::Derived));
 }
 
-/// Only an infra node may carry the mark; an access step is pointed at
+/// Only an infra node may carry the mark; an access node is pointed at
 /// `@instance_filled` on its connection.
 #[test]
 fn only_an_infra_node_carries_the_mark() {
@@ -118,7 +118,7 @@ fn the_mark_is_refused_where_it_means_nothing() {
 /// An instance-filled connection carries its service's recipe on the
 /// definition, and every instance-filled node its rules: an instance is
 /// connected and filled from its own page, and the program is all that
-/// door has to read them from. A shared access step, and a step the slice
+/// door has to read them from. A shared access node, and a node the slice
 /// only reached, carry neither.
 #[test]
 fn an_instance_filled_node_carries_what_the_instance_door_reads() {

@@ -1,9 +1,9 @@
 // Pre-flight gate for the action bar's shipping verbs (PREFLIGHT_VERBS).
 //
-// Runtime-level findings (an unpicked connection, a missing model) are not
+// Runtime-level findings (a provider with no model named yet) are not
 // code errors: the Problems panel skips them so a project can be sketched
-// with secrets unfilled. But sending such a project to the dispatcher wastes
-// a build and fails mid-execution. So before the extension spawns the CLI
+// with those settings unfilled. But sending such a project to the dispatcher wastes
+// a build and fails mid-run. So before the extension spawns the CLI
 // verb, it validates the saved entry file in `runtime` mode; any
 // error-severity finding blocks the verb and lands on the action bar's
 // error banner (complete list in the details modal), and nothing is sent.

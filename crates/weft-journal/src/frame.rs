@@ -9,7 +9,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 use crate::record::{Born, Fate, StoredSelection, Written};
 
@@ -33,7 +33,7 @@ pub struct BatchHead {
 /// One run's share of a batch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunHead {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The epoch the run's writer holds it under (1 for a run it bore,
     /// what its claim answered for one it claimed).
     pub epoch: i32,
@@ -110,7 +110,7 @@ mod tests {
             runs: runs
                 .iter()
                 .map(|(id, sizes)| RunHead {
-                    execution_id: ExecutionId::from_u128(*id),
+                    run_id: RunId::from_u128(*id),
                     epoch: 1,
                     first_seq: 0,
                     row_sizes: sizes.to_vec(),

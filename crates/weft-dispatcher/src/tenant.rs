@@ -44,7 +44,7 @@ impl std::fmt::Display for TenantId {
 /// caller already runs in a `Result` context and propagates with `?`.
 ///
 /// A caller that must tolerate a deleted project reads the tenant off the
-/// run's own row instead (`ExecutionOwner::tenant`, frozen at its birth), so
+/// run's own row instead (`RunOwner::tenant`, frozen at its birth), so
 /// it never reaches this lookup, which stays uniformly loud.
 #[async_trait]
 pub trait TenantRouter: Send + Sync {

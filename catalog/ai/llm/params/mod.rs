@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmParamsNode;
@@ -24,7 +24,7 @@ impl Node for LlmParamsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The node's whole job is forwarding its config fields as one object.
         let out = ctx.inputs.object()?.clone();
         ctx.pulse_downstream(NodeOutput::new().set("params", Value::Object(out))).await

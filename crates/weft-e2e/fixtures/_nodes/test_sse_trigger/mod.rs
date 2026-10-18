@@ -12,20 +12,20 @@ use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::signal::SseSubscribe;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct TestSseTriggerNode;
 
 #[async_trait]
 impl Node for TestSseTriggerNode {
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
         let event_name: String = ctx.inputs.get("event_name")?;
         ctx.register_signal(SseSubscribe { url, event_name, filters: Vec::new() }).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The SSE listener delivers the parsed `data:` object as the
         // wake payload. Emit its `value` field on our `value` port.
         let value: Value = ctx.wake.get_or("value", Value::Null)?;

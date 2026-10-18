@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, NodeErrExt, WeftResult};
+use weft::{Access, RunContext, NodeErrExt, WeftResult};
 
 use super::elevenlabs::{audio_file_type, API};
 use super::flows::set_some;
@@ -32,7 +32,7 @@ pub fn line_refusal(text: Option<&str>) -> Option<String> {
 /// description, the line the previews speak (or ElevenLabs asked to
 /// write one), and the guidance scale, loudness, seed and prompt
 /// strength when given.
-pub fn preview_request(ctx: &ExecutionContext, description: &str, text: Option<&str>) -> WeftResult<Value> {
+pub fn preview_request(ctx: &RunContext, description: &str, text: Option<&str>) -> WeftResult<Value> {
     let mut body = json!({ "voice_description": description });
     match text {
         Some(t) => body["text"] = json!(t),
@@ -53,7 +53,7 @@ pub fn preview_request(ctx: &ExecutionContext, description: &str, text: Option<&
 /// speak. A format with no file type is refused before anything is
 /// sent.
 pub async fn emit_previews(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     account: &Access,
     route: &str,
     body: &Value,
@@ -65,7 +65,7 @@ pub async fn emit_previews(
     let url = format!("{API}/text-to-voice/{route}?output_format={}", urlencoding::encode(output_format));
     let answer = post_json(&http, &url, body, what).await?;
 
-    let storage = ctx.storage(StorageScope::Execution);
+    let storage = ctx.storage(StorageScope::Run);
     let mut previews: Vec<Value> = Vec::new();
     for (n, p) in answer["previews"].as_array().into_iter().flatten().enumerate() {
         // A preview without its audio or its voice id is no preview:

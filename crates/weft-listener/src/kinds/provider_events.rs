@@ -468,7 +468,7 @@ static SOCKETS: LazyLock<DashMap<String, SocketShare>> = LazyLock::new(DashMap::
 
 /// One subscription on a shared socket: its fire plumbing plus what
 /// it may hear. On a multi-install socket (the recipe declares
-/// `multi_account`) an account-scoped subscriber only hears frames
+/// `multiAccount`) an account-scoped subscriber only hears frames
 /// proven to be its own account's; an app-wide one hears everything.
 #[derive(Clone)]
 struct Subscriber {
@@ -912,13 +912,13 @@ mod tests {
                     "url": "https://slack.com/api/apps.connections.open",
                     "method": "POST",
                     "auth": [{ "kind": "header", "name": "Authorization",
-                               "value": "Bearer {app_token}" }],
+                               "value": "Bearer {appToken}" }],
                     "captures": [{ "name": "url", "path": "url" }]
                 }
             },
             "webhook": { "verify": { "kind": "hmac",
-                                     "signature_header": "X-Slack-Signature",
-                                     "timestamp_header": "X-Slack-Request-Timestamp",
+                                     "signatureHeader": "X-Slack-Signature",
+                                     "timestampHeader": "X-Slack-Request-Timestamp",
                                      "concat": "v0:{timestamp}:{body}",
                                      "prefix": "v0=" } }
         }))
@@ -931,7 +931,7 @@ mod tests {
     fn the_transport_follows_the_connection() {
         let both = slack_topic();
         let with_token =
-            BTreeMap::from([("app_token".to_string(), "xapp-1".to_string())]);
+            BTreeMap::from([("appToken".to_string(), "xapp-1".to_string())]);
         assert_eq!(
             decide_transport(&both, EventScope::Account, &with_token, false),
             Transport::Socket
@@ -950,7 +950,7 @@ mod tests {
         match decide_transport(&both, EventScope::App, &BTreeMap::new(), false) {
             Transport::Unservable(reason) => {
                 assert!(reason.contains("app-wide"), "{reason}");
-                assert!(reason.contains("app_token"), "{reason}");
+                assert!(reason.contains("appToken"), "{reason}");
             }
             other => panic!("expected unservable, got {other:?}"),
         }
@@ -962,14 +962,14 @@ mod tests {
                 "connect": {
                     "url": "https://x/open", "method": "POST",
                     "auth": [{ "kind": "header", "name": "Authorization",
-                               "value": "Bearer {app_token}" }],
+                               "value": "Bearer {appToken}" }],
                     "captures": [{ "name": "url", "path": "url" }]
                 }
             }
         }));
         match decide_transport(&socket_only, EventScope::Account, &BTreeMap::new(), false) {
             Transport::Unservable(reason) => {
-                assert!(reason.contains("app_token"), "{reason}")
+                assert!(reason.contains("appToken"), "{reason}")
             }
             other => panic!("expected unservable, got {other:?}"),
         }
@@ -982,7 +982,7 @@ mod tests {
     #[test]
     fn an_install_that_prefers_the_push_takes_it() {
         let both = slack_topic();
-        let with_token = BTreeMap::from([("app_token".to_string(), "xapp-1".to_string())]);
+        let with_token = BTreeMap::from([("appToken".to_string(), "xapp-1".to_string())]);
         assert_eq!(decide_transport(&both, EventScope::Account, &with_token, true), Transport::Webhook);
         assert_eq!(decide_transport(&both, EventScope::App, &with_token, true), Transport::Socket);
     }

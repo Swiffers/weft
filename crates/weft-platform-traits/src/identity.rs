@@ -101,7 +101,7 @@ impl IdentityTokens for FixedToken {
 /// The header a worker process names itself with on every call to the
 /// broker: a random replica id it mints at boot. The principal says WHICH
 /// project; this says which running process of it, so a claim, the
-/// ownership of the execution it drives, and the journal rows it writes all
+/// ownership of the run it drives, and the journal rows it writes all
 /// name the same writer. It is self-asserted, and that is enough: it
 /// only orders writers inside one project, all of which are the same
 /// principal.

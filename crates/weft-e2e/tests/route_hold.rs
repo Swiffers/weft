@@ -42,13 +42,13 @@ async fn a_route_holds_its_wait_and_gives_up_after_its_hold() -> anyhow::Result<
     let failed = poll_until("the given-up run to end", Duration::from_secs(60), Duration::from_millis(250), || {
         let disp = disp.clone();
         async move {
-            let page: Value = disp.get_json(&format!("/executions?project_id={pid}&phase=fire&limit=50")).await?;
-            Ok(page["executions"]
+            let page: Value = disp.get_json(&format!("/runs?project_id={pid}&phase=fire&limit=50")).await?;
+            Ok(page["runs"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|row| row["entry_node"] == "impatient" && row["status"] != "running"))
+                .find(|row| row["entryNode"] == "impatient" && row["status"] != "running"))
         }
     })
     .await?;

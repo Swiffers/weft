@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use weft::infra::{Container, ContainerPort, Endpoint, EndpointTarget, Expose, Image, InfraSpec, Probe, Protocol, Unit};
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::{RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct TickServiceNode;
@@ -34,7 +34,7 @@ impl Node for TickServiceNode {
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let api = ctx.endpoint("api").await?;
         ctx.pulse_downstream(NodeOutput::new().set("eventsUrl", format!("{}/events", api.url()))).await
     }

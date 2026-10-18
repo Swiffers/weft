@@ -2,7 +2,7 @@
 //! rule serves two things that are otherwise unrelated: a NODE's tags
 //! (`_tags` in its config, a compile-time label used for token-scoped
 //! signal enumeration: a token with `allowed_tags = ["t1"]` sees only
-//! signals tagged `t1`) and an EXECUTION's tags (`ctx.tag_execution`, a
+//! signals tagged `t1`) and a RUN's tags (`ctx.tag_run`, a
 //! run-time label a sibling run can `ctx.stop_tagged` on). One
 //! validator, two homes; nothing else is shared.
 //!
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// SYNC: TAGS_CONFIG_KEY <-> packages/weft-graph/src/webview/lib/node-tags.ts (TAGS_CONFIG_KEY)
 pub const TAGS_CONFIG_KEY: &str = "_tags";
 
-/// Whether `ctx.stop_tagged` counts the calling execution among the
+/// Whether `ctx.stop_tagged` counts the calling run among the
 /// ones it stops. A named choice rather than a bare boolean, because
 /// `stop_tagged("x", true)` at a call site says nothing about which way
 /// `true` points.
@@ -100,8 +100,8 @@ pub fn validate_tags(tags: &[String]) -> Result<(), TagError> {
 /// tag, while the readable part keeps most of the room.
 const FINGERPRINT_LEN: usize = 16;
 
-/// Any string as a valid tag, the one rule every execution-tag call
-/// (`ctx.tag_execution`, `ctx.stop_tagged`, a runs query's tag filter)
+/// Any string as a valid tag, the one rule every run-tag call
+/// (`ctx.tag_run`, `ctx.stop_tagged`, a runs query's tag filter)
 /// applies to what it is handed. A value that already is a tag is kept
 /// as it is, so a chat id stays readable and the same clean value is
 /// the same tag. Anything else is rewritten: every other character

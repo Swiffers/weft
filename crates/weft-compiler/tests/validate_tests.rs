@@ -643,14 +643,43 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
 }
 
 #[test]
+fn loop_snake_case_settings_are_rejected_naming_the_camel_case_ones() {
+    // Loop settings are camelCase like every other setting, with no
+    // alias: a program still written `max_iters` / `trim_on_mismatch`
+    // must not compile (and must not run uncapped), and the error lists
+    // the names to write instead.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    parallel: true
+    over: ["items"]
+    max_iters: 10
+    trim_on_mismatch: false
+    p = Text { value: "x" }
+    self.results = p.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hits: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("loop-unknown-config-field")).collect();
+    assert_eq!(hits.len(), 2, "{d:?}");
+    for key in ["'max_iters'", "'trim_on_mismatch'"] {
+        assert!(hits.iter().any(|e| e.message.contains(key)), "{key} flagged: {d:?}");
+    }
+    for e in &hits {
+        assert!(e.message.contains("maxIters") && e.message.contains("trimOnMismatch"), "{}", e.message);
+    }
+}
+
+#[test]
 fn loop_max_iters_and_trim_types_are_enforced() {
     let (project, _) = parse_enrich_lenient(
         r#"
 my = Loop(items: List[String]) -> (results: List[String | Null]) {
     parallel: true
     over: ["items"]
-    max_iters: "ten"
-    trim_on_mismatch: "nope"
+    maxIters: "ten"
+    trimOnMismatch: "nope"
     p = Text { value: "x" }
     self.results = p.value
 }
@@ -712,7 +741,7 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
 
 #[test]
 fn sequential_loop_without_termination_fires() {
-    // No `over`, no `max_iters`, no `self.done` write: provably
+    // No `over`, no `maxIters`, no `self.done` write: provably
     // infinite, rejected at compile time.
     let (project, _) = parse_enrich_lenient(
         r#"
@@ -751,14 +780,14 @@ fn max_iters_only_sequential_loop_is_accepted() {
         r#"
 my = Loop() -> () {
     parallel: false
-    max_iters: 5
+    maxIters: 5
     p = Text { value: "x" }
 }
 "#,
     );
     let d = validate(&project, &catalog());
     assert!(!codes(&d).contains(&"loop-unbounded-no-termination"),
-        "max_iters-capped loop must not be flagged unbounded, got {:?}", codes(&d));
+        "maxIters-capped loop must not be flagged unbounded, got {:?}", codes(&d));
 }
 
 #[test]
@@ -1015,7 +1044,7 @@ show.media = fetch.file
 link = DownloadLink
 link.file = fetch.file
 
-kept = KeepFile { ttl_days: 30 }
+kept = KeepFile { ttlDays: 30 }
 kept.file = fetch.file
 "#,
     );
@@ -1262,7 +1291,7 @@ send.account = ws.access
     match &account.widget {
         Some(weft_core::node::Widget::Access { service, optional }) => {
             assert_eq!(service.as_deref(), Some("slack"));
-            assert!(!optional, "slack's recipe does not declare connection_optional");
+            assert!(!optional, "slack's recipe does not declare connectionOptional");
         }
         other => panic!("account input is not an access widget: {other:?}"),
     }
@@ -1348,7 +1377,7 @@ out.data = req.body
 
 #[test]
 fn a_free_text_select_takes_a_value_its_options_never_listed() {
-    // LlmParams' `reasoningEffort` lists suggestions (`free_text`): an
+    // LlmParams' `reasoningEffort` lists suggestions (`freeText`): an
     // effort level a provider added after the list was written compiles.
     let project = parse_enrich(
         r#"
@@ -1826,8 +1855,8 @@ out.data = grp.done
 
 /// A stream declared on the PROJECT'S OWN input boundary has no
 /// incoming edge at all, so an edge-based rule would let it compile
-/// clean and ship an unsatisfiable graph (nothing can hand an
-/// execution a live stream as an input).
+/// clean and ship an unsatisfiable graph (nothing can hand a
+/// run a live stream as an input).
 #[test]
 fn a_stream_on_the_projects_input_boundary_is_rejected() {
     let (project, _) = parse_enrich_lenient(
@@ -2434,7 +2463,7 @@ ask = HumanQuery {
 }
 q = Text { value: "ok to send?" }
 ask.question = q.value
-out = Debug { data: ask.send_approved }
+out = Debug { data: ask.sendApproved }
 "#,
     );
     let d = validate(&project, &catalog());
@@ -2466,7 +2495,7 @@ ask = HumanQuery {
 }
 q = Text { value: "ok to send?" }
 ask.question = q.value
-out = Debug { data: ask.send_approved }
+out = Debug { data: ask.sendApproved }
 "#,
     );
     let d = validate(&project, &catalog());
@@ -3065,12 +3094,12 @@ fn a_loop_reading_the_enclosing_groups_self_is_told_to_thread_it_in() {
 outer = Group(db: String, items: List[String]) -> (done: List[String | Null]) {
     run = Loop(items: List[String]) -> (results: List[String | Null]) {
         over: ["items"]
-        step = ExecPython(row: String, db: String) -> (out: String) {
+        py = ExecPython(row: String, db: String) -> (out: String) {
             code: "return {'out': row + db}"
             row: self.items
             db: self.db
         }
-        self.results = step.out
+        self.results = py.out
     }
     run.items = self.items
     self.done = run.results
@@ -3860,7 +3889,7 @@ fn a_trigger_name_follows_whose_triggers_the_node_acts_on() {
 
 /// `input_names` with a field: SetInstanceValues keys its `values` and
 /// lists its `clear` by `node.field`, and each must be a field this
-/// program writes `@instance_filled`. Renaming the step leaves the old
+/// program writes `@instance_filled`. Renaming the node leaves the old
 /// name behind, and the compiler says so.
 #[test]
 fn set_instance_values_names_fields_an_instance_fills() {
@@ -3902,11 +3931,11 @@ fn a_wired_gate_silences_the_all_optional_inputs_warning() {
         validate(&parse_enrich(source), &catalog()).iter().any(|d| d.code.as_deref() == Some("no-required-skip"))
     };
     let base = "t = Route { path: \"gone\", method: \"DELETE\" }\n\
-                step = ExecPython(method: String) -> (why: String, ok: Boolean) { code: \"return {'why': 'x', 'ok': False}\" }\n\
-                step.method = t.method\n\
-                bye = Close { status: 404 }\nbye.reason = step.why\n";
+                py = ExecPython(method: String) -> (why: String, ok: Boolean) { code: \"return {'why': 'x', 'ok': False}\" }\n\
+                py.method = t.method\n\
+                bye = Close { status: 404 }\nbye.reason = py.why\n";
     assert!(warned(base), "all of Close's wired inputs are optional and nothing gates it");
-    assert!(!warned(&format!("{base}bye._should_flow = step.ok\n")), "the gate is the author's decision");
+    assert!(!warned(&format!("{base}bye._should_flow = py.ok\n")), "the gate is the author's decision");
 }
 
 /// Close's two wires have one field each, and the pair that cannot work
@@ -3919,12 +3948,12 @@ fn close_says_at_edit_time_which_wire_its_fields_belong_to() {
     };
     let route = "t = Route { path: \"gone\", method: \"DELETE\" }\nstep = ExecPython(method: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.method = t.method\nbye = Close ";
     // A reason under a 204 cannot reach the caller.
-    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
-    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
-    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = step.n\n"), "carries no body"));
+    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = py.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = py.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = py.n\n"), "carries no body"));
     // A socket's close code behind a Route, and an HTTP status behind a socket.
-    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = step.n\n"), "WebSocket close code"));
-    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = step.n\n";
+    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = py.n\n"), "WebSocket close code"));
+    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = py.n\n";
     assert!(says(socket, "an HTTP status"));
     assert!(!says(socket, "WebSocket close code"));
 }
@@ -4883,4 +4912,198 @@ fn an_input_required_when_wired_is_optional_unwired_and_required_wired() {
     let d = validate(&wired, &catalog());
     assert!(!codes(&d).contains(&"required-port-unmet"), "{d:?}");
     assert!(!codes(&d).contains(&"no-required-skip"), "a closed wire on `instance` skips the node: {d:?}");
+}
+
+// ── not-camel-case ───────────────────────────────────────────────────────────
+
+fn casing_warnings(d: &[Diagnostic]) -> Vec<&Diagnostic> {
+    d.iter().filter(|x| x.code.as_deref() == Some("not-camel-case")).collect()
+}
+
+/// A snake_case node name warns once, on its own line, naming the
+/// spelling that fits; the program still builds.
+#[test]
+fn a_snake_case_node_name_warns_with_the_fix() {
+    let d = validate(&parse_enrich("\nhit_body = Text { value: \"x\" }\nout = Debug { data: hit_body.value }\n"), &catalog());
+    let warned = casing_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert_eq!(warned[0].severity, Severity::Warning);
+    assert_eq!(warned[0].message, "node 'hit_body' is not camelCase: write 'hitBody'");
+    assert_eq!(warned[0].line, 2, "on the declaration: {warned:?}");
+}
+
+/// A port a header declares is the author's: a snake_case one warns on
+/// a node and on a group, once per name even when both sides declare it,
+/// and so do the group's and loop's own names.
+#[test]
+fn a_snake_case_declared_port_warns_with_the_fix() {
+    let d = validate(
+        &parse_enrich(
+            r#"
+py = ExecPython(ttl_days: Number) -> (ttl_days: Number) { code: "return {'ttl_days': ttl_days}", ttl_days: 1 }
+work_stage = Group(raw_text: String) -> (out: String) {
+  t = Text { value: "x" }
+  self.out = t.value
+}
+work_stage.raw_text = "hi"
+"#,
+        ),
+        &catalog(),
+    );
+    let mut messages: Vec<&str> = casing_warnings(&d).iter().map(|x| x.message.as_str()).collect();
+    messages.sort();
+    assert_eq!(
+        messages,
+        vec![
+            "group 'work_stage' is not camelCase: write 'workStage'",
+            "port 'raw_text' is not camelCase: write 'rawText'",
+            "port 'ttl_days' is not camelCase: write 'ttlDays'",
+        ],
+        "{d:?}"
+    );
+    let loop_d = validate(
+        &parse_enrich(
+            r#"
+each_item = Loop(the_items: List[String]) -> (results: List[String | Null]) {
+  parallel: true
+  over: ["the_items"]
+  d = Debug { data: self.the_items }
+  self.results = d.data
+}
+each_item.the_items = ["a"]
+"#,
+        ),
+        &catalog(),
+    );
+    let mut loop_messages: Vec<&str> = casing_warnings(&loop_d).iter().map(|x| x.message.as_str()).collect();
+    loop_messages.sort();
+    assert_eq!(
+        loop_messages,
+        vec![
+            "loop 'each_item' is not camelCase: write 'eachItem'",
+            "port 'the_items' is not camelCase: write 'theItems'",
+        ],
+        "{loop_d:?}"
+    );
+}
+
+/// Silent on what the author did not write or spelled right: camelCase
+/// names and ports, a node type's own ports, the gates, the ids the
+/// compiler mints for groups, loops and inline expressions.
+#[test]
+fn camel_case_catalog_ports_gates_and_generated_ids_do_not_warn() {
+    let d = validate(
+        &parse_enrich(
+            r#"
+hitBody = Text { value: "x" }
+llm = LlmInference { prompt: Text { value: "hi" }.value }
+work = Group(rawText: String, _should_flow: Boolean) -> (out: String) {
+  inner = Debug { data: Text { value: "y" }.value }
+  self.out = inner.data
+}
+work.rawText = hitBody.value
+work._should_flow = true
+each = Loop(items: List[String]) -> (results: List[String | Null]) {
+  parallel: true
+  over: ["items"]
+  d = Debug { data: self.items }
+  self.results = d.data
+}
+each.items = ["a"]
+"#,
+        ),
+        &catalog(),
+    );
+    assert!(casing_warnings(&d).is_empty(), "{d:?}");
+}
+
+/// A node type's own ports are the catalog's to spell: a project node
+/// whose input is snake_case warns in the catalog, on its own
+/// metadata.json, and never on the program nodes that use it, whether
+/// they set the input in the body or narrow it in a header.
+#[test]
+fn a_node_types_own_snake_case_input_is_the_catalogs_warning_not_the_programs() {
+    let nodes = tempfile::tempdir().unwrap();
+    let shout = nodes.path().join("shout");
+    std::fs::create_dir_all(&shout).unwrap();
+    std::fs::write(
+        shout.join("metadata.json"),
+        r#"{"type": "Shout", "label": "Shout", "description": "d",
+            "inputs": [{"name": "user_name", "type": "String"}],
+            "outputs": [{"name": "out", "type": "String"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(shout.join("mod.rs"), "// impl\n").unwrap();
+    let stdlib = stdlib_root().expect("stdlib root");
+    let catalog = FsCatalog::discover_roots(&[stdlib.as_path(), nodes.path()]).expect("catalog");
+    assert!(
+        catalog.warnings().iter().any(|w| w.message.contains("input 'user_name' is not camelCase")),
+        "the catalog owns the warning: {:?}",
+        catalog.warnings()
+    );
+
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let source = r#"
+first = Shout { user_name: "ada" }
+second = Shout(user_name: String) -> (out: String) { user_name: "bob" }
+d = Debug { data: first.out }
+e = Debug { data: second.out }
+"#;
+    let mut project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Full, COMPONENT)
+        .expect("compile ok");
+    enrich(&mut project, &catalog).expect("enrich ok");
+    let d = validate(&project, &catalog);
+    assert!(casing_warnings(&d).is_empty(), "{d:?}");
+}
+
+/// An included file's names are checked once, on that file's own lines,
+/// however many sites call it: the site's ports are the file's, and the
+/// body's id (its path) is not a name anyone wrote.
+#[test]
+fn an_included_file_is_checked_once_on_its_own_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("clean_text.weft"),
+        "Group(raw_text: String) -> (out: String) {\n  t = Text { value: \"x\" }\n  self.out = t.value\n}\n",
+    )
+    .unwrap();
+    let mut project = compile(
+        "first = @include(\"clean_text.weft\")\nfirst.raw_text = \"a\"\nsecond = @include(\"clean_text.weft\")\nsecond.raw_text = \"b\"\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+    )
+    .expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    let d = validate(&project, &catalog());
+    let warned = casing_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert_eq!(warned[0].message, "port 'raw_text' is not camelCase: write 'rawText'");
+    assert!(
+        warned[0].file.as_deref().is_some_and(|f| f.ends_with("clean_text.weft")) && warned[0].line == 1,
+        "on the included file's header: {warned:?}"
+    );
+}
+
+/// A node whose added ports are named after outside data
+/// (`addedPortsAreDataKeys`) keeps that data's spelling: a body's
+/// `user_id` key is the port `user_id`, and nothing warns. The node's
+/// own name is still the author's, and still checked.
+#[test]
+fn ports_named_after_outside_data_do_not_warn() {
+    let d = validate(
+        &parse_enrich("\nbody_out = JsonObject(user_id: String) { user_id: \"42\" }\nout = Debug { data: body_out.object }\n"),
+        &catalog(),
+    );
+    let messages: Vec<&str> = casing_warnings(&d).iter().map(|x| x.message.as_str()).collect();
+    assert_eq!(messages, vec!["node 'body_out' is not camelCase: write 'bodyOut'"], "{d:?}");
+}
+
+/// A port made by writing a key in a node's body is the author's name
+/// too, and warns like a header port; a catalog setting written in the
+/// body (`code`) is the node type's and does not.
+#[test]
+fn a_snake_case_input_made_by_a_body_key_warns() {
+    let d = validate(&parse_enrich("\npy = ExecPython { code: \"return {}\", user_id: 3 }\n"), &catalog());
+    let messages: Vec<&str> = casing_warnings(&d).iter().map(|x| x.message.as_str()).collect();
+    assert_eq!(messages, vec!["port 'user_id' is not camelCase: write 'userId'"], "{d:?}");
 }

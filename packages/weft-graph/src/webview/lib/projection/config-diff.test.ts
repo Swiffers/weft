@@ -13,7 +13,7 @@ describe('diffConfigOps', () => {
 	it('emits ops only for the keys that changed', () => {
 		const current = { from: 0, to: 10, step: 1 };
 		const ops = diffConfigOps('range_1', { ...current, to: 20 }, current, false);
-		expect(ops).toEqual([{ op: 'setConfig', node: 'range_1', key: 'to', value: '20' }]);
+		expect(ops).toEqual([{ op: 'set_config', node: 'range_1', key: 'to', value: '20' }]);
 	});
 
 	it('layout/view keys never become source ops', () => {
@@ -23,7 +23,7 @@ describe('diffConfigOps', () => {
 
 	it('unsetting a previously-set key emits a remove; an always-unset key emits nothing', () => {
 		expect(diffConfigOps('n', { text: null }, { text: 'old' }, false))
-			.toEqual([{ op: 'removeConfig', node: 'n', key: 'text' }]);
+			.toEqual([{ op: 'remove_config', node: 'n', key: 'text' }]);
 		expect(diffConfigOps('n', { text: null }, {}, false)).toEqual([]);
 	});
 
@@ -34,13 +34,13 @@ describe('diffConfigOps', () => {
 		// A genuinely different object is.
 		const ops = diffConfigOps('n', { schema: { fields: [{ key: 'b' }] } }, current, false);
 		expect(ops).toHaveLength(1);
-		expect(ops[0].op).toBe('setConfig');
+		expect(ops[0].op).toBe('set_config');
 	});
 
 	it('object values compare regardless of key order (no phantom setConfig)', () => {
 		// A render that reconstructs an object config with keys in a DIFFERENT order
 		// is the same value. A key-order-sensitive compare would emit a phantom
-		// setConfig here (the exact toggle regression this module exists to prevent).
+		// set_config here (the exact toggle regression this module exists to prevent).
 		const current = { schema: { a: 1, b: 2, nested: { x: 1, y: 2 } } };
 		const reordered = { schema: { nested: { y: 2, x: 1 }, b: 2, a: 1 } };
 		expect(diffConfigOps('n', reordered, current, false)).toEqual([]);
@@ -48,9 +48,9 @@ describe('diffConfigOps', () => {
 
 	it('routes Loop containers to the loop op family', () => {
 		expect(diffConfigOps('MyLoop', { parallel: true }, { parallel: false }, true))
-			.toEqual([{ op: 'setLoopConfig', loopId: 'MyLoop', key: 'parallel', value: 'true' }]);
-		expect(diffConfigOps('MyLoop', { max_iters: null }, { max_iters: 5 }, true))
-			.toEqual([{ op: 'removeLoopConfig', loopId: 'MyLoop', key: 'max_iters' }]);
+			.toEqual([{ op: 'set_loop_config', loopId: 'MyLoop', key: 'parallel', value: 'true' }]);
+		expect(diffConfigOps('MyLoop', { maxIters: null }, { maxIters: 5 }, true))
+			.toEqual([{ op: 'remove_loop_config', loopId: 'MyLoop', key: 'maxIters' }]);
 	});
 });
 
@@ -68,20 +68,20 @@ describe('diffPortLiteralOps', () => {
 		const marker = { __weft_install_picked__: {} };
 		const ops = diffPortLiteralOps('n', { account: instanceFilledValue() }, { account: marker }, {}, 'inline');
 		expect(ops).toHaveLength(1);
-		expect(ops[0]).toMatchObject({ op: 'setConfig', node: 'n', key: 'account', form: 'inline' });
+		expect(ops[0]).toMatchObject({ op: 'set_config', node: 'n', key: 'account', form: 'inline' });
 	});
 
 	it('a value already in source keeps its written form, whatever the first form is', () => {
 		expect(diffPortLiteralOps('n', { text: 'new' }, { text: 'old' }, { text: span('connection') }, 'inline'))
-			.toEqual([{ op: 'setConfig', node: 'n', key: 'text', value: '"new"', form: 'connection' }]);
+			.toEqual([{ op: 'set_config', node: 'n', key: 'text', value: '"new"', form: 'connection' }]);
 		expect(diffPortLiteralOps('n', {}, { text: 'old' }, { text: span('inline') }, 'connection'))
-			.toEqual([{ op: 'removeConfig', node: 'n', key: 'text', form: 'inline' }]);
+			.toEqual([{ op: 'remove_config', node: 'n', key: 'text', form: 'inline' }]);
 	});
 
 	it('a first write takes the node kind\'s form: braces on a node, a statement line on an include', () => {
 		expect(diffPortLiteralOps('n', { text: 'hi' }, {}, {}, 'inline'))
-			.toEqual([{ op: 'setConfig', node: 'n', key: 'text', value: '"hi"', form: 'inline' }]);
+			.toEqual([{ op: 'set_config', node: 'n', key: 'text', value: '"hi"', form: 'inline' }]);
 		expect(diffPortLiteralOps('keep', { n: 7 }, {}, {}, 'connection'))
-			.toEqual([{ op: 'setConfig', node: 'keep', key: 'n', value: '7', form: 'connection' }]);
+			.toEqual([{ op: 'set_config', node: 'keep', key: 'n', value: '7', form: 'connection' }]);
 	});
 });

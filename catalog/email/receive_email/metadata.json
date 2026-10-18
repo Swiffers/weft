@@ -18,8 +18,8 @@
       "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
-        "imap_host",
-        "imap_port"
+        "imapHost",
+        "imapPort"
       ],
       "description": "Needs the connection's IMAP server filled."
     },

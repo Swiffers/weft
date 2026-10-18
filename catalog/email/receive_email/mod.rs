@@ -17,7 +17,7 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use weft::signal::{Framing, SocketFrame, StreamListen};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ReceiveEmailNode;
@@ -32,14 +32,14 @@ impl Node for ReceiveEmailNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         // The IMAP watch dialogue: sign in, open the inbox, hold an
         // IDLE. The server announces arrivals as "* N EXISTS" (or
         // RECENT), which is the fire. The heartbeat re-issues the
         // IDLE inside the 29-minute window RFC 2177 allows.
         let watch = StreamListen::new(
-            "{imap_host}:{imap_port}",
+            "{imapHost}:{imapPort}",
             Framing::Delimiter { bytes: "\r\n".into() },
             r"^\* \d+ (EXISTS|RECENT)",
         )
@@ -57,7 +57,7 @@ impl Node for ReceiveEmailNode {
         ctx.register_signal(watch).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let from_contains: Option<String> = ctx.inputs.opt("fromContains")?;
         let subject_contains: Option<String> = ctx.inputs.opt("subjectContains")?;
@@ -73,7 +73,7 @@ impl Node for ReceiveEmailNode {
                 let imap = super::mailbox::imap(&conn)?;
                 let raw = fetch_unseen(&imap.address, &imap.user, &imap.password)
                     .await
-                    .map_err(|e| weft::WeftError::NodeExecution(format!("reading the inbox over IMAP: {e}")))?;
+                    .map_err(|e| weft::WeftError::NodeFailed(format!("reading the inbox over IMAP: {e}")))?;
                 Ok(Value::Array(raw.iter().map(|m| parse_message(m)).collect()))
             })
             .await?
@@ -99,7 +99,7 @@ impl Node for ReceiveEmailNode {
             }
         }
 
-        // Nothing new passed the filters: the execution ends with the
+        // Nothing new passed the filters: the run ends with the
         // ports closed, which downstream reads as "nothing came".
         let Some(newest) = messages.last().cloned() else {
             return ctx.pulse_downstream(weft::node::NodeOutput::new().set("count", 0)).await;

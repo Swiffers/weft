@@ -73,10 +73,10 @@ describe('fieldForInput', () => {
 					sources: [
 						{ kind: 'granted', from: 'repositories' },
 						{ kind: 'list', get: 'https://x/list?q={query}', items: 'channels', label: 'name', value: 'id',
-							page: { cursor_param: 'cursor', cursor_path: 'meta.next' } },
+							page: { cursorParam: 'cursor', cursorPath: 'meta.next' } },
 						{ kind: 'from_url', pattern: 'x\\.com/([^/]+)' },
 					],
-					depends_on: ['repo'],
+					dependsOn: ['repo'],
 				},
 			}),
 		);

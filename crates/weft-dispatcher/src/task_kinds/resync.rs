@@ -224,7 +224,7 @@ pub fn task(tenant: &str, project_id: uuid::Uuid, driver: uuid::Uuid) -> weft_ta
         kind: weft_task_store::TaskKind::Resync,
         project_id: Some(project_id),
         dedup_key: Some(driver.to_string()),
-        execution_id: None,
+        run_id: None,
         tenant_id: tenant.to_string(),
         payload: serde_json::to_value(weft_task_store::ResyncPayload { driver }).expect("a resync payload serializes"),
     }

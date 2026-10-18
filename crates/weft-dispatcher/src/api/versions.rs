@@ -2,10 +2,10 @@
 //! itself (seeded, scoped, or plain), the tree, head, activation, and
 //! prune. See `crate::versions` for the model.
 //!
-//! One start path. `run` here is THE way an execution starts from the
+//! One start path. `run` here is THE way a run starts from the
 //! CLI or the editor: it resolves the spec (`weft_core::run_spec`),
 //! decides what a seeded run inherits (`weft_core::seeding`), journals
-//! the birth rows through `project::start_queued_execution` exactly as
+//! the birth rows through `project::start_queued_run` exactly as
 //! every other start does, and records the run under its version. A
 //! plain `weft run` is this endpoint with no seed and no scope.
 
@@ -19,14 +19,14 @@ use serde_json::Value;
 use weft_core::run_spec::{resolve_spec, Refusal, Resolved, RunSpec};
 use weft_core::frames::Located;
 use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 use crate::api::project::{coherent_definition, require_action, Kick};
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
 use crate::versions::{plan_prune, resolve_seed, version_id, Manifest, RunRow, SeedChoice, VersionRow};
 use weft_core::versions::{
-    manifest_diff, CheckpointRequest, Head, HeadRequest, HeadResponse, PruneResponse, RunStarted, RunSummary, RunUpdate,
+    manifest_diff, CheckpointRequest, Head, HeadRequest, HeadResponse, PruneResponse, RunStarted, VersionRun, RunUpdate,
     RunningSource, SweepResponse, VersionRunRequest, VersionSummary, VersionTree, VersionUpsert,
 };
 
@@ -43,7 +43,7 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 /// they are named here because the compare-and-set inside
 /// [`move_head_or_conflict`] is the only thing standing between them and
 /// a writer in here: `weft clean` deletes one run row and clears
-/// `head_run` (`api::execution`), a deactivate clears the activation pin
+/// `head_run` (`api::run`), a deactivate clears the activation pin
 /// (`api::project`), and the retirement sweep deletes rows of a project
 /// that no longer exists (`versions::retire_unused_versions`). A lost
 /// compare-and-set names those, and only those, as its cause.
@@ -260,7 +260,7 @@ async fn move_head_or_conflict(
     project: uuid::Uuid,
     expected: &Head,
     version: Option<&str>,
-    run: Option<ExecutionId>,
+    run: Option<RunId>,
 ) -> Result<(), ApiError> {
     let moved = state
         .versions
@@ -296,49 +296,49 @@ fn refused(refusal: &Refusal) -> ApiError {
 /// The runs of a project that are still going: queued or being driven. A
 /// run the version tree names that has no run row is not going; it is
 /// nothing.
-async fn in_flight_execution_ids(
+async fn in_flight_run_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
-) -> Result<std::collections::HashSet<ExecutionId>, ApiError> {
+) -> Result<std::collections::HashSet<RunId>, ApiError> {
     Ok(state
         .journal
-        .going_execution_ids_for_project(project)
+        .going_run_ids_for_project(project)
         .await
         .map_err(|e| internal("runs going", e))?
         .into_iter()
-        .map(|(execution_id, _)| execution_id)
+        .map(|(run_id, _)| run_id)
         .collect())
 }
 
-/// Every settled execution of a project: ended, or parked on a wait. Asked
+/// Every settled run of a project: ended, or parked on a wait. Asked
 /// once per project, never per run.
-async fn settled_execution_ids(
+async fn settled_run_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
-) -> Result<std::collections::HashSet<ExecutionId>, ApiError> {
-    state.journal.settled_execution_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
+) -> Result<std::collections::HashSet<RunId>, ApiError> {
+    state.journal.settled_run_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
 }
 
 /// The seed run folded, with its program: what the stale set reads.
 struct SeededFrom {
-    execution_id: ExecutionId,
+    run_id: RunId,
     outcomes: BTreeMap<Located, SeedOutcome>,
     outputs: Vec<weft_core::run_spec::OutputWire>,
 }
 
 async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -> Result<SeededFrom, ApiError> {
     if run.project_id != project { return Err((StatusCode::NOT_FOUND, "seed is outside this project".into())); }
-    let sources = crate::projection::reconstruct_execution(state, run.execution_id).await.map_err(|e| internal("seed sources", e))?;
-    let definition = sources[&run.execution_id].project().as_ref();
-    let snapshot = sources[&run.execution_id].snapshot();
-    let outputs = sources[&run.execution_id].output_wires().map_err(|e| internal("seed outputs", e))?;
+    let sources = crate::projection::reconstruct_run(state, run.run_id).await.map_err(|e| internal("seed sources", e))?;
+    let definition = sources[&run.run_id].project().as_ref();
+    let snapshot = sources[&run.run_id].snapshot();
+    let outputs = sources[&run.run_id].output_wires().map_err(|e| internal("seed outputs", e))?;
     let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
         .map(|wire| wire.place()).collect();
     let mut identities = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
     for place in inheritable_nodes(definition, snapshot) {
-        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.execution_id);
-        let (original, graph) = if origin == run.execution_id { (snapshot, definition) } else {
+        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.run_id);
+        let (original, graph) = if origin == run.run_id { (snapshot, definition) } else {
             let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
             (source.snapshot(), source.project().as_ref())
         };
@@ -355,7 +355,7 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
         let mut backup_origins = BTreeMap::new();
         let mut absent_ports = BTreeSet::new();
         let declaration = graph.nodes.iter().find(|n| n.id == place.id).ok_or_else(|| internal("seed node", &place.id))?;
-        for record in original.executions.get(&place.id).into_iter().flatten()
+        for record in original.firings.get(&place.id).into_iter().flatten()
             .filter(|record| Located::at(&place.id, &record.frames) == place)
         {
             for port in &record.received.backup_ports {
@@ -374,18 +374,18 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
                 .map(|(_, kick)| kick.payload.clone().unwrap_or(Value::Null)),
         });
     }
-    Ok(SeededFrom { execution_id: run.execution_id, outcomes, outputs })
+    Ok(SeededFrom { run_id: run.run_id, outcomes, outputs })
 }
 
 /// Refuse a seed that would reuse an output naming a stored file the
-/// file has moved on from: a reused step's saved result says what the
-/// step made, and a file edited since (by a later step, by another run)
+/// file has moved on from: a reused node's saved result says what the
+/// node made, and a file edited since (by a later node, by another run)
 /// or gone no longer holds it. Every such output is named at once, so
 /// one refusal says everything to hand in or re-run.
 async fn refuse_moved_files(
     state: &DispatcherState,
     project: &weft_core::ProjectDefinition,
-    reused: &BTreeMap<Located, ExecutionId>,
+    reused: &BTreeMap<Located, RunId>,
     outputs: &[weft_core::run_spec::OutputWire],
 ) -> Result<(), ApiError> {
     let mut refusals = Vec::new();
@@ -399,8 +399,8 @@ async fn refuse_moved_files(
                 Err(e) => return Err(internal("read a reused output's file", e)),
             };
             let place = wire.place();
-            let step = weft_core::project::address_of(project, &place.id, &place.path);
-            refusals.extend(weft_core::seeding::moved_file_refusal(&step, &wire.port, &file, now));
+            let node = weft_core::project::address_of(project, &place.id, &place.path);
+            refusals.extend(weft_core::seeding::moved_file_refusal(&node, &wire.port, &file, now));
         }
     }
     if refusals.is_empty() {
@@ -467,14 +467,14 @@ pub async fn run(
     let seed_run: Option<RunRow> = if body.seed && !body.root {
         let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
         let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let settled = settled_execution_ids(&state, id).await?;
+        let settled = settled_run_ids(&state, id).await?;
         match resolve_seed(&head, &versions, &runs, |c| settled.contains(&c)) {
-            SeedChoice::Run(execution_id) => runs.into_iter().find(|r| r.execution_id == execution_id),
+            SeedChoice::Run(run_id) => runs.into_iter().find(|r| r.run_id == run_id),
             SeedChoice::Nothing => None,
-            SeedChoice::HeadRunning(execution_id) => {
+            SeedChoice::HeadRunning(run_id) => {
                 return Err((
                     StatusCode::CONFLICT,
-                    format!("head {execution_id} is still running; `weft stop {execution_id}` or wait, then run again"),
+                    format!("head {run_id} is still running; `weft stop {run_id}` or wait, then run again"),
                 ));
             }
         }
@@ -558,7 +558,7 @@ pub async fn run(
             resolved.selection = planned.selection;
             let stale = resolved.selection.nodes.clone();
             let kicks = seeded_kicks(&resolved, &stale);
-            let seed = weft_journal::Seed { parent: from.execution_id, origins: planned.origins };
+            let seed = weft_journal::Seed { parent: from.run_id, origins: planned.origins };
             (Some(seed), stale, kicks)
         }
         None => (None, resolved.selection.nodes.clone(), resolved.kicks.clone()),
@@ -581,7 +581,7 @@ pub async fn run(
     // An instance's run reaching a `@instance_filled` field runs on what that
     // instance provides there: read and checked now, refused naming every
     // field left unfilled or filled wrong, rather than failing at the
-    // step mid-run. The run carries what was read.
+    // node mid-run. The run carries what was read.
     let instance_values = match &spec.instance {
         Some(instance) => {
             crate::api::project::instance_values_for_run(&state, id, &project, &resolved.selection, instance, None).await?
@@ -595,12 +595,12 @@ pub async fn run(
     // pulses the worker folds in, and it fires the moment they settle
     // after the selected reuse boundary. Only a run with
     // nothing stale, nothing kicked and nothing provided has no work.
-    let execution_id = weft_core::new_execution_id();
+    let run_id = weft_core::new_run_id();
     let now = crate::lease::now_unix() as u64;
-    let mut birth_rows = supplied_output_events(&project, &spec, &resolved, execution_id, now);
-    birth_rows.extend(weft_journal::birth::baked_rows(&project, execution_id, &resolved.baked, now));
+    let mut birth_rows = supplied_output_events(&project, &spec, &resolved, run_id, now);
+    birth_rows.extend(weft_journal::birth::baked_rows(&project, run_id, &resolved.baked, now));
     // An empty `entry_node` is the journal's marker for a row that no
-    // longer decodes, and `weft executions` prints `?` for it. A
+    // longer decodes, and `weft runs` prints `?` for it. A
     // seeded re-run of a mid-graph node has no kick and no provided
     // value, so falling back to the empty string labelled a perfectly
     // good run as corrupt. A stale node is the honest answer instead:
@@ -628,9 +628,9 @@ pub async fn run(
     // Recording the run and starting it happen under the project's
     // transition lock, together.
     //
-    // The tree row goes first: once `start_queued_execution_with`
+    // The tree row goes first: once `start_queued_run_with`
     // returns, a real run is queued and burning worker capacity, so a
-    // failure after that point would hand the caller no execution at all
+    // failure after that point would hand the caller no run at all
     // while the run proceeded, unreachable from `weft tree` and with
     // nothing to hand `weft clean`.
     //
@@ -658,11 +658,11 @@ pub async fn run(
         let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
         let version = commit_version(&state, id, &body.manifest, None, body.root, &head).await?;
         let spec_json = serde_json::to_value(&starting_parameters).map_err(|e| internal("the run's spec", e))?;
-        crate::api::project::start_queued_execution_with(
+        crate::api::project::start_queued_run_with(
             &state,
             &project.defaults,
             weft_journal::birth::Birth {
-                execution_id,
+                run_id,
                 project_id: id,
                 phase: weft_core::context::Phase::Fire,
                 entry_node: &entry_node,
@@ -691,7 +691,7 @@ pub async fn run(
         // Head moves LAST, and a lost race is reported, never refused.
         let moved = state
             .versions
-            .move_head(id, &head, Some(&version.version), Some(execution_id))
+            .move_head(id, &head, Some(&version.version), Some(run_id))
             .await
             .map_err(|e| internal("set head", e))?;
         Ok((version, moved))
@@ -700,10 +700,10 @@ pub async fn run(
 
     // A head that would not move is reported, never refused.
     //
-    // By this point the execution is journaled, queued and recorded
+    // By this point the run is journaled, queued and recorded
     // under its version: it is running. Answering 409 would tell the
     // person nothing started while a real run burned worker capacity
-    // under an execution they were never given, with no way to stop it. So
+    // under a run they were never given, with no way to stop it. So
     // the run stands and the answer says what happened.
     //
     // Another session checkpointing is NOT the cause any more: every tree
@@ -725,15 +725,15 @@ pub async fn run(
              this version, which is what they already are unless you have edited them since \
              reading this.",
             version.version,
-            &execution_id.to_string()[..8],
-            &execution_id.to_string()[..8],
+            &run_id.to_string()[..8],
+            &run_id.to_string()[..8],
         ));
     }
 
     let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
     let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect::<BTreeSet<_>>().into_iter().collect()).unwrap_or_default();
     Ok(Json(RunStarted {
-        execution_id,
+        run_id,
         version: version.version,
         seed: seed.map(|s| s.parent),
         inherited,
@@ -760,7 +760,7 @@ pub async fn run(
 /// through a trigger that answers a caller: read out of the fire's
 /// payload, refused at the command when it is no request or the trigger
 /// is one nobody can stand in for. The run's birth carries the trigger's
-/// spec (`ExecutionStarted::stand_in`), and the worker that drives it
+/// spec (`RunStarted::stand_in`), and the worker that drives it
 /// serves this request from its firing kick.
 fn stand_in_caller(
     spec: &weft_core::primitive::SignalSpec,
@@ -769,7 +769,7 @@ fn stand_in_caller(
 ) -> Result<weft_core::caller::LiveRequest, String> {
     // Refused HERE, at the command, rather than only in the worker that
     // would serve it: the engine keeps its own floor, but by then the
-    // person has already waited for an execution to start just to be
+    // person has already waited for a run to start just to be
     // told the thing they asked for cannot happen.
     if weft_core::signal::caller_protocol(&spec.kind) == Some(weft_core::signal::Protocol::Websocket) {
         return Err(format!(
@@ -793,7 +793,7 @@ fn stand_in_caller(
     })
 }
 
-fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, execution_id: ExecutionId, at_unix: u64) -> Vec<weft_journal::ExecEvent> {
+fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, run_id: RunId, at_unix: u64) -> Vec<weft_journal::RunEvent> {
     // Seed suppliers carry their original events. Only authored emits create
     // new supplied facts, including closures for an explicit empty port map,
     // and only the emits the cut kept (`--before` can drop one).
@@ -813,7 +813,7 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
                 .or_insert_with(|| (place.frames(), Default::default()));
         }
     }
-    weft_journal::birth::supplied_rows(project, execution_id, by_source.iter().map(|(source, (frames, ports))| (*source, frames, ports.clone())), at_unix)
+    weft_journal::birth::supplied_rows(project, run_id, by_source.iter().map(|(source, (frames, ports))| (*source, frames, ports.clone())), at_unix)
 }
 
 /// Whose bakes a preview asks about: the shared triggers' by default.
@@ -904,31 +904,24 @@ pub async fn tree(
     // ONE read for every run's status. Asked per run, a project with a
     // thousand runs started by hand did a thousand point lookups on every
     // `weft tree` and every refresh of the editor's version sidebar.
-    let run_ids: Vec<ExecutionId> = runs.iter().map(|r| r.execution_id).collect();
-    let summaries = state
+    let run_ids: Vec<RunId> = runs.iter().map(|r| r.run_id).collect();
+    let mut summaries = state
         .journal
-        .execution_summaries(&run_ids)
+        .run_summaries(&run_ids)
         .await
-        .map_err(|e| internal("execution summaries", e))?;
+        .map_err(|e| internal("run summaries", e))?;
     let mut run_summaries = Vec::with_capacity(runs.len());
     for r in runs {
-        let (status, started_at, completed_at, cancel_cause, skipped_nodes) = match summaries.get(&r.execution_id) {
-            Some(s) => (Some(s.status), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
-            None => (None, r.created_at, None, None, 0),
-        };
-        run_summaries.push(RunSummary {
-            execution_id: r.execution_id,
+        run_summaries.push(VersionRun {
+            listing: summaries.remove(&r.run_id),
+            run_id: r.run_id,
             version_id: r.version_id,
             definition_hash: r.definition_hash,
-            seed_execution_id: r.seed_execution_id,
+            seed_run_id: r.seed_run_id,
             stale: r.stale,
             spec: r.spec,
             example: r.example,
-            status,
-            started_at,
-            completed_at,
-            cancel_cause,
-            skipped_nodes,
+            started_at: r.created_at,
         });
     }
     Ok(Json(VersionTree { head, versions: version_summaries, runs: run_summaries }))
@@ -950,15 +943,15 @@ pub async fn set_head(
         // Resolve the destination under the same lock as prune and the head move.
         // Otherwise a valid destination can disappear between its read and use.
         let (version_id, run) = match (body.run, body.version) {
-            (Some(execution_id), _) => {
+            (Some(run_id), _) => {
                 let run = state
                     .versions
-                    .run(execution_id)
+                    .run(run_id)
                     .await
                     .map_err(|e| internal("run", e))?
                     .filter(|r| r.project_id == id)
-                    .ok_or((StatusCode::NOT_FOUND, format!("run {execution_id} is not recorded in this project's tree")))?;
-                (run.version_id, Some(execution_id))
+                    .ok_or((StatusCode::NOT_FOUND, format!("run {run_id} is not recorded in this project's tree")))?;
+                (run.version_id, Some(run_id))
             }
             (None, Some(version)) => (version, None),
             (None, None) => return Err((StatusCode::BAD_REQUEST, "name a version or a run".into())),
@@ -983,26 +976,26 @@ pub async fn set_head(
 pub async fn update_run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id, execution_id)): Path<(uuid::Uuid, String)>,
+    Path((id, run_id)): Path<(uuid::Uuid, String)>,
     Json(body): Json<RunUpdate>,
 ) -> Result<StatusCode, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    let execution_id: ExecutionId = execution_id.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad execution".into()))?;
-    // Read only to authorize the execution to this project. What gets written
+    let run_id: RunId = run_id.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".into()))?;
+    // Read only to authorize the run to this project. What gets written
     // is exactly what the caller named: the store leaves an unmentioned
     // column alone, so two sessions writing different fields of one run
     // cannot put back each other's stale value.
     state
         .versions
-        .run(execution_id)
+        .run(run_id)
         .await
         .map_err(|e| internal("run", e))?
         .filter(|r| r.project_id == id)
-        .ok_or((StatusCode::NOT_FOUND, format!("run {execution_id} is not recorded in this project's tree")))?;
+        .ok_or((StatusCode::NOT_FOUND, format!("run {run_id} is not recorded in this project's tree")))?;
     if let Some(example) = body.example {
         state
             .versions
-            .set_run_example(execution_id, example.as_deref())
+            .set_run_example(run_id, example.as_deref())
             .await
             .map_err(|e| internal("update run", e))?;
     }
@@ -1046,7 +1039,7 @@ pub async fn prune(
         let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
         let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
         let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let in_flight = in_flight_execution_ids(&state, id).await?;
+        let in_flight = in_flight_run_ids(&state, id).await?;
         let frozen: Vec<String> = query
             .frozen
             .as_deref()
@@ -1076,7 +1069,7 @@ pub async fn prune(
         // "run X is still running", for a run that could never finish
         // and that `weft stop` could no longer reach. Dropping the tree
         // rows first means a failure here leaves journals nobody's tree
-        // names, which `weft clean` still reaches by execution.
+        // names, which `weft clean` still reaches by run.
         state
             .versions
             .delete_versions(id, &plan.versions)
@@ -1099,17 +1092,17 @@ pub async fn prune(
     // and every run start on that project queued behind it while
     // holding a connection of its own.
     let mut failed: Vec<String> = Vec::new();
-    for execution_id in &plan.runs {
-        match crate::api::execution::clean_execution(&state, &caller.0, *execution_id).await {
+    for run_id in &plan.runs {
+        match crate::api::run::clean_run(&state, &caller.0, *run_id).await {
             Ok(_) => {}
             // A journal that is already gone is already clean: the
             // residue an older ordering left behind (a tree row
             // outliving its journal). Its row has just been cascaded
             // away, so there is nothing to do and nothing to report;
             // calling it a failure told the person to run a command
-            // that answers 404 for ever on that execution.
+            // that answers 404 for ever on that run.
             Err(StatusCode::NOT_FOUND) => {}
-            Err(status) => failed.push(format!("{execution_id} ({status})")),
+            Err(status) => failed.push(format!("{run_id} ({status})")),
         }
     }
     if !failed.is_empty() {
@@ -1117,7 +1110,7 @@ pub async fn prune(
             "prune",
             format!(
                 "the versions were pruned, but these runs' journals could not be cleaned: {}. \
-                 They are no longer in the tree; `weft clean <execution_id>` removes each one.",
+                 They are no longer in the tree; `weft clean <run_id>` removes each one.",
                 failed.join(", ")
             ),
         ));
@@ -1271,17 +1264,17 @@ mod fire_snapshot_tests {
                 "outputs": [{"name": "value", "portType": "String", "required": true}]
             }], "edges": []
         })).unwrap();
-        let execution_id = ExecutionId::new_v4();
+        let run_id = RunId::new_v4();
         let mut spec = RunSpec::whole("reuse");
         let resolved = |spec: &RunSpec| resolve_spec(spec, &project, &Default::default()).expect("one node resolves");
-        assert!(supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0).is_empty());
+        assert!(supplied_output_events(&project, &spec, &resolved(&spec), run_id, 0).is_empty());
         spec.emit.insert("source".into(), BTreeMap::new());
-        let events = supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0);
-        assert!(matches!(&events[..], [weft_journal::ExecEvent::PortClosed { node_id, port, provided: true, .. }]
+        let events = supplied_output_events(&project, &spec, &resolved(&spec), run_id, 0);
+        assert!(matches!(&events[..], [weft_journal::RunEvent::PortClosed { node_id, port, provided: true, .. }]
             if node_id == "source" && port == "value"));
         spec.emit.get_mut("source").unwrap().insert("value".into(), serde_json::json!("manual"));
-        let events = supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0);
-        assert!(matches!(&events[..], [weft_journal::ExecEvent::PortEmitted { value, provided: true, .. }]
+        let events = supplied_output_events(&project, &spec, &resolved(&spec), run_id, 0);
+        assert!(matches!(&events[..], [weft_journal::RunEvent::PortEmitted { value, provided: true, .. }]
             if **value == serde_json::json!("manual")));
     }
 
@@ -1389,7 +1382,7 @@ mod stand_in_caller_tests {
 
     /// A socket is a conversation over time and there is nothing
     /// honest to invent for the caller's next message, so firing one is
-    /// refused. At the command, not after an execution has started:
+    /// refused. At the command, not after a run has started:
     /// the worker keeps its own floor, but waiting for a run just to be
     /// told no is a worse way to hear it.
     #[test]

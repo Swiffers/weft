@@ -4,8 +4,8 @@
 //!
 //! Route categories:
 //! - `/projects/*`: project registration, run, stop, logs.
-//! - `/executions/*`: execution state queries and control.
-//! - `/events/*`: SSE streams for project and execution state.
+//! - `/runs/*`: run state queries and control.
+//! - `/events/*`: SSE streams for project and run state.
 //! - `/signal-token*`: signal-token minting, token-scoped signal access,
 //!   and token-scoped reads of what a node is showing (`/displays`).
 //!
@@ -211,7 +211,7 @@ pub mod domains;
 // `pub` (not `pub(crate)`) like `project` above: `cancel_terminal_events`
 // is exercised by the db-test rig in `tests/db_tags.rs` against a real
 // Postgres.
-pub mod execution;
+pub mod run;
 mod events;
 mod provider_events;
 pub(crate) mod signal_token;
@@ -269,7 +269,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // the activation version, per-run bookkeeping, and prune.
         .route("/projects/{id}/versions", post(versions::checkpoint))
         .route("/projects/{id}/versions/runs", post(versions::run))
-        .route("/projects/{id}/versions/runs/{execution_id}", axum::routing::put(versions::update_run))
+        .route("/projects/{id}/versions/runs/{run_id}", axum::routing::put(versions::update_run))
         .route("/projects/{id}/versions/tree", get(versions::tree))
         .route("/projects/{id}/versions/running", get(versions::running))
         .route("/projects/{id}/versions/sweep", post(versions::sweep))
@@ -285,12 +285,12 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/picks/check", post(picks::check))
         // The project's own worker levers.
         .route("/projects/{id}/workers", get(workers::get).put(workers::put))
-        .route("/projects/{id}/executions/latest", get(execution::latest_for_project))
+        .route("/projects/{id}/runs/latest", get(run::latest_for_project))
         .route("/projects/{id}/activate", post(project::activate))
         .route("/projects/{id}/bake", post(project::bake))
         // Cancel an in-flight activate (status=Activating). Wipes
         // every signal row registered so far, cancels the
-        // TriggerSetup execution, CASes status to Inactive.
+        // TriggerSetup run, CASes status to Inactive.
         .route("/projects/{id}/cancel-activate", post(project::cancel_activate))
         // Cancel an in-flight build (transition=building). CASes the
         // transition to cancelling_build and stops the project's image
@@ -299,7 +299,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/deactivate", post(project::deactivate))
         .route("/projects/{id}/quiesce", post(project::quiesce))
         // While the project is in `deactivating`, this endpoint
-        // cancels every running, non-suspended execution; the
+        // cancels every running, non-suspended run; the
         // journal-bridge drain-watcher then CASes status to
         // `inactive` (the lifecycle target the original deactivate
         // already wrote to the row stays in place).
@@ -315,7 +315,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/infra/terminate", post(infra::terminate))
         // Cancel in-flight infra work: halt claimed lifecycle commands
         // between platform calls, cancel unclaimed ones outright, and
-        // interrupt the InfraSetup provisioning execution. HALT, not
+        // interrupt the InfraSetup provisioning run. HALT, not
         // rollback: per-node partial state stays visible.
         .route("/projects/{id}/infra/cancel", post(infra::cancel))
         .route("/projects/{id}/infra/look", post(infra::look))
@@ -332,22 +332,22 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/infra/nodes/{node}/live", get(infra::live))
         .route("/projects/{id}/infra/nodes/{node}/action", post(infra::action))
         .route("/projects/{id}/infra/nodes/{node}/rebake", post(infra::rebake))
-        .route("/executions/resolve/{prefix}", get(execution::resolve_execution_id))
-        .route("/executions/{execution_id}/cancel", post(execution::cancel))
+        .route("/runs/resolve/{prefix}", get(run::resolve_run_id))
+        .route("/runs/{run_id}/cancel", post(run::cancel))
         // Resolve a pure time wait now (`weft wake`).
-        .route("/executions/{execution_id}/wake/{node}", post(execution::wake))
-        .route("/executions/{execution_id}/logs", get(execution::list_logs))
-        .route("/executions/{execution_id}/replay", get(execution::replay))
-        .route("/executions/{execution_id}/outputs", get(execution::outputs))
+        .route("/runs/{run_id}/wake/{node}", post(run::wake))
+        .route("/runs/{run_id}/logs", get(run::list_logs))
+        .route("/runs/{run_id}/replay", get(run::replay))
+        .route("/runs/{run_id}/outputs", get(run::outputs))
         .route(
-            "/executions/{execution_id}",
-            get(execution::get).delete(execution::delete_execution),
+            "/runs/{run_id}",
+            get(run::get).delete(run::delete_run),
         )
-        .route("/executions", get(execution::list_executions))
-        .route("/executions/clean", post(execution::clean))
+        .route("/runs", get(run::list_runs))
+        .route("/runs/clean", post(run::clean))
         .route("/events/project/{id}", get(events::project_stream))
         .route("/events/project/{id}/displays", get(events::display_stream))
-        .route("/events/execution/{execution_id}", get(events::execution_stream))
+        .route("/events/run/{run_id}", get(events::run_stream))
         // Token administration (tenant-authenticated): mint returns the value
         // ONCE, list returns metadata only, revoke addresses the id.
         .route(

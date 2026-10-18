@@ -4,7 +4,7 @@
 //! node asks the context for provider access, gets a metered HTTP client, and
 //! streams a completion through it. The runtime measures what the call really
 //! cost (the provider's meter, run around the call) and lands that figure on
-//! the execution's journal. What it proves that no unit test can: the provider
+//! the run's journal. What it proves that no unit test can: the provider
 //! really answers, the meter really resolves a real number from the real
 //! response, and that number reaches the cost trail.
 //!

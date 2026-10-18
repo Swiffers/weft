@@ -21,7 +21,7 @@ Fill in the services you expect to use often, and leave the rest alone. We
 recommend at least [OpenRouter](https://openrouter.ai/keys), because a single
 key there reaches most models.
 
-A service you set up here becomes one click forever after: a step that calls it
+A service you set up here becomes one click forever after: a node that calls it
 picks the key up on its own, and your AI assistant can wire one in without
 stopping to ask you for anything. A service you skip asks you for a credential
 the first time you need it, which is fine for the ones you touch once.
@@ -136,6 +136,13 @@ made, along with every named install on the machine (the question lists them).
 Your project folders stay, and `weft run` registers them again. If
 `./setup.sh` has no terminal to ask on, run `scripts/scrub-old-install.sh`
 yourself first.
+
+If your install's database was built before executions were renamed runs,
+that update starts it over too. `./setup.sh` asks before wiping that one
+install's database: its run history, versions and stored connections go,
+and so does everything only that database gave a meaning to (the files the
+install stored, and the workers and infra of its projects). Your project
+folders, the install's settings and every other install stay. Without a terminal to ask on, run `./setup.sh --yes`.
 
 **To remove it**, run `./setup.sh --uninstall`. It stops the runtime and
 removes the CLI and the editor extension. Your database, stored connections

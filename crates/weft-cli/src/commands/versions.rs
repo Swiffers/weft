@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use weft_compiler::project::Project;
-use weft_core::versions::{RunSummary, VersionSummary, VersionTree};
+use weft_core::versions::{VersionRun, VersionSummary, VersionTree};
 use weft_core::live_event::{DispatcherEvent, LiveEvent};
 use weft_core::run_spec::{Expected, ExpectedWire, PortValues, RunSpec};
 
@@ -237,22 +237,22 @@ pub async fn fetch_tree_raw(client: &DispatcherClient, project_id: &str) -> Resu
     Ok((tree, value))
 }
 
-/// The first characters of a version id or an execution, for a line.
+/// The first characters of a version id or a run, for a line.
 pub fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// The run `ref` names: a whole execution, or the start of one among the
+/// The run `ref` names: a whole run, or the start of one among the
 /// tree's runs.
-pub fn resolve_run<'a>(tree: &'a VersionTree, reference: &str) -> Result<&'a RunSummary> {
-    let matches: Vec<&RunSummary> = tree.runs.iter().filter(|r| r.execution_id.to_string().starts_with(reference)).collect();
+pub fn resolve_run<'a>(tree: &'a VersionTree, reference: &str) -> Result<&'a VersionRun> {
+    let matches: Vec<&VersionRun> = tree.runs.iter().filter(|r| r.run_id.to_string().starts_with(reference)).collect();
     match matches.as_slice() {
         [one] => Ok(one),
         [] => bail!("no run starts with {reference} in this project's tree; `weft tree` lists them"),
         many => bail!(
             "{reference} names {} runs ({}); give more characters",
             many.len(),
-            some_ids(many.iter().map(|r| r.execution_id.to_string()))
+            some_ids(many.iter().map(|r| r.run_id.to_string()))
         ),
     }
 }
@@ -331,10 +331,10 @@ pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
 /// their own copy of the first half.
 pub async fn replay_rows(
     client: &crate::client::DispatcherClient,
-    execution_id: &str,
+    run_id: &str,
 ) -> Result<Vec<LiveEvent>> {
     let rows = client
-        .get_json(&format!("/executions/{execution_id}/replay"))
+        .get_json(&format!("/runs/{run_id}/replay"))
         .await
         .context("read the run")?;
     serde_json::from_value(rows)
@@ -345,9 +345,9 @@ pub async fn replay_rows(
 /// bytes so two runs' values compare as values.
 pub async fn output_wires(
     client: &crate::client::DispatcherClient,
-    execution_id: &str,
+    run_id: &str,
 ) -> Result<Expected> {
-    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/executions/{execution_id}/outputs")).await?)
+    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/runs/{run_id}/outputs")).await?)
         .context("decode complete output history")?;
     normalize_media(client, &mut expected.wires).await?;
     Ok(expected)
@@ -373,7 +373,7 @@ pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunS
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let mut spec: RunSpec = serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    let mut spec = RunSpec::parse_file(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     spec.name = path.file_stem().context("example filename")?.to_string_lossy().into_owned();
     Ok(Some(spec))
 }
@@ -449,7 +449,7 @@ pub fn list_specs(project: &Project) -> Result<(Vec<RunSpec>, Vec<String>)> {
         // or one file with the wrong permissions, stopped `weft prune`
         // dead with a bare "Is a directory (os error 21)" and no path.
         match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| {
-            serde_json::from_str::<RunSpec>(&text).map_err(|e| format!("is not a spec ({e})"))
+            RunSpec::parse_file(&text).map_err(|e| format!("is not a spec ({e})"))
         }) {
             Ok(mut spec) => {
                 // The filename is the runnable name; an edited display name
@@ -478,7 +478,7 @@ pub struct RunFlags {
     /// Which instance the run is in (`--instance`).
     pub instance: Option<weft_core::instance::InstanceId>,
     pub clear: Vec<String>,
-    /// Write each step before the next (`--durable`).
+    /// Write what the run did down before each node starts (`--durable`).
     pub durable: bool,
     /// Never wait for the record except to pause (`--fast`), over a
     /// durable trigger.
@@ -826,6 +826,33 @@ mod tests {
         assert_eq!(listed, vec![spec]);
     }
 
+    /// A spec an older weft saved, with keys spelled the old way, is
+    /// refused naming the file, each old key and its spelling now.
+    #[test]
+    fn a_spec_with_an_old_spelling_is_refused_naming_the_file_and_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        std::fs::create_dir_all(examples_dir(&project)).unwrap();
+        let path = spec_path(&project, "old");
+        std::fs::write(
+            &path,
+            r#"{"name":"old","frozen_from":{"version":"v","execution_id":"00000000-0000-0000-0000-000000000002","definition_hash":"h"},"settings":{"keep_for":"1d"}}"#,
+        )
+        .unwrap();
+        let error = read_spec(&project, "old").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "parse {}: this spec was saved by an older weft, and these keys are spelled differently now: \
+                 `frozen_from` is `frozenFrom`, `frozen_from.execution_id` is `runId`, \
+                 `frozen_from.definition_hash` is `definitionHash`, `settings.keep_for` is `keepFor`. \
+                 The old spelling is no longer read; rename them",
+                path.display()
+            )
+        );
+    }
+
     fn version(id: &str, label: Option<&str>) -> VersionSummary {
         VersionSummary {
             id: format!("{id}00000000"),
@@ -1167,14 +1194,14 @@ mod tests {
         // the kind's.
         let row = |mut fields: Value| -> LiveEvent {
             let fields_of = fields.as_object_mut().unwrap();
-            fields_of.insert("event_id".into(), json!("journal:1:0"));
-            fields_of.insert("execution_id".into(), json!(uuid::Uuid::nil()));
-            fields_of.insert("project_id".into(), json!(uuid::Uuid::nil()));
-            fields_of.insert("at_unix".into(), json!(1));
+            fields_of.insert("eventId".into(), json!("journal:1:0"));
+            fields_of.insert("runId".into(), json!(uuid::Uuid::nil()));
+            fields_of.insert("projectId".into(), json!(uuid::Uuid::nil()));
+            fields_of.insert("atUnix".into(), json!(1));
             serde_json::from_value(fields).unwrap()
         };
         let rows = vec![
-            row(json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" }, "closed_ports": [] })),
+            row(json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" }, "closedPorts": [] })),
             row(json!({ "kind": "node_suspended", "node": "review", "frames": [], "token": "t" })),
             row(json!({ "kind": "wait_ended", "node": "review", "frames": [], "token": "t", "ended": { "type": "answered", "value": { "answer": "yes" } } })),
             row(json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t" })),
@@ -1182,15 +1209,15 @@ mod tests {
             row(json!({ "kind": "wait_ended", "node": "skipped", "frames": [], "token": "t3", "ended": { "type": "skipped" } })),
             // A wait held in the worker that gave up: no suspend, no
             // resume, only its ending and the node failing with its error.
-            row(json!({ "kind": "node_started", "node": "held", "frames": [], "input": { "prompt": "still there?" }, "closed_ports": [] })),
+            row(json!({ "kind": "node_started", "node": "held", "frames": [], "input": { "prompt": "still there?" }, "closedPorts": [] })),
             row(json!({ "kind": "wait_ended", "node": "held", "frames": [], "token": "t2", "ended": { "type": "gave_up", "error": "node 'held' gave up its wait: quiet" } })),
             row(json!({ "kind": "node_failed", "node": "held", "frames": [], "error": "node 'held' gave up its wait: quiet" })),
             // One window row carrying the whole short conversation,
             // which is how the journal writes it: the messages come out
             // of the row, not one row each.
-            row(json!({ "kind": "caller_window", "first_offset": 0, "last_offset": 1, "messages": [
-                { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payload_byte_size": 4, "at_unix": 1 },
-                { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payload_byte_size": 5, "terminal": true, "at_unix": 1 },
+            row(json!({ "kind": "caller_window", "firstOffset": 0, "lastOffset": 1, "messages": [
+                { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payloadByteSize": 4, "atUnix": 1 },
+                { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payloadByteSize": 5, "terminal": true, "atUnix": 1 },
             ], "totals": [] })),
         ];
         let facts = outside_facts(&rows).unwrap();
@@ -1210,8 +1237,8 @@ mod tests {
 
     #[test]
     fn a_stored_media_marker_is_recognised_and_a_plain_value_is_not() {
-        let marker = json!({ "__weft_image__": { "key": "t/exec/c/pic", "mimeType": "image/png", "sizeBytes": 3, "filename": "pic.png" } });
-        assert_eq!(stored_key(&marker), Some("t/exec/c/pic".to_string()));
+        let marker = json!({ "__weft_image__": { "key": "t/run/c/pic", "mimeType": "image/png", "sizeBytes": 3, "filename": "pic.png" } });
+        assert_eq!(stored_key(&marker), Some("t/run/c/pic".to_string()));
         assert_eq!(stored_key(&json!({ "key": "x" })), None);
     }
 }

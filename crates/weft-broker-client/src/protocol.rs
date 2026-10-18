@@ -10,7 +10,7 @@ use uuid::Uuid;
 // beside the other connect wire types; the store's read-back query
 // answers the same struct, so publish and read-back cannot drift.
 use weft_core::access::wire::PublishedConnection;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_task_store::tasks::{NewTask, TaskOutcome, TaskStatus};
 
 // The wire-enum helper is weft-core's (`weft_core::wire_enum!`), so an
@@ -154,7 +154,7 @@ pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_V
 /// ancestor).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordOfRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +169,7 @@ pub struct RecordOfResponse {
 /// reads its record in the same trip. `None` when it is not queued.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunClaimRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,7 +185,7 @@ pub struct RunClaimResponse {
 /// when one is handed to it (`crate::line::PARKED_FIRE_CHANNEL`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunAnswersRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The waits whose answers the worker already took. An answer stays
     /// waiting until the run's record holds it, which an unrecorded run's
     /// never does, so these are left out rather than handed again.
@@ -219,10 +219,10 @@ pub struct RunRecheckedResponse {
     pub answers: Vec<RunAnswerOf>,
 }
 
-/// An answer handed to the run `execution_id`.
+/// An answer handed to the run `run_id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunAnswerOf {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub token: String,
     pub answer: weft_core::primitive::WaitAnswer,
 }
@@ -232,7 +232,7 @@ pub struct RunAnswerOf {
 /// Answered 409 when the worker does not drive it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunGiveUpRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// Why, as the run's failure says it.
     pub error: String,
 }
@@ -246,45 +246,45 @@ pub struct RunGiveUpResponse {
 /// One cancel waiting for a run, and why.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCancel {
-    pub execution_id: ExecutionId,
-    pub cause: weft_core::exec::CancelCause,
+    pub run_id: RunId,
+    pub cause: weft_core::run::CancelCause,
 }
 
-// ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
+// ---------- Run steering (`ctx.tag_run` / `ctx.stop_tagged`) ----------
 
-/// `POST /v1/execution/tag`: the worker tags the execution it is
-/// driving, its `ExecutionTagged` already on record. Worker-only: the
-/// broker writes the `execution_tag` rows synchronously, so by the time
+/// `POST /v1/run/tag`: the worker tags the run it is
+/// driving, its `RunTagged` already on record. Worker-only: the
+/// broker writes the `run_tag` rows synchronously, so by the time
 /// the node's call returns its tag row exists and a following
 /// `stop_tagged` can anchor on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionTagRequest {
-    pub execution_id: ExecutionId,
+pub struct RunTagRequest {
+    pub run_id: RunId,
     /// Already validated by the ctx (`weft_core::tag`); the broker
     /// validates again, because it trusts no process.
     pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionTagResponse {}
+pub struct RunTagResponse {}
 
-/// `POST /v1/execution/stop_tagged`: the worker asks that every live
-/// execution of ITS project carrying `tag` be stopped. The broker
+/// `POST /v1/run/stop_tagged`: the worker asks that every live
+/// run of ITS project carrying `tag` be stopped. The broker
 /// resolves the ordering anchor at this moment (the asker's own tag
 /// seq, or one past the newest row) and enqueues the dispatcher's
 /// `stop_tagged` task with it, so a stop that runs late can never reach
 /// a sibling that tagged itself after the ask. The project is the
 /// run's, read from its row; the request never names one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionStopTaggedRequest {
-    /// The asking execution.
-    pub execution_id: ExecutionId,
+pub struct RunStopTaggedRequest {
+    /// The asking run.
+    pub run_id: RunId,
     pub tag: String,
     pub stop_self: weft_core::StopSelf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionStopTaggedResponse {
+pub struct RunStopTaggedResponse {
     /// The stop reaches the asking run itself (`StopSelf::Include` and
     /// the run carries the tag). The asker then waits for its own
     /// cancel instead of going on: the dispatcher carries the stop out
@@ -356,7 +356,7 @@ pub struct InfraEndpointUrlRequest {
     /// The asking run. The broker resolves its project from it, so a
     /// handle never reaches outside the run's project, and checks the
     /// handle's instance against the run's.
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The endpoint asked for: an infra node's place (see
     /// `InfraEnqueueApplyRequest`), the endpoint's name, and the instance
     /// whose copy it is (absent for a shared copy).
@@ -367,7 +367,7 @@ pub struct InfraEndpointUrlRequest {
 /// outputs, for the run that runs the node (`InfraReader::baked_outputs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraBakedRequest {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The node's place, spelled.
     pub place: String,
     /// Whose copy: absent for the shared one.
@@ -386,7 +386,7 @@ pub struct InfraBakedResponse {
 /// run saves, and only for a copy it may read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraBakeRequest {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The node's place, spelled.
     pub place: String,
     /// Whose copy: absent for the shared one.
@@ -409,17 +409,17 @@ pub struct InfraEndpointUrlResponse {
 /// connection `connection_id`. The store refreshes lazily
 /// (single-flight) before answering; for a connection whose credential
 /// the runtime supplies, the runtime's credential source answers
-/// instead. The caller's execution scope anchors the tenant, and the
+/// instead. The caller's run scope anchors the tenant, and the
 /// row's tenant must match (the tenant wall at run time). The firing's
 /// identity travels on EVERY resolve, because any connection can be
 /// billable and every cost record must be attributable to a firing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveConnectionRequest {
-    /// The requesting execution. The broker resolves the owning tenant
+    /// The requesting run. The broker resolves the owning tenant
     /// AND project from it and enforces both, so neither is taken from
     /// this request: a credential policy that decides per project must
     /// not be deciding on a name the worker chose.
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate, so anything the
     /// runtime later books against this connection (a measured cost)
@@ -456,9 +456,9 @@ pub struct ResolveConnectionRequest {
 /// person would have pasted; the store refuses anything else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishAccessRequest {
-    /// The publishing execution. The broker resolves the owning tenant
+    /// The publishing run. The broker resolves the owning tenant
     /// AND project from it, so neither is taken from this request.
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The publishing node's PLACE, spelled the way a person writes it
     /// (`db`, or `one.db` inside the file the site `one` includes). Its
     /// connection: publishing again updates that one row, and
@@ -487,7 +487,7 @@ pub struct PublishAccessResponse {
 /// "Which connection did this node publish for this service, if any?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedAccessRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub node_id: String,
     pub service: String,
     /// As on [`PublishAccessRequest::per_instance`].
@@ -504,7 +504,7 @@ pub struct ProgramMintInstanceTokenRequest {
     /// that token (a new value, the old one dead) instead of leaving a
     /// second one behind.
     pub id: uuid::Uuid,
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub instance: weft_core::instance::InstanceId,
     /// How long it works, in seconds; required, a year at most.
     pub expires_in_secs: u64,
@@ -579,7 +579,7 @@ pub struct ResolveConnectionResponse {
 /// theirs and never travel back. Nothing node-facing makes this call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseConnectionRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The resolved values being given back; the runtime's credential
     /// source retires the ones it recognizes.
     pub values: std::collections::BTreeMap<String, String>,
@@ -591,7 +591,7 @@ pub struct ReleaseConnectionResponse {}
 // ---------- Project (worker fetches its own definition) ----------
 
 /// Worker call to fetch the project's runtime `ProjectDefinition`
-/// at execution claim time. Keyed by `(project_id, expected_hash)`:
+/// at run claim time. Keyed by `(project_id, expected_hash)`:
 /// the hash makes the lookup content-addressed against the
 /// append-only `project_definition` history table.
 ///
@@ -1929,7 +1929,7 @@ pub struct SignalRowWire {
     pub node_id: String,
     pub spec_json: String,
     pub is_resume: bool,
-    pub execution_id: Option<ExecutionId>,
+    pub run_id: Option<RunId>,
     pub surface_kind: SignalSurfaceKind,
     pub mount_path: Option<String>,
     /// The HTTP methods a `PublicEntry` serves, uppercase; empty = any
@@ -2367,7 +2367,7 @@ pub struct DoorInstanceToken {
 /// next.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorLetGoRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub why: LetGo,
 }
 
@@ -2517,14 +2517,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn publish_access_round_trip() {
         // The request carries no project: the broker resolves that
-        // from the execution, so a worker cannot name someone else's.
+        // from the run, so a worker cannot name someone else's.
         let spec: weft_core::AccessSpec = serde_json::from_value(json!({
             "service": "postgres",
             "acquisition": { "kind": "static", "fields": [{ "name": "host" }] },
         }))
         .unwrap();
         let req = PublishAccessRequest {
-            execution_id: uuid::Uuid::from_u128(0xc1),
+            run_id: uuid::Uuid::from_u128(0xc1),
             node_id: "db".into(),
             service: "postgres".into(),
             spec,
@@ -2534,7 +2534,7 @@ mod supervisor_protocol_tests {
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["per_instance"], true, "whose copy published it rides as a flag; the instance is the run's");
-        assert_eq!(v["execution_id"], json!(uuid::Uuid::from_u128(0xc1)));
+        assert_eq!(v["run_id"], json!(uuid::Uuid::from_u128(0xc1)));
         assert_eq!(v["node_id"], "db");
         assert_eq!(v["values"]["host"], "db.svc");
         assert!(v.get("project_id").is_none(), "the project is never on the wire");
@@ -2542,7 +2542,7 @@ mod supervisor_protocol_tests {
         // Both verbs answer the SAME shape, so a connection read back
         // is the same value as the one published.
         let published: PublishAccessResponse = serde_json::from_value(json!({
-            "connection": { "connection_id": "id-1", "identity": "weft@db/app" },
+            "connection": { "connectionId": "id-1", "identity": "weft@db/app" },
         }))
         .unwrap();
         assert_eq!(published.connection.connection_id, "id-1");
@@ -2560,7 +2560,7 @@ mod supervisor_protocol_tests {
         );
         let some: PublishedAccessResponse = serde_json::from_value(json!({
             "state": "published",
-            "connection": { "connection_id": "id-1", "identity": null },
+            "connection": { "connectionId": "id-1", "identity": null },
         }))
         .unwrap();
         assert_eq!(some.connection().expect("a connection").connection_id, "id-1");
@@ -2832,14 +2832,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn resolve_connection_request_round_trip() {
         let req = ResolveConnectionRequest {
-            execution_id: uuid::Uuid::from_u128(0xc1),
+            run_id: uuid::Uuid::from_u128(0xc1),
             node_id: "ask".into(),
             frames: vec![weft_core::frames::Frame::Loop { index: 3 }],
             node_type: "openrouter.inference".into(),
             connection_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "openrouter".into(),
             required_permissions: vec!["drive.readonly".into()],
-            required_values: vec!["imap_host".into()],
+            required_values: vec!["imapHost".into()],
             expected_duration_secs: 120,
         };
         // The full literal object pins the FIELD NAMES on the wire: a
@@ -2849,14 +2849,14 @@ mod supervisor_protocol_tests {
         assert_eq!(
             v,
             json!({
-                // No project: the broker resolves it from the execution,
+                // No project: the broker resolves it from the run,
                 // so a worker never names one.
-                "execution_id": uuid::Uuid::from_u128(0xc1), "node_id": "ask",
+                "run_id": uuid::Uuid::from_u128(0xc1), "node_id": "ask",
                 "frames": [{"index": 3}], "node_type": "openrouter.inference",
                 "connection_id": "11111111-2222-3333-4444-555555555555",
                 "service": "openrouter",
                 "required_permissions": ["drive.readonly"],
-                "required_values": ["imap_host"],
+                "required_values": ["imapHost"],
                 "expected_duration_secs": 120
             })
         );
@@ -2906,14 +2906,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn release_connection_request_round_trip() {
         let req = ReleaseConnectionRequest {
-            execution_id: uuid::Uuid::from_u128(0xc1),
+            run_id: uuid::Uuid::from_u128(0xc1),
             values: [("token".to_string(), "cred".to_string())].into_iter().collect(),
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "execution_id": uuid::Uuid::from_u128(0xc1), "values": { "token": "cred" } }));
+        assert_eq!(v, json!({ "run_id": uuid::Uuid::from_u128(0xc1), "values": { "token": "cred" } }));
         let back: ReleaseConnectionRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.values["token"], "cred");
-        assert_eq!(back.execution_id, uuid::Uuid::from_u128(0xc1));
+        assert_eq!(back.run_id, uuid::Uuid::from_u128(0xc1));
     }
 
     #[test]
@@ -3201,7 +3201,7 @@ mod supervisor_protocol_tests {
 
     #[test]
     fn endpoint_url_response_carries_the_public_url() {
-        let v = json!({ "address": { "url": "http://a.ns.svc:80", "public_url": "http://door/infra/ns/a/hooks" } });
+        let v = json!({ "address": { "url": "http://a.ns.svc:80", "publicUrl": "http://door/infra/ns/a/hooks" } });
         let r: InfraEndpointUrlResponse = serde_json::from_value(v).unwrap();
         let address = r.address.unwrap();
         assert_eq!(address.url, "http://a.ns.svc:80");
@@ -3211,7 +3211,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn endpoint_url_request_carries_the_handle() {
         let v = json!({
-            "execution_id": "00000000-0000-0000-0000-0000000000a1",
+            "run_id": "00000000-0000-0000-0000-0000000000a1",
             "infra": { "__weft_infra__": { "place": "n", "endpoint": "api", "instance": "ada" } }
         });
         let r: InfraEndpointUrlRequest = serde_json::from_value(v).unwrap();
@@ -3233,7 +3233,7 @@ mod supervisor_protocol_tests {
             kind_state_seq: 0,
             spec_json: "{}".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             surface_kind,
             mount_path: mount_path.map(|s| s.to_string()),
             mount_methods: Vec::new(),
@@ -3360,7 +3360,7 @@ mod supervisor_protocol_tests {
             }),
             access_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "slack".into(),
-            required_values: vec!["imap_host".into()],
+            required_values: vec!["imapHost".into()],
         };
         // The full literal pins the FIELD NAMES on the wire: a
         // symmetric rename round-trips fine but breaks the peer.
@@ -3370,12 +3370,12 @@ mod supervisor_protocol_tests {
             json!({
                 "tenant": "tenant-a",
                 "for_instance": {
-                    "project_id": "00000000-0000-0000-0000-0000000000a1",
+                    "projectId": "00000000-0000-0000-0000-0000000000a1",
                     "instance": "alice"
                 },
                 "access_id": "11111111-2222-3333-4444-555555555555",
                 "service": "slack",
-                "required_values": ["imap_host"]
+                "required_values": ["imapHost"]
             })
         );
         let back: ListenerResolveRequest = serde_json::from_value(v).unwrap();
@@ -3407,7 +3407,7 @@ mod supervisor_protocol_tests {
                 }
             }))
             .unwrap(),
-            recipe_values: [("app_token".to_string(), "xapp-1".to_string())]
+            recipe_values: [("appToken".to_string(), "xapp-1".to_string())]
                 .into_iter()
                 .collect(),
             provider_account: Some("T1".into()),
@@ -3419,7 +3419,7 @@ mod supervisor_protocol_tests {
             v["auth"],
             json!([{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }])
         );
-        assert_eq!(v["recipe_values"], json!({ "app_token": "xapp-1" }));
+        assert_eq!(v["recipe_values"], json!({ "appToken": "xapp-1" }));
         assert_eq!(v["provider_account"], "T1");
         assert_eq!(v["events"]["messages"]["account"]["value"], "team");
         let back: ResolvedEventSource = serde_json::from_value(v).unwrap();

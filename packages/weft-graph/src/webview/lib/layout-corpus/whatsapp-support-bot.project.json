@@ -573,12 +573,12 @@
       ],
       "outputs": [
         {
-          "name": "send_approved",
+          "name": "sendApproved",
           "portType": "Boolean",
           "required": false
         },
         {
-          "name": "send_rejected",
+          "name": "sendRejected",
           "portType": "Boolean",
           "required": false
         }
@@ -808,7 +808,7 @@
                 "public": true
               }
             ],
-            "free_text": true
+            "freeText": true
           },
           "label": "Model",
           "placeholder": "deepseek/deepseek-v4-flash-0731",
@@ -1243,10 +1243,10 @@
       }
     },
     {
-      "id": "e-review-send_approved-allowed-approved",
+      "id": "e-review-sendApproved-allowed-approved",
       "source": "review",
       "target": "allowed",
-      "sourceHandle": "send_approved",
+      "sourceHandle": "sendApproved",
       "targetHandle": "approved",
       "span": {
         "startLine": 42,

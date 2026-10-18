@@ -1,4 +1,4 @@
-//! Platform: a worker crashes mid-execution and the job resumes on a FRESH
+//! Platform: a worker crashes mid-run and the job resumes on a FRESH
 //! worker. This is the core local-reliability guarantee (a single machine's
 //! worker dies; parked work must survive).
 //!
@@ -9,7 +9,7 @@
 //! so a worker (fresh, re-seeded from the journal) picks it up and completes.
 //!
 //! Proof is by INFERENCE, and airtight: we kill the ONLY live worker while the
-//! execution is parked at the form (before we send the answer, so it provably
+//! run is parked at the form (before we send the answer, so it provably
 //! had not finished), then assert it still completed with the right approval. A
 //! dead worker cannot finish a job, so a fresh one must have resumed it. We do
 //! NOT additionally fingerprint the new worker: a respawn reuses the worker's
@@ -40,14 +40,14 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     project.substitute_in_main("__E2E_FAKE_URL__", &feed.url())?;
     project.activate().await?;
 
-    // Start a fresh execution that runs to HumanQuery and suspends.
-    let before = run::executions(&disp, &pid).await?;
+    // Start a fresh run that runs to HumanQuery and suspends.
+    let before = run::runs(&disp, &pid).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     feed.push_event("go", &json!({ "value": "the change" }).to_string());
-    let execution_id =
-        run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let run_id =
+        run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
 
-    // Wait until the execution is genuinely parked at the form (the worker has
+    // Wait until the run is genuinely parked at the form (the worker has
     // registered the suspension), THEN kill its worker to fake a crash. We kill
     // every worker container of the project; an empty kill set would mean the
     // worker already idle-exited (also a valid resume path), but we assert at
@@ -57,7 +57,7 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     let killed = platform.kill_workers(&pid).await?;
     assert!(
         !killed.is_empty(),
-        "expected a live worker to kill while the execution was suspended at the form; \
+        "expected a live worker to kill while the run was suspended at the form; \
          killed none (the worker idle-exited before we caught it). Widen the window."
     );
 
@@ -66,14 +66,14 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
 
     // The proof of resume-across-a-crash is by inference, and it is airtight: we
-    // killed the ONLY live worker while the execution was parked at the form
+    // killed the ONLY live worker while the run was parked at the form
     // (before we sent the answer, so it provably had not finished), yet the
-    // execution still completed with the correct approval. A dead worker cannot
+    // run still completed with the correct approval. A dead worker cannot
     // finish a job; a fresh one re-seeded from the journal must have. We do NOT
     // additionally fingerprint the new worker replica: a respawn reuses the
     // worker's deterministic name and the dead row is GC'd within seconds, so
     // any "a different replica did it" marker is timing-flaky (see platform.rs).
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!(true))?;
 

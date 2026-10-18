@@ -40,7 +40,7 @@ use weft::bus::{BusEntryKind, BusHandle, BusOptions, BusPayloadKind, WirePayload
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
 use weft::{
-    node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, ValueBag, WeftError, WeftResult,
+    node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, ValueBag, WeftError, WeftResult,
 };
 
 use super::elevenlabs::{audio_file_type, WS_API};
@@ -372,7 +372,7 @@ impl Node for ElevenLabsSpeakNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let voice: String = ctx.inputs.get("voice")?;
         let session = Session::read(&ctx.inputs, voice_settings(&ctx)?, ctx.is_output_wired("alignment"))?;
@@ -525,7 +525,7 @@ impl Node for ElevenLabsSpeakNode {
         }
 
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             // The generated speech is the run's product: keep it past
             // the run (default 30-day access-bumped TTL).
             .put(full, mime, &format!("speech.{ext}"), Some(KeepTtl::Default))

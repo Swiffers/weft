@@ -13,12 +13,12 @@
 
 mod common;
 
-use common::execution_id_of;
+use common::run_id_of;
 
 use serde_json::{json, Value};
 use weft_e2e::{ensure, run, project::Project};
 
-/// `weft wake <execution_id> gate.hold` resolves the timer inside the included
+/// `weft wake <run_id> gate.hold` resolves the timer inside the included
 /// file, and the id the runtime keys that timer by is refused with the
 /// spelling that works. The run is aimed at `out`, which leaves the
 /// access node beside the timer untouched.
@@ -28,7 +28,7 @@ async fn wake_reaches_a_timer_inside_an_included_file_through_its_site() -> anyh
     let project = Project::prepare("include_addressing", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let held = execution_id_of(&stdout)?;
+    let held = run_id_of(&stdout)?;
     run::wait_for_status(&disp, held, "waiting_for_input").await?;
 
     // The compiler's own id resolves (it IS the node's id), so nothing
@@ -56,10 +56,10 @@ async fn a_parked_run_names_the_node_it_waits_on_through_its_site() -> anyhow::R
     let project = Project::prepare("include_addressing", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let held = execution_id_of(&stdout)?;
+    let held = run_id_of(&stdout)?;
     run::wait_for_status(&disp, held, "waiting_for_input").await?;
 
-    let detail: Value = disp.get_json(&format!("/executions/{held}")).await?;
+    let detail: Value = disp.get_json(&format!("/runs/{held}")).await?;
     let waits = detail["waiting"].as_array().cloned().unwrap_or_default();
     anyhow::ensure!(waits.len() == 1, "one wait, the timer: {detail}");
     anyhow::ensure!(waits[0]["node"] == json!("gate.hold"), "spelled through its site: {detail}");

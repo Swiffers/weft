@@ -2,7 +2,7 @@
 //! clean markdown. Submits the crawl job, then parks on the job without
 //! holding a worker until it reaches a terminal state (a crawl the user
 //! asked for takes as long as it takes, so there is no deadline here;
-//! cancelling the execution cancels the wait).
+//! cancelling the run cancels the wait).
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use weft::access::client::get_json;
 use weft::node::NodeOutput;
 use weft::signal::{PollEndpoint, Predicate};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -25,7 +25,7 @@ impl Node for CrawlSiteNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let url: String = ctx.inputs.get("url")?;
         let limit: f64 = ctx.inputs.get("limit")?;

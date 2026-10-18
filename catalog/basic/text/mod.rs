@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -18,7 +18,7 @@ impl Node for TextNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: String = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }

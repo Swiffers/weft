@@ -81,6 +81,7 @@ pub enum LogsFrom {
 /// stderr back apart, so where the lines of one instant fall between the
 /// two is not an order that holds from one read to the next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogMark {
     pub at: DateTime<Utc>,
     pub stdout_seen: usize,
@@ -210,7 +211,7 @@ pub struct SyncRequest {
     #[serde(flatten)]
     pub build: crate::builds::BuildHashes,
     /// How the worker reconciliation inside sync (and an upgrade's
-    /// stop leg) treats executions still running on an older image once
+    /// stop leg) treats runs still running on an older image once
     /// a new one went live. `cancel` (the default) cancels them; `wait`
     /// lets them finish up to `drainTimeoutSecs`, then cancels what is
     /// left. Never a silent kill.
@@ -248,8 +249,8 @@ pub struct UpgradeRequest {
 /// `POST /projects/{id}/infra/stop` and `/infra/terminate`. Carries the
 /// trigger-deactivation choice when the project is Active (the same
 /// picker as the standalone Deactivate verb, and its answer governs
-/// the running executions), and the running-work choice on its own
-/// for when it is not: an inactive project can still have executions
+/// the running runs), and the running-work choice on its own
+/// for when it is not: an inactive project can still have runs
 /// running on this infra, and `wait` lets them land before the
 /// supervisor scales it down.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -267,9 +268,9 @@ pub struct StopRequest {
 /// `POST /projects/{id}/infra/nodes/{node}/stop` and `/terminate`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerNodeRequest {
-    /// What happens to the running executions this copy can reach.
+    /// What happens to the running runs this copy can reach.
     /// Which ones use this one instance is not recorded, so for the
-    /// shared copy `cancel` (the default) ends every running execution
+    /// shared copy `cancel` (the default) ends every running run
     /// of the project, and for an instance's copy every run of that
     /// instance; `wait` lets the same set land first.
     #[serde(flatten)]
@@ -308,6 +309,7 @@ impl InfraStatus {
 
 /// One copy of an infra node, and its state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InfraStatusEntry {
     /// The node's placement, spelled the way a person writes the node
     /// (`db`, `one.db`): what a person is shown, what the editor matches
@@ -405,6 +407,7 @@ mod change_progress_tests {
 /// be the state before the action. Clients follow the command
 /// (`/infra/commands/{id}`) for its outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LifecycleCommandIssued {
     pub command_id: i64,
 }
@@ -440,10 +443,10 @@ mod tests {
     #[test]
     fn a_status_hands_its_host_notes_over_and_reads_an_entry_without_any() {
         let status: InfraStatus = serde_json::from_value(serde_json::json!({ "nodes": [
-            { "node": "llm", "status": "running", "endpoint_url": null, "public_urls": {},
-              "failure_stage": null, "failure_message": null, "notes": ["asked for 1 x l4"] },
-            { "node": "db", "instance": "ann", "status": "running", "endpoint_url": "http://x", "public_urls": {},
-              "failure_stage": null, "failure_message": null },
+            { "node": "llm", "status": "running", "endpointUrl": null, "publicUrls": {},
+              "failureStage": null, "failureMessage": null, "notes": ["asked for 1 x l4"] },
+            { "node": "db", "instance": "ann", "status": "running", "endpointUrl": "http://x", "publicUrls": {},
+              "failureStage": null, "failureMessage": null },
         ] }))
         .unwrap();
         assert_eq!(status.host_notes().collect::<Vec<_>>(), vec!["asked for 1 x l4"]);

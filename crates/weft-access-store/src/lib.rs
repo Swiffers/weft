@@ -253,7 +253,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             ON access_grant (project_id, instance_id) WHERE instance_id IS NOT NULL;
         -- What an instance provides for the fields its program writes
         -- `@instance_filled`: the value a run for it puts where the
-        -- source would hold one. The step is its place, spelled the
+        -- source would hold one. The node is its place, spelled the
         -- way the program reads it (`read`, `one.read`), and the field
         -- one of its inputs. A value that is a connection (the
         -- `{id, identity}` handle an access field holds) names its
@@ -263,12 +263,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             tenant_id TEXT NOT NULL,
             project_id UUID NOT NULL,
             instance_id TEXT NOT NULL,
-            step TEXT NOT NULL,
+            node TEXT NOT NULL,
             field TEXT NOT NULL,
             value JSONB NOT NULL,
             grant_id UUID REFERENCES access_grant(id) ON DELETE CASCADE,
             set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (project_id, instance_id, step, field)
+            PRIMARY KEY (project_id, instance_id, node, field)
         );
         CREATE INDEX IF NOT EXISTS instance_value_grant ON instance_value (grant_id) WHERE grant_id IS NOT NULL;
         -- The connection each of a program's access nodes uses on this
@@ -279,11 +279,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         CREATE TABLE IF NOT EXISTS install_pick (
             tenant_id TEXT NOT NULL,
             project_id UUID NOT NULL,
-            step TEXT NOT NULL,
+            node TEXT NOT NULL,
             field TEXT NOT NULL,
             grant_id UUID NOT NULL REFERENCES access_grant(id) ON DELETE CASCADE,
             set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (project_id, step, field)
+            PRIMARY KEY (project_id, node, field)
         );
         CREATE INDEX IF NOT EXISTS install_pick_grant ON install_pick (grant_id);
         -- The inbound-event lookup: an incoming push names a service

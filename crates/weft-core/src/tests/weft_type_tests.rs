@@ -2114,7 +2114,7 @@ fn the_wire_named_form_refuses_a_typevar_body_but_stays_registry_independent() {
     assert!(WeftType::parse("MyBox=List[T]").is_none(), "a typevar body is refused");
     // Parsing stays PURE: a wire string deserializes identically with
     // or without a registry, even one whose declaration has since been
-    // EDITED (a resumed execution must get the exact shape it started
+    // EDITED (a resumed run must get the exact shape it started
     // on). Restatement agreement is the compiler's job
     // (`named-type-conflict`), never the parser's.
     let reg = std::sync::Arc::new(

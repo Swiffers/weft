@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, StopSelf, WeftResult};
+use weft::{RunContext, Node, NodeManifest, StopSelf, WeftResult};
 
 use super::steering::tags_from_inputs;
 
@@ -29,7 +29,7 @@ impl Node for StopTaggedNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let include_self: bool = ctx.inputs.get("includeSelf")?;
         let stop_self = if include_self { StopSelf::Include } else { StopSelf::Keep };
         let tags = tags_from_inputs(&ctx)?;

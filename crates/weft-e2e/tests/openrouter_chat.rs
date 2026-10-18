@@ -48,7 +48,7 @@ async fn a_conversation_file_carries_turns_and_media() -> anyhow::Result<()> {
     // shows the link path actually engaged.
     let links = weft_e2e::platform::Platform::connect(&disp)
         .await?
-        .public_file_link_count_for(&settled.execution_id, &project.id())
+        .public_file_link_count_for(&settled.run_id, &project.id())
         .await?;
     if links > 0 {
         eprintln!("media path: PUBLIC RELAY LINK ({links} live link(s) minted)");

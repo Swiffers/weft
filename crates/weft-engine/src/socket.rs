@@ -10,7 +10,7 @@
 //!   3. on a direct session route with a registered meter, run the meter's
 //!      session observation over every frame BOTH directions, and when the
 //!      session ends (cleanly or cut, including by drop) record the
-//!      accrued figure durably on the execution's cost trail.
+//!      accrued figure durably on the run's cost trail.
 //!
 //! A relayed session is not measured here: the relay is where the
 //! runtime's own measuring happens (same rule as HTTP). A worker-side
@@ -55,7 +55,7 @@ impl ConnectionSocketDial {
 }
 
 fn dial_err(service: &str, msg: impl std::fmt::Display) -> WeftError {
-    WeftError::NodeExecution(format!("open a '{service}' socket: {msg}"))
+    WeftError::NodeFailed(format!("open a '{service}' socket: {msg}"))
 }
 
 /// The session URL in its HTTPS spelling, for route classification
@@ -75,7 +75,7 @@ fn ws_scheme(scheme: &str) -> WeftResult<&'static str> {
     match scheme {
         "https" | "wss" => Ok("wss"),
         "http" | "ws" => Ok("ws"),
-        other => Err(WeftError::NodeExecution(format!(
+        other => Err(WeftError::NodeFailed(format!(
             "'{other}' is not a scheme a socket can dial"
         ))),
     }
@@ -290,7 +290,7 @@ impl SocketTransport for MeteredSocket {
             }
             Err(e) => {
                 self.finish(true);
-                Err(WeftError::NodeExecution(format!("the session dropped mid-send: {e}")))
+                Err(WeftError::NodeFailed(format!("the session dropped mid-send: {e}")))
             }
         }
     }
@@ -319,7 +319,7 @@ impl SocketTransport for MeteredSocket {
                             && frame.code
                                 != tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal
                         {
-                            return Err(WeftError::NodeExecution(format!(
+                            return Err(WeftError::NodeFailed(format!(
                                 "the session was closed: {}",
                                 frame.reason
                             )));
@@ -329,7 +329,7 @@ impl SocketTransport for MeteredSocket {
                 }
                 Some(Err(e)) => {
                     self.finish(true);
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "the session dropped: {e}"
                     )));
                 }
@@ -546,7 +546,7 @@ mod tests {
             replica: "w".into(),
             pending,
             open_charges: crate::metering::OpenCharges::new(),
-            execution_id: uuid::Uuid::nil(),
+            run_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: weft_core::frames::LoopFrames::default(),
             service: "bytesvc".into(),

@@ -35,11 +35,11 @@ async fn one_change(rig: FakeRig) -> WeftResult<()> {
     match &calls[0].0 {
         ProgramCall::ValuesChange { instance, set, clear } => {
             assert_eq!(instance.as_str(), "ada");
-            let mut steps: Vec<(&str, &str)> = set.iter().map(|v| (v.step.as_str(), v.field.as_str())).collect();
-            steps.sort();
-            assert_eq!(steps, vec![("digest", "cron"), ("one.read", "spreadsheet")]);
+            let mut nodes: Vec<(&str, &str)> = set.iter().map(|v| (v.node.as_str(), v.field.as_str())).collect();
+            nodes.sort();
+            assert_eq!(nodes, vec![("digest", "cron"), ("one.read", "spreadsheet")]);
             assert_eq!(clear.len(), 1);
-            assert_eq!((clear[0].step.as_str(), clear[0].field.as_str()), ("read", "tab"));
+            assert_eq!((clear[0].node.as_str(), clear[0].field.as_str()), ("read", "tab"));
         }
         other => panic!("unexpected call {other:?}"),
     }

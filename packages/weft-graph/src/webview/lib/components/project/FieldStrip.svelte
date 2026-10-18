@@ -49,7 +49,7 @@
 		/// home the key lives in so the parent routes the write (a port
 		/// literal vs a config field). The parent decides how to plumb it
 		/// (typically to data.onUpdate so the round-trip turns into
-		/// setConfig EditOps).
+		/// set_config EditOps).
 		onUpdate: (key: string, value: unknown, portDriven?: boolean) => void;
 		/// Keys the parent renders itself (access / entry_list /
 		/// code / file-backed). The strip skips them as primitives and
@@ -273,7 +273,7 @@
 					use:observeTextareaResize={field.key}
 				></textarea>
 			{:else if field.type === 'select' && field.options && field.freeText}
-				<!-- A free_text select: the options are suggestions (model
+				<!-- A freeText select: the options are suggestions (model
 				     ids, voices), so the box takes any typed value and the
 				     browser's own list offers the known ones. -->
 				<input
@@ -316,7 +316,7 @@
 			{:else if field.type === 'multiselect' && field.options}
 				<!-- Empty options cannot reach here: an optionless
 				     select/multiselect widget fails the node's metadata load. -->
-				<!-- A free_text multiselect also shows the typed values the
+				<!-- A freeText multiselect also shows the typed values the
 				     options never listed, and a box to add one. -->
 				{@const picked = (effectiveValue(field) as string[] | undefined) ?? []}
 				{@const shown = field.freeText ? [...field.options, ...picked.filter((v) => !field.options!.includes(v))] : field.options}

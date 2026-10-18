@@ -191,7 +191,7 @@ fn render_needs_input(render: &FormFieldRender) -> bool {
 /// specs, dispatched on each field's `kind`:
 ///   * `approve_reject`: the response is the decision (`true` or
 ///     `"approve"`, `false` or `"reject"`). The chosen side's port
-///     (`{key}_approved` or `{key}_rejected`) gets `true`; the other is
+///     (`{key}Approved` or `{key}Rejected`) gets `true`; the other is
 ///     OMITTED so the engine emits a structural closure on it at
 ///     termination (the losing branch is cut by the closure marker,
 ///     not a `false` data pulse).
@@ -240,10 +240,10 @@ fn emit_outputs_for_field(
 ) -> WeftResult<()> {
     let templates: Vec<&str> = ports.iter().map(|p| p.name_template.as_str()).collect();
     if kind == APPROVE_REJECT {
-        if templates != ["{key}_approved", "{key}_rejected"] {
+        if templates != ["{key}Approved", "{key}Rejected"] {
             weft::node_bail!(
                 "form kind '{kind}' declares outputs {templates:?}; its response maps \
-                 only onto [\"{{key}}_approved\", \"{{key}}_rejected\"]"
+                 only onto [\"{{key}}Approved\", \"{{key}}Rejected\"]"
             );
         }
         let approved = match &raw_value {

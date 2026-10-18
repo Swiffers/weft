@@ -14,8 +14,8 @@
       "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
-        "smtp_host",
-        "smtp_port"
+        "smtpHost",
+        "smtpPort"
       ],
       "description": "Needs the connection's SMTP server filled."
     },

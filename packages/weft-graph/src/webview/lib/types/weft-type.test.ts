@@ -855,7 +855,7 @@ describe('inferTypeFromValue', () => {
 			.toEqual({ kind: 'primitive', value: 'Video' });
 		expect(inferTypeFromValue({ __weft_audio__: { url: 'http://x/a', mimeType: 'audio/wav' } }))
 			.toEqual({ kind: 'primitive', value: 'Audio' });
-		expect(inferTypeFromValue({ __weft_blob__: { key: 'exec/c/x', mimeType: 'application/pdf' } }))
+		expect(inferTypeFromValue({ __weft_blob__: { key: 'run/c/x', mimeType: 'application/pdf' } }))
 			.toEqual({ kind: 'primitive', value: 'Blob' });
 		// No marker -> not a stored file.
 		expect(inferTypeFromValue({ url: 'http://x/i', mimeType: 'image/png' }).kind).toBe('dict');

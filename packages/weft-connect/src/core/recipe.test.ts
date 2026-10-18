@@ -16,7 +16,7 @@ const oauth: AccessSpecWire = {
 const key: AccessSpecWire = { service: 'exa', acquisition: { kind: 'static', fields: [{ name: 'api_key' }] } };
 
 function row(over: Partial<GrantSummary>): GrantSummary {
-	return { id: 'g', service: 'google', scopes: [], permissions_verified: true, owner: 'author', door: 'own', has_credential: true, ...over };
+	return { id: 'g', service: 'google', scopes: [], permissionsVerified: true, owner: 'author', door: 'own', hasCredential: true, ...over };
 }
 
 describe('recipe', () => {
@@ -36,7 +36,7 @@ describe('recipe', () => {
 		const whoami: AccessSpecWire = {
 			...oauth,
 			permissions: [{ id: 'email', label: 'Your address', description: '', always: true }, ...(oauth.permissions ?? [])],
-			own_page: { guide: { steps: ['Allow {permissions}.'] } },
+			ownPage: { guide: { steps: ['Allow {permissions}.'] } },
 		};
 		expect(requestedPermissions(whoami, ['mail'])).toEqual(['email', 'mail']);
 		expect(requestedPermissions(whoami, ['email', 'mail'])).toEqual(['email', 'mail']);
@@ -47,8 +47,8 @@ describe('recipe', () => {
 
 	it('reads a connection row the way the list shows it', () => {
 		expect(permissionSummary(oauth, ['mail', 'cal', 'drive', 'docs'])).toBe('Read mail, Calendar, Drive, ...');
-		expect(canDo(oauth, row({ scopes: ['mail'], permissions_verified: false }))).toBe('Read mail (claimed)');
-		expect(canDo(oauth, row({ owner: 'platform', has_credential: false }))).toContain('NO KEY');
+		expect(canDo(oauth, row({ scopes: ['mail'], permissionsVerified: false }))).toBe('Read mail (claimed)');
+		expect(canDo(oauth, row({ owner: 'platform', hasCredential: false }))).toContain('NO KEY');
 		expect(canDo(oauth, row({ owner: { instance: 'ada' } }))).toBe('full access of its credential');
 	});
 
@@ -70,15 +70,15 @@ describe('recipe', () => {
 			acquisition: {
 				kind: 'oauth2',
 				grant: { kind: 'authorization_code' },
-				registration_fields: [{ name: 'app_token', label: 'App token', optional: true }],
+				registrationFields: [{ name: 'appToken', label: 'App token', optional: true }],
 			},
 		};
-		expect(ownFields(slack).map((f) => f.name)).toContain('app_token');
-		expect(ownRegistration(slack, { client_id: 'id', client_secret: 's', app_token: ' ' }, 'Mine', undefined)).toEqual({
+		expect(ownFields(slack).map((f) => f.name)).toContain('appToken');
+		expect(ownRegistration(slack, { client_id: 'id', client_secret: 's', appToken: ' ' }, 'Mine', undefined)).toEqual({
 			label: 'Mine',
 			client_id: 'id',
 			client_secret: 's',
 		});
-		expect(() => ownRegistration(slack, { client_id: 'id', app_token: 'xapp' }, '', undefined)).toThrow(/Client secret/);
+		expect(() => ownRegistration(slack, { client_id: 'id', appToken: 'xapp' }, '', undefined)).toThrow(/Client secret/);
 	});
 });

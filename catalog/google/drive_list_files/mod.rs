@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GoogleDriveListFilesNode;
@@ -21,7 +21,7 @@ impl Node for GoogleDriveListFilesNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get_or("query", String::new())?;
         // `pageSize` declares a metadata default, so the bag always

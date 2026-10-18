@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct JsonObjectNode;
@@ -40,7 +40,7 @@ impl Node for JsonObjectNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let mut object = serde_json::Map::new();
         // `in_order`, not `custom`: the bag's values are a sorted map, so
         // iterating them hands back alphabetical keys whatever the build

@@ -7,16 +7,16 @@ use crate::flows::connection_handle;
 use crate::AccessError;
 
 /// One pick to keep: the author's connection `grant_id` for `field` of the
-/// step at `step` (its place, spelled), a field connecting to `service`.
+/// node at `node` (its place, spelled), a field connecting to `service`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickWrite {
-    pub step: String,
+    pub node: String,
     pub field: String,
     pub grant_id: uuid::Uuid,
     pub service: String,
 }
 
-/// Keep `writes` and forget `clears` (step, field) for `project_id`, all
+/// Keep `writes` and forget `clears` (node, field) for `project_id`, all
 /// or none, on `conn` (the caller's transaction). A pick must name one of
 /// the author's own connections (never an instance's: that would spend its
 /// account on everybody's runs) to the field's service, or the whole
@@ -46,31 +46,31 @@ pub async fn change_install_picks(
         if service != write.service {
             return Err(AccessError::Invalid(format!(
                 "'{}.{}' connects to '{}', and connection {} is a '{service}' one",
-                write.step, write.field, write.service, write.grant_id
+                write.node, write.field, write.service, write.grant_id
             ))
             .into());
         }
     }
     for write in writes {
         sqlx::query(
-            "INSERT INTO install_pick (tenant_id, project_id, step, field, grant_id)
+            "INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (project_id, step, field) DO UPDATE
+             ON CONFLICT (project_id, node, field) DO UPDATE
                SET grant_id = EXCLUDED.grant_id, tenant_id = EXCLUDED.tenant_id, set_at = now()",
         )
         .bind(tenant)
         .bind(project_id)
-        .bind(&write.step)
+        .bind(&write.node)
         .bind(&write.field)
         .bind(write.grant_id)
         .execute(&mut *conn)
         .await?;
     }
-    for (step, field) in clears {
-        sqlx::query("DELETE FROM install_pick WHERE tenant_id = $1 AND project_id = $2 AND step = $3 AND field = $4")
+    for (node, field) in clears {
+        sqlx::query("DELETE FROM install_pick WHERE tenant_id = $1 AND project_id = $2 AND node = $3 AND field = $4")
             .bind(tenant)
             .bind(project_id)
-            .bind(step)
+            .bind(node)
             .bind(field)
             .execute(&mut *conn)
             .await?;
@@ -78,7 +78,7 @@ pub async fn change_install_picks(
     Ok(())
 }
 
-/// Every pick this install keeps for `project_id`, by step and field, each
+/// Every pick this install keeps for `project_id`, by node and field, each
 /// as the handle a connection field holds (`{id, identity}`), its identity
 /// read from the connection now.
 pub async fn install_picks<'e>(
@@ -87,7 +87,7 @@ pub async fn install_picks<'e>(
     project_id: uuid::Uuid,
 ) -> anyhow::Result<weft_core::picks::Picks> {
     let rows: Vec<(String, String, uuid::Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT p.step, p.field, p.grant_id, g.identity FROM install_pick p
+        "SELECT p.node, p.field, p.grant_id, g.identity FROM install_pick p
          JOIN access_grant g ON g.id = p.grant_id
          WHERE p.tenant_id = $1 AND p.project_id = $2",
     )
@@ -96,8 +96,8 @@ pub async fn install_picks<'e>(
     .fetch_all(executor)
     .await?;
     let mut picks = weft_core::picks::Picks::new();
-    for (step, field, grant_id, identity) in rows {
-        picks.entry(step).or_default().insert(field, connection_handle(grant_id, identity.as_deref()));
+    for (node, field, grant_id, identity) in rows {
+        picks.entry(node).or_default().insert(field, connection_handle(grant_id, identity.as_deref()));
     }
     Ok(picks)
 }
@@ -113,11 +113,11 @@ pub async fn stored_fields<'e>(
     project_id: uuid::Uuid,
 ) -> anyhow::Result<Vec<weft_core::picks::StoredField>> {
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT p.step, p.field, g.service, NULL::TEXT FROM install_pick p
+        "SELECT p.node, p.field, g.service, NULL::TEXT FROM install_pick p
          JOIN access_grant g ON g.id = p.grant_id
          WHERE p.tenant_id = $1 AND p.project_id = $2
          UNION ALL
-         SELECT v.step, v.field, g.service, v.instance_id FROM instance_value v
+         SELECT v.node, v.field, g.service, v.instance_id FROM instance_value v
          LEFT JOIN access_grant g ON g.id = v.grant_id
          WHERE v.tenant_id = $1 AND v.project_id = $2",
     )
@@ -126,12 +126,12 @@ pub async fn stored_fields<'e>(
     .fetch_all(executor)
     .await?;
     rows.into_iter()
-        .map(|(step, field, service, instance)| {
+        .map(|(node, field, service, instance)| {
             let instance = instance
                 .map(weft_core::instance::InstanceId::new)
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("a stored instance id is invalid: {e}"))?;
-            Ok(weft_core::picks::StoredField { step, field, service, instance })
+            Ok(weft_core::picks::StoredField { node, field, service, instance })
         })
         .collect()
 }
@@ -149,7 +149,7 @@ pub async fn move_stored(
     to: &str,
 ) -> anyhow::Result<(u64, u64)> {
     let picks = sqlx::query(
-        "UPDATE install_pick SET step = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND step = $3",
+        "UPDATE install_pick SET node = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND node = $3",
     )
     .bind(tenant)
     .bind(project_id)
@@ -159,7 +159,7 @@ pub async fn move_stored(
     .await?
     .rows_affected();
     let values = sqlx::query(
-        "UPDATE instance_value SET step = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND step = $3",
+        "UPDATE instance_value SET node = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND node = $3",
     )
     .bind(tenant)
     .bind(project_id)

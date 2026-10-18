@@ -4,7 +4,7 @@
 //! in the run for its `holdSecs` ([`HoldClock`],
 //! `weft_core::run_settings::RunSettings::hold_secs`).
 //!
-//! The drive of every run keeps them (`crate::execution_driver`). A node
+//! The drive of every run keeps them (`crate::run_driver`). A node
 //! test's run has no drive: its rig keeps them through [`keep_held`], the
 //! same pieces, so a live test waits exactly the way a run that cannot
 //! pause does.
@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use weft_broker_client::protocol::RunAnswer;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 use crate::context::EngineClients;
 use crate::held_waits::{HeldWaits, Unsuspendable};
@@ -23,15 +23,15 @@ use crate::held_waits::{HeldWaits, Unsuspendable};
 /// turn would read as often.
 pub(crate) struct AnswerAsk<'a> {
     clients: &'a EngineClients,
-    execution_id: ExecutionId,
+    run_id: RunId,
     /// Every wait whose answer this ask took, which the broker leaves out.
     taken: Vec<String>,
     asking: Option<futures::future::BoxFuture<'static, anyhow::Result<Vec<RunAnswer>>>>,
 }
 
 impl<'a> AnswerAsk<'a> {
-    pub(crate) fn new(clients: &'a EngineClients, execution_id: ExecutionId) -> Self {
-        Self { clients, execution_id, taken: Vec::new(), asking: None }
+    pub(crate) fn new(clients: &'a EngineClients, run_id: RunId) -> Self {
+        Self { clients, run_id, taken: Vec::new(), asking: None }
     }
 
     /// Ask while `needed`, keeping an ask already under way; with nothing
@@ -43,7 +43,7 @@ impl<'a> AnswerAsk<'a> {
             self.asking = Some(Box::pin(answers_once_told(
                 self.clients.runs.clone(),
                 self.clients.told.subscribe(),
-                self.execution_id,
+                self.run_id,
                 self.taken.clone(),
             )));
         }
@@ -61,7 +61,7 @@ impl<'a> AnswerAsk<'a> {
     }
 }
 
-/// The answers waiting for run `execution_id`'s waits but the ones
+/// The answers waiting for run `run_id`'s waits but the ones
 /// `taken`, once there are some: read now (the run starts waiting, or just
 /// took an answer), and again each time its process's line says one was
 /// handed to this run (`told`, subscribed before this is called, so an
@@ -72,24 +72,24 @@ impl<'a> AnswerAsk<'a> {
 async fn answers_once_told(
     runs: std::sync::Arc<dyn crate::context::RunClient>,
     mut told: tokio::sync::broadcast::Receiver<crate::context::RunTold>,
-    execution_id: ExecutionId,
+    run_id: RunId,
     taken: Vec<String>,
 ) -> anyhow::Result<Vec<RunAnswer>> {
     use crate::context::RunTold;
     use tokio::sync::broadcast::error::RecvError;
     loop {
-        let answers = runs.answers(execution_id, &taken).await?;
+        let answers = runs.answers(run_id, &taken).await?;
         if !answers.is_empty() {
             return Ok(answers);
         }
         loop {
             match told.recv().await {
-                Ok(RunTold::Answered(run)) if run == execution_id => break,
+                Ok(RunTold::Answered(run)) if run == run_id => break,
                 Ok(RunTold::Answered(_)) => {}
                 Ok(RunTold::Rechecked(all)) => {
                     let mine: Vec<_> = all
                         .iter()
-                        .filter(|answer| answer.execution_id == execution_id && !taken.contains(&answer.token))
+                        .filter(|answer| answer.run_id == run_id && !taken.contains(&answer.token))
                         .map(|answer| RunAnswer { token: answer.token.clone(), answer: answer.answer.clone() })
                         .collect();
                     if !mine.is_empty() {
@@ -104,12 +104,12 @@ async fn answers_once_told(
     }
 }
 
-/// How long a run has been quiet (every step it runs waits, and only the
+/// How long a run has been quiet (every node it runs waits, and only the
 /// outside can end one of those waits), and when its hold gives up: its
 /// `holdSecs` after the last time anything moved in it.
 pub(crate) struct HoldClock<'a> {
     clock: &'a dyn weft_platform_traits::Clock,
-    execution_id: ExecutionId,
+    run_id: RunId,
     hold_secs: u32,
     /// When the run went quiet.
     quiet_since: Option<std::time::Instant>,
@@ -119,8 +119,8 @@ pub(crate) struct HoldClock<'a> {
 }
 
 impl<'a> HoldClock<'a> {
-    pub(crate) fn new(clock: &'a dyn weft_platform_traits::Clock, execution_id: ExecutionId, hold_secs: u32) -> Self {
-        Self { clock, execution_id, hold_secs, quiet_since: None, quiet_until: None }
+    pub(crate) fn new(clock: &'a dyn weft_platform_traits::Clock, run_id: RunId, hold_secs: u32) -> Self {
+        Self { clock, run_id, hold_secs, quiet_since: None, quiet_until: None }
     }
 
     /// Whether the run is quiet now: the clock runs from when it went
@@ -130,7 +130,7 @@ impl<'a> HoldClock<'a> {
     }
 
     /// How long the run has been quiet, while the hold `counts` (it never
-    /// does while a step waits on its caller: a silent caller is never cut),
+    /// does while a node waits on its caller: a silent caller is never cut),
     /// which also settles when the hold gives up ([`Self::until`]).
     pub(crate) fn quiet_for(&mut self, counts: bool) -> Option<Duration> {
         let quiet_for = self.quiet_since.filter(|_| counts).map(|since| self.clock.now().saturating_duration_since(since));
@@ -165,7 +165,7 @@ impl<'a> HoldClock<'a> {
         let given_up = why.map_or(0, |why| held.give_up(&crate::held_waits::gave_up_because(why, self.hold_secs)));
         tracing::info!(
             target: "weft_engine::outside_waits",
-            execution_id = %self.execution_id,
+            run_id = %self.run_id,
             hold_secs = self.hold_secs,
             given_up,
             "nothing moved in the run for its hold; giving up the waits it holds"
@@ -207,7 +207,7 @@ fn hold_ends_unix(now: u64, left: Duration) -> i64 {
 #[cfg(any(test, feature = "node-tests"))]
 pub(crate) async fn keep_held(
     clients: &EngineClients,
-    execution_id: ExecutionId,
+    run_id: RunId,
     waits: &crate::wait_tracker::WaitTracker,
     firing: weft_core::liveness::FiringLocation,
     hold_secs: u32,
@@ -216,8 +216,8 @@ pub(crate) async fn keep_held(
 ) {
     let firing: std::collections::HashSet<_> = [firing].into_iter().collect();
     let held = waits.held();
-    let mut ask = AnswerAsk::new(clients, execution_id);
-    let mut clock = HoldClock::new(clients.clock.as_ref(), execution_id, hold_secs);
+    let mut ask = AnswerAsk::new(clients, run_id);
+    let mut clock = HoldClock::new(clients.clock.as_ref(), run_id, hold_secs);
     loop {
         // Armed before anything is read, so a wait that begins or ends
         // between the read and the wait still wakes it.
@@ -272,7 +272,7 @@ mod tests {
 
     use super::*;
     use crate::context::{BusCoordinator, RunRecord, RunnerHandle};
-    use crate::execution_driver::engine_test_rig::{clients, handle, Answers, AwaitTasks, MemJournal};
+    use crate::run_driver::engine_test_rig::{clients, handle, Answers, AwaitTasks, MemJournal};
 
     /// A node's wait in a run with no program, held for `hold_secs`, and
     /// what it went through.
@@ -280,7 +280,7 @@ mod tests {
         tasks: Arc<AwaitTasks>,
         answers: Arc<Answers>,
         cancellation: Arc<CancellationFlag>,
-        execution_id: ExecutionId,
+        run_id: RunId,
         /// The node's call: what its wait ended with.
         call: tokio::task::JoinHandle<WeftResult<serde_json::Value>>,
         keeper: tokio::task::JoinHandle<()>,
@@ -291,14 +291,14 @@ mod tests {
     fn held(hold_secs: u32) -> Held {
         let (tasks, answers) = (AwaitTasks::new(), Arc::new(Answers::default()));
         let clients = EngineClients { tasks: tasks.clone(), told: answers.told.clone(), runs: answers.clone(), ..clients(Arc::new(MemJournal::default())) };
-        let execution_id = weft_core::new_execution_id();
-        let record = RunRecord { journal: handle(&clients, execution_id, &[], 0, Default::default()), costs: crate::metering::PendingCostRecords::new() };
+        let run_id = weft_core::new_run_id();
+        let record = RunRecord { journal: handle(&clients, run_id, &[], 0, Default::default()), costs: crate::metering::PendingCostRecords::new() };
         let waits = crate::wait_tracker::WaitTracker::new();
         let cancellation = CancellationFlag::new_arc();
         let settings = weft_core::run_settings::RunSettings::bookkeeping().holding_for(hold_secs).unwrap();
         let node = RunnerHandle::new(
             uuid::Uuid::nil(),
-            execution_id,
+            run_id,
             "node".into(),
             "node".into(),
             "Waits".into(),
@@ -326,10 +326,10 @@ mod tests {
             let cancellation = cancellation.clone();
             async move {
                 let here = FiringLocation::new("node", Default::default());
-                keep_held(&clients, execution_id, &waits, here, hold_secs, Unsuspendable::NoProgram, &cancellation).await
+                keep_held(&clients, run_id, &waits, here, hold_secs, Unsuspendable::NoProgram, &cancellation).await
             }
         });
-        Held { tasks, answers, cancellation, execution_id, call, keeper }
+        Held { tasks, answers, cancellation, run_id, call, keeper }
     }
 
     impl Held {
@@ -364,7 +364,7 @@ mod tests {
             // Handed to the run, and the news of it passed on, as the
             // line watch passes it on.
             held.answers.keep(token, json!("done"));
-            held.answers.told.send(crate::context::RunTold::Answered(held.execution_id)).unwrap();
+            held.answers.told.send(crate::context::RunTold::Answered(held.run_id)).unwrap();
             let (ended, withdrawn) = held.ended().await;
             assert_eq!(ended.unwrap(), json!("done"));
             assert!(withdrawn.is_empty(), "an answered wait is not withdrawn: {withdrawn:?}");
@@ -389,7 +389,7 @@ mod tests {
     async fn a_cancel_gives_up_the_held_wait() {
         let held = held(60);
         let token = held.asked().await;
-        held.cancellation.cancel_because(weft_core::exec::CancelCause::User);
+        held.cancellation.cancel_because(weft_core::run::CancelCause::User);
         let (ended, withdrawn) = held.ended().await;
         let error = ended.unwrap_err().to_string();
         assert!(error.contains("its run was cancelled"), "{error}");

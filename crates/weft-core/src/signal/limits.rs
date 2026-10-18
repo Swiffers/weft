@@ -7,7 +7,7 @@
 //! policy, so every kind gets it without any kind or node knowing: the
 //! language gives every trigger the settings
 //! ([`EntryLimits::node_inputs`]), the ctx reads them when the node
-//! registers its signal (`ExecutionContext::register_signal`), and the
+//! registers its signal (`RunContext::register_signal`), and the
 //! worker's door enforces them before any run starts, for every way work
 //! arrives (a caller, an event, a fire replayed): `weft_engine::door`.
 //!

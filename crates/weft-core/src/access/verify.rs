@@ -67,7 +67,7 @@ pub struct VerifySecrets {
 
 /// The material a scheme reads off a CONNECTION's stored values, by
 /// the fixed names the scheme vocabulary reserves
-/// (`signing_secret`, `public_key`, `keys`, `audience`). Pure: the
+/// (`signingSecret`, `publicKey`, `keys`, `audience`). Pure: the
 /// broker hands the connection's values in, the scheme's secrets come
 /// out. A key list is keys separated by commas or line breaks (the
 /// paste field is one line; a key never contains either), blanks
@@ -1017,7 +1017,7 @@ mod tests {
     #[test]
     fn secrets_come_off_the_connection_by_fixed_names() {
         let values = BTreeMap::from([
-            ("signing_secret".to_string(), "s".to_string()),
+            ("signingSecret".to_string(), "s".to_string()),
             ("keys".to_string(), " k1 , k2\nk3\n".to_string()),
             ("audience".to_string(), "aud".to_string()),
         ]);

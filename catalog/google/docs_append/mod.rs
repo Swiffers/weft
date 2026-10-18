@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::docs::append_text;
 
@@ -20,7 +20,7 @@ impl Node for GoogleDocsAppendNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let doc_id: String = ctx.inputs.get("documentId")?;
         let text: String = ctx.inputs.get("text")?;

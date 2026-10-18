@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::checked_send;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct S3ListObjectsNode;
@@ -20,7 +20,7 @@ impl Node for S3ListObjectsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let bucket: String = ctx.inputs.get("bucket")?;
         let prefix: String = ctx.inputs.get_or("prefix", String::new())?;

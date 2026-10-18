@@ -129,7 +129,7 @@ async fn http_endpoint_echoes_request_body() -> anyhow::Result<()> {
     let nodes: Vec<&str> = listed.iter().filter_map(|e| e["node"].as_str()).collect();
     assert_eq!(nodes, vec!["route"], "listing: {listed:?}");
     assert_eq!(listed[0]["kind"], json!("trigger"));
-    assert_eq!(listed[0]["project_id"], json!(pid.to_string()));
+    assert_eq!(listed[0]["projectId"], json!(pid.to_string()));
     assert_eq!(display::as_token(&disp, &scoped, &pid, "route").await?.expect_text("Address")?, address);
 
     // Pressing a trigger's display is refused, through the token door

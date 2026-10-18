@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::call;
 
@@ -47,7 +47,7 @@ impl Node for LlmInferenceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // `parseJson` declares a metadata default, so the bag always
         // holds a value.
         let parse_json: bool = ctx.inputs.get("parseJson")?;

@@ -36,19 +36,19 @@
       "url": "https://api.elevenlabs.io/v1/user",
       "captures": [
         {
-          "name": "account_name",
+          "name": "accountName",
           "path": "first_name",
           "optional": true
         }
       ]
     },
-    "identity": "{account_name}",
+    "identity": "{accountName}",
     "permissions": [
       {
         "id": "voice_lab",
         "label": "Voice creation",
         "description": "Clone, design or remix voices. A minted voice lives in the connected account and counts against its voice slots.",
-        "own_only": true,
+        "ownOnly": true,
         "guide": {
           "link": "https://elevenlabs.io/app/voice-lab",
           "steps": [
@@ -62,7 +62,7 @@
         "id": "agents",
         "label": "Voice agents",
         "description": "Phone/voice agents: the agents, their phone numbers, and their call history live in the connected account.",
-        "own_only": true,
+        "ownOnly": true,
         "guide": {
           "link": "https://elevenlabs.io/app/agents",
           "steps": [
@@ -77,7 +77,7 @@
         "id": "image_video",
         "label": "Images and video",
         "description": "Generate images and videos, and run Flows templates, paid from the connected account's credits.",
-        "own_only": true,
+        "ownOnly": true,
         "guide": {
           "link": "https://elevenlabs.io/app/settings/api-keys",
           "steps": [
@@ -93,7 +93,7 @@
       "rung": "reports_validity",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "guide": {
         "link": "https://elevenlabs.io/app/settings/api-keys",
         "steps": [

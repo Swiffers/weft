@@ -1,6 +1,6 @@
 //! `weft cancel-running [project]`. Force the drain to finish when
 //! the project is in `deactivating` state: cancels every running,
-//! non-suspended execution. The lifecycle target the original
+//! non-suspended run. The lifecycle target the original
 //! deactivate wrote stays in place; the dispatcher's drain-watcher
 //! flips status to `inactive` once the running set empties.
 //!
@@ -28,7 +28,7 @@ async fn run_inner(
     let path = format!("/projects/{id}/cancel-running");
     progress.dispatcher_call_start(&path);
     client.post_with_body(&path, &serde_json::to_value(&scope)?).await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
     progress.complete(&format!("cancel-running issued for {id}"));
     Ok(())
 }

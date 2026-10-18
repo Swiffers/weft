@@ -21,14 +21,14 @@ use serde_json::{json, Value};
 
 use weft::caller::{InboundMessage, OutboundChunk};
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LiveHttpResponderNode;
 
 #[async_trait]
 impl Node for LiveHttpResponderNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let message: String = ctx.inputs.get("message")?;
         let http = ctx.http_caller().await?;
 

@@ -17,7 +17,7 @@ use serde_json::Value;
 use weft::bus::{BusEntryKind, WirePayload};
 use weft::caller::{CallerHandle, HttpCaller, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::framing::{ndjson_line, sse_event, Format};
 use super::wire;
@@ -35,7 +35,7 @@ impl Node for StreamNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let format: String = ctx.inputs.get("format")?;
         let format = Format::parse(&format).map_err(weft::node_error)?;
         let status: u16 = ctx.inputs.get("status")?;
@@ -117,7 +117,7 @@ async fn write_chunk(
 /// `ndjson`, the payload itself per the data type for `raw` (a byte
 /// payload rides as bytes whatever the format, it has no text form).
 async fn framed(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     format: Format,
     data_type: weft::signal::DataType,
     payload: WirePayload,

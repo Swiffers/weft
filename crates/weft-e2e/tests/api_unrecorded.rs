@@ -1,7 +1,7 @@
 //! A route that does not record its runs (`recorded: false`): a page
-//! polling it answers every time and leaves nothing in the executions
+//! polling it answers every time and leaves nothing in the runs
 //! listing, and a call that fails leaves its failure on record, so it
-//! lists with the step that failed and why.
+//! lists with the node that failed and why.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
@@ -12,8 +12,8 @@ use weft_e2e::{client::poll_until, ensure, live, project::Project};
 
 /// The project's fire runs, as the listing has them, by entry node.
 async fn listed(disp: &weft_e2e::client::Dispatcher, pid: uuid::Uuid) -> anyhow::Result<Vec<Value>> {
-    let page: Value = disp.get_json(&format!("/executions?project_id={pid}&phase=fire&limit=50")).await?;
-    Ok(page["executions"].as_array().cloned().unwrap_or_default())
+    let page: Value = disp.get_json(&format!("/runs?project_id={pid}&phase=fire&limit=50")).await?;
+    Ok(page["runs"].as_array().cloned().unwrap_or_default())
 }
 
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
         let disp = disp.clone();
         async move {
             let rows = listed(&disp, pid).await?;
-            Ok(rows.into_iter().find(|row| row["entry_node"] == "broken"))
+            Ok(rows.into_iter().find(|row| row["entryNode"] == "broken"))
         }
     })
     .await?;
@@ -61,7 +61,7 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
         let disp = disp.clone();
         async move {
             let rows = listed(&disp, pid).await?;
-            Ok(rows.into_iter().find(|row| row["entry_node"] == "silent"))
+            Ok(rows.into_iter().find(|row| row["entryNode"] == "silent"))
         }
     })
     .await?;
@@ -70,12 +70,12 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
     // The successful calls left nothing, whatever time has passed.
     let rows = listed(&disp, pid).await?;
     assert!(
-        !rows.iter().any(|row| row["entry_node"] == "status"),
+        !rows.iter().any(|row| row["entryNode"] == "status"),
         "a successful unrecorded run is never listed: {rows:?}"
     );
-    let execution_id = failed["execution_id"].as_str().unwrap_or_default();
-    let cli = project.weft(&["executions", "--project", &pid.to_string()]).await?;
-    assert!(cli.contains(&execution_id[..8.min(execution_id.len())]), "`weft executions` lists the failed run {execution_id}: {cli}");
+    let run_id = failed["runId"].as_str().unwrap_or_default();
+    let cli = project.weft(&["runs", "--project", &pid.to_string()]).await?;
+    assert!(cli.contains(&run_id[..8.min(run_id.len())]), "`weft runs` lists the failed run {run_id}: {cli}");
 
     project.finish().await
 }

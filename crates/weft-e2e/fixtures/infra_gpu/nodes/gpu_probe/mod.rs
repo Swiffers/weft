@@ -8,7 +8,7 @@ use weft::infra::{
     Container, ContainerPort, Endpoint, EndpointTarget, Expose, Gpu, Image, InfraSpec, MachineShape, Probe, Protocol, Unit,
 };
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::{RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GpuProbeNode;
@@ -38,7 +38,7 @@ impl Node for GpuProbeNode {
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let api = ctx.endpoint("api").await?;
         let outputs = api.call(weft::EndpointMethod::Get, "/outputs", None).await?;
         ctx.pulse_downstream(NodeOutput::new().extend_from_object(&outputs)).await

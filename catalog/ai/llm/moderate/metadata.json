@@ -23,7 +23,7 @@
       "description": "The OpenAI moderation model.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "omni-moderation-latest",
           "text-moderation-latest"

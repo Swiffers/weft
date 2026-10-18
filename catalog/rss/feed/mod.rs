@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::signal::{DeltaMode, PollDelta, PollEndpoint, PollFormat};
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct RssFeedNode;
@@ -23,7 +23,7 @@ impl Node for RssFeedNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("feedUrl")?;
         let interval: f64 = ctx.inputs.get("intervalSecs")?;
 
@@ -42,7 +42,7 @@ impl Node for RssFeedNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let wake = ctx.wake.record()?;
         let entry = wake["item"].clone();
         // A feed that gives no title or no link says so with a null.

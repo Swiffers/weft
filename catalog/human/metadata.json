@@ -58,11 +58,11 @@
         ],
         "addsOutputs": [
           {
-            "nameTemplate": "{key}_approved",
+            "nameTemplate": "{key}Approved",
             "portType": "Boolean"
           },
           {
-            "nameTemplate": "{key}_rejected",
+            "nameTemplate": "{key}Rejected",
             "portType": "Boolean"
           }
         ]

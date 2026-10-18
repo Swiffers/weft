@@ -3,7 +3,7 @@
 //! the value it was holding flows on unchanged when the timer fires.
 //!
 //! The park is what needs an install: the worker records a timer suspension and
-//! the execution resumes from the journal when the dispatcher fires it, so a
+//! the run resumes from the journal when the dispatcher fires it, so a
 //! completed run with the right value on the far side of the wait is the proof.
 //!
 //! It also holds the wait to its length. The seconds count from when the node
@@ -59,7 +59,7 @@ fn hold_stamps(settled: &weft_e2e::SettledRun) -> anyhow::Result<(u64, u64, u64)
         settled
             .events_of("hold")
             .find(|e| e.kind() == kind)
-            .and_then(|e| e.field("at_unix"))
+            .and_then(|e| e.field("atUnix"))
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("no {kind} for `hold` in the replay"))
     };

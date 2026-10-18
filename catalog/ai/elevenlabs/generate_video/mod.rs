@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::flows::{generate, video_request, Media, References};
 
@@ -22,7 +22,7 @@ impl Node for ElevenLabsGenerateVideoNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let start: Option<FileHandle> = ctx.inputs.opt("startFrame")?;
         let end: Option<FileHandle> = ctx.inputs.opt("endFrame")?;

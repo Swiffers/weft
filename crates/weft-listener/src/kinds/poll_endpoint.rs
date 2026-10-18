@@ -7,7 +7,7 @@
 //! database, and the row is written only when the cursor moves or the
 //! polls start failing, fail long enough to say so loudly, or work again.
 //!
-//! As an entry trigger every fire starts a fresh execution. As a parked
+//! As an entry trigger every fire starts a fresh run. As a parked
 //! run's wait (`await_signal`, a node waiting for an outside job to
 //! finish) the first poll runs at once, so a job already done resumes
 //! the run without waiting an interval, and the first answer that passes

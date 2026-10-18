@@ -30,7 +30,7 @@ use weft_core::program::{
     ProgramCallOutcome, ProgramCallPayload, RunsCounted, TokensRevoked,
 };
 use weft_core::running_policy::DeactivateSpec;
-use weft_core::{ExecutionId, StopSelf};
+use weft_core::{RunId, StopSelf};
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 
@@ -129,7 +129,7 @@ pub(crate) async fn run_call(
             answered(serde_json::to_value(values).map_err(internal("answer"))?)
         }
         ProgramCall::ValuesChange { instance, set, clear } => {
-            let clear: Vec<(String, String)> = clear.iter().map(|f| (f.step.clone(), f.field.clone())).collect();
+            let clear: Vec<(String, String)> = clear.iter().map(|f| (f.node.clone(), f.field.clone())).collect();
             let changed = crate::instance_values::change(state, owner().await?.as_str(), project_id, instance, set, &clear).await?;
             answered(serde_json::to_value(changed).map_err(internal("answer"))?)
         }
@@ -144,19 +144,19 @@ pub(crate) async fn run_call(
             let tenant = owner().await?;
             let asker_matches = asker_matches_filter(state, project_id, filter, asker).await?;
             let outcome =
-                crate::api::execution::clean_runs(state, &tenant, Some(project_id), filter, *running, Some(asker)).await?;
+                crate::api::run::clean_runs(state, &tenant, Some(project_id), filter, *running, Some(asker)).await?;
             let stops_asker = payload.stop_self == StopSelf::Include && asker_matches;
             stop_asker(state, asker, stops_asker).await?;
             Ok(ProgramCallOutcome { value: serde_json::to_value(outcome).map_err(internal("answer"))?, stops_asker })
         }
         ProgramCall::RunsList { filter, limit } => {
             let tenant = owner().await?;
-            let page = crate::api::execution::list_runs(state, &tenant, project_id, filter, *limit).await?;
+            let page = crate::api::run::list_project_runs(state, &tenant, project_id, filter, *limit).await?;
             answered(serde_json::to_value(page).map_err(internal("answer"))?)
         }
         ProgramCall::RunsCount { filter } => {
             let tenant = owner().await?;
-            let total = crate::api::execution::count_runs(state, &tenant, project_id, filter).await?;
+            let total = crate::api::run::count_runs(state, &tenant, project_id, filter).await?;
             answered(serde_json::to_value(RunsCounted { total }).map_err(internal("answer"))?)
         }
         ProgramCall::TokensRevoke { instance, id } => {
@@ -249,7 +249,7 @@ async fn infra_down(
     instance: Option<&InstanceId>,
     take_down: TakeDown,
     spec: &DeactivateSpec,
-    asker: ExecutionId,
+    asker: RunId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
     spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
@@ -261,7 +261,7 @@ async fn infra_down(
     // is the later intent, so the start ends here.
     let cancelled_start = !pending.setups_starting(node, instance).is_empty();
     for setup in pending.setups_starting(node, instance) {
-        crate::api::execution::cancel_execution_id(state, setup, &weft_core::exec::CancelCause::User)
+        crate::api::run::cancel_run_id(state, setup, &weft_core::run::CancelCause::User)
             .await
             .map_err(internal("cancel the copy's start"))?;
     }
@@ -312,7 +312,7 @@ async fn infra_down(
         .await?;
     }
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.execution_id == asker);
+    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.run_id == asker);
     crate::api::infra::settle_running_before_infra_op(
         state,
         project_id,
@@ -372,7 +372,7 @@ async fn triggers_deactivate(
     project_id: uuid::Uuid,
     scope: &ActivationScope,
     spec: &DeactivateSpec,
-    asker: ExecutionId,
+    asker: RunId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
     let project = state
@@ -384,7 +384,7 @@ async fn triggers_deactivate(
     let keys = scope.resolve(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let target = crate::take_down::TakeDownTarget::Activations(keys);
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.execution_id == asker);
+    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.run_id == asker);
     crate::take_down::take_down(state, project_id, &target, spec, None, crate::take_down::TakeDownAsker::Run(asker)).await?;
     let stops_asker = stop_self == StopSelf::Include && asker_fired;
     stop_asker(state, asker, stops_asker).await?;
@@ -393,9 +393,9 @@ async fn triggers_deactivate(
 
 /// Cancel the asking run when its own call reaches it and it asked to be
 /// stopped with the rest. Its worker is waiting for exactly this.
-async fn stop_asker(state: &DispatcherState, asker: ExecutionId, stops: bool) -> Result<(), CallError> {
+async fn stop_asker(state: &DispatcherState, asker: RunId, stops: bool) -> Result<(), CallError> {
     if stops {
-        crate::api::execution::cancel_execution_id(state, asker, &weft_core::exec::CancelCause::User)
+        crate::api::run::cancel_run_id(state, asker, &weft_core::run::CancelCause::User)
             .await
             .map_err(internal("cancel the asking run"))?;
     }
@@ -408,9 +408,9 @@ async fn asker_matches_filter(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     filter: &weft_core::program::RunFilter,
-    asker: ExecutionId,
+    asker: RunId,
 ) -> Result<bool, CallError> {
-    let Some(run) = state.journal.execution_summary(asker).await.map_err(internal("the asking run"))? else {
+    let Some(run) = state.journal.run_summary(asker).await.map_err(internal("the asking run"))? else {
         return Ok(false);
     };
     let now = crate::lease::now_unix() as u64;
@@ -431,13 +431,13 @@ async fn asker_matches_filter(
 /// instance, and the runs still going or ended since its `since`). The
 /// run's instance is its run row's, born with the run and never changed.
 async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, CallError> {
-    let runs: Vec<(ExecutionId, Option<String>)> = sqlx::query_as(
-        "SELECT execution_id, instance_id FROM run \
+    let runs: Vec<(RunId, Option<String>)> = sqlx::query_as(
+        "SELECT run_id, instance_id FROM run \
          WHERE project_id = $1 \
            AND ($2::text IS NULL OR instance_id = $2) \
-           AND ($3::uuid IS NULL OR execution_id = $3) \
+           AND ($3::uuid IS NULL OR run_id = $3) \
            AND ($4::bigint IS NULL OR ended_at IS NULL OR ended_at >= $4) \
-         ORDER BY started_at, execution_id",
+         ORDER BY started_at, run_id",
     )
     .bind(project_id)
     .bind(filter.instance.as_ref().map(|m| m.as_str()))
@@ -449,16 +449,16 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
     let project = state.projects.project(project_id).await.map_err(internal("project"))?;
     let mut out = Vec::new();
     let mut reported = Vec::new();
-    for (execution_id, instance) in runs {
+    for (run_id, instance) in runs {
         let record = {
             let mut conn = state.pg_pool.acquire().await.map_err(internal("costs"))?;
-            weft_journal::record::read_record(&mut conn, execution_id, None).await.map_err(internal("cost record"))?
+            weft_journal::record::read_record(&mut conn, run_id, None).await.map_err(internal("cost record"))?
         };
-        let events = record.events(execution_id).map_err(internal("cost record"))?;
-        reported.push(events.into_iter().map(move |event| (execution_id, event, instance.clone())));
+        let events = record.events(run_id).map_err(internal("cost record"))?;
+        reported.push(events.into_iter().map(move |event| (run_id, event, instance.clone())));
     }
-    for (execution_id, event, instance) in reported.into_iter().flatten() {
-        let weft_journal::ExecEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
+    for (run_id, event, instance) in reported.into_iter().flatten() {
+        let weft_journal::RunEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
             continue;
         };
         if filter.since_unix.is_some_and(|since| at_unix < since) {
@@ -478,7 +478,7 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
             continue;
         }
         out.push(CostRecord {
-            run: execution_id,
+            run: run_id,
             instance: instance.map(InstanceId::new).transpose().map_err(internal("cost row instance"))?,
             node,
             service,

@@ -571,13 +571,13 @@
                 "label": "endpoint_id",
                 "value": "endpoint_id",
                 "page": {
-                  "cursor_param": "cursor",
-                  "cursor_path": "next_cursor"
+                  "cursorParam": "cursor",
+                  "cursorPath": "next_cursor"
                 },
                 "public": true
               }
             ],
-            "free_text": true
+            "freeText": true
           },
           "default": "fal-ai/flux/dev",
           "label": "Model",
@@ -2024,7 +2024,7 @@
                 "public": true
               }
             ],
-            "free_text": true
+            "freeText": true
           },
           "label": "Model",
           "placeholder": "deepseek/deepseek-v4-flash-0731",

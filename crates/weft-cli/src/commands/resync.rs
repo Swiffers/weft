@@ -35,7 +35,7 @@ pub async fn resume(ctx: Ctx) -> anyhow::Result<()> {
         progress.dispatcher_call_start(&path);
         let answer = client.post_json(&path, &serde_json::json!({})).await?;
         let resynced = resynced_of(answer)?;
-        progress.dispatcher_call_done(serde_json::json!({ "project_id": id, "resynced": resynced }));
+        progress.dispatcher_call_done(serde_json::json!({ "projectId": id, "resynced": resynced }));
         progress.trigger_register_done();
         let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");
         progress.complete(&format!("took the resync up again and resynced {whom} in {id}"));
@@ -108,7 +108,7 @@ async fn run_inner(
     )
     .await?;
     let resynced = resynced_of(answer)?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id, "resynced": resynced }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": handle.id, "resynced": resynced }));
     progress.trigger_register_done();
     let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");
     progress.complete(&format!("resynced {whom} in {} ({})", handle.name, handle.id));

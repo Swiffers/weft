@@ -69,6 +69,7 @@
   ],
   "features": {
     "canAddOutputPorts": true,
+    "addedPortsAreDataKeys": true,
     "canAddInputPorts": true
   },
   "validate": [

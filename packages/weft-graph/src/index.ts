@@ -25,7 +25,7 @@ export { nodeTags, TAGS_CONFIG_KEY } from './webview/lib/node-tags';
 // The typed field renderer + the config-diff producer, so a host-drawn config
 // panel edits a node's fields THROUGH the same machinery the canvas uses:
 // FieldStrip draws the typed controls (with the debounced field editor), and
-// `diffConfigOps` turns a new config map into the correct setConfig/removeConfig
+// `diffConfigOps` turns a new config map into the correct set_config/remove_config
 // EditOps (source tokens via `formatConfigValue`), instead of a parallel
 // hand-rolled renderer + token formatter that would drift.
 export { default as FieldStrip } from './webview/lib/components/project/FieldStrip.svelte';
@@ -62,14 +62,14 @@ export type {
   Failure,
 } from './protocol';
 
-// The editor's view of a project + execution state, for consumers that build
+// The editor's view of a project + run state, for consumers that build
 // `HostMessage`s from their own backend data.
 export type {
   ProjectDefinition,
   NodeInstance,
   Edge,
-  NodeExecution,
-  ExecutionState,
+  NodeFiring,
+  RunState,
 } from './webview/lib/types';
 
 // Convert a compiled (Rust-shape) ProjectDefinition into the editor's view.

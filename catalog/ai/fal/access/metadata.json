@@ -35,14 +35,14 @@
     ],
     "test": {
       "url": "https://api.fal.ai/v1/models?limit=1",
-      "expect_status": 200
+      "expectStatus": 200
     },
     "identity": "fal",
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "guide": {
         "link": "https://fal.ai/dashboard/keys",
         "steps": [

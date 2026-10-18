@@ -4,7 +4,7 @@
 //! The node's metadata marks which of its outputs are baked
 //! (`OutputSpec::baked`, carried as `NodeDefinition::baked_outputs`). The
 //! run that applies its infra (the infra setup) runs its body and saves
-//! what went out on those outputs (`weft_engine`'s execution driver); the
+//! what went out on those outputs (`weft_engine`'s run driver); the
 //! infra itself can change a saved value later with no node running
 //! ([`PushedValues`]).
 //!

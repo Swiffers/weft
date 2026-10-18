@@ -28,7 +28,7 @@ describe('classifyUpdate', () => {
 		);
 		expect(c.isExpandToggle).toBe(false);
 		expect(c.configOps).toHaveLength(1);
-		expect(c.configOps[0]).toMatchObject({ op: 'setConfig', node: 'n', key: 'account' });
+		expect(c.configOps[0]).toMatchObject({ op: 'set_config', node: 'n', key: 'account' });
 	});
 
 	it('a resize spread (expanded unchanged) is not a toggle', () => {
@@ -41,7 +41,7 @@ describe('classifyUpdate', () => {
 		const c = classify({ config: { ...live, value: 'xy' } });
 		expect(c.isExpandToggle).toBe(false);
 		expect(c.configOps).toHaveLength(1);
-		expect(c.configOps[0]).toMatchObject({ op: 'setConfig', key: 'value' });
+		expect(c.configOps[0]).toMatchObject({ op: 'set_config', key: 'value' });
 	});
 
 	it('a label rename riding an expanded change is not a toggle', () => {
@@ -56,6 +56,6 @@ describe('classifyUpdate', () => {
 
 	it('loop config routes to the loop op family', () => {
 		const c = classifyUpdate('l', { config: { parallel: 4 } }, {}, true);
-		expect(c.configOps[0]).toMatchObject({ op: 'setLoopConfig', loopId: 'l', key: 'parallel' });
+		expect(c.configOps[0]).toMatchObject({ op: 'set_loop_config', loopId: 'l', key: 'parallel' });
 	});
 });

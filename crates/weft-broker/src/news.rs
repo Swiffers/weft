@@ -23,13 +23,13 @@ pub const NEWS_CHANNELS: &[&str] = &[weft_task_store::parked_fires::PARKED_FIRE_
 
 /// What the database announces for `news`: an answer handed to a run as a
 /// parked fire naming the run, a cancel as a cancel naming it.
-// SYNC: the payloads <-> crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/journal/postgres.rs (cancel_execution)
+// SYNC: the payloads <-> crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/journal/postgres.rs (cancel_run)
 fn as_announced(news: RunNews) -> (&'static str, String) {
     let channel = match news.kind {
         NewsKind::Answer => weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
         NewsKind::Cancel => weft_task_store::runs::CANCEL_CHANNEL,
     };
-    (channel, weft_task_store::runs::run_payload(news.project, news.execution))
+    (channel, weft_task_store::runs::run_payload(news.project, news.run))
 }
 
 /// Tell `told` everything `listening` hears, for the life of the process:
@@ -85,7 +85,7 @@ mod tests {
     use super::*;
 
     fn news(kind: NewsKind) -> RunNews {
-        RunNews { project: uuid::Uuid::from_u128(1), execution: uuid::Uuid::from_u128(2), kind }
+        RunNews { project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(2), kind }
     }
 
     #[test]

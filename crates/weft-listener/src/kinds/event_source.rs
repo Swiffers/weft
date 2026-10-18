@@ -1,6 +1,6 @@
 //! Shared plumbing for the outbound event-source kinds (`SseSubscribe`,
 //! `PollEndpoint`, `SocketListen`). All three hold or poll an external
-//! source and fire a fresh execution per event; what differs is HOW they
+//! source and fire a fresh run per event; what differs is HOW they
 //! read (held SSE stream vs periodic poll vs bidirectional socket). The
 //! payload coercion, the reconnect-backoff ladder and what a reconnecting
 //! connection says are identical, so they live here once and the

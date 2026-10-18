@@ -1,6 +1,6 @@
 ---
 name: weft-language
-description: "Read before writing or editing any .weft source: declarations, wiring, config literals, reserved keys, inline signatures and expressions, types, groups and the level rule, included files, loops, the pulse execution model, @file, @asset and @include, and every compiler error slug."
+description: "Read before writing or editing any .weft source: declarations, wiring, config literals, reserved keys, inline signatures and expressions, types, groups and the level rule, how names are spelled, included files, loops, the pulse model, @file, @asset and @include, and every compiler error slug."
 ---
 
 # The weft language
@@ -19,22 +19,53 @@ that never receives anything is closed the same way.
 
 ````weft
 name = NodeType
-name = NodeType { config_field: value }
+name = NodeType { configField: value }
 name = NodeType {}
 ````
 
-`name` is the node id, unique in its scope, snake_case. `NodeType` must exist
+`name` is the node id, unique in its scope, camelCase. `NodeType` must exist
 in the project's `nodes/` catalog; you read its real ports with
 `weft describe-nodes --node <Type> --compact`, never from memory.
+
+### Spelling a name
+
+Every name you choose in a program is camelCase: a node (`sendReply`), a
+group, a loop, an `@include`, and every port you declare on a node, a group,
+a loop or an included file's header (`maxRetries: Number`). On a node that takes added
+inputs, a key in the braces that creates a port counts too (`userId: 3` on
+`ExecPython`). A node type is spelled the way
+the catalog spells it, which is PascalCase (`ExecPython`). A type you
+declare is PascalCase too (`type Card = ...`), though the compiler does not
+check it. Settings are spelled the way the node's interface names them,
+camelCase too (`systemPrompt`).
+
+If a name you chose is spelled any other way, the program still runs, and
+the compiler warns `not-camel-case`, with the fix when it can work one out:
+
+```text
+node 'send_reply' is not camelCase: write 'sendReply'
+```
+
+A few names keep another spelling. The gates, `_should_flow` and
+`_should_not_flow`, are the language's own names, so the warning skips them;
+the markers keep theirs too (`@per_instance`, `@instance_filled`,
+`@require_one_of`). A value you pick from a fixed list is written exactly as
+the list spells it (`kind: "photo"`). And on a node whose added ports
+are named after data from outside weft, a port keeps that data's spelling:
+`Route` for a request body's fields, `JsonObject` for the keys of the object
+it builds, the Postgres query nodes for a query's `$` holes and a table's
+columns, among others. `post = Route -> (user_id: String)` draws no warning
+for `user_id`; the name you give the node, `post`, is still checked. Such a
+node shows `addedPortsAreDataKeys` in the `features` block of its wiring view.
 
 ## Connecting
 
 ````weft
-target.input_port = source.output_port
+target.inputPort = source.outputPort
 ````
 
-Right to left: the value flows from `source.output_port` into
-`target.input_port`, and the types must be compatible. Every required input
+Right to left: the value flows from `source.outputPort` into
+`target.inputPort`, and the types must be compatible. Every required input
 gets a wire or a literal; an optional one (`port?`) can stay unwired. This
 line is the longhand; [the shorthand] (next section) is the same wire inside
 the target's braces, and the one you write (`answer = Reply { body:
@@ -135,7 +166,7 @@ the same. `null` is never a literal: omit the field instead
 
 A field with a fixed list of choices (a dropdown in the editor) takes one of
 them and nothing else: any other written value is `literal-not-an-option`,
-and the message lists the choices. A list the node marks `free_text` (model
+and the message lists the choices. A list the node marks `freeText` (model
 ids, voices) only suggests: any value is accepted there.
 
 A list or object literal holds plain values only, so `params: [self.chatId,
@@ -159,9 +190,9 @@ Reserved keys).
 
 Calling a library, parsing what no type describes, reshaping a list in
 memory: that is processing, and Python is the right answer for it. A branch
-or a loop that decides what the program does next (whether a step runs,
+or a loop that decides what the program does next (whether a node runs,
 which service is called, a call made once per item) is coordination, and it
-belongs in the graph, where each step is visible and journaled: a Boolean
+belongs in the graph, where each node is visible and journaled: a Boolean
 on `_should_flow` for the branch, a `Loop` for the repetition, one node per
 call.
 
@@ -202,8 +233,8 @@ node with neither key, or no `features` block at all, takes only the ports
 it declares.
 
 ````weft
-step = ExecPython -> (out: String) {
-  code: @file("assets/scripts/step.py")
+score = ExecPython -> (out: String) {
+  code: @file("assets/scripts/score.py")
   text: draft.answer      # a String port, from the wire
   limit: 3                # a Number port, from the literal
   notes?: review.notes    # optional: a closed pulse here does not skip the node
@@ -243,7 +274,7 @@ both. Wrong family is `input-accepts`, and the message reads the list back
 ("`params` accepts: wire"). A compiler-read port (a form's `fields`, a
 switch's `cases`, the access picker) takes an inline typed value only: no
 wire, no `@file`, no `@asset`. The line also works on a [boundary port]. An
-output port never takes a value, on any node: `step.out = "lit"` and
+output port never takes a value, on any node: `score.out = "lit"` and
 `out: "lit"` beside a `-> (out: String)` signature are refused, and so is a
 group's own output written from inside (`self.result = "lit"`). A firing
 emits on an output; you read it as `node.port`.
@@ -251,7 +282,7 @@ emits on an output; you read it as `node.port`.
 ### Multi-line strings
 
 ````weft
-step = ExecPython() -> (out: Number) {
+fortyTwo = ExecPython() -> (out: Number) {
   code: ```
     return {'out': 42}
   ```
@@ -307,9 +338,9 @@ names `query`, the node that broke.
 
 ### Handling a failure: the `error` output
 
-If you want the program to do something when a step that reaches outside
+If you want the program to do something when a node that reaches outside
 fails (mark a row `error` with the reason, answer the caller with a message,
-try another branch), wire that step's `error` output. A node that declares
+try another branch), wire that node's `error` output. A node that declares
 `catchErrors` among its features gets an `error` output added by weft; read
 the node's interface to see whether it has one.
 
@@ -322,7 +353,7 @@ not: those are the program's own shape, never an outcome to route around.
 What counts as a failure for a given node (an answer with an error status,
 say) is in that node's description.
 
-A step that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the step that was running (How a run is kept, below, has both); only a step of a `pure` node that had sent nothing on and read no stream runs again. With `error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
+A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again. With `error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
 
 ````weft
 ask = LlmInference { provider: prov.provider, prompt: job.text }
@@ -597,7 +628,7 @@ containers element-wise; type variables unify. Everything else is
 ## How a program runs
 
 A node fires when every required input holds a [pulse] that agrees on
-the execution and
+the run and
 on frames (loop iterations).
 
 A node that emits on some outputs and not others closes the rest. A [closed]
@@ -619,7 +650,7 @@ carried a value, in written order, so alternative paths rejoin into one
 wire. `All` says yes only when every input wired onto it arrived and none
 of them is `false`, and closes its output otherwise; it is where the second
 answer goes when a gate takes one wire and the permission has two parts.
-`Not` flips one Boolean, for the step that should run when the answer was
+`Not` flips one Boolean, for the node that should run when the answer was
 `false`.
 
 Three shapes come up constantly:
@@ -686,17 +717,17 @@ bytes whatever the file weighs. A program that would carry a big value on a
 good day and fail on a long one is not done until the bound is written.
 
 If the big value is text (a long document), keep it in a stored file.
-`TextToFile` turns text into a stored file and `FileToText` reads one back
-as text (both in the `storage` package; `FileToText` only works while the
-text fits on a wire).
+`TextToFile` turns text into a stored file and `FileToText` reads one back as
+text (both in the `storage` package; `FileToText` only works while the text
+fits on a wire).
 
-A value that grows with use (a conversation, a log) passes 100 KB one day,
-so it never rides a wire at all: it lives in a stored file that each step
-edits in place. A node that keeps such a value takes it on a file input and
-gives the same file back on a file output, the next version of it. Two steps
+A value that grows with use (a conversation, a log) passes 100 KB one day, so
+it never rides a wire at all: it lives in a stored file that each node edits
+in place. A node that keeps such a value takes it on a file input and gives
+the same file back on a file output, the next version of it. Two nodes
 editing one file at once (a parallel loop, two runs on one project file)
 never lose each other's change, and each edit shows in the graph, under the
-step's "Files edited", as the lines it added. A node that keeps a value this
+node's "Files edited", as the lines it added. A node that keeps a value this
 way names the file ports in its own description, as the AI nodes do for a
 conversation. If you want a file that later runs keep adding to, store its
 first content in the project scope with `TextToFile` and wire that file in.
@@ -720,7 +751,7 @@ including the dependencies needed downstream. Its input settings come from
 matching preparation; its wake payload belongs to this event. Other triggers
 are not fired. Preparation and infra extraction also stop precisely inside
 ordinary groups and refuse interior loop cuts. One file can hold several
-trigger programs sharing dependencies without executing unrelated branches.
+trigger programs sharing dependencies without running unrelated branches.
 
 Ends: completed (no pulse in flight), suspended (every live firing parked on
 an external wait: a person, a timer; costs nothing), stuck (provably
@@ -735,7 +766,7 @@ Every trigger has inputs, written in its braces like any other, that say how the
 
 | Input | Default | Change it when |
 |---|---|---|
-| `durable` | off | the run has to carry on from the steps already finished if its worker dies, with a record of exactly which ones ran |
+| `durable` | off | the run has to carry on from the nodes already finished if its worker dies, with a record of exactly which ones ran |
 | `recorded` | on | a route is polled every few seconds and each call would leave a run behind (turn it off) |
 | `keepRunsFor` | the project's `[runs] keep_for` in `weft.toml`, else a week | its runs should be kept longer or shorter once they end (`12h`, `30d`, `forever`), then they are deleted |
 
@@ -747,7 +778,7 @@ pay = Route -> (body: JsonDict) {
 }
 ```
 
-With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a step that could act outside it starts (a pure node's step does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished step; a step that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a step that answers it then fails, saying no live caller is attached. A
+With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached. A
 run with `recorded: false` cannot be tagged, and `durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
 A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `error`. If the run can pause again (its last bus closed), the wait pauses after all.
 A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for` and `--hold-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
@@ -813,12 +844,12 @@ connection from it stops the one before, so a reconnect REPLACES its run
 instead of stacking on it.
 
 A stopped run ends cancelled, and its journal names who did it:
-`Stopped by execution <execution-id> (tag <tag>)`. Any string is a tag: a Telegram
+`Stopped by run <run-id> (tag <tag>)`. Any string is a tag: a Telegram
 chat id, a WhatsApp address (`49151@s.whatsapp.net`), a phone number with a
 `+` and spaces. Both nodes clean it the same way (unsafe characters become
 `_`, a short fingerprint of the original is appended, so two different
 values never share one), so you wire the raw value and never clean it up
-yourself. Inside your own node the same two moves are `ctx.tag_execution`
+yourself. Inside your own node the same two moves are `ctx.tag_run`
 and `ctx.stop_tagged`, which take a tag already clean (letters, digits, `_`,
 `-`, at most 64) and refuse anything else, naming the character; for those,
 go and read `weft-node-authoring`.
@@ -998,16 +1029,16 @@ doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   parallel: false
   over: ["values"]
 
-  step = ExecPython -> (out: Number) {
+  double = ExecPython -> (out: Number) {
     code: "return {'out': n * 2}"
     n: self.values
   }
-  self.results = step.out
+  self.results = double.out
 }
 ````
 
-The settings in the braces (`parallel`, `over`, `carry`, `max_iters`,
-`trim_on_mismatch`) take a written value only, never a wire: the compiler
+The settings in the braces (`parallel`, `over`, `carry`, `maxIters`,
+`trimOnMismatch`) take a written value only, never a wire: the compiler
 reads them to build the loop. A loop's ports take a value the way a group's
 do, on their own lines outside (`doubler.values = [1, 2]`), never in the
 braces.
@@ -1034,7 +1065,7 @@ and wired from the group (`run = Loop(db: Access, ...) { ... }` then
 
 `parallel` defaults `false`. Five shapes: parallel map (true, over, no
 carry), sequential map, fold (carry), while (no over, stop vote or
-`max_iters`), side effect (no over, no carry). Refused: parallel with carry;
+`maxIters`), side effect (no over, no carry). Refused: parallel with carry;
 parallel with empty over; parallel with any `self.done` write; a port in both
 `over` and `carry`; a sequential loop with nothing that can end it.
 
@@ -1047,13 +1078,13 @@ iteration is a `null` slot, and the loop goes on. So if one bad item must not
 end a fold, wire the failing node's `error` output (under Handling a failure)
 and write the carry on both branches.
 
-### Trying a step again
+### Trying a node again
 
-If a step can fail for a passing reason (a model whose JSON does not fit the
+If a node can fail for a passing reason (a model whose JSON does not fit the
 shape you asked for, a service that times out now and then), the retry is a
-sequential loop, and `max_iters` is its cap. The step's `error` goes into a
+sequential loop, and `maxIters` is its cap. The node's `error` goes into a
 carried value, which the next try reads and which comes out holding the last
-failure; `self.done` is written once the step's answer arrived, so a try
+failure; `self.done` is written once the node's answer arrived, so a try
 that worked is the last one. A record type on the answer makes a reply with
 a missing key, a wrong type or an extra key a failure on `error`, which is
 what sends it round again:
@@ -1064,7 +1095,7 @@ type Verdict = { label: String, score: Number }
 grade = Loop(text: String, provider: LlmProvider) -> (problem: String, verdicts: List[Verdict | Null]) {
   # Grades the text, asking again while the answer does not fit, three tries at most
   carry: ["problem"]
-  max_iters: 3
+  maxIters: 3
 
   ask = Format(text: String, problem: String) {
     template: "Grade this text: {{text}}. Answer JSON with label and score. {{problem}}"
@@ -1138,9 +1169,9 @@ description says how.
 
 A stored file lives as long as its scope says: a run's files are swept when
 the run ends, a project's stay. The storage nodes `TextToFile`,
-`FetchToStorage` and `KeepFile` all take `scope` (`execution` or `project`)
-and `ttl_days`, and emit `file`, `filename`, `mimeType` and `sizeBytes` like
-every node that makes a file. `ttl_days` works in both scopes: the file
+`FetchToStorage` and `KeepFile` all take `scope` (`run` or `project`)
+and `ttlDays`, and emit `file`, `filename`, `mimeType` and `sizeBytes` like
+every node that makes a file. `ttlDays` works in both scopes: the file
 expires that many days after anybody last touched it, since every read,
 download or link resets the clock, and `0` keeps it for ever. Any other node
 that makes a file (an S3, Slack or Drive download, a generated picture)
@@ -1177,7 +1208,7 @@ structural rules, fast and local, run by the `PostToolUse` hook after every
 edit and by your own validate run, and what keeps the graph rendering. [the runtime tier] is
 `rule-runtime`: what only a running program can know, chiefly a connection
 not picked on an access node (the compiler synthesizes that rule from the
-node's `service` declaration; `connection_optional: true` in the service
+node's `service` declaration; `connectionOptional: true` in the service
 block is the opt-out, for a node that runs with no connection picked). `weft
 validate` and the editor's pre-flight gate on Run, Activate and Resync report
 it; the Problems panel is structural only and never shows it; `weft build`

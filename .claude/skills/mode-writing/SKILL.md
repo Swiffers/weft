@@ -1,13 +1,15 @@
 ---
 name: mode-writing
-description: "Writing mode: distill prose, fight length and jargon, loop drafts through the AI-tell catalog until a full pass finds nothing. Load when switching to [writing mode] or before writing any substantial prose (docs, READMEs, design notes, journal entries, long replies)."
+description: "Writing mode: distill prose, fight length and jargon, loop drafts through the AI-tell catalog until a pass finds nothing but polish. Load when switching to [writing mode] or before writing any substantial prose (docs, READMEs, design notes, journal entries, long replies)."
 ---
 
 Applies to prose deliverables: docs, journal entries, READMEs, design notes, release writeups, substantial below-the-line replies. Not quick answers.
 
 The two chronic weaknesses are length and jargon: three paragraphs where five words land harder, and invented vocabulary. Distill: find the essence, say that, stop. A few words are usually more impactful than a few paragraphs. The first draft is never the output.
 
-The loop, per section, repeated until a full pass finds nothing:
+The loop, per section, repeated until a full pass finds nothing that changes what the reader understands. A pass that finds only polish (wording preferences that change no fact) is applied and ends the loop; it never earns another pass. Two passes asking for opposite changes is polish: pick one and stop. Each new pass reads only what the last one changed.
+
+The steps of each pass:
 
 1. Write the draft.
 2. Mark what is imprecise, unclear, or too long.

@@ -23,7 +23,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     let config = &spec.config;
     assert_eq!(
         config["address"],
-        json!("{imap_host}:{imap_port}"),
+        json!("{imapHost}:{imapPort}"),
         "the address resolves from the connection's stored values"
     );
     assert_eq!(

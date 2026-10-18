@@ -21,7 +21,7 @@ use crate::{Diagnostic, Severity};
 /// Which validation rules to run. `Structural` checks only editor-
 /// time errors (graph shape, required ports wired or satisfied by a
 /// literal, config shape). `Runtime` additionally runs rules flagged
-/// `level: runtime` (e.g. missing credentials), which we deliberately
+/// `level: runtime` (e.g. a provider with no model named), which we deliberately
 /// skip during editing so an AI builder or human-in-the-loop can
 /// sketch a project without filling every secret.
 // SYNC: ValidationMode <-> extension-vscode/src/parseServer.ts ValidationMode
@@ -72,6 +72,7 @@ fn validate_scoped(
     check_double_driven_ports(project, &mut d);
     check_two_gates(project, &mut d);
     check_warnings(project, &mut d);
+    check_name_casing(project, catalog, &mut d);
     check_level_sizes(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
     check_reserved_names(project, catalog, &mut d);
@@ -108,7 +109,7 @@ fn check_run_settings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// of its own, which the node's metadata says, never its name: an infra
 /// node (`requiresInfra`), one container per instance. What an instance
 /// provides (its connection, its sheet) is a field written
-/// `@instance_filled`, and a step that reads a per-instance value runs per
+/// `@instance_filled`, and a node that reads a per-instance value runs per
 /// instance without a mark, which the compiler already follows.
 fn check_per_instance(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
     for node in project.nodes.iter().filter(|n| n.per_instance == Some(weft_core::instance::PerInstance::Marked)) {
@@ -701,7 +702,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                 push(d, file, span, Severity::Error, "generator-through-group",
                     format!(
                         "'{port_name}' declares a stream on the project's {} boundary; an \
-                         execution's inputs and outputs are values, not live edges. \
+                         run's inputs and outputs are values, not live edges. \
                          Produce (or consume) the stream inside the project instead",
                         match gb.role {
                             weft_core::project::GroupBoundaryRole::In => "input",
@@ -840,7 +841,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
 ///
 /// graph-cycle: the wire graph must be a DAG. Iteration is the Loop
 ///   container's job and cross-node feedback is the bus's; a wire cycle
-///   has no execution order and would wedge the engine.
+///   has no run order and would wedge the engine.
 /// trigger-in-loop: a trigger inside a Loop container. Registration
 ///   happens once per project and fires land outside any iteration, so
 ///   a per-iteration trigger has no meaning.
@@ -1106,7 +1107,7 @@ fn check_declarative_rules(
 /// node an access node, and running one without a connection picked
 /// always fails, so the LANGUAGE synthesizes that runtime rule instead of
 /// every node's metadata restating it. Opt-out for the genuine
-/// can-run-unauthenticated case: `connection_optional: true` on the
+/// can-run-unauthenticated case: `connectionOptional: true` on the
 /// recipe. The ONE list both the compiler's check and an instance's value
 /// check (`InstanceRules`, filled at enrich) read.
 pub(crate) fn node_rules(meta: &weft_core::node::NodeMetadata, node: &NodeDefinition) -> Vec<ValidationRule> {
@@ -1321,7 +1322,7 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
 /// there is no sane rule for combining them. Refused loudly instead of
 /// quietly picking one.
 fn check_two_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    use weft_core::exec::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
+    use weft_core::run::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
     for node in &project.nodes {
         // `literal_fills`, not a raw key lookup: a `null` literal is
         // nothing, not a gate. `_should_not_flow: null` beside a real
@@ -1939,7 +1940,7 @@ fn check_container_inputs(
     }
     for input in &node.inputs {
         if input.required
-            || weft_core::exec::skip::is_gate_port(&input.name)
+            || weft_core::run::skip::is_gate_port(&input.name)
             || driven.contains(&(node.id.clone(), input.name.clone()))
             || literal_fills(node, &input.name)
         {
@@ -2046,7 +2047,7 @@ fn check_port_coverage(
             let literal = node
                 .port_literals
                 .get(&input.name)
-                .filter(|v| weft_core::exec::ready::literal_is_data(node, &input.name, v));
+                .filter(|v| weft_core::run::ready::literal_is_data(node, &input.name, v));
             let has_literal = literal.is_some();
             // The file follows the span: an interface-port fill's span
             // lives in the file that wrote it, not the boundary node's.
@@ -2135,7 +2136,7 @@ fn check_port_coverage(
             // language's own, and a constant written for one is a
             // Boolean or a type error (a wire may carry anything; the
             // run reads it).
-            if weft_core::exec::skip::is_gate_port(&input.name) {
+            if weft_core::run::skip::is_gate_port(&input.name) {
                 if let Some(v) = literal.filter(|v| !v.is_boolean()) {
                     let (lit_file, lit_span) = literal_anchor();
                     push(
@@ -2235,7 +2236,7 @@ fn check_port_coverage(
                 let available: Vec<&str> = node
                     .inputs
                     .iter()
-                    .filter(|p| !weft_core::exec::skip::is_gate_port(&p.name))
+                    .filter(|p| !weft_core::run::skip::is_gate_port(&p.name))
                     .map(|p| p.name.as_str())
                     .collect();
                 push(
@@ -2529,7 +2530,7 @@ fn check_config_derived_ports(
                     Some(value) => {
                         // Where the list IS the choice set, an empty one
                         // on a required field chose nothing: the branch
-                        // could never fire (a `valueList` `in`) or the
+                        // could never fire (a `value_list` `in`) or the
                         // human would get an empty dropdown. Where a
                         // list is one VALUE being matched, `[]` is a
                         // legitimate value and says nothing here.
@@ -2799,14 +2800,14 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // in at flatten time, never a user key (lowering rejects a
         // user-written `parentId` before the merge).
         const KNOWN_LOOP_KEYS: &[&str] =
-            &["parentId", "parallel", "over", "carry", "max_iters", "trim_on_mismatch"];
+            &["parentId", "parallel", "over", "carry", "maxIters", "trimOnMismatch"];
         if let Some(obj) = cfg.as_object() {
             for key in obj.keys() {
                 if !KNOWN_LOOP_KEYS.contains(&key.as_str()) {
                     cfg_push(d, in_node, key, Severity::Error, "loop-unknown-config-field",
                         format!(
                             "loop '{gid}': unknown config field '{key}' (known: parallel, \
-                             over, carry, max_iters, trim_on_mismatch)"
+                             over, carry, maxIters, trimOnMismatch)"
                         ));
                 }
             }
@@ -2837,19 +2838,19 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             }
         };
 
-        // `max_iters`: non-negative integer literal when present
-        // (`max_iters: 0` is a legal zero-iteration cap).
-        if let Some(v) = cfg.get("max_iters") {
+        // `maxIters`: non-negative integer literal when present
+        // (`maxIters: 0` is a legal zero-iteration cap).
+        if let Some(v) = cfg.get("maxIters") {
             if v.as_u64().is_none() {
-                cfg_push(d, in_node, "max_iters", Severity::Error, "loop-max-iters-not-integer",
-                    format!("loop '{gid}': `max_iters` must be a non-negative integer literal (got {v})"));
+                cfg_push(d, in_node, "maxIters", Severity::Error, "loop-max-iters-not-integer",
+                    format!("loop '{gid}': `maxIters` must be a non-negative integer literal (got {v})"));
             }
         }
-        // `trim_on_mismatch`: boolean literal when present.
-        if let Some(v) = cfg.get("trim_on_mismatch") {
+        // `trimOnMismatch`: boolean literal when present.
+        if let Some(v) = cfg.get("trimOnMismatch") {
             if !v.is_boolean() {
-                cfg_push(d, in_node, "trim_on_mismatch", Severity::Error, "loop-trim-not-boolean",
-                    format!("loop '{gid}': `trim_on_mismatch` must be a boolean literal (got {v})"));
+                cfg_push(d, in_node, "trimOnMismatch", Severity::Error, "loop-trim-not-boolean",
+                    format!("loop '{gid}': `trimOnMismatch` must be a boolean literal (got {v})"));
             }
         }
 
@@ -2899,16 +2900,16 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
 
         // loop-unbounded-no-termination: a SEQUENTIAL loop with no
-        // `over` (nothing to exhaust), no `max_iters` (no cap), and no
+        // `over` (nothing to exhaust), no `maxIters` (no cap), and no
         // `self.done` write (no vote to stop) is provably infinite.
         // Reject at compile time. A loop that has ANY of the three is
         // the user's own program: trusted, unbounded by the runtime.
-        if lists_ok && !parallel && over.is_empty() && cfg.get("max_iters").is_none() && !done_wired {
+        if lists_ok && !parallel && over.is_empty() && cfg.get("maxIters").is_none() && !done_wired {
             push(d, file, span, Severity::Error, "loop-unbounded-no-termination",
                 format!(
-                    "loop '{gid}': sequential loop declares no 'over', no 'max_iters', and \
+                    "loop '{gid}': sequential loop declares no 'over', no 'maxIters', and \
                      never writes `self.done`; it can never terminate. Iterate a list with \
-                     `over: [...]`, cap it with `max_iters`, or wire `self.done = ...` in the body."
+                     `over: [...]`, cap it with `maxIters`, or wire `self.done = ...` in the body."
                 ));
         }
 
@@ -3129,11 +3130,11 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // with it.
         let gated = wired_ports
             .get(node.id.as_str())
-            .is_some_and(|w| w.iter().any(|p| weft_core::exec::skip::is_gate_port(p)));
+            .is_some_and(|w| w.iter().any(|p| weft_core::run::skip::is_gate_port(p)));
         let wired: Vec<_> = node
             .inputs
             .iter()
-            .filter(|p| !weft_core::exec::skip::is_gate_port(&p.name))
+            .filter(|p| !weft_core::run::skip::is_gate_port(&p.name))
             .filter(|p| wired_ports.get(node.id.as_str()).is_some_and(|w| w.contains(p.name.as_str())))
             .collect();
         // A node whose created inputs are optional BY NATURE (a join,
@@ -3153,7 +3154,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 Severity::Warning,
                 "no-required-skip",
                 format!(
-                    "node '{name}' runs even when nothing arrives on its wires: none of its wired inputs is required, so if the steps feeding it do not run, it still runs, with those inputs empty. If it should wait for one of them, mark that input required or add `@require_one_of(<inputs>)`."
+                    "node '{name}' runs even when nothing arrives on its wires: none of its wired inputs is required, so if the nodes feeding it do not run, it still runs, with those inputs empty. If it should wait for one of them, mark that input required or add `@require_one_of(<inputs>)`."
                 ),
             );
         }
@@ -3175,6 +3176,117 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                         ),
                     );
                 }
+            }
+        }
+    }
+}
+
+/// not-camel-case: a name the program's author wrote that is not
+/// camelCase, the spelling weft uses for node names and ports. A
+/// warning: the program runs the same, and the message names the
+/// spelling that fits (`weft_core::casing`, the same check the catalog
+/// test applies to `metadata.json`).
+///
+/// Only names the author wrote, each once, where it was written:
+/// - a node's name, a group's or loop's, an `@include` alias: the local
+///   segment of the id (`g.hitBody` reads `hitBody`). A name holding
+///   `__` was minted by the compiler (an inline expression's node), an
+///   anonymous group takes its file's name, and an included file's body
+///   takes its path, so none of those is checked.
+/// - a port the program adds to a node, in its header or by writing a
+///   key in its body that the node type does not have (`user_id: 3` on
+///   `ExecPython`), unless the node type already has it (a catalog port
+///   the header only narrows, which the catalog's own check owns) or
+///   names its added ports after outside data
+///   (`features.addedPortsAreDataKeys`: a body's fields, a table's
+///   columns, spelled however that data spells them).
+/// - a port a group's or loop's header declares. A call site's ports
+///   are its file's, checked once on that file's own header; a loop's
+///   carry ghost mirrors a port checked where it was declared.
+///
+/// The gates (`_should_flow`, `_should_not_flow`) are the language's
+/// own and never checked. Boundary nodes are skipped: their ports are
+/// their group's, checked on the group.
+fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
+    use weft_core::casing::Casing;
+    use weft_core::run::skip::is_gate_port;
+
+    fn local(id: &str) -> &str {
+        id.rsplit('.').next().unwrap_or(id)
+    }
+    // One finding per name on one owner, so a port declared on both
+    // sides of a header (`(text) -> (text)`) warns once.
+    let warn = |d: &mut Vec<Diagnostic>, file: Option<&str>, span: Span, seen: &mut Vec<String>, what: &str, name: &str| {
+        if seen.iter().any(|s| s == name) {
+            return;
+        }
+        if let Err(message) = Casing::Camel.check(what, name) {
+            seen.push(name.to_string());
+            push(d, file, span, Severity::Warning, "not-camel-case", message);
+        }
+    };
+
+    for node in &project.nodes {
+        if node.group_boundary.is_some() {
+            continue;
+        }
+        let file = node.source_file.as_deref();
+        let span = node.header_span_or_default();
+        let mut seen = Vec::new();
+        let name = local(&node.id);
+        if !name.contains("__") {
+            let what = if node.include_path.is_some() { "include" } else { "node" };
+            warn(d, file, span, &mut seen, what, name);
+        }
+        let meta = catalog.lookup(&node.node_type);
+        if meta.is_some_and(|m| m.features.added_ports_are_data_keys) {
+            continue;
+        }
+        // A port the node type's catalog entry declares is the catalog's
+        // to spell (its spelling check names the node's own file), so a
+        // header that only narrows one, or a program using a node whose
+        // own port is off, adds nothing here.
+        let ports = node
+            .inputs
+            .iter()
+            .filter(|p| {
+                !p.from_spec
+                    && !p.port.synthesized_from_carry
+                    && !meta.is_some_and(|m| m.inputs.iter().any(|i| i.name == p.port.name))
+            })
+            .map(|p| &p.port)
+            .chain(node.outputs.iter().filter(|p| {
+                p.declared_type.is_some()
+                    && !meta.is_some_and(|m| m.outputs.iter().any(|o| o.name == p.name))
+            }));
+        let mut seen_ports = Vec::new();
+        for port in ports {
+            if !is_gate_port(&port.name) {
+                warn(d, file, span, &mut seen_ports, "port", &port.name);
+            }
+        }
+    }
+
+    for group in &project.groups {
+        let file = group.source_file.as_deref();
+        let span = group.header_span.unwrap_or_default();
+        let what = match group.kind {
+            weft_core::project::GroupKind::Group => "group",
+            weft_core::project::GroupKind::Loop { .. } => "loop",
+            weft_core::project::GroupKind::Call { .. } => "include",
+            weft_core::project::GroupKind::Body => "included file",
+        };
+        let mut seen = Vec::new();
+        if !group.anonymous && !matches!(group.kind, weft_core::project::GroupKind::Body) {
+            warn(d, file, span, &mut seen, what, local(&group.id));
+        }
+        if matches!(group.kind, weft_core::project::GroupKind::Call { .. }) {
+            continue;
+        }
+        let mut seen_ports = Vec::new();
+        for port in group.in_ports.iter().chain(&group.out_ports) {
+            if !port.synthesized_from_carry && !is_gate_port(&port.name) {
+                warn(d, file, span, &mut seen_ports, "port", &port.name);
             }
         }
     }

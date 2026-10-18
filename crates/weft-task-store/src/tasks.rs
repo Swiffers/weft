@@ -66,7 +66,7 @@ pub struct Task {
     pub status: TaskStatus,
     pub project_id: Option<Uuid>,
     /// The run that asked for the work, when one did.
-    pub execution_id: Option<weft_core::ExecutionId>,
+    pub run_id: Option<weft_core::RunId>,
     /// The tenant the task belongs to: every task has one, and the dedup
     /// uniqueness is scoped by it.
     pub tenant_id: String,
@@ -90,7 +90,7 @@ pub struct NewTask {
     pub project_id: Option<Uuid>,
     pub dedup_key: Option<String>,
     /// The run that asks for the work, when one does.
-    pub execution_id: Option<weft_core::ExecutionId>,
+    pub run_id: Option<weft_core::RunId>,
     /// The tenant the task belongs to: required, because the dedup
     /// uniqueness is scoped by it (a NULL tenant would never dedup) and
     /// every task is somebody's.
@@ -139,7 +139,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             status TEXT NOT NULL,
             project_id UUID,
             dedup_key TEXT,
-            execution_id UUID,
+            run_id UUID,
             tenant_id TEXT NOT NULL,
             payload JSONB NOT NULL,
             claimed_by TEXT,
@@ -208,7 +208,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // tripping the unique index. Run inside the caller's transaction,
         // which the lock lasts.
         r#"CREATE OR REPLACE FUNCTION weft_enqueue_dedup(
-                p_id UUID, p_kind TEXT, p_project UUID, p_dedup TEXT, p_execution UUID,
+                p_id UUID, p_kind TEXT, p_project UUID, p_dedup TEXT, p_run UUID,
                 p_tenant TEXT, p_payload JSONB, p_now BIGINT,
                 OUT task_id UUID, OUT inserted BOOLEAN
             ) AS $$
@@ -222,8 +222,8 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
                     inserted := FALSE;
                     RETURN;
                 END IF;
-                INSERT INTO task (id, kind, status, project_id, dedup_key, execution_id, tenant_id, payload, attempts, created_at_unix)
-                    VALUES (p_id, p_kind, 'pending', p_project, p_dedup, p_execution, p_tenant, p_payload, 0, p_now);
+                INSERT INTO task (id, kind, status, project_id, dedup_key, run_id, tenant_id, payload, attempts, created_at_unix)
+                    VALUES (p_id, p_kind, 'pending', p_project, p_dedup, p_run, p_tenant, p_payload, 0, p_now);
                 task_id := p_id;
                 inserted := TRUE;
             END;
@@ -263,14 +263,14 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
 pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     let id = Uuid::now_v7();
     sqlx::query(
-        r#"INSERT INTO task (id, kind, status, project_id, dedup_key, execution_id, tenant_id, payload, attempts, created_at_unix)
+        r#"INSERT INTO task (id, kind, status, project_id, dedup_key, run_id, tenant_id, payload, attempts, created_at_unix)
            VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, 0, $8)"#,
     )
     .bind(id)
     .bind(spec.kind.as_str())
     .bind(spec.project_id)
     .bind(spec.dedup_key.as_deref())
-    .bind(spec.execution_id)
+    .bind(spec.run_id)
     .bind(spec.tenant_id.as_str())
     .bind(&spec.payload)
     .bind(unix_now())
@@ -310,7 +310,7 @@ pub async fn enqueue_dedup_in(conn: &mut sqlx::PgConnection, spec: NewTask) -> R
             .bind(spec.kind.as_str())
             .bind(spec.project_id)
             .bind(dedup_key)
-            .bind(spec.execution_id)
+            .bind(spec.run_id)
             .bind(spec.tenant_id.as_str())
             .bind(&spec.payload)
             .bind(unix_now())
@@ -354,7 +354,7 @@ pub async fn claim_next(pool: &PgPool, replica: &str) -> Result<Claim> {
                            ORDER BY created_at_unix ASC
                            FOR UPDATE SKIP LOCKED
                            LIMIT 1)
-               RETURNING id, kind, status, project_id, execution_id, tenant_id, attempts, payload)
+               RETURNING id, kind, status, project_id, run_id, tenant_id, attempts, payload)
            SELECT p.*,
                   CASE WHEN p.id IS NULL
                        THEN (SELECT MIN(claimed_until_unix) FROM task WHERE status = 'claimed') END AS next_lapse,
@@ -401,7 +401,7 @@ pub async fn heartbeat(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bo
 /// (`claimed_until_unix` is empty). Whoever watches that run hands the
 /// task back once it ended and nobody resumed the claim
 /// (`weft_dispatcher::lapses`). False when the row is no longer ours.
-pub async fn rest_claim(pool: &PgPool, task_id: Uuid, replica: &str, run: weft_core::ExecutionId) -> Result<bool> {
+pub async fn rest_claim(pool: &PgPool, task_id: Uuid, replica: &str, run: weft_core::RunId) -> Result<bool> {
     let rows = sqlx::query(
         r#"UPDATE task SET claimed_until_unix = NULL, claim_rests_on = $3
            WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
@@ -647,7 +647,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         kind: row.try_get("kind")?,
         status,
         project_id: row.try_get("project_id")?,
-        execution_id: row.try_get("execution_id")?,
+        run_id: row.try_get("run_id")?,
         tenant_id: row.try_get("tenant_id")?,
         attempts: row.try_get("attempts")?,
         payload: row.try_get("payload")?,
@@ -675,7 +675,7 @@ mod wire_tests {
             kind: crate::TaskKind::Resync,
             project_id: Some(Uuid::from_u128(1)),
             dedup_key: Some("d1".to_string()),
-            execution_id: Some(Uuid::from_u128(2)),
+            run_id: Some(Uuid::from_u128(2)),
             tenant_id: "t1".to_string(),
             payload: serde_json::json!({ "a": 1, "nested": [true, null] }),
         };
@@ -684,7 +684,7 @@ mod wire_tests {
         assert_eq!(back.kind, original.kind);
         assert_eq!(back.project_id, original.project_id);
         assert_eq!(back.dedup_key, original.dedup_key);
-        assert_eq!(back.execution_id, original.execution_id);
+        assert_eq!(back.run_id, original.run_id);
         assert_eq!(back.tenant_id, original.tenant_id);
         assert_eq!(back.payload, original.payload);
         // The kind travels as its plain tag.
@@ -698,7 +698,7 @@ mod wire_tests {
             kind: crate::TaskKind::RegisterSignal.to_string(),
             status: TaskStatus::Pending,
             project_id: None,
-            execution_id: None,
+            run_id: None,
             tenant_id: "t".into(),
             attempts: 2,
             payload: serde_json::json!(null),
@@ -709,7 +709,7 @@ mod wire_tests {
         assert_eq!(back.kind, original.kind);
         assert_eq!(back.status, original.status);
         assert_eq!(back.project_id, original.project_id);
-        assert_eq!(back.execution_id, original.execution_id);
+        assert_eq!(back.run_id, original.run_id);
         assert_eq!(back.tenant_id, original.tenant_id);
         assert_eq!(back.attempts, original.attempts);
         assert_eq!(back.payload, original.payload);
@@ -724,7 +724,7 @@ mod wire_tests {
             "kind": "fire_signal",
             "project_id": null,
             "dedup_key": null,
-            "execution_id": null,
+            "run_id": null,
             "tenant_id": null,
             "payload": {}
         }"#;

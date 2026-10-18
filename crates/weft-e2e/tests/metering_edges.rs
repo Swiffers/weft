@@ -9,13 +9,13 @@
 //!
 //! What is being proved:
 //!   - a job submitted and never read back lands on the trail as a
-//!     spend with NO figure, when the execution ends, rather than as a
+//!     spend with NO figure, when the run ends, rather than as a
 //!     zero (which would claim the call was free), as nothing at all
 //!     (which would claim it never happened), or only when the worker
 //!     eventually dies (which used to keep the worker from retiring);
 //!   - a job whose answer IS read back lands with what the provider
 //!     actually stated;
-//!   - a panicking node fails its own execution and leaves the worker
+//!   - a panicking node fails its own run and leaves the worker
 //!     able to run the next one.
 #![cfg(feature = "e2e")]
 
@@ -47,7 +47,7 @@ async fn connect_queue(
 /// The node submits a job and walks away, which is an ordinary thing to
 /// do: a branch stops caring, a person cancels. The spend is real, and
 /// the only honest record is one with no figure on it. It has to land
-/// when the EXECUTION ends: tying it to the worker's own shutdown meant
+/// when the RUN ends: tying it to the worker's own shutdown meant
 /// the record arrived whenever that worker eventually died, and the worker
 /// refused to retire while any such charge was open.
 #[tokio::test]
@@ -102,9 +102,9 @@ async fn a_job_read_back_records_what_the_provider_stated() -> anyhow::Result<()
     project.finish().await
 }
 
-/// Node code panics. The execution has to end failed rather than hang,
+/// Node code panics. The run has to end failed rather than hang,
 /// and the worker has to be fit to run the next one: a panic unwinds
-/// past the ordinary cleanup, so everything that execution registered on
+/// past the ordinary cleanup, so everything that run registered on
 /// the worker is released by a guard or not at all.
 #[tokio::test]
 async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyhow::Result<()> {
@@ -114,7 +114,7 @@ async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyho
     let settled = run::run_and_settle(&mut project).await?;
     anyhow::ensure!(
         settled.status == "failed",
-        "a panicking node fails its execution rather than hanging it; got {}",
+        "a panicking node fails its run rather than hanging it; got {}",
         settled.status
     );
     // Whatever the worker does with the node behind a panic (skip it on
@@ -130,19 +130,19 @@ async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyho
     // fresh worker would pass this whatever the panic left behind. So the
     // worker serving the first run is read, the second run goes through,
     // and the worker is asserted to be that same one, still running. If
-    // the panic had left the execution's state behind, this is where it
-    // shows: a cancel flag and a live config for a dead execution, and a
+    // the panic had left the run's state behind, this is where it
+    // shows: a cancel flag and a live config for a dead run, and a
     // worker that refuses to retire.
     let platform = weft_e2e::platform::Platform::connect(&disp).await?;
     let pid = project.id();
-    let before = platform.execution_writer(&settled.execution_id).await?
+    let before = platform.run_writer(&settled.run_id).await?
         .ok_or_else(|| anyhow::anyhow!("the panicking run's record names no worker"))?;
 
     project.set_node_config("boom", "explode", "false")?;
     let ok = run::run_and_settle(&mut project).await?;
     ok.completed()?;
     ok.assert_completed("after")?;
-    let owner = platform.execution_writer(&ok.execution_id).await?;
+    let owner = platform.run_writer(&ok.run_id).await?;
     anyhow::ensure!(owner.as_deref() == Some(before.as_str()), "the second run used {owner:?}, but the panicking run used {before}");
 
     let running = platform.workers_for_project(&pid).await?;

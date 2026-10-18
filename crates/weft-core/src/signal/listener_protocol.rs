@@ -45,17 +45,17 @@ pub struct PrepareRequest {
     /// task's node; a fire never echoes it (the dispatcher reads the
     /// row by token).
     pub node_id: String,
-    /// True iff this signal is a mid-execution resume (HumanQuery
+    /// True iff this signal is a mid-run resume (HumanQuery
     /// awaiting form submission, etc) rather than an entry trigger.
     /// The listener uses this to decide which `ProcessTarget`
     /// discriminant to return at fire time. Without it, dual-use
     /// kinds like Form can't tell resume from entry.
     #[serde(default)]
     pub is_resume: bool,
-    /// Execution of the suspended execution to resume, present iff
+    /// Run of the suspended run to resume, present iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
     #[serde(default)]
-    pub execution_id: Option<crate::ExecutionId>,
+    pub run_id: Option<crate::RunId>,
     /// Where the registration's kind_state starts from (see
     /// [`PrepareSource`]).
     pub source: PrepareSource,
@@ -336,8 +336,8 @@ pub enum ProcessTarget {
     /// Answer the wait of a run: the install hands the value to its run
     /// (`weft_dispatcher::api::signal::answer_run`). The wait is found by
     /// its token; only the run is echoed here.
-    Resume { execution_id: crate::ExecutionId },
-    /// Start a fresh execution as an entry trigger: the event goes to
+    Resume { run_id: crate::RunId },
+    /// Start a fresh run as an entry trigger: the event goes to
     /// the worker's door of the trigger's program (`weft_core::door_fire`),
     /// which reads the trigger by token.
     Entry,
@@ -369,7 +369,7 @@ mod tests {
             spec: spec(),
             node_id: "node-1".into(),
             is_resume: false,
-            execution_id: Some(uuid::Uuid::nil()),
+            run_id: Some(uuid::Uuid::nil()),
             source: PrepareSource {
                 prior_kind_state: Some(serde_json::json!({"cursor": 42})),
                 asked_at_unix_ms: 1_700_000_000_123,
@@ -420,7 +420,7 @@ mod tests {
     fn process_target_round_trips() {
         for target in [
             ProcessTarget::Entry,
-            ProcessTarget::Resume { execution_id: uuid::Uuid::nil() },
+            ProcessTarget::Resume { run_id: uuid::Uuid::nil() },
             ProcessTarget::Drop { reason: Some("dup".into()) },
         ] {
             let json = serde_json::to_string(&target).unwrap();

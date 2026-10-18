@@ -219,7 +219,7 @@ impl<'de> Deserialize<'de> for KeepFor {
 /// record is written whole however it ends.
 // SYNC: SettingsChoice <-> packages/weft-graph/src/run-spec.ts (RunSettings, its validator, and the flags it maps to)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SettingsChoice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keeping: Option<Keeping>,
@@ -440,7 +440,7 @@ impl RunSettings {
                 true,
                 "Record each run",
                 "Turn off for a route called every few seconds (a status a page polls). Off: no history of \
-                 a run is kept. One that fails is listed in `weft executions` with its failure (which \
+                 a run is kept. One that fails is listed in `weft runs` with its failure (which \
                  step, and why); one that reported a cost or asked weft for something its worker does not already hold \
                  (a stored file, a new connection or infrastructure address, a task such as starting or \
                  stopping its infra, a stop through `ctx.stop_tagged`) is listed with its costs and how it ended; any other leaves only a count in `weft status`. \
@@ -466,7 +466,7 @@ impl RunSettings {
                 "description": "How long, in seconds, a wait (a form, a timer) holds the run's worker when \
                  the run cannot pause: its caller is on the line and it does not outlive it, it is not \
                  recorded, or a bus between its nodes is open. The clock runs only while nothing moves in \
-                 the run (no step working, nothing said on a bus), and starts over when something does. \
+                 the run (no node working, nothing said on a bus), and starts over when something does. \
                  When it runs out, the waiting node fails, saying it gave up, and the node may handle that \
                  itself. `0` fails such a wait at once; at most 30 days.",
             }))

@@ -102,7 +102,7 @@
         ]
       },
       "then": {
-        "message": "'{id}' declares output ports ({custom_outputs}) that only fire with parseJson: true; turn it on, or drop the ports and read `response`",
+        "message": "'{id}' declares output ports ({customOutputs}) that only fire with parseJson: true; turn it on, or drop the ports and read `response`",
         "level": "structural",
         "severity": "error",
         "field": "parseJson"

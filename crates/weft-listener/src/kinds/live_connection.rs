@@ -153,7 +153,7 @@ mod tests {
             node_id: "n".into(),
             tenant_id: "t".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             task: None,
             kind_state: None,
             routing: SignalRouting {

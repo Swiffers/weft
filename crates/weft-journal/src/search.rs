@@ -4,7 +4,7 @@
 //! the run's record by the first search after the run ended
 //! (`weft_dispatcher::search_index`).
 
-use crate::events::ExecEvent;
+use crate::events::RunEvent;
 
 /// How much of a run's text its document keeps, in characters, and how
 /// much of any one value. A document holds each word once with its
@@ -24,7 +24,7 @@ pub struct SearchText {
 
 impl SearchText {
     /// Add `event`'s values, in order.
-    pub fn push(&mut self, event: &ExecEvent) {
+    pub fn push(&mut self, event: &RunEvent) {
         if self.full() {
             return;
         }
@@ -72,10 +72,10 @@ mod tests {
 
     #[test]
     fn a_runs_words_are_its_values_cut_to_the_caps() {
-        let execution_id = weft_core::ExecutionId::from_u128(7);
+        let run_id = weft_core::RunId::from_u128(7);
         let mut search = SearchText::default();
-        search.push(&ExecEvent::LogLine {
-            execution_id,
+        search.push(&RunEvent::LogLine {
+            run_id,
             node_id: "mailer".into(),
             frames: vec![],
             level: "info".into(),
@@ -90,8 +90,8 @@ mod tests {
         assert!(!text.contains("message"), "never a field's name: {text}");
         let mut long = SearchText::default();
         for _ in 0..100 {
-            long.push(&ExecEvent::LogLine {
-                execution_id,
+            long.push(&RunEvent::LogLine {
+                run_id,
                 node_id: "n".into(),
                 frames: vec![],
                 level: "info".into(),

@@ -2,7 +2,7 @@
 //!
 //! Owns:
 //! - Event routing (webhook URLs, form URLs, cron, infra events).
-//! - Handing executions to the project's workers (`delivery`, through
+//! - Handing runs to the project's workers (`delivery`, through
 //!   the platform's `Runner`).
 //! - Infrastructure orchestration: the `infra_lifecycle_command` table the
 //!   project's supervisor claims, and a bridge that fans supervisor-emitted

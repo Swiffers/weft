@@ -3,7 +3,7 @@
 //!
 //!   - [`Dispatcher`]: a thin HTTP client over the dispatcher's public API
 //!     (where the install under test, or a test's cell, answers). Used for
-//!     reads (execution status / replay, storage, infra status) and
+//!     reads (run status / replay, storage, infra status) and
 //!     outside-world pokes (firing signals, the live-caller handshake). This is the same contract the CLI and the
 //!     VS Code extension speak.
 //!   - [`cli`]: shells out to the installed `weft` binary in a project

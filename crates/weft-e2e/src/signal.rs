@@ -42,7 +42,7 @@ impl DiscoveredSignal {
     pub fn kind(&self) -> Option<&str> {
         self.0.get("kind").and_then(Value::as_str)
     }
-    /// True for a RESUME signal (a one-shot reply to a paused execution), false
+    /// True for a RESUME signal (a one-shot reply to a paused run), false
     /// for an ENTRY trigger (fireable repeatedly to start a run). The consumer
     /// splits its list on this: "Triggers" vs "Tasks".
     pub fn is_resume(&self) -> Option<bool> {

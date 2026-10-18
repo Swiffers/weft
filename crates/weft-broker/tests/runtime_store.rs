@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use weft_broker::entitlement::{Entitlement, EntitlementSource};
 use weft_broker::runtime_store::{
     charged_bytes_for, BeginUpload, RuntimeStore, RuntimeStoreError, UploadSpec,
-    CLAIM_LEASE_SECS, DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, EXEC_LINGER_TTL_SECS,
+    CLAIM_LEASE_SECS, DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, RUN_LINGER_TTL_SECS,
 };
 use weft_core::storage::key::CallerAuth;
 use weft_core::storage::{bytes_stream, ByteRange, KeepTtl, PartAsk, StorageScope, StoredFileMeta};
@@ -41,12 +41,12 @@ fn ask(part_number: i32, size_bytes: u64) -> PartAsk {
 /// in `weft-e2e/tests/config_media.rs`.)
 const WORKER: PresignAudience = PresignAudience::Internal;
 
-/// A worker caller in (tenant t1, project p1, execution c1).
-fn worker(tenant: &str, project: &str, execution_id: Option<&str>) -> CallerAuth {
+/// A worker caller in (tenant t1, project p1, run c1).
+fn worker(tenant: &str, project: &str, run_id: Option<&str>) -> CallerAuth {
     CallerAuth::Worker {
         tenant: tenant.into(),
         project_id: project.into(),
-        execution_id: execution_id.map(String::from),
+        run_id: run_id.map(String::from),
         instance: None,
     }
 }
@@ -246,12 +246,12 @@ async fn get_via(
 async fn put_then_get_round_trips_and_records_metadata(pool: PgPool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let meta = put_via(&s, &bucket, &w, &StorageScope::Execution, "text/plain", "hi.txt", None, &big(), body(b"hello"))
+    let meta = put_via(&s, &bucket, &w, &StorageScope::Run, "text/plain", "hi.txt", None, &big(), body(b"hello"))
         .await
         .expect("put");
     assert_eq!(meta.mime_type, "text/plain");
     assert_eq!(meta.size_bytes, 5);
-    assert!(meta.key.starts_with("t1/exec/c1/"));
+    assert!(meta.key.starts_with("t1/run/c1/"));
     assert!(bucket.in_progress_uploads().is_empty(), "no lingering multipart upload");
 
     // get round-trips the bytes + meta.
@@ -377,17 +377,17 @@ async fn a_multi_part_upload_assembles_in_order(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn wall_denies_cross_execution_id_get(pool: PgPool) {
+async fn wall_denies_cross_run_id_get(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
     let w1 = worker("t1", "p1", Some("c1"));
-    let meta = put_via(&s, &bucket, &w1, &StorageScope::Execution, "text/plain", "f", None, &big(), body(b"x"))
+    let meta = put_via(&s, &bucket, &w1, &StorageScope::Run, "text/plain", "f", None, &big(), body(b"x"))
         .await
         .unwrap();
-    // The key is under execution c1; a parsed key for ANOTHER execution under the same
+    // The key is under run c1; a parsed key for ANOTHER run under the same
     // tenant must be denied by the wall (the store applies check_key_access via
-    // the route, but here we assert the key the put minted is execution-scoped).
-    assert!(meta.key.contains("/exec/c1/"));
-    // A worker with a different execution cannot mint a key for c1's file: the put
+    // the route, but here we assert the key the put minted is run-scoped).
+    assert!(meta.key.contains("/run/c1/"));
+    // A worker with a different run cannot mint a key for c1's file: the put
     // wall already proved that; here confirm the access check directly.
     let parsed = weft_core::storage::key::parse_key(&meta.key).unwrap();
     let w2 = worker("t1", "p1", Some("c2"));
@@ -601,14 +601,14 @@ async fn abort_frees_the_reservation(pool: PgPool) {
 async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    // two exec files: one kept, one not.
-    let kept = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "keep", Some(KeepTtl::Default), &big(), body(b"k"))
+    // two run files: one kept, one not.
+    let kept = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "keep", Some(KeepTtl::Default), &big(), body(b"k"))
         .await
         .unwrap();
-    let scratch = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "scratch", None, &big(), body(b"s"))
+    let scratch = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "scratch", None, &big(), body(b"s"))
         .await
         .unwrap();
-    let (swept, lingering) = s.sweep_exec("t1", "c1").await.unwrap();
+    let (swept, lingering) = s.sweep_run("t1", "c1").await.unwrap();
     assert_eq!((swept, lingering), (0, 1), "the un-kept file lingers, nothing is reaped");
     // Both are still readable right after terminate: the un-kept file carries
     // the linger deadline (what the file lists surface as remaining lifetime).
@@ -617,14 +617,14 @@ async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
     assert!(get_via(&s, &bucket, &kept_parsed, None).await.is_ok());
     assert!(get_via(&s, &bucket, &scratch_parsed, None).await.is_ok(), "downloadable during the linger");
     let stamped = s.meta(&scratch_parsed).await.unwrap();
-    assert_eq!(stamped.expires_at_unix, Some(clock.now_unix() + EXEC_LINGER_TTL_SECS));
+    assert_eq!(stamped.expires_at_unix, Some(clock.now_unix() + RUN_LINGER_TTL_SECS));
     // A re-delivered terminate sweep (the queue is idempotent) must not push
     // the deadline out.
     clock.advance(Duration::from_secs(60));
-    assert_eq!(s.sweep_exec("t1", "c1").await.unwrap(), (0, 0), "re-sweep restamps nothing");
+    assert_eq!(s.sweep_run("t1", "c1").await.unwrap(), (0, 0), "re-sweep restamps nothing");
     assert_eq!(s.meta(&scratch_parsed).await.unwrap().expires_at_unix, stamped.expires_at_unix);
     // Past the linger, the expiry sweep reclaims the scratch; kept survives.
-    clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64));
+    clock.advance(Duration::from_secs(RUN_LINGER_TTL_SECS as u64));
     assert_eq!(expire(&s, &pool).await, 1);
     assert!(get_via(&s, &bucket, &kept_parsed, None).await.is_ok(), "kept survives");
     assert!(matches!(get_via(&s, &bucket, &scratch_parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
@@ -634,7 +634,7 @@ async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
 async fn public_link_outlives_terminate_and_dies_with_its_file(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let file = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "img", None, &big(), body(b"png"))
+    let file = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "img", None, &big(), body(b"png"))
         .await
         .unwrap();
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
@@ -645,13 +645,13 @@ async fn public_link_outlives_terminate_and_dies_with_its_file(pool: PgPool) {
 
     // Terminate: the linger deadline honors the live link (a minted link
     // is a promise the bytes stay fetchable for its stated lifetime).
-    assert!(link_ttl as i64 > EXEC_LINGER_TTL_SECS, "the test needs the link to outlast the linger");
-    let (_, lingering) = s.sweep_exec("t1", "c1").await.unwrap();
+    assert!(link_ttl as i64 > RUN_LINGER_TTL_SECS, "the test needs the link to outlast the linger");
+    let (_, lingering) = s.sweep_run("t1", "c1").await.unwrap();
     assert_eq!(lingering, 1);
     assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, Some(link_expiry));
 
     // Past the plain linger but inside the link's life: file + link live.
-    clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64 + 1));
+    clock.advance(Duration::from_secs(RUN_LINGER_TTL_SECS as u64 + 1));
     assert_eq!(expire(&s, &pool).await, 0);
     assert!(s.resolve_public_link(&token).await.unwrap().is_some());
 
@@ -678,7 +678,7 @@ async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     // A kept file on a SHORT keep TTL, carrying a LONG-lived link.
-    let file = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "img", Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png"))
+    let file = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "img", Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png"))
         .await
         .unwrap();
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
@@ -715,7 +715,7 @@ async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
 async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", Some(KeepTtl::Secs { secs: 100 }), &big(), body(b"x"))
+    let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", Some(KeepTtl::Secs { secs: 100 }), &big(), body(b"x"))
         .await
         .unwrap();
     let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
@@ -737,7 +737,7 @@ async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: PgPool) {
 async fn keep_default_resolves_to_default_ttl(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", Some(KeepTtl::Default), &big(), body(b"x"))
+    let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", Some(KeepTtl::Default), &big(), body(b"x"))
         .await
         .unwrap();
     assert_eq!(f.keep_ttl_secs, Some(DEFAULT_KEEP_TTL_SECS));
@@ -750,7 +750,7 @@ async fn keep_never_has_no_expiry(pool: PgPool) {
     // "keep forever" file is never silently reclaimed by the expiry sweep.
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", Some(KeepTtl::Never), &big(), body(b"x"))
+    let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", Some(KeepTtl::Never), &big(), body(b"x"))
         .await
         .unwrap();
     assert_eq!(f.keep_ttl_secs, None);
@@ -763,15 +763,15 @@ async fn list_is_scoped_and_wipe_prefix_clears_it(pool: PgPool) {
     let w = worker("t1", "p1", Some("c1"));
     put_via(&s, &bucket, &w, &StorageScope::Project, "b", "a", None, &big(), body(b"a")).await.unwrap();
     put_via(&s, &bucket, &w, &StorageScope::Project, "b", "b", None, &big(), body(b"b")).await.unwrap();
-    put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "e", None, &big(), body(b"e")).await.unwrap();
+    put_via(&s, &bucket, &w, &StorageScope::Run, "b", "e", None, &big(), body(b"e")).await.unwrap();
     // list project scope sees only project files.
     let prefix = weft_core::storage::key::prefix_for_list(&w, &StorageScope::Project).unwrap();
     assert_eq!(s.list(&prefix).await.unwrap().len(), 2);
-    // wipe the project prefix clears them, leaves exec.
+    // wipe the project prefix clears them, leaves the run's.
     let wiped = s.wipe_prefix(&prefix).await.unwrap();
     assert_eq!(wiped, 2);
     assert_eq!(s.list(&prefix).await.unwrap().len(), 0);
-    assert_eq!(s.tenant_usage("t1").await.unwrap().0, 1); // the exec file remains
+    assert_eq!(s.tenant_usage("t1").await.unwrap().0, 1); // the run file remains
 }
 
 #[sqlx::test]
@@ -1085,7 +1085,7 @@ async fn asset_references_are_walled_by_tenant_and_preserve_node_selected_ttls(p
     let own = asset_via(&s, &bucket, "t1", 1).await;
     let foreign = asset_via(&s, &bucket, "t2", 2).await;
     let w = worker("t1", "p1", Some("c1"));
-    let generated = put_via(&s, &bucket, &w, &StorageScope::Execution, "image/png", "generated.png",
+    let generated = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "generated.png",
         Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png")).await.unwrap();
     for forbidden in [&foreign.key, &generated.key] {
         assert!(matches!(s.set_asset_references("t1", "p1", std::slice::from_ref(forbidden), &[]).await,
@@ -1151,13 +1151,13 @@ async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: P
 async fn a_lifetime_expires_a_project_file_like_a_kept_one(pool: PgPool) {
     // Expiry works in every scope a node writes: a project file stored with
     // a lifetime expires once nobody touched it for that long, an access
-    // renews it, and it never carries the execution-only keep flag.
+    // renews it, and it never carries the run-only keep flag.
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", Some(KeepTtl::Secs { secs: 100 }), &big(), body(b"x"))
         .await
         .unwrap();
-    assert!(!f.keep, "the keep flag is the execution sweep's exemption only");
+    assert!(!f.keep, "the keep flag is the run sweep's exemption only");
     assert_eq!(f.keep_ttl_secs, Some(100));
     let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
     clock.advance(Duration::from_secs(80));
@@ -1395,14 +1395,14 @@ async fn a_dropped_completion_the_bucket_finished_is_recovered(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn an_execution_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
+async fn a_run_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
     // The run ends while the upload is completing and the bucket is
     // unreachable for it; it lands later, and it carries
     // the same linger deadline as the run's other files.
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, part_size) =
-        begin_via(&s, &w, &StorageScope::Execution, "b", "f", None, &big(), Some(3)).await.unwrap();
+        begin_via(&s, &w, &StorageScope::Run, "b", "f", None, &big(), Some(3)).await.unwrap();
     upload_parts(&s, &bucket, &w, &key, part_size, &body(b"abc"), &big()).await.unwrap();
     sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
         .bind(&key)
@@ -1412,7 +1412,7 @@ async fn an_execution_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
         .unwrap();
     let ended = clock.now_unix();
     bucket.fail_next_complete();
-    s.sweep_exec("t1", "c1").await.unwrap();
+    s.sweep_run("t1", "c1").await.unwrap();
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"), "not landed at the run's end");
     // Landed afterwards (a retried complete; the stale-claim sweep folds
     // the same way), it keeps the linger deadline the run's end stamped.
@@ -1422,7 +1422,7 @@ async fn an_execution_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(expires, Some(ended + EXEC_LINGER_TTL_SECS));
+    assert_eq!(expires, Some(ended + RUN_LINGER_TTL_SECS));
 }
 
 #[sqlx::test]
@@ -1520,7 +1520,7 @@ async fn an_abandoned_replacement_leaves_the_file_untouched(pool: PgPool) {
     // replacing keeps its object and its bytes.
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", None, &big(), body(b"old"))
+    let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", None, &big(), body(b"old"))
         .await
         .unwrap();
     let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
@@ -1532,7 +1532,7 @@ async fn an_abandoned_replacement_leaves_the_file_untouched(pool: PgPool) {
     assert_eq!(s.meta(&parsed).await.unwrap().version, 2, "an ended replacement always moves the version");
 
     let (swept, _) = s.begin_replace(&w, &f.key, Some(3), None, &big()).await.unwrap();
-    s.sweep_exec("t1", "c1").await.unwrap();
+    s.sweep_run("t1", "c1").await.unwrap();
     assert!(bucket.in_progress_uploads().is_empty(), "the replacement's multipart is aborted");
     assert!(bucket.get(&object_key(&f.key)).await.unwrap().is_some(), "the file's object survives the reap");
     assert!(matches!(s.complete_upload(&w, &swept).await, Err(RuntimeStoreError::NotFound(_))));
@@ -1569,8 +1569,8 @@ async fn replace_refuses_what_it_cannot_overwrite(pool: PgPool) {
     // A file that is not there.
     let missing = "t1/project/p1/00000000-0000-0000-0000-000000000000";
     assert!(matches!(s.begin_replace(&w, missing, Some(1), None, &big()).await, Err(RuntimeStoreError::NotFound(_))));
-    // Another execution's file: the same wall as a read.
-    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", None, &big(), body(b"x"))
+    // Another run's file: the same wall as a read.
+    let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", None, &big(), body(b"x"))
         .await
         .unwrap();
     let other = worker("t1", "p1", Some("c2"));
@@ -1612,7 +1612,7 @@ async fn upload_verbs_reject_a_key_begin_never_minted(pool: PgPool) {
     // recording, resuming, and completing an unknown key all fail loud.
     let (s, _bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let key = "t1/exec/c1/forged";
+    let key = "t1/run/c1/forged";
     let err = s.reserve_parts(&w, key, &[ask(1, 1)], &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
     let err = s.record_part(&w, key, 1, "\"etag\"").await.unwrap_err();
@@ -1632,7 +1632,7 @@ async fn an_abandoned_upload_is_reaped_after_grace(pool: PgPool) {
     // past the grace: multipart aborted, row gone, charge freed.
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    // A project-scoped upload (no exec sweep, no expiry) is the case only this
+    // A project-scoped upload (no run sweep, no expiry) is the case only this
     // reap covers.
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(6))
         .await
@@ -1668,19 +1668,19 @@ async fn progress_defers_the_abandoned_reap(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn terminate_sweep_reaps_an_abandoned_exec_upload(pool: PgPool) {
-    // The common case: an exec-scoped upload crashes mid-flight. The terminate
-    // sweep for that execution aborts the multipart and frees everything
+async fn terminate_sweep_reaps_an_abandoned_run_upload(pool: PgPool) {
+    // The common case: an run-scoped upload crashes mid-flight. The terminate
+    // sweep for that run aborts the multipart and frees everything
     // immediately (no grace).
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let (key, _ps) = begin_via(&s, &w, &StorageScope::Execution, "b", "f", None, &big(), Some(6))
+    let (key, _ps) = begin_via(&s, &w, &StorageScope::Run, "b", "f", None, &big(), Some(6))
         .await
         .unwrap();
     let part = &s.reserve_parts(&w, &key, &[ask(1, 6)], &big(), WORKER).await.unwrap()[0];
     bucket.put_part(&part.url, body(b"orphan")).unwrap();
-    let (swept, lingering) = s.sweep_exec("t1", "c1").await.unwrap();
-    assert_eq!((swept, lingering), (1, 0), "the abandoned exec upload is swept, no linger");
+    let (swept, lingering) = s.sweep_run("t1", "c1").await.unwrap();
+    assert_eq!((swept, lingering), (1, 0), "the abandoned run upload is swept, no linger");
     assert!(bucket.in_progress_uploads().is_empty(), "multipart aborted");
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0));
 }
@@ -1700,7 +1700,7 @@ async fn complete_retry_after_success_is_idempotent(pool: PgPool) {
     // the existing metadata unchanged and never touches the object.
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let first = put_via(&s, &bucket, &w, &StorageScope::Execution, "text/plain", "a.txt", None, &big(), body(b"finalized bytes"))
+    let first = put_via(&s, &bucket, &w, &StorageScope::Run, "text/plain", "a.txt", None, &big(), body(b"finalized bytes"))
         .await
         .unwrap();
     let retry = s.complete_upload(&w, &first.key).await.unwrap();
@@ -1714,7 +1714,7 @@ async fn a_completed_file_is_immutable(pool: PgPool) {
     // No upload verb can touch a finalized file: its upload state is gone.
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let meta = put_via(&s, &bucket, &w, &StorageScope::Execution, "text/plain", "a.txt", None, &big(), body(b"original"))
+    let meta = put_via(&s, &bucket, &w, &StorageScope::Run, "text/plain", "a.txt", None, &big(), body(b"original"))
         .await
         .unwrap();
     let err = s.reserve_parts(&w, &meta.key, &[ask(1, 3)], &big(), WORKER).await.unwrap_err();
@@ -1726,11 +1726,11 @@ async fn a_completed_file_is_immutable(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn wipe_prefix_does_not_touch_a_sibling_execution_id_prefix(pool: PgPool) {
-    // The trailing-slash invariant the wall rests on: sweeping execution `c1` must
-    // never match a sibling execution whose name merely starts with `c1`.
+async fn wipe_prefix_does_not_touch_a_sibling_run_id_prefix(pool: PgPool) {
+    // The trailing-slash invariant the wall rests on: sweeping run `c1` must
+    // never match a sibling run whose name merely starts with `c1`.
     let (s, bucket, _clock) = store(&pool).await;
-    let scope = StorageScope::Execution;
+    let scope = StorageScope::Run;
     let w_short = worker("t1", "p1", Some("c1"));
     let w_long = worker("t1", "p1", Some("c1x"));
     put_via(&s, &bucket, &w_short, &scope, "text/plain", "a.txt", None, &big(), body(b"short"))
@@ -1739,11 +1739,11 @@ async fn wipe_prefix_does_not_touch_a_sibling_execution_id_prefix(pool: PgPool) 
     let kept = put_via(&s, &bucket, &w_long, &scope, "text/plain", "b.txt", None, &big(), body(b"long"))
         .await
         .unwrap();
-    let (swept, lingering) = s.sweep_exec("t1", "c1").await.unwrap();
+    let (swept, lingering) = s.sweep_run("t1", "c1").await.unwrap();
     assert_eq!((swept, lingering), (0, 1), "only c1's file is stamped to linger");
     // The sibling's row is untouched: no linger deadline landed on it.
     let sibling = weft_core::storage::key::parse_key(&kept.key).unwrap();
-    assert_eq!(s.meta(&sibling).await.unwrap().expires_at_unix, None, "sibling execution c1x untouched");
+    assert_eq!(s.meta(&sibling).await.unwrap().expires_at_unix, None, "sibling run c1x untouched");
 }
 
 #[sqlx::test]
@@ -1753,7 +1753,7 @@ async fn concurrent_begins_cannot_blow_past_the_byte_cap(pool: PgPool) {
     // exactly one begin wins, before any byte could move.
     let (s, _bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let scope = StorageScope::Execution;
+    let scope = StorageScope::Run;
     let cap = budget(Entitlement { disk_bytes_cap: 10, file_cap: 100 });
     let (r1, r2) = tokio::join!(
         begin_via(&s, &w, &scope, "application/octet-stream", "f1", None, &cap, Some(8)),
@@ -1789,14 +1789,14 @@ async fn one_failing_row_does_not_block_the_others(pool: PgPool) {
     let put = |name: &'static str| {
         let (s, bucket, w) = (s.clone(), bucket.clone(), w.clone());
         async move {
-            put_via(&s, &bucket, &w, &StorageScope::Execution, "b", name, Some(KeepTtl::Secs { secs: 10 }), &big(), body(b"xyz"))
+            put_via(&s, &bucket, &w, &StorageScope::Run, "b", name, Some(KeepTtl::Secs { secs: 10 }), &big(), body(b"xyz"))
                 .await
                 .unwrap()
         }
     };
     let stuck = put("stuck").await;
     let fine = put("fine").await;
-    let later = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "later", Some(KeepTtl::Secs { secs: 1000 }), &big(), body(b"z"))
+    let later = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "later", Some(KeepTtl::Secs { secs: 1000 }), &big(), body(b"z"))
         .await
         .unwrap();
     let parsed = weft_core::storage::key::parse_key(&stuck.key).unwrap();
@@ -2118,13 +2118,13 @@ async fn a_linger_stamp_books_the_loop_at_its_end(pool: PgPool) {
     heard.listen(weft_broker::runtime_store::FILE_EXPIRY_CHANNEL).await.unwrap();
     for run in ["c1", "c2"] {
         let w = worker("t1", "p1", Some(run));
-        put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "out", None, &big(), body(b"x")).await.unwrap();
+        put_via(&s, &bucket, &w, &StorageScope::Run, "b", "out", None, &big(), body(b"x")).await.unwrap();
     }
-    assert_eq!(s.sweep_exec("t1", "c1").await.unwrap(), (0, 1));
-    let end = clock.now_unix() + EXEC_LINGER_TTL_SECS;
+    assert_eq!(s.sweep_run("t1", "c1").await.unwrap(), (0, 1));
+    let end = clock.now_unix() + RUN_LINGER_TTL_SECS;
     tokio::time::timeout(Duration::from_secs(10), heard.recv()).await.expect("rung").unwrap();
     clock.advance(Duration::from_secs(1));
-    assert_eq!(s.sweep_exec("t1", "c2").await.unwrap(), (0, 1));
+    assert_eq!(s.sweep_run("t1", "c2").await.unwrap(), (0, 1));
     assert!(
         tokio::time::timeout(Duration::from_millis(500), heard.recv()).await.is_err(),
         "a later linger end is covered by the first ring"
@@ -2142,12 +2142,12 @@ async fn a_linger_stamp_books_the_loop_at_its_end(pool: PgPool) {
 async fn a_presigned_link_keeps_a_lingering_file_for_its_life(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    let file = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "out", None, &big(), body(b"x")).await.unwrap();
+    let file = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "out", None, &big(), body(b"x")).await.unwrap();
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
-    s.sweep_exec("t1", "c1").await.unwrap();
+    s.sweep_run("t1", "c1").await.unwrap();
     s.presign(&parsed, Some(900)).await.unwrap();
     assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, Some(clock.now_unix() + 900));
-    clock.advance(Duration::from_secs(EXEC_LINGER_TTL_SECS as u64 + 1));
+    clock.advance(Duration::from_secs(RUN_LINGER_TTL_SECS as u64 + 1));
     assert!(s.meta(&parsed).await.is_ok(), "still there past the linger");
     assert_eq!(expire(&s, &pool).await, 0);
 }

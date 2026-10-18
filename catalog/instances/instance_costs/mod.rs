@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::program::PaidBy;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::instance;
 
@@ -22,7 +22,7 @@ impl Node for InstanceCostsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let mut query = ctx.costs().instance(instance(&ctx)?);
         if let Some(service) = ctx.inputs.opt::<String>("service")?.filter(|s| !s.trim().is_empty()) {
             query = query.service(service);

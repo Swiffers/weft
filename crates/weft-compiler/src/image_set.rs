@@ -1,7 +1,7 @@
 //! The set of infra images a project needs, enumerated once.
 //!
 //! A project's runnable artifacts are its WORKER image (one, content-addressed by
-//! the binary hash) plus, for every `requires_infra` node, the IMAGES that node
+//! the binary hash) plus, for every `requiresInfra` node, the IMAGES that node
 //! declares (`metadata.images`, e.g. `images/bridge`). The worker image is built
 //! identically everywhere off `binary_hash`; the infra images are enumerated the
 //! same way by every caller. This module is the ONE place that walks the graph +
@@ -42,7 +42,7 @@ pub struct InfraImage {
 }
 
 /// Enumerate every infra image the project needs, walking the enriched
-/// definition's `requires_infra` nodes and their declared `metadata.images`.
+/// definition's `requiresInfra` nodes and their declared `metadata.images`.
 /// Fails loud (never silently skips) if a node's type is missing from the catalog
 /// or declares an image with no `Dockerfile`, so a misconfigured node surfaces at
 /// build time rather than as a dangling `Image::Local` at apply time.

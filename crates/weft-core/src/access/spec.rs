@@ -26,9 +26,6 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The recipe for one service's personal accesses: how a grant is
-/// acquired, how a request through it is authenticated, and how grants
-/// coexist across projects.
 /// What a provider accepts as its OAuth callback address
 /// ([`AccessSpec::callback`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -49,9 +46,12 @@ impl CallbackAddress {
     }
 }
 
+/// The recipe for one service's personal accesses: how a grant is
+/// acquired, how a request through it is authenticated, and how grants
+/// coexist across projects.
 // SYNC: AccessSpec <-> packages/weft-connect/src/core/wire.ts AccessSpecWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccessSpec {
     /// The service's identity in the store and on the wire
     /// (`[a-z0-9_]+`, same charset as provider names).
@@ -123,7 +123,7 @@ pub struct AccessSpec {
     /// Deliberately NOT exhaustive on providers with a huge scope pool
     /// (Google class): list only the permissions shipped nodes
     /// genuinely use, and grow the list with the node that needs the
-    /// next one. `all_permissions_url` is what keeps that honest.
+    /// next one. `allPermissionsUrl` is what keeps that honest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<Permission>,
     /// Where the PROVIDER's complete permission list lives, for
@@ -152,8 +152,8 @@ pub struct AccessSpec {
     /// when a live route is gated by it (`Route { auth: ... }`): the
     /// scheme (a shared-key set, an identity token, an HMAC) is data
     /// here, and the connection's stored values hold the material by
-    /// the names the scheme reserves (`keys`, `signing_secret`,
-    /// `public_key`, `audience`; an `oidc` scheme names its addresses
+    /// the names the scheme reserves (`keys`, `signingSecret`,
+    /// `publicKey`, `audience`; an `oidc` scheme names its addresses
     /// as templates over the fields). The broker runs it, secret-free
     /// from the gateway's side. Absent = connections of this service
     /// cannot gate a route.
@@ -184,7 +184,7 @@ pub struct AccessSpec {
 /// [`AccessSpec::capabilities`] for the two rules a group carries.
 // SYNC: Capability <-> packages/weft-connect/src/core/wire.ts Capability
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Capability {
     /// What filling this group lets the connection do, in the words
     /// the refusals use ("receive mail"): the thing the user gains,
@@ -224,7 +224,7 @@ fn is_default_doors(doors: &[Door]) -> bool {
 /// these exist, plus the fields, as ONE form.
 // SYNC: OwnPage <-> packages/weft-connect/src/core/wire.ts OwnPage
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnPage {
     /// We can create the app for them: the provider's app-manifest
     /// endpoint and the payload to send. Renders "Create it for me".
@@ -247,7 +247,7 @@ pub struct OwnPage {
 /// The paste-a-credential section of the "Your own" page.
 // SYNC: Paste <-> packages/weft-connect/src/core/wire.ts OwnPageWire.paste
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Paste {
     /// What the user pastes (a bot token, a key pair).
     pub fields: Vec<CredentialField>,
@@ -255,7 +255,7 @@ pub struct Paste {
 
 /// A provider's create-an-app-by-API recipe (Slack/Zoom manifest class).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MintApp {
     /// POST target on the provider's API.
     pub url: String,
@@ -272,7 +272,7 @@ pub struct MintApp {
 /// `{permissions}`, replaced by the ticked permissions' labels; see
 /// [`AccessSpec::guide_steps`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Guide {
     /// A pre-filled creation link (a manifest / template URL). May
     /// embed `{permissions}` (ticked ids, comma-joined, url-encoded).
@@ -285,7 +285,7 @@ pub struct Guide {
 /// One entry of a service's permission catalogue.
 // SYNC: Permission <-> packages/weft-connect/src/core/wire.ts Permission
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Permission {
     /// The provider's own id for it (an OAuth scope string, a bot
     /// permission name). What consent URLs carry and `covers` names.
@@ -324,7 +324,7 @@ pub struct Permission {
 
 /// What connect-time verification can learn, and what it costs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Verification {
     #[serde(default)]
     pub rung: VerificationRung,
@@ -401,7 +401,7 @@ impl VerificationCost {
 pub const APPS_FILE_ENV: &str = "WEFT_ACCESS_APPS_FILE";
 
 /// The credentials of a service's OAuth app: the client id, the secret
-/// (absent for a public PKCE client), and any `registration_fields`
+/// (absent for a public PKCE client), and any `registrationFields`
 /// extras the service declares. Keyed by service name in
 /// [`crate::node::NodeMetadata::access_apps`], where a project (or a
 /// package root, inherited by every member) declares the app it uses.
@@ -424,7 +424,7 @@ pub struct AppRegistration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
     /// Extra registration values a service declares beyond id + secret
-    /// (e.g. a Zoom `account_id`), keyed by the `registration_fields`
+    /// (e.g. a Zoom `account_id`), keyed by the `registrationFields`
     /// name. Flattened so the app reads as one flat object.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, String>,
@@ -455,11 +455,32 @@ impl AppRegistration {
             return Err("the app's client_id is empty".to_string());
         }
         for f in fields {
-            if !f.optional && !self.extra.contains_key(&f.name) {
+            if !f.optional && self.extra.get(&f.name).is_none_or(|value| value.trim().is_empty()) {
                 return Err(format!("the app is missing the required field '{}'", f.name));
             }
         }
-        Ok(())
+        self.check_keys(fields, false)
+    }
+
+    /// Refuse a key the service does not declare. Every key beyond
+    /// `label`, `client_id` and `client_secret` lands in `extra`, so a
+    /// misspelled `client_secrte` would otherwise load as an extra and
+    /// leave the app without its secret. `fields` are the service's
+    /// declared registration fields. `shipped` is an app a node's
+    /// metadata ships, which is public: the keys it may hold leave out
+    /// the secret ones, so the message never offers one.
+    pub fn check_keys(&self, fields: &[CredentialField], shipped: bool) -> Result<(), String> {
+        match self.extra.keys().find(|key| !fields.iter().any(|f| f.name == **key)) {
+            None => Ok(()),
+            Some(key) => {
+                let mut known = vec!["label", "client_id"];
+                if !shipped {
+                    known.push("client_secret");
+                }
+                known.extend(fields.iter().filter(|f| !(shipped && f.secret)).map(|f| f.name.as_str()));
+                Err(format!("the app has a field '{key}' its service does not declare (known: {})", known.join(", ")))
+            }
+        }
     }
 }
 
@@ -479,7 +500,7 @@ pub enum GrantCoexistence {
 /// rides the journal in plaintext).
 // SYNC: CredentialField <-> packages/weft-connect/src/core/wire.ts CredentialFieldWire
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialField {
     /// The stored value's name; what templates interpolate.
     pub name: String,
@@ -507,14 +528,14 @@ fn default_true() -> bool {
 /// How a grant's stored values are acquired.
 // SYNC: Acquisition <-> packages/weft-connect/src/core/wire.ts AccessSpecWire.acquisition
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Acquisition {
     /// The user pastes the declared fields (a bot token, an API key
     /// pair). Scoping, if any, happened on the provider's own site, so
     /// a static spec never declares scopes.
     Static { fields: Vec<CredentialField> },
     /// OAuth2. The connect uses an app (client id + secret, plus any
-    /// `registration_fields` extras): the door decides whose. The
+    /// `registrationFields` extras): the door decides whose. The
     /// ticked permissions (from [`AccessSpec::permissions`]) drive the
     /// consent URL.
     #[serde(rename = "oauth2")]
@@ -597,7 +618,7 @@ fn default_jwt_ttl() -> u64 {
 }
 
 /// How an OAuth2 token call authenticates the client; see the
-/// `token_auth` field on [`Acquisition::OAuth2`]. (The editor's
+/// `tokenAuth` field on [`Acquisition::OAuth2`]. (The editor's
 /// acquisition wire passes unknown keys through, so this needs no
 /// frontend mirror.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -610,7 +631,7 @@ pub enum TokenAuth {
 
 /// The OAuth2 grant flow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum OAuthGrant {
     /// Browser consent -> code -> token. The self-host flow weft ships.
     AuthorizationCode {
@@ -628,7 +649,7 @@ pub enum OAuthGrant {
 /// One JSON-path capture off a token/test response, stored as a named
 /// value templates can interpolate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Capture {
     pub name: String,
     /// Dotted path into the response JSON (`team.name`,
@@ -643,7 +664,7 @@ pub struct Capture {
 
 /// Exchange a minted JWT for the working token (`MintJwt.exchange`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TokenExchange {
     /// POST target; a template over the pasted fields
     /// (`https://api.github.com/app/installations/{installation_id}/access_tokens`).
@@ -666,7 +687,7 @@ pub enum JwtAlgorithm {
 
 /// The connect-time verification call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TestCall {
     pub url: Template,
     #[serde(default)]
@@ -704,7 +725,7 @@ impl TestMethod {
 /// authenticated. ~5 verbs cover the surveyed services; a mechanism
 /// none expresses becomes a new typed variant, never author code.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum AuthStep {
     /// `Authorization: Bearer {token}`, `X-Shopify-Access-Token:
     /// {token}`, `Bot {token}` ... any header. The name is a template
@@ -735,7 +756,7 @@ pub enum AuthStep {
 
 /// The per-request signing schemes weft implements.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum SignKind {
     /// AWS Signature V4: S3, R2, every S3-compatible store.
     #[serde(rename = "sigv4")]
@@ -764,7 +785,7 @@ pub enum SignKind {
 /// One shape for both, because both are "POST this body with these
 /// credentials and read these values out of the answer".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConnectCall {
     /// The address, as a template over the caller's values (a watch
     /// call addresses `.../files/{target}/watch`).
@@ -777,7 +798,7 @@ pub struct ConnectCall {
     pub body: Option<Value>,
     /// How this call authenticates, in the same vocabulary as a
     /// service's own `auth`: templates over the values the caller
-    /// resolved (a socket mint uses `Bearer {app_token}`, which is a
+    /// resolved (a socket mint uses `Bearer {appToken}`, which is a
     /// DIFFERENT stored value from the API token).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth: Vec<AuthStep>,
@@ -860,7 +881,7 @@ pub fn resolve_body(
 }
 
 /// A declarative acknowledgement rule for a held socket: when an
-/// inbound frame carries something at `when_field`, send `frame` back
+/// inbound frame carries something at `whenField`, send `frame` back
 /// with `{value}` replaced by what was found there.
 ///
 /// This is the generic shape of every ack protocol surveyed (Slack's
@@ -868,7 +889,7 @@ pub fn resolve_body(
 /// "read a field, echo it in a frame", and WHICH field and WHICH
 /// frame are the service's declared data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplyRule {
     /// Dotted path into the inbound frame. No value there = this rule
     /// does not apply to this frame.
@@ -910,6 +931,7 @@ fn is_default_url_from(s: &str) -> bool {
 /// flattened into the recipes that dial out so their wire fields stay
 /// flat.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MintedSocket {
     /// The authenticated call that answers the socket address. Runs
     /// again on every reconnect (these addresses are single-use).
@@ -942,7 +964,7 @@ impl MintedSocket {
             if !call.captures.iter().any(|c| c.name == self.url_from) {
                 return Err(format!(
                     "{what}.connect captures nothing named '{}', so the minted socket \
-                     address would be unknown; capture it (or point `url_from` at the \
+                     address would be unknown; capture it (or point `urlFrom` at the \
                      capture that carries it)",
                     self.url_from
                 ));
@@ -950,7 +972,7 @@ impl MintedSocket {
         }
         for rule in &self.replies {
             if rule.when_field.trim().is_empty() {
-                return Err(format!("{what}.replies needs a non-empty when_field"));
+                return Err(format!("{what}.replies needs a non-empty whenField"));
             }
         }
         Ok(())
@@ -997,10 +1019,10 @@ impl Template {
             };
             let name = &after[..end];
             if name.is_empty()
-                || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 return Err(format!(
-                    "bad placeholder '{{{name}}}' in template {:?}: names are [a-z0-9_]+",
+                    "bad placeholder '{{{name}}}' in template {:?}: names are [A-Za-z0-9_]+",
                     self.0
                 ));
             }
@@ -1430,7 +1452,7 @@ impl AccessSpec {
                 if let Some(ex) = exchange {
                     ex.url.placeholders()?;
                     if ex.token_path.is_empty() {
-                        return Err("token exchange needs a token_path".into());
+                        return Err("token exchange needs a tokenPath".into());
                     }
                     validate_captures(&ex.captures)?;
                 }
@@ -1505,11 +1527,11 @@ impl AccessSpec {
         for fields in field_lists {
             let mut seen = std::collections::HashSet::new();
             for f in fields {
-                if !f.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                if !f.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     || f.name.is_empty()
                 {
                     return Err(format!(
-                        "field name '{}' is invalid: use only lowercase letters, digits, and '_'",
+                        "field name '{}' is invalid: use only letters, digits, and '_'",
                         f.name
                     ));
                 }
@@ -1594,7 +1616,7 @@ impl AccessSpec {
                 if p.always && (p.default || p.own_only) {
                     return Err(format!(
                         "permission '{}' is `always` (asked for on every consent, never ticked), so it \
-                         cannot also be `default` or `own_only`",
+                         cannot also be `default` or `ownOnly`",
                         p.id
                     ));
                 }
@@ -1641,13 +1663,13 @@ impl AccessSpec {
                     Acquisition::Static { .. } | Acquisition::MintJwt { .. }
                 ) {
                     return Err(
-                        "own_page.paste is redundant: this acquisition already IS a paste \
+                        "ownPage.paste is redundant: this acquisition already IS a paste \
                          form (its fields render on the page); declare the fields there"
                             .into(),
                     );
                 }
                 if paste.fields.is_empty() {
-                    return Err("own_page.paste needs at least one field".into());
+                    return Err("ownPage.paste needs at least one field".into());
                 }
                 // The pasted values are ALL a static row stores, so
                 // they must cover every value the auth steps
@@ -1657,7 +1679,7 @@ impl AccessSpec {
                 for name in &names {
                     if !paste.fields.iter().any(|f| &f.name == name) {
                         return Err(format!(
-                            "own_page.paste is missing a '{name}' field: the auth steps \
+                            "ownPage.paste is missing a '{name}' field: the auth steps \
                              interpolate it, so a pasted connection must collect it"
                         ));
                     }
@@ -1668,7 +1690,7 @@ impl AccessSpec {
     }
 
     /// The spec a PASTED connection stores: this spec with its
-    /// acquisition replaced by `Static` over the `own_page.paste`
+    /// acquisition replaced by `Static` over the `ownPage.paste`
     /// fields. `None` when the service declares no paste section.
     /// The variant is what connect validates and snapshots, so a
     /// pasted row refreshes (i.e. asks for a fresh paste) and
@@ -1941,8 +1963,8 @@ mod tests {
             "acquisition": {
                 "kind": "oauth2",
                 "grant": { "kind": "authorization_code",
-                           "auth_url": "https://slack.com/oauth/v2/authorize", "pkce": false },
-                "token_url": "https://slack.com/api/oauth.v2.access",
+                           "authUrl": "https://slack.com/oauth/v2/authorize", "pkce": false },
+                "tokenUrl": "https://slack.com/api/oauth.v2.access",
                 "captures": [
                     { "name": "team", "path": "team.name" },
                     { "name": "token", "path": "access_token" }
@@ -1956,9 +1978,9 @@ mod tests {
                 { "id": "files:write", "label": "Upload files",
                   "description": "Upload files into channels." }
             ],
-            "all_permissions_url": "https://docs.slack.dev/reference/scopes",
+            "allPermissionsUrl": "https://docs.slack.dev/reference/scopes",
             "verification": { "rung": "reports_permissions", "cost": "free" },
-            "own_page": {
+            "ownPage": {
                 "guide": { "steps": [
                     "Create an app at api.slack.com/apps.",
                     "Add these bot scopes: {permissions}."
@@ -1973,7 +1995,7 @@ mod tests {
         .expect("slack spec parses")
     }
 
-    /// `own_page.paste` on a consent service: valid when its fields
+    /// `ownPage.paste` on a consent service: valid when its fields
     /// cover the auth steps' values; the variant a connect stores is
     /// the same spec with a Static acquisition and no page.
     #[test]
@@ -2204,14 +2226,14 @@ mod tests {
             "service": "s3",
             "doors": ["shared", "own"],
             "acquisition": { "kind": "static", "fields": [
-                { "name": "access_key_id", "secret": false },
-                { "name": "secret_access_key" },
+                { "name": "accessKeyId", "secret": false },
+                { "name": "secretAccessKey" },
                 { "name": "region", "secret": false }
             ]},
             "auth": [{ "kind": "sign", "with": {
                 "kind": "sigv4", "service": "s3", "region": "{region}",
-                "access_key_id": "{access_key_id}",
-                "secret_access_key": "{secret_access_key}"
+                "accessKeyId": "{accessKeyId}",
+                "secretAccessKey": "{secretAccessKey}"
             }}]
         }))
         .unwrap();
@@ -2257,8 +2279,8 @@ mod tests {
                 "claims": { "iss": "{app_id}" },
                 "exchange": {
                     "url": "https://api.github.com/app/installations/{installation_id}/access_tokens",
-                    "token_path": "token",
-                    "expires_path": "expires_at"
+                    "tokenPath": "token",
+                    "expiresPath": "expires_at"
                 }
             },
             "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }]
@@ -2272,21 +2294,21 @@ mod tests {
         let s3: AccessSpec = serde_json::from_value(json!({
             "service": "s3",
             "acquisition": { "kind": "static", "fields": [
-                { "name": "access_key_id", "secret": false },
-                { "name": "secret_access_key" },
+                { "name": "accessKeyId", "secret": false },
+                { "name": "secretAccessKey" },
                 { "name": "region", "secret": false }
             ]},
             "auth": [{ "kind": "sign", "with": {
                 "kind": "sigv4", "service": "s3", "region": "{region}",
-                "access_key_id": "{access_key_id}",
-                "secret_access_key": "{secret_access_key}"
+                "accessKeyId": "{accessKeyId}",
+                "secretAccessKey": "{secretAccessKey}"
             }}]
         }))
         .unwrap();
         s3.validate().unwrap();
         assert_eq!(
             s3.worker_value_names().unwrap(),
-            vec!["region", "access_key_id", "secret_access_key"]
+            vec!["region", "accessKeyId", "secretAccessKey"]
         );
     }
 
@@ -2298,28 +2320,28 @@ mod tests {
         let caps = vec![
             Capability {
                 label: "receive mail".into(),
-                fields: vec!["imap_host".into(), "imap_port".into()],
+                fields: vec!["imapHost".into(), "imapPort".into()],
             },
             Capability {
                 label: "send mail".into(),
-                fields: vec!["smtp_host".into(), "smtp_port".into()],
+                fields: vec!["smtpHost".into(), "smtpPort".into()],
             },
         ];
         let filled = |names: &'static [&'static str]| move |n: &str| names.contains(&n);
 
-        capability_shortfall(&caps, filled(&["imap_host", "imap_port"]))
+        capability_shortfall(&caps, filled(&["imapHost", "imapPort"]))
             .expect("one complete group is enough");
-        capability_shortfall(&caps, filled(&["smtp_host", "smtp_port"]))
+        capability_shortfall(&caps, filled(&["smtpHost", "smtpPort"]))
             .expect("the other group alone is enough too");
         capability_shortfall(
             &caps,
-            filled(&["imap_host", "imap_port", "smtp_host", "smtp_port"]),
+            filled(&["imapHost", "imapPort", "smtpHost", "smtpPort"]),
         )
         .expect("both groups is the everyday case");
 
         // Half a group names the missing half and the capability.
-        let err = capability_shortfall(&caps, filled(&["imap_host"])).unwrap_err();
-        assert!(err.contains("receive mail") && err.contains("imap_port"), "{err}");
+        let err = capability_shortfall(&caps, filled(&["imapHost"])).unwrap_err();
+        assert!(err.contains("receive mail") && err.contains("imapPort"), "{err}");
 
         // No group at all names every choice.
         let err = capability_shortfall(&caps, filled(&[])).unwrap_err();
@@ -2330,9 +2352,9 @@ mod tests {
 
         // A field NO group names is untouched by both rules: it
         // neither completes a group nor satisfies rule 2 on its own.
-        let err = capability_shortfall(&caps, filled(&["send_as"])).unwrap_err();
+        let err = capability_shortfall(&caps, filled(&["sendAs"])).unwrap_err();
         assert!(err.contains("nothing"), "an ungrouped field satisfies no group: {err}");
-        capability_shortfall(&caps, filled(&["send_as", "imap_host", "imap_port"]))
+        capability_shortfall(&caps, filled(&["sendAs", "imapHost", "imapPort"]))
             .expect("an ungrouped field never blocks a complete group either");
     }
 
@@ -2344,10 +2366,10 @@ mod tests {
             "service": "mail",
             "acquisition": { "kind": "static", "fields": [
                 { "name": "user" },
-                { "name": "imap_host", "optional": true }
+                { "name": "imapHost", "optional": true }
             ]},
             "auth": [{ "kind": "header", "name": "A", "value": "{user}" }],
-            "capabilities": [{ "label": "receive mail", "fields": ["imap_host"] }]
+            "capabilities": [{ "label": "receive mail", "fields": ["imapHost"] }]
         }))
         .expect("parses");
         spec.validate().expect("a group over a declared optional field is fine");
@@ -2499,7 +2521,7 @@ mod tests {
 
         assert!(Template::new("Bearer {").placeholders().is_err());
         assert!(Template::new("Bearer }").placeholders().is_err());
-        assert!(Template::new("Bearer {BAD}").placeholders().is_err());
+        assert!(Template::new("Bearer {bad-name}").placeholders().is_err());
         assert_eq!(Template::new("no holes").placeholders().unwrap(), Vec::<String>::new());
         // Repeats dedupe, order of first appearance.
         assert_eq!(
@@ -2618,18 +2640,18 @@ mod tests {
         assert!(err.contains("'keys'"), "{err}");
 
         let oidc = verifier_spec(
-            &["jwks_url", "issuer", "audience"],
-            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }),
+            &["jwksUrl", "issuer", "audience"],
+            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }),
         )
         .unwrap();
         oidc.validate().expect("templated addresses over declared fields");
         let short = verifier_spec(
             &["issuer"],
-            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }),
+            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }),
         )
         .unwrap();
-        let err = short.validate().expect_err("jwks_url is not declared");
-        assert!(err.contains("'jwks_url'"), "{err}");
+        let err = short.validate().expect_err("jwksUrl is not declared");
+        assert!(err.contains("'jwksUrl'"), "{err}");
 
         let echo = verifier_spec(&["token"], json!({ "kind": "token_echo" })).unwrap();
         let err = echo.validate().expect_err("token echo cannot gate callers");
@@ -2642,16 +2664,16 @@ mod tests {
     fn oidc_templates_resolve_against_the_connection() {
         use crate::access::events::VerifyKind;
         let kind: VerifyKind = serde_json::from_value(
-            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }),
+            json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }),
         )
         .unwrap();
         assert_eq!(
             kind.required_value_names().unwrap(),
-            vec!["jwks_url".to_string(), "issuer".to_string()]
+            vec!["jwksUrl".to_string(), "issuer".to_string()]
         );
         let values = BTreeMap::from([
             ("issuer".to_string(), "https://auth.example".to_string()),
-            ("jwks_url".to_string(), "https://auth.example/jwks".to_string()),
+            ("jwksUrl".to_string(), "https://auth.example/jwks".to_string()),
         ]);
         let resolved = kind.resolved(&values).unwrap();
         match resolved {
@@ -2678,7 +2700,7 @@ mod tests {
             }))
             .expect("parses")
         };
-        let err = pushed(json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwks_url": "{jwks_url}" }))
+        let err = pushed(json!({ "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }))
             .validate()
             .expect_err("a push recipe must be literal");
         assert!(err.contains("placeholder"), "{err}");

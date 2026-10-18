@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ListInstanceInfraNode;
@@ -19,7 +19,7 @@ impl Node for ListInstanceInfraNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let node: String = ctx.inputs.get("node")?;
         let copies = ctx.infra(node).copies().await?;
         let instances: Vec<String> =

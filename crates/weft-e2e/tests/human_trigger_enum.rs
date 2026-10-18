@@ -1,6 +1,6 @@
 //! A HumanTrigger ENTRY form is enumerable via the signal-token list (so the
 //! browser extension can show it under "Triggers") and firing it starts a fresh
-//! execution. Entry-trigger forms used to be excluded from enumeration; this
+//! run. Entry-trigger forms used to be excluded from enumeration; this
 //! pins the fixed behavior: the list returns them tagged `isResume=false`, and a
 //! submit to `POST /signal/{token}` runs the graph.
 #![cfg(feature = "e2e")]
@@ -18,7 +18,7 @@ async fn human_trigger_entry_form_enumerates_and_fires() -> anyhow::Result<()> {
 
     // Activate: the HumanTrigger registers its entry form signal.
     project.activate().await?;
-    let before = run::executions(&disp, &pid).await?;
+    let before = run::runs(&disp, &pid).await?;
 
     // The entry form appears in the signal-token enumeration, tagged as a
     // trigger (isResume=false), NOT a resume task.
@@ -37,12 +37,12 @@ async fn human_trigger_entry_form_enumerates_and_fires() -> anyhow::Result<()> {
         "the trigger stays listed while the project is active"
     );
 
-    // Firing the entry form (POST /signal/{token}) starts a fresh execution.
+    // Firing the entry form (POST /signal/{token}) starts a fresh run.
     human::answer_form(&disp, &form, &json!({ "go": "approve" })).await?;
-    let execution_id = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let run_id = run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
-    // approve_reject 'go' -> go_approved = true reaches Debug.
+    // approve_reject 'go' -> goApproved = true reaches Debug.
     settled.assert_input("out", "data", &json!(true))?;
 
     project.finish().await

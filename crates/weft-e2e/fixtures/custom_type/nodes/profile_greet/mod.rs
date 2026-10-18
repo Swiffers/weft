@@ -6,14 +6,14 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ProfileGreetNode;
 
 #[async_trait]
 impl Node for ProfileGreetNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let profile: serde_json::Value = ctx.inputs.get("profile")?;
         let Some(name) = profile["name"].as_str() else {
             node_bail!("profile has no name field");

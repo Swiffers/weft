@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::s3;
 
@@ -24,7 +24,7 @@ impl Node for S3GetObjectNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let bucket: String = ctx.inputs.get("bucket")?;
         let key: String = ctx.inputs.get("key")?;
@@ -39,7 +39,7 @@ impl Node for S3GetObjectNode {
         // filename, so the last path segment stands in.
         let filename = key.rsplit('/').next().unwrap_or(&key).to_string();
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             .put_response(
                 resp,
                 "s3: read the object",

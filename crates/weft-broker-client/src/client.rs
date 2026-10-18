@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_journal::{BatchError, RecordClient};
 use weft_task_store::tasks::{DedupOutcome, NewTask, TaskOutcome};
 use weft_task_store::{InfraReader, TaskStoreClient};
@@ -310,18 +310,18 @@ impl RecordClient for BrokerRecordClient {
         Err(if refused.is_outage() { BatchError::Unanswered(refused.into()) } else { BatchError::Refused(refused.to_string()) })
     }
 
-    async fn record_of(&self, execution_id: ExecutionId) -> Result<weft_journal::record::RawRecord> {
+    async fn record_of(&self, run_id: RunId) -> Result<weft_journal::record::RawRecord> {
         let path = "/v1/journal/record_of";
-        let req = RecordOfRequest { execution_id };
+        let req = RecordOfRequest { run_id };
         let resp: RecordOfResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
         Ok(resp.record)
     }
 
-    async fn give_up(&self, execution_id: ExecutionId, why: String) -> std::result::Result<(), BatchError> {
+    async fn give_up(&self, run_id: RunId, why: String) -> std::result::Result<(), BatchError> {
         let path = "/v1/run/give_up";
         let answer = self
             .http
-            .post_raw(path, &RunGiveUpRequest { execution_id, error: why }, DEFAULT_CALL_WAIT)
+            .post_raw(path, &RunGiveUpRequest { run_id, error: why }, DEFAULT_CALL_WAIT)
             .await
             .map_err(BatchError::Unanswered)?;
         if answer.status.is_success() {
@@ -507,11 +507,11 @@ impl BrokerInfraClient {
 impl InfraReader for BrokerInfraClient {
     async fn endpoint_address(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         _run_instance: Option<&weft_core::instance::InstanceId>,
         infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
-        let req = InfraEndpointUrlRequest { execution_id, infra: infra.clone() };
+        let req = InfraEndpointUrlRequest { run_id, infra: infra.clone() };
         let resp: InfraEndpointUrlResponse =
             self.http.post("/v1/infra/endpoint_url", &req).await?;
         Ok(resp.address)
@@ -519,12 +519,12 @@ impl InfraReader for BrokerInfraClient {
 
     async fn baked_outputs(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         _run_instance: Option<&weft_core::instance::InstanceId>,
         place: &str,
         copy: Option<&weft_core::instance::InstanceId>,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
-        let req = InfraBakedRequest { execution_id, place: place.to_string(), instance: copy.cloned() };
+        let req = InfraBakedRequest { run_id, place: place.to_string(), instance: copy.cloned() };
         let resp: InfraBakedResponse = self.http.post("/v1/infra/baked", &req).await?;
         Ok(resp.saved)
     }
@@ -650,28 +650,28 @@ impl BrokerRunClient {
         Arc::new(Self { http: HttpCore::new(link) })
     }
 
-    /// Claim queued run `execution_id` (`RunClaimRequest`); `None` when it
+    /// Claim queued run `run_id` (`RunClaimRequest`); `None` when it
     /// is not queued. A claim the broker could not even start is sent
     /// again.
-    pub async fn claim(&self, execution_id: ExecutionId) -> Result<Option<weft_journal::record::Claimed>> {
+    pub async fn claim(&self, run_id: RunId) -> Result<Option<weft_journal::record::Claimed>> {
         let path = "/v1/run/claim";
-        let req = RunClaimRequest { execution_id };
+        let req = RunClaimRequest { run_id };
         let resp: RunClaimResponse = until_done(path, || self.http.post(path, &req)).await?;
         Ok(resp.claimed)
     }
 
-    /// This worker no longer drives `execution_id`, its whole record
+    /// This worker no longer drives `run_id`, its whole record
     /// written, for `why` (`DoorLetGoRequest`).
-    pub async fn let_go(&self, execution_id: ExecutionId, why: LetGo) -> Result<()> {
-        let _: DoorLetGo = self.http.post("/v1/door/let_go", &DoorLetGoRequest { execution_id, why }).await?;
+    pub async fn let_go(&self, run_id: RunId, why: LetGo) -> Result<()> {
+        let _: DoorLetGo = self.http.post("/v1/door/let_go", &DoorLetGoRequest { run_id, why }).await?;
         Ok(())
     }
 
-    /// The answers waiting for `execution_id`'s waits, but the waits in
+    /// The answers waiting for `run_id`'s waits, but the waits in
     /// `taken`, read once (`RunAnswersRequest`).
-    pub async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> Result<Vec<RunAnswer>> {
+    pub async fn answers(&self, run_id: RunId, taken: &[String]) -> Result<Vec<RunAnswer>> {
         let path = "/v1/run/answers";
-        let req = RunAnswersRequest { execution_id, taken: taken.to_vec() };
+        let req = RunAnswersRequest { run_id, taken: taken.to_vec() };
         let resp: RunAnswersResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
         Ok(resp.answers)
     }
@@ -686,42 +686,42 @@ impl BrokerRunClient {
     }
 }
 
-// ---------- Execution steering (worker tags/stops runs) ----------
+// ---------- Run steering (worker tags/stops runs) ----------
 
-/// The worker's door to steering executions: tag its own run, stop
+/// The worker's door to steering runs: tag its own run, stop
 /// its siblings by tag. Two endpoints, both worker-only and process-bound
-/// on the broker side (`/v1/execution/tag`, `/v1/execution/stop_tagged`).
-pub struct BrokerExecutionClient {
+/// on the broker side (`/v1/run/tag`, `/v1/run/stop_tagged`).
+pub struct BrokerSteeringClient {
     http: HttpCore,
 }
 
-impl BrokerExecutionClient {
+impl BrokerSteeringClient {
     pub fn new(link: BrokerLink) -> Arc<Self> {
         Arc::new(Self { http: HttpCore::new(link) })
     }
 
-    /// Tag `execution_id` with `tags`. Synchronous: on return the tag rows
+    /// Tag `run_id` with `tags`. Synchronous: on return the tag rows
     /// exist (or the call failed), which is what lets a following
     /// `stop_tagged` anchor on them.
-    pub async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> Result<()> {
-        let req = ExecutionTagRequest { execution_id, tags };
-        let _: ExecutionTagResponse = self.http.post("/v1/execution/tag", &req).await?;
+    pub async fn tag_run(&self, run_id: RunId, tags: Vec<String>) -> Result<()> {
+        let req = RunTagRequest { run_id, tags };
+        let _: RunTagResponse = self.http.post("/v1/run/tag", &req).await?;
         Ok(())
     }
 
-    /// Ask that every live execution of `execution_id`'s project carrying
+    /// Ask that every live run of `run_id`'s project carrying
     /// `tag` be stopped. Returns once the stop is durably queued; the
     /// dispatcher carries it out.
-    pub async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> Result<ExecutionStopTaggedResponse> {
-        let req = ExecutionStopTaggedRequest { execution_id, tag, stop_self };
-        self.http.post("/v1/execution/stop_tagged", &req).await
+    pub async fn stop_tagged(&self, run_id: RunId, tag: String, stop_self: weft_core::StopSelf) -> Result<RunStopTaggedResponse> {
+        let req = RunStopTaggedRequest { run_id, tag, stop_self };
+        self.http.post("/v1/run/stop_tagged", &req).await
     }
 }
 
 // ---------- Project (worker fetches own definition) ----------
 
 /// Worker-side client for `/v1/project/fetch_definition`. Used at
-/// execution claim time to pull the runtime `ProjectDefinition`
+/// run claim time to pull the runtime `ProjectDefinition`
 /// keyed by `(project_id, expected_hash)`. The lookup is content-
 /// addressed against the append-only `project_definition` history
 /// table: the row either exists for the requested hash (200), or it
@@ -1107,16 +1107,16 @@ impl BrokerInfraStateClient {
         Ok(resp.command_id)
     }
 
-    /// Save what the infra setup `execution_id` sent out on the baked
+    /// Save what the infra setup `run_id` sent out on the baked
     /// outputs of its node at `place` (`InfraBakeRequest`).
     pub async fn save_bake(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         place: &str,
         copy: Option<&weft_core::instance::InstanceId>,
         values: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<()> {
-        let req = InfraBakeRequest { execution_id, place: place.to_string(), instance: copy.cloned(), values };
+        let req = InfraBakeRequest { run_id, place: place.to_string(), instance: copy.cloned(), values };
         let _: serde_json::Value = self.http.post("/v1/infra/bake", &req).await?;
         Ok(())
     }

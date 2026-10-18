@@ -32,7 +32,7 @@ run a `--seed` inherits from.
 | `weft tree` | The whole tree: every version with what changed against its parent, its runs beneath it, head marked |
 | `weft checkpoint [<label>]` | Records the files as a version. No run, no build |
 | `weft branch <version>` | Puts those files back and moves head |
-| `weft branch <execution-id>` | The same, and points head's run at that one, so the next seed inherits from it |
+| `weft branch <run-id>` | The same, and points head's run at that one, so the next seed inherits from it |
 
 `weft branch` refuses on a dirty tree and names the files, rather than throwing
 your work away:
@@ -50,8 +50,8 @@ weft run --seed
 ```
 
 Reuse everything from head's run whose slice of the program did not change, and
-run only the rest. That is the loop when you are iterating on step nine of a
-twelve step program and steps one to eight cost real money.
+run only the rest. That is the loop when you are iterating on node nine of a
+twelve-node program and nodes one to eight cost real money.
 
 ### What will not be reused
 
@@ -66,19 +66,19 @@ twelve step program and steps one to eight cost real money.
 | Anything past `--seed-before` or `--seed-until` | You said where to stop |
 | A starting value you supplied that differs from the one the earlier run used | Different input, different work |
 
-The invalidation spreads: if a step is not reusable, nothing downstream of it
+The invalidation spreads: if a node is not reusable, nothing downstream of it
 is either.
 
-### When a reused step's file changed
+### When a reused node's file changed
 
 A saved result that names a stored file says what the file held then. If the
-file has been edited since (a later step added to it, another run changed it)
+file has been edited since (a later node added to it, another run changed it)
 or is gone, the run is refused before anything starts:
 
 ```text
 --seed would reuse what 'ask' produced on 'historyFile', but the file it names,
 'conversation.json', has changed since (that run left it at version 4, it is at
-version 6 now), so the saved result no longer says what that step made. Hand
+version 6 now), so the saved result no longer says what that node made. Hand
 the file in yourself (`--emit ask='{"historyFile": ...}'`), or run 'ask' again
 by keeping it out of the seed (`--seed-before ask`).
 ```
@@ -89,7 +89,7 @@ A value you hand in at a start is a **backup**. It stands in only when nothing
 upstream supplies that port.
 
 Under a seed the upstream result is usually right there in history, so your
-backup goes unused and the step is reused exactly as it was. The run reports
+backup goes unused and the node is reused exactly as it was. The run reports
 success and nothing ran, which is correct and invisible, so weft says it out
 loud:
 
@@ -116,7 +116,7 @@ Then, after a change:
 
 ```bash
 weft run angry-customer
-weft diff <new-execution-id> example:angry-customer
+weft diff <new-run-id> example:angry-customer
 ```
 
 `diff` shows what moved on the wires. You, or Tangle, judge whether the change
@@ -128,8 +128,8 @@ them rather than burying them.
 | Command | What it does |
 |---|---|
 | `weft examples` | What is saved, which are frozen, and each one's latest run |
-| `weft freeze <name> [<execution-id>]` | Freeze a run. Without an execution id, head's run |
-| `weft diff <left> <right>` | Compare two runs. A side is an execution id or `example:<name>` |
+| `weft freeze <name> [<run-id>]` | Freeze a run. Without a run id, head's run |
+| `weft diff <left> <right>` | Compare two runs. A side is a run id or `example:<name>` |
 | `weft run <name>` | Run the current code with that example's parameters |
 
 A freeze **replaces** the example whole, and says so. Only a completed run can

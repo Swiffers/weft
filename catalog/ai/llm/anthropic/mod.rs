@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::provider;
 
@@ -25,7 +25,7 @@ impl Node for AnthropicProviderNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         provider::emit(&ctx, "anthropic").await
     }
 }

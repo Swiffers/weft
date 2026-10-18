@@ -4,7 +4,7 @@ A value on a wire is capped at 100 KB. Anything bigger goes into storage, and
 what travels the wire is a small marker saying where it is.
 
 ```rust
-let storage = ctx.storage(StorageScope::Execution);
+let storage = ctx.storage(StorageScope::Run);
 let stored = storage.put(bytes, "image/png", "chart.png", None).await?;
 ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&stored)?)).await
 ```
@@ -15,7 +15,7 @@ The scope decides where new files go, and how long they live.
 
 | Scope | Lives | Gone when |
 |---|---|---|
-| `Execution` (the default) | This run | Five minutes after the run ends, so its output is still downloadable, unless you kept it |
+| `Run` (the default) | This run | Five minutes after the run ends, so its output is still downloadable, unless you kept it |
 | `Project` | Across runs of this project | `weft clean` or `weft rm`, or once its lifetime runs out if you gave it one |
 | `Shared { name }` | Across projects that name the same space | Explicit removal, or once its lifetime runs out if you gave it one |
 | `Asset` | The project's `@asset` copies | Readable by your node, and the worker refuses writes to it |
@@ -29,7 +29,7 @@ crosses.
 
 ## How long a file lives
 
-An execution-scoped file is swept shortly after the run ends. If you want it to
+A run-scoped file is swept shortly after the run ends. If you want it to
 outlive the run (anything a person will open later), give it a lifetime:
 
 ```rust
@@ -56,7 +56,7 @@ ctx.storage(StorageScope::Project)
 ```
 
 For a file that already exists, `keep(&file, ttl)` sets its lifetime from now
-on. On an execution file it also marks the file to outlive its run, and that
+on. On a run file it also marks the file to outlive its run, and that
 mark cannot be taken back. On the other scopes `keep(&file, KeepTtl::Never)`
 takes a lifetime away again. An asset lives as long as a version of the project
 still names it (once none does, it expires on its own), so you cannot give one
@@ -124,9 +124,9 @@ Every stored file value carries a `version`: 1 when the file is made, going up
 every time the content is written. A key always names the same file,
 so a key plus a version always means the same bytes.
 
-If you seed a run that would reuse a step whose file has changed since, the run
+If you seed a run that would reuse a node whose file has changed since, the run
 is refused; for what to do then, go and read
-[when a reused step's file changed](../running/versions.md#when-a-reused-steps-file-changed).
+[when a reused node's file changed](../running/versions.md#when-a-reused-nodes-file-changed).
 
 ### Storing the same thing twice
 

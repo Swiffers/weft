@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use weft::access::client::Multipart;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::drive;
 
@@ -23,13 +23,13 @@ impl Node for GoogleDriveUploadNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let file: FileHandle = ctx.inputs.get("file")?;
         let name: Option<String> = ctx.inputs.opt("name")?;
         let folder: Option<String> = ctx.inputs.opt("folder")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
+        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
         let file_meta = drive::file_metadata(
             Some(name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| meta.filename.clone())),
             folder,

@@ -23,7 +23,7 @@ pub fn tests() -> Vec<NodeTest> {
 /// list in two files (the JSON side cannot carry the SYNC marker), so
 /// this walks the manifest and reads a minimal entry of every declared
 /// kind: a spec added to metadata.json without a `read` arm fails HERE,
-/// when the metadata is edited, instead of mid-execution on the first
+/// when the metadata is edited, instead of mid-run on the first
 /// firing that takes the new branch.
 async fn metadata_kinds_covered(rig: FakeRig) -> WeftResult<()> {
     use weft::NodeManifest;

@@ -268,7 +268,7 @@ fn activation_held(row: &str) -> String {
 /// holder claims it: a freed claim's last word is not the truth.
 fn held_select() -> String {
     format!(
-        "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.execution_id, \
+        "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.run_id, \
                 s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
                 s.kind_state, s.kind_state_seq, s.project_id, s.instance_id, s.holds, \
                 s.generation, s.held_failed, \
@@ -296,7 +296,7 @@ fn decode(r: sqlx::postgres::PgRow) -> anyhow::Result<SignalRowWire> {
         node_id: r.try_get("node_id")?,
         spec_json: r.try_get("spec_json")?,
         is_resume: r.try_get("is_resume")?,
-        execution_id: r.try_get("execution_id")?,
+        run_id: r.try_get("run_id")?,
         surface_kind,
         mount_path: r.try_get("mount_path")?,
         mount_methods: r.try_get("mount_methods")?,

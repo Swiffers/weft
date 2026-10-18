@@ -45,7 +45,7 @@ export interface RunSpec {
   fire?: [string, JsonValue];
   answers?: Answer[];
   caller?: JsonValue[];
-  frozen_from?: FrozenFrom;
+  frozenFrom?: FrozenFrom;
   expected?: Expected;
   /// Which instance of the program the run is for. Needed only when the
   /// run reaches something that exists once per instance.
@@ -62,10 +62,10 @@ export interface RunSettings {
   keeping?: 'fast' | 'durable';
   /** How long the run is kept once it ended: a whole number and a unit
    *  (`30m`, `12h`, `7d`), or `forever`. */
-  keep_for?: string;
+  keepFor?: string;
   /** How long, in seconds, a wait holds the run's worker while the run
    *  cannot pause, from the last time anything moved in it. */
-  hold_secs?: number;
+  holdSecs?: number;
 }
 
 /// The longest hold a run may ask for: 30 days.
@@ -111,21 +111,21 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   };
   const spec = object(value, 'spec');
-  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'instance', 'settings'], 'spec');
+  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozenFrom', 'expected', 'instance', 'settings'], 'spec');
   string(spec.name, 'name');
   if (spec.settings !== undefined) {
     const settings = object(spec.settings, 'settings');
-    fields(settings, ['keeping', 'keep_for', 'hold_secs'], 'settings');
+    fields(settings, ['keeping', 'keepFor', 'holdSecs'], 'settings');
     // A key left out (or null, which the runtime reads as left out) follows
     // the fired trigger.
     if (settings.keeping != null && settings.keeping !== 'fast' && settings.keeping !== 'durable') {
       throw new Error(`settings.keeping: '${String(settings.keeping)}' is neither 'fast' nor 'durable'`);
     }
-    if (settings.keep_for != null && (typeof settings.keep_for !== 'string' || !KEEP_FOR_PATTERN.test(settings.keep_for.trim()))) {
-      throw new Error(`settings.keep_for: '${String(settings.keep_for)}' is not how long to keep a run (\`30m\`, \`12h\`, \`7d\`, or \`forever\`)`);
+    if (settings.keepFor != null && (typeof settings.keepFor !== 'string' || !KEEP_FOR_PATTERN.test(settings.keepFor.trim()))) {
+      throw new Error(`settings.keepFor: '${String(settings.keepFor)}' is not how long to keep a run (\`30m\`, \`12h\`, \`7d\`, or \`forever\`)`);
     }
-    if (settings.hold_secs != null && (!Number.isInteger(settings.hold_secs) || (settings.hold_secs as number) < 0 || (settings.hold_secs as number) > MAX_HOLD_SECS)) {
-      throw new Error(`settings.hold_secs: '${String(settings.hold_secs)}' is not a whole number of seconds from 0 to ${MAX_HOLD_SECS} (30 days)`);
+    if (settings.holdSecs != null && (!Number.isInteger(settings.holdSecs) || (settings.holdSecs as number) < 0 || (settings.holdSecs as number) > MAX_HOLD_SECS)) {
+      throw new Error(`settings.holdSecs: '${String(settings.holdSecs)}' is not a whole number of seconds from 0 to ${MAX_HOLD_SECS} (30 days)`);
     }
   }
   if (spec.instance != null) {
@@ -152,26 +152,26 @@ export function parseRunSpec(value: unknown): RunSpec {
   // SYNC: answer refusals <-> crates/weft-core/src/run_spec.rs Answer TryFrom<AnswerFile>
   if (spec.answers !== undefined) for (const value of array(spec.answers, 'answers')) {
     const answer = object(value, 'answer');
-    fields(answer, ['node', 'frames', 'payload', 'skipped', 'gave_up', 'question'], 'answer');
+    fields(answer, ['node', 'frames', 'payload', 'skipped', 'gaveUp', 'question'], 'answer');
     string(answer.node, 'answer node');
     frames(answer.frames, 'answer frames');
     if (answer.skipped !== undefined && typeof answer.skipped !== 'boolean') throw new Error('answer: skipped must be true or false');
-    // A null `gave_up` is left out, as the Rust side reads it.
-    if (answer.gave_up != null) string(answer.gave_up, 'answer gave_up');
+    // A null `gaveUp` is left out, as the Rust side reads it.
+    if (answer.gaveUp != null) string(answer.gaveUp, 'answer gaveUp');
     // `payload: null` is a given null: only an absent payload is none.
     const said = [
       ...('payload' in answer ? ['a payload'] : []),
       ...(answer.skipped === true ? ['"skipped": true'] : []),
-      ...(answer.gave_up != null ? ['"gave_up"'] : []),
+      ...(answer.gaveUp != null ? ['"gaveUp"'] : []),
     ];
     if (said.length > 1) throw new Error(`the answer to '${answer.node}' says its wait ended more than one way (${said.join(' and ')}); a wait ends once, so keep only one`);
-    if (said.length === 0) throw new Error(`the answer to '${answer.node}' says nothing about how its wait ended; give the value the person answered ("payload"), "skipped": true if they skipped it, or "gave_up" with the error if the run gave it up`);
+    if (said.length === 0) throw new Error(`the answer to '${answer.node}' says nothing about how its wait ended; give the value the person answered ("payload"), "skipped": true if they skipped it, or "gaveUp" with the error if the run gave it up`);
   }
   if (spec.caller !== undefined) array(spec.caller, 'caller');
-  if (spec.frozen_from != null) {
-    const origin = object(spec.frozen_from, 'frozen_from');
-    fields(origin, ['version', 'execution_id', 'definition_hash'], 'frozen_from');
-    for (const key of ['version', 'execution_id', 'definition_hash']) string(origin[key], `frozen_from.${key}`);
+  if (spec.frozenFrom != null) {
+    const origin = object(spec.frozenFrom, 'frozenFrom');
+    fields(origin, ['version', 'runId', 'definitionHash'], 'frozenFrom');
+    for (const key of ['version', 'runId', 'definitionHash']) string(origin[key], `frozenFrom.${key}`);
   }
   if (spec.expected != null) {
     const expected = object(spec.expected, 'expected');
@@ -196,12 +196,12 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   }
   const normalized = { ...spec };
-  for (const key of ['group', 'fire', 'frozen_from', 'expected', 'instance']) if (normalized[key] === null) delete normalized[key];
+  for (const key of ['group', 'fire', 'frozenFrom', 'expected', 'instance']) if (normalized[key] === null) delete normalized[key];
   // A null setting is left out, on a copy: the caller's spec is never
   // changed by reading it.
   if (normalized.settings !== undefined) {
     const settings = { ...(normalized.settings as Record<string, unknown>) };
-    for (const key of ['keeping', 'keep_for', 'hold_secs']) if (settings[key] === null) delete settings[key];
+    for (const key of ['keeping', 'keepFor', 'holdSecs']) if (settings[key] === null) delete settings[key];
     normalized.settings = settings;
   }
   return normalized as unknown as RunSpec;
@@ -209,7 +209,7 @@ export function parseRunSpec(value: unknown): RunSpec {
 
 /** How one wait ended, as a frozen example holds it: the value the person
  *  gave as `payload` (`null` included), `skipped: true` for a person
- *  skipping it, or `gave_up` with the error the waiting step failed with
+ *  skipping it, or `gaveUp` with the error the waiting step failed with
  *  when the run gave the wait up. Exactly one of the three. */
 // SYNC: Answer <-> crates/weft-core/src/run_spec.rs Answer
 export type Answer = {
@@ -217,15 +217,15 @@ export type Answer = {
   frames?: Array<{ index: number }>;
   question?: JsonValue;
 } & (
-  | { payload: JsonValue; skipped?: false; gave_up?: never }
-  | { skipped: true; payload?: never; gave_up?: never }
-  | { gave_up: string; payload?: never; skipped?: false }
+  | { payload: JsonValue; skipped?: false; gaveUp?: never }
+  | { skipped: true; payload?: never; gaveUp?: never }
+  | { gaveUp: string; payload?: never; skipped?: false }
 );
 
 export interface FrozenFrom {
   version: string;
-  execution_id: string;
-  definition_hash: string;
+  runId: string;
+  definitionHash: string;
 }
 
 // SYNC: Expected <-> crates/weft-core/src/run_spec.rs Expected
@@ -259,8 +259,8 @@ export interface ProgramIdentity {
 export interface BakeSummary {
   program: ProgramIdentity;
   captured: string[];
-  execution_id: string;
-  at_unix: number;
+  runId: string;
+  atUnix: number;
 }
 
 /// Every entry is a place: a `locatedKey` (`one/Clean.strip` for a node
@@ -281,7 +281,7 @@ export interface RunSelection {
 export interface Resolved {
   selection: RunSelection;
   kicks: Array<{ node: string; frames?: Frame[]; firing: boolean; payload: JsonValue | null; port_snapshot?: JsonValue }>;
-  provided: Array<{ source_node: string; source_port: string; frames?: Frame[]; value: JsonValue; consumers: Array<[string, string]> }>;
+  provided: Array<{ sourceNode: string; sourcePort: string; frames?: Frame[]; value: JsonValue; consumers: Array<[string, string]> }>;
   crossings: CrossingPort[];
   warnings: string[];
 }
@@ -291,15 +291,15 @@ export interface CrossingPort {
   /// same key a `from` entry uses.
   node: string;
   port: string;
-  source_node: string;
-  source_port: string;
-  /// Whether something in the run needs this input (`needed_by` is set).
+  sourceNode: string;
+  sourcePort: string;
+  /// Whether something in the run needs this input (`neededBy` is set).
   required: boolean;
   /// The required input it ends up feeding: its own, or one inside the
   /// group, loop or included file it enters.
-  needed_by?: string;
+  neededBy?: string;
   /// Where to hand the missing value: the first start the value would pass.
-  hand_at?: StartPort;
+  handAt?: StartPort;
   supplied: boolean;
 }
 
@@ -342,8 +342,8 @@ export function specToRunArgs(spec: RunSpec, seeded = false): string[] {
   if (spec.instance) args.push('--instance', spec.instance);
   if (spec.settings?.keeping === 'durable') args.push('--durable');
   if (spec.settings?.keeping === 'fast') args.push('--fast');
-  if (spec.settings?.keep_for) args.push('--keep-for', spec.settings.keep_for);
-  if (spec.settings?.hold_secs != null) args.push('--hold-secs', String(spec.settings.hold_secs));
+  if (spec.settings?.keepFor) args.push('--keep-for', spec.settings.keepFor);
+  if (spec.settings?.holdSecs != null) args.push('--hold-secs', String(spec.settings.holdSecs));
   return args;
 }
 

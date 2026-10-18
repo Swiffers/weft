@@ -327,7 +327,7 @@ async fn oauth_complete(
 /// through the stored connection; the editor sees label/id pairs only.
 /// An ours-owned connection stores no credential of its own, so the
 /// runtime's credential source is asked for a design-time key,
-/// through the same meter allowlist the execution path enforces.
+/// through the same meter allowlist the run path enforces.
 async fn lookup(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -533,8 +533,8 @@ mod tests {
             "service": "fakeoauth",
             "acquisition": {
                 "kind": "oauth2",
-                "grant": { "kind": "authorization_code", "auth_url": "https://a/x" },
-                "token_url": "https://a/t"
+                "grant": { "kind": "authorization_code", "authUrl": "https://a/x" },
+                "tokenUrl": "https://a/t"
             },
             "auth": [{ "kind": "header", "name": "Authorization",
                        "value": "Bearer {token}" }]

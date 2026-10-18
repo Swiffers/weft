@@ -117,6 +117,11 @@ pub trait ObjectStore: Send + Sync {
     /// the post-condition "the key is gone" already holds.
     async fn delete(&self, key: &str) -> Result<()>;
 
+    /// Copy the object at `from` to `to`, inside the store, overwriting
+    /// whatever `to` held. Copying again is harmless. `Err` when `from`
+    /// is absent or the backend refuses.
+    async fn copy(&self, from: &str, to: &str) -> Result<()>;
+
     /// List every object whose key starts with `prefix`, in lexical key
     /// order. The store is flat, so this is a flat list of full keys; a
     /// folder view is the caller's projection over them.
@@ -451,6 +456,20 @@ impl S3ObjectStore {
     }
 }
 
+/// RFC 3986 encoding of one key segment: everything but the unreserved
+/// characters, as an S3 copy source spells a key.
+fn percent_encoded(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for b in segment.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
     async fn put(&self, key: &str, bytes: Bytes) -> Result<()> {
@@ -544,6 +563,24 @@ impl ObjectStore for S3ObjectStore {
             .send()
             .await
             .with_context(|| format!("object-store delete {key}"))?;
+        Ok(())
+    }
+
+    async fn copy(&self, from: &str, to: &str) -> Result<()> {
+        // The copy source is `<bucket>/<key>`, URL-encoded segment by
+        // segment (a key segment may hold any character a filename can).
+        let source: Vec<String> = std::iter::once(self.bucket.as_str())
+            .chain(from.split('/'))
+            .map(percent_encoded)
+            .collect();
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(source.join("/"))
+            .key(to)
+            .send()
+            .await
+            .with_context(|| format!("object-store copy {from} -> {to}"))?;
         Ok(())
     }
 
@@ -789,6 +826,7 @@ pub mod fake {
         Exists { key: String },
         Size { key: String },
         Delete { key: String },
+        Copy { from: String, to: String },
         List { prefix: String },
         PresignGet { key: String, audience: PresignAudience, ttl_secs: u64 },
         PresignPut { key: String, content_length: u64, audience: PresignAudience, ttl_secs: u64 },
@@ -1017,6 +1055,13 @@ pub mod fake {
         async fn size(&self, key: &str) -> Result<Option<u64>> {
             self.calls.lock().push(FakeCall::Size { key: key.to_string() });
             Ok(self.objects.lock().get(key).map(|b| b.len() as u64))
+        }
+
+        async fn copy(&self, from: &str, to: &str) -> Result<()> {
+            self.calls.lock().push(FakeCall::Copy { from: from.to_string(), to: to.to_string() });
+            let bytes = self.objects.lock().get(from).cloned().ok_or_else(|| anyhow::anyhow!("object-store copy {from}: no such object"))?;
+            self.objects.lock().insert(to.to_string(), bytes);
+            Ok(())
         }
 
         async fn delete(&self, key: &str) -> Result<()> {

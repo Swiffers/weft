@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 /// How a run that only waits outside waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +39,7 @@ pub(crate) struct Quiet {
 /// Every run of this worker that only waits outside, by how it waits, and
 /// how the door hears of a change.
 pub(crate) struct Holds {
-    quiet: Mutex<HashMap<ExecutionId, Quiet>>,
+    quiet: Mutex<HashMap<RunId, Quiet>>,
     /// Told whenever a run goes quiet or moves again, so the door's tick
     /// looks again at whether, and for how long, it may sleep
     /// (`crate::door::Door::wake`).
@@ -60,23 +60,23 @@ impl Holds {
 
     /// The runs that only wait, by how each waits, held still: no run goes
     /// quiet or moves again until the guard goes.
-    pub(crate) fn held_still(&self) -> std::sync::MutexGuard<'_, HashMap<ExecutionId, Quiet>> {
+    pub(crate) fn held_still(&self) -> std::sync::MutexGuard<'_, HashMap<RunId, Quiet>> {
         self.quiet.lock().expect("run holds")
     }
 
-    /// Run `execution_id`'s drive says how it waits ([`RunHold`]); its own
+    /// Run `run_id`'s drive says how it waits ([`RunHold`]); its own
     /// cap on this worker ends at `cap_ends` (unix seconds), never without
     /// one. Nothing is kept for it until it first goes quiet.
-    pub(crate) fn of(self: &Arc<Self>, execution_id: ExecutionId, cap_ends: Option<i64>) -> RunHold {
-        RunHold { holds: self.clone(), execution_id, cap_ends, quiet: AtomicBool::new(false) }
+    pub(crate) fn of(self: &Arc<Self>, run_id: RunId, cap_ends: Option<i64>) -> RunHold {
+        RunHold { holds: self.clone(), run_id, cap_ends, quiet: AtomicBool::new(false) }
     }
 
-    fn set(&self, execution_id: ExecutionId, how: Option<Quiet>) {
+    fn set(&self, run_id: RunId, how: Option<Quiet>) {
         let changed = {
             let mut quiet = self.quiet.lock().expect("run holds");
             match how {
-                Some(how) => quiet.insert(execution_id, how) != Some(how),
-                None => quiet.remove(&execution_id).is_some(),
+                Some(how) => quiet.insert(run_id, how) != Some(how),
+                None => quiet.remove(&run_id).is_some(),
             }
         };
         if changed {
@@ -90,7 +90,7 @@ impl Holds {
 /// touches the [`Holds`].
 pub(crate) struct RunHold {
     holds: Arc<Holds>,
-    execution_id: ExecutionId,
+    run_id: RunId,
     /// When the run's own cap on this worker ends (unix seconds).
     cap_ends: Option<i64>,
     /// Whether the run is among the quiet ones.
@@ -114,7 +114,7 @@ impl RunHold {
             return;
         }
         self.quiet.store(how.is_some(), Ordering::Release);
-        self.holds.set(self.execution_id, how);
+        self.holds.set(self.run_id, how);
     }
 }
 

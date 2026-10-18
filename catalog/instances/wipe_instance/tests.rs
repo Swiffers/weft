@@ -18,7 +18,7 @@ pub fn tests() -> Vec<NodeTest> {
 async fn order(rig: FakeRig) -> WeftResult<()> {
     rig.answer_program_call("weft.connections.forget", json!({ "forgotten": 2 }));
     rig.answer_program_call("weft.tokens.revoke", json!({ "revoked": 1 }));
-    rig.answer_program_call("weft.runs.clean", json!({ "deleted": 3, "cancelled": 0, "left_running": 0 }));
+    rig.answer_program_call("weft.runs.clean", json!({ "deleted": 3, "cancelled": 0, "leftRunning": 0 }));
     let ada = StorageScope::instance_of(InstanceId::new("ada").expect("a valid id"));
     let grace = StorageScope::instance_of(InstanceId::new("grace").expect("a valid id"));
     let theirs = rig.store_file_in(&ada, "notes.txt", "text/plain", "ada's notes");

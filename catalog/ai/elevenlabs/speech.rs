@@ -8,7 +8,7 @@
 
 use serde_json::{json, Map, Value};
 
-use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::flows::set_some;
 
@@ -19,7 +19,7 @@ const MAX_REQUEST_IDS: usize = 3;
 
 /// The query a speech request goes out with: its output format, and
 /// zero retention when the node turned logging off.
-pub fn query(ctx: &ExecutionContext, output_format: &str) -> WeftResult<String> {
+pub fn query(ctx: &RunContext, output_format: &str) -> WeftResult<String> {
     let logging: bool = ctx.inputs.get("enableLogging")?;
     let mut query = format!("output_format={}", urlencoding::encode(output_format));
     if !logging {
@@ -30,7 +30,7 @@ pub fn query(ctx: &ExecutionContext, output_format: &str) -> WeftResult<String> 
 
 /// Put every shared setting the node was given on `body`, refusing
 /// before anything is sent what ElevenLabs would refuse.
-pub fn shared_settings(ctx: &ExecutionContext, body: &mut Value, output_format: &str) -> WeftResult<()> {
+pub fn shared_settings(ctx: &RunContext, body: &mut Value, output_format: &str) -> WeftResult<()> {
     let language: Option<String> = ctx.inputs.opt("languageCode")?;
     // A whole number: the widget's step holds a wired value to whole
     // numbers too.
@@ -92,7 +92,7 @@ pub fn shared_settings(ctx: &ExecutionContext, body: &mut Value, output_format: 
 /// The `voice_settings` object from the node's `stability`,
 /// `similarityBoost`, `style`, `speed` and `speakerBoost` inputs, or
 /// `None` when none is set, so the voice keeps its own settings.
-pub fn voice_settings(ctx: &ExecutionContext) -> WeftResult<Option<Value>> {
+pub fn voice_settings(ctx: &RunContext) -> WeftResult<Option<Value>> {
     let mut settings = Map::new();
     for (port, key) in [("stability", "stability"), ("similarityBoost", "similarity_boost"), ("style", "style"), ("speed", "speed")] {
         if let Some(v) = ctx.inputs.opt::<f64>(port)? {
@@ -123,7 +123,7 @@ fn dictionary_locator(entry: &Value) -> WeftResult<Value> {
 }
 
 /// The `audio_effects` object, or `None` when the node set no effect.
-fn audio_effects(ctx: &ExecutionContext, output_format: &str) -> WeftResult<Option<Value>> {
+fn audio_effects(ctx: &RunContext, output_format: &str) -> WeftResult<Option<Value>> {
     let filter: Option<String> = ctx.inputs.opt("filterPreset")?;
     let distance: Option<f64> = ctx.inputs.opt("distance")?;
     let environment: Option<String> = ctx.inputs.opt("environment")?;

@@ -54,8 +54,8 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         woken(state, ON_PARKED_FIRE, crate::parked_drain::PARKED_FIRES, "hand queued trigger events to their runs", |s| async move {
             crate::parked_drain::drain_due(&s).await
         }),
-        // Storage plane: the durable terminate sweep (un-kept exec files of
-        // a terminated execution). The queue deletes an execution's row only after
+        // Storage plane: the durable terminate sweep (un-kept run files of
+        // a terminated run). The queue deletes a run's row only after
         // the broker confirms the sweep; a broker that keeps failing fails
         // the pass, and the next run ending queued for a sweep tries every
         // row again. The kept-file expiry sweep is the broker's own loop

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GoogleCalendarListEventsNode;
@@ -20,7 +20,7 @@ impl Node for GoogleCalendarListEventsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let calendar: String = ctx.inputs.get("calendar")?;
         let time_min: String = ctx.inputs.get("timeMin")?;

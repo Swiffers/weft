@@ -1,12 +1,12 @@
 //! WebSearch: search the web through Exa (semantic + keyword,
 //! auto-picked per query) and emit results with their page text, the
-//! shape an LLM step consumes directly.
+//! shape an LLM node consumes directly.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -21,7 +21,7 @@ impl Node for WebSearchNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
         let num_results: f64 = ctx.inputs.get("numResults")?;

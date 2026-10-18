@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmEmbedNode;
@@ -22,7 +22,7 @@ impl Node for LlmEmbedNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let (model, account) = super::provider::read_for(&ctx, "openrouter", "embeddings")?;
         let inputs: Vec<String> = ctx.inputs.list("texts")?;
         let dimensions: Option<f64> = ctx.inputs.opt("dimensions")?;

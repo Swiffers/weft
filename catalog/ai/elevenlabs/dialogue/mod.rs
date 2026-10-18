@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{audio_file_type, emit_audio_with_id, API};
 use super::flows::set_some;
@@ -32,7 +32,7 @@ impl Node for ElevenLabsDialogueNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let lines: Vec<DialogueLine> = ctx.inputs.get("lines")?;
         let model: String = ctx.inputs.get("model")?;

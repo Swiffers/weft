@@ -564,7 +564,7 @@ fn workers_through_sql(project_expr: &str, last_ms_expr: &str) -> String {
 #[cfg(any(test, feature = "db-tests"))]
 pub async fn judged_run_columns(pool: &PgPool) -> Result<()> {
     sqlx::query(
-        "CREATE TABLE run (execution_id UUID PRIMARY KEY, project_id UUID NOT NULL, state TEXT NOT NULL, started_at BIGINT NOT NULL, \
+        "CREATE TABLE run (run_id UUID PRIMARY KEY, project_id UUID NOT NULL, state TEXT NOT NULL, started_at BIGINT NOT NULL, \
          busy_since BIGINT, refusals SMALLINT NOT NULL DEFAULT 0, unreached SMALLINT NOT NULL DEFAULT 0)",
     )
     .execute(pool)

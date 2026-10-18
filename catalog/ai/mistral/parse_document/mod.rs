@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use weft::node::NodeOutput;
 use weft::access::client::{get_json, json_call, post_json, Multipart};
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MistralParseDocumentNode;
@@ -24,11 +24,11 @@ impl Node for MistralParseDocumentNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let file: FileHandle = ctx.inputs.get("file")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
+        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
         let http = ctx.client(&access).await?;
 
         // 1. Upload for OCR (two fields plus the file bytes).

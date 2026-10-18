@@ -2,7 +2,7 @@
 	import { untrack } from "svelte";
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
-	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
+	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeFiring, LiveDataItem, NodeFiringStatus } from "../../types";
 	import { declaredHomeValue, acceptsWire, ownValue, storedValueOf, portValueFirstForm, isIncludeNodeType } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
@@ -22,7 +22,7 @@
 	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { portDeleteAction } from "../../projection/header-ports";
 	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
-	import ExecutionInspector from './ExecutionInspector.svelte';
+	import FiringInspector from './FiringInspector.svelte';
 	import PayloadCards from './PayloadCards.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -44,7 +44,7 @@
 			label: string | null;
 			nodeType: NodeType;
 			/// Simplified view: render as a fixed square (icon + type label,
-			/// one in/out dot), no ports/config/body. Execution overlays
+			/// one in/out dot), no ports/config/body. Run overlays
 			/// (status glyph, inspector, glow) are kept.
 			simplified?: boolean;
 			/// The user aimed the run at this output node (right-click, "Set as
@@ -94,37 +94,37 @@
 			/// While a start is under way: since when, and what it waits on.
 			infraProgress?: ChangeProgress;
 			debugData?: unknown;
-			executions?: NodeExecution[];
+			firings?: NodeFiring[];
 			/// One IRC-style scrollable log per bus this node took part
 			/// in (live + replay, identical shape). Empty `[]` for
 			/// nodes that never touched a bus. Populated by ProjectEditorInner
-			/// from `executionState.busLogByBus` filtered by participant set.
+			/// from `runState.busLogByBus` filtered by participant set.
 			busLogs?: Array<{
 				busId: string;
 				events: BusInspectorEvent[];
 				meta?: BusMeta;
 			}>;
-			/// Execution-wide journal corruptions. Empty in the normal
+			/// Run-wide journal corruptions. Empty in the normal
 			/// case. The inspector renders a muted collapsed
 			/// disclosure at the bottom when non-empty; not alarming.
 			journalCorruptions?: Array<{
 				site: CorruptionSite;
 				reason: string;
 			}>;
-			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// The run's own tags (`ctx.tag_run`), the same on
 			/// every node; the inspector footer shows them.
-			executionTags?: string[];
+			runTags?: string[];
 			/// How the run ended, the same on every node; the inspector
 			/// footer names a cancel's cause from it, and the cancel card
 			/// falls back to it when the node's own row carries no reason.
-			runTerminal?: import('../../types').ExecutionTerminal;
+			runTerminal?: import('../../types').RunTerminal;
 			/// What this node is showing: its display, set ONLY for the
 			/// two kinds that have one (an infra node whose container
 			/// serves `/live`, and a trigger, whose signal kind serves
 			/// one). Other nodes get undefined and render no body panel
 			/// here. Distinct from `debugData`, which is the value
 			/// preview Debug-style nodes show under the body, drawn as
-			/// the same cards as the execution inspector.
+			/// the same cards as the run inspector.
 			bodyFeed?: NodeFeedState;
 		};
 		id: string;
@@ -171,14 +171,14 @@
 	// catalog entry and no name a person wrote), the type's label otherwise.
 	const typeName = $derived(isInclude ? includeName : typeConfig.label);
 
-	const executions = $derived(data.executions ?? []);
-	const latestExecution = $derived(executions[executions.length - 1]);
-	// `undefined` means idle (no execution yet), NOT a status value.
+	const firings = $derived(data.firings ?? []);
+	const latestFiring = $derived(firings[firings.length - 1]);
+	// `undefined` means idle (no run yet), NOT a status value.
 	// The status helpers are exhaustive over the real statuses only;
 	// the idle case is handled explicitly at each use site (no glyph,
 	// the node's own type color) instead of a `''` sentinel that fell
 	// through every switch and silently returned undefined.
-	const displayedStatus = $derived<NodeExecutionStatus | undefined>(latestExecution?.status);
+	const displayedStatus = $derived<NodeFiringStatus | undefined>(latestFiring?.status);
 	/// The ONE ring this node shows, picked here rather than left to the
 	/// stylesheet. An inherited firing is also a completed (or failed)
 	/// one, so both classes used to land on the node and which ring the
@@ -192,7 +192,7 @@
 				? 'node-waiting-glow'
 				: displayedStatus === 'failed'
 					? 'node-failed-glow'
-					: latestExecution?.inheritedFrom
+					: latestFiring?.inheritedFrom
 						? 'node-inherited-glow'
 						: displayedStatus === 'completed'
 							? 'node-completed-glow'
@@ -202,7 +202,7 @@
 	// that never touched a bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
-	const executionTags = $derived(data.executionTags ?? []);
+	const runTags = $derived(data.runTags ?? []);
 	const runTerminal = $derived(data.runTerminal);
 
 	const entryKinds: PortSpec[] = $derived(typeConfig.portsFromConfig?.specs ?? []);
@@ -273,7 +273,7 @@
 
 
 	/// Is there a latest value to preview? The preview itself is drawn
-	/// by `PayloadCards`, the same component the execution inspector
+	/// by `PayloadCards`, the same component the run inspector
 	/// uses, so a port reads the same in both places.
 	const hasDebugData = $derived(data.debugData !== undefined && data.debugData !== null);
 
@@ -288,7 +288,7 @@
 		if (!spec) return null;
 		// The declaration names the port WITH its side, so a node with
 		// a same-named input and output stays unambiguous.
-		const side = spec.output !== undefined ? latestExecution?.output : latestExecution?.input;
+		const side = spec.output !== undefined ? latestFiring?.output : latestFiring?.input;
 		const port = spec.output ?? spec.input;
 		if (typeof side !== 'object' || side === null || port === undefined) return null;
 		return parseFileValue(ownValue(side as Record<string, unknown>, port));
@@ -590,7 +590,7 @@
 	function remoteTextSource(key: string): string | null {
 		const ref = fileRefOf(key);
 		if (!ref || ref.marker !== 'asset') return null;
-		const remote = /^https?:\/\//.test(ref.path) || /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(ref.path);
+		const remote = /^https?:\/\//.test(ref.path) || /^(run|project|shared|asset)\/[^/]+\/[^/]+$/.test(ref.path);
 		return remote ? ref.path : null;
 	}
 
@@ -1050,11 +1050,11 @@
 					if (grant)
 						next[name] = {
 							scopes: grant.scopes,
-							verified: grant.permissions_verified,
-							valueNames: grant.value_names ?? [],
+							verified: grant.permissionsVerified,
+							valueNames: grant.valueNames ?? [],
 							owner: grant.owner,
 							service: ref.service,
-							hasCredential: grant.has_credential,
+							hasCredential: grant.hasCredential,
 						};
 				} catch (e) {
 					failure = e instanceof Error ? e.message : String(e);
@@ -1107,7 +1107,7 @@
 			if (!grant || grant.owner !== 'platform') continue;
 			const catalogue = specForService(grant.service)?.permissions ?? [];
 			for (const p of catalogue) {
-				if (p.own_only && required.includes(p.id)) {
+				if (p.ownOnly && required.includes(p.id)) {
 					out.push({
 						text: `'${p.label}' only works on your own ${grant.service} account (the shared credential's account would hold the result); connect your own on the access node.`,
 						link: p.guide?.link,
@@ -1543,7 +1543,7 @@
 {/snippet}
 
 <!-- The Debug-style preview: the node's latest payload, one card per
-     port, drawn by the same component as the execution inspector. The
+     port, drawn by the same component as the run inspector. The
      box scrolls and resizes; the flow classes keep a drag, a pan or a
      wheel inside it from moving the canvas instead. -->
 {#snippet debugDisplay()}
@@ -1662,7 +1662,7 @@
 	<!-- Simplified view. A bare node is a square: icon, type, editable label, one
 	     in/out dot. A node with LIVE DISPLAY content (infra feed, debug preview,
 	     image) grows into a card that shows that display under the header instead
-	     of staying square. Execution overlays (status glyph, inspector, glow) are
+	     of staying square. Run overlays (status glyph, inspector, glow) are
 	     kept; ports/config are not shown; structure is not editable, but the
 	     LABEL can still be renamed by double-click. -->
 	{@const Icon = typeConfig.icon}
@@ -1705,7 +1705,7 @@
 			{#if displayedStatus}
 				<span class="text-xs leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			{/if}
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeName} />
+			<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} label={data.label || typeName} />
 		</div>
 		<!-- Bare node: the content column is fixed to the square's inner width (the
 		     square side minus the 8px padding each side) so the node measures as a
@@ -1838,7 +1838,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeName} />
+			<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} label={data.label || typeName} />
 		{#if isInclude}
 			<button
 				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
@@ -2374,18 +2374,18 @@
 				{:else if displayedStatus === 'completed'}
 					<div class="debug-placeholder completed">
 						<span>✓</span>
-						<span>Execution complete</span>
+						<span>Run complete</span>
 					</div>
 				{:else if displayedStatus === 'failed'}
 					<div class="debug-placeholder completed" style="color: var(--color-red-500);">
 						<span>✗</span>
-						<span>Execution failed{latestExecution?.error ? `: ${latestExecution.error}` : ''}</span>
+						<span>Run failed{latestFiring?.error ? `: ${latestFiring.error}` : ''}</span>
 					</div>
 				{:else if displayedStatus === 'cancelled'}
 					<div class="debug-placeholder completed" style="color: #71717a;">
 						<span>■</span>
 						<span>
-							{latestExecution?.error
+							{latestFiring?.error
 								|| (runTerminal?.state === 'cancelled' ? runTerminal.reason : undefined)
 								|| 'Cancelled'}
 						</span>

@@ -17,9 +17,9 @@ async fn fetched_file_is_stored_and_downloadable() -> anyhow::Result<()> {
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
 
-    // The kept execution-scoped file is downloadable and matches the bytes the
+    // The kept run-scoped file is downloadable and matches the bytes the
     // program fetched.
-    let prefix = format!("exec/{}/", settled.execution_id);
+    let prefix = format!("run/{}/", settled.run_id);
     let key = storage::assert_file_contents(&disp, &prefix, &content).await?;
     eprintln!("stored file verified at key {key}");
 

@@ -105,11 +105,12 @@ node the operator thought was configured.
 
 ## Apps a node ships
 
-A node's own `metadata.json` can declare `accessApps` for public applications
-with no secret. Those need PKCE, and metadata carrying a `client_secret` is
-refused: node metadata is source, and source never holds secrets.
+A node's own `metadata.json` can also ship a public application, with no
+secret. It is not a one-click connection: the "Your own" page signs in with it
+when the person leaves every app field empty. For what it may carry, go and read [accessApps](../nodes/metadata.md#accessapps).
 
-An application with a secret belongs in this file.
+If your application has a secret, put it in this file instead, or paste it on
+the "Your own" page when you connect.
 
 ## Encryption
 

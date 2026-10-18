@@ -66,7 +66,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- 'failed' = the claimer hit a real error executing the
             --   verb; the worker / caller treats this as a failure.
             -- 'cancelled' = the command was abandoned (e.g. the
-            --   targeted node was removed before execution). NOT a
+            --   targeted node was removed before run). NOT a
             --   failure; surfaces as "no longer applicable".
             outcome           TEXT,
             -- Human-readable message accompanying the outcome.
@@ -289,7 +289,7 @@ pub struct DrainFirst {
     /// Until when (unix seconds); what is left then is cancelled.
     pub by_unix: i64,
     /// The run that asked, never cancelled by the wait.
-    pub asked_by: Option<weft_core::ExecutionId>,
+    pub asked_by: Option<weft_core::RunId>,
 }
 
 /// Enqueue a Stop or Terminate command. Returns its id. With `drain`, the
@@ -338,7 +338,7 @@ pub async fn issue_lifecycle(
 pub struct UpgradeWork {
     /// The places to cycle, every one of the owner's kind when empty.
     pub nodes: Vec<String>,
-    /// The running executions' answer, resolved when the upgrade was
+    /// The running runs' answer, resolved when the upgrade was
     /// asked for (the picker's, else the request's, else the default).
     pub running_policy: RunningPolicy,
     pub drain_timeout_secs: u64,
@@ -706,7 +706,7 @@ pub async fn request_cancel_owner(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = 'cancelled', \
-             outcome_message = 'cancelled by user before execution' \
+             outcome_message = 'cancelled by user before run' \
          WHERE {owner} AND claimed_by_replica IS NULL"
     ))
     .bind(project_id)

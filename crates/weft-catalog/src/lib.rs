@@ -40,6 +40,8 @@ use thiserror::Error;
 use weft_core::is_rust_identifier;
 use weft_core::node::{MetadataCatalog, NodeMetadata};
 
+mod spelling;
+
 /// Entry names that are never part of a node's source tree: build
 /// outputs, VCS/dependency caches, local secrets and databases. The
 /// runtime image carries weft's `catalog/` and `crates/` minus exactly
@@ -185,6 +187,32 @@ pub struct CatalogProblem {
     pub error: CatalogError,
 }
 
+/// One line of [`FsCatalog::warnings`]. Never a failure on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogWarning {
+    pub kind: WarningKind,
+    /// The line as a person reads it.
+    pub message: String,
+}
+
+/// What a [`CatalogWarning`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningKind {
+    /// A node or package left out of the catalog: one that failed to
+    /// load, a node not ready yet, a package with no node in it yet.
+    LeftOut,
+    /// A name a node spells off the weft way (see `spelling`). The node
+    /// loads as usual; the line names the node, its file, and the
+    /// spelling that fits.
+    Spelling,
+}
+
+impl std::fmt::Display for CatalogWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 #[derive(Debug)]
 pub struct FsCatalog {
     entries: HashMap<String, CatalogEntry>,
@@ -193,9 +221,10 @@ pub struct FsCatalog {
     packages: HashMap<PathBuf, Package>,
     /// Every node or package that failed to load, with its error.
     problems: Vec<CatalogProblem>,
-    /// One line per thing left out: each problem, each node not ready
-    /// yet (see `pending`), each package with no node in it yet.
-    warnings: Vec<String>,
+    /// One line per thing left out (each problem, each node not ready
+    /// yet, see `pending`, each package with no node in it yet), and one
+    /// per name a node spells off the weft way, which leaves nothing out.
+    warnings: Vec<CatalogWarning>,
     /// Nodes seen but left out: a folder with a `metadata.json` and no
     /// `mod.rs` yet (a specialist writes the description before the
     /// code). Type name to the folder. A build never references such a
@@ -282,9 +311,12 @@ impl FsCatalog {
         }
     }
 
-    /// One line per thing left out of the catalog: every problem, every
-    /// node not ready yet, every package with no node in it yet.
-    pub fn warnings(&self) -> &[String] {
+    /// One line per thing left out of the catalog (every problem, every
+    /// node not ready yet, every package with no node in it yet), and one
+    /// per name a node spells off the weft way (a port in snake_case, a
+    /// node type not in PascalCase), whose node still loads. `kind` tells
+    /// the two apart.
+    pub fn warnings(&self) -> &[CatalogWarning] {
         &self.warnings
     }
 
@@ -766,15 +798,43 @@ impl DiscoverCtx<'_> {
     /// an error in anyone's build), recorded so the compiler can name it
     /// when a program asks for it.
     fn leave_pending(&mut self, node_type: String, dir: PathBuf) {
-        self.cat.warnings.push(pending_reason(&node_type, &dir));
+        self.warn(WarningKind::LeftOut, pending_reason(&node_type, &dir));
         self.cat.pending.insert(node_type, dir);
     }
 
     /// A node or package that failed to load: left out, with its error,
     /// under the types it claims.
     fn record(&mut self, node_types: Vec<String>, error: CatalogError) {
-        self.cat.warnings.push(error.to_string());
+        self.warn(WarningKind::LeftOut, error.to_string());
         self.cat.problems.push(CatalogProblem { node_types, error });
+    }
+
+    fn warn(&mut self, kind: WarningKind, message: String) {
+        self.cat.warnings.push(CatalogWarning { kind, message });
+    }
+
+    /// The names a node or a package's defaults spell off the weft way,
+    /// one line each, naming `subject` and the `metadata.json` they are in.
+    fn warn_spelling(&mut self, subject: &str, file: &Path, messages: Vec<String>) {
+        for message in messages {
+            self.warn(WarningKind::Spelling, format!("{subject} ({}): {message}", file.display()));
+        }
+    }
+
+    /// What loading a node folder found, its spelling lines included.
+    fn take_loaded(&mut self, loaded: Loaded, dir: &Path) -> Option<CatalogEntry> {
+        let file = dir.join("metadata.json");
+        match loaded {
+            Loaded::Ready { entry, misspelled } => {
+                self.warn_spelling(&entry.node_type, &file, misspelled);
+                Some(*entry)
+            }
+            Loaded::Pending { node_type, misspelled } => {
+                self.warn_spelling(&node_type, &file, misspelled);
+                self.leave_pending(node_type, dir.to_path_buf());
+                None
+            }
+        }
     }
 
     /// Register every loaded unit, after leaving out each one that
@@ -838,6 +898,56 @@ impl DiscoverCtx<'_> {
             unit.entries.retain(|e| {
                 e.metadata.service.as_ref().is_none_or(|s| by_service[&s.service].len() == 1)
             });
+        }
+
+        // An app a node declares under `accessApps` is held to the keys
+        // its service's recipe declares, now that every recipe is known: a
+        // misspelled key would otherwise load as an extra registration
+        // value, silently. Only the services this catalog declares can be
+        // checked here (a project's catalog holds the standard nodes, so
+        // theirs always are); for any other, connect refuses an unknown
+        // key (`AppRegistration::validate`) but cannot tell a shipped app
+        // from a pasted one, so a secret field is refused only here.
+        let registration: BTreeMap<String, Vec<weft_core::access::spec::CredentialField>> = units_ok
+            .iter()
+            .flat_map(|u| &u.entries)
+            .filter_map(|e| e.metadata.service.as_ref())
+            .filter_map(|spec| match &spec.acquisition {
+                weft_core::access::spec::Acquisition::OAuth2 { registration_fields, .. } => {
+                    Some((spec.service.clone(), registration_fields.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut bad_apps: Vec<(String, PathBuf, String)> = Vec::new();
+        for entry in units_ok.iter().flat_map(|u| &u.entries) {
+            for (service, app) in &entry.metadata.access_apps {
+                let Some(fields) = registration.get(service) else { continue };
+                let refusal = app.check_keys(fields, true).err().or_else(|| {
+                    // A shipped app is public: like `client_secret`, a field the
+                    // service marks secret would go to everyone the node reaches.
+                    fields.iter().find(|f| f.secret && app.extra.contains_key(&f.name)).map(|f| {
+                        format!(
+                            "'{}' is a secret, and a metadata.json ships with the node to everyone who \
+                             uses it; leave it out here, and put an app that needs it in the install's \
+                             apps file (`access-apps.json`) or paste it on the editor's \"Your own\" page",
+                            f.name
+                        )
+                    })
+                })
+                // Whole, too: a required field left out or an empty label
+                // would otherwise wait for the first connect to show.
+                .or_else(|| app.validate(fields).err());
+                if let Some(error) = refusal {
+                    bad_apps.push((entry.node_type.clone(), entry.source_dir.join("metadata.json"), format!("accessApps.{service}: {error}")));
+                }
+            }
+        }
+        for (node_type, path, error) in &bad_apps {
+            self.record(vec![node_type.clone()], CatalogError::Parse { path: path.clone(), error: error.clone() });
+        }
+        for unit in &mut units_ok {
+            unit.entries.retain(|e| !bad_apps.iter().any(|(t, _, _)| *t == e.node_type));
         }
 
         // A unit whose every entry was taken out has nothing to serve;
@@ -1158,8 +1268,10 @@ fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
 /// the whole story).
 fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
     let entry = match load_node_entry(dir, dir, None, &ctx.broken_files) {
-        Ok(Loaded::Ready(e)) => *e,
-        Ok(Loaded::Pending { node_type }) => return ctx.leave_pending(node_type, dir.to_path_buf()),
+        Ok(loaded) => match ctx.take_loaded(loaded, dir) {
+            Some(entry) => entry,
+            None => return,
+        },
         Err(e) => return ctx.record(declared_type(dir).into_iter().collect(), e),
     };
     // The package name is the directory name. A non-UTF-8 name is a
@@ -1211,6 +1323,17 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     } else {
         None
     };
+    // The defaults' keys are checked once, here, against the file they
+    // are written in, so a default every member overrides is still checked
+    // and a member reports nothing for a key it inherits. What a member
+    // inherits as ports (or a `portsFromConfig` spec) is checked again on
+    // each member, against the merged metadata (`spelling::check_node`).
+    if let Some(defaults) = &package_defaults {
+        let mut misspelled = Vec::new();
+        spelling::check_document(defaults, &mut misspelled);
+        let subject = format!("package '{}' defaults", parsed.package.name);
+        ctx.warn_spelling(&subject, &dir.join("metadata.json"), misspelled);
+    }
 
     // Auto-detect members: every immediate subdir whose own
     // `read_node_dir` view contains a `metadata.json`. Shared `.rs` files live at the
@@ -1235,8 +1358,7 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
                 }
                 members_seen += 1;
                 match load_node_entry(&path, dir, package_defaults.as_ref(), &ctx.broken_files) {
-                    Ok(Loaded::Ready(entry)) => loaded.push(*entry),
-                    Ok(Loaded::Pending { node_type }) => ctx.leave_pending(node_type, path),
+                    Ok(found) => loaded.extend(ctx.take_loaded(found, &path)),
                     Err(e) => ctx.record(declared_type(&path).into_iter().collect(), e),
                 }
             }
@@ -1257,7 +1379,7 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     // name is claimed all the same, so a healthy package elsewhere under
     // that name is a collision rather than the quiet winner.
     if members_seen == 0 {
-        ctx.cat.warnings.push(format!(
+        ctx.warn(WarningKind::LeftOut, format!(
             "package '{}' at {} has no node in it yet (no subfolder with a metadata.json); it is \
              left out until it does",
             parsed.package.name,
@@ -1322,10 +1444,13 @@ fn load_package_defaults(
 }
 
 /// What loading a node folder found: a node ready to catalog, or one
-/// whose description exists but whose code does not yet.
+/// whose description exists but whose code does not yet. Either way,
+/// `misspelled` holds what `spelling` found off in the names the node
+/// chooses, one message each (the node is named when they become
+/// warnings).
 enum Loaded {
-    Ready(Box<CatalogEntry>),
-    Pending { node_type: String },
+    Ready { entry: Box<CatalogEntry>, misspelled: Vec<String> },
+    Pending { node_type: String, misspelled: Vec<String> },
 }
 
 /// Load a single node's metadata + form field specs.
@@ -1349,6 +1474,13 @@ fn load_node_entry(
             path: meta_path.clone(),
             error: e.to_string(),
         })?;
+    // The names this file spells, walked on the value already in memory
+    // and BEFORE the merge: an inherited key is the package root's to
+    // spell, and `register_package` checks that file once.
+    let mut misspelled = Vec::new();
+    if let Some(own) = value.as_object() {
+        spelling::check_document(own, &mut misspelled);
+    }
     if let Some(defaults) = package_defaults {
         // The node's own key wins wholesale (no deep merge). Same merge the
         // derive runs at compile time, so catalog metadata and the runtime
@@ -1401,18 +1533,23 @@ fn load_node_entry(
         });
     }
 
+    spelling::check_node(&metadata, &mut misspelled);
+
     // The description is sound; the code may not be there yet. The
     // same `read_node_dir` view the walk and the staging use decides.
     if !has_node_file(&read_node_dir(node_dir)?, "mod.rs") {
-        return Ok(Loaded::Pending { node_type: metadata.node_type });
+        return Ok(Loaded::Pending { node_type: metadata.node_type, misspelled });
     }
 
-    Ok(Loaded::Ready(Box::new(CatalogEntry {
-        node_type: metadata.node_type.clone(),
-        metadata,
-        source_dir: node_dir.to_path_buf(),
-        package_key: package_key.to_path_buf(),
-    })))
+    Ok(Loaded::Ready {
+        entry: Box::new(CatalogEntry {
+            node_type: metadata.node_type.clone(),
+            metadata,
+            source_dir: node_dir.to_path_buf(),
+            package_key: package_key.to_path_buf(),
+        }),
+        misspelled,
+    })
 }
 
 // ----- Errors --------------------------------------------------------
@@ -1677,7 +1814,7 @@ mod package_tests {
         assert!(reason.contains("is not ready yet") && reason.contains("no mod.rs yet") && reason.contains(&bare.display().to_string()), "{reason}");
         assert!(cat.unavailable("Nowhere").is_none());
         assert!(cat.problems().is_empty(), "not ready is no problem: {:?}", cat.problems());
-        assert_eq!(cat.warnings().iter().filter(|w| w.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
+        assert_eq!(cat.warnings().iter().filter(|w| w.message.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
         assert_eq!(cat.warnings().len(), 3, "nothing else complained: {:?}", cat.warnings());
     }
 
@@ -1697,7 +1834,151 @@ mod package_tests {
         assert!(cat.lookup("FirstInOrder").is_some());
         assert!(!cat.packages().any(|p| p.name == "fresh"));
         assert_eq!(cat.warnings().len(), 1, "{:?}", cat.warnings());
-        assert!(cat.warnings()[0].contains("has no node in it yet"), "{:?}", cat.warnings());
+        assert!(cat.warnings()[0].message.contains("has no node in it yet"), "{:?}", cat.warnings());
+    }
+
+    /// A project's own node is held to weft's spelling like the stdlib:
+    /// each name that is off is one warning naming the node, its file and
+    /// the fix, and the node still loads. The language's own `_should_flow`
+    /// (as an output: the loader refuses it as an input) and the keys of an
+    /// input's `default` (the node's data) are never flagged.
+    #[test]
+    fn a_project_node_spelled_off_the_weft_way_loads_with_one_warning_per_name() {
+        let root = tempfile::tempdir().expect("temp root");
+        let node = root.path().join("nodes/profile");
+        fs::create_dir_all(&node).expect("mkdir");
+        fs::write(
+            node.join("metadata.json"),
+            r#"{
+                "type": "Profile", "label": "Profile", "description": "d",
+                "inputs": [
+                    {"name": "user_id", "type": "String"},
+                    {"name": "prefs", "type": "JsonDict", "default": {"dark_mode": true}}
+                ],
+                "outputs": [{"name": "_should_flow", "type": "Boolean"}],
+                "features": {"isTrigger": true},
+                "firesWith": {"user_name": "String"}
+            }"#,
+        )
+        .expect("write");
+        fs::write(node.join("mod.rs"), "// impl\n").expect("write");
+
+        let cat = FsCatalog::discover(&root.path().join("nodes")).expect("catalog");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        assert!(cat.lookup("Profile").is_some(), "a spelling warning never leaves the node out");
+        let file = node.join("metadata.json").display().to_string();
+        let mut found: Vec<&str> = cat.warnings().iter().map(|w| w.message.as_str()).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                format!("Profile ({file}): fire payload field 'user_name' is not camelCase: write 'userName'"),
+                format!("Profile ({file}): input 'user_id' is not camelCase: write 'userId'"),
+            ]
+        );
+        assert!(cat.warnings().iter().all(|w| w.kind == WarningKind::Spelling), "{:?}", cat.warnings());
+    }
+
+    /// A package root's defaults are checked once, against the root's own
+    /// file, however many members inherit them.
+    #[test]
+    fn a_package_default_spelled_off_is_one_warning_on_the_package_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let pkg = root.path().join("tools");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"tools\"\n").expect("write");
+        fs::write(pkg.join("metadata.json"), r#"{"firesWith": {"user_name": "String"}}"#).expect("write");
+        for member in ["one", "two"] {
+            let dir = pkg.join(member);
+            fs::create_dir_all(&dir).expect("mkdir");
+            let ty = if member == "one" { "One" } else { "Two" };
+            fs::write(
+                dir.join("metadata.json"),
+                format!(r#"{{"type": "{ty}", "label": "{ty}", "description": "d", "inputs": [], "outputs": [], "features": {{"isTrigger": true}}}}"#),
+            )
+            .expect("write");
+            fs::write(dir.join("mod.rs"), "// impl\n").expect("write");
+        }
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        let file = pkg.join("metadata.json").display().to_string();
+        let found: Vec<&str> = cat.warnings().iter().map(|w| w.message.as_str()).collect();
+        assert_eq!(
+            found,
+            [format!(
+                "package 'tools' defaults ({file}): fire payload field 'user_name' is not camelCase: write 'userName'"
+            )]
+        );
+    }
+
+    /// An app declared under `accessApps` is held to the keys its
+    /// service declares, and to none it marks secret: either leaves every
+    /// node carrying the app out, naming the key and the keys a shipped app
+    /// may hold (never a secret one); a public app loads.
+    #[test]
+    fn an_access_app_with_a_key_its_service_does_not_declare_is_left_out() {
+        let load = |app: &str| {
+            let root = tempfile::tempdir().expect("temp root");
+            let stdlib = stdlib_root().expect("stdlib root");
+            copy_dir(&stdlib.join("slack"), &root.path().join("slack"));
+            fs::write(root.path().join("slack/metadata.json"), format!(r#"{{"accessApps": {{"slack": {app}}}}}"#)).expect("write");
+            (FsCatalog::discover(root.path()).expect("catalog"), root)
+        };
+
+        let (cat, _root) = load(r#"{"label": "Ours", "client_id": "c", "appTokn": "x"}"#);
+        let errors: Vec<String> = cat.problems().iter().map(|p| p.error.to_string()).collect();
+        assert!(!errors.is_empty(), "the misspelled key leaves the nodes out");
+        assert!(
+            errors.iter().all(|e| e.contains("accessApps.slack: the app has a field 'appTokn' its service does not declare")
+                && e.contains("(known: label, client_id)")),
+            "{errors:?}"
+        );
+
+        // `appToken` is a field Slack marks secret: a shipped app is public.
+        let (cat, _root) = load(r#"{"label": "Ours", "client_id": "c", "appToken": "x"}"#);
+        let errors: Vec<String> = cat.problems().iter().map(|p| p.error.to_string()).collect();
+        assert!(!errors.is_empty() && errors.iter().all(|e| e.contains("'appToken' is a secret")), "{errors:?}");
+
+        let (cat, _root) = load(r#"{"label": "", "client_id": "c"}"#);
+        let errors: Vec<String> = cat.problems().iter().map(|p| p.error.to_string()).collect();
+        assert!(!errors.is_empty() && errors.iter().all(|e| e.contains("needs a name")), "{errors:?}");
+
+        let (cat, _root) = load(r#"{"label": "Ours", "client_id": "c"}"#);
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+    }
+
+    /// A type the package root declares is checked where it is declared:
+    /// a field spelled off warns once, on the root, and the members whose
+    /// ports use the type add nothing.
+    #[test]
+    fn a_declared_types_field_spelled_off_warns_once_where_declared() {
+        let root = tempfile::tempdir().expect("temp root");
+        let pkg = root.path().join("tools");
+        fs::create_dir_all(&pkg).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"tools\"\n").expect("write");
+        fs::write(pkg.join("metadata.json"), r#"{"types": {"Place": "{ street_name: String }"}}"#).expect("write");
+        for ty in ["One", "Two"] {
+            let dir = pkg.join(ty.to_lowercase());
+            fs::create_dir_all(&dir).expect("mkdir");
+            fs::write(
+                dir.join("metadata.json"),
+                format!(
+                    r#"{{"type": "{ty}", "label": "{ty}", "description": "d", "inputs": [], "outputs": [{{"name": "place", "type": "Place"}}]}}"#
+                ),
+            )
+            .expect("write");
+            fs::write(dir.join("mod.rs"), "// impl\n").expect("write");
+        }
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        let file = pkg.join("metadata.json").display().to_string();
+        let found: Vec<&str> = cat.warnings().iter().map(|w| w.message.as_str()).collect();
+        assert_eq!(
+            found,
+            [format!("package 'tools' defaults ({file}): record field 'street_name' is not camelCase: write 'streetName'")]
+        );
     }
 
     /// A node whose metadata does not load is left out with its error,
@@ -1870,7 +2151,7 @@ mod package_tests {
     }
 
     /// The compact wiring view stamps each access node's access widget
-    /// with the service name and `connection_optional` from its own
+    /// with the service name and `connectionOptional` from its own
     /// recipe (the same stamp the compiler applies at enrich time),
     /// because the compact view drops the recipe itself and those two
     /// facts are what a wiring reader needs from it: which service,

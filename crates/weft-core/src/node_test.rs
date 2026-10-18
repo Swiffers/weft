@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::access::{Access, CredentialOwner, OpenedConnection};
 use crate::cancellation::CancellationFlag;
-use crate::context::{ContextHandle, EndpointMethod, ExecutionContext, LogLevel, ValueBag};
+use crate::context::{ContextHandle, EndpointMethod, RunContext, LogLevel, ValueBag};
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::node::{InputSpec, Node, NodeMetadata, NodeOutput};
@@ -113,11 +113,11 @@ pub struct TestReport {
     pub passed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Live only: the executions the run's cost is recorded
-    /// under (the pinned pre-registered execution when one was supplied,
+    /// Live only: the runs the run's cost is recorded
+    /// under (the pinned pre-registered run when one was supplied,
     /// throwaways otherwise).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub execution_ids: Vec<String>,
+    pub run_ids: Vec<String>,
 }
 
 /// `POST /projects/{id}/node-tests/run`: run one live test on the
@@ -349,7 +349,7 @@ impl NodeTest {
                 match tokio::time::timeout(deadline, body).await {
                     Ok(Ok(result)) => result,
                     Ok(Err(payload)) => Err(panic_error(self.name, payload)),
-                    Err(_) => Err(WeftError::NodeExecution(format!(
+                    Err(_) => Err(WeftError::NodeFailed(format!(
                         "test '{}' did not finish within {}s. Something in \
                          it is waiting for what it never gets: a cursor reading a bus nothing \
                          closes, a caller nobody attaches, a signal nobody answers. Close the bus \
@@ -471,7 +471,7 @@ where
         };
     let cleanup_result = cleanup().await;
     match (body_result, cleanup_result) {
-        (Err(body_err), Err(cleanup_err)) => Err(WeftError::NodeExecution(format!(
+        (Err(body_err), Err(cleanup_err)) => Err(WeftError::NodeFailed(format!(
             "{body_err}; AND cleanup then failed, leaving an artifact behind: {cleanup_err}"
         ))),
         (Err(body_err), Ok(())) => Err(body_err),
@@ -490,7 +490,7 @@ fn panic_error(test: &str, payload: Box<dyn std::any::Any + Send>) -> WeftError 
     } else {
         "<non-string panic payload>".to_string()
     };
-    WeftError::NodeExecution(format!("test '{test}' panicked: {message}"))
+    WeftError::NodeFailed(format!("test '{test}' panicked: {message}"))
 }
 
 impl std::fmt::Debug for NodeTest {
@@ -504,13 +504,13 @@ impl std::fmt::Debug for NodeTest {
     }
 }
 
-// ----- The run outcome ------------------------------------------------
+// ----- The rig outcome ------------------------------------------------
 
 /// What one node run through a rig produced: the body's result plus
 /// every emitted output, merged across `pulse_downstream` calls (each
 /// port appears at most once; the rigs enforce the production
 /// one-emission-per-port rule).
-pub struct RunOutcome {
+pub struct RigOutcome {
     /// The node body's own result. Tests that expect success `?` it
     /// via [`Self::ok`]; tests that expect a refusal match it.
     pub result: WeftResult<()>,
@@ -523,7 +523,7 @@ pub struct RunOutcome {
     pub infra_spec: Option<crate::infra::InfraSpec>,
 }
 
-impl RunOutcome {
+impl RigOutcome {
     /// The outcome with its result unwrapped: `outcome.ok()?` is the
     /// standard first line of a happy-path test, erroring with the
     /// body's own failure when the run did not succeed.
@@ -540,7 +540,7 @@ impl RunOutcome {
     pub fn failure(self) -> WeftResult<String> {
         match self.result {
             Err(e) => Ok(e.to_string()),
-            Ok(()) => Err(WeftError::NodeExecution(format!(
+            Ok(()) => Err(WeftError::NodeFailed(format!(
                 "the node was expected to refuse, but it succeeded and emitted {:?}",
                 self.outputs.keys().collect::<Vec<_>>()
             ))),
@@ -550,7 +550,7 @@ impl RunOutcome {
     /// The value emitted on `port`, loud when the body never emitted it.
     pub fn output(&self, port: &str) -> WeftResult<&Value> {
         self.outputs.get(port).ok_or_else(|| {
-            WeftError::NodeExecution(format!(
+            WeftError::NodeFailed(format!(
                 "the node emitted nothing on port '{port}' (emitted: {:?})",
                 self.outputs.keys().collect::<Vec<_>>()
             ))
@@ -561,7 +561,7 @@ impl RunOutcome {
     /// come from a `run_provision_infra` call.
     pub fn infra_spec(&self) -> WeftResult<&crate::infra::InfraSpec> {
         self.infra_spec.as_ref().ok_or_else(|| {
-            WeftError::NodeExecution(
+            WeftError::NodeFailed(
                 "this outcome carries no infra spec (only run_provision_infra produces one)"
                     .to_string(),
             )
@@ -702,7 +702,7 @@ impl FakeState {
         match scope {
             crate::storage::StorageScope::Instance { of: None } => {
                 let instance = self.instance.lock().unwrap().clone().ok_or_else(|| {
-                    WeftError::NodeExecution(
+                    WeftError::NodeFailed(
                         "instance storage in a run for no instance: name the instance, or give the run one with rig.instance(..)".into(),
                     )
                 })?;
@@ -740,7 +740,7 @@ impl FakeState {
     /// A fresh key inside `scope` (already resolved).
     fn mint_storage_key(&self, scope: &crate::storage::StorageScope, filename: &str) -> String {
         let wall = match scope {
-            crate::storage::StorageScope::Execution => "exec".to_string(),
+            crate::storage::StorageScope::Run => "run".to_string(),
             crate::storage::StorageScope::Project => "project".to_string(),
             crate::storage::StorageScope::Shared { name } => format!("shared/{name}"),
             crate::storage::StorageScope::Asset => "asset".to_string(),
@@ -828,9 +828,9 @@ struct FakeState {
     next_storage_key: AtomicU64,
     /// Every `ctx.log` line, in order.
     logs: Mutex<Vec<(LogLevel, String)>>,
-    /// Every tag the node put on its execution, in call order, one
-    /// entry per `ctx.tag_execution` call.
-    execution_tags: Mutex<Vec<Vec<String>>>,
+    /// Every tag the node put on its run, in call order, one
+    /// entry per `ctx.tag_run` call.
+    run_tags: Mutex<Vec<Vec<String>>>,
     /// Every `ctx.stop_tagged` the node asked for, in order. The fake
     /// stops nothing (there are no sibling runs here); it records the
     /// ask so a test can assert the node steered the right tag the
@@ -871,7 +871,7 @@ struct FakeState {
     /// with one counter, exactly as production journals them (a body
     /// that awaits then runs journals the run at index 1). Keyed the
     /// way production keys its journal, per node body (a node's run
-    /// and its trigger setup are two executions there, and two node
+    /// and its trigger setup are two runs there, and two node
     /// types never share one), and it lives on the RIG, not on one
     /// run's handle, so a second `rig.run(..)` of the same node on the
     /// same rig is a resume: it replays what the first recorded, a
@@ -955,7 +955,7 @@ impl FakeState {
             file_edits: Mutex::new(Vec::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
-            execution_tags: Mutex::new(Vec::new()),
+            run_tags: Mutex::new(Vec::new()),
             stops: Mutex::new(Vec::new()),
             program_calls: Mutex::new(Vec::new()),
             program_answers: Mutex::new(HashMap::new()),
@@ -977,7 +977,7 @@ impl FakeState {
         let Some(limit) = *self.stop_after_calls.lock().unwrap() else { return };
         let made = self.requests.lock().unwrap().len() + self.endpoint_calls.lock().unwrap().len();
         if made >= limit {
-            self.cancellation.cancel_because(crate::exec::CancelCause::User);
+            self.cancellation.cancel_because(crate::run::CancelCause::User);
         }
     }
 }
@@ -1177,7 +1177,7 @@ impl FakeRig {
     }
 
     /// Attach a scripted live caller for the next runs: what a Route or
-    /// Socket trigger's execution carries. Build it with
+    /// Socket trigger's run carries. Build it with
     /// `FakeCallerConnection::connected(config)`, script its handshake,
     /// body and inbound messages, run the node, then assert on its
     /// recorded calls (`heads`, `chunks`, `close_reason`, `calls`).
@@ -1195,7 +1195,7 @@ impl FakeRig {
         opts: crate::bus::BusOptions,
     ) -> WeftResult<(crate::bus::BusHandle, Value)> {
         let handle = crate::bus::BusHandle::create_with_options(opts)
-            .map_err(|e| WeftError::NodeExecution(format!("create bus: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("create bus: {e}")))?;
         let marker = handle.marker();
         self.state
             .buses
@@ -1445,7 +1445,7 @@ impl FakeRig {
     /// Run the node's `run` body: build the ctx from the node's own
     /// manifest (declared inputs/outputs) + `inputs` (a JSON object of
     /// input name -> value), capture everything it emits.
-    pub async fn run(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
+    pub async fn run(&self, node: &dyn Node, inputs: Value) -> RigOutcome {
         // `_feeds_alive` is LOAD-BEARING despite never being read: it
         // OWNS the run's generator feeds (the registry keeps only a
         // `Weak`, so these `Arc`s are what keep the markers
@@ -1455,7 +1455,7 @@ impl FakeRig {
         let (handle, ctx, _feeds_alive) = match self.build_ctx(node, RUN_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
-                return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
         let result = node.run(ctx).await;
@@ -1464,9 +1464,9 @@ impl FakeRig {
 
     /// Run an infra node's `provision_infra` body with throwaway
     /// identities. The declared spec is behind
-    /// [`RunOutcome::infra_spec`] for assertions.
-    pub async fn run_provision_infra(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
-        let empty = || RunOutcome {
+    /// [`RigOutcome::infra_spec`] for assertions.
+    pub async fn run_provision_infra(&self, node: &dyn Node, inputs: Value) -> RigOutcome {
+        let empty = || RigOutcome {
             result: Ok(()),
             outputs: Default::default(),
             closed_ports: Vec::new(),
@@ -1475,7 +1475,7 @@ impl FakeRig {
         // Keeps the run's generator feeds registered (see `run`).
         let (bag, _feeds_alive) = match manifest_input_bag(node.manifest(), &self.state.input_types.lock().unwrap(), inputs) {
             Ok(pair) => pair,
-            Err(e) => return RunOutcome { result: Err(e), ..empty() },
+            Err(e) => return RigOutcome { result: Err(e), ..empty() },
         };
         let ictx = crate::infra::InfraProvisionContext::new(
             uuid::Uuid::new_v4(),
@@ -1483,19 +1483,19 @@ impl FakeRig {
             "node-test".to_string(),
         );
         match node.provision_infra(ictx, bag).await {
-            Ok(spec) => RunOutcome { infra_spec: Some(spec), ..empty() },
-            Err(e) => RunOutcome { result: Err(e), ..empty() },
+            Ok(spec) => RigOutcome { infra_spec: Some(spec), ..empty() },
+            Err(e) => RigOutcome { result: Err(e), ..empty() },
         }
     }
 
     /// Run the node's `setup_trigger` body (a trigger registering its
     /// wake signal). Assert on [`Self::registered_signals`] after.
-    pub async fn run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
+    pub async fn run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RigOutcome {
         // Keeps the run's generator feeds registered (see `run`).
         let (handle, ctx, _feeds_alive) = match self.build_ctx(node, SETUP_TRIGGER_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
-                return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
         let result = node.setup_trigger(ctx).await;
@@ -1503,7 +1503,7 @@ impl FakeRig {
     }
 
     /// The journal a body of `node` replays and records: what
-    /// production keys by (execution, node, frames), here one sequence per
+    /// production keys by (run, node, frames), here one sequence per
     /// node TYPE and body kind, because a rig runs one instance of a
     /// type at a time (`NODE_UNDER_TEST_ID` is every node's id here).
     /// Two structs returning one manifest are one node to the rig.
@@ -1516,7 +1516,7 @@ impl FakeRig {
         node: &dyn Node,
         body: &str,
         inputs: Value,
-    ) -> WeftResult<(CaptureBox, ExecutionContext, RegisteredFeeds)> {
+    ) -> WeftResult<(CaptureBox, RunContext, RegisteredFeeds)> {
         let manifest = node.manifest();
         let custom = self.state.input_types.lock().unwrap().clone();
         let (mut bag, feeds) = manifest_input_bag(manifest, &custom, inputs)?;
@@ -1537,7 +1537,7 @@ impl FakeRig {
         if manifest.features.is_trigger {
             if let Some(payload) = &wake {
                 crate::node::check_fire_payload(&manifest.fires_with, Some(payload))
-                    .map_err(WeftError::NodeExecution)?;
+                    .map_err(WeftError::NodeFailed)?;
             }
         }
         // Declared overrides play the compiler's role for MustOverride
@@ -1551,7 +1551,7 @@ impl FakeRig {
         for (port, ty) in self.state.output_types.lock().unwrap().iter() {
             outputs.insert(port.clone(), ty.clone());
         }
-        // A resume loads the body's journal, exactly as the execution
+        // A resume loads the body's journal, exactly as the run
         // driver seeds a firing's awaited sequence from the fold: in
         // call-index order, whatever order the records landed in (two
         // steps started together record in completion order, and the
@@ -1585,7 +1585,7 @@ impl FakeRig {
     /// "application/pdf", bytes)})`. The same shape `ctx.storage`
     /// verbs mint during a run.
     pub fn store_file(&self, filename: &str, mime_type: &str, bytes: impl Into<Vec<u8>>) -> Value {
-        self.store_file_in(&crate::storage::StorageScope::Execution, filename, mime_type, bytes)
+        self.store_file_in(&crate::storage::StorageScope::Run, filename, mime_type, bytes)
     }
 
     /// [`Self::store_file`] inside `scope`: an instance's files
@@ -1635,7 +1635,7 @@ impl FakeRig {
             .get(key)
             .map(|e| e.meta.clone())
             .ok_or_else(|| {
-                WeftError::NodeExecution(format!("no stored file under key {key}"))
+                WeftError::NodeFailed(format!("no stored file under key {key}"))
             })
     }
 
@@ -1662,7 +1662,7 @@ impl FakeRig {
             .unwrap()
             .get(key)
             .map(|e| e.bytes.clone())
-            .ok_or_else(|| WeftError::NodeExecution(format!("no stored file under key {key}")))
+            .ok_or_else(|| WeftError::NodeFailed(format!("no stored file under key {key}")))
     }
 
     /// The live bus behind an emitted marker (`outcome.outputs["stream"]`),
@@ -1676,7 +1676,7 @@ impl FakeRig {
             .get(&marker.to_string())
             .map(|h| h.new_handle())
             .ok_or_else(|| {
-                WeftError::NodeExecution(
+                WeftError::NodeFailed(
                     "no bus behind this marker (the run never opened one)".to_string(),
                 )
             })
@@ -1728,7 +1728,7 @@ impl FakeRig {
     /// payload it got, in call order with the call index each landed
     /// at, for `node`'s run body. A second `rig.run(..)` of the node on
     /// the same rig replays them instead of running the step's work or
-    /// popping a new signal, the way a resumed execution replays its
+    /// popping a new signal, the way a resumed run replays its
     /// journal: run the node twice and this list still holds one entry
     /// per call, and the request log shows the provider was called
     /// once.
@@ -1736,10 +1736,10 @@ impl FakeRig {
         self.state.journal.lock().unwrap().get(&Self::journal_key(node, RUN_BODY)).cloned().unwrap_or_default()
     }
 
-    /// Every tag the node put on its execution, one list per
-    /// `ctx.tag_execution` call, in call order.
-    pub fn execution_tags(&self) -> Vec<Vec<String>> {
-        self.state.execution_tags.lock().unwrap().clone()
+    /// Every tag the node put on its run, one list per
+    /// `ctx.tag_run` call, in call order.
+    pub fn run_tags(&self) -> Vec<Vec<String>> {
+        self.state.run_tags.lock().unwrap().clone()
     }
 
     /// Every `ctx.stop_tagged` the node asked for, in order: the tag
@@ -1916,20 +1916,20 @@ fn declared_output_map(manifest: &NodeMetadata, config: &Value) -> HashMap<Strin
     declared
 }
 
-/// One ExecutionContext for a rig run: throwaway identities, the
+/// One RunContext for a rig run: throwaway identities, the
 /// node's real type/label from its manifest.
 fn test_context(
     manifest: &NodeMetadata,
     inputs: ValueBag,
     instance: Option<crate::instance::InstanceId>,
     handle: Arc<dyn ContextHandle>,
-) -> ExecutionContext {
-    ExecutionContext::new(
+) -> RunContext {
+    RunContext::new(
         uuid::Uuid::new_v4(),
         NODE_UNDER_TEST_ID.to_string(),
         manifest.node_type.clone(),
         None,
-        crate::ExecutionId::new_v4(),
+        crate::RunId::new_v4(),
         LoopFrames::default(),
         instance,
         inputs,
@@ -1984,7 +1984,7 @@ impl Capture {
         // the same gate here and there.
         for port in output.outputs.keys() {
             if !self.declared.contains_key(port) {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "the node emitted on undeclared output port '{port}'; declare it in \
                      metadata.json's outputs list, or correct the port name in the body"
                 )));
@@ -2000,7 +2000,7 @@ impl Capture {
         for (port, value) in &output.outputs {
             let declared = self.declared[port].port_value_type();
             if !declared.accepts_runtime_value(value) {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "the node emitted a value on port '{port}' that its declared type \
                      '{declared}' does not accept; nothing was sent and the port is still \
                      open, so this emission can be retried with a value that fits"
@@ -2010,7 +2010,7 @@ impl Capture {
         for port in output.outputs.keys() {
             let is_generator = self.declared[port].as_generator().is_some();
             if closed.iter().any(|p| p == port) {
-                return Err(WeftError::NodeExecution(if is_generator {
+                return Err(WeftError::NodeFailed(if is_generator {
                     format!("the node yielded on stream port '{port}' after closing it")
                 } else {
                     format!(
@@ -2020,7 +2020,7 @@ impl Capture {
                 }));
             }
             if !is_generator && recorded.contains_key(port) {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "the node touched output port '{port}' twice in one firing; each port \
                      can be emitted or closed at most once"
                 )));
@@ -2033,7 +2033,7 @@ impl Capture {
         // lifetime counter would falsely fail any high-volume
         // fire-and-forget producer that runs fine behind a keeping-up
         // consumer. The overrun contract is pinned at the engine layer
-        // instead (execution_driver_tests/stream.rs, deterministic
+        // instead (run_driver_tests/stream.rs, deterministic
         // gated-consumer constructions).
         for (port, value) in output.outputs {
             if self.declared[&port].as_generator().is_some() {
@@ -2047,7 +2047,7 @@ impl Capture {
 
     fn close_port(&self, port: &str) -> WeftResult<()> {
         if !self.declared.contains_key(port) {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "the node closed undeclared output port '{port}'"
             )));
         }
@@ -2060,7 +2060,7 @@ impl Capture {
         if closed.iter().any(|p| p == port)
             || (!is_generator && recorded.contains_key(port))
         {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "the node touched output port '{port}' twice in one firing; each port can \
                  be emitted or closed at most once (a stream port may yield then close once)"
             )));
@@ -2084,13 +2084,13 @@ impl Capture {
     /// instantly, so nothing is ever un-taken (see `pulse`).
     fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
         if self.declared.get(port).is_none_or(|t| t.as_generator().is_none()) {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "set_max_buffered_items on '{port}', which is not a Generator output of \
                  this node"
             )));
         }
         if items == 0 {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 "set_max_buffered_items(0): a cap of 0 could never accept even the first \
                  item"
                     .to_string(),
@@ -2099,7 +2099,7 @@ impl Capture {
         Ok(())
     }
 
-    fn into_outcome(self, result: WeftResult<()>) -> RunOutcome {
+    fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
         let mut outputs = self.outputs.into_inner().unwrap();
         // The runtime's catch, decided by the same function the engine
         // reads: a caught failure lands on `error` and the step ends
@@ -2128,7 +2128,7 @@ impl Capture {
                 outputs.insert(port.clone(), Value::Array(streams.remove(port).unwrap_or_default()));
             }
         }
-        RunOutcome {
+        RigOutcome {
             result,
             outputs,
             closed_ports: self.closed_ports.into_inner().unwrap(),
@@ -2146,12 +2146,12 @@ enum CaptureBox {
 }
 
 impl CaptureBox {
-    fn into_outcome(self, result: WeftResult<()>) -> RunOutcome {
+    fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
         fn unwrap_capture<T>(handle: Arc<T>, capture: impl FnOnce(T) -> Capture) -> Capture {
             match Arc::try_unwrap(handle) {
                 Ok(h) => capture(h),
                 Err(_) => panic!(
-                    "the node's body leaked its ExecutionContext past its own return (a \
+                    "the node's body leaked its RunContext past its own return (a \
                      spawned task holding ctx?); a node must not outlive its firing"
                 ),
             }
@@ -2186,7 +2186,7 @@ struct TestHandle {
     /// from the body.
     publishes: Option<String>,
     /// Whether the node under test declares a Generator input, so the
-    /// rig refuses `await_signal` exactly where an execution would.
+    /// rig refuses `await_signal` exactly where a run would.
     has_generator_input: bool,
     /// Which of the rig's journals this body records into.
     journal_key: String,
@@ -2229,15 +2229,15 @@ impl ContextHandle for TestHandle {
 
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
         // Same refusals as the production handle, in production's
-        // order: a green node test on a body an execution would refuse
+        // order: a green node test on a body a run would refuse
         // is the costly divergence.
         if self.capture.has_touched_a_stream() {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 crate::context::streamed_then_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
         if self.has_generator_input {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 crate::context::stream_consumer_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
@@ -2249,7 +2249,7 @@ impl ContextHandle for TestHandle {
         match replay_await(&mut self.awaited_sequence.lock().unwrap(), call_index)? {
             Some(ReplayedAwait::Resolved(payload)) => return Ok(payload),
             Some(ReplayedAwait::Pending { token }) => {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "the rig's journal holds an unanswered await ({token}) at call_index={call_index}, \
                      which it never records: every await it journals was answered when it was made"
                 )));
@@ -2486,8 +2486,8 @@ impl ContextHandle for TestHandle {
         Ok(())
     }
 
-    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
-        self.state.execution_tags.lock().unwrap().push(tags);
+    async fn tag_run(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.state.run_tags.lock().unwrap().push(tags);
         Ok(())
     }
 
@@ -2596,7 +2596,7 @@ impl ContextHandle for TestHandle {
         // marker resolves back (`ctx.bus`, and the test's own
         // `rig.bus` read after the run).
         let handle = crate::bus::BusHandle::create_with_options(opts)
-            .map_err(|e| WeftError::NodeExecution(format!("create bus: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("create bus: {e}")))?;
         let marker = handle.marker();
         self.state
             .buses
@@ -2614,7 +2614,7 @@ impl ContextHandle for TestHandle {
             .get(&marker.to_string())
             .map(|h| h.new_handle())
             .ok_or_else(|| {
-                WeftError::NodeExecution(
+                WeftError::NodeFailed(
                     "no bus behind this marker (the run never opened one)".to_string(),
                 )
             })
@@ -2632,10 +2632,10 @@ impl ContextHandle for TestHandle {
     ) -> WeftResult<Value> {
         let bytes = crate::storage::collect_stream(data)
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("fake storage put: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("fake storage put: {e}")))?;
         let scope = self.state.resolve_scope(scope)?;
         if keep.is_some() && scope == crate::storage::StorageScope::Asset {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 "an asset's lifetime follows the source that references it; it takes no keep".into(),
             ));
         }
@@ -2645,14 +2645,14 @@ impl ContextHandle for TestHandle {
         let identity_key = identity.map(|i| (scope.clone(), i.to_string()));
         let key = self.state.mint_storage_key(&scope, filename);
         // As the store records it: the keep flag is the end-of-run
-        // exemption only an execution file has; the lifetime applies in
+        // exemption only a run file has; the lifetime applies in
         // every scope.
         let meta = crate::storage::StoredFileMeta {
             key: key.clone(),
             mime_type: mime_type.to_string(),
             size_bytes: bytes.len() as u64,
             filename: filename.to_string(),
-            keep: keep.is_some() && scope == crate::storage::StorageScope::Execution,
+            keep: keep.is_some() && scope == crate::storage::StorageScope::Run,
             expires_at_unix: None,
             keep_ttl_secs: keep.and_then(crate::storage::KeepTtl::secs),
             created_at_unix: 0,
@@ -2694,9 +2694,9 @@ impl ContextHandle for TestHandle {
             .get(url)
             .send()
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("fake put_from_url: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("fake put_from_url: {e}")))?;
         if !resp.status().is_success() {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "fake put_from_url: the canned route answered {}",
                 resp.status()
             )));
@@ -2723,7 +2723,7 @@ impl ContextHandle for TestHandle {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("fake put_from_url body: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("fake put_from_url body: {e}")))?;
         self.storage_put(scope, identity, crate::storage::bytes_stream(bytes), &mime, &name, keep, None)
             .await
     }
@@ -2738,7 +2738,7 @@ impl ContextHandle for TestHandle {
         }
         let store = self.state.storage.lock().unwrap();
         let entry = store.get(key).ok_or_else(|| {
-            WeftError::NodeExecution(format!("fake storage holds no file at key '{key}'"))
+            WeftError::NodeFailed(format!("fake storage holds no file at key '{key}'"))
         })?;
         Ok((entry.meta.clone(), crate::storage::bytes_stream(entry.bytes.clone())))
     }
@@ -2760,7 +2760,7 @@ impl ContextHandle for TestHandle {
                 self.state.identities.lock().unwrap().retain(|(_, minted)| minted != key);
                 Ok(())
             }
-            None => Err(WeftError::NodeExecution(format!(
+            None => Err(WeftError::NodeFailed(format!(
                 "fake storage holds no file at key '{key}'"
             ))),
         }
@@ -2782,13 +2782,13 @@ impl ContextHandle for TestHandle {
     ) -> WeftResult<crate::storage::ReplaceOutcome> {
         let bytes = crate::storage::collect_stream(data)
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("fake storage replace: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("fake storage replace: {e}")))?;
         let mut store = self.state.storage.lock().unwrap();
         let entry = store.get_mut(key).ok_or_else(|| {
-            WeftError::NodeExecution(format!("fake storage holds no file at key '{key}'"))
+            WeftError::NodeFailed(format!("fake storage holds no file at key '{key}'"))
         })?;
         if entry.scope == crate::storage::StorageScope::Asset {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 "an asset is managed by the pre-build asset sync; node code never replaces one".into(),
             ));
         }
@@ -2815,17 +2815,17 @@ impl ContextHandle for TestHandle {
             Some(entry) => {
                 match entry.scope {
                     crate::storage::StorageScope::Asset => {
-                        return Err(WeftError::NodeExecution(
+                        return Err(WeftError::NodeFailed(
                             "an asset's lifetime follows the source that references it; it takes no keep".into(),
                         ))
                     }
-                    crate::storage::StorageScope::Execution => entry.meta.keep = true,
+                    crate::storage::StorageScope::Run => entry.meta.keep = true,
                     _ => {}
                 }
                 entry.meta.keep_ttl_secs = ttl.secs();
                 Ok(())
             }
-            None => Err(WeftError::NodeExecution(format!(
+            None => Err(WeftError::NodeFailed(format!(
                 "fake storage holds no file at key '{key}'"
             ))),
         }
@@ -3001,7 +3001,7 @@ pub enum HandleRole<'a> {
 }
 
 /// The two bodies a rig runs for a node, each with a journal of its
-/// own on the rig, as each is its own execution in production.
+/// own on the rig, as each is its own run in production.
 const RUN_BODY: &str = "run";
 const SETUP_TRIGGER_BODY: &str = "setup_trigger";
 
@@ -3022,8 +3022,8 @@ pub const NODE_TEST_HARNESS_ID: &str = "node-test-harness";
 /// Builds the production `ContextHandle` for one live-rig actor, from
 /// its role, its declared output map, and whether it declares a
 /// Generator input (so the production `await_signal` guard applies in
-/// a live test exactly as in an execution). The runtime composes it
-/// (broker clients, throwaway execution identity, no-op journal) and
+/// a live test exactly as in a run). The runtime composes it
+/// (broker clients, throwaway run identity, no-op journal) and
 /// hands it to the runner; weft-core only names the seam so
 /// [`NodeTest`] can be declared without depending on the runtime
 /// crate.
@@ -3140,7 +3140,7 @@ impl LiveRig {
         )?;
         handle
             .storage_put(
-                &crate::storage::StorageScope::Execution,
+                &crate::storage::StorageScope::Run,
                 None,
                 crate::storage::bytes_stream(bytes::Bytes::from(bytes.into())),
                 mime_type,
@@ -3166,7 +3166,7 @@ impl LiveRig {
         let (_, stream) = handle.storage_get(&key, None).await?;
         crate::storage::collect_stream(stream)
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("read the stored file {key}: {e}")))
+            .map_err(|e| WeftError::NodeFailed(format!("read the stored file {key}: {e}")))
     }
 
     /// Open the test's declared-service grant through the PRODUCTION
@@ -3214,7 +3214,7 @@ impl LiveRig {
     /// Run the node's `run` body against the production handle,
     /// capturing outputs at the ctx seam (there is no downstream graph
     /// in a node test, so pulses are recorded, not routed).
-    pub async fn run(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
+    pub async fn run(&self, node: &dyn Node, inputs: Value) -> RigOutcome {
         let manifest = node.manifest();
         let custom = self.input_types.lock().unwrap().clone();
         // Keeps the run's generator feeds registered (see the fake
@@ -3222,7 +3222,7 @@ impl LiveRig {
         let (bag, _feeds_alive) = match manifest_input_bag(manifest, &custom, inputs) {
             Ok(pair) => pair,
             Err(e) => {
-                return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
         let has_generator_input = manifest.has_generator_input();
@@ -3232,7 +3232,7 @@ impl LiveRig {
         let config = match bag.object() {
             Ok(obj) => Value::Object(obj.clone()),
             Err(e) => {
-                return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
         let mut outputs_by_name = declared_output_map(manifest, &config);
@@ -3246,7 +3246,7 @@ impl LiveRig {
         ) {
             Ok(handle) => handle,
             Err(e) => {
-                return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
         let handle = Arc::new(CapturingHandle {
@@ -3282,7 +3282,7 @@ impl ContextHandle for CapturingHandle {
         // handle's own streamed-then-suspend guard never sees them;
         // apply it at the capture layer where the truth lives.
         if self.capture.has_touched_a_stream() {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 crate::context::streamed_then_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
@@ -3358,8 +3358,8 @@ impl ContextHandle for CapturingHandle {
         self.inner.log(level, message).await
     }
 
-    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
-        self.inner.tag_execution(tags).await
+    async fn tag_run(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.inner.tag_run(tags).await
     }
 
     async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
@@ -3564,7 +3564,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Node for ProbeNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let text: String = ctx.inputs.get("text")?;
             let client = ctx.client(&access).await?;
@@ -3615,7 +3615,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Node for PollingNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let cancelled = ctx.cancellation();
             loop {
                 let status = crate::access::client::get_json(
@@ -3672,18 +3672,18 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for SteeringNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let text: String = ctx.inputs.get("text")?;
-            ctx.tag_execution([text.as_str(), "batch_a"]).await?;
+            ctx.tag_run([text.as_str(), "batch_a"]).await?;
             ctx.stop_tagged(text.as_str(), crate::tag::StopSelf::Keep).await?;
             ctx.stop_tagged("batch_a", crate::tag::StopSelf::Include).await?;
             // An empty tag is refused at the ctx, before the handle
             // sees it (any other string is normalized into a tag). So
             // is an empty tag list: "at least one tag" is part of the
             // ctx contract, not only the broker's.
-            let bad = ctx.tag_execution([""]).await;
+            let bad = ctx.tag_run([""]).await;
             assert!(matches!(bad, Err(WeftError::Input(_))), "{bad:?}");
-            let empty = ctx.tag_execution(Vec::<String>::new()).await;
+            let empty = ctx.tag_run(Vec::<String>::new()).await;
             assert!(matches!(empty, Err(WeftError::Input(_))), "{empty:?}");
             ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
         }
@@ -3697,7 +3697,7 @@ mod tests {
             .ok()
             .expect("steering run succeeds");
         assert_eq!(
-            rig.execution_tags(),
+            rig.run_tags(),
             vec![vec!["user_7".to_string(), "batch_a".to_string()]],
             "the refused tag was never recorded"
         );
@@ -3744,7 +3744,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for StorageProbe {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let storage = ctx.storage(crate::storage::StorageScope::Project);
             let put = storage
                 .put(&b"v1"[..], "text/plain", "a.txt", Some(crate::storage::KeepTtl::Secs { secs: 60 }))
@@ -3819,7 +3819,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for HeaderReadingNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let client = ctx.client(&access).await?;
             let resp = client
@@ -3882,7 +3882,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for PublishingNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let client = ctx.client(&access).await?;
             let published = ctx
@@ -3932,7 +3932,7 @@ mod tests {
         );
     }
 
-    /// Two node types on one rig are two executions in production, with
+    /// Two node types on one rig are two runs in production, with
     /// a journal each: the second never replays the first's steps.
     #[tokio::test]
     async fn another_node_on_the_same_rig_has_its_own_journal() {
@@ -3978,7 +3978,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for AskThenPublishNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let client = ctx.client(&access).await?;
             let answer = if self.ask {
@@ -4064,7 +4064,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for DoubleEmitNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
             ctx.pulse_downstream(NodeOutput::new().set("done", false)).await
         }
@@ -4078,7 +4078,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for UndeclaredPortNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             ctx.pulse_downstream(NodeOutput::new().set("nope", 1)).await
         }
     }
@@ -4113,7 +4113,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for WrongTypeNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             // `done` is declared Boolean; a string must be refused.
             ctx.pulse_downstream(NodeOutput::new().set("done", "yes")).await
         }
@@ -4145,7 +4145,7 @@ mod tests {
                 "description": "test-only node",
                 "inputs": [
                     {"name": "account", "type": "Access", "required": true,
-                     "requiresValues": ["smtp_host"],
+                     "requiresValues": ["smtpHost"],
                      "requiresScopes": ["mail.send"]}
                 ],
                 "outputs": [{"name": "done", "type": "Boolean"}]
@@ -4162,7 +4162,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for RequiringNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let access: Access = ctx.inputs.get("account")?;
             let _conn = ctx.open(&access).await?;
             ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
@@ -4182,13 +4182,13 @@ mod tests {
             .result
             .expect_err("missing value refused")
             .to_string();
-        assert!(err.contains("no value 'smtp_host'"), "{err}");
-        assert!(err.contains("rig.connection_value(\"mail\", \"smtp_host\""), "{err}");
+        assert!(err.contains("no value 'smtpHost'"), "{err}");
+        assert!(err.contains("rig.connection_value(\"mail\", \"smtpHost\""), "{err}");
 
         // Value present, no permissions declared: the permission check
         // is skipped and the run succeeds.
         let rig = FakeRig::new();
-        rig.connection_value("mail", "smtp_host", "smtp.example.com");
+        rig.connection_value("mail", "smtpHost", "smtp.example.com");
         rig.run(&RequiringNode, json!({"account": rig.access("mail")}))
             .await
             .ok()
@@ -4196,7 +4196,7 @@ mod tests {
 
         // A declared granted set missing the required permission: loud.
         let rig = FakeRig::new();
-        rig.connection_value("mail", "smtp_host", "smtp.example.com");
+        rig.connection_value("mail", "smtpHost", "smtp.example.com");
         rig.connection_permissions("mail", &["mail.read"]);
         let err = rig
             .run(&RequiringNode, json!({"account": rig.access("mail")}))
@@ -4208,7 +4208,7 @@ mod tests {
 
         // The granted set covering the requirement passes.
         let rig = FakeRig::new();
-        rig.connection_value("mail", "smtp_host", "smtp.example.com");
+        rig.connection_value("mail", "smtpHost", "smtp.example.com");
         rig.connection_permissions("mail", &["mail.read", "mail.send"]);
         rig.run(&RequiringNode, json!({"account": rig.access("mail")}))
             .await
@@ -4224,7 +4224,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for AwaitingNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let answer = ctx
                 .await_signal(crate::signal::timer::Timer {
                     spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
@@ -4282,7 +4282,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for StreamConsumerNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             if self.awaits {
                 ctx.await_signal(crate::signal::timer::Timer {
                     spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
@@ -4345,7 +4345,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for EmitThenAwaitNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await?;
             let answer = ctx
                 .await_signal(crate::signal::timer::Timer {
@@ -4387,7 +4387,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for YieldThenAwaitNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             ctx.pulse_downstream(NodeOutput::new().set("rows", json!(1))).await?;
             ctx.await_signal(crate::signal::timer::Timer {
                 spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
@@ -4423,7 +4423,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for WakeEchoNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let event: Value = ctx.wake.get("event")?;
             ctx.pulse_downstream(NodeOutput::new().set("reply", event)).await
         }
@@ -4455,8 +4455,8 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for StorageRoundTripNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-            let storage = ctx.storage(crate::storage::StorageScope::Execution);
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let storage = ctx.storage(crate::storage::StorageScope::Run);
             let stored = storage.put(bytes::Bytes::from_static(b"hello"), "text/plain", "h.txt", None).await?;
             let handle = crate::storage::FileHandle::from_value(&stored)
                 .map_err(|e| node_error(format!("parse stored value: {e}")))?;
@@ -4588,7 +4588,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for PlainHttpNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let resp = ctx
                 .http()
                 .get("https://public.example/feed?page=2&size=10")
@@ -4648,7 +4648,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Node for SharedInfraNode {
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let service: crate::infra::InfraHandle = ctx.inputs.get("service")?;
             let reply = ctx.endpoint_of(&service).await?.action("ping", json!({"n": 1})).await?;
             ctx.pulse_downstream(NodeOutput::new().set("reply", reply)).await

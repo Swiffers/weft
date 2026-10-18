@@ -27,6 +27,7 @@ pub struct SharedAppChoice {
 /// probe uses (the editor hides what is not offered; it never greys).
 // SYNC: DoorsAnswer <-> packages/weft-connect/src/core/wire.ts DoorsStatus (flattens it in)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DoorsAnswer {
     /// The registered apps, one shared-door option each (oauth
     /// services only). Empty = the one-click door is hidden.
@@ -43,6 +44,7 @@ pub struct DoorsAnswer {
 /// (an identity that appeared on the first run and vanished on the
 /// second was the bug this shape prevents).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublishedConnection {
     /// The grant row's id. A string like every marker id on this wire.
     pub connection_id: String,
@@ -63,6 +65,7 @@ pub struct DoorsRequest {
 /// (only it knows the public host).
 // SYNC: DoorsStatus <-> packages/weft-connect/src/core/wire.ts DoorsStatus
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DoorsStatus {
     /// The broker's probe answer (shared-door options + the
     /// runtime-credential flag), flattened onto this wire unchanged.
@@ -86,6 +89,7 @@ pub struct DoorsStatus {
 /// second call.
 // SYNC: GrantSummary <-> packages/weft-connect/src/core/wire.ts GrantSummary
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GrantSummary {
     pub id: uuid::Uuid,
     pub service: String,
@@ -154,6 +158,7 @@ pub struct SharedCredentialsAnswer {
 /// is refused here; that is [`BeginOAuth`].
 // SYNC: ConnectDirect <-> packages/weft-connect/src/core/transport.ts DirectConnect
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectDirect {
     pub spec: AccessSpec,
     /// Which door the user walked through. The SHARED door of a
@@ -185,7 +190,7 @@ pub struct ConnectDirect {
     #[serde(default)]
     pub registration: Option<AppRegistration>,
     /// The user pasted a ready credential through the service's
-    /// `own_page.paste` section instead of going through an app: the
+    /// `ownPage.paste` section instead of going through an app: the
     /// connect runs on [`AccessSpec::paste_variant`] (a `Static`
     /// acquisition over the paste fields).
     #[serde(default)]
@@ -207,7 +212,7 @@ fn own_door() -> Door {
 }
 
 /// The "Create it for me" app mint as it travels the wire (editor ->
-/// dispatcher -> broker): the service's spec (whose `own_page.mint`
+/// dispatcher -> broker): the service's spec (whose `ownPage.mint`
 /// recipe runs) and the ticked permissions baked into the manifest.
 /// ONE definition so the hops cannot drift.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,8 +243,9 @@ pub struct CompletedConnect {
 /// and its fixed `covers` before the store flow runs; the flows
 /// themselves never read it. Defined here so the dispatcher's
 /// forwarding and the broker's handling share one wire shape.
-// SYNC: SharedDoorPick <-> packages/weft-connect/src/core/transport.ts DirectConnect.shared_app, packages/weft-connect/src/core/transport.ts ConsentStart.shared_app
+// SYNC: SharedDoorPick <-> packages/weft-connect/src/core/transport.ts DirectConnect.sharedApp, packages/weft-connect/src/core/transport.ts ConsentStart.sharedApp
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SharedDoorPick<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_app: Option<String>,
@@ -251,6 +257,7 @@ pub struct SharedDoorPick<T> {
 /// pending state, answer the consent URL to open.
 // SYNC: BeginOAuth <-> packages/weft-connect/src/core/transport.ts ConsentStart
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BeginOAuth {
     pub spec: AccessSpec,
     /// Which door the user walked through. Decides which app the
@@ -286,6 +293,7 @@ pub struct BeginOAuth {
 
 // SYNC: StartedOAuth <-> packages/weft-connect/src/core/wire.ts StartedConsent
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartedOAuth {
     /// Open this in the user's browser.
     pub consent_url: String,
@@ -321,7 +329,7 @@ mod wire_tests {
         let v = serde_json::to_value(&doors).unwrap();
         // The broker's answer is FLATTENED onto the status: clients read
         // `shared_apps` at the top level, never under a `doors` key.
-        assert!(v.get("shared_apps").is_some() && v.get("doors").is_none(), "{v}");
+        assert!(v.get("sharedApps").is_some() && v.get("doors").is_none(), "{v}");
         let back: DoorsStatus = serde_json::from_value(v).unwrap();
         assert_eq!(back.doors.shared_apps[0].label, "App");
 
@@ -400,13 +408,13 @@ mod wire_tests {
             },
         };
         let v = serde_json::to_value(&pick).unwrap();
-        assert!(v.get("shared_app").is_none(), "None shared_app must be absent: {v}");
+        assert!(v.get("sharedApp").is_none(), "None sharedApp must be absent: {v}");
         assert_eq!(v.get("door").and_then(|d| d.as_str()), Some("shared"), "{v}");
         assert!(v.get("inner").is_none(), "the wrapper flattens; no `inner` key: {v}");
 
         let parsed: ConnectDirect = serde_json::from_value(json!({
             "spec": serde_json::to_value(spec()).unwrap(),
-            "project_id": null
+            "projectId": null
         }))
         .unwrap();
         assert_eq!(parsed.door, Door::Own, "an omitted door is the own door");

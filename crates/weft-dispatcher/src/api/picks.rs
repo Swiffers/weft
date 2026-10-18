@@ -33,7 +33,7 @@ pub async fn change(
     Json(body): Json<weft_core::picks::ChangePicks>,
 ) -> Result<Json<weft_core::instance_door::ValuesChanged>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
-    let clear: Vec<(String, String)> = body.clear.into_iter().map(|f| (f.step, f.field)).collect();
+    let clear: Vec<(String, String)> = body.clear.into_iter().map(|f| (f.node, f.field)).collect();
     Ok(Json(crate::install_picks::change(&state, id, &body.set, &clear).await?))
 }
 

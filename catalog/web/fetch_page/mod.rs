@@ -1,12 +1,12 @@
 //! FetchPage: one URL to clean markdown through Firecrawl (JS
-//! rendered, boilerplate stripped), the shape an LLM step consumes
+//! rendered, boilerplate stripped), the shape an LLM node consumes
 //! directly.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -21,7 +21,7 @@ impl Node for FetchPageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let url: String = ctx.inputs.get("url")?;
         let only_main: bool = ctx.inputs.get("onlyMainContent")?;

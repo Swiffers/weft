@@ -105,7 +105,7 @@ impl Drop for TransitionHeartbeat {
 }
 
 /// The same drop-guarded heartbeat for an activation in flight: bumps the
-/// heartbeat of every activation row the setup execution `activation` claimed.
+/// heartbeat of every activation row the setup run `activation` claimed.
 ///
 /// It rests while the setup run goes: from the run's first event after its
 /// birth (a worker took it) until its ending. The run may wait days on a
@@ -138,9 +138,9 @@ impl ActivationHeartbeat {
                         continue;
                     }
                     heard = events.recv() => match heard {
-                        Ok(record) if record.event.execution_id() != Some(activation) => continue,
-                        Ok(record) if record.event.is_execution_terminal() => false,
-                        Ok(record) => !matches!(record.event, crate::events::DispatcherEvent::ExecutionStarted { .. }),
+                        Ok(record) if record.event.run_id() != Some(activation) => continue,
+                        Ok(record) if record.event.is_run_terminal() => false,
+                        Ok(record) => !matches!(record.event, crate::events::DispatcherEvent::RunStarted { .. }),
                         // A gap in what was heard: the run's row says
                         // whether it still goes.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {

@@ -1,6 +1,6 @@
 <script lang="ts">
 	// An instance's settings page: every field that takes a value of the
-	// instance's own (`@instance_filled`), grouped by the step it belongs
+	// instance's own (`@instance_filled`), grouped by the node it belongs
 	// to, each drawn with its own control: a connection picker for a
 	// connection, the searchable list and chooser for a `remote_select`
 	// field, a plain input for anything else. Everything goes through the
@@ -14,7 +14,7 @@
 	import ResourceSelect from './ResourceSelect.svelte';
 
 	// `labels` holds the site's own words for what its visitors read, keyed by
-	// a step's id (its title) and by `step.field` (a field). Anything it does
+	// a node's place (its title) and by `node.field` (a field). Anything it does
 	// not name keeps the program's own label, which is written for the
 	// program's author.
 	let { door, labels = {} }: { door: InstanceDoor; labels?: Record<string, string> } = $props();
@@ -24,13 +24,13 @@
 	let notice = $state<string | null>(null);
 	let loading = $state(true);
 
-	/// The fields, one group per step, in the program's order.
-	const steps = $derived.by(() => {
-		const groups: { step: string; title: string; fields: InstanceField[] }[] = [];
+	/// The fields, one group per node, in the program's order.
+	const nodes = $derived.by(() => {
+		const groups: { node: string; title: string; fields: InstanceField[] }[] = [];
 		for (const field of fields) {
-			let group = groups.find((g) => g.step === field.step);
+			let group = groups.find((g) => g.node === field.node);
 			if (!group) {
-				group = { step: field.step, title: labels[field.step] ?? field.label ?? field.nodeType, fields: [] };
+				group = { node: field.node, title: labels[field.node] ?? field.label ?? field.nodeType, fields: [] };
 				groups.push(group);
 			}
 			group.fields.push(field);
@@ -63,8 +63,8 @@
 		try {
 			const changed =
 				value === null || value === undefined || value === ''
-					? await door.setValues([], [{ step: field.step, field: field.field }])
-					: await door.setValues([{ step: field.step, field: field.field, value }]);
+					? await door.setValues([], [{ node: field.node, field: field.field }])
+					: await door.setValues([{ node: field.node, field: field.field, value }]);
 			if (changed.rearmed.length > 0) notice = `Set up again with your new value: ${changed.rearmed.join(', ')}.`;
 			fields = await door.fields();
 		} catch (e) {
@@ -76,11 +76,11 @@
 		return field.input.widget ?? null;
 	}
 
-	/// The picked ids of the fields a list depends on, at the same step.
+	/// The picked ids of the fields a list depends on, at the same node.
 	function parentsOf(field: InstanceField, dependsOn: string[] | undefined): Record<string, string> {
 		const parents: Record<string, string> = {};
 		for (const name of dependsOn ?? []) {
-			const parent = fields.find((f) => f.step === field.step && f.field === name);
+			const parent = fields.find((f) => f.node === field.node && f.field === name);
 			if (typeof parent?.value === 'string') parents[name] = parent.value;
 		}
 		return parents;
@@ -95,7 +95,7 @@
 	}
 
 	function labelOf(field: InstanceField): string {
-		return labels[`${field.step}.${field.field}`] ?? field.input.label ?? field.field;
+		return labels[`${field.node}.${field.field}`] ?? field.input.label ?? field.field;
 	}
 
 	function handleOf(value: unknown): { id: string; identity?: string } | undefined {
@@ -129,7 +129,7 @@
 <div class="wc-settings">
 	{#if loading}
 		<div class="wc-settings-muted">Loading...</div>
-	{:else if steps.length === 0 && !error}
+	{:else if nodes.length === 0 && !error}
 		<div class="wc-settings-muted">This program asks you for nothing.</div>
 	{:else}
 		{#if error}
@@ -138,14 +138,14 @@
 		{#if notice}
 			<div class="wc-settings-muted">{notice}</div>
 		{/if}
-		{#each steps as group (group.step)}
-			<section class="wc-settings-step">
+		{#each nodes as group (group.node)}
+			<section class="wc-settings-node">
 				<div class="wc-settings-title">{group.title}</div>
 				{#each group.fields as field (field.field)}
 					{@const widget = widgetOf(field)}
 					<div class="wc-settings-field">
 						{#if drawsOwnInput(field)}
-							<label class="wc-settings-label" for={`wc-${field.step}-${field.field}`}>{@render title(field)}</label>
+							<label class="wc-settings-label" for={`wc-${field.node}-${field.field}`}>{@render title(field)}</label>
 						{:else}
 							<div class="wc-settings-label">{@render title(field)}</div>
 						{/if}
@@ -164,32 +164,32 @@
 								sources={widget.sources}
 								value={typeof field.value === 'string' ? field.value : undefined}
 								connection={field.connection}
-								transport={door.resources(field.step, field.field)}
+								transport={door.resources(field.node, field.field)}
 								placeholder={hintOf(field) || null}
-								freeText={widget.free_text ?? false}
-								parents={parentsOf(field, widget.depends_on)}
-								connectFirst="Connect your account for this step first."
+								freeText={widget.freeText ?? false}
+								parents={parentsOf(field, widget.dependsOn)}
+								connectFirst="Connect your account for this node first."
 								onUpdate={(id) => save(field, id)}
 							/>
-						{:else if widget?.kind === 'select' && widget.free_text}
+						{:else if widget?.kind === 'select' && widget.freeText}
 							<!-- Suggestions: any typed value, the options offered. -->
 							<input
-								id={`wc-${field.step}-${field.field}`}
+								id={`wc-${field.node}-${field.field}`}
 								class="wc-settings-input"
 								type="text"
-								list={`wc-${field.step}-${field.field}-options`}
+								list={`wc-${field.node}-${field.field}-options`}
 								placeholder={hintOf(field)}
 								value={textOf(field.value)}
 								onchange={(e) => save(field, e.currentTarget.value.trim() || null)}
 							/>
-							<datalist id={`wc-${field.step}-${field.field}-options`}>
+							<datalist id={`wc-${field.node}-${field.field}-options`}>
 								{#each widget.options as option}
 									<option value={option}></option>
 								{/each}
 							</datalist>
 						{:else if widget?.kind === 'select'}
 							<select
-								id={`wc-${field.step}-${field.field}`}
+								id={`wc-${field.node}-${field.field}`}
 								class="wc-settings-input"
 								value={textOf(field.value)}
 								onchange={(e) => save(field, e.currentTarget.value || null)}
@@ -201,14 +201,14 @@
 							</select>
 						{:else if widget?.kind === 'checkbox'}
 							<input
-								id={`wc-${field.step}-${field.field}`}
+								id={`wc-${field.node}-${field.field}`}
 								type="checkbox"
 								checked={field.value === true}
 								onchange={(e) => save(field, e.currentTarget.checked)}
 							/>
 						{:else if widget?.kind === 'number'}
 							<input
-								id={`wc-${field.step}-${field.field}`}
+								id={`wc-${field.node}-${field.field}`}
 								type="number"
 								class="wc-settings-input"
 								value={textOf(field.value)}
@@ -217,7 +217,7 @@
 							/>
 						{:else if widget?.kind === 'textarea'}
 							<textarea
-								id={`wc-${field.step}-${field.field}`}
+								id={`wc-${field.node}-${field.field}`}
 								class="wc-settings-input"
 								value={textOf(field.value)}
 								placeholder={hintOf(field)}
@@ -225,7 +225,7 @@
 							></textarea>
 						{:else}
 							<input
-								id={`wc-${field.step}-${field.field}`}
+								id={`wc-${field.node}-${field.field}`}
 								type={widget?.kind === 'password' ? 'password' : 'text'}
 								class="wc-settings-input"
 								value={textOf(field.value)}
@@ -245,7 +245,7 @@
 
 <style>
 	.wc-settings > * + *,
-	.wc-settings-step > * + * {
+	.wc-settings-node > * + * {
 		margin-top: 0.75rem;
 	}
 	.wc-settings-field > * + * {

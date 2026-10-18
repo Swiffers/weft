@@ -78,9 +78,9 @@ fn check(
     let writes: Vec<weft_access_store::InstanceValueWrite> = checked
         .into_iter()
         .map(|value| {
-            changes.set.entry(value.step.clone()).or_default().insert(value.field.clone(), value.value.clone());
+            changes.set.entry(value.node.clone()).or_default().insert(value.field.clone(), value.value.clone());
             weft_access_store::InstanceValueWrite {
-                step: value.step,
+                node: value.node,
                 field: value.field,
                 value: value.value,
                 connection: value.connection.map(|(grant_id, service)| weft_access_store::ConnectionValue { grant_id, service }),
@@ -91,7 +91,7 @@ fn check(
     Ok(Checked { changes, writes, cleared })
 }
 
-/// Set `set` and clear `clear` (step, field) for `instance` of
+/// Set `set` and clear `clear` (node, field) for `instance` of
 /// `project_id`, owned by `tenant` ([`owning_tenant`]), all or none, re-arming the instance's live triggers that
 /// read any of them (see the module docs).
 pub async fn change(
@@ -261,11 +261,11 @@ async fn route_waiting_fires(state: &DispatcherState, project_id: uuid::Uuid, in
     }
 }
 
-/// A (step, field) an instance's value is stored under.
+/// A (node, field) an instance's value is stored under.
 type FieldKey = (String, String);
 
 /// `stored` split into the fields the program fills per instance and the
-/// ones left over from fields it no longer fills, as (step, field).
+/// ones left over from fields it no longer fills, as (node, field).
 fn stored_split(
     project: &weft_core::ProjectDefinition,
     stored: &weft_core::instance::InstanceValues,
@@ -273,24 +273,24 @@ fn stored_split(
     let places = weft_core::project::instance_filled_places(project);
     stored
         .iter()
-        .flat_map(|(step, fields)| fields.keys().map(move |field| (step.clone(), field.clone())))
-        .partition(|(step, field)| fills(&places, step, field))
+        .flat_map(|(node, fields)| fields.keys().map(move |field| (node.clone(), field.clone())))
+        .partition(|(node, field)| fills(&places, node, field))
 }
 
-/// Whether `field` at `step` is one the program fills per instance.
-fn fills(places: &[(String, &weft_core::project::NodeDefinition)], step: &str, field: &str) -> bool {
+/// Whether `field` at `at` is one the program fills per instance.
+fn fills(places: &[(String, &weft_core::project::NodeDefinition)], at: &str, field: &str) -> bool {
     places
         .iter()
-        .any(|(place, node)| place == step && weft_core::instance::instance_filled_fields(node).any(|(filled, _)| filled == field))
+        .any(|(place, node)| place == at && weft_core::instance::instance_filled_fields(node).any(|(filled, _)| filled == field))
 }
 
 /// A clear must name a field the program fills per instance, or the clear
 /// is a typo that would silently change nothing.
 fn refuse_unknown_clears(project: &weft_core::ProjectDefinition, clear: &[(String, String)]) -> Result<(), ApiError> {
     let places = weft_core::project::instance_filled_places(project);
-    for (step, field) in clear {
-        if !fills(&places, step, field) {
-            return Err((StatusCode::BAD_REQUEST, format!("'{step}.{field}' is no field an instance fills")));
+    for (node, field) in clear {
+        if !fills(&places, node, field) {
+            return Err((StatusCode::BAD_REQUEST, format!("'{node}.{field}' is no field an instance fills")));
         }
     }
     Ok(())

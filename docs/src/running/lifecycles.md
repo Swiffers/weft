@@ -6,8 +6,8 @@ after you change something. For why they are three separate things, go and read
 
 ## Infrastructure
 
-A program has infrastructure when one of its steps needs a container of its
-own, which you can see in the source because the step says so:
+A program has infrastructure when one of its nodes needs a container of its
+own, which you can see in the source because the node says so:
 
 ```weft
 pg = PostgresDatabase { database: "imagebot" }
@@ -19,7 +19,7 @@ Nothing starts it for you. Not `weft run`, not `weft build`, not activation.
 |---|---|
 | `weft infra start` | Brings up whatever is down and leaves whatever is already up alone |
 | `weft infra stop` | Scales to nothing and **keeps the disk**. Start it again and your rows are there |
-| `weft infra terminate` | Deletes it, **disk included**, unless the step asked for the disk to be kept |
+| `weft infra terminate` | Deletes it, **disk included**, unless the node asked for the disk to be kept |
 | `weft infra upgrade` | Rebuilds against your current source. The triggers it took down come back once the new infrastructure is up |
 | `weft infra status` | Where each piece stands, with its address |
 | `weft infra list-doors` | The addresses this project's infra answers on |
@@ -58,7 +58,7 @@ check `weft infra status` and either terminate it or run the verb again.
 
 ### Infra you deleted from the source
 
-Deleting the step does not delete the container. `weft status` warns you that
+Deleting the node does not delete the container. `weft status` warns you that
 live infrastructure exists whose node is gone from the source, and it keeps
 running, and costing, until you stop or terminate it. The verbs stay available
 for exactly that reason.
@@ -168,8 +168,8 @@ the triggers are down, park them:
 A schedule parked for two hours has two hours of ticks waiting when it comes
 back; the reactivate choice below decides whether they run.
 
-With no terminal attached, or with `--json`, the default is `wipe`. Running
-executions are cancelled unless you pass `--running-policy wait` with `--mode
+With no terminal attached, or with `--json`, the default is `wipe`. Runs still
+going are cancelled unless you pass `--running-policy wait` with `--mode
 park` or `--mode hibernate` (a `wipe` cancels everything, so it refuses
 `wait`). That lets them land first, capped at a minute (`--drain-timeout`), and `weft
 cancel-running` ends that wait early. The wait covers every run the triggers
@@ -190,8 +190,8 @@ on, nothing is asked, but a run may still be using that infrastructure:
 
 `weft activate` and `weft bake` make the same choice about a worker still up
 from an older build: by default what it runs is cancelled and it is replaced
-now; with `--running-policy wait` its executions land first. While it waits,
-nothing new is sent to that worker, and once its last execution lands the
+now; with `--running-policy wait` its runs land first. While it waits,
+nothing new is sent to that worker, and once its last run lands the
 worker finishes writing down what it owes (a metered call's cost) and leaves on
 its own, which takes a second or two; the cap covers both.
 
@@ -220,7 +220,7 @@ these triggers' infra is not running: pg. Start it with `weft infra start`, then
 
 Infrastructure that only a run touches does not hold activation back.
 
-## Executions
+## Runs
 
 | It starts from | Command |
 |---|---|
@@ -234,22 +234,22 @@ Infrastructure that only a run touches does not hold activation back.
 | `running` | Work is happening now |
 | `waiting_for_input` | Parked on a person or a service. No worker is up and nothing is being spent |
 | `completed` | Finished |
-| `failed` | A step failed (a wait the run held past its `holdSecs` and its node did not handle counts as one), or the run could get no further |
+| `failed` | A node failed (a wait the run held past its `holdSecs`, which that node did not handle, counts as one), or the run could get no further |
 | `cancelled` | You or another run stopped it; its live caller hung up; it was a fast run and its worker went away; its worker was stopped while it could not pause (`recorded: false`, a caller still on the line with `outlivesCaller` off, or a bus between its nodes open); it reached the hour a cloud install allows one stretch of a run; its caller's session reached the route's or socket's `maxSessionSecs`; or the runtime stopped it (a newer build replaced its image, or a queued run was refused three times, which names who said the last no: `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>`, or `its project's worker settings kept it from any worker 3 times: <error>`) |
 
-`weft executions --status running` lists both the ones working and the ones
+`weft runs --status running` lists both the ones working and the ones
 waiting, and the status column tells them apart.
 
 ### Waiting, and stuck
 
 **Waiting** means somebody still has to answer. **Stuck** means nobody can:
-steps are holding values that will never add up to enough to run them, and
+nodes are holding values that will never add up to enough to run them, and
 nothing is parked on a signal, so no answer exists that would move it along.
 
-weft ends a stuck run as failed and names every step and what each is short of:
+weft ends a stuck run as failed and names every node and what each is short of:
 
 ```text
-execution stuck: 2 firings hold pulses and can never fire: theirs has value,
+run stuck: 2 firings hold pulses and can never fire: theirs has value,
 still waiting on go; leaf has value, every wired input arrived
 ```
 
@@ -257,7 +257,7 @@ That is a bug in the shape of your graph rather than something to wait out.
 
 ### Stopping one
 
-`weft stop <execution-id>` cancels it. If a worker is up, it stops within about fifty
+`weft stop <run-id>` cancels it. If a worker is up, it stops within about fifty
 milliseconds. If the run was parked, the cancellation is written down and the
 listener forgets its signals, so a late answer finds nothing.
 
@@ -283,7 +283,7 @@ drift:
 |---|---|
 | The shape of the graph | Nothing. The next run picks it up |
 | A node's Rust code | Nothing. The next run rebuilds it |
-| What an infra step asks for | `weft infra upgrade`, then `weft activate` |
+| What an infra node asks for | `weft infra upgrade`, then `weft activate` |
 | Anything a trigger reads, on a live project | `weft resync` |
 
 Until you resync, the subscription sitting at the provider is still pointed at

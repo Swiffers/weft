@@ -1,4 +1,4 @@
-//! A build must enumerate a `requires_infra` node's declared images. This
+//! A build must enumerate a `requiresInfra` node's declared images. This
 //! replicates the compile (seed base catalog -> load + enrich ->
 //! `image_set::infra_images`) on the `infra_min` fixture, and asserts
 //! the mini_service image is found. An infra project that produces ZERO infra

@@ -23,7 +23,7 @@ use weft_dispatcher::journal::Journal;
 use weft_core::versions::Head;
 use weft_dispatcher::versions::{version_id, PostgresVersionStore, VersionRow, VersionStoreOps};
 use weft_journal::record::{Queued, Then};
-use weft_journal::ExecEvent;
+use weft_journal::RunEvent;
 
 const TENANT: &str = "tenant-1";
 
@@ -72,11 +72,11 @@ async fn start_run(
     spec: Option<&RunSpec>,
     at: u64,
 ) -> Uuid {
-    let execution_id = weft_core::new_execution_id();
-    let birth = ExecEvent::ExecutionStarted {
-        execution_id, project_id: project, entry_node: "a".into(),
+    let run_id = weft_core::new_run_id();
+    let birth = RunEvent::RunStarted {
+        run_id, project_id: project, entry_node: "a".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()), binary_hash: Some("bin-A".into()),
-        source_version: Some(version.into()), run_kind: weft_core::exec::RunKind::Execution, selection: None,
+        source_version: Some(version.into()), run_kind: weft_core::run::RunKind::Project, selection: None,
         seed: seed.map(|parent| weft_core::run_spec::Seed { parent, origins: Default::default() }),
         instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: at,
         settings: Default::default(),
@@ -88,7 +88,7 @@ async fn start_run(
         watch_end: false, stale: &stale, spec: spec.as_ref(), example: None,
     };
     assert!(journal.queue_run(queued, false).await.unwrap());
-    execution_id
+    run_id
 }
 
 /// The same manifest is one row however often it is recorded, and a
@@ -129,9 +129,9 @@ async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
     let child = start_run(&journal, project, &v.id, Some(seed), Some(&spec), 5).await;
     start_run(&journal, project, &v.id, None, None, 6).await;
     let rows = versions.runs(project).await.unwrap();
-    assert_eq!(rows.iter().map(|r| r.execution_id).collect::<Vec<_>>(), vec![seed, child], "in the order they were started");
+    assert_eq!(rows.iter().map(|r| r.run_id).collect::<Vec<_>>(), vec![seed, child], "in the order they were started");
     assert_eq!(rows[1].version_id, v.id);
-    assert_eq!(rows[1].seed_execution_id, Some(seed));
+    assert_eq!(rows[1].seed_run_id, Some(seed));
     assert_eq!(rows[1].stale, vec!["b", "c"]);
     assert_eq!(rows[1].spec, Some(spec));
     versions.set_run_example(child, Some("angry")).await.unwrap();
@@ -154,26 +154,26 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     assert_eq!(versions.head(project).await.unwrap(), Default::default());
-    let execution_id = Uuid::new_v4();
-    versions.move_head(project, &Head::default(), Some("v1"), Some(execution_id)).await.unwrap();
+    let run_id = Uuid::new_v4();
+    versions.move_head(project, &Head::default(), Some("v1"), Some(run_id)).await.unwrap();
     let activated = weft_core::project::hash::ProgramIdentity {
         binary_hash: "bin-A".into(), definition_hash: "def-1".into(), implementations: Default::default(),
     };
     let activations = PostgresActivationStore::new(pool.clone());
     let keys = [ActivationKey::new("door", Owner::Shared)];
-    let setup_execution_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(project, &keys, setup_execution_id, None, None).await.unwrap().is_ok());
-    assert!(activations.record_activation_source(project, setup_execution_id, &activated, "v1").await.unwrap());
-    activations.end_activating(project, setup_execution_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
+    let setup_run_id = Uuid::new_v4();
+    assert!(activations.try_begin_activating(project, &keys, setup_run_id, None, None).await.unwrap().is_ok());
+    assert!(activations.record_activation_source(project, setup_run_id, &activated, "v1").await.unwrap());
+    activations.end_activating(project, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None).await.unwrap();
     let listed = activations.list(project).await.unwrap();
     assert_eq!(listed[0].program, Some(activated), "a build preserves the code activation used");
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some("v1"));
-    assert_eq!(head.head_run, Some(execution_id));
+    assert_eq!(head.head_run, Some(run_id));
     assert_eq!(head.activated_versions, vec!["v1".to_string()]);
     versions
-        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(execution_id), activated_versions: vec![] }, Some("v2"), None)
+        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(run_id), activated_versions: vec![] }, Some("v2"), None)
         .await
         .unwrap();
     activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::wiped(), SignalsGoing::Kept, None).await.unwrap();
@@ -193,7 +193,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     );
 }
 
-/// `weft clean <execution_id>` erases the run, and a head that pointed at
+/// `weft clean <run_id>` erases the run, and a head that pointed at
 /// it keeps its version and loses the run pointer.
 #[sqlx::test]
 async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
@@ -203,15 +203,15 @@ async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
-    let execution_id = start_run(&journal, project, &v.id, None, Some(&RunSpec::default()), 5).await;
-    versions.move_head(project, &Head::default(), Some(&v.id), Some(execution_id)).await.unwrap();
-    // The order `clean_execution` uses.
-    versions.forget_head_run(execution_id).await.unwrap();
-    journal.delete_execution(execution_id).await.unwrap();
-    assert!(versions.run(execution_id).await.unwrap().is_none(), "the run is gone");
+    let run_id = start_run(&journal, project, &v.id, None, Some(&RunSpec::default()), 5).await;
+    versions.move_head(project, &Head::default(), Some(&v.id), Some(run_id)).await.unwrap();
+    // The order `clean_run` uses.
+    versions.forget_head_run(run_id).await.unwrap();
+    journal.delete_run(run_id).await.unwrap();
+    assert!(versions.run(run_id).await.unwrap().is_none(), "the run is gone");
     // Idempotent, which is what makes the retry safe.
-    versions.forget_head_run(execution_id).await.unwrap();
-    journal.delete_execution(execution_id).await.unwrap();
+    versions.forget_head_run(run_id).await.unwrap();
+    journal.delete_run(run_id).await.unwrap();
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some(v.id.as_str()));
     assert_eq!(head.head_run, None);
@@ -235,7 +235,7 @@ async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
     let r1 = start_run(&journal, project, &root.id, None, Some(&RunSpec::default()), 3).await;
     let r2 = start_run(&journal, project, &child.id, None, Some(&RunSpec::default()), 4).await;
     for run in [r1, r2] {
-        let written = journal.append(run, &[ExecEvent::ExecutionCompleted { execution_id: run, at_unix: 5 }], Then::Stays).await.unwrap();
+        let written = journal.append(run, &[RunEvent::RunCompleted { run_id: run, at_unix: 5 }], Then::Stays).await.unwrap();
         assert!(matches!(written, weft_journal::record::Appended::At(_)));
     }
     versions.delete_versions(project, std::slice::from_ref(&child.id)).await.unwrap();

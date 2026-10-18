@@ -32,7 +32,7 @@
 		/// row and no list.
 		multiple?: boolean;
 		// The value to set: one ref, a list of them when the port takes
-		// several, or null to clear (routes to removeConfig).
+		// several, or null to clear (routes to remove_config).
 		onUpdate: (ref: WeftFileRefValue | WeftFileRefValue[] | null) => void;
 	} = $props();
 
@@ -55,7 +55,7 @@
 	// file picked from the project's storage, not a folder path.
 	// SYNC: key shape <-> crates/weft-core/src/storage/key.rs is_scope_key
 	function isStored(path: string): boolean {
-		return /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(path);
+		return /^(run|project|shared|asset)\/[^/]+\/[^/]+$/.test(path);
 	}
 	function originOf(path: string): string {
 		return isUrl(path) ? 'external URL' : isStored(path) ? 'stored file' : 'project asset';

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::instance;
 
@@ -19,7 +19,7 @@ mod tests;
 /// its call sites: `one.read.spreadsheet`).
 pub fn field_of(raw: &str) -> WeftResult<(String, String)> {
     match raw.rsplit_once('.') {
-        Some((step, field)) if !step.is_empty() && !field.is_empty() => Ok((step.to_string(), field.to_string())),
+        Some((node, field)) if !node.is_empty() && !field.is_empty() => Ok((node.to_string(), field.to_string())),
         _ => node_bail!("'{raw}' is not `node.field` (`read.spreadsheet`)"),
     }
 }
@@ -31,7 +31,7 @@ impl Node for SetInstanceValuesNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let values: serde_json::Map<String, Value> = ctx.inputs.opt("values")?.unwrap_or_default();
         let clear: Vec<String> = ctx.inputs.opt("clear")?.unwrap_or_default();
         if values.is_empty() && clear.is_empty() {
@@ -39,12 +39,12 @@ impl Node for SetInstanceValuesNode {
         }
         let mut change = ctx.values().instance(instance(&ctx)?);
         for (target, value) in values {
-            let (step, field) = field_of(&target)?;
-            change = change.set(step, field, value);
+            let (node, field) = field_of(&target)?;
+            change = change.set(node, field, value);
         }
         for target in clear {
-            let (step, field) = field_of(&target)?;
-            change = change.clear(step, field);
+            let (node, field) = field_of(&target)?;
+            change = change.clear(node, field);
         }
         let rearmed = change.apply().await?;
         ctx.pulse_downstream(NodeOutput::new().set("rearmed", rearmed)).await

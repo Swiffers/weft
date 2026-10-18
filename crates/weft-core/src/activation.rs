@@ -284,6 +284,7 @@ pub struct ActivateResponse {
 
 /// One address a listener answers on, for the trigger at `node_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivationUrl {
     pub node_id: String,
     pub url: String,

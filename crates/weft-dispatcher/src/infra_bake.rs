@@ -3,7 +3,7 @@
 //!
 //! The run that applies a copy's infra (an infra setup) runs the node's
 //! body, and the step saves what went out on its baked outputs before it
-//! completes (`weft_engine`'s execution driver, through the broker's
+//! completes (`weft_engine`'s run driver, through the broker's
 //! `/v1/infra/bake`), so a setup that ended has saved its bake. That
 //! happens whenever the copy's infra setup runs (`weft infra start`,
 //! `upgrade`, a program's own start), and by hand ([`rebake`],
@@ -29,7 +29,7 @@ pub(crate) async fn rebake(
     let nodes = [node.to_string()];
     loop {
         let next = crate::lease::with_project_transition_lock(&state.lock_pool, project_id, || async {
-            let live = crate::api::project::infra_setup_execution_ids(state, project_id, Some(instance)).await?;
+            let live = crate::api::project::infra_setup_run_ids(state, project_id, Some(instance)).await?;
             if !live.is_empty() {
                 return Ok(Err(live));
             }
@@ -45,8 +45,8 @@ pub(crate) async fn rebake(
             // Its own outcome is its own: this rebake only waits for it to
             // end, then looks again.
             Err(live) => {
-                for execution_id in live {
-                    let other = crate::api::project::InfraSetupRun::follow(state, project_id, execution_id).await;
+                for run_id in live {
+                    let other = crate::api::project::InfraSetupRun::follow(state, project_id, run_id).await;
                     let _ = crate::api::project::await_infra_setup(state, other).await;
                 }
             }

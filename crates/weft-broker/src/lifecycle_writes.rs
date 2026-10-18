@@ -568,7 +568,7 @@ where
     let sql = format!(
         "SELECT p.id AS project_id, p.tenant_id, \
                 a.status, a.accepting_fires, a.fires_visible_to_consumers, a.fires_deadline_unix, \
-                a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_execution_id \
+                a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_run_id \
          FROM infra_owner io \
          JOIN project p ON p.id = io.project_id \
          LEFT JOIN trigger_activation a ON a.project_id = p.id \
@@ -611,7 +611,7 @@ where
                 }),
                 (cause, at) => anyhow::bail!("trigger_activation.went_down_with={cause:?} and went_down_at_unix={at:?} must be set together"),
             },
-            activating_execution_id: r.try_get("activating_execution_id").context("decode activating_execution_id")?,
+            activating_run_id: r.try_get("activating_run_id").context("decode activating_run_id")?,
         };
         projects.last_mut().expect("pushed above").2.push(lifecycle);
     }

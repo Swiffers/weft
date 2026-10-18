@@ -47,7 +47,7 @@
       "type": "String"
     }
   ],
-  "requires_infra": false,
+  "requiresInfra": false,
   "service": {
     "service": "openrouter_custom",
     "label": "OpenRouter (custom)",

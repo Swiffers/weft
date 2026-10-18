@@ -10,7 +10,7 @@
   ],
   "icon": "Database",
   "color": "#336791",
-  "requires_infra": true,
+  "requiresInfra": true,
   "features": {
     "liveEndpoint": "credential"
   },

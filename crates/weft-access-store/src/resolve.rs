@@ -1259,7 +1259,7 @@ mod tests {
             "permissions": [
                 { "id": "generate", "label": "Generate audio", "description": "x" },
                 { "id": "voice_lab", "label": "Voice creation", "description": "x",
-                  "own_only": true,
+                  "ownOnly": true,
                   "guide": { "link": "https://example/voices", "steps": ["s"] } },
             ],
         }))

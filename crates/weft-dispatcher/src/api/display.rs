@@ -65,6 +65,7 @@ use crate::state::DispatcherState;
 
 /// One node that has something to show, as the listing gives it.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeDisplayEntry {
     pub project_id: uuid::Uuid,
     pub project_name: String,
@@ -112,7 +113,7 @@ pub async fn list_displays(
     //
     // It does NOT filter on `fires_visible_to_consumers` the way the
     // signals door does, and that difference is the right one. That
-    // flag hides what would START AN EXECUTION: a hibernating project
+    // flag hides what would START A RUN: a hibernating project
     // must not be fired into. A display starts nothing. Infra can be
     // up while the program sleeps, so its panel is worth reading the
     // whole time, and hiding it would say the node is gone when it is

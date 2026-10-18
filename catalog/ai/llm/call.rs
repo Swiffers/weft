@@ -23,7 +23,7 @@ use serde_json::Value;
 use weft::node::NodeOutput;
 use weft::storage::media::{ExternalizePolicy, MediaForm};
 use weft::storage::{FileHandle, StorageScope};
-use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::chat;
 
@@ -101,7 +101,7 @@ fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
 /// Read the node's shared inputs (`provider`, `params`, `historyFile`,
 /// `prompt`, `media`, `tools`, `toolChoice`) into one ready-to-send
 /// call. Fails loudly on a provider object no provider node built.
-pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
+pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     // The `provider` input carries ONE `LlmProvider` object (the wired
     // provider node's output: which service, which model, and the
     // connection to spend). THIS node interprets it.
@@ -293,7 +293,7 @@ fn prepare_conversation(conversation: &mut Vec<Value>, system_prompt: &str) -> W
 /// deserializes straight into minillmlib messages because the shapes
 /// are identical apart from the media slots. Returns the conversation
 /// leaf the completion runs on.
-pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNode> {
+pub async fn to_wire(ctx: &RunContext, llm: &LlmCall) -> WeftResult<ChatNode> {
     let mut request = llm.stored.clone();
     // A tool call left without its answer (a run stopped between the
     // call and its result, or another run sharing the file still mid
@@ -354,7 +354,7 @@ pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNo
 /// conversation file holding this turn, kept past the run; unwired, the call
 /// is a one-shot and keeps nothing.
 pub async fn finish(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     llm: LlmCall,
     response: &minillmlib::CompletionResponse,
     output: NodeOutput,

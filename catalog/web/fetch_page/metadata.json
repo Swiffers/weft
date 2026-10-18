@@ -1,7 +1,7 @@
 {
   "type": "FetchPage",
   "label": "Fetch Page",
-  "description": "Fetch one URL as clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM step. Uses Firecrawl.",
+  "description": "Fetch one URL as clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM node. Uses Firecrawl.",
   "tags": [
     "web",
     "scrape"

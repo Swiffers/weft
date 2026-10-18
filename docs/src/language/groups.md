@@ -1,6 +1,6 @@
 # Groups
 
-A group holds several steps under one name and folds shut like a folder. Its
+A group holds several nodes under one name and folds shut like a folder. Its
 signature says what the outside can see.
 
 ```weft
@@ -53,12 +53,12 @@ the run wires into it has arrived, `_should_flow` included. A closed input
 counts as arrived. An included file is a group, so each `@include` starts the
 same way.
 
-When it fires, every step inside that no wire feeds starts with it. So a step
+When it fires, every node inside that no wire feeds starts with it. So a node
 with no inputs needs no `_should_flow` to get its turn, and it never runs
 before the group's slowest input has landed.
 
 It only runs in a run that takes it along, though. A trigger's run holds what
-the trigger feeds plus what those steps read, so a step with no inputs inside a
+the trigger feeds plus what those nodes read, so a node with no inputs inside a
 group comes along when something that run uses reads it, or when the run feeds
 the group's `_should_flow`, which brings the whole group in. If several routes
 feed one include, a route that did not fire never holds it up: it is either
@@ -72,8 +72,8 @@ This is the part that surprises people.
 You declare `db: Access` without a `?`, so it is required. Then the thing
 feeding it closes. You would expect the whole group to skip.
 
-It does not. The closure goes **inside**, and whichever step actually needed
-that value skips there, and the skip cascades from that step outward. Every
+It does not. The closure goes **inside**, and whichever node actually needed
+that value skips there, and the skip cascades from that node outward. Every
 port on a group's boundary is optional, and the requiredness you declared is
 enforced by the node that consumes it.
 
@@ -81,7 +81,7 @@ That is deliberate. A group is usually several jobs, and one missing input
 often only kills one of them. Skipping the whole group would throw away work
 that had everything it needed.
 
-It also means `@require_one_of` is refused on a group. Put it on the step
+It also means `@require_one_of` is refused on a group. Put it on the node
 inside that needs one of those values.
 
 A loop is the exception, for the ports it iterates or threads: with no list to
@@ -90,10 +90,10 @@ walk, there is no iteration to launch.
 ## When a group input has to be connected
 
 A group port is never required for its own sake, and the `?` on it changes
-nothing. What the compiler checks is whether a step inside needs it.
+nothing. What the compiler checks is whether a node inside needs it.
 
 It follows the port inward, through any group, loop or included file nested
-behind it, until it reaches the steps that read it. If one of them takes it
+behind it, until it reaches the nodes that read it. If one of them takes it
 into a required input, or into the only member of a `@require_one_of` set that
 could get a value, and nothing outside connects or writes the group's port, the
 build fails with `required-port-unmet`, naming both ends:
@@ -121,7 +121,7 @@ brief.request = ask.text
 brief._should_flow = credit.paid
 ```
 
-The gate is consumed at the boundary. The steps inside never see it, and they
+The gate is consumed at the boundary. The nodes inside never see it, and they
 do not each get to decide: they take the group's decision as a whole.
 
 Only the incoming side takes a gate. The outgoing side has nothing to decide,

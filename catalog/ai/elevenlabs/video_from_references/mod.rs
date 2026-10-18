@@ -7,7 +7,7 @@ use serde_json::json;
 
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::flows::{generate, is_veo, video_request, Media, References};
 
@@ -24,7 +24,7 @@ impl Node for ElevenLabsVideoFromReferencesNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let model: String = ctx.inputs.get("model")?;
         let subjects: Vec<FileHandle> = ctx.inputs.list("subjects")?;

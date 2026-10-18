@@ -14,7 +14,7 @@
       "name": "instance",
       "type": "String",
       "requiredWhenWired": true,
-      "description": "Whose triggers: an instance id your program gives it (`user-42`), for that instance's per-instance triggers. Unwired: the program's own triggers, the ones shared by every instance. Wired, and no id arrives (the step feeding it did not run): this node skips."
+      "description": "Whose triggers: an instance id your program gives it (`user-42`), for that instance's per-instance triggers. Unwired: the program's own triggers, the ones shared by every instance. Wired, and no id arrives (the node feeding it did not run): this node skips."
     },
     {
       "name": "only",
@@ -46,7 +46,7 @@
               "names": {
                 "node": {
                   "role": "trigger",
-                  "per_instance": true
+                  "perInstance": true
                 }
               }
             }
@@ -79,7 +79,7 @@
               "names": {
                 "node": {
                   "role": "trigger",
-                  "per_instance": false
+                  "perInstance": false
                 }
               }
             }

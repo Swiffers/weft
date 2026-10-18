@@ -13,14 +13,14 @@ describe('parseStatusPayload', () => {
     const snap = parseStatusPayload({
       status: 'active',
       transition: 'building',
-      infra_rollup: 'running',
-      drift: { binary_drift: true, definition_drift: false, infra_drift: true },
-      orphaned_infra: true,
+      infraRollup: 'running',
+      drift: { binaryDrift: true, definitionDrift: false, infraDrift: true },
+      orphanedInfra: true,
       mode: 'active',
-      running_count: 3,
-      available_actions: ['deactivate'],
-      fires_deadline_unix: 123,
-      infra: [{ node: 'n1', node_type: 'pg', status: 'running' }],
+      runningCount: 3,
+      availableActions: ['deactivate'],
+      firesDeadlineUnix: 123,
+      infra: [{ node: 'n1', nodeType: 'pg', status: 'running' }],
       preservation: { parked: 2, suspended: 1 },
     });
     expect(snap.projectStatus).toBe('active');
@@ -54,7 +54,7 @@ describe('parseStatusPayload', () => {
     const snap = parseStatusPayload({
       status: 'some-future-status',
       transition: 'some-future-transition',
-      infra_rollup: 'some-future-rollup',
+      infraRollup: 'some-future-rollup',
     });
     expect(snap.projectStatus).toBe('unknown');
     expect(snap.transition).toBe('none');
@@ -62,7 +62,7 @@ describe('parseStatusPayload', () => {
   });
 
   it('carries a project being removed onto the bar', () => {
-    const snap = parseStatusPayload({ removing: true, status: 'inactive', available_actions: [] });
+    const snap = parseStatusPayload({ removing: true, status: 'inactive', availableActions: [] });
     expect(snap.removing).toBe(true);
     expect(backendFromSnapshot(snap).removing).toBe(true);
     expect(parseStatusPayload({}).removing).toBe(false);
@@ -83,15 +83,15 @@ describe('parseStatusPayload', () => {
 describe('parseRunning', () => {
   it('keeps the dispatcher order and each phase', () => {
     const running = parseRunning({
-      executions: { running: [{ execution_id: 'a', phase: 'infra_setup' }, { execution_id: 'b', phase: 'fire' }] },
+      runs: { running: [{ runId: 'a', phase: 'infra_setup' }, { runId: 'b', phase: 'fire' }] },
     });
-    expect(running).toEqual([{ execution_id: 'a', phase: 'infra_setup' }, { execution_id: 'b', phase: 'fire' }]);
+    expect(running).toEqual([{ runId: 'a', phase: 'infra_setup' }, { runId: 'b', phase: 'fire' }]);
     expect(parseRunning({})).toEqual([]);
   });
 
   it('refuses a phase it does not know rather than showing it as a run', () => {
     expect(() => parseRunning({
-      executions: { running: [{ execution_id: 'a', phase: 'mystery' as never }] },
+      runs: { running: [{ runId: 'a', phase: 'mystery' as never }] },
     })).toThrow(/cannot read/);
   });
 });
@@ -113,7 +113,7 @@ describe('infra progress', () => {
     vi.useFakeTimers();
     vi.setSystemTime(9_000_000);
     const snap = parseStatusPayload({
-      infra: [{ node: 'db', node_type: 'pg', status: 'provisioning', progress: { sinceUnix: 100, asOfUnix: 130 } }],
+      infra: [{ node: 'db', nodeType: 'pg', status: 'provisioning', progress: { sinceUnix: 100, asOfUnix: 130 } }],
     });
     const progress = snap.infraNodes[0].progress!;
     expect(progress).toEqual({ sinceUnix: 8_970, asOfUnix: 9_000 });

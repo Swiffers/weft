@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::{instance_if_given, stop_self, take_down_spec};
 
@@ -22,7 +22,7 @@ impl Node for DeactivateTriggersNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let instance = instance_if_given(&ctx)?;
         let only: Vec<String> = ctx.inputs.opt("only")?.unwrap_or_default();
         let spec = take_down_spec(&ctx)?;

@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::weft_type::FileKind;
-use weft::{ExecutionContext, WeftError, WeftResult};
+use weft::{RunContext, WeftError, WeftResult};
 
 /// The content part wrapping one stored media value, keyed by the
 /// marker's own kind. The slot keeps the stored-file value verbatim
@@ -168,7 +168,7 @@ pub fn conversation_bytes(messages: &[Value]) -> WeftResult<Vec<u8>> {
         .iter()
         .map(|m| serde_json::to_string(m))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| WeftError::NodeExecution(format!("serializing the conversation: {e}")))?;
+        .map_err(|e| WeftError::NodeFailed(format!("serializing the conversation: {e}")))?;
     Ok(if lines.is_empty() { b"[]\n".to_vec() } else { format!("[\n{}\n]\n", lines.join(",\n")).into_bytes() })
 }
 
@@ -193,7 +193,7 @@ pub fn parse_conversation(bytes: &[u8], history_ty: &weft::WeftType) -> WeftResu
 /// The conversation a node was handed on `historyFile`, and that file;
 /// an empty conversation and no file when nothing is wired.
 pub async fn incoming_history(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     history_ty: &weft::WeftType,
 ) -> WeftResult<(Vec<Value>, Option<FileHandle>)> {
     let Some(file) = ctx.inputs.opt::<FileHandle>("historyFile")? else {
@@ -211,7 +211,7 @@ pub async fn incoming_history(
 /// no file, the turn starts a new conversation file, kept past the run.
 /// Returns the file's value, to go out on `historyFile`.
 pub async fn append_turn(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     file: Option<&FileHandle>,
     history_ty: &weft::WeftType,
     turn: &[Value],
@@ -225,7 +225,7 @@ pub async fn append_turn(
         // image: kept past the run (default access-renewed lifetime) so
         // the file still reads once the run has ended.
         return ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             .put(conversation_bytes(&conversation)?, "application/json", "conversation.json", Some(KeepTtl::Default))
             .await;
     };

@@ -2,7 +2,7 @@
 
 ## "Why a new language? Just make it a library"
 
-For the actual work, weft is a Rust framework. You write a step's logic in Rust
+For the actual work, weft is a Rust framework. You write a node's logic in Rust
 with the APIs weft gives you, and I am not going to invent a new syntax for
 parsing a response or adding up a total.
 
@@ -72,13 +72,13 @@ answer to the wrong person.
 What the checks catch today is incompatible port types, missing required inputs
 and cycles in the wiring. That is feedback about how the pieces got connected,
 which is exactly the kind of mistake an assistant makes and can fix without you.
-It says nothing about whether a step does the right work. That is still your
-judgement, and the step's own tests.
+It says nothing about whether a node does the right work. That is still your
+judgement, and the node's own tests.
 
 Where I want to take it is proving things about how the program behaves, at
 compilation time: letting a node carry labels about what it is and what it does,
 then having the compiler check claims across the whole graph, so that an
-autonomous step cannot reach a high-stakes action without a strong enough
+autonomous node cannot reach a high-stakes action without a strong enough
 verification in front of it. The full argument, and why I think it matters, is
 in [how I think about AI safety](safety.md).
 

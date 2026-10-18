@@ -136,7 +136,7 @@ async fn a_workers_failure_ends_once_a_later_run_reached_a_worker(pool: PgPool) 
     let run = |state: &'static str, started_at: i64| {
         let pool = pool.clone();
         async move {
-            sqlx::query("INSERT INTO run (execution_id, project_id, state, started_at) VALUES ($1, $2, $3, $4)")
+            sqlx::query("INSERT INTO run (run_id, project_id, state, started_at) VALUES ($1, $2, $3, $4)")
                 .bind(Uuid::new_v4())
                 .bind(project)
                 .bind(state)

@@ -9,7 +9,7 @@ use weft::access::client::Multipart;
 use weft::node::NodeOutput;
 use weft::reqwest::header::CONTENT_TYPE;
 use weft::storage::{normalize_content_type, FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::{audio_file_type, input_file_format, store_audio, API};
 
@@ -56,11 +56,11 @@ impl Node for ElevenLabsIsolateVoiceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let audio: FileHandle = ctx.inputs.get("audio")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&audio).await?;
+        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&audio).await?;
         let file_format = input_file_format(&ctx, &meta.mime_type)?;
         let mut form = Multipart::form_data().file("audio", &meta.filename, &meta.mime_type, bytes);
         if let Some(file_format) = file_format {

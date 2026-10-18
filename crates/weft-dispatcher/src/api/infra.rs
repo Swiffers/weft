@@ -5,8 +5,8 @@
 //! (`/stop` and `/terminate`), and two per-node destroy verbs for
 //! partial-state recovery.
 //!
-//! `/sync` runs an `InfraSetup` subworkflow exec: the worker walks
-//! every `requires_infra` node + its upstream closure; each infra
+//! `/sync` runs an `InfraSetup` subworkflow run: the worker walks
+//! every `requiresInfra` node + its upstream closure; each infra
 //! node calls `Node::provision_infra`. The engine enqueues an `Apply`
 //! lifecycle command carrying the spec. The supervisor that owns the
 //! project picks it up, makes the skip / fresh / replace decision
@@ -52,11 +52,11 @@ pub(crate) async fn settle_running_before_infra_op(
     trigger_deactivation_ran: bool,
     // The run that asked (a program's `ctx.infra(..).stop(..)`): never
     // among the runs this cancels; its own `StopSelf` decides its fate.
-    asked_by: Option<weft_core::ExecutionId>,
+    asked_by: Option<weft_core::RunId>,
 ) -> Result<(), (StatusCode, String)> {
     if running_policy == RunningPolicy::Cancel && !trigger_deactivation_ran {
         let scope = crate::drain::DrainScope { project_id, reaching: crate::drain::Reaching::Copies(copies), except: asked_by };
-        crate::drain::cancel_left(state, &scope, &weft_core::exec::CancelCause::User)
+        crate::drain::cancel_left(state, &scope, &weft_core::run::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e:#}")))?;
     }
@@ -70,7 +70,7 @@ pub(crate) async fn settle_running_before_infra_op(
 pub(crate) fn drain_first(
     running_policy: RunningPolicy,
     drain_timeout_secs: u64,
-    asked_by: Option<weft_core::ExecutionId>,
+    asked_by: Option<weft_core::RunId>,
 ) -> Option<infra_lifecycle_command::DrainFirst> {
     (running_policy == RunningPolicy::Wait).then(|| infra_lifecycle_command::DrainFirst {
         by_unix: crate::lease::now_unix() + i64::try_from(drain_timeout_secs).unwrap_or(i64::MAX / 2),
@@ -326,7 +326,7 @@ async fn upgrade_legs(
         let triggers_taken_down = take_down_upgrade_readers(state, id, &project, &targeted, &copies, work).await?;
         // The apply path leaves up units frozen, so to cycle a running
         // unit onto a new spec the stop comes first (respecting each
-        // unit's on_stop). What happens to the executions running
+        // unit's on_stop). What happens to the runs running
         // meanwhile is the person's answer: `wait` lets them finish up
         // to their cap, `cancel` ends them first.
         settle_running_before_infra_op(state, id, &copies, work.running_policy, triggers_taken_down, None).await?;
@@ -340,7 +340,7 @@ async fn upgrade_legs(
         )
         .await?;
         // No deadline: a drain the person asked to wait for can run as
-        // long as their executions do. A breadcrumb each minute keeps
+        // long as their runs do. A breadcrumb each minute keeps
         // the wait legible, and `/infra/cancel` is the way out (it
         // completes the stop as cancelled, which ends this wait).
         let mut waited_minutes = 0u64;
@@ -404,15 +404,15 @@ async fn upgrade_legs(
     // Its outcome is not this upgrade's: whatever it ended in, the start
     // below goes again (a cancel meant for this upgrade is read off the
     // command's own flag, right after).
-    let left = crate::api::project::infra_setup_execution_ids(state, id, Some(instance))
+    let left = crate::api::project::infra_setup_run_ids(state, id, Some(instance))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e:#}")))?;
-    for execution_id in left {
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup runs: {e:#}")))?;
+    for run_id in left {
         if let Err(ended) =
-            crate::api::project::await_infra_setup(state, crate::api::project::InfraSetupRun::follow(state, id, execution_id).await)
+            crate::api::project::await_infra_setup(state, crate::api::project::InfraSetupRun::follow(state, id, run_id).await)
                 .await
         {
-            tracing::info!(%id, %execution_id, ?ended, "an earlier infra setup ended before this upgrade's start");
+            tracing::info!(%id, %run_id, ?ended, "an earlier infra setup ended before this upgrade's start");
         }
     }
     if infra_lifecycle_command::cancel_requested(&state.pg_pool, command_id)
@@ -631,7 +631,7 @@ async fn apply_sync(
     body: &SyncRequest,
 ) -> Result<BegunSync, (StatusCode, String)> {
     // Orphan reap. An `infra_node` row whose `node_id` isn't in the
-    // current project source (or no longer carries `requires_infra`)
+    // current project source (or no longer carries `requiresInfra`)
     // is stale: the user removed it from .weft but the supervisor
     // still runs its units and keeps its disks. Reap before
     // running the subworkflow so the new shape is the only thing
@@ -644,11 +644,11 @@ async fn apply_sync(
     //   1. UNDER the per-project transition lock (short; two concurrent
     //      syncs serialize here and the second is rejected by the
     //      in-flight re-check):
-    //      a. re-check no InfraSetup execution is in flight;
-    //      b. start_infra_setup: journal the InfraSetup execution (the
+    //      a. re-check no InfraSetup run is in flight;
+    //      b. start_infra_setup: journal the InfraSetup run (the
     //         durable "sync in flight" state) + enqueue. It runs on the
-    //         image armed now, like every execution.
-    //   2. OUTSIDE the lock: await the InfraSetup execution (user code
+    //         image armed now, like every run.
+    //   2. OUTSIDE the lock: await the InfraSetup run (user code
     //      upstream of infra nodes may legitimately be slow; never hold
     //      a lock across it).
     //   3. reconcile_worker: settle what still runs on an older image,
@@ -837,7 +837,7 @@ pub async fn terminate(
 /// one instance's. Flags that owner's claimed supervisor commands (the
 /// executing supervisor halts between platform calls), cancels its
 /// still-unclaimed ones outright, and cancels its non-terminal
-/// InfraSetup provisioning execution. Dispatcher-owned verbs
+/// InfraSetup provisioning run. Dispatcher-owned verbs
 /// (deactivate / reactivate) are never touched: they are health's own
 /// work, not something a person started. Cancel = HALT, never
 /// rollback: no platform applies a project transactionally, so per-node partial state
@@ -858,16 +858,16 @@ pub async fn cancel(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request cancel: {e}")))?;
 
-    // Cancel the provisioning sub-execution too (the InfraSetup worker
+    // Cancel the provisioning sub-run too (the InfraSetup worker
     // run that computes specs and enqueues applies).
-    let execution_ids = crate::api::project::infra_setup_execution_ids(&state, id, Some(copy.instance.as_ref()))
+    let run_ids = crate::api::project::infra_setup_run_ids(&state, id, Some(copy.instance.as_ref()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e}")))?;
-    let had_setup = !execution_ids.is_empty();
-    for execution_id in execution_ids {
-        crate::api::execution::cancel_execution_id(&state, execution_id, &weft_core::exec::CancelCause::User)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup runs: {e}")))?;
+    let had_setup = !run_ids.is_empty();
+    for run_id in run_ids {
+        crate::api::run::cancel_run_id(&state, run_id, &weft_core::run::CancelCause::User)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_execution_id: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_run_id: {e}")))?;
     }
 
     if touched == 0 && !had_setup {
@@ -947,7 +947,7 @@ async fn issue_destroy(
             format!("trigger {} reading this infra is activating; cannot {}", busy.key, verb.as_str()),
         ));
     }
-    // What happens to the executions running right now is the person's
+    // What happens to the runs running right now is the person's
     // answer, not the verb's. When triggers read this infra they gave it
     // in the same picker a plain deactivate uses; otherwise (no door to
     // close, nothing to park, hibernate or wipe, so no picker) the
@@ -1106,7 +1106,7 @@ async fn issue_per_node(
 
     // No picker on a per-node verb (an active project's dependent
     // triggers refused it above; the rest run on), so nothing else
-    // cancelled the running executions. Which executions use this one
+    // cancelled the running runs. Which runs use this one
     // instance is not something the journal records, so under cancel
     // every run the copy can reach is cancelled, the ones that never
     // touched it included: every run of the project for the shared
@@ -1663,7 +1663,7 @@ async fn issue_per_nodes(
 }
 
 /// Reap infra_node rows whose place is no longer one the project
-/// source puts a `requires_infra` node at: the node was deleted, or the
+/// source puts a `requiresInfra` node at: the node was deleted, or the
 /// include that reached it was (a file included twice and then once
 /// leaves the second call's instance behind). Step 1 of the sync
 /// pipeline so the rest of the subworkflow operates on the new

@@ -1,7 +1,7 @@
-import type { NodeExecutionStatus } from '../types';
+import type { NodeFiringStatus } from '../types';
 
 /// The status a group or loop card shows for one launch of it, read off
-/// the boundary firings and every member execution at play.
+/// the boundary firings and every member run at play.
 ///
 /// A skipped In boundary is the whole story: the container did not run
 /// (its `_should_flow` said no, or a loop had nothing to iterate), and
@@ -13,9 +13,9 @@ import type { NodeExecutionStatus } from '../types';
 /// in the same cyan the parked node wears, rather than running. Only
 /// when some other member is actually running does running win.
 export function containerStatus(
-	inStatus: NodeExecutionStatus,
-	related: ReadonlyArray<{ status: NodeExecutionStatus }>,
-): NodeExecutionStatus {
+	inStatus: NodeFiringStatus,
+	related: ReadonlyArray<{ status: NodeFiringStatus }>,
+): NodeFiringStatus {
 	if (related.some((e) => e.status === 'running')) return 'running';
 	if (related.some((e) => e.status === 'waiting_for_input')) return 'waiting_for_input';
 	if (related.some((e) => e.status === 'failed')) return 'failed';

@@ -10,7 +10,7 @@ use serde_json::json;
 use weft::infra::{Container, ContainerPort, Endpoint, EndpointTarget, Expose, Image, InfraSpec, Limits, Probe, Protocol, Unit};
 use weft::node::NodeOutput;
 use weft::signal::{PollEndpoint, Predicate};
-use weft::{EndpointMethod, ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::{EndpointMethod, RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct JobServiceNode;
@@ -38,7 +38,7 @@ impl Node for JobServiceNode {
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let api = ctx.endpoint("api").await?;
         let job = ctx
             .run("start the job", || async { api.call(EndpointMethod::Post, "/jobs", Some(json!({}))).await })

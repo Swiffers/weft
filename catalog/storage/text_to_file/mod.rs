@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::storage::StoredFile;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifetime;
 
@@ -22,15 +22,15 @@ impl Node for TextToFileNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let text: String = ctx.inputs.get("text")?;
         // Both declare metadata defaults, so the bag always holds them.
         let filename: String = ctx.inputs.get("filename")?;
         let mime_type: String = ctx.inputs.get("mimeType")?;
         let scope = lifetime::scope_named(&ctx.inputs.get::<String>("scope")?)?;
-        // No default on purpose: absent is the scope's own lifetime (an
-        // execution file goes with its run, a project file stays).
-        let ttl_days: Option<u64> = ctx.inputs.opt("ttl_days")?;
+        // No default on purpose: absent is the scope's own lifetime (a
+        // run file goes with its run, a project file stays).
+        let ttl_days: Option<u64> = ctx.inputs.opt("ttlDays")?;
         let file = ctx
             .storage(scope)
             .put(text.into_bytes(), &mime_type, &filename, ttl_days.map(lifetime::ttl_of_days))

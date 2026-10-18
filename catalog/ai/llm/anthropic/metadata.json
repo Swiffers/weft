@@ -44,7 +44,7 @@
       "rung": "reports_validity",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "guide": {
         "link": "https://console.anthropic.com/settings/keys",
         "steps": [
@@ -70,7 +70,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "connection",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",

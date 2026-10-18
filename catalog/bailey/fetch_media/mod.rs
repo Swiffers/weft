@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::storage::StoredFile;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyFetchMediaNode;
@@ -24,7 +24,7 @@ impl Node for BaileyFetchMediaNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let message_id: String = ctx.inputs.get("messageId")?;
         let bridge = ctx.endpoint_of(&bridge).await?;

@@ -157,7 +157,7 @@ pub fn build_project(
         catalog,
         ValidationMode::Structural,
     ))?;
-    // Project identity arrives with each execution, never in the worker image.
+    // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
 
     let crate_root = project_root.join(".weft").join("target").join("build");

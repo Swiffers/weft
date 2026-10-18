@@ -1,5 +1,5 @@
 //! In-process message bus: a channel between co-alive nodes in the same
-//! execution (the same worker process).
+//! run (the same worker process).
 //!
 //! One node creates a bus (`ctx.create_bus(opts)`) and emits the marker on
 //! an output port; downstream nodes resolve the marker via `ctx.bus`
@@ -40,7 +40,7 @@
 //! ## Windowed journaling (the inspector trail)
 //!
 //! Journaling exists for the INSPECTOR, not for resume. Every append
-//! signals a per-execution `journal_pump_notify`; the engine's
+//! signals a per-run `journal_pump_notify`; the engine's
 //! bus-journal-pump task drains every live bus's unjournaled tail. The
 //! pump buffers each bus's `Message` entries and flushes ONE
 //! `BusWindow` journal row per bus per `journal_window` (a journaled
@@ -115,7 +115,7 @@
 //! The bus does NOT try to decide for itself whether a name will ever
 //! appear. That question depends on dispatch state, terminations, and
 //! topology, all of which live in the engine. The engine watches the
-//! execution and, when it concludes a wait can never be satisfied,
+//! run and, when it concludes a wait can never be satisfied,
 //! closes the bus. Every waiting cursor wakes; `next()` returns `None`.
 //!
 //! ## "wait" vs "park" vocabulary
@@ -128,7 +128,7 @@
 //! write.
 //!
 //! The only reason the engine needs to know about the bus's await at
-//! all is the stuck-detector: it tracks, per NODE EXECUTION, whether
+//! all is the stuck-detector: it tracks, per FIRING, whether
 //! that node is parked inside a bus wait with nothing to read, so when
 //! every participant node is parked it can declare deadlock and close
 //! every bus. Hence `WaitLiveness` and the `wait_on` protocol (which
@@ -312,8 +312,9 @@ impl WirePayload {
 
 /// One observable record on a bus, in append-only order. The cursor
 /// returns these directly to consumers; the engine's journal pump
-/// projects them to `ExecEvent::Bus*` rows for replay.
+/// projects them to `RunEvent::Bus*` rows for replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BusEntry {
     /// Monotonic per-bus position. The Nth append has offset N (0-based).
     /// Cursors use this as their resume cursor; the journal pump uses
@@ -329,6 +330,7 @@ pub struct BusEntry {
 
 /// One of the four shapes a bus entry takes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all_fields = "camelCase")]
 pub enum BusEntryKind {
     /// A handle registered `name`.
     Joined { name: String },
@@ -358,8 +360,9 @@ pub enum BusEntryKind {
 /// what it said as far as the journal keeps it. Only the ROW
 /// granularity is windowed; every message of a journaled bus gets its
 /// own line here.
-// SYNC: WindowedBusMessage <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'message', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' messages
+// SYNC: WindowedBusMessage <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'message', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' messages
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindowedBusMessage {
     pub offset: u64,
     pub from: String,
@@ -384,8 +387,9 @@ pub struct WindowedBusMessage {
 /// messages and how many bytes passed. The whole story an ephemeral
 /// bus journals; the summary line a journaled one carries besides its
 /// messages.
-// SYNC: BusWindowTotal <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' totals
+// SYNC: BusWindowTotal <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' totals
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BusWindowTotal {
     pub from: String,
     pub msg_kind: String,
@@ -700,7 +704,7 @@ impl EphemeralStore {
 /// coordinator drop naturally; a wait/pump-notify observed after
 /// coordinator drop is a no-op.
 ///
-/// Public so the engine's per-execution bus-journal-pump task can
+/// Public so the engine's per-run bus-journal-pump task can
 /// hold `Weak<BusInner>` and call the engine-facing `pub fn`s in this
 /// file's impl block. Handle-level state, options, and the log
 /// itself stay private to this module.
@@ -757,7 +761,7 @@ pub struct BusInner {
     /// log entry.
     present_names: Mutex<HashSet<String>>,
     /// Engine node-liveness hook. `Weak::new()` outside an engine-driven
-    /// execution; set once at bus creation via
+    /// run; set once at bus creation via
     /// `BusHandle::create_with_engine`. Fired at every cursor wait via
     /// the shared `wait_on` protocol and at every append via
     /// `push_entry`.
@@ -770,9 +774,9 @@ pub struct BusInner {
     /// send path beyond the one `fetch_add`; all comparison cost lives
     /// on the engine's stuck-check.
     append_gen: AtomicU64,
-    /// Per-execution journal pump wake. The bus ping it after every
+    /// Per-run journal pump wake. The bus ping it after every
     /// append; the pump wakes, walks every live bus, drains tails.
-    /// `Weak::new()` outside an engine-driven execution.
+    /// `Weak::new()` outside an engine-driven run.
     journal_pump_notify: Weak<Notify>,
     /// Optional ephemeral payload store. `Some` iff `ephemeral`.
     ephemeral_store: Option<EphemeralStore>,
@@ -801,7 +805,7 @@ impl BusInner {
     /// every other participant (including `BusHandle::drop`, which
     /// runs DURING the panicking task's unwind) would panic on the
     /// lock, and a panic-during-unwind aborts the whole worker
-    /// process, killing every execution on the process.
+    /// process, killing every run on the process.
     fn lock_log(&self) -> std::sync::MutexGuard<'_, Vec<BusEntry>> {
         self.log
             .lock()
@@ -970,7 +974,7 @@ impl BusInner {
     /// successful write supersedes the previous failure.
     pub fn acknowledge_journaled_through(&self, through_offset: u64) {
         // `fetch_max` makes the documented monotonicity true BY
-        // CONSTRUCTION rather than relying on a single-pump-per-execution
+        // CONSTRUCTION rather than relying on a single-pump-per-run
         // topology assumption stated nowhere: a load-then-store max would
         // regress the cursor if two acks ever interleaved (5 then 3),
         // after which the pump re-drains and double-ships journal rows.
@@ -1069,11 +1073,11 @@ pub struct BusHandle {
     /// handshake is race-free (see `cursor`). `None` until
     /// registration.
     registration: Option<(String, u64)>,
-    /// The node EXECUTION that minted this handle (`(node_id, frames)`),
+    /// The FIRING that minted this handle (`(node_id, frames)`),
     /// or `None` for a bus created outside an engine-driven node (unit
     /// tests, `BusHandle::create`). Used to key the node's bus liveness:
     /// every wait this handle enters, and the participant membership it
-    /// registers, are attributed to this node execution. Forked handles
+    /// registers, are attributed to this firing. Forked handles
     /// (`new_handle`) inherit it, because a forked handle is still the
     /// SAME node grabbing a second grip on the bus.
     node: Option<FiringLocation>,
@@ -1104,7 +1108,7 @@ impl BusHandle {
 
 impl BusHandle {
     /// Create a fresh bus with default options and no engine hooks.
-    /// Used in unit tests and code outside an engine-driven execution.
+    /// Used in unit tests and code outside an engine-driven run.
     pub fn create() -> Self {
         Self::create_with_options(BusOptions::default())
             .expect("default BusOptions cannot fail")
@@ -1120,7 +1124,7 @@ impl BusHandle {
     /// whenever this node's cursor enters/leaves a wait and on every
     /// append; the pump notify fires after every append to signal the
     /// engine's bus-journal-pump task. `node` is the minting node
-    /// execution (`None` outside an engine-driven node). Errors on an
+    /// run (`None` outside an engine-driven node). Errors on an
     /// invalid `window` (must be >= 1 when `ephemeral=true`).
     pub fn create_with_engine(
         opts: BusOptions,
@@ -1166,7 +1170,7 @@ impl BusHandle {
     }
 
     /// Build a handle from an existing inner, attributed to the node
-    /// execution `node` that is resolving the marker. Used by
+    /// run `node` that is resolving the marker. Used by
     /// `BusRegistry::lookup` to hand a consumer a fresh handle on a bus
     /// the producer already created; the consumer's own node identity
     /// (not the producer's) keys its liveness.
@@ -1600,7 +1604,7 @@ pub struct BusCursor {
     inner: Weak<BusInner>,
     next_offset: u64,
     filter: Option<CursorFilter>,
-    /// The node execution that owns this cursor (inherited from the
+    /// The firing that owns this cursor (inherited from the
     /// handle that minted it), or `None` outside an engine-driven node.
     /// Keys this cursor's waits in the engine's liveness map, so a node
     /// parked in `next()` is correctly attributed.
@@ -1822,15 +1826,15 @@ pub enum BusLookupError {
     NotABusMarker,
     #[error("bus marker uuid is malformed: {0}")]
     InvalidUuid(String),
-    #[error("no bus with id {0} is live in this execution")]
+    #[error("no bus with id {0} is live in this run")]
     UnknownBus(Uuid),
 }
 
-/// Per-execution registry mapping a bus's id to its live state. The
+/// Per-run registry mapping a bus's id to its live state. The
 /// engine's `BusCoordinator` owns one. A node creating a bus inserts;
 /// a node receiving a marker looks up. Single source of truth for
-/// "every bus this execution minted": holds the strong `Arc<BusInner>`
-/// so the bus stays pinned for the lifetime of the execution and the
+/// "every bus this run minted": holds the strong `Arc<BusInner>`
+/// so the bus stays pinned for the lifetime of the run and the
 /// pump's `Weak` refs always upgrade. Released by `shutdown()`'s
 /// `clear()` after the final drain.
 pub struct BusRegistry {
@@ -1861,7 +1865,7 @@ impl BusRegistry {
     }
 
     /// Resolve a marker JSON value to a fresh consumer handle attributed
-    /// to the resolving node execution `node` (whose identity keys its
+    /// to the resolving firing `node` (whose identity keys its
     /// own bus liveness). Errors loud on every failure mode.
     pub fn lookup(
         &self,

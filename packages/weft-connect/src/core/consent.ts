@@ -27,7 +27,7 @@ export async function runConsent(
 	wait: ConsentWait,
 ): Promise<GrantSummary | null> {
 	const started = await transport.beginConsent(request);
-	transport.openExternal(started.consent_url);
+	transport.openExternal(started.consentUrl);
 	wait.onWaiting?.();
 	const sleep = wait.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 	for (;;) {

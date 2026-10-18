@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyPresenceNode;
@@ -21,7 +21,7 @@ impl Node for BaileyPresenceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         let presence: String = ctx.inputs.get("presence")?;

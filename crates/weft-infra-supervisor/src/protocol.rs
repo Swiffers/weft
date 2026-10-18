@@ -182,7 +182,7 @@ pub(crate) fn names_infra(cond: &HealthCondition) -> bool {
 /// 1. **Park what reads broken infra.** While the project listens AND
 ///    some unit is declared flaky (not ready for its whole flaky window
 ///    after having been ready), park the triggers that read the broken
-///    copies. New fires queue against parked signals; running executions
+///    copies. New fires queue against parked signals; running runs
 ///    drain. Triggers reading only healthy infra keep running.
 ///
 /// 2. **Reactivate on recovery.** While something the health loop

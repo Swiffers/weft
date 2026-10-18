@@ -224,7 +224,7 @@ async fn run_inner(
     all_instances: bool,
 ) -> anyhow::Result<()> {
     // No `--mode` off a terminal (or under `--json`) is `wipe` with the
-    // running executions cancelled, the standing answer while building;
+    // running runs cancelled, the standing answer while building;
     // on a terminal `prompt_trigger_deactivation` asks.
     let (running_policy, drain_timeout) = parse_running_choice(flags.running_policy.as_deref(), flags.drain_timeout)?;
     let deactivation =

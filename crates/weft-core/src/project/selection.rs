@@ -1,4 +1,4 @@
-//! The immutable portion of a program admitted to one execution.
+//! The immutable portion of a program admitted to one run.
 //!
 //! Ordinary boundaries forward a port, not every branch of their group.
 //! Loops remain indivisible. Control dependencies are admitted separately
@@ -29,7 +29,7 @@ pub struct RunSelection {
     /// from a site's In sits inside the call, so does the wire out of a
     /// body into its site's Out.
     pub edges: BTreeSet<Located>,
-    /// Boundary input ports whose data participates in this execution.
+    /// Boundary input ports whose data participates in this run.
     pub boundary_ports: BTreeMap<Located, BTreeSet<String>>,
     /// Enclosing groups, each at the place its In runs: a site at its
     /// caller's place, a body at the place inside the call.
@@ -39,7 +39,7 @@ pub struct RunSelection {
     /// Authored backups for selected receiving ports, recorded at birth.
     pub input: BTreeMap<Located, BTreeMap<String, serde_json::Value>>,
     /// Origins only for inherited backups. Authored backups belong to this run.
-    pub input_origins: BTreeMap<Located, BTreeMap<String, crate::ExecutionId>>,
+    pub input_origins: BTreeMap<Located, BTreeMap<String, crate::RunId>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -203,7 +203,7 @@ fn feeders_of(
         }
         let node = g.node(&start.id).ok_or_else(|| format!("unknown node '{spelled}'"))?;
         let mut pending: Vec<(Located, String)> = node.inputs.iter()
-            .filter(|input| !crate::exec::skip::is_gate_port(&input.name) && !handed.contains(&input.name))
+            .filter(|input| !crate::run::skip::is_gate_port(&input.name) && !handed.contains(&input.name))
             .map(|input| (start.clone(), input.name.clone())).collect();
         let mut visited = BTreeSet::new();
         while let Some((place, port)) = pending.pop() {
@@ -291,7 +291,7 @@ pub fn required_consumer(
     let mut visited = BTreeSet::new();
     while let Some((place, port, start)) = pending.pop() {
         if !visited.insert((place.clone(), port.clone())) { continue; }
-        if crate::exec::skip::is_gate_port(&port) || !counts(&place, &port) { continue; }
+        if crate::run::skip::is_gate_port(&port) || !counts(&place, &port) { continue; }
         let Some(node) = project.node(&place.id) else { continue };
         let start = start.or_else(|| is_start(&place).then(|| (place.clone(), port.clone())));
         let input = node.inputs.iter().find(|p| p.name == port);
@@ -601,7 +601,7 @@ impl RunSelection {
         let mut doors: BTreeSet<Located> = gates_of(&g, start).into_iter()
             .map(|gate| Located::new(boundary_in_id(&gate.id), gate.path)).collect();
         doors.insert(start.clone());
-        let gate = crate::exec::skip::SHOULD_FLOW_PORT;
+        let gate = crate::run::skip::SHOULD_FLOW_PORT;
         doors.into_iter().filter_map(|door| {
             if self.input.get(&door).is_some_and(|ports| ports.contains_key(gate)) { return None; }
             if !g.edges_into(&door.id).any(|edge| edge.target_handle.as_deref() == Some(gate)) { return None; }
@@ -1062,7 +1062,7 @@ fn walk_ports(g: &ProjectGraph, mut pending: Vec<(Located, Option<String>)>, dir
         // walking forward through it puts the whole group in the run,
         // its body behind a call site included. A data port on the door
         // keeps the port-by-port walk, so a cut stays precise.
-        if direction == Direction::Downstream && port.as_deref().is_some_and(crate::exec::skip::is_gate_port) {
+        if direction == Direction::Downstream && port.as_deref().is_some_and(crate::run::skip::is_gate_port) {
             if let Some(group) = gated_group(g, &place) {
                 for member in members_in(g, &group, &place.path) {
                     if !visited.contains(&(member.clone(), None)) { pending.push((member, None)); }

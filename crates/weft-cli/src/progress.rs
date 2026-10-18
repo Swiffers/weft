@@ -11,7 +11,7 @@
 //! `progress.<phase>(detail)`.
 //!
 //! Output schema (per line, on stdout):
-//!   { "ts_unix": <u64>,
+//!   { "tsUnix": <u64>,
 //!     "verb":    <ActionVerb>,
 //!     "phase":   <Phase>,
 //!     "detail":  <object | null> }
@@ -45,7 +45,7 @@ pub enum ActionVerb {
     /// stops the project's image builds.
     CancelBuild,
     Deactivate,
-    /// Force-cancel running executions while a deactivate-with-wait
+    /// Force-cancel the runs still going while a deactivate-with-wait
     /// is draining. The lifecycle target the original deactivate
     /// wrote stays in place; this just unblocks the drain.
     CancelRunning,
@@ -59,7 +59,7 @@ pub enum ActionVerb {
     InfraNodeTerminate,
     /// Cancel in-flight infra work: halt claimed lifecycle commands,
     /// cancel unclaimed ones, interrupt the InfraSetup provisioning
-    /// execution. HALT, not rollback: per-node partial state stays.
+    /// run. HALT, not rollback: per-node partial state stays.
     InfraCancel,
     /// Multi-level project cleanup (deactivate + unregister + optional
     /// infra/journal/image/local wipes).
@@ -99,7 +99,7 @@ pub enum Phase {
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
     /// HTTP request to the dispatcher finished. Body in `detail`
-    /// (e.g. `{ "execution_id": "..." }` for run, `{ "signal_count": N }`
+    /// (e.g. `{ "runId": "..." }` for run, `{ "signalCount": N }`
     /// for activate).
     DispatcherCallDone,
     /// Infra provision started (one event covers every infra node
@@ -107,7 +107,7 @@ pub enum Phase {
     InfraProvisionStart,
     InfraProvisionDone,
     /// The command is about to wait for the project's running
-    /// executions to finish before it lands. Detail carries
+    /// runs to finish before it lands. Detail carries
     /// `{ "capSeconds": N }` when the user set `--drain-timeout`, and
     /// nothing when the dispatcher's own cap applies. Emitted before
     /// the call that waits, because the wait itself happens on the
@@ -118,7 +118,7 @@ pub enum Phase {
     TriggerRegisterDone,
     /// Waiting on a long-running infra supervisor command (stop /
     /// terminate / start), which can depend on draining in-flight
-    /// executions and so is unbounded. Detail:
+    /// runs and so is unbounded. Detail:
     /// `{ "verb": "...", "elapsedSeconds": S }`.
     InfraWait,
     /// Something the person should know that is not a failure: the verb
@@ -134,6 +134,7 @@ pub enum Phase {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Event<'a> {
     ts_unix: u64,
     /// Absent on the one event a verb with no progress channel (a
@@ -374,7 +375,7 @@ impl Progress {
     pub fn infra_provision_start(&self, node_ids: &[String]) {
         self.emit(
             Phase::InfraProvisionStart,
-            Some(serde_json::json!({ "node_ids": node_ids })),
+            Some(serde_json::json!({ "nodeIds": node_ids })),
         );
     }
 
@@ -540,7 +541,7 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 None => "up to the dispatcher's cap".to_string(),
             };
             format!(
-                "waiting for this project's running executions to finish, {cap}, then the rest \
+                "waiting for this project's runs still going to finish, {cap}, then the rest \
                  are cancelled (`--running-policy cancel` stops them now)"
             )
         }

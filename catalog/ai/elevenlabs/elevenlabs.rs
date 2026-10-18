@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope, StoredFile};
-use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 pub const API: &str = "https://api.elevenlabs.io/v1";
 /// The same API over a websocket, for the live (streaming) nodes.
@@ -52,13 +52,13 @@ pub fn link_filename(link: &str, fallback: &str) -> String {
 /// access-bumped TTL), and give back the file marker a port carries:
 /// how a result that grows with the input (a transcript, timings, a
 /// conversation) leaves a node, since a wire carries at most 100 KB.
-pub async fn store_json(ctx: &ExecutionContext, value: &Value, filename: &str) -> WeftResult<Value> {
+pub async fn store_json(ctx: &RunContext, value: &Value, filename: &str) -> WeftResult<Value> {
     let bytes = serde_json::to_vec(value).node_err(format!("serialize {filename}"))?;
-    ctx.storage(StorageScope::Execution).put(bytes, "application/json", filename, Some(KeepTtl::Default)).await
+    ctx.storage(StorageScope::Run).put(bytes, "application/json", filename, Some(KeepTtl::Default)).await
 }
 
 /// An optional text input, with a blank value read as absent.
-pub fn text_input(ctx: &ExecutionContext, name: &str) -> WeftResult<Option<String>> {
+pub fn text_input(ctx: &RunContext, name: &str) -> WeftResult<Option<String>> {
     Ok(ctx.inputs.opt::<String>(name)?.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
 }
 
@@ -104,7 +104,7 @@ pub fn merge_json(base: &mut Value, over: Value) {
 /// travels. ElevenLabs takes `pcm_s16le_16` only for raw 16-bit PCM
 /// at 16 kHz, mono, little-endian, so declaring it on a file whose
 /// type says otherwise is refused before anything is sent.
-pub fn input_file_format(ctx: &ExecutionContext, file_mime: &str) -> WeftResult<Option<&'static str>> {
+pub fn input_file_format(ctx: &RunContext, file_mime: &str) -> WeftResult<Option<&'static str>> {
     let format: String = ctx.inputs.get("fileFormat")?;
     match format.as_str() {
         "other" => Ok(None),
@@ -126,7 +126,7 @@ pub fn is_raw_pcm(mime: &str) -> bool {
 }
 
 /// Send a prepared request whose success body is audio, stream it into
-/// execution storage, and emit the stored-file quartet. `what` names
+/// run storage, and emit the stored-file quartet. `what` names
 /// the attempt in errors; `filename` names the stored file, and `mime`
 /// is the type the requested format really is. A refusal fails loud
 /// quoting the provider (via `put_response`).
@@ -138,7 +138,7 @@ pub fn is_raw_pcm(mime: &str) -> bool {
 /// instead of a voice note. The extension and the mime come from the
 /// same [`audio_file_type`] row, so they cannot disagree.
 pub async fn emit_audio(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     req: weft::reqwest_middleware::RequestBuilder,
     what: &str,
     filename: &str,
@@ -155,7 +155,7 @@ pub async fn emit_audio(
 /// audio is paid for and stored either way, so a missing header never
 /// fails the node; only a program that reads `port` is told.
 pub async fn emit_audio_with_id(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     req: weft::reqwest_middleware::RequestBuilder,
     what: &str,
     filename: &str,
@@ -177,16 +177,16 @@ pub async fn emit_audio_with_id(
     ctx.pulse_downstream(output).await
 }
 
-/// Stream an answer whose success body is audio into execution
+/// Stream an answer whose success body is audio into run
 /// storage, as [`emit_audio`] does.
 pub async fn store_audio(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     resp: weft::reqwest::Response,
     what: &str,
     filename: &str,
     mime: &str,
 ) -> WeftResult<StoredFile> {
-    ctx.storage(StorageScope::Execution)
+    ctx.storage(StorageScope::Run)
         // The generated audio is the run's product: keep it past the
         // run (default 30-day access-bumped TTL).
         .put_response(resp, what, Some(mime), filename, Some(KeepTtl::Default))

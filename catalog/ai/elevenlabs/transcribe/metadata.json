@@ -38,7 +38,7 @@
       "default": "scribe_v2_realtime",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "scribe_v2_realtime"
         ]

@@ -46,7 +46,7 @@ pub fn tests() -> Vec<NodeTest> {
         }),
         NodeTest::fake("an_exception_is_a_node_failure_carrying_the_traceback", |_rig| async {
             let err = python("raise ValueError('boom')", Vec::new()).await.expect_err("a raise must fail the run");
-            let WeftError::NodeExecution(message) = &err else { panic!("a raise is catchable: {err}") };
+            let WeftError::NodeFailed(message) = &err else { panic!("a raise is catchable: {err}") };
             assert!(message.contains("ValueError: boom"), "{message}");
             assert!(message.contains("Traceback"), "{message}");
             Ok(())
@@ -104,7 +104,7 @@ pub fn tests() -> Vec<NodeTest> {
             let stopping = flag.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                stopping.cancel_because(weft::exec::CancelCause::User);
+                stopping.cancel_because(weft::run::CancelCause::User);
             });
             let result = run_python(&interpreters, "while True:\n    pass", Vec::new(), &flag).await;
             assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
@@ -115,7 +115,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_cancelled_script_never_starts", |_rig| async {
             let interpreters = Interpreters::new();
             let flag = CancellationFlag::new();
-            flag.cancel_because(weft::exec::CancelCause::User);
+            flag.cancel_because(weft::run::CancelCause::User);
             let result = run_python(&interpreters, "return {'ran': True}", Vec::new(), &flag).await;
             assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
             Ok(())

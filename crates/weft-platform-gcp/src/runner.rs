@@ -51,7 +51,7 @@ const SETTLE_POLL: Duration = Duration::from_secs(5);
 /// How long a [`Patience::Brief`] caller (a delivery, a live caller)
 /// waits on a bring-up before it hears [`WorkerStarting`]. Well under a delivery's
 /// lease, so a delivery is given back before its lease can lapse and hand
-/// the same execution out twice.
+/// the same run out twice.
 const CALLER_HOLD: Duration = Duration::from_secs(20);
 
 /// A bring-up's outcome as every caller sharing it reads it: the address,

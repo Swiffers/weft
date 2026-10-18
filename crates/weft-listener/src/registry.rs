@@ -42,13 +42,13 @@ pub struct RegisteredSignal {
     /// many tenants; the fire path reads this to stamp the correct
     /// tenant on the enqueued `FireSignal` task.
     pub tenant_id: String,
-    /// True iff this is a mid-execution resume (HumanQuery, etc).
+    /// True iff this is a mid-run resume (HumanQuery, etc).
     /// Used by `process()` to decide which `ProcessTarget` to return
     /// for dual-use kinds like Form.
     pub is_resume: bool,
-    /// Execution of the suspended execution to resume. Set iff
+    /// Run of the suspended run to resume. Set iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
-    pub execution_id: Option<weft_core::ExecutionId>,
+    pub run_id: Option<weft_core::RunId>,
     /// Background task for kinds that hold a connection
     /// (`BetweenFires::Holds`). Dropping the handle via `.abort()`
     /// cancels the loop. `None` for every other kind.
@@ -273,7 +273,7 @@ pub async fn held_in(registry: &Registry, signals: &weft_broker_client::BrokerSi
         node_id: row.node_id.clone(),
         tenant_id: row.tenant_id.clone(),
         is_resume: row.is_resume,
-        execution_id: row.execution_id,
+        run_id: row.run_id,
         task: None,
         // A held connection's task owns its state while it runs.
         kind_state: (!row.holds).then(|| row.kind_state.clone()),

@@ -9,7 +9,7 @@
 //!     identity is identical and only the string form differs.
 //! Two things are NOT here because they interleave with each caller's own logic:
 //! (1) probing whether a ref is already built (against a container daemon, or a
-//! registry), and (2) the actual build execution of the stale set. Each caller
+//! registry), and (2) the actual build run of the stale set. Each caller
 //! drives its own check-and-build over `plan.images`.
 //!
 //! Because the worker image ref is content-addressed on `binary_hash` (engine +

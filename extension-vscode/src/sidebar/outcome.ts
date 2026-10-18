@@ -1,4 +1,4 @@
-// How a finished run is shown in the two sidebars (the executions list
+// How a finished run is shown in the two sidebars (the runs list
 // and the version tree's runs): the words beside its name and the icon
 // in front of it, from its status, its cancel cause and its skip count.
 // One place, so a cancelled run reads the same in both trees.
@@ -23,7 +23,7 @@ export function describeOutcome(
           return 'stopped';
         case 'caller_gone':
           return 'cancelled  ·  caller left';
-        case 'execution':
+        case 'run':
           return `cancelled  ·  stopped by run ${cancelCause.by.slice(0, 8)} (tag ${cancelCause.tag})`;
         case 'runtime':
           return `cancelled  ·  ${cancelCause.detail}`;

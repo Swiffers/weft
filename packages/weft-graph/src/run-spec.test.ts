@@ -36,31 +36,31 @@ describe('run spec', () => {
     expect(parseRunSpec(spec)).toEqual(spec);
   });
   it('reads a wait ending as a payload (null included), a skip or a give-up, and refuses two or none', () => {
-    for (const answer of [{ node: 'review', payload: null }, { node: 'review', skipped: true }, { node: 'review', gave_up: "node 'review' gave up its wait: quiet" }]) {
+    for (const answer of [{ node: 'review', payload: null }, { node: 'review', skipped: true }, { node: 'review', gaveUp: "node 'review' gave up its wait: quiet" }]) {
       const spec = { name: 'x', answers: [answer] };
       expect(parseRunSpec(spec)).toEqual(spec);
     }
     const two: Array<[Record<string, unknown>, string]> = [
       [{ payload: null, skipped: true }, '(a payload and "skipped": true)'],
-      [{ payload: 1, gave_up: 'quiet' }, '(a payload and "gave_up")'],
-      [{ skipped: true, gave_up: 'quiet' }, '("skipped": true and "gave_up")'],
+      [{ payload: 1, gaveUp: 'quiet' }, '(a payload and "gaveUp")'],
+      [{ skipped: true, gaveUp: 'quiet' }, '("skipped": true and "gaveUp")'],
     ];
     for (const [ending, named] of two) {
       expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', ...ending }] })).toThrow(`ended more than one way ${named}`);
     }
     expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review' }] })).toThrow('says nothing about how its wait ended');
     expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', skipped: false }] })).toThrow('says nothing about how its wait ended');
-    expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', gave_up: 3 }] })).toThrow('gave_up');
+    expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', gaveUp: 3 }] })).toThrow('gaveUp');
   });
   it('reads how long a run is kept and refuses what is no duration', () => {
-    expect(parseRunSpec({ name: 'x', settings: { keep_for: '12h' } }).settings).toEqual({ keep_for: '12h' });
-    expect(parseRunSpec({ name: 'x', settings: { keep_for: 'forever' } }).settings).toEqual({ keep_for: 'forever' });
-    expect(() => parseRunSpec({ name: 'x', settings: { keep_for: 'a week' } })).toThrow('keep_for');
+    expect(parseRunSpec({ name: 'x', settings: { keepFor: '12h' } }).settings).toEqual({ keepFor: '12h' });
+    expect(parseRunSpec({ name: 'x', settings: { keepFor: 'forever' } }).settings).toEqual({ keepFor: 'forever' });
+    expect(() => parseRunSpec({ name: 'x', settings: { keepFor: 'a week' } })).toThrow('keepFor');
   });
   it('reads how long a wait holds and refuses what is no hold', () => {
-    expect(parseRunSpec({ name: 'x', settings: { hold_secs: 0 } }).settings).toEqual({ hold_secs: 0 });
-    expect(() => parseRunSpec({ name: 'x', settings: { hold_secs: 1.5 } })).toThrow('hold_secs');
-    expect(() => parseRunSpec({ name: 'x', settings: { hold_secs: 30 * 24 * 3600 + 1 } })).toThrow('hold_secs');
+    expect(parseRunSpec({ name: 'x', settings: { holdSecs: 0 } }).settings).toEqual({ holdSecs: 0 });
+    expect(() => parseRunSpec({ name: 'x', settings: { holdSecs: 1.5 } })).toThrow('holdSecs');
+    expect(() => parseRunSpec({ name: 'x', settings: { holdSecs: 30 * 24 * 3600 + 1 } })).toThrow('holdSecs');
   });
 
   it('reads how a run is kept', () => {
@@ -100,8 +100,8 @@ describe('run spec', () => {
     // of a saved spec would run somewhere else, kept some other way.
     expect(specToRunArgs({ name: 'kept', instance: 'ws-a', settings: { keeping: 'durable' } }))
       .toEqual(['--instance', 'ws-a', '--durable']);
-    expect(specToRunArgs({ name: 'kept', settings: { keep_for: '30d' } })).toEqual(['--keep-for', '30d']);
-    expect(specToRunArgs({ name: 'held', settings: { hold_secs: 0 } })).toEqual(['--hold-secs', '0']);
+    expect(specToRunArgs({ name: 'kept', settings: { keepFor: '30d' } })).toEqual(['--keep-for', '30d']);
+    expect(specToRunArgs({ name: 'held', settings: { holdSecs: 0 } })).toEqual(['--hold-secs', '0']);
     expect(specToRunArgs({ name: 'over', settings: { keeping: 'fast' } })).toEqual(['--fast']);
   });
 

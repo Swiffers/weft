@@ -11,7 +11,7 @@
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, WeftError, WeftResult};
+use weft::{Access, RunContext, WeftError, WeftResult};
 
 /// OpenRouter's API base, for the single-service nodes (embeddings,
 /// rerank) that call it directly.
@@ -24,9 +24,9 @@ pub const OPENROUTER_API: &str = "https://openrouter.ai/api/v1";
 /// service-specific knob added there rides the object with no code
 /// change, and none can silently desync. Whether the connection is
 /// required comes from the same place: the recipe's
-/// `connection_optional` (a custom endpoint may be unauthenticated),
+/// `connectionOptional` (a custom endpoint may be unauthenticated),
 /// read through the bag's access accessor.
-pub async fn emit(ctx: &ExecutionContext, kind: &str) -> WeftResult<()> {
+pub async fn emit(ctx: &RunContext, kind: &str) -> WeftResult<()> {
     let mut provider = Map::new();
     // Service-specific knobs first; the fields this function OWNS
     // (`kind`, `model`, `account`) are inserted after, so no declared
@@ -56,7 +56,7 @@ pub async fn emit(ctx: &ExecutionContext, kind: &str) -> WeftResult<()> {
 /// and this single-service one), never a per-node copy. `what` names
 /// the capability ("moderation", "reranking", ...).
 pub fn read_for(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     expected_kind: &str,
     what: &str,
 ) -> WeftResult<(String, Access)> {

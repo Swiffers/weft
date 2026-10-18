@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
 use weft::signal::{PollDelta, PollEndpoint};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::sheets::{header_row, row_object, row_to_strings, tab_title, values_url};
 
@@ -32,7 +32,7 @@ impl Node for GoogleSheetsNewRowNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: Option<String> = ctx.inputs.opt("tab")?;
@@ -56,7 +56,7 @@ impl Node for GoogleSheetsNewRowNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: Option<String> = ctx.inputs.opt("tab")?;

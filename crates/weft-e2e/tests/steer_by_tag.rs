@@ -1,4 +1,4 @@
-//! Executions steering each other by tag, end to end, through the two
+//! Runs steering each other by tag, end to end, through the two
 //! catalog nodes `TagRun` and `StopTagged` and nothing else.
 //!
 //! The `steer_by_tag` fixture has three programs on one fake SSE feed:
@@ -69,7 +69,7 @@ impl Rig {
         project.activate().await?;
         feed.wait_for_subscribers(subscribers, Duration::from_secs(60)).await?;
         let pid = project.id();
-        let known = run::executions(&disp, &pid).await?;
+        let known = run::runs(&disp, &pid).await?;
         Ok(Self {
             disp,
             project,
@@ -91,11 +91,11 @@ impl Rig {
     /// Push one event and return the run it started.
     async fn fire(&mut self, event: &str, value: &str) -> anyhow::Result<Uuid> {
         self.feed.push_event(event, &Self::event_data(value));
-        let execution_id =
-            run::wait_for_triggered_execution(&self.disp, &self.pid, &self.known, Duration::from_secs(60))
+        let run_id =
+            run::wait_for_triggered_run(&self.disp, &self.pid, &self.known, Duration::from_secs(60))
                 .await?;
-        self.known.insert(execution_id);
-        Ok(execution_id)
+        self.known.insert(run_id);
+        Ok(run_id)
     }
 
     /// Push `values` as a burst of "go" events with no wait between them
@@ -104,7 +104,7 @@ impl Rig {
         for value in values {
             self.feed.push_event("go", &Self::event_data(value));
         }
-        let execution_ids = run::wait_for_triggered_executions(
+        let run_ids = run::wait_for_triggered_runs(
             &self.disp,
             &self.pid,
             &self.known,
@@ -112,29 +112,29 @@ impl Rig {
             Duration::from_secs(60),
         )
         .await?;
-        self.known.extend(execution_ids.iter().copied());
-        Ok(execution_ids)
+        self.known.extend(run_ids.iter().copied());
+        Ok(run_ids)
     }
 
-    async fn summary(&self, execution_id: Uuid) -> anyhow::Result<Value> {
-        self.disp.get_json(&format!("/executions/{execution_id}")).await
+    async fn summary(&self, run_id: Uuid) -> anyhow::Result<Value> {
+        self.disp.get_json(&format!("/runs/{run_id}")).await
     }
 
-    async fn parked(&self, execution_id: Uuid) -> anyhow::Result<()> {
-        run::wait_for_status(&self.disp, execution_id, "waiting_for_input").await
+    async fn parked(&self, run_id: Uuid) -> anyhow::Result<()> {
+        run::wait_for_status(&self.disp, run_id, "waiting_for_input").await
     }
 
-    /// Wait until `execution_id` carries `tag`. A run reads as running before
+    /// Wait until `run_id` carries `tag`. A run reads as running before
     /// its tag node has run, and the stop order is the order runs TAGGED
     /// themselves, so a test that means "a later run stops this one"
     /// waits for the tag, not for the status.
-    async fn tagged(&self, execution_id: Uuid, tag: &str) -> anyhow::Result<()> {
+    async fn tagged(&self, run_id: Uuid, tag: &str) -> anyhow::Result<()> {
         weft_e2e::client::poll_until(
-            &format!("execution {execution_id} to carry the tag '{tag}'"),
+            &format!("run {run_id} to carry the tag '{tag}'"),
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async move {
-                let summary = self.summary(execution_id).await?;
+                let summary = self.summary(run_id).await?;
                 let carries = summary["tags"]
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|t| t == tag));
@@ -196,37 +196,37 @@ async fn later_run_stops_earlier_runs_for_the_same_sender() -> anyhow::Result<()
     assert_eq!(second_settled.status, "cancelled", "run 2 was stopped by run 3");
     assert_stopped_by(&second_settled, third, "user_7")?;
 
-    // The tags are where a person looks for them: the execution listing
-    // (what the sidebar and `weft executions` read) and `weft events`
+    // The tags are where a person looks for them: the run listing
+    // (what the sidebar and `weft runs` read) and `weft events`
     // (which prints the cancel's reason and the tagging).
     rig.parked(third).await?;
     let listing: Value = rig
         .disp
-        .get_json(&format!("/executions?project_id={}&limit=50", rig.pid))
+        .get_json(&format!("/runs?project_id={}&limit=50", rig.pid))
         .await?;
-    let row = listing["executions"]
+    let row = listing["runs"]
         .as_array()
-        .and_then(|rows| rows.iter().find(|r| r["execution_id"] == json!(third)))
+        .and_then(|rows| rows.iter().find(|r| r["runId"] == json!(third)))
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("run 3 missing from the listing: {listing}"))?;
     assert_eq!(row["tags"], json!(["user_7", "everyone"]), "{row}");
     let events_cli = rig.project.weft(&["events", &second.to_string()]).await?;
     anyhow::ensure!(
-        events_cli.contains(&format!("reason=Stopped by execution {third} (tag user_7)")),
+        events_cli.contains(&format!("reason=Stopped by run {third} (tag user_7)")),
         "weft events must print who stopped run 2:\n{events_cli}"
     );
     anyhow::ensure!(
-        events_cli.contains("execution_tagged") && events_cli.contains("tags=user_7,everyone"),
+        events_cli.contains("run_tagged") && events_cli.contains("tags=user_7,everyone"),
         "weft events must print the tagging:\n{events_cli}"
     );
-    let executions_cli = rig.project.weft(&["executions"]).await?;
-    let third_line = executions_cli
+    let runs_cli = rig.project.weft(&["runs"]).await?;
+    let third_line = runs_cli
         .lines()
         .find(|l| l.starts_with(&third.to_string()))
-        .ok_or_else(|| anyhow::anyhow!("run 3 missing from weft executions:\n{executions_cli}"))?;
+        .ok_or_else(|| anyhow::anyhow!("run 3 missing from weft runs:\n{runs_cli}"))?;
     anyhow::ensure!(
         third_line.ends_with("user_7,everyone"),
-        "weft executions must end the row with its tags: {third_line}"
+        "weft runs must end the row with its tags: {third_line}"
     );
 
     // Answering run 3's form completes it with the approval.
@@ -497,30 +497,30 @@ fn graph_in_flight(sse_url: &str, release_url: &str) -> String {
 }
 
 /// The stopped run's terminal names the run that asked and the tag
-/// that matched, on the execution row AND on the parked node's own
+/// that matched, on the run row AND on the parked node's own
 /// cancel row, so the inspector never shows it as a plain failure.
 fn assert_stopped_by(settled: &SettledRun, by: Uuid, tag: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         settled.status == "cancelled",
         "run {} must be cancelled, is {}",
-        settled.execution_id,
+        settled.run_id,
         settled.status
     );
     let terminal = settled
         .replay()
-        .first_kind("execution_cancelled")
-        .ok_or_else(|| anyhow::anyhow!("no execution_cancelled for {}", settled.execution_id))?;
+        .first_kind("run_cancelled")
+        .ok_or_else(|| anyhow::anyhow!("no run_cancelled for {}", settled.run_id))?;
     let cause = terminal.0["cause"].clone();
     anyhow::ensure!(
-        cause == json!({ "kind": "execution", "by": by, "tag": tag }),
+        cause == json!({ "kind": "run", "by": by, "tag": tag }),
         "cause on {}: {cause}",
-        settled.execution_id
+        settled.run_id
     );
     let reason = settled.cancel_reason().unwrap_or_default();
     anyhow::ensure!(
         reason.contains(&by.to_string()) && reason.contains(tag),
         "reason on {}: {reason}",
-        settled.execution_id
+        settled.run_id
     );
     // A node is cancelled only if one was live when the stop landed: a
     // run stopped between two nodes (one finished, the next not yet
@@ -529,7 +529,7 @@ fn assert_stopped_by(settled: &SettledRun, by: Uuid, tag: &str) -> anyhow::Resul
         let node_cancel = settled
             .replay()
             .first_kind("node_cancelled")
-            .ok_or_else(|| anyhow::anyhow!("no node_cancelled for the live node on {}", settled.execution_id))?;
+            .ok_or_else(|| anyhow::anyhow!("no node_cancelled for the live node on {}", settled.run_id))?;
         anyhow::ensure!(
             node_cancel.str_field("reason").unwrap_or_default() == reason,
             "the live node's cancel row names the same cause: {:?}",
@@ -559,17 +559,17 @@ fn live_before_cancel(settled: &SettledRun) -> Vec<String> {
     live
 }
 
-/// The tagging is on the record as one `execution_tagged` carrying the
+/// The tagging is on the record as one `run_tagged` carrying the
 /// tags in the order the node put them on.
 fn assert_tagged_event(settled: &SettledRun, tags: &[&str]) -> anyhow::Result<()> {
     let tagged = settled
         .replay()
-        .first_kind("execution_tagged")
-        .ok_or_else(|| anyhow::anyhow!("no execution_tagged on {}", settled.execution_id))?;
+        .first_kind("run_tagged")
+        .ok_or_else(|| anyhow::anyhow!("no run_tagged on {}", settled.run_id))?;
     anyhow::ensure!(
         tagged.0["tags"] == json!(tags),
         "tags on {}: {:?}",
-        settled.execution_id,
+        settled.run_id,
         tagged.0
     );
     Ok(())

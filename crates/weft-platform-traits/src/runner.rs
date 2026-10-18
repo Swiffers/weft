@@ -2,9 +2,9 @@
 //!
 //! A worker is the project's compiled program serving HTTP. Weft does not
 //! keep workers running and hand them work from a queue: it CALLS a worker
-//! for each execution (`POST /run/<execution_id>`, or the caller's own
+//! for each run (`POST /run/<run_id>`, or the caller's own
 //! forwarded request for a live one), and the worker answers when the
-//! execution ends or waits on something outside it. That is the whole
+//! run ends or waits on something outside it. That is the whole
 //! protocol, and it is weft's, the same on every platform (see
 //! `weft_engine::worker_server`).
 //!
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Everything the platform needs to run one project's workers at one
 /// image. A project can have several images live at once (a new build
-/// while older executions still resume on the image they started on), so
+/// while older runs still resume on the image they started on), so
 /// the image is part of the target, not a property of the project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTarget {

@@ -8,7 +8,7 @@
 //! (`{"__weft_<image|video|audio|blob>__": {key, mimeType, sizeBytes,
 //! filename}}`, NO url). Bytes never ride the journal/pulse/task
 //! path; they flow worker<->box or client<->box directly. The key is
-//! the full tenant-local storage path (`exec/<execution_id>/<id>`,
+//! the full tenant-local storage path (`run/<run_id>/<id>`,
 //! `project/<project_id>/<id>`, `shared/<name>/<id>`), so a key
 //! alone names both the file and the scope wall that guards it.
 
@@ -247,22 +247,22 @@ pub async fn collect_stream(mut stream: ByteStream) -> std::io::Result<bytes::By
 
 /// Which key-prefix wall a storage handle operates inside. One box
 /// per tenant; the scope picks the prefix, the caller's verified
-/// identity picks the values inside it (its own execution / project).
+/// identity picks the values inside it (its own run / project).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageScope {
-    /// `exec/<execution_id>/`: walled to a single run, swept on terminate
+    /// `run/<run_id>/`: walled to a single run, swept on terminate
     /// unless kept. The default.
     #[default]
-    Execution,
+    Run,
     /// `project/<project_id>/`: outlives runs, shared across the
-    /// project's executions, wiped by `weft clean` / `weft rm`.
+    /// project's runs, wiped by `weft clean` / `weft rm`.
     Project,
     /// `shared/<name>/`: tenant-scoped shared space. Projects that
     /// name the same `name` meet in the same prefix; first use by a
     /// project auto-grants it. Opt-in by naming.
     Shared { name: String },
-    /// `asset/<project_id>/`: the project's PUBLISHED ASSETS, the storage
+    /// `asset/<sha256>`: the project's PUBLISHED ASSETS, named by content, the storage
     /// copies of files the source references via `@asset`. Current source
     /// references protect their copies; replaced/removed ones receive the
     /// default access-renewed TTL (content-hash ids). Workers READ this
@@ -295,7 +295,7 @@ impl StorageScope {
 
 /// How long a stored file lives, in any scope but the asset one. Every
 /// access bumps the expiry back to now + TTL, so actively-used files
-/// never expire. On an execution file, keeping it at all is also what
+/// never expire. On a run file, keeping it at all is also what
 /// makes it survive the end of its run. `Default` resolves to
 /// [`DEFAULT_KEEP_TTL_SECS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,12 +344,12 @@ pub struct StoredFileMeta {
     #[serde(rename = "sizeBytes")]
     pub size_bytes: u64,
     pub filename: String,
-    /// True iff this exec-scoped file is flagged to survive the
+    /// True iff this run-scoped file is flagged to survive the
     /// terminate sweep. Always false in the other scopes, which outlive
     /// runs without a flag (their lifetime is `keep_ttl_secs`).
     pub keep: bool,
     /// Unix seconds at which this file expires, renewed on access. `None`
-    /// = no expiry (a file stored with no lifetime outside the execution
+    /// = no expiry (a file stored with no lifetime outside the run
     /// scope, a current source asset, `KeepTtl::Never`).
     #[serde(rename = "expiresAtUnix")]
     pub expires_at_unix: Option<i64>,
@@ -635,6 +635,7 @@ pub struct PresignResponse {
 /// quota immediately); `None` for an unknown-length stream (each part is
 /// charged as it is reserved).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadBeginRequest {
     pub scope: StorageScope,
     pub mime_type: String,
@@ -660,6 +661,7 @@ pub struct UploadBeginRequest {
 /// replaced file's value (its own key, its new size). The file keeps its
 /// key, scope, name, type and lifetime; only its content changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadReplaceRequest {
     pub key: String,
     #[serde(default)]
@@ -710,6 +712,7 @@ pub enum ReplaceOutcome {
 /// transfer, the caller must not reserve parts, and `part_size` is a
 /// meaningless 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadBeginResponse {
     pub key: String,
     pub part_size: u64,
@@ -750,6 +753,7 @@ pub struct UploadPartsRequest {
 /// One part a caller is about to upload: which part of the file it is,
 /// and how many bytes it will PUT.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartAsk {
     /// 1-based, and it IS the position: part `n` of an upload whose part
     /// size is `p` carries the file's bytes from `(n - 1) * p`.
@@ -760,6 +764,7 @@ pub struct PartAsk {
 /// One reserved part: its assigned number, its exact byte size, and the
 /// presigned URL to PUT exactly that many bytes to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PresignedPart {
     pub part_number: i32,
     pub size_bytes: u64,
@@ -788,6 +793,7 @@ pub struct UploadPartsResponse {
 /// bucket's response header VERBATIM (quotes included); the server records the
 /// part's size from its own reservation, never from the caller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartDoneRequest {
     pub key: String,
     pub part_number: i32,
@@ -809,6 +815,7 @@ pub struct UploadResumeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadResumeResponse {
     pub part_size: u64,
     pub missing: Vec<PresignedPart>,
@@ -841,7 +848,7 @@ pub struct DownloadUrlResponse {
     pub url: String,
 }
 
-/// `POST /v1/storage/keep`: extend an execution-scoped file's lifetime past the
+/// `POST /v1/storage/keep`: extend a run-scoped file's lifetime past the
 /// run that created it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeepRequest {
@@ -854,6 +861,7 @@ pub struct KeepRequest {
 /// install serves one, else one signed for the install's own address.
 /// `POST /v1/storage/public-link` takes the same shape plus `reach`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PresignRequest {
     pub key: String,
     pub ttl_secs: Option<u64>,
@@ -962,7 +970,7 @@ pub struct WipePrefixResponse {
 // The admin upload surface: the dispatcher drives the same multipart upload
 // contract as a worker, on behalf of a tenant's editor session (a file-drop
 // config field). Editor uploads are always PROJECT-scoped (there is no
-// execution at edit time, and project files persist without a keep flag), so
+// run at edit time, and project files persist without a keep flag), so
 // `begin` names the project explicitly; every later verb is key-addressed and
 // carries only the acting tenant (the key itself names project + tenant, and
 // the broker re-checks they match).
@@ -1025,6 +1033,7 @@ pub struct AssetsPublished {
 /// `content_hash` is the sha256 that becomes the key id, so content the
 /// tenant already stores, from whichever project, answers "already stored".
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetUploadBeginRequest {
     pub mime_type: String,
     pub filename: String,
@@ -1062,7 +1071,7 @@ pub struct DownloadRequest {
 }
 
 /// `DELETE /storage/files`: exactly one of `key` (one file) or `prefix`
-/// (a whole space, e.g. `shared/team/` or `exec/<execution_id>/`).
+/// (a whole space, e.g. `shared/team/` or `run/<run_id>/`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveFilesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1077,18 +1086,18 @@ pub struct FilesRemoved {
     pub removed: u64,
 }
 
-/// `POST /v1/storage/admin/sweep-exec`: terminate-sweep one execution's un-kept
-/// exec files (crashed uploads reaped; completed files stamped to expire
+/// `POST /v1/storage/admin/sweep-run`: terminate-sweep one run's un-kept
+/// run files (crashed uploads reaped; completed files stamped to expire
 /// after the post-run linger).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepExecRequest {
+pub struct SweepRunRequest {
     pub tenant: String,
-    pub execution_id: String,
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepExecResponse {
-    /// Rows removed outright (crashed/abandoned uploads under the execution).
+pub struct SweepRunResponse {
+    /// Rows removed outright (crashed/abandoned uploads under the run).
     pub swept: u64,
     /// Completed un-kept files stamped with the post-run linger expiry
     /// (deleted by the expiry sweep once it passes).
@@ -1413,8 +1422,8 @@ mod tests {
                 "tenant": "alice",
                 "key": "alice/project/p1/f",
                 "parts": [
-                    {"part_number": 1, "size_bytes": 5},
-                    {"part_number": 2, "size_bytes": 3},
+                    {"partNumber": 1, "sizeBytes": 5},
+                    {"partNumber": 2, "sizeBytes": 3},
                 ],
             })
         );
@@ -1437,17 +1446,17 @@ mod tests {
         let v = serde_json::to_value(&begin).unwrap();
         assert_eq!(
             v,
-            json!({"tenant": "alice", "mime_type": "image/png",
-                   "filename": "x.png", "declared_size": 8,
-                   "content_hash": "a".repeat(64)})
+            json!({"tenant": "alice", "mimeType": "image/png",
+                   "filename": "x.png", "declaredSize": 8,
+                   "contentHash": "a".repeat(64)})
         );
         let back: Tenanted<AssetUploadBeginRequest> = serde_json::from_value(v).unwrap();
         assert_eq!(back.inner.content_hash, "a".repeat(64));
         // declared_size is optional on the wire; content_hash is not (the
         // admin surface uploads only the content-addressed asset plane).
         let min: Tenanted<AssetUploadBeginRequest> = serde_json::from_value(json!({
-            "tenant": "t", "mime_type": "a/b", "filename": "f",
-            "content_hash": "b".repeat(64)
+            "tenant": "t", "mimeType": "a/b", "filename": "f",
+            "contentHash": "b".repeat(64)
         }))
         .unwrap();
         assert_eq!(min.inner.declared_size, None);
@@ -1456,7 +1465,7 @@ mod tests {
     #[test]
     fn stored_file_value_round_trip() {
         let m = StoredFile {
-            key: "exec/0188-execution_id/9f3a".into(),
+            key: "run/0188-run_id/9f3a".into(),
             mime_type: "audio/ogg".into(),
             size_bytes: 4_200_000,
             filename: "clip.ogg".into(),
@@ -1468,7 +1477,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"__weft_audio__": {
-                "key": "exec/0188-execution_id/9f3a",
+                "key": "run/0188-run_id/9f3a",
                 "mimeType": "audio/ogg",
                 "sizeBytes": 4_200_000u64,
                 "filename": "clip.ogg",
@@ -1483,7 +1492,7 @@ mod tests {
         assert_eq!(StoredFile::from_value(&older).unwrap().version, FIRST_FILE_VERSION);
         // A non image/video/audio mime takes the Blob marker.
         let pdf = StoredFile {
-            key: "exec/c/x".into(),
+            key: "run/c/x".into(),
             mime_type: "application/pdf".into(),
             size_bytes: 10,
             filename: "x.pdf".into(),
@@ -1496,7 +1505,7 @@ mod tests {
     #[test]
     fn stored_file_value_is_typed_by_its_marker() {
         let m = StoredFile {
-            key: "exec/c/1".into(),
+            key: "run/c/1".into(),
             mime_type: "audio/ogg".into(),
             size_bytes: 1,
             filename: "a.ogg".into(),
@@ -1616,9 +1625,9 @@ mod tests {
     #[test]
     fn keep_and_presign_request_wire_shapes() {
         // Worker -> broker envelopes: exact wire, both directions.
-        let keep = KeepRequest { key: "t/exec/c/1".into(), ttl: KeepTtl::Secs { secs: 60 } };
+        let keep = KeepRequest { key: "t/run/c/1".into(), ttl: KeepTtl::Secs { secs: 60 } };
         let v = serde_json::to_value(&keep).unwrap();
-        assert_eq!(v, json!({"key": "t/exec/c/1", "ttl": {"kind": "secs", "secs": 60}}));
+        assert_eq!(v, json!({"key": "t/run/c/1", "ttl": {"kind": "secs", "secs": 60}}));
         let back: KeepRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.key, keep.key);
         assert_eq!(back.ttl, keep.ttl);
@@ -1628,7 +1637,7 @@ mod tests {
         let v = serde_json::to_value(&presign).unwrap();
         assert_eq!(
             v,
-            json!({"key": "t/project/p/1", "ttl_secs": 900, "reach": {"caller": {"base": "http://127.0.0.1:14111"}}})
+            json!({"key": "t/project/p/1", "ttlSecs": 900, "reach": {"caller": {"base": "http://127.0.0.1:14111"}}})
         );
         let back: PresignRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.key, presign.key);
@@ -1641,7 +1650,7 @@ mod tests {
 
         let replace = UploadReplaceRequest { key: "t/project/p/1".into(), declared_size: Some(12), expected_version: Some(4) };
         let v = serde_json::to_value(&replace).unwrap();
-        assert_eq!(v, json!({"key": "t/project/p/1", "declared_size": 12, "expected_version": 4}));
+        assert_eq!(v, json!({"key": "t/project/p/1", "declaredSize": 12, "expectedVersion": 4}));
         let back: UploadReplaceRequest = serde_json::from_value(v).unwrap();
         assert_eq!(
             (back.key, back.declared_size, back.expected_version),
@@ -1651,7 +1660,7 @@ mod tests {
         let blind: UploadReplaceRequest = serde_json::from_value(json!({"key": "t/project/p/1"})).unwrap();
         assert_eq!(blind.expected_version, None);
         // An older asker sends no reach: the internet, the strict one.
-        let bare: PresignRequest = serde_json::from_value(json!({"key": "t/project/p/1", "ttl_secs": null})).unwrap();
+        let bare: PresignRequest = serde_json::from_value(json!({"key": "t/project/p/1", "ttlSecs": null})).unwrap();
         assert_eq!(bare.reach, LinkReach::Internet);
     }
 
@@ -1676,16 +1685,16 @@ mod tests {
             json!({"tenant": "t1"})
         );
         assert_eq!(
-            serde_json::to_value(WipePrefixRequest { prefix: "t1/exec/c/".into() }).unwrap(),
-            json!({"prefix": "t1/exec/c/"})
+            serde_json::to_value(WipePrefixRequest { prefix: "t1/run/c/".into() }).unwrap(),
+            json!({"prefix": "t1/run/c/"})
         );
         assert_eq!(serde_json::to_value(WipePrefixResponse { wiped: 2 }).unwrap(), json!({"wiped": 2}));
         assert_eq!(
-            serde_json::to_value(SweepExecRequest { tenant: "t1".into(), execution_id: "c1".into() }).unwrap(),
-            json!({"tenant": "t1", "execution_id": "c1"})
+            serde_json::to_value(SweepRunRequest { tenant: "t1".into(), run_id: "c1".into() }).unwrap(),
+            json!({"tenant": "t1", "run_id": "c1"})
         );
         assert_eq!(
-            serde_json::to_value(SweepExecResponse { swept: 1, lingering: 2 }).unwrap(),
+            serde_json::to_value(SweepRunResponse { swept: 1, lingering: 2 }).unwrap(),
             json!({"swept": 1, "lingering": 2})
         );
     }
@@ -1693,8 +1702,8 @@ mod tests {
     #[test]
     fn scope_wire_shape() {
         assert_eq!(
-            serde_json::to_value(StorageScope::Execution).unwrap(),
-            json!({"kind": "execution"})
+            serde_json::to_value(StorageScope::Run).unwrap(),
+            json!({"kind": "run"})
         );
         assert_eq!(
             serde_json::to_value(StorageScope::Shared { name: "team".into() }).unwrap(),
@@ -1722,7 +1731,7 @@ mod tests {
     #[test]
     fn stored_file_meta_wire_shape() {
         let m = StoredFileMeta {
-            key: "exec/c/1".into(),
+            key: "run/c/1".into(),
             mime_type: "video/mp4".into(),
             size_bytes: 5,
             filename: "v.mp4".into(),
@@ -1746,8 +1755,8 @@ mod tests {
     fn upload_envelopes_wire_shape() {
         // begin: declared_size and keep are optional on the wire.
         let b: UploadBeginRequest = serde_json::from_value(json!({
-            "scope": {"kind": "execution"},
-            "mime_type": "image/png",
+            "scope": {"kind": "run"},
+            "mimeType": "image/png",
             "filename": "a.png",
         }))
         .unwrap();
@@ -1755,16 +1764,16 @@ mod tests {
         assert!(b.keep.is_none());
         let b2: UploadBeginRequest = serde_json::from_value(json!({
             "scope": {"kind": "project"},
-            "mime_type": "image/png",
+            "mimeType": "image/png",
             "filename": "a.png",
             "keep": {"kind": "never"},
-            "declared_size": 42,
+            "declaredSize": 42,
         }))
         .unwrap();
         assert_eq!(b2.declared_size, Some(42));
 
         let r = UploadBeginResponse {
-            key: "t/exec/c/1".into(),
+            key: "t/run/c/1".into(),
             part_size: 8 << 20,
             already_stored: false,
             resume: false,
@@ -1773,16 +1782,16 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "key": "t/exec/c/1",
-                "part_size": 8_388_608u64,
-                "already_stored": false,
+                "key": "t/run/c/1",
+                "partSize": 8_388_608u64,
+                "alreadyStored": false,
                 "resume": false,
             })
         );
         // Both flags default false on the wire, so a begin reply without
         // them parses as a fresh reservation.
         let back: UploadBeginResponse =
-            serde_json::from_value(json!({"key": "t/exec/c/1", "part_size": 1})).unwrap();
+            serde_json::from_value(json!({"key": "t/run/c/1", "partSize": 1})).unwrap();
         assert!(!back.already_stored);
         assert!(!back.resume);
 
@@ -1790,11 +1799,11 @@ mod tests {
         let v = serde_json::to_value(UploadPartsResponse { parts: vec![p.clone()] }).unwrap();
         assert_eq!(
             v,
-            json!({"parts": [{"part_number": 2, "size_bytes": 5, "offset_bytes": 8, "url": "u"}]})
+            json!({"parts": [{"partNumber": 2, "sizeBytes": 5, "offsetBytes": 8, "url": "u"}]})
         );
 
         let d: PartDoneRequest = serde_json::from_value(json!({
-            "key": "k", "part_number": 1, "etag": "\"abc\"",
+            "key": "k", "partNumber": 1, "etag": "\"abc\"",
         }))
         .unwrap();
         // The etag survives verbatim, quotes included.
@@ -1816,9 +1825,9 @@ mod tests {
         // that stands for somewhere else in it.
         assert!(
             serde_json::from_value::<UploadResumeResponse>(serde_json::json!({
-                "part_size": 8,
-                "missing": [{"part_number": 1, "size_bytes": 8, "url": "u"}],
-                "reserved_bytes": 8,
+                "partSize": 8,
+                "missing": [{"partNumber": 1, "sizeBytes": 8, "url": "u"}],
+                "reservedBytes": 8,
             }))
             .is_err(),
             "offset_bytes must be required"

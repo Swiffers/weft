@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use weft::access::client::checked_send;
 use weft::node::NodeOutput;
 use weft::reqwest_middleware::ClientWithMiddleware;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::sheets::{read_cells, rows_from_cells, tab_title};
 
@@ -29,7 +29,7 @@ impl Node for GoogleSheetsReadNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Option<Access> = ctx.inputs.opt("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         // `tab` is the sheet's gid (what the tab dropdown stores and what

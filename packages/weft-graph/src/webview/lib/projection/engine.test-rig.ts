@@ -117,8 +117,8 @@ export function ok(p: ProjectDefinition, weftCode = 'code', hold = false): EditS
 	return { kind: 'ok', result: { inverse, project: p, weftCode }, hold };
 }
 
-export const addNodeOp = (id: string): EditOp => ({ op: 'addNode', id, nodeType: 'Text', parentGroup: null });
+export const addNodeOp = (id: string): EditOp => ({ op: 'add_node', id, nodeType: 'Text', parentGroup: null });
 export const addEdgeOp = (source: string, target: string): EditOp =>
-	({ op: 'addEdge', source, sourcePort: 'value', target, targetPort: 'data', scopeGroup: null });
+	({ op: 'add_edge', source, sourcePort: 'value', target, targetPort: 'data', scopeGroup: null });
 export const setConfigOp = (nodeId: string, value: string): EditOp =>
-	({ op: 'setConfig', node: nodeId, key: 'text', value });
+	({ op: 'set_config', node: nodeId, key: 'text', value });

@@ -31,7 +31,7 @@ async fn postgres_grants_of_this_project(project: &Project) -> Result<Vec<serde_
     let all: Vec<serde_json::Value> =
         project.dispatcher().get_json("/access/grants?service=postgres").await?;
     let mine = json!(project.id().to_string());
-    Ok(all.into_iter().filter(|g| g.get("project_id") == Some(&mine)).collect())
+    Ok(all.into_iter().filter(|g| g.get("projectId") == Some(&mine)).collect())
 }
 
 /// The one sentence this test writes, and matches on when reading

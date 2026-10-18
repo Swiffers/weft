@@ -1,5 +1,5 @@
 <script lang="ts">
-	/// One port's value in the execution inspector: a card carrying the
+	/// One port's value in the run inspector: a card carrying the
 	/// port name, what the value is, a copy button, and the value
 	/// itself. Same card shape as `FileCard`, so a file port and a data
 	/// port read as the same kind of thing.

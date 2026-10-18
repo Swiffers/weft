@@ -35,13 +35,13 @@ async fn a_step_the_worker_died_in_is_failed_never_run_again() -> anyhow::Result
     let mut project = Project::prepare("step_crash", disp.clone()).await?;
     let pid = project.id();
 
-    let execution_id = run::start_durable(&mut project).await?;
-    run::wait_for_nodes_started(&disp, execution_id, &["plain", "caught"]).await?;
+    let run_id = run::start_durable(&mut project).await?;
+    run::wait_for_nodes_started(&disp, run_id, &["plain", "caught"]).await?;
     let killed = platform.kill_workers(&pid).await?;
     anyhow::ensure!(!killed.is_empty(), "no worker was running the steps when the test removed them");
 
     // The dead worker's claim lapses before a fresh one takes the run.
-    let settled = SettledRun::observe_within(&disp, execution_id, Duration::from_secs(240)).await?;
+    let settled = SettledRun::observe_within(&disp, run_id, Duration::from_secs(240)).await?;
     settled.failed_with(WENT_AWAY)?;
 
     for step in ["plain", "caught"] {
@@ -74,14 +74,14 @@ async fn a_fast_run_whose_worker_died_ends_cancelled_never_run_again() -> anyhow
     let mut project = Project::prepare("step_crash", disp.clone()).await?;
     let pid = project.id();
 
-    let execution_id = run::start(&mut project).await?;
-    run::wait_for_nodes_started(&disp, execution_id, &["plain", "caught"]).await?;
+    let run_id = run::start(&mut project).await?;
+    run::wait_for_nodes_started(&disp, run_id, &["plain", "caught"]).await?;
     let killed = platform.kill_workers(&pid).await?;
     anyhow::ensure!(!killed.is_empty(), "no worker was running the steps when the test removed them");
 
     // The dead worker's claim lapses, a fresh worker takes the run's task
     // and ends it instead of driving it.
-    let settled = SettledRun::observe_within(&disp, execution_id, Duration::from_secs(240)).await?;
+    let settled = SettledRun::observe_within(&disp, run_id, Duration::from_secs(240)).await?;
     anyhow::ensure!(settled.status == "cancelled", "expected the fast run to be cancelled, it is {}", settled.status);
     let reason = settled.cancel_reason().unwrap_or_default();
     anyhow::ensure!(reason.contains("a fast run lives in its worker's memory"), "{reason}");
@@ -100,14 +100,14 @@ async fn a_fast_run_whose_worker_is_told_to_stop_is_carried_on_by_the_next_one()
     let mut project = Project::prepare("step_crash", disp.clone()).await?;
     let pid = project.id();
 
-    let execution_id = run::start(&mut project).await?;
-    run::wait_for_nodes_started(&disp, execution_id, &["plain", "caught"]).await?;
+    let run_id = run::start(&mut project).await?;
+    run::wait_for_nodes_started(&disp, run_id, &["plain", "caught"]).await?;
     let told = platform.stop_workers(&pid).await?;
     anyhow::ensure!(!told.is_empty(), "no worker was running the steps when the test stopped them");
 
     // Handed back, not lost: the next worker fails the two steps that were
     // cut short and the run goes on to its end like a durable one would.
-    let settled = SettledRun::observe_within(&disp, execution_id, Duration::from_secs(240)).await?;
+    let settled = SettledRun::observe_within(&disp, run_id, Duration::from_secs(240)).await?;
     settled.failed_with(WENT_AWAY)?;
     for step in ["plain", "caught"] {
         let starts = settled.events_of(step).filter(|e| e.kind() == "node_started").count();

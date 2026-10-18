@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmRerankNode;
@@ -22,7 +22,7 @@ impl Node for LlmRerankNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let (model, account) = super::provider::read_for(&ctx, "openrouter", "reranking")?;
         let query: String = ctx.inputs.get("query")?;
         let documents: Vec<String> = ctx.inputs.get("documents")?;

@@ -73,7 +73,7 @@ export interface BasePortMenuOptions {
 	 *  a port on a Loop container; the strip surfaces the four derived roles
 	 *  (broadcast / iter / gather / carry) and lets the user cycle the port
 	 *  to the legal alternatives. The handlers translate the chosen role to
-	 *  the right cascade of setConfig / updateGroupPorts ops. */
+	 *  the right cascade of set_config / update_group_ports ops. */
 	loopRole?: LoopPortRoleContext;
 	/** Set ONLY on an input whose value each instance could fill: not wired,
 	 *  not a `_` key, not on an include. The menu then offers the same

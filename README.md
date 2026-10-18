@@ -41,11 +41,11 @@ Tangle loads automatically when you open a weft project, and it works with all m
 
 - **Readable.** The language describes how components interact, not what happens inside them, so a whole system fits in a few lines of code that are fast to produce and hard to get wrong. The internal representation of the program is natively a graph, so even a non-developer can follow what is happening and fully interact with it through a GUI.
 - **Compiled.** The compiler proves things about your orchestration before it runs: today it checks port types, required connections and graph structure; it will grow toward compiler flags that pin down what the system is allowed to do at runtime. The compiler emits a Rust crate around the graph and builds it into a native binary, so you get Rust's memory safety and speed.
-- **Alive.** Execution is not one pass through a graph. Parts can stay up, wait for answers, and keep talking to each other while the rest of the program carries on.
+- **Alive.** A run is not one pass through a graph. Parts can stay up, wait for answers, and keep talking to each other while the rest of the program carries on.
 - **Durable.** A program can save a wait for a human or an external event, release its worker, and continue when the answer arrives. Every run is written down as it happens (unless its trigger turns `recorded` off), so you can open any of them and see what happened, or is happening, interactively through the graph.
-- **Tests itself.** Any piece of the program can run on its own, with values you make up or against a real service you connected. Tangle uses that to build without you: it runs one step, reads what came out, fixes it, then re-runs only what changed. When a case comes out right, Tangle freezes it and runs it again after later changes to see what moved. You hand it a job and find the program working when you come back. For how to build this way, go and read [Sequential Diffusion Programming](https://weavemindai.github.io/weft/thinking/sdp.html).
+- **Tests itself.** Any piece of the program can run on its own, with values you make up or against a real service you connected. Tangle uses that to build without you: it runs one piece, reads what came out, fixes it, then re-runs only what changed. When a case comes out right, Tangle freezes it and runs it again after later changes to see what moved. You hand it a job and find the program working when you come back. For how to build this way, go and read [Sequential Diffusion Programming](https://weavemindai.github.io/weft/thinking/sdp.html).
 - **Infrastructure included.** Write `pg = PostgresDatabase` and the program gets a Postgres of its own. The node says which container it needs; the runtime starts that container with a disk that survives restarts, and the rest of the program reaches it through one output, `pg.access`. Anything that runs in a container can be an infrastructure node; if you want to write your own, go and read [infrastructure nodes](https://weavemindai.github.io/weft/nodes/infrastructure.html).
-- **Dynamic vocabulary.** A node starts with two files: its declaration and its Rust code. The ctx supplies the shared machinery for credentials, storage, signals and execution records. It is opinionated on purpose: there is one way a file is stored and one way a credential is held, and you get every parameter but never the mechanism, so each piece is hardened once instead of half-written again in every node. Your node implements its own job without rebuilding those mechanisms. Where weft's job stops and yours begins is written down in [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
+- **Dynamic vocabulary.** A node starts with two files: its declaration and its Rust code. The ctx supplies the shared machinery for credentials, storage, signals and run records. It is opinionated on purpose: there is one way a file is stored and one way a credential is held, and you get every parameter but never the mechanism, so each piece is hardened once instead of half-written again in every node. Your node implements its own job without rebuilding those mechanisms. Where weft's job stops and yours begins is written down in [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
 
 ## Stop prompting, start writing orchestrations
 
@@ -100,7 +100,7 @@ review = HumanQuery {
 }
 
 allowed = FirstInOrder {
-  approved: review.send_approved
+  approved: review.sendApproved
   automatic: route.goAhead
 }
 
@@ -127,15 +127,15 @@ This is a complete runnable program: a support bot on WhatsApp. A customer messa
 The first line is the WhatsApp integration. **It is only one line** because `BaileyBridge` is an infrastructure node: it ships with its own container and manages its own lifecycle. After you start the infrastructure, the bridge shows a QR code in the graph view. Scan it with whatsapp to connect the bridge. You can check the source code of `BaileyBridge` in the [`catalog/`](catalog/bailey/bridge/) if you want to see how it works.
 
 
-Then `ask` is a trigger: when a message arrives, it starts an execution with the payload. `draft` then calls an LLM and drafts a reply. The system prompt asks for JSON. `parseJson: true` parses the reply, attempts to repair malformed JSON, and pulls out the declared outputs: the answer and the sensitivity rating. The prompt lives in its own file, and the model is pinned in the source, here `z-ai/glm-5.3`.
+Then `ask` is a trigger: when a message arrives, it starts a run with the payload. `draft` then calls an LLM and drafts a reply. The system prompt asks for JSON. `parseJson: true` parses the reply, attempts to repair malformed JSON, and pulls out the declared outputs: the answer and the sensitivity rating. The prompt lives in its own file, and the model is pinned in the source, here `z-ai/glm-5.3`.
 
 After that there is a `Switch`. It looks at `draft.sensitivity` and opens exactly one of its two ports: `needsAPerson` if the rating is `"high"`, `goAhead` otherwise. `review` reads that port through `_should_flow`, so the person is only asked when the answer was sensitive.
 
-When the `review` fires, this execution waits for a human to review the answer through the integrated [Weft browser extension](extension-browser/). The question and execution state are saved. Once the worker has no other work, it exits; the waiting execution needs no process of its own. When the human replies, the runtime restores the recorded state and continues. The WhatsApp bridge and shared runtime services stay up. For what survives a restart, read [the journal](https://weavemindai.github.io/weft/running/the-journal.html).
+When the `review` fires, this run waits for a human to review the answer through the integrated [Weft browser extension](extension-browser/). The question and the run's state are saved. Once the worker has no other work, it exits; the waiting run needs no process of its own. When the human replies, the runtime restores the recorded state and continues. The WhatsApp bridge and shared runtime services stay up. For what survives a restart, read [the journal](https://weavemindai.github.io/weft/running/the-journal.html).
 
-If the user refuses, `send_rejected` fires and `send_approved` closes. That propagates through the rest of the program and stops the execution. If the user approves, `send_approved` fires and `send_rejected` closes. (The two are auto-inferred ports from the field of kind `approve_reject`.)
+If the user refuses, `sendRejected` fires and `sendApproved` closes. That propagates through the rest of the program and stops the run. If the user approves, `sendApproved` fires and `sendRejected` closes. (The two are auto-inferred ports from the field of kind `approve_reject`.)
 
-`FirstInOrder` emits the first of its inputs, in written order, that delivered a value: `review.send_approved` or `route.goAhead`. `reply` uses that as its `_should_flow`.
+`FirstInOrder` emits the first of its inputs, in written order, that delivered a value: `review.sendApproved` or `route.goAhead`. `reply` uses that as its `_should_flow`.
 
 The whole thing is a runnable project in [`examples/whatsapp-support-bot/`](examples/whatsapp-support-bot/).
 
@@ -173,15 +173,15 @@ For human questions and approvals, install **Weft tasks** from
 [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/weft-tasks/) or the
 [Chrome Web Store](https://chromewebstore.google.com/detail/weavemind/mddobmalhoelphnmhbenmbmeibfpoppm).
 
-To connect Weft tasks to weft, read the [human-step walkthrough](https://weavemindai.github.io/weft/build/a-person-in-the-loop.html).
+To connect Weft tasks to weft, read [putting a person in the loop](https://weavemindai.github.io/weft/build/a-person-in-the-loop.html).
 
 ## Where to go from here
 
 - **Build something you need.** Give Tangle a whole brief, or ask it for one
   piece at a time. To avoid AI slop, we recommend working against real inputs:
   run a piece, inspect what came out, correct it, then add the next piece.
-  `weft run --seed` reuses compatible completed work so you are not paying
-  for the same steps again. Once a run comes out right, `weft freeze <name>`
+  `weft run --seed` reuses compatible completed work so you do not pay
+  to run the same nodes again. Once a run comes out right, `weft freeze <name>`
   keeps its starting parameters and the outputs you accepted, `weft run <name>`
   replays them against the code you have now, and `weft diff` shows you or
   Tangle what changed. Once the whole program works on one example, try
@@ -285,7 +285,7 @@ For why I am building this rather than something else, read
 ## Where things stand
 
 You can build and run typed graphs with groups, loops, live channels,
-infrastructure and waits today. The editor displays execution records,
+infrastructure and waits today. The editor displays run records,
 node inputs and outputs, and live node panels.
 
 If your program needs a web app, Tangle builds one next to it, in `front/`,
@@ -293,7 +293,7 @@ talking to your program through its own HTTP routes.
 
 The [catalog](catalog/) includes messaging, databases, model providers,
 image and audio generation, web search and more. Nodes share the ctx for
-connections, files and execution machinery. Cost meters record the calls they
+connections, files, signals and run records. Cost meters record the calls they
 know how to price.
 
 Weft is early, and breaking changes are still possible. This is what we are working on:

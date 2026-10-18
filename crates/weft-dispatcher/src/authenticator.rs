@@ -247,38 +247,38 @@ pub async fn authorize_project(
     }
 }
 
-/// Authorize a caller against an execution (identified by its execution):
-/// the tenant STAMPED on the execution when it was born must be the
-/// caller's. Returns the execution's owner (tenant + project id), which
+/// Authorize a caller against a run (identified by its run):
+/// the tenant STAMPED on the run when it was born must be the
+/// caller's. Returns the run's owner (tenant + project id), which
 /// handlers need next.
 ///
-/// Deliberately NOT `authorize_project` on the execution's project: an
-/// execution outlives its project (the journal is the record of what
+/// Deliberately NOT `authorize_project` on the run's project: a
+/// run outlives its project (the journal is the record of what
 /// ran, and `weft rm` takes only the project), so asking the project
-/// store made every execution of a removed project un-replayable and
+/// store made every run of a removed project un-replayable and
 /// UNDELETABLE, with `weft clean` (the documented way to remove them)
 /// refused on the rows that needed it most. The stamped tenant is
 /// equally strict, because a project cannot change tenant, and it
 /// cannot be deleted out from under the row.
 ///
-/// An execution with no `run` row is `NOT_FOUND`, the same
-/// answer as a cross-tenant execution, so neither leaks the other's
+/// A run with no `run` row is `NOT_FOUND`, the same
+/// answer as a cross-tenant run, so neither leaks the other's
 /// existence.
-/// Takes the JOURNAL, not the whole state: the execution's own row is
+/// Takes the JOURNAL, not the whole state: the run's own row is
 /// the only thing this consults, and saying so in the signature is
 /// what keeps a future edit from reaching for the project store again.
-pub async fn authorize_execution(
+pub async fn authorize_run(
     journal: &dyn crate::journal::Journal,
     caller: &TenantId,
-    execution_id: weft_core::ExecutionId,
-) -> Result<crate::journal::ExecutionOwner, (StatusCode, String)> {
-    let owner = match journal.execution_owner(execution_id).await {
+    run_id: weft_core::RunId,
+) -> Result<crate::journal::RunOwner, (StatusCode, String)> {
+    let owner = match journal.run_owner(run_id).await {
         Ok(Some(o)) => o,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "not found".to_string())),
         Err(e) => {
             return Err(crate::api::unavailable_or_internal(
-                "read who owns this execution",
-                e.context(format!("execution {execution_id}")),
+                "read who owns this run",
+                e.context(format!("run {run_id}")),
             ))
         }
     };

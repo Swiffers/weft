@@ -99,8 +99,8 @@
 	let guideOpen = $state(true);
 	/// The own-account-only capabilities with their own tutorial section
 	/// on the "Your own" page; folded state per capability.
-	const ownOnlyGuides = $derived((spec.permissions ?? []).filter((p) => p.own_only && p.guide));
-	const ownOnlyLabels = $derived((spec.permissions ?? []).filter((p) => p.own_only).map((p) => p.label));
+	const ownOnlyGuides = $derived((spec.permissions ?? []).filter((p) => p.ownOnly && p.guide));
+	const ownOnlyLabels = $derived((spec.permissions ?? []).filter((p) => p.ownOnly).map((p) => p.label));
 	let capGuideOpen = $state<Record<string, boolean>>({});
 	/// The shared door's one-time displacement warning: shown before the
 	/// FIRST connection is created through it, acknowledged per attempt.
@@ -135,10 +135,10 @@
 		try {
 			connections = await transport.connections(spec.service);
 			const doors = await transport.doors(spec);
-			sharedApps = doors.shared_apps;
-			sharedCredential = doors.shared_credential && transport.allowsSharedKey;
-			redirectUri = doors.redirect_uri ?? '';
-			consentBlocked = doors.consent_blocked ?? null;
+			sharedApps = doors.sharedApps;
+			sharedCredential = doors.sharedCredential && transport.allowsSharedKey;
+			redirectUri = doors.redirectUri ?? '';
+			consentBlocked = doors.consentBlocked ?? null;
 		} catch (e) {
 			fail(e);
 		} finally {
@@ -216,7 +216,7 @@
 				values: paste ? { ...pasteValues } : door === 'own' ? { ...formValues } : {},
 				label: door === 'own' && ownName.trim() ? ownName.trim() : null,
 				permissions: ticked,
-				shared_app: door === 'shared' ? (chosenApp?.label ?? null) : null,
+				sharedApp: door === 'shared' ? (chosenApp?.label ?? null) : null,
 				registration: door === 'own' && !paste ? ownRegistration(spec, formValues, ownName, projectApp) : null,
 			});
 			finish(done.grant);
@@ -247,8 +247,8 @@
 					spec,
 					door,
 					permissions: ticked,
-					shared_app: door === 'shared' ? (sharedApp ?? chosenApp?.label ?? null) : null,
-					upgrade_grant_id: upgradeGrantId ?? null,
+					sharedApp: door === 'shared' ? (sharedApp ?? chosenApp?.label ?? null) : null,
+					upgradeGrantId: upgradeGrantId ?? null,
 					registration: door === 'own' ? ownRegistration(spec, formValues, ownName, projectApp) : null,
 				},
 				{ stopped: () => seq !== waitSeq, onWaiting: () => (waitingConsent = true) },
@@ -334,7 +334,7 @@
 						<button type="button" class="wc-connection" title={c.id} onclick={(e) => pick(e, c)}>
 							<span class="wc-ellipsis">{c.identity ?? c.label ?? label}</span>
 							<span class="wc-ellipsis wc-muted">{c.label ?? label}</span>
-							<span class="wc-ellipsis wc-end {c.has_credential ? 'wc-muted' : 'wc-danger'}">{canDo(spec, c)}</span>
+							<span class="wc-ellipsis wc-end {c.hasCredential ? 'wc-muted' : 'wc-danger'}">{canDo(spec, c)}</span>
 						</button>
 						{#if forgetPending === c.id}
 							<button type="button" class="wc-quiet wc-danger" onclick={(e) => forget(e, c)}>Forget</button>
@@ -394,7 +394,7 @@
 				{:else}
 					<PermissionPicker
 						permissions={tickablePermissions(spec)}
-						allPermissionsUrl={spec.all_permissions_url ?? null}
+						allPermissionsUrl={spec.allPermissionsUrl ?? null}
 						{nodeType}
 						openExternal={(url) => transport.openExternal(url)}
 						bind:ticked
@@ -433,16 +433,16 @@
 				{#if hasPermissions}
 					<PermissionPicker
 						permissions={tickablePermissions(spec)}
-						allPermissionsUrl={spec.all_permissions_url ?? null}
+						allPermissionsUrl={spec.allPermissionsUrl ?? null}
 						{nodeType}
 						openExternal={(url) => transport.openExternal(url)}
 						bind:ticked
 					/>
 				{/if}
-				{#if spec.own_page?.mint && transport.mintApp}
+				{#if spec.ownPage?.mint && transport.mintApp}
 					<button type="button" class="wc-primary wc-go" disabled={busy} onclick={mintApp}>Create it for me</button>
 				{/if}
-				{#if spec.own_page?.guide}
+				{#if spec.ownPage?.guide}
 					<button type="button" class="wc-fold" onclick={(e) => { e.stopPropagation(); guideOpen = !guideOpen; }}>
 						<span>{guideOpen ? '▾' : '▸'}</span>
 						<span>How to create one</span>
@@ -512,9 +512,9 @@
 				{:else}
 					<button type="button" class="wc-primary" disabled={busy} onclick={(e) => connectDirect(e, 'own')}>Connect</button>
 				{/if}
-				{#if spec.own_page?.paste}
+				{#if spec.ownPage?.paste}
 					<div class="wc-muted wc-divider">Or paste a credential you already made:</div>
-					{#each spec.own_page.paste.fields as f (f.name)}
+					{#each spec.ownPage.paste.fields as f (f.name)}
 						<div class="wc-field">
 							<label class="wc-muted" for={`wc-${spec.service}-paste-${f.name}`}>{f.label ?? f.name}</label>
 							<input

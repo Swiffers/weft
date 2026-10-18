@@ -82,7 +82,7 @@ pub enum ProgramCall {
     RunsClean { filter: RunFilter, running: RunningPolicy },
     /// The newest runs matching `filter`, at most `limit` of them
     /// (1 to [`MAX_RUNS_PAGE`]), with how many match in all
-    /// ([`ExecutionPage`]).
+    /// ([`RunPage`]).
     RunsList { filter: RunFilter, limit: u32 },
     /// How many runs match `filter` ([`RunsCounted`]).
     RunsCount { filter: RunFilter },
@@ -133,7 +133,7 @@ impl ProgramCall {
 /// happens to the asker when the call takes it down, and the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgramCallPayload {
-    /// The calling run (its execution).
+    /// The calling run (its run).
     pub by: uuid::Uuid,
     pub stop_self: StopSelf,
     pub call: ProgramCall,
@@ -308,8 +308,8 @@ impl InstanceHoldings {
 
 crate::wire_enum! {
     /// Where a run stands, as a filter asks for it: each word is the
-    /// [`ExecutionSummary::status`] a run reads in a listing.
-    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/executions.ts RunStatus
+    /// [`RunSummary::status`] a run reads in a listing.
+    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_runs (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/runs.ts RunStatus
     pub enum RunStatus {
         /// Not ended: no terminal event yet. A run parked on a wait has
         /// not ended either, so it is here too.
@@ -337,8 +337,9 @@ impl RunStatus {
 
 /// Which runs a clean (or a listing) reaches. Every filter narrows; none
 /// set is every run of the project.
-// SYNC: RunFilter <-> crates/weft-cli/src/commands/executions.rs (clean's flags)
+// SYNC: RunFilter <-> crates/weft-cli/src/commands/runs.rs (clean's flags)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunFilter {
     /// Runs for this instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,7 +360,7 @@ pub struct RunFilter {
 }
 
 /// The most runs one listing answers (`ctx.runs().list(..)`, the
-/// executions page): a listing past it pages with a narrower filter.
+/// runs page): a listing past it pages with a narrower filter.
 pub const MAX_RUNS_PAGE: u32 = 200;
 
 /// What `ProgramCall::RunsCount` answers: how many runs match.
@@ -370,6 +371,7 @@ pub struct RunsCounted {
 
 /// What a clean did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CleanOutcome {
     /// Runs deleted.
     pub deleted: u64,
@@ -380,7 +382,7 @@ pub struct CleanOutcome {
     pub left_running: u64,
 }
 
-/// `POST /executions/clean`: delete every run the filter reaches. What
+/// `POST /runs/clean`: delete every run the filter reaches. What
 /// `weft clean --project .. --instance .. --status ..` sends; a program's
 /// `ctx.runs()..clean(..)` runs the same clean.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,12 +402,13 @@ fn default_clean_running() -> RunningPolicy {
     RunningPolicy::Wait
 }
 
-/// One run, as the executions listing shows it.
-// SYNC: ExecutionSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
-//       extension-vscode/src/sidebar/executions.ts (ExecutionSummary)
+/// One run, as the runs listing shows it.
+// SYNC: RunSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
+//       extension-vscode/src/sidebar/runs.ts (RunSummary)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionSummary {
-    pub execution_id: crate::ExecutionId,
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub run_id: crate::RunId,
     pub project_id: uuid::Uuid,
     pub entry_node: String,
     /// Where the run stands: a running run parked on a wait reads
@@ -415,21 +418,21 @@ pub struct ExecutionSummary {
     /// manual run), or one of the two setup phases an activate /
     /// resync / infra start runs. The listing mixes all three, and
     /// "has my trigger fired since the change" is unanswerable without
-    /// it. Copied from the `ExecutionStarted` row, or, when that row
-    /// no longer decodes, from the `execution.phase` column the
+    /// it. Copied from the `RunStarted` row, or, when that row
+    /// no longer decodes, from the `run.phase` column the
     /// listing filtered on.
     pub phase: crate::primitive::Phase,
     pub started_at: u64,
     pub completed_at: Option<u64>,
-    /// The tags the run put on itself (`ctx.tag_execution`), in the
+    /// The tags the run put on itself (`ctx.tag_run`), in the
     /// order it claimed them. Empty for a run that never tagged.
     pub tags: Vec<String>,
     /// For a `cancelled` run: who or what stopped it (a person, a
     /// sibling run, the caller leaving, the runtime). What the
-    /// executions panel draws the row's icon and words from. `None`
+    /// runs panel draws the row's icon and words from. `None`
     /// for every other status, and for a cancel row written without
     /// a cause.
-    pub cancel_cause: Option<crate::exec::CancelCause>,
+    pub cancel_cause: Option<crate::run::CancelCause>,
     /// For a `failed` run: what failed it, as its terminal row says.
     /// `None` for every other status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,29 +441,29 @@ pub struct ExecutionSummary {
     /// flow). A completed run with skips is still completed; the count
     /// is what the panel says beside it.
     pub skipped_nodes: u64,
-    /// Who the run is for (`ExecutionStarted.instance`); `None` for a run
+    /// Who the run is for (`RunStarted.instance`); `None` for a run
     /// for nobody in particular.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<InstanceId>,
 }
 
-/// One page of executions plus the total number matching the same filters
+/// One page of runs plus the total number matching the same filters
 /// (ignoring limit/offset), so a consumer can render page controls without a
 /// second count round-trip.
-// SYNC: ExecutionPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
-//       extension-vscode/src/sidebar/executions.ts (ExecutionPage)
+// SYNC: RunPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
+//       extension-vscode/src/sidebar/runs.ts (RunPage)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionPage {
-    pub executions: Vec<ExecutionSummary>,
+pub struct RunPage {
+    pub runs: Vec<RunSummary>,
     pub total: u64,
 }
 
-/// `GET /executions/{id}`: one run as the listing shows it, and what it
+/// `GET /runs/{id}`: one run as the listing shows it, and what it
 /// is parked on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionDetail {
+pub struct RunDetail {
     #[serde(flatten)]
-    pub summary: ExecutionSummary,
+    pub summary: RunSummary,
     /// The waits the run holds, in registration order; empty unless it is
     /// `waiting_for_input`. They ride with the status they produced, so a
     /// client that learns the run is parked learns from the same read
@@ -470,7 +473,7 @@ pub struct ExecutionDetail {
 
 /// One wait a parked run holds: the node, the token that answers it, and
 /// the signal kind (a `timer` is woken, anything else expects a value).
-/// What `weft wake <execution_id> <node>` matches against.
+/// What `weft wake <run_id> <node>` matches against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkedWait {
     /// The waiting node's place, spelled the way a person writes it
@@ -482,35 +485,37 @@ pub struct ParkedWait {
     pub kind: String,
 }
 
-/// `GET /executions/resolve/{prefix}`: the one execution of the caller's
+/// `GET /runs/resolve/{prefix}`: the one run of the caller's
 /// whose id starts with the prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResolvedExecution {
-    pub execution_id: crate::ExecutionId,
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedRun {
+    pub run_id: crate::RunId,
 }
 
-/// `DELETE /executions/{id}`: the run's project, and the versions the run
+/// `DELETE /runs/{id}`: the run's project, and the versions the run
 /// left bare that went with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeletedExecution {
+pub struct DeletedRun {
     pub project: uuid::Uuid,
     pub swept: Vec<String>,
 }
 
-/// `GET /executions/{id}/logs`: the tail of a run's log, and the limit
+/// `GET /runs/{id}/logs`: the tail of a run's log, and the limit
 /// that cut it, so a reader can tell a full page from the whole log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionLogs {
+pub struct RunLogs {
     pub limit: u32,
-    pub lines: Vec<ExecutionLogLine>,
+    pub lines: Vec<RunLogLine>,
 }
 
 /// One line of a run's log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionLogLine {
+#[serde(rename_all = "camelCase")]
+pub struct RunLogLine {
     /// The seed run this line was carried over from, for a seeded run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<crate::ExecutionId>,
+    pub inherited_from: Option<crate::RunId>,
     pub at_unix: u64,
     pub level: String,
     /// The firing this line is about: the node, and the loop
@@ -551,6 +556,7 @@ impl PaidBy {
 
 /// Which cost records `ctx.costs()` reads. Every filter narrows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CostFilter {
     /// Costs of runs for this instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,7 +568,7 @@ pub struct CostFilter {
     pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid_by: Option<PaidBy>,
-    /// Costs of one run (`ctx.execution_id` for the calling run's own).
+    /// Costs of one run (`ctx.run_id` for the calling run's own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<uuid::Uuid>,
     /// Costs booked at or after this unix second.
@@ -573,6 +579,7 @@ pub struct CostFilter {
 /// One cost record, as `ctx.costs().list()` answers it. Weft reports the
 /// price it measured; what anybody is billed is the program's business.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CostRecord {
     pub run: uuid::Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -590,6 +597,7 @@ pub struct CostRecord {
 /// An instance token a program minted. The value is shown here once; the
 /// server keeps only its hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MintedInstanceToken {
     /// Revoke it by this id.
     pub id: uuid::Uuid,
@@ -725,6 +733,61 @@ mod tests {
         assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), count);
         assert!(!list.takes_down() && !count.takes_down());
         assert_eq!(serde_json::to_value(RunsCounted { total: 3 }).unwrap(), serde_json::json!({ "total": 3 }));
+    }
+
+    #[test]
+    fn a_run_listing_names_its_fields_in_camel_case() {
+        let run = RunSummary {
+            run_id: crate::RunId::from_u128(1),
+            project_id: uuid::Uuid::from_u128(2),
+            entry_node: "hook".into(),
+            status: RunStatus::WaitingForInput,
+            phase: crate::primitive::Phase::Fire,
+            started_at: 10,
+            completed_at: None,
+            tags: vec!["draft".into()],
+            cancel_cause: None,
+            error: None,
+            skipped_nodes: 3,
+            instance: None,
+        };
+        let page = RunPage { runs: vec![run], total: 1 };
+        let wire = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "runs": [{
+                "runId": "00000000-0000-0000-0000-000000000001",
+                "projectId": "00000000-0000-0000-0000-000000000002",
+                "entryNode": "hook",
+                "status": "waiting_for_input",
+                "phase": "fire",
+                "startedAt": 10,
+                "completedAt": null,
+                "tags": ["draft"],
+                "cancelCause": null,
+                "skippedNodes": 3,
+            }], "total": 1 })
+        );
+        let back: RunPage = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.runs[0].run_id, page.runs[0].run_id);
+        assert_eq!(
+            serde_json::to_value(ResolvedRun { run_id: crate::RunId::nil() }).unwrap(),
+            serde_json::json!({ "runId": "00000000-0000-0000-0000-000000000000" })
+        );
+        let line = RunLogLine {
+            inherited_from: Some(crate::RunId::nil()),
+            at_unix: 4,
+            level: "info".into(),
+            node: None,
+            frames: Default::default(),
+            message: "m".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(line).unwrap(),
+            serde_json::json!({ "inheritedFrom": "00000000-0000-0000-0000-000000000000", "atUnix": 4, "level": "info", "message": "m" })
+        );
+        let filter = RunFilter { older_than_secs: Some(60), ..RunFilter::default() };
+        assert_eq!(serde_json::to_value(&filter).unwrap(), serde_json::json!({ "olderThanSecs": 60 }));
     }
 
     #[test]

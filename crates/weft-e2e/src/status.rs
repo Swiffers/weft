@@ -40,30 +40,30 @@ impl ProjectStatus {
     /// The derived infra rollup (`none` / `provisioning` / `running` /
     /// `stopping` / `terminating` / `stopped` / `partial` / `failed` / `flaky`).
     pub fn infra_rollup(&self) -> &str {
-        self.0.get("infra_rollup").and_then(Value::as_str).unwrap_or("")
+        self.0.get("infraRollup").and_then(Value::as_str).unwrap_or("")
     }
 
     /// Whether the REGISTERED definition declares infra (the source fact the
     /// dispatcher enforces with; refreshed on every register).
     pub fn has_infra(&self) -> bool {
-        self.0.get("has_infra").and_then(Value::as_bool).unwrap_or(false)
+        self.0.get("hasInfra").and_then(Value::as_bool).unwrap_or(false)
     }
 
     /// Live infra rows whose node is no longer in the registered source.
     pub fn orphaned_infra(&self) -> bool {
-        self.0.get("orphaned_infra").and_then(Value::as_bool).unwrap_or(false)
+        self.0.get("orphanedInfra").and_then(Value::as_bool).unwrap_or(false)
     }
 
-    /// Running (non-suspended, non-terminal) executions.
+    /// Running (non-suspended, non-terminal) runs.
     pub fn running_count(&self) -> u64 {
-        self.0.get("running_count").and_then(Value::as_u64).unwrap_or(0)
+        self.0.get("runningCount").and_then(Value::as_u64).unwrap_or(0)
     }
 
     /// The reconciliation table's answer: the verbs the dispatcher will
     /// currently accept.
     pub fn available_actions(&self) -> Vec<&str> {
         self.0
-            .get("available_actions")
+            .get("availableActions")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default()

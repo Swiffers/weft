@@ -156,7 +156,7 @@
   });
   const refresh = refreshFlight.join;
 
-  /// Skip = "I don't want to answer this one." The step that asked
+  /// Skip = "I don't want to answer this one." The node that asked
   /// ends skipped, its outputs close and what reads them skips; the
   /// rest of the run keeps going.
   async function handleSkipTask(task: PendingTask) {
@@ -169,10 +169,10 @@
   }
 
   /// Cancel = "kill this whole run." Drops every sibling task
-  /// of the same execution. Confirm before doing it because the
+  /// of the same run. Confirm before doing it because the
   /// blast radius is bigger than the visible task.
   async function handleCancelRun(task: PendingTask) {
-    if (!confirm('Cancel the entire run? Every related task will be dropped and the execution will be marked failed.')) {
+    if (!confirm('Cancel the entire run? Every related task will be dropped and the run will end cancelled.')) {
       return;
     }
     try {
@@ -190,13 +190,13 @@
   async function handleClearAll() {
     if (!confirm(
       'Cancel every pending run AND delete every trigger these tokens see? '
-      + 'Runs are marked failed (still inspectable in the journal); deleted '
+      + 'Runs end cancelled (still inspectable in the journal); deleted '
       + 'triggers come back only when their project re-registers.',
     )) {
       return;
     }
     // Clear-all calls the per-token endpoint once per token. Each
-    // call cancels every distinct execution that token sees, so
+    // call cancels every distinct run that token sees, so
     // iterating across configured tokens covers everything. Failures
     // are COLLECTED and reported, never swallowed: a runtime that was
     // down still has its runs pending, and a popup that looks cleared
@@ -207,7 +207,7 @@
     for (const t of tokens) {
       try {
         const counts = await clearAll(t);
-        cancelled += counts.executionsCancelled;
+        cancelled += counts.runsCancelled;
         triggersDropped += counts.entrySignalsDropped;
       } catch (e) {
         console.warn('[weft] clearAll failed for', t.name, e);
@@ -583,7 +583,7 @@
         <button
           class="clear-all-btn"
           onclick={handleClearAll}
-          title="Cancel every pending run this token sees. Drops every related task; runs are marked failed (still inspectable in the journal)."
+          title="Cancel every pending run this token sees. Drops every related task; runs end cancelled (still inspectable in the journal)."
         >
           Clear all
         </button>
@@ -600,7 +600,7 @@
 <!-- One card renderer for both sections. `isTrigger` gates the
      skip/cancel buttons (THE shared trigger test, same as the task
      runner's): a RESUME task acts on a paused run (skip = end the
-     asking step as skipped, cancel = kill the run), so it shows them; a
+     asking node as skipped, cancel = kill the run), so it shows them; a
      TRIGGER has no question to skip (weft refuses it) and no in-flight
      run to cancel, so opening it (to submit its form and START a run)
      is the only action. -->
@@ -619,7 +619,7 @@
       <button
         class="task-skip"
         onclick={() => handleSkipTask(task)}
-        title="Skip: the step that asked ends skipped, and what reads its answer skips too. The rest of the run continues."
+        title="Skip: the node that asked ends skipped, and what reads its answer skips too. The rest of the run continues."
         aria-label="Skip task"
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -629,7 +629,7 @@
       <button
         class="task-cancel"
         onclick={() => handleCancelRun(task)}
-        title="Cancel run: kill this entire execution. Every related task is dropped and the run is marked failed (you can still inspect it in the journal)."
+        title="Cancel run: kill this entire run. Every related task is dropped and the run ends cancelled (you can still inspect it in the journal)."
         aria-label="Cancel run"
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

@@ -38,7 +38,7 @@ that could block for minutes.
 A run can tag itself, and a run can stop every run carrying a tag.
 
 ```rust
-ctx.tag_execution(["chat_7"]).await?;
+ctx.tag_run(["chat_7"]).await?;
 ctx.stop_tagged("chat_7", StopSelf::Keep).await?;
 ```
 
@@ -50,7 +50,7 @@ run stops the first two and answers once.
 | `StopSelf::Keep` | Stop the others, keep running |
 | `StopSelf::Include` | Stop everything carrying the tag, including this run |
 
-It reaches running executions, ones parked on a signal or a timer, whose wake
+It reaches runs that are working, ones parked on a signal or a timer, whose wake
 is erased so they never come back, and ones whose wake is already on its way,
 which find the run gone and do nothing. Each one is recorded as cancelled,
 naming this run and the tag, so it reads as a decision rather than a failure.
@@ -90,7 +90,7 @@ The fake rig does not stop anything. It records what your node asked for, and
 you assert on that:
 
 ```rust
-assert_eq!(rig.execution_tags(), vec!["chat_7"]);
+assert_eq!(rig.run_tags(), vec![vec!["chat_7"]]);
 assert_eq!(rig.stops().len(), 1);
 ```
 

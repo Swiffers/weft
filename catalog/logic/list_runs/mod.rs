@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftError, WeftResult};
 
 use super::runs::runs_from_inputs;
 
@@ -21,7 +21,7 @@ impl Node for ListRunsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let limit: f64 = ctx.inputs.get("limit")?;
         // The range is the runtime's to refuse (`RunQuery::list`); a
         // count that is not a whole number never reaches it.
@@ -29,6 +29,6 @@ impl Node for ListRunsNode {
             return Err(WeftError::Input(format!("limit is how many runs to list, a whole number, so it cannot be {limit}")));
         }
         let page = runs_from_inputs(&ctx)?.list(limit as u32).await?;
-        ctx.pulse_downstream(NodeOutput::new().set_serialized("runs", &page.executions)?.set("total", page.total)).await
+        ctx.pulse_downstream(NodeOutput::new().set_serialized("runs", &page.runs)?.set("total", page.total)).await
     }
 }

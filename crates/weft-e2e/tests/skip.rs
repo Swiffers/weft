@@ -11,7 +11,7 @@ async fn a_gate_decides_both_ways_round() -> anyhow::Result<()> {
     let mut project = Project::prepare("skip", disp).await?;
 
     let settled = run::run_and_settle(&mut project).await?;
-    // The execution itself completes (a skip is not a failure).
+    // The run itself completes (a skip is not a failure).
     settled.completed()?;
     // The guarded node was told not to run, and the node reading its
     // output closed in turn: neither ever started.

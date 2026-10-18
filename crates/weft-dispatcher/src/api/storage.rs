@@ -392,17 +392,17 @@ mod tests {
 
     #[test]
     fn ensure_tenant_key_prefixes_bare_scope_keys() {
-        assert_eq!(ensure_tenant_key(&t(), "exec/c1/f").unwrap(), "alice/exec/c1/f");
+        assert_eq!(ensure_tenant_key(&t(), "run/c1/f").unwrap(), "alice/run/c1/f");
         assert_eq!(ensure_tenant_key(&t(), "project/p1/f").unwrap(), "alice/project/p1/f");
         assert_eq!(ensure_tenant_key(&t(), "shared/team/f").unwrap(), "alice/shared/team/f");
-        assert_eq!(ensure_tenant_key(&t(), "alice/exec/c1/f").unwrap(), "alice/exec/c1/f");
+        assert_eq!(ensure_tenant_key(&t(), "alice/run/c1/f").unwrap(), "alice/run/c1/f");
         let sha = "a".repeat(64);
         assert_eq!(ensure_tenant_key(&t(), &format!("asset/{sha}")).unwrap(), format!("alice/asset/{sha}"));
     }
 
     #[test]
     fn ensure_tenant_key_rejects_cross_tenant_reach() {
-        let err = ensure_tenant_key(&t(), "bob/exec/c1/f").unwrap_err();
+        let err = ensure_tenant_key(&t(), "bob/run/c1/f").unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         assert!(ensure_tenant_key(&t(), "garbage").is_err());
     }
@@ -448,8 +448,8 @@ mod tests {
 
     #[test]
     fn ensure_tenant_prefix_prefixes_and_walls() {
-        assert_eq!(ensure_tenant_prefix(&t(), "exec/c1/").unwrap(), "alice/exec/c1/");
+        assert_eq!(ensure_tenant_prefix(&t(), "run/c1/").unwrap(), "alice/run/c1/");
         assert_eq!(ensure_tenant_prefix(&t(), "alice/shared/team/").unwrap(), "alice/shared/team/");
-        assert!(ensure_tenant_prefix(&t(), "bob/exec/c1/").is_err());
+        assert!(ensure_tenant_prefix(&t(), "bob/run/c1/").is_err());
     }
 }

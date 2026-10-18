@@ -148,8 +148,8 @@ impl FireSignalSink {
                 tracing::debug!(target: "weft_listener::fire_sink", %token, ?reason, "the kind dropped the event");
                 return Ok(Delivered::Taken);
             }
-            (weft_core::signal::listener_protocol::ProcessTarget::Resume { execution_id }, true) => {
-                return self.enqueue_answer(token, tenant_id, held_by, execution_id, processed.value, fire_id).await;
+            (weft_core::signal::listener_protocol::ProcessTarget::Resume { run_id }, true) => {
+                return self.enqueue_answer(token, tenant_id, held_by, run_id, processed.value, fire_id).await;
             }
             (weft_core::signal::listener_protocol::ProcessTarget::Entry, false) => processed.value,
             (weft_core::signal::listener_protocol::ProcessTarget::Resume { .. }, false) => {
@@ -207,14 +207,14 @@ impl FireSignalSink {
     }
 
     /// The `FireSignal` task for `value`, the kind's answer to the waiting
-    /// run `execution_id`: a retry of the same event collapses onto its
+    /// run `run_id`: a retry of the same event collapses onto its
     /// task row while it is still queued.
     async fn enqueue_answer(
         &self,
         token: &str,
         tenant_id: &str,
         held_by: Option<&str>,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         value: Value,
         fire_id: uuid::Uuid,
     ) -> Result<Delivered> {
@@ -223,11 +223,11 @@ impl FireSignalSink {
                 kind: TaskKind::FireSignal,
                 project_id: None,
                 dedup_key: Some(format!("fire:{fire_id}")),
-                execution_id: Some(execution_id),
+                run_id: Some(run_id),
                 tenant_id: tenant_id.to_string(),
                 payload: serde_json::to_value(weft_task_store::kinds::FireSignalPayload {
                     token: token.to_string(),
-                    execution_id,
+                    run_id,
                     value,
                     held_by: held_by.map(str::to_string),
                 })?,

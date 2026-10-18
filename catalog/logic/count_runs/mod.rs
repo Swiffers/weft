@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::runs::runs_from_inputs;
 
@@ -20,7 +20,7 @@ impl Node for CountRunsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let count = runs_from_inputs(&ctx)?.count().await?;
         ctx.pulse_downstream(NodeOutput::new().set("count", count)).await
     }

@@ -550,8 +550,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "service": "google",
             "acquisition": { "kind": "oauth2",
-                "grant": { "kind": "authorization_code", "auth_url": "https://a/x" },
-                "token_url": "https://a/t" },
+                "grant": { "kind": "authorization_code", "authUrl": "https://a/x" },
+                "tokenUrl": "https://a/t" },
             "permissions": ids.iter().map(|id| serde_json::json!({
                 "id": id, "label": id, "description": "d."
             })).collect::<Vec<_>>()

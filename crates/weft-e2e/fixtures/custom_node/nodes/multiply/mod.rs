@@ -5,14 +5,14 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MultiplyNode;
 
 #[async_trait]
 impl Node for MultiplyNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // Both inputs are required, so the engine only fires once they are
         // present; read them loudly (`get` errors on absent/wrong type).
         let a: f64 = ctx.inputs.get("a")?;

@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 
 use weft::signal::{Predicate, ProviderEvents};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SlackOnReactionNode;
@@ -29,7 +29,7 @@ impl Node for SlackOnReactionNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let channel: Option<String> = ctx.inputs.opt("channel")?;
         let emoji: Option<String> = ctx.inputs.opt("emoji")?;
@@ -53,7 +53,7 @@ impl Node for SlackOnReactionNode {
         ctx.register_signal(ProviderEvents::new(&account, "reactions", filters)).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         ctx.pulse_downstream(ctx.fan_declared(&ctx.wake.record()?)).await
     }
 }

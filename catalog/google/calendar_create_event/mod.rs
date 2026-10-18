@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::required_str;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 /// A start/end value to the API's shape: a bare date is all-day.
 fn when(value: &str) -> Value {
@@ -32,7 +32,7 @@ impl Node for GoogleCalendarCreateEventNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let calendar: String = ctx.inputs.get("calendar")?;
         let summary: String = ctx.inputs.get("summary")?;

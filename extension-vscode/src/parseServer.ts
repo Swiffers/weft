@@ -51,11 +51,11 @@ export type ParseServerRequest =
   /** Edit ops, applied in order to `source`. */
   | ({ kind: 'edit'; ops: EditOp[] } & ParseServerRequestBase)
   /** A raw text edit to replay (the undo/redo path). */
-  | ({ kind: 'applyEdit'; textEdit: TextEdit } & ParseServerRequestBase)
+  | ({ kind: 'apply_edit'; textEdit: TextEdit } & ParseServerRequestBase)
   /// Resolve a run spec against the parsed program: the dispatcher's own
   /// resolver, so the spec dialog refuses what the run would refuse.
   | ({
-      kind: 'resolveSpec';
+      kind: 'resolve_spec';
       spec: RunSpec;
       seeded: boolean;
       bakes?: BakeSummary[];

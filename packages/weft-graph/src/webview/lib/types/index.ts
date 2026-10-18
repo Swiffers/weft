@@ -11,14 +11,14 @@ import type {
 	CorruptionSite,
 	LoopInspectorEvent,
 	Frame,
-	NodeExecutionStatus,
+	NodeFiringStatus,
 	NodeFeaturesWire as NodeFeatures,
 } from '../../../protocol';
 // Node feature flags ARE the wire type `NodeFeaturesWire`, aliased to
 // `NodeFeatures` and re-exported under the `lib/types` module so webview
 // imports stay uniform and there is one definition of the concept (not a
 // webview-local copy that drifts from the wire shape).
-export type { NodeExecutionStatus };
+export type { NodeFiringStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../protocol';
 // The accepts/widget vocabulary IS the wire type, re-exported for the
 // same one-definition reason.
@@ -414,13 +414,13 @@ export interface FieldDefinition {
 // =============================================================================
 
 
-/** Record of a single execution of a node. The `NodeExecutionStatus`
+/** Record of a single run of a node. The `NodeFiringStatus`
  *  alias re-exported at the top of the file lets the wire and the UI
  *  share one source of truth and never drift on which states exist. */
-export interface NodeExecution {
+export interface NodeFiring {
 	id: string;
 	nodeId: string;
-	status: NodeExecutionStatus;
+	status: NodeFiringStatus;
 	pulseId: string;
 	error?: string;
 	callbackId?: string;
@@ -456,7 +456,7 @@ export interface NodeExecution {
 	/// landed (deduped on key + produced version across replay and live).
 	fileEdits?: import('../../../protocol').FileEditWire[];
 	logs: unknown[];
-	executionId: string;
+	runId: string;
 	frames: Frame[];
 	/// Frame stack serialized as JSON, used to correlate completion
 	/// events to the right running row when several firings run
@@ -466,31 +466,31 @@ export interface NodeExecution {
 	inheritedFrom?: string;
 	/// Input ports whose value a person provided (a scoped run).
 	providedPorts?: string[];
-	// SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent
+	// SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent
 	backupPorts?: string[];
 	inheritedPorts?: Record<string, string>;
 }
 
-/** Node executions keyed by node ID. */
-export type NodeExecutionTable = Record<string, NodeExecution[]>;
+/** Node firings keyed by node ID. */
+export type NodeFiringTable = Record<string, NodeFiring[]>;
 
 /** How the run ended, once it has: the state plus, for a cancel, the
  *  text and structured cause (a sibling run stopping it names the run
  *  and the tag). Undefined while the run is live. */
-export interface ExecutionTerminal {
+export interface RunTerminal {
 	state: 'completed' | 'failed' | 'cancelled';
 	reason?: string;
 	cause?: import('../../../protocol').CancelCause;
 }
 
-/** Live execution state the webview maintains from the extension
+/** Live run state the webview maintains from the extension
  *  host's SSE stream. Single source of truth: lifted here so
  *  `App.svelte` (which owns the state) and the editor components
  *  (which consume it) cannot drift on field shape. Webview-internal
  *  only: `Set<string>` does not survive the wire, so this type never
  *  appears in a `HostMessage`.
  */
-export interface ExecutionState {
+export interface RunState {
 	isRunning: boolean;
 	/** The places the followed run is held to (`locatedKey`s); `null`
 	 *  for the whole graph, `undefined` before the run's birth arrived. A
@@ -503,13 +503,13 @@ export interface ExecutionState {
 	/** The version the run ran and the version the files on disk are,
 	 *  when the host knows them (a run opened from the version tree). */
 	version?: { version: string | null; diskVersion: string | null };
-	/** The tags the run put on itself (`ctx.tag_execution`), in claim
+	/** The tags the run put on itself (`ctx.tag_run`), in claim
 	 *  order, deduplicated. The handle a sibling's `ctx.stop_tagged`
 	 *  selects on; shown on the run in the inspector. */
 	tags: string[];
-	terminal?: ExecutionTerminal;
+	terminal?: RunTerminal;
 	nodeOutputs: Record<string, unknown>;
-	nodeExecutions: NodeExecutionTable;
+	nodeFirings: NodeFiringTable;
 	/** Full bus log per `busId` (in arrival order). The inspector
 	 *  renders one IRC-style panel per bus a node participates in. */
 	busLogByBus: Record<string, BusInspectorEvent[]>;
@@ -535,9 +535,9 @@ export interface ExecutionState {
 	loopEventsByGroup: Record<string, LoopInspectorEvent[]>;
 	/** Full ordered log of the live caller exchange (connected /
 	 *  inbound / outbound / errored / disconnected). One caller per
-	 *  execution, so this is a flat list, not keyed. Empty for runs
+	 *  run, so this is a flat list, not keyed. Empty for runs
 	 *  with no live connection. The inspector replays it as a single
-	 *  caller panel on the execution. */
+	 *  caller panel on the run. */
 	callerLog: CallerInspectorEvent[];
 }
 
@@ -572,7 +572,7 @@ export interface NodeTemplate {
 	 *  ranking. Always present (empty array when the node declares
 	 *  none) so consumers don't have to optional-chain. */
 	tags: string[];
-	/// Mirrors the node's `metadata.requires_infra` flag. The infra
+	/// Mirrors the node's `metadata.requiresInfra` flag. The infra
 	/// subgraph extractor + node-role helpers key off this to decide
 	/// whether to seed from this node. Always present in templates
 	/// built from the `weft describe-nodes` payload; defaults to false
@@ -701,11 +701,11 @@ export interface NodeDataUpdates {
 	config?: Record<string, unknown>;
 	/// Body-set PORT values (the node's portLiterals map), kept apart
 	/// from `config`: one home per name. The handler diffs it into
-	/// setConfig/removeConfig ops stamped with the value's written form.
+	/// set_config/remove_config ops stamped with the value's written form.
 	portLiterals?: Record<string, unknown>;
 	/// Flip a port value's WRITTEN form (braces vs statement); becomes a
-	/// `setValueForm` op.
-	// SYNC: portValueForm.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/protocol.ts EditOp setValueForm.form
+	/// `set_value_form` op.
+	// SYNC: portValueForm.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/protocol.ts EditOp set_value_form.form
 	portValueForm?: { key: string; form: 'inline' | 'connection' };
 	inputs?: PortDefinition[];
 	outputs?: PortDefinition[];
@@ -774,7 +774,7 @@ export function isIncludeNodeType(nodeType: unknown): boolean {
 	return nodeType === INCLUDE_NODE_TYPE;
 }
 
-/** A box whose own execution is its boundary pair: a container (its
+/** A box whose own run is its boundary pair: a container (its
  *  `__in` / `__out` fire at this level around its members) or an include
  *  (the call site's `__in` / `__out` fire at this level around the body,
  *  which runs one call frame deeper). Both are painted from the pair the

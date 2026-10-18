@@ -21,7 +21,7 @@ use weft::context::LogLevel;
 use weft::reqwest::StatusCode;
 use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{FileHandle, KeepTtl, StorageScope, StoredFile};
-use weft::{node_error, Access, ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{node_error, Access, RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -115,13 +115,13 @@ pub fn set_some<T: Serialize>(body: &mut Value, key: &str, value: Option<T>) {
 /// carries, and remembers every temporary asset it had to upload, so
 /// the node removes them once the job no longer needs them.
 pub struct References<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     http: &'a Client,
     uploads: Mutex<Vec<String>>,
 }
 
 impl<'a> References<'a> {
-    pub fn new(ctx: &'a ExecutionContext, http: &'a Client) -> Self {
+    pub fn new(ctx: &'a RunContext, http: &'a Client) -> Self {
         Self { ctx, http, uploads: Mutex::new(Vec::new()) }
     }
 
@@ -129,7 +129,7 @@ impl<'a> References<'a> {
     /// takes it that way, otherwise an asset uploaded to the workspace
     /// for this job and named by its id.
     pub async fn of(&self, file: &FileHandle) -> WeftResult<Value> {
-        let (meta, bytes) = self.ctx.storage(StorageScope::Execution).get_bytes(file).await?;
+        let (meta, bytes) = self.ctx.storage(StorageScope::Run).get_bytes(file).await?;
         if let Some(mime) = inline_mime(&meta.mime_type, bytes.len()) {
             return Ok(json!({
                 "type": "inline_base64",
@@ -181,7 +181,7 @@ pub struct Submitted {
 /// of paying for a second job. A request that fails takes its
 /// temporary uploads with it.
 pub async fn submit<F, Fut>(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     http: &Client,
     refs: &References<'_>,
     url: &str,
@@ -230,7 +230,7 @@ where
 /// waits runs none of this, so its temporary uploads stay in the
 /// workspace's assets.
 pub async fn finish(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     account: &Access,
     http: &Client,
     url: &str,
@@ -271,7 +271,7 @@ pub async fn finish(
 /// job it served is already paid for: it is named on the node's log,
 /// with where to delete it, because it stays in the workspace and
 /// counts against its storage.
-async fn remove_uploads(ctx: &ExecutionContext, http: &Client, uploads: &[String]) -> WeftResult<()> {
+async fn remove_uploads(ctx: &RunContext, http: &Client, uploads: &[String]) -> WeftResult<()> {
     for id in uploads {
         let refused = match http.delete(format!("{API}/assets/{id}")).send().await {
             Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => continue,
@@ -309,7 +309,7 @@ pub fn failure(what: &str, job: &Value) -> weft::WeftError {
 /// the job, not whatever the download's header says: everything
 /// downstream reads the stored type as the truth about the bytes, and
 /// it decides which kind of file the graph sees.
-pub async fn store_output(ctx: &ExecutionContext, kind: &str, output: &Value) -> WeftResult<Value> {
+pub async fn store_output(ctx: &RunContext, kind: &str, output: &Value) -> WeftResult<Value> {
     let url = output["content_url"].as_str().node_err("ElevenLabs answered a finished output with no content_url")?;
     let mime = output["content_mime_type"]
         .as_str()
@@ -326,19 +326,19 @@ pub async fn store_output(ctx: &ExecutionContext, kind: &str, output: &Value) ->
 /// ElevenLabs stated, never the download's header: everything
 /// downstream reads the stored type as the truth about the bytes) under
 /// `filename`.
-pub async fn store_download(ctx: &ExecutionContext, url: &str, mime: &str, filename: &str) -> WeftResult<StoredFile> {
+pub async fn store_download(ctx: &RunContext, url: &str, mime: &str, filename: &str) -> WeftResult<StoredFile> {
     let what = format!("download {filename} from ElevenLabs");
     // The URL is signed by ElevenLabs and served by a storage host: it
     // goes out on the plain client, so the account's key never travels
     // with it.
     let resp = ctx.http().get(url).send().await.map_err(|e| node_error(format!("{what}: {}", send_error(e))))?;
-    ctx.storage(StorageScope::Execution).put_response(resp, &what, Some(mime), filename, Some(KeepTtl::Default)).await
+    ctx.storage(StorageScope::Run).put_response(resp, &what, Some(mime), filename, Some(KeepTtl::Default)).await
 }
 
 /// Make one generation: POST what `build` returns to the route for
 /// `media`, wait for the job, and answer the stored output.
 pub async fn generate<F, Fut>(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     account: &Access,
     http: &Client,
     refs: &References<'_>,
@@ -376,7 +376,7 @@ pub fn is_veo(model: &str) -> bool {
 /// node's inputs: the model, the prompt, and the output settings the
 /// person set (`durationSecs`, `aspectRatio`, `resolution`,
 /// `generateAudio`, `negativePrompt`, `promptAsWritten`, `seed`).
-pub fn video_request(ctx: &ExecutionContext) -> WeftResult<Value> {
+pub fn video_request(ctx: &RunContext) -> WeftResult<Value> {
     let model: String = ctx.inputs.get("model")?;
     let prompt: String = ctx.inputs.get("prompt")?;
     let generate_audio: bool = ctx.inputs.get("generateAudio")?;

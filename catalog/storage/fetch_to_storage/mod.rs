@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::storage::StoredFile;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifetime;
 
@@ -29,15 +29,15 @@ impl Node for FetchToStorageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
         let filename: Option<String> = ctx.inputs.opt("filename")?;
         let scope = lifetime::scope_named(&ctx.inputs.get::<String>("scope")?)?;
         let identity: Option<String> = ctx.inputs.opt("identity")?.filter(|s: &String| !s.is_empty());
         // No default on purpose, as on every storage node: absent is the
-        // scope's own lifetime (an execution file goes with its run, a
+        // scope's own lifetime (a run file goes with its run, a
         // project file stays).
-        let ttl_days: Option<u64> = ctx.inputs.opt("ttl_days")?;
+        let ttl_days: Option<u64> = ctx.inputs.opt("ttlDays")?;
         let keep_ttl = ttl_days.map(lifetime::ttl_of_days);
 
         // The whole fetch-stream-into-storage path is a language

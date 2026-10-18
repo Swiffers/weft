@@ -53,7 +53,7 @@ struct TestRequest<'a> {
 #[derive(Debug, Serialize)]
 struct LiveTest<'a> {
     connection: &'a str,
-    execution_id: uuid::Uuid,
+    run_id: uuid::Uuid,
     replica: &'a str,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     fixtures: &'a std::collections::BTreeMap<String, String>,
@@ -69,16 +69,16 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
             require_fixture_safe(name, value)?;
         }
         // The replica the run names itself with, and on a live run the
-        // execution: both the task's, so every claim lands on the same ones.
+        // run: both the task's, so every claim lands on the same ones.
         let replica = format!("node-test-{}", task.id.simple());
-        let execution_id: Option<weft_core::ExecutionId> = payload.live_connection.as_ref().map(|_| task.id);
+        let run_id: Option<weft_core::RunId> = payload.live_connection.as_ref().map(|_| task.id);
 
         // Re-claim fast path: a prior claim already has the report on
         // the TASK row.
         if let Some(report) = weft_task_store::tasks::stored_result(&state.pg_pool, task.id).await? {
             return Ok(report);
         }
-        if execution_id.is_some() && task.attempts > 1 {
+        if run_id.is_some() && task.attempts > 1 {
             anyhow::bail!(
                 "a prior claim of this live test task recorded no report; the test may or may \
                  not have run (and spent money), so it will not be re-run automatically. Re-run \
@@ -86,7 +86,7 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
             );
         }
 
-        let report = call_test_server(state, &payload, &replica, execution_id).await?;
+        let report = call_test_server(state, &payload, &replica, run_id).await?;
         // Persist the report on the TASK row: a re-claim returns it through
         // the fast path at the top.
         weft_task_store::tasks::store_result_partial(&state.pg_pool, task.id, state.replica.as_str(), &report).await?;
@@ -100,7 +100,7 @@ async fn call_test_server(
     state: &DispatcherState,
     payload: &RunNodeTestPayload,
     replica: &str,
-    execution_id: Option<weft_core::ExecutionId>,
+    run_id: Option<weft_core::RunId>,
 ) -> Result<Value> {
     let target = weft_platform_traits::WorkerTarget {
         tenant: payload.tenant.clone(),
@@ -115,9 +115,9 @@ async fn call_test_server(
     let request = TestRequest {
         node: &payload.node,
         test: &payload.test,
-        live: payload.live_connection.as_deref().zip(execution_id).map(|(connection, execution_id)| LiveTest {
+        live: payload.live_connection.as_deref().zip(run_id).map(|(connection, run_id)| LiveTest {
             connection,
-            execution_id,
+            run_id,
             replica,
             fixtures: &payload.fixtures,
         }),
@@ -183,21 +183,21 @@ mod tests {
     }
 
     /// The request the test server reads: a live run carries its
-    /// connection, execution, replica and fixtures; a free-tier run none.
+    /// connection, run, replica and fixtures; a free-tier run none.
     #[test]
     fn the_test_request_reads_as_the_server_expects() {
         let fixtures = std::collections::BTreeMap::from([("WEFT_NODE_TEST_CHAT".to_string(), "1".to_string())]);
-        let execution_id = uuid::Uuid::from_u128(7);
+        let run_id = uuid::Uuid::from_u128(7);
         let live = TestRequest {
             node: "SlackSendMessage",
             test: "posts",
-            live: Some(LiveTest { connection: "c1", execution_id, replica: "node-test-x", fixtures: &fixtures }),
+            live: Some(LiveTest { connection: "c1", run_id, replica: "node-test-x", fixtures: &fixtures }),
         };
         assert_eq!(
             serde_json::to_value(&live).unwrap(),
             serde_json::json!({
                 "node": "SlackSendMessage", "test": "posts",
-                "live": { "connection": "c1", "execution_id": execution_id, "replica": "node-test-x", "fixtures": { "WEFT_NODE_TEST_CHAT": "1" } }
+                "live": { "connection": "c1", "run_id": run_id, "replica": "node-test-x", "fixtures": { "WEFT_NODE_TEST_CHAT": "1" } }
             })
         );
         let free = TestRequest { node: "Text", test: "t", live: None };

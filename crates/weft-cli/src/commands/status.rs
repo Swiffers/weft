@@ -101,7 +101,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // command that leaves it. The marked 404 is how the dispatcher says
     // "no project I know under this id" (as opposed to a missing route).
     let Some(data) = ctx.client()?.get_json_if_found(&path).await? else {
-        if !ctx.json_out(&serde_json::json!({ "registered": false, "project_id": project_id }))? {
+        if !ctx.json_out(&serde_json::json!({ "registered": false, "projectId": project_id }))? {
             // A program with infra of its own has it started before its
             // triggers are switched on: a trigger reads its infra.
             let first = if declares_infra {
@@ -163,11 +163,11 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     // One entry per infra node the program declares, started or not, so
-    // an empty list really means no node declares `requires_infra`.
+    // an empty list really means no node declares `requiresInfra`.
     if data.infra.is_empty() && !data.built {
         println!("  infra: (this install has not built the program yet, so it does not know its nodes)");
     } else if data.infra.is_empty() {
-        println!("  infra: (no nodes declare requires_infra)");
+        println!("  infra: (no nodes declare requiresInfra)");
     } else {
         println!("  infra:");
         for entry in &data.infra {
@@ -234,20 +234,20 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         }
     }
 
-    let execs = &data.executions;
+    let runs = &data.runs;
     // `weft tree` lists the program's own runs; the ones that set it up
     // (arming triggers, starting infra) are counted apart so the two agree.
-    match execs.setup {
-        0 => println!("  executions: {} runs", execs.total),
-        setup => println!("  executions: {} runs (and {setup} that set the program up: its triggers, its infra)", execs.total),
+    match runs.setup {
+        0 => println!("  runs: {} runs", runs.total),
+        setup => println!("  runs: {} runs (and {setup} that set the program up: its triggers, its infra)", runs.total),
     }
-    if let (Some(execution_id), Some(status)) = (&execs.last_execution_id, &execs.last_status) {
-        match execs.last_completed_at {
+    if let (Some(run_id), Some(status)) = (&runs.last_run_id, &runs.last_status) {
+        match runs.last_completed_at {
             Some(ts) => {
                 let age = crate::progress::now_unix().saturating_sub(ts);
-                println!("    last: {execution_id} ({status}, completed {age}s ago)");
+                println!("    last: {run_id} ({status}, completed {age}s ago)");
             }
-            None => println!("    last: {execution_id} ({status}, in flight)"),
+            None => println!("    last: {run_id} ({status}, in flight)"),
         }
     }
     print_drift(&ctx, &data.drift);
@@ -262,9 +262,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
     // What each trigger started lately: the one trace a run kept
     // unrecorded leaves when it goes well.
-    if !data.runs.is_empty() {
+    if !data.trigger_runs.is_empty() {
         println!("  runs started (the last minute or two):");
-        for entry in &data.runs {
+        for entry in &data.trigger_runs {
             match entry.failed {
                 0 => println!("    {}: {}", entry.node, entry.started),
                 failed => println!("    {}: {} ({failed} failed)", entry.node, entry.started),

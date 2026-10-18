@@ -4,9 +4,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS entry_rate (
             hits INTEGER NOT NULL,
             PRIMARY KEY (key, window_start)
         );
-CREATE TABLE IF NOT EXISTS entry_slot (
-            execution_id TEXT PRIMARY KEY,
-            signal_token TEXT NOT NULL,
-            unborn_until BIGINT NOT NULL
-        );
-CREATE INDEX IF NOT EXISTS idx_entry_slot_token ON entry_slot(signal_token);
+CREATE OR REPLACE FUNCTION weft_rate_hit(p_key TEXT, p_window_start BIGINT) RETURNS INTEGER AS $$
+            DELETE FROM entry_rate WHERE window_start < p_window_start - 60;
+            INSERT INTO entry_rate (key, window_start, hits) VALUES (p_key, p_window_start, 1)
+            ON CONFLICT (key, window_start) DO UPDATE SET hits = entry_rate.hits + 1
+            RETURNING hits
+            $$ LANGUAGE sql;

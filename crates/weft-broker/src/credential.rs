@@ -20,8 +20,8 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct KeyRequest {
     pub tenant: String,
-    /// The opening execution, verified against the tenant by the handler.
-    pub execution_id: weft_core::ExecutionId,
+    /// The opening run, verified against the tenant by the handler.
+    pub run_id: weft_core::RunId,
     pub project_id: uuid::Uuid,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate: a source that books
@@ -63,7 +63,7 @@ pub enum KeyResolution {
 }
 
 /// Who is asking for a DESIGN-TIME credential: the editor signing a
-/// `remote_select` lookup on an ours-owned connection. No execution
+/// `remote_select` lookup on an ours-owned connection. No run
 /// exists, so there is no firing to book against; a source with a
 /// billing story decides from the tenant, the service, and the exact
 /// URL the call will hit.
@@ -88,8 +88,8 @@ pub trait CredentialSource: Send + Sync {
 
     /// Design-time twin of [`Self::resolve`]: sign an editor-side
     /// lookup on an ours-owned connection. Required, not defaulted:
-    /// whether (and where) the runtime's key may travel outside an
-    /// execution is a policy decision every source must make.
+    /// whether (and where) the runtime's key may travel outside a
+    /// run is a policy decision every source must make.
     async fn design_resolve(
         &self,
         pool: &sqlx::PgPool,
@@ -188,8 +188,8 @@ pub struct DesignGrant {
 }
 
 /// Sign ONE editor-side lookup with the runtime's credential, end to
-/// end: gate the URL on the meter allowlist (the SAME gate an
-/// execution's direct lane runs, so an ours-owned credential is never
+/// end: gate the URL on the meter allowlist (the SAME gate a
+/// run's direct lane runs, so an ours-owned credential is never
 /// attached to a route the meter does not declare), ask the source for
 /// the design credential, fill the resolved access's single auth
 /// value, and answer the URL to call.

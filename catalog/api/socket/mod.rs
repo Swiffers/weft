@@ -2,7 +2,7 @@
 //! endpoint. An outside caller opens a socket at the project's live URL;
 //! the dispatcher matches the path, checks the caller against the auth,
 //! and routes the held socket to a worker; this trigger fires a fresh
-//! execution and stays alive for the socket's life.
+//! run and stays alive for the socket's life.
 //!
 //!   - `setup_trigger`: build a `Socket` signal from the node's fields
 //!     and register it. The dispatcher mounts the public route.
@@ -18,7 +18,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::signal::{LiveConnectionConfig, Socket};
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::wire;
 
@@ -35,13 +35,13 @@ impl Node for SocketNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let fields = ctx.inputs.object()?;
         let common = LiveConnectionConfig::from_node_fields(fields).map_err(weft::node_error)?;
         ctx.register_signal(Socket { common }).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let request = wire::opening_request(&ctx)?;
         let ws = ctx.ws_caller().await?;
         // The opening request first: everything downstream that is not

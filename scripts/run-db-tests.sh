@@ -7,7 +7,7 @@
 #
 # Why a container rather than the Postgres weft runs: these tests create and
 # drop databases on whatever server they are pointed at, and the one your local
-# weft uses is holding your projects and your execution history.
+# weft uses is holding your projects and your run history.
 #
 # Usage:
 #   scripts/run-db-tests.sh                 # every crate that has them

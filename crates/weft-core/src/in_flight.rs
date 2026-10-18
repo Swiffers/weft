@@ -1,7 +1,7 @@
 //! "How much work is still running, and tell me when there is none."
 //!
 //! A worker dies in the middle of things unless something holds the
-//! door: a cost record still being written, an execution still folding
+//! door: a cost record still being written, a run still folding
 //! its journal. Both want the same thing, a count that goes up when the
 //! work starts, down when it lands, and a way to park until it reaches
 //! zero. That count is here once rather than per subsystem, because the

@@ -6,7 +6,7 @@ use serde_json::json;
 
 use weft::access::client::json_call;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::notion::{children_of, API};
 
@@ -23,7 +23,7 @@ impl Node for NotionAppendBlocksNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let page: String = ctx.inputs.get("page")?;
         let content: Option<String> = ctx.inputs.opt("content")?;

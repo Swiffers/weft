@@ -424,10 +424,10 @@ pub struct SignalIdentity {
     pub token: String,
     pub tenant_id: String,
     pub node_id: String,
-    /// True iff this is a mid-execution resume (HumanQuery, etc).
+    /// True iff this is a mid-run resume (HumanQuery, etc).
     pub is_resume: bool,
-    /// Execution of the suspended execution to resume. Set iff `is_resume`.
-    pub execution_id: Option<weft_core::ExecutionId>,
+    /// Run of the suspended run to resume. Set iff `is_resume`.
+    pub run_id: Option<weft_core::RunId>,
     pub spec: SignalSpec,
 }
 
@@ -461,7 +461,7 @@ pub async fn prepare_signal(
     prior_kind_state: Option<&Value>,
     asked_at_unix_ms: i64,
 ) -> Result<Prepared> {
-    let SignalIdentity { token, tenant_id, node_id, is_resume, execution_id, spec } = identity;
+    let SignalIdentity { token, tenant_id, node_id, is_resume, run_id, spec } = identity;
     let handler = handler_or_err(&spec.kind)?;
     // A resume wait fed by broad account-routed pushes must pin
     // itself with a predicate (its minted correlation id): with none,
@@ -490,7 +490,7 @@ pub async fn prepare_signal(
         node_id,
         tenant_id,
         is_resume,
-        execution_id,
+        run_id,
         task: None,
         kind_state: Some(kind_state.clone()),
         routing: routing.clone(),
@@ -574,7 +574,7 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
                     node_id: row.node_id,
                     tenant_id: row.tenant_id,
                     is_resume: row.is_resume,
-                    execution_id: row.execution_id,
+                    run_id: row.run_id,
                     task: Some(Arc::new(TaskGuard::new(task))),
                     kind_state: None,
                     routing,
@@ -636,7 +636,7 @@ pub async fn unregister(
         node_id: String::new(),
         tenant_id: req.tenant_id,
         is_resume: false,
-        execution_id: None,
+        run_id: None,
         task: None,
         kind_state: Some(req.kind_state),
         routing: SignalRouting {
@@ -1220,7 +1220,7 @@ fn now_unix_ms() -> i64 {
 }
 
 /// Process one stateless fire. Resume signals route to the
-/// suspended execution regardless of kind; entry signals delegate to
+/// suspended run regardless of kind; entry signals delegate to
 /// the kind's `process_entry`. A signal with no held row drops the fire,
 /// saying why.
 pub async fn process(state: &crate::ListenerState, token: &str, payload: Value) -> Result<ProcessOutcome> {
@@ -1244,10 +1244,10 @@ pub async fn process_in(
     if signal.is_resume {
         // The signal table holds no wait without its run (a check on the
         // row), so a held one without it is a broken invariant.
-        let execution_id = signal.execution_id.ok_or_else(|| anyhow::anyhow!("the wait {token} names no run"))?;
+        let run_id = signal.run_id.ok_or_else(|| anyhow::anyhow!("the wait {token} names no run"))?;
         return Ok(ProcessOutcome {
             value: payload,
-            target: ProcessTarget::Resume { execution_id },
+            target: ProcessTarget::Resume { run_id },
         });
     }
 
@@ -1575,7 +1575,7 @@ mod tests {
             node_id: "ask".into(),
             tenant_id: "t".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             task: None,
             kind_state: None,
             routing: SignalRouting { surface, auth, auth_config },
@@ -1800,7 +1800,7 @@ mod tests {
             node_id: "n1".into(),
             tenant_id: "t1".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             task: None,
             kind_state: None,
             routing: SignalRouting {

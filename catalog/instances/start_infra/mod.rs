@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::instance_if_given;
 
@@ -23,7 +23,7 @@ impl Node for StartInfraNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let node: String = ctx.inputs.get("node")?;
         let wait_until_running: bool = ctx.inputs.get("waitUntilRunning")?;
         let mut copy = ctx.infra(node);

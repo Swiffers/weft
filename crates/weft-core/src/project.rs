@@ -72,8 +72,8 @@ impl ProjectDefaults {
 /// this to pick a renderer; the runtime / flatten step uses the
 /// underlying boundary node type (Passthrough vs LoopIn/LoopOut).
 ///
-/// The loop's config (parallel / over / carry / max_iters /
-/// trim_on_mismatch) rides INSIDE the `Loop` variant, so "kind ==
+/// The loop's config (parallel / over / carry / maxIters /
+/// trimOnMismatch) rides INSIDE the `Loop` variant, so "kind ==
 /// Loop" and "has a loop config" cannot drift apart (the invalid
 /// states "Loop without config" / "Group with config" are
 /// unrepresentable). The enum is internally tagged on `kind` and
@@ -697,7 +697,7 @@ pub struct InputDefinition {
 impl PortDefinition {
     /// Whether this port carries a stream (`Generator[T]`). THE one
     /// reading of a port's type for that question; the node-level
-    /// readers in `exec::ready` are built on it.
+    /// readers in `run::ready` are built on it.
     pub fn is_generator(&self) -> bool {
         self.port_type.as_generator().is_some()
     }
@@ -828,12 +828,12 @@ pub struct ProgramIndex {
     /// Each node's position in `project.nodes`, by id.
     nodes: std::collections::HashMap<String, usize>,
     /// Per node, by position: the inputs it reads as a stream
-    /// ([`crate::exec::ready::generator_inputs`]).
+    /// ([`crate::run::ready::generator_inputs`]).
     stream_inputs: Vec<Vec<String>>,
     /// The positions of the nodes that read a stream.
     stream_consumers: Vec<usize>,
     /// The positions of the passthroughs: the boundaries that forward
-    /// what reaches them ([`crate::exec::boundary::is_passthrough`]).
+    /// what reaches them ([`crate::run::boundary::is_passthrough`]).
     passthroughs: Vec<usize>,
     /// Each scope's In boundary ([`boundary_in_id`]), by scope id.
     scope_in: std::collections::HashMap<String, usize>,
@@ -854,7 +854,7 @@ impl ProgramIndex {
         let stream_inputs: Vec<Vec<String>> = project
             .nodes
             .iter()
-            .map(|node| crate::exec::ready::generator_inputs(node).into_iter().map(str::to_string).collect())
+            .map(|node| crate::run::ready::generator_inputs(node).into_iter().map(str::to_string).collect())
             .collect();
         let stream_consumers = stream_inputs.iter().enumerate().filter(|(_, ports)| !ports.is_empty()).map(|(at, _)| at).collect();
         let scope_in = project
@@ -865,7 +865,7 @@ impl ProgramIndex {
             .filter_map(|(at, node)| node.id.strip_suffix(BOUNDARY_IN_SUFFIX).map(|scope| (scope.to_string(), at)))
             .collect();
         let passthroughs =
-            project.nodes.iter().enumerate().filter(|(_, node)| crate::exec::boundary::is_passthrough(node)).map(|(at, _)| at).collect();
+            project.nodes.iter().enumerate().filter(|(_, node)| crate::run::boundary::is_passthrough(node)).map(|(at, _)| at).collect();
         let fire_payload = project.nodes.iter().map(|node| crate::node::fire_payload_type(&node.fires_with)).collect();
         Self { outgoing, incoming, selection: None, nodes, stream_inputs, stream_consumers, passthroughs, scope_in, fire_payload }
     }
@@ -923,7 +923,7 @@ impl ProgramIndex {
 
     /// The node `id` when it is a passthrough.
     pub fn passthrough<'a>(&self, project: &'a ProjectDefinition, id: &str) -> Option<&'a NodeDefinition> {
-        self.node(project, id).filter(|node| crate::exec::boundary::is_passthrough(node))
+        self.node(project, id).filter(|node| crate::run::boundary::is_passthrough(node))
     }
 
     /// The In boundary of the scope `scope`.
@@ -1325,7 +1325,7 @@ pub struct InstanceRules {
     /// run for an instance is a run, so runtime-level rules hold too.
     pub rules: Vec<crate::node::ValidationRule>,
     /// The output ports the source added beyond the type's own, which
-    /// `custom_outputs_declared` and `{custom_outputs}` read.
+    /// `custom_outputs_declared` and `{customOutputs}` read.
     #[serde(default, rename = "customOutputs", skip_serializing_if = "Vec::is_empty")]
     pub custom_outputs: Vec<String>,
 }

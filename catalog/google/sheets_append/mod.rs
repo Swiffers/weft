@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::sheets::{header_for_row, row_to_cells, tab_title, values_url};
 
@@ -24,7 +24,7 @@ impl Node for GoogleSheetsAppendNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: Option<String> = ctx.inputs.opt("tab")?;

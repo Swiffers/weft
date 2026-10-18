@@ -3,7 +3,7 @@ import { runConsent } from './consent';
 import type { ConnectTransport } from './transport';
 import type { ConsentOutcome, GrantSummary } from './wire';
 
-const grant: GrantSummary = { id: 'g', service: 's', scopes: [], permissions_verified: true, owner: 'author', door: 'own', has_credential: true };
+const grant: GrantSummary = { id: 'g', service: 's', scopes: [], permissionsVerified: true, owner: 'author', door: 'own', hasCredential: true };
 
 function transport(outcomes: ConsentOutcome[]): ConnectTransport & { opened: string[] } {
 	const opened: string[] = [];
@@ -12,15 +12,15 @@ function transport(outcomes: ConsentOutcome[]): ConnectTransport & { opened: str
 		allowsSharedKey: false,
 		connections: async () => [],
 		forget: async () => {},
-		doors: async () => ({ shared_apps: [], shared_credential: false, redirect_uri: null }),
+		doors: async () => ({ sharedApps: [], sharedCredential: false, redirectUri: null }),
 		connectDirect: async () => ({ grant }),
-		beginConsent: async () => ({ consent_url: 'https://provider/consent', state: 'st' }),
+		beginConsent: async () => ({ consentUrl: 'https://provider/consent', state: 'st' }),
 		consentOutcome: async () => outcomes.shift() ?? null,
 		openExternal: (url) => opened.push(url),
 	};
 }
 
-const request = { spec: { service: 's', acquisition: { kind: 'oauth2' as const } }, door: 'own' as const, permissions: [], shared_app: null, upgrade_grant_id: null, registration: null };
+const request = { spec: { service: 's', acquisition: { kind: 'oauth2' as const } }, door: 'own' as const, permissions: [], sharedApp: null, upgradeGrantId: null, registration: null };
 const now = { sleep: async () => {} };
 
 describe('a browser consent', () => {

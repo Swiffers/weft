@@ -23,8 +23,8 @@ async fn wired_inputs_are_tags(rig: FakeRig) -> WeftResult<()> {
         .run(&TagRunNode, json!({ "sender": "user_7", "channel": "support" }))
         .await
         .ok()?;
-    let mut tagged = rig.execution_tags();
-    assert_eq!(tagged.len(), 1, "one tag_execution call: {tagged:?}");
+    let mut tagged = rig.run_tags();
+    assert_eq!(tagged.len(), 1, "one tag_run call: {tagged:?}");
     let mut tags = tagged.remove(0);
     tags.sort();
     assert_eq!(tags, vec!["support".to_string(), "user_7".to_string()]);
@@ -39,7 +39,7 @@ async fn list_and_inputs_add_up(rig: FakeRig) -> WeftResult<()> {
     rig.run(&TagRunNode, json!({ "sender": "user_7", "tags": ["batch_a", "user_7"] }))
         .await
         .ok()?;
-    let tagged = rig.execution_tags();
+    let tagged = rig.run_tags();
     assert_eq!(tagged, vec![vec!["user_7".to_string(), "batch_a".to_string()]]);
     Ok(())
 }
@@ -49,7 +49,7 @@ async fn list_and_inputs_add_up(rig: FakeRig) -> WeftResult<()> {
 /// appended, and the ctx accepts the result.
 async fn unsafe_value_is_cleaned(rig: FakeRig) -> WeftResult<()> {
     rig.run(&TagRunNode, json!({ "sender": "49151@s.whatsapp.net" })).await.ok()?;
-    let tagged = rig.execution_tags();
+    let tagged = rig.run_tags();
     assert_eq!(tagged.len(), 1);
     let tag = &tagged[0][0];
     assert!(tag.starts_with("49151_s_whatsapp_net-"), "{tag}");
@@ -66,7 +66,7 @@ async fn unsafe_value_is_cleaned(rig: FakeRig) -> WeftResult<()> {
 async fn empty_tag_fails(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&TagRunNode, json!({ "sender": "user_7", "tags": [""] })).await.failure()?;
     assert!(err.contains("must not be empty"), "{err}");
-    assert!(rig.execution_tags().is_empty(), "nothing is tagged");
+    assert!(rig.run_tags().is_empty(), "nothing is tagged");
     Ok(())
 }
 

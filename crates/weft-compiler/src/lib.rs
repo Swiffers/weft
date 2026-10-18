@@ -22,7 +22,8 @@
 //! 4. `validate` checks the graph (ids, scopes, port types, required
 //!    ports and `@require_one_of`, loops, trigger and infra placement,
 //!    each node's declarative rules). `Structural` gates the build;
-//!    `Runtime` adds the rules a sketch may leave open (credentials).
+//!    `Runtime` adds the rules a sketch may leave open (a provider with
+//!    no model named yet).
 //! 5. The CLI resolves file-typed `@asset` markers into stored files
 //!    (`weft-assets`), then `build_plan::plan_build_from` computes the
 //!    three hashes (`hash`: binary, definition, infra) and stages every
@@ -208,9 +209,11 @@ fn parse_only_inner(
 /// through it, so the four paths can't drift.
 ///
 /// `mode` selects how much validation runs: `Structural` (graph shape)
-/// or `Runtime` (also missing-credential style rules). The editor's
-/// Problems panel wants `Runtime`; the build gate wants `Structural`
-/// (a project may legitimately build without every secret filled).
+/// or `Runtime` (also the rules a sketch may leave open, like a provider
+/// with no model named). The editor's Problems panel and the build gate
+/// want `Structural` (a project may legitimately build half-filled); the
+/// editor's pre-flight before Run, Activate and Resync and `weft
+/// validate` want `Runtime`.
 ///
 /// Never aborts: a parse failure returns an empty project plus the
 /// parse diagnostics, mirroring `parse_only`, so a caller that only

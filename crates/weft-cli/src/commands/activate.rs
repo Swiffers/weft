@@ -11,7 +11,7 @@
 //! the kept work over.
 //!
 //! A worker built from an older image is replaced on the way:
-//! `--running-policy` says whether its running executions are
+//! `--running-policy` says whether its running runs are
 //! cancelled now (the default) or waited for, up to `--drain-timeout`.
 
 use anyhow::Context;
@@ -106,7 +106,7 @@ async fn run_inner(
     progress.dispatcher_call_start(&path);
     let answer: ActivateResponse = serde_json::from_value(client.post_json(&path, &serde_json::to_value(&body)?).await?)
         .context("read the activate answer")?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
     progress.trigger_register_done();
     if let Some(note) = &answer.infra_not_running {
         progress.warn(note);
@@ -129,7 +129,7 @@ async fn run_inner(
         }
         None => format!("activated {name} ({id})"),
     };
-    progress.complete_with(&summary, serde_json::json!({ "per_instance_left_out": left_out, "address": answer.address }));
+    progress.complete_with(&summary, serde_json::json!({ "perInstanceLeftOut": left_out, "address": answer.address }));
     Ok(())
 }
 

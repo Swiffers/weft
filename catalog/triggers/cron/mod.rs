@@ -1,4 +1,4 @@
-//! Cron: fires an execution on a schedule.
+//! Cron: fires a run on a schedule.
 //!
 //!   - `setup_trigger`: register a Timer signal for the configured
 //!     cron expression.
@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::signal::{Timer, TimerSpec};
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -26,7 +26,7 @@ impl Node for CronNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         // `cron` is required (no schedule is right for everybody) and
         // `timezone` declares a default, so the bag always holds both.
         let expression: String = ctx.inputs.get("cron")?;
@@ -36,7 +36,7 @@ impl Node for CronNode {
         ctx.register_signal(Timer { spec }).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // Required reads fail loud on a missing field (a broken listener
         // delivery) rather than substitute `now()`, which would silently
         // mask it as an on-time fire.

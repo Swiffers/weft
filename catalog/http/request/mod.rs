@@ -10,7 +10,7 @@ use reqwest::Method;
 use serde_json::Value;
 
 use weft::storage::{self, diff::is_text_mime, KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -26,7 +26,7 @@ impl Node for HttpRequestNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // A failure is no answer at all or an unreadable body. An answer
         // with any status is a success: `status` and `ok` say it.
         let url: String = ctx.inputs.get("url")?;
@@ -76,7 +76,7 @@ impl Node for HttpRequestNode {
             .and_then(|v| v.to_str().ok())
             .and_then(storage::filename_from_disposition)
             .unwrap_or_else(|| storage::filename_from_url(&url));
-        let files = ctx.storage(StorageScope::Execution);
+        let files = ctx.storage(StorageScope::Run);
         let out = match content_type {
             // A body that says it is not text is bytes, and decoding it
             // as text would corrupt it: it is stored whole, as a file.

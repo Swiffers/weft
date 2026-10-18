@@ -1293,6 +1293,28 @@ fn runtime_command(install: &Install, bin: &Path) -> String {
     )
 }
 
+/// Bring the install's database into this generation before the runtime
+/// starts on it (`weft-runtime carry`): nothing on a database already of
+/// it, and on one from the previous generation, a copy into a fresh one
+/// that an interruption never leaves half done (the next start finishes
+/// it). Run with the runtime stopped, in the runtime's own environment.
+async fn carry_database(install: &Install) -> Result<()> {
+    let bin = runtime_binary()?;
+    let line = format!(
+        "set -a; . '{}'; set +a; exec '{}' carry --config '{}'",
+        install.secrets_path().display(),
+        bin.display(),
+        install.config_path().display()
+    );
+    let status = Command::new("/bin/sh").args(["-c", &line]).status().await.context("run weft-runtime carry")?;
+    anyhow::ensure!(
+        status.success(),
+        "carrying the database into this generation failed (above); the old database is kept as it was, and \
+         `weft daemon start` (or ./setup.sh) picks the carry up where it stopped"
+    );
+    Ok(())
+}
+
 async fn run_checked(cmd: &mut Command, what: &str) -> Result<()> {
     let out = cmd.output().await.with_context(|| format!("run {what}"))?;
     anyhow::ensure!(out.status.success(), "{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -1524,6 +1546,7 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
         uses.push(PortUse::of(install, outside, "the doors outside callers use (the tunnel's target)", "WEFT_OUTSIDE_PORT"));
     }
     refuse_taken_ports(&uses).await?;
+    carry_database(install).await?;
     start_runtime(install).await?;
     wait_for_runtime(install, ports.public).await?;
     let local = crate::client::DispatcherClient::new(format!("http://127.0.0.1:{}", ports.public), None);

@@ -29,7 +29,7 @@ review = HumanQuery {
 review.context = src.value
 
 gate = Debug
-gate.data = review.decision_approved
+gate.data = review.decisionApproved
 
 hold = Wait { seconds: 3600 }
 hold.value = src.value

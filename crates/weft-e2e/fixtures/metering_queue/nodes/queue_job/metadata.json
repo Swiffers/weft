@@ -25,7 +25,7 @@
   "outputs": [
     { "name": "requestId", "type": "String" }
   ],
-  "requires_infra": false,
+  "requiresInfra": false,
   "service": {
     "service": "queue_fake",
     "label": "Queue fake (e2e)",

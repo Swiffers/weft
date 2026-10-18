@@ -1,7 +1,7 @@
 //! The broker's runtime-file HTTP surface (`ctx.storage`).
 //!
 //! Worker data path (bearer = the worker's platform identity token, resolved
-//! in-process to `Worker { tenant, project, execution_id }`). BYTES never transit the
+//! in-process to `Worker { tenant, project, run_id }`). BYTES never transit the
 //! broker: it mints presigned URLs and the worker moves bytes direct to/from the
 //! bucket.
 //!   POST   /v1/storage/upload/begin      mint the key, charge a known size, open the upload
@@ -25,7 +25,7 @@
 //!   DELETE /v1/storage/admin/files/{*key}   delete one file
 //!   POST   /v1/storage/admin/presign        presign one file
 //!   POST   /v1/storage/admin/wipe-prefix    weft rm / weft clean
-//!   POST   /v1/storage/admin/sweep-exec     terminate sweep for one execution
+//!   POST   /v1/storage/admin/sweep-run     terminate sweep for one run
 //!
 //! The broker is the single gatekeeper: it verifies the caller, runs the pure
 //! `key` wall, enforces quota, records metadata, and is the ONLY thing that signs
@@ -45,8 +45,8 @@ use weft_core::storage::key::{self, CallerAuth};
 use weft_core::storage::{
     AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, DownloadUrlResponse, ListFilesResponse,
     PartDoneRequest,
-    PresignResponse, PresignResult, StorageScope, StoredFile, StoredFileMeta, SweepExecRequest,
-    SweepExecResponse, Tenanted, TenantScopeRequest, TenantUsage, UploadAbortRequest,
+    PresignResponse, PresignResult, StorageScope, StoredFile, StoredFileMeta, SweepRunRequest,
+    SweepRunResponse, Tenanted, TenantScopeRequest, TenantUsage, UploadAbortRequest,
     UploadBeginRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
     UploadPartsResponse, UploadResumeRequest, UploadResumeResponse, WipePrefixRequest,
     WipePrefixResponse,
@@ -57,11 +57,11 @@ use crate::auth::control_plane;
 use crate::runtime_store::{RuntimeStore, RuntimeStoreError};
 use crate::state::BrokerState;
 
-/// The execution claim a worker stamps on every storage call, so the broker scopes
-/// the op to that execution. (The file's scope / mime / filename / keep travel
+/// The run claim a worker stamps on every storage call, so the broker scopes
+/// the op to that run. (The file's scope / mime / filename / keep travel
 /// in the JSON body of upload/begin, not headers.)
-// SYNC: HDR_EXECUTION_ID <-> crates/weft-engine/src/storage.rs (HDR_EXECUTION_ID)
-pub const HDR_EXECUTION_ID: &str = "x-weft-execution-id";
+// SYNC: HDR_RUN_ID <-> crates/weft-engine/src/storage.rs (HDR_RUN_ID)
+pub const HDR_RUN_ID: &str = "x-weft-run-id";
 
 /// A refusal: a status and a message, plus the "still completing" marker
 /// ([`weft_core::storage::COMPLETING_HEADER`]) when the refusal is that
@@ -133,7 +133,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/download-link", post(admin_download_link))
         .route("/v1/storage/admin/relay/{token}", axum::routing::get(admin_relay))
         .route("/v1/storage/admin/wipe-prefix", post(admin_wipe_prefix))
-        .route("/v1/storage/admin/sweep-exec", post(admin_sweep_exec))
+        .route("/v1/storage/admin/sweep-run", post(admin_sweep_run))
 }
 
 // ---------- error mapping ----------
@@ -201,12 +201,12 @@ fn map_anyhow(e: anyhow::Error) -> ApiError {
 
 // ---------- caller resolution ----------
 
-/// Resolve the worker caller for a data-path request (the `x-weft-execution_id`
-/// header carries the optional execution claim). Rejects a
+/// Resolve the worker caller for a data-path request (the `x-weft-run_id`
+/// header carries the optional run claim). Rejects a
 /// control-plane caller on the data path (it uses the admin surface).
 async fn worker_caller(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<CallerAuth, ApiError> {
-    let execution_id = headers.get(HDR_EXECUTION_ID).and_then(|v| v.to_str().ok());
-    let caller = crate::auth::resolve_storage_caller(state, headers, execution_id).await?;
+    let run_id = headers.get(HDR_RUN_ID).and_then(|v| v.to_str().ok());
+    let caller = crate::auth::resolve_storage_caller(state, headers, run_id).await?;
     match &caller {
         CallerAuth::Worker { .. } => Ok(caller),
         CallerAuth::ControlPlane | CallerAuth::Tenant { .. } => Err(ApiError::from((
@@ -255,7 +255,7 @@ async fn upload_begin(
         return Err(ApiError::from((
             StatusCode::FORBIDDEN,
             "the asset scope is managed by the pre-build asset sync; node code writes \
-             execution/project/shared scopes"
+             run/project/shared scopes"
                 .into(),
         )));
     }
@@ -978,15 +978,15 @@ async fn admin_wipe_prefix(
     Ok(Json(WipePrefixResponse { wiped }))
 }
 
-async fn admin_sweep_exec(
+async fn admin_sweep_run(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<SweepExecRequest>,
-) -> Result<Json<SweepExecResponse>, ApiError> {
+    Json(req): Json<SweepRunRequest>,
+) -> Result<Json<SweepRunResponse>, ApiError> {
     control_plane(&state, &headers).await?;
     let store = &state.runtime_store;
-    let (swept, lingering) = store.sweep_exec(&req.tenant, &req.execution_id).await.map_err(map_anyhow)?;
-    Ok(Json(SweepExecResponse { swept, lingering }))
+    let (swept, lingering) = store.sweep_run(&req.tenant, &req.run_id).await.map_err(map_anyhow)?;
+    Ok(Json(SweepRunResponse { swept, lingering }))
 }
 
 #[cfg(test)]
@@ -1027,7 +1027,7 @@ mod link_route_tests {
 
     #[test]
     fn unavailable_generated_file_does_not_claim_a_fixed_thirty_day_lifetime() {
-        let message = map_err(RuntimeStoreError::NotFound("tenant/exec/execution_id/file".into())).message;
+        let message = map_err(RuntimeStoreError::NotFound("tenant/run/run_id/file".into())).message;
         assert!(message.contains("keep duration"), "{message}");
         assert!(!message.contains("30 days"), "{message}");
     }

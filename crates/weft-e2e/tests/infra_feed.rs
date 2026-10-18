@@ -16,17 +16,17 @@ async fn a_trigger_listens_to_the_programs_own_infra() -> anyhow::Result<()> {
 
     infra::start_and_wait_running(&mut project, "svc").await?;
     project.activate().await?;
-    let before = run::executions(&disp, &pid).await?;
+    let before = run::runs(&disp, &pid).await?;
 
     // The unit ticks every second and each tick fires a run, so more than
     // one may have started by the time the listing is read: the first is
     // the one to follow (run ids grow with time).
-    let execution_id = poll_until("a tick to fire a run", Duration::from_secs(60), Duration::from_millis(300), || {
+    let run_id = poll_until("a tick to fire a run", Duration::from_secs(60), Duration::from_millis(300), || {
         let (disp, before) = (disp.clone(), before.clone());
-        async move { Ok(run::executions(&disp, &pid).await?.difference(&before).min().copied()) }
+        async move { Ok(run::runs(&disp, &pid).await?.difference(&before).min().copied()) }
     })
     .await?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     let value = settled.input_of("out").and_then(|i| i.get("data").cloned());
     anyhow::ensure!(value.as_ref().is_some_and(|v| v.as_u64().is_some()), "a tick's value reached Debug, got {value:?}");

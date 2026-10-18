@@ -111,7 +111,7 @@ impl ValuesStore<'_> {
 /// may wait days on a person, and is judged by its own worker's lease
 /// (`crate::lapses`) and its ending (`crate::run_ends`).
 pub(crate) const SETUP_RUN_GOES: &str =
-    "EXISTS (SELECT 1 FROM run setup WHERE setup.execution_id = a.activating_execution_id AND setup.state <> 'ended')";
+    "EXISTS (SELECT 1 FROM run setup WHERE setup.run_id = a.activating_run_id AND setup.state <> 'ended')";
 
 /// THE activations their driver holds by its heartbeat alone, as a SQL
 /// condition over a `trigger_activation` row aliased `a`: activating, with
@@ -120,7 +120,7 @@ pub(crate) const SETUP_RUN_GOES: &str =
 /// `lapses` loop looks when the earliest of them could
 /// (`crate::lapses::earliest_lapse`).
 pub(crate) fn held_by_driver_alone() -> String {
-    format!("(a.status = 'activating' AND a.activating_execution_id IS NOT NULL AND NOT {SETUP_RUN_GOES})")
+    format!("(a.status = 'activating' AND a.activating_run_id IS NOT NULL AND NOT {SETUP_RUN_GOES})")
 }
 
 /// An activation whose driver died mid-activation (its heartbeat went
@@ -128,7 +128,7 @@ pub(crate) fn held_by_driver_alone() -> String {
 #[derive(Debug, Clone)]
 pub struct StuckActivation {
     pub project_id: uuid::Uuid,
-    pub execution_id: uuid::Uuid,
+    pub run_id: uuid::Uuid,
 }
 
 /// Backing store for activations. Implementations:
@@ -140,7 +140,7 @@ pub trait ActivationStoreOps: Send + Sync {
     async fn list(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<Activation>>;
 
     /// Single-flight entry into Activating for ALL of `keys` at once,
-    /// under one setup `execution_id`. Refused ([`ClaimRefused`], decided in the
+    /// under one setup `run_id`. Refused ([`ClaimRefused`], decided in the
     /// claim's own transaction) when any of them is already activating,
     /// or while the project is building (the build transition lives on
     /// the project row). Every other status is a
@@ -162,63 +162,63 @@ pub trait ActivationStoreOps: Send + Sync {
         &self,
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
         resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>>;
 
-    /// End the activation `execution_id` names (every row it claimed) at `to`; an
+    /// End the activation `run_id` names (every row it claimed) at `to`; an
     /// instance's row landing wiped goes instead ([`wipe_forgets`]). With
     /// `remove_entries`, those activations' entry rows are deleted in the
     /// same transaction and handed back for the listener cleanup; the waits
     /// of runs their triggers fired stay, since nothing here ends those
     /// runs. With `values`, that change is stored in it too. `None`
-    /// (and nothing stored) if `execution_id` no longer owns any row.
+    /// (and nothing stored) if `run_id` no longer owns any row.
     async fn end_activating(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         to: &ActivationLifecycle,
         remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
 
-    /// End the activation `execution_id` names that nobody will finish (a
+    /// End the activation `run_id` names that nobody will finish (a
     /// person cancelled it, or its driver died). When its triggers kept work
     /// (events waiting on them, runs of theirs waiting:
     /// `crate::journal::postgres::activation_preservation`), they land
     /// parked with every signal kept, so that work waits for their next
     /// activation; otherwise they are wiped, their entry rows going. Decided
     /// and written in one transaction under the activation's rows. `None`
-    /// when `execution_id` no longer owns any row.
+    /// when `run_id` no longer owns any row.
     async fn end_unfinished(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
 
-    /// Put the activations `execution_id` claimed back as they were before the
+    /// Put the activations `run_id` claimed back as they were before the
     /// claim (`previous`, what [`Self::try_begin_activating`] answered):
     /// an activation that failed before touching any signal leaves each
     /// trigger as it found it (a parked one parked, a live one listening
     /// on the code it fired before), and the row of one never activated
     /// before goes again, so it reads as never activated. Guarded by the
-    /// claim, like [`Self::end_activating`]; `false` when `execution_id` no
+    /// claim, like [`Self::end_activating`]; `false` when `run_id` no
     /// longer owns them.
     async fn restore(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         previous: &[Activation],
     ) -> anyhow::Result<bool>;
 
     /// Record the code an activation's listeners now fire. Guarded by the
-    /// activation's own execution, so a cancelled driver cannot overwrite a
+    /// activation's own run, so a cancelled driver cannot overwrite a
     /// newer activation's record.
     async fn record_activation_source(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         program: &ProgramIdentity,
         source_version: &str,
     ) -> anyhow::Result<bool>;
@@ -250,9 +250,9 @@ pub trait ActivationStoreOps: Send + Sync {
         to: ProjectStatus,
     ) -> anyhow::Result<bool>;
 
-    /// Bump the heartbeat of the activation `execution_id` names; the driving
+    /// Bump the heartbeat of the activation `run_id` names; the driving
     /// process does this on an interval so the reaper only repairs dead ones.
-    async fn bump_heartbeat(&self, execution_id: uuid::Uuid) -> anyhow::Result<()>;
+    async fn bump_heartbeat(&self, run_id: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Activations stuck in Activating: their heartbeat went stale, and no
     /// setup run of theirs goes on ([`SETUP_RUN_GOES`]; its driver stops
@@ -341,12 +341,12 @@ fn owned_keys(rows: Vec<(String, Option<String>)>) -> anyhow::Result<Vec<Activat
 async fn end_activating_in(
     tx: &mut sqlx::PgConnection,
     project_id: uuid::Uuid,
-    execution_id: uuid::Uuid,
+    run_id: uuid::Uuid,
     to: &ActivationLifecycle,
     remove_entries: bool,
     values: Option<&ValuesStore<'_>>,
 ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
-    let owned = "project_id = $1 AND activating_execution_id = $2 AND status = 'activating'";
+    let owned = "project_id = $1 AND activating_run_id = $2 AND status = 'activating'";
     // An instance's rows landing wiped go ([`wipe_forgets`]); the rest
     // move to `to`.
     let mut ended: Vec<(String, Option<String>)> = if forgets_instance_rows(to) {
@@ -354,7 +354,7 @@ async fn end_activating_in(
             "DELETE FROM trigger_activation WHERE {owned} AND instance_id IS NOT NULL RETURNING trigger, instance_id"
         ))
         .bind(project_id)
-        .bind(execution_id)
+        .bind(run_id)
         .fetch_all(&mut *tx)
         .await?
     } else {
@@ -365,11 +365,11 @@ async fn end_activating_in(
          SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
              fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, \
              went_down_at_unix = $10, \
-             activating_execution_id = NULL, \
+             activating_run_id = NULL, \
              activation_program = CASE WHEN $1 = 'active' THEN activation_program ELSE NULL END, \
              activation_version = CASE WHEN $1 = 'active' THEN activation_version ELSE NULL END, \
              updated_at = $7 \
-         WHERE project_id = $8 AND activating_execution_id = $9 AND status = 'activating' \
+         WHERE project_id = $8 AND activating_run_id = $9 AND status = 'activating' \
          RETURNING trigger, instance_id",
     )
     .bind(to.status.as_str())
@@ -380,7 +380,7 @@ async fn end_activating_in(
     .bind(to.drain_deadline_unix)
     .bind(crate::lease::now_unix())
     .bind(project_id)
-    .bind(execution_id)
+    .bind(run_id)
     .bind(to.went_down.map(|w| w.at_unix))
     .fetch_all(&mut *tx)
     .await?;
@@ -441,7 +441,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             went_down_at_unix BIGINT,
             -- The trigger-setup run of the activation in flight; one run
             -- sets up every activation a verb names, so rows share it.
-            activating_execution_id UUID,
+            activating_run_id UUID,
             heartbeat_unix BIGINT NOT NULL DEFAULT 0,
             -- What the listeners fire, recorded when setup finished.
             activation_program JSONB,
@@ -450,8 +450,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS trigger_activation_key
              ON trigger_activation (project_id, trigger, instance_id) NULLS NOT DISTINCT"#,
-        r#"CREATE INDEX IF NOT EXISTS trigger_activation_execution_id
-             ON trigger_activation (activating_execution_id) WHERE activating_execution_id IS NOT NULL"#,
+        r#"CREATE INDEX IF NOT EXISTS trigger_activation_run_id
+             ON trigger_activation (activating_run_id) WHERE activating_run_id IS NOT NULL"#,
         r#"CREATE INDEX IF NOT EXISTS trigger_activation_transitional
              ON trigger_activation (status) WHERE status IN ('activating', 'deactivating')"#,
         // An activation changing status, whether it takes work or until
@@ -565,7 +565,7 @@ type LifecycleRow = (
 );
 
 fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
-    let (trigger, instance, status, accepting, visible, deadline, drain, went_down_with, went_down_at, execution_id, program, version) = row;
+    let (trigger, instance, status, accepting, visible, deadline, drain, went_down_with, went_down_at, run_id, program, version) = row;
     let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("trigger_activation.instance_id: {e}"))?;
     Ok(Activation {
         key: ActivationKey::new(trigger, Owner::from_instance(instance)),
@@ -585,7 +585,7 @@ fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
                 }),
                 (cause, at) => anyhow::bail!("trigger_activation.went_down_with={cause:?} and went_down_at_unix={at:?} must be set together"),
             },
-            activating_execution_id: execution_id,
+            activating_run_id: run_id,
         },
         program: program.map(serde_json::from_value).transpose()?,
         source_version: version,
@@ -693,7 +693,7 @@ impl HeldProject {
 pub(crate) async fn list_in(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<Vec<Activation>> {
     let rows: Vec<LifecycleRow> = sqlx::query_as(
         "SELECT trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
-                fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_execution_id, \
+                fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_run_id, \
                 activation_program, activation_version \
          FROM trigger_activation WHERE project_id = $1 ORDER BY trigger, instance_id NULLS FIRST",
     )
@@ -713,7 +713,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         &self,
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
         resync: Option<uuid::Uuid>,
     ) -> anyhow::Result<Result<Vec<Activation>, ClaimRefused>> {
@@ -740,7 +740,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         }
         let before: Vec<LifecycleRow> = sqlx::query_as(&format!(
             "SELECT a.trigger, a.instance_id, a.status, a.accepting_fires, a.fires_visible_to_consumers, \
-                    a.fires_deadline_unix, a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_execution_id, \
+                    a.fires_deadline_unix, a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_run_id, \
                     a.activation_program, a.activation_version \
              FROM trigger_activation a WHERE a.project_id = $1 AND {KEYS_JOIN} FOR UPDATE"
         ))
@@ -754,11 +754,11 @@ impl ActivationStoreOps for PostgresActivationStore {
             return Ok(Err(refused));
         }
         held.decided(&mut tx, project_id, keys).await?;
-        let activating = ActivationLifecycle::activating(execution_id);
+        let activating = ActivationLifecycle::activating(run_id);
         sqlx::query(
             "INSERT INTO trigger_activation \
                (project_id, trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
-                fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_execution_id, \
+                fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_run_id, \
                 heartbeat_unix, activation_program, activation_version, updated_at) \
              SELECT $1, t, NULLIF(m, ''), $4, $5, $6, NULL, NULL, NULL, NULL, $7, $8, NULL, NULL, $8 \
              FROM unnest($2::text[], $3::text[]) AS k(t, m) \
@@ -770,7 +770,7 @@ impl ActivationStoreOps for PostgresActivationStore {
                  drain_deadline_unix = NULL, \
                  went_down_with = NULL, \
                  went_down_at_unix = NULL, \
-                 activating_execution_id = EXCLUDED.activating_execution_id, \
+                 activating_run_id = EXCLUDED.activating_run_id, \
                  heartbeat_unix = EXCLUDED.heartbeat_unix, \
                  activation_program = NULL, \
                  activation_version = NULL, \
@@ -782,7 +782,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         .bind(activating.status.as_str())
         .bind(activating.accepting_fires)
         .bind(activating.fires_visible_to_consumers)
-        .bind(execution_id)
+        .bind(run_id)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -793,13 +793,13 @@ impl ActivationStoreOps for PostgresActivationStore {
     async fn end_activating(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         to: &ActivationLifecycle,
         remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
-        let ended = end_activating_in(&mut tx, project_id, execution_id, to, remove_entries, values).await?;
+        let ended = end_activating_in(&mut tx, project_id, run_id, to, remove_entries, values).await?;
         tx.commit().await?;
         Ok(ended)
     }
@@ -807,15 +807,15 @@ impl ActivationStoreOps for PostgresActivationStore {
     async fn end_unfinished(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
         let owned: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT trigger, instance_id FROM trigger_activation \
-             WHERE project_id = $1 AND activating_execution_id = $2 AND status = 'activating' FOR UPDATE",
+             WHERE project_id = $1 AND activating_run_id = $2 AND status = 'activating' FOR UPDATE",
         )
         .bind(project_id)
-        .bind(execution_id)
+        .bind(run_id)
         .fetch_all(&mut *tx)
         .await?;
         if owned.is_empty() {
@@ -824,8 +824,8 @@ impl ActivationStoreOps for PostgresActivationStore {
         let keys = owned_keys(owned)?;
         let kept = crate::journal::postgres::activation_preservation(&mut *tx, project_id, &keys).await?;
         let ended = match kept.parked > 0 || kept.suspended > 0 {
-            true => end_activating_in(&mut tx, project_id, execution_id, &ActivationLifecycle::parked(), false, None).await?,
-            false => end_activating_in(&mut tx, project_id, execution_id, &ActivationLifecycle::wiped(), true, None).await?,
+            true => end_activating_in(&mut tx, project_id, run_id, &ActivationLifecycle::parked(), false, None).await?,
+            false => end_activating_in(&mut tx, project_id, run_id, &ActivationLifecycle::wiped(), true, None).await?,
         };
         tx.commit().await?;
         Ok(ended)
@@ -834,7 +834,7 @@ impl ActivationStoreOps for PostgresActivationStore {
     async fn restore(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         previous: &[Activation],
     ) -> anyhow::Result<bool> {
         let now = crate::lease::now_unix();
@@ -846,8 +846,8 @@ impl ActivationStoreOps for PostgresActivationStore {
                 "UPDATE trigger_activation \
                  SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
                      fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, went_down_at_unix = $14, \
-                     activating_execution_id = NULL, activation_program = $7, activation_version = $8, updated_at = $9 \
-                 WHERE project_id = $10 AND activating_execution_id = $11 AND status = 'activating' \
+                     activating_run_id = NULL, activation_program = $7, activation_version = $8, updated_at = $9 \
+                 WHERE project_id = $10 AND activating_run_id = $11 AND status = 'activating' \
                    AND trigger = $12 AND instance_id IS NOT DISTINCT FROM $13",
             )
             .bind(before.status.as_str())
@@ -860,7 +860,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             .bind(activation.source_version.as_deref())
             .bind(now)
             .bind(project_id)
-            .bind(execution_id)
+            .bind(run_id)
             .bind(&activation.key.trigger)
             .bind(activation.key.instance().map(InstanceId::as_str))
             .bind(before.went_down.map(|w| w.at_unix))
@@ -872,10 +872,10 @@ impl ActivationStoreOps for PostgresActivationStore {
         // goes again.
         restored += sqlx::query(
             "DELETE FROM trigger_activation \
-             WHERE project_id = $1 AND activating_execution_id = $2 AND status = 'activating'",
+             WHERE project_id = $1 AND activating_run_id = $2 AND status = 'activating'",
         )
         .bind(project_id)
-        .bind(execution_id)
+        .bind(run_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -886,16 +886,16 @@ impl ActivationStoreOps for PostgresActivationStore {
     async fn record_activation_source(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         program: &ProgramIdentity,
         source_version: &str,
     ) -> anyhow::Result<bool> {
         let res = sqlx::query(
             "UPDATE trigger_activation SET activation_program = $3, activation_version = $4 \
-             WHERE project_id = $1 AND activating_execution_id = $2 AND status = 'activating'",
+             WHERE project_id = $1 AND activating_run_id = $2 AND status = 'activating'",
         )
         .bind(project_id)
-        .bind(execution_id)
+        .bind(run_id)
         .bind(sqlx::types::Json(program))
         .bind(source_version)
         .execute(&self.pool)
@@ -956,7 +956,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             "UPDATE trigger_activation a \
              SET status = $4, accepting_fires = $5, fires_visible_to_consumers = $6, \
                  fires_deadline_unix = $7, went_down_with = $8, drain_deadline_unix = $9, went_down_at_unix = $11, \
-                 activating_execution_id = NULL, \
+                 activating_run_id = NULL, \
                  activation_program = CASE WHEN $4 IN ('inactive', 'deactivating') THEN NULL ELSE activation_program END, \
                  activation_version = CASE WHEN $4 IN ('inactive', 'deactivating') THEN NULL ELSE activation_version END, \
                  updated_at = $10 \
@@ -1025,10 +1025,10 @@ impl ActivationStoreOps for PostgresActivationStore {
         Ok(forgot.rows_affected() + moved.rows_affected() > 0)
     }
 
-    async fn bump_heartbeat(&self, execution_id: uuid::Uuid) -> anyhow::Result<()> {
-        sqlx::query("UPDATE trigger_activation SET heartbeat_unix = $1 WHERE activating_execution_id = $2")
+    async fn bump_heartbeat(&self, run_id: uuid::Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE trigger_activation SET heartbeat_unix = $1 WHERE activating_run_id = $2")
             .bind(crate::lease::now_unix())
-            .bind(execution_id)
+            .bind(run_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1036,14 +1036,14 @@ impl ActivationStoreOps for PostgresActivationStore {
 
     async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>> {
         let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(&format!(
-            "SELECT DISTINCT a.project_id, a.activating_execution_id FROM trigger_activation a \
+            "SELECT DISTINCT a.project_id, a.activating_run_id FROM trigger_activation a \
              WHERE {} AND a.heartbeat_unix < $1",
             held_by_driver_alone()
         ))
         .bind(stale_before)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(project_id, execution_id)| StuckActivation { project_id, execution_id }).collect())
+        Ok(rows.into_iter().map(|(project_id, run_id)| StuckActivation { project_id, run_id }).collect())
     }
 
     async fn list_deactivating(&self) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
@@ -1113,7 +1113,7 @@ impl ActivationStoreOps for FakeActivationStore {
         &self,
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         expect: Option<ProjectStatus>,
         // The project's transition lives in the project store, which this
         // fake does not see: it guards the build axis alone.
@@ -1139,7 +1139,7 @@ impl ActivationStoreOps for FakeActivationStore {
             return Ok(Err(refused));
         }
         for key in keys {
-            rows.insert((project_id, key.clone()), (ActivationLifecycle::activating(execution_id), crate::lease::now_unix(), None, None));
+            rows.insert((project_id, key.clone()), (ActivationLifecycle::activating(run_id), crate::lease::now_unix(), None, None));
         }
         Ok(Ok(before))
     }
@@ -1147,7 +1147,7 @@ impl ActivationStoreOps for FakeActivationStore {
     async fn end_activating(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         to: &ActivationLifecycle,
         _remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
@@ -1158,7 +1158,7 @@ impl ActivationStoreOps for FakeActivationStore {
         let mut rows = self.rows.write().await;
         let mut ended = false;
         rows.retain(|(p, key), (lifecycle, _, program, version)| {
-            if *p != project_id || lifecycle.status != ProjectStatus::Activating || lifecycle.activating_execution_id != Some(execution_id) {
+            if *p != project_id || lifecycle.status != ProjectStatus::Activating || lifecycle.activating_run_id != Some(run_id) {
                 return true;
             }
             ended = true;
@@ -1178,22 +1178,22 @@ impl ActivationStoreOps for FakeActivationStore {
     async fn end_unfinished(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
     ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         // The fake keeps no signals, so no trigger kept any work.
-        self.end_activating(project_id, execution_id, &ActivationLifecycle::wiped(), true, None).await
+        self.end_activating(project_id, run_id, &ActivationLifecycle::wiped(), true, None).await
     }
 
     async fn restore(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         previous: &[Activation],
     ) -> anyhow::Result<bool> {
         let mut restored = false;
         let mut rows = self.rows.write().await;
         rows.retain(|(p, key), (lifecycle, _, program, version)| {
-            if *p != project_id || lifecycle.status != ProjectStatus::Activating || lifecycle.activating_execution_id != Some(execution_id) {
+            if *p != project_id || lifecycle.status != ProjectStatus::Activating || lifecycle.activating_run_id != Some(run_id) {
                 return true;
             }
             restored = true;
@@ -1213,13 +1213,13 @@ impl ActivationStoreOps for FakeActivationStore {
     async fn record_activation_source(
         &self,
         project_id: uuid::Uuid,
-        execution_id: uuid::Uuid,
+        run_id: uuid::Uuid,
         program: &ProgramIdentity,
         source_version: &str,
     ) -> anyhow::Result<bool> {
         let mut recorded = false;
         for ((p, _), (lifecycle, _, stored, version)) in self.rows.write().await.iter_mut() {
-            if *p == project_id && lifecycle.status == ProjectStatus::Activating && lifecycle.activating_execution_id == Some(execution_id) {
+            if *p == project_id && lifecycle.status == ProjectStatus::Activating && lifecycle.activating_run_id == Some(run_id) {
                 *stored = Some(program.clone());
                 *version = Some(source_version.to_string());
                 recorded = true;
@@ -1251,7 +1251,7 @@ impl ActivationStoreOps for FakeActivationStore {
                 continue;
             }
             if let Some((stored, _, program, version)) = rows.get_mut(&(project_id, key.clone())) {
-                *stored = ActivationLifecycle { activating_execution_id: None, ..lifecycle.clone() };
+                *stored = ActivationLifecycle { activating_run_id: None, ..lifecycle.clone() };
                 if matches!(lifecycle.status, ProjectStatus::Inactive | ProjectStatus::Deactivating) {
                     *program = None;
                     *version = None;
@@ -1287,10 +1287,10 @@ impl ActivationStoreOps for FakeActivationStore {
         }
     }
 
-    async fn bump_heartbeat(&self, execution_id: uuid::Uuid) -> anyhow::Result<()> {
+    async fn bump_heartbeat(&self, run_id: uuid::Uuid) -> anyhow::Result<()> {
         let now = crate::lease::now_unix();
         for (lifecycle, heartbeat, ..) in self.rows.write().await.values_mut() {
-            if lifecycle.activating_execution_id == Some(execution_id) {
+            if lifecycle.activating_run_id == Some(run_id) {
                 *heartbeat = now;
             }
         }
@@ -1300,9 +1300,9 @@ impl ActivationStoreOps for FakeActivationStore {
     async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>> {
         let mut out: Vec<StuckActivation> = Vec::new();
         for ((project_id, _), (lifecycle, heartbeat, ..)) in self.rows.read().await.iter() {
-            if let (ProjectStatus::Activating, Some(execution_id)) = (lifecycle.status, lifecycle.activating_execution_id) {
-                if *heartbeat < stale_before && !out.iter().any(|s| s.execution_id == execution_id) {
-                    out.push(StuckActivation { project_id: *project_id, execution_id });
+            if let (ProjectStatus::Activating, Some(run_id)) = (lifecycle.status, lifecycle.activating_run_id) {
+                if *heartbeat < stale_before && !out.iter().any(|s| s.run_id == run_id) {
+                    out.push(StuckActivation { project_id: *project_id, run_id });
                 }
             }
         }

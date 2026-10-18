@@ -1,5 +1,5 @@
 //! Project lifecycle HTTP handlers. `POST /projects` registers a
-//! project; `POST /projects/{id}/run` kicks off a fresh execution.
+//! project; `POST /projects/{id}/run` kicks off a fresh run.
 //! `weft run` on the CLI calls these.
 
 use std::collections::HashSet;
@@ -18,7 +18,7 @@ use weft_core::activation::{
 use weft_core::deactivation::{whose_triggers, DeactivateRequest, DeactivateResponse, ResyncRequest};
 use weft_core::projects::{
     ActivationEntry, DeclareRequest, InstanceInfraEntry, LimitedEntry, PreservationCounts, ProjectDrift,
-    ProjectExecutionsSummary, ProjectInfraEntry, ProjectStatusResponse, ProjectSummary, RunningExecution, StatusQuery,
+    ProjectRunsSummary, ProjectInfraEntry, ProjectStatusResponse, ProjectSummary, GoingRun, StatusQuery,
 };
 use weft_core::infra::wire::{INFRA_NOT_STARTED, INFRA_PER_INSTANCE};
 use weft_core::frames::Located;
@@ -434,7 +434,7 @@ pub async fn remove(
         // A concurrent rm dropped the row after our gate.
         return Err(StatusError::NotMyProject);
     }
-    // Deactivate first: cancels any in-flight executions, unregisters
+    // Deactivate first: cancels any in-flight runs, unregisters
     // every wake signal (entry + resume) from the listener processes holding them,
     // drops entry tokens. If deactivate fails on a DB / listener
     // error we must abort: removing the project row while signals
@@ -540,7 +540,7 @@ pub async fn remove(
 
 /// The project's CURRENT definition as one coherent (hash, shape)
 /// pair: read `running_definition_hash` once, then fetch the
-/// definition recorded under THAT hash. Every execution-starting path
+/// definition recorded under THAT hash. Every run-starting path
 /// MUST use this instead of pairing a live `project_json` read with a
 /// separate hash read: a concurrent re-register between two separate
 /// reads would journal hash B while the kick set was computed from
@@ -563,7 +563,7 @@ pub(crate) async fn coherent_definition(
                 StatusCode::PRECONDITION_FAILED,
                 format!(
                     "project {id} has no production code identity; build it (`weft build`, or any \
-                     verb that runs it) before starting an execution"
+                     verb that runs it) before starting a run"
                 ),
             )
         })?;
@@ -585,7 +585,7 @@ pub(crate) async fn coherent_definition(
 }
 
 
-/// For each `requires_infra` node in the project, list the
+/// For each `requiresInfra` node in the project, list the
 /// `is_trigger` nodes that have it in their upstream closure.
 ///
 /// Re-export from weft-core. The function lives there because both
@@ -617,7 +617,7 @@ fn setup_kicks(project: &ProjectDefinition, seeds: Vec<Located>) -> Result<Vec<K
 /// (`keep.db` for the db of a file included as `keep`): the node under
 /// the call sites on the kick's frames. What a run is recorded as
 /// started by, setup runs here and fire runs in `versions::run`, so
-/// `weft executions` lists every run by a place and never by a
+/// `weft runs` lists every run by a place and never by a
 /// compiled id.
 pub(crate) fn kick_place(project: &ProjectDefinition, kick: &Kick) -> String {
     let place = Located::at(&kick.node, &kick.frames);
@@ -632,18 +632,18 @@ pub(crate) fn kick_place(project: &ProjectDefinition, kick: &Kick) -> String {
 /// lost-run sweep), so nothing here can be a setup nobody will advance.
 /// Sync rejects while any exists (two concurrent syncs would race the
 /// provisioning subworkflow); the infra-cancel verb interrupts them.
-pub(crate) async fn infra_setup_execution_ids(
+pub(crate) async fn infra_setup_run_ids(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     // Whose copies: `None` for any owner's setup, `Some(None)` for the
     // shared copies' setup, `Some(Some(m))` for instance m's.
     owner: Option<Option<&weft_core::instance::InstanceId>>,
-) -> anyhow::Result<Vec<weft_core::ExecutionId>> {
+) -> anyhow::Result<Vec<weft_core::RunId>> {
     Ok(sqlx::query_scalar(
-        "SELECT execution_id FROM run \
+        "SELECT run_id FROM run \
          WHERE project_id = $1 AND phase = 'infra_setup' AND state <> 'ended' \
            AND ($2 OR instance_id IS NOT DISTINCT FROM $3) \
-         ORDER BY started_at, execution_id",
+         ORDER BY started_at, run_id",
     )
     .bind(project_id)
     .bind(owner.is_none())
@@ -652,7 +652,7 @@ pub(crate) async fn infra_setup_execution_ids(
     .await?)
 }
 
-/// Whether an infra setup of `owner` (see [`infra_setup_execution_ids`])
+/// Whether an infra setup of `owner` (see [`infra_setup_run_ids`])
 /// is in flight: one instance starting its copy does not hold another
 /// instance's back.
 pub(crate) async fn infra_setup_in_flight(
@@ -660,16 +660,16 @@ pub(crate) async fn infra_setup_in_flight(
     project_id: uuid::Uuid,
     owner: Option<Option<&weft_core::instance::InstanceId>>,
 ) -> anyhow::Result<bool> {
-    Ok(!infra_setup_execution_ids(state, project_id, owner).await?.is_empty())
+    Ok(!infra_setup_run_ids(state, project_id, owner).await?.is_empty())
 }
 
-/// A started InfraSetup sub-execution: the execution to await plus the
+/// A started InfraSetup sub-run: the run to await plus the
 /// subscriptions opened BEFORE the enqueue (so the worker can't beat the
 /// waiter to the terminal event): the project's events, and the signal
 /// watch, which hears the run's ending (`weft_journal::RUN_ENDED_CHANNEL`:
 /// the run is queued watched).
 pub struct InfraSetupRun {
-    pub(crate) execution_id: weft_core::ExecutionId,
+    pub(crate) run_id: weft_core::RunId,
     events: tokio::sync::broadcast::Receiver<crate::events::LiveEvent>,
     heard: weft_task_store::pg_signal::Subscription,
     project_id: uuid::Uuid,
@@ -678,16 +678,16 @@ pub struct InfraSetupRun {
 impl InfraSetupRun {
     /// Follow a setup run already in flight (one a dispatcher that died
     /// mid-upgrade left behind), for [`await_infra_setup`] to wait out.
-    pub(crate) async fn follow(state: &DispatcherState, project_id: uuid::Uuid, execution_id: weft_core::ExecutionId) -> Self {
+    pub(crate) async fn follow(state: &DispatcherState, project_id: uuid::Uuid, run_id: weft_core::RunId) -> Self {
         let heard = state.signals.subscribe();
         let events = state.events.subscribe_project(project_id).await;
-        Self { execution_id, events, heard, project_id }
+        Self { run_id, events, heard, project_id }
     }
 }
 
 /// Queue a run of the program `program` started by the dispatcher (a setup
 /// run), recording the program's source as the version it ran.
-async fn start_queued_execution(
+async fn start_queued_run(
     state: &DispatcherState,
     program: &weft_core::project::hash::ProgramIdentity,
     defaults: &weft_core::project::ProjectDefaults,
@@ -696,14 +696,14 @@ async fn start_queued_execution(
 ) -> Result<(), (StatusCode, String)> {
     let source_version = super::versions::record_program_source(state, birth.project_id, program).await?;
     birth.source_version = Some(&source_version);
-    start_queued_execution_with(state, defaults, birth, &[], queue_as).await
+    start_queued_run_with(state, defaults, birth, &[], queue_as).await
 }
 
 /// What a run the dispatcher queues is born with beside its birth.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct QueueAs<'a> {
     /// A trigger setup an activation asked for (the activation is the
-    /// setup's own execution): queued only while that activation still
+    /// setup's own run): queued only while that activation still
     /// owns its rows.
     pub for_activation: bool,
     /// Somebody waits on its ending, which then announces itself
@@ -719,18 +719,18 @@ pub(crate) struct QueueAs<'a> {
 }
 
 /// THE one way the dispatcher starts a run (entrance 3): its birth (its
-/// `ExecutionStarted`, one `NodeKicked` per root) and `extra_rows` (birth
+/// `RunStarted`, one `NodeKicked` per root) and `extra_rows` (birth
 /// facts beyond the kicks: a scoped run's provided values as `PortEmitted
 /// { provided: true }`), written as its first record row with its `run`
 /// row, `queued`, in one transaction; delivery hands it to a worker. Every
 /// start path (`run`, trigger setup, infra setup) goes through here.
-pub(crate) async fn start_queued_execution_with(
+pub(crate) async fn start_queued_run_with(
     state: &DispatcherState,
     // The program's defaults (`weft.toml`): how long the run is kept when
     // what started it says nothing.
     defaults: &weft_core::project::ProjectDefaults,
     birth: weft_journal::birth::Birth<'_>,
-    extra_rows: &[weft_journal::ExecEvent],
+    extra_rows: &[weft_journal::RunEvent],
     queue_as: QueueAs<'_>,
 ) -> Result<(), (StatusCode, String)> {
     let tenant = state
@@ -738,7 +738,7 @@ pub(crate) async fn start_queued_execution_with(
         .tenant_for_project(birth.project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let execution_id = birth.execution_id;
+    let run_id = birth.run_id;
     let keep_for = birth.settings.kept_for(defaults.keep_for());
     let (start, kicks) = weft_journal::birth::birth_events(birth);
     let mut events = Vec::with_capacity(1 + kicks.len() + extra_rows.len());
@@ -758,9 +758,9 @@ pub(crate) async fn start_queued_execution_with(
         .journal
         .queue_run(queued, queue_as.for_activation)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e:#}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start run: {e:#}")))?;
     if !inserted {
-        return Err((StatusCode::CONFLICT, format!("execution {execution_id} was started already")));
+        return Err((StatusCode::CONFLICT, format!("run {run_id} was started already")));
     }
     Ok(())
 }
@@ -963,8 +963,8 @@ pub(crate) async fn require_run_infra(
 }
 
 
-/// START the InfraSetup sub-execution for every `requires_infra` node
-/// in the project: journal `ExecutionStarted` + the upstream-closure
+/// START the InfraSetup sub-run for every `requiresInfra` node
+/// in the project: journal `RunStarted` + the upstream-closure
 /// root kicks (so programmatic-infra patterns, text → compute →
 /// infra, flow values into the infra body), then enqueue the execute
 /// task. Returns `None` when the project has no infra nodes (nothing
@@ -1005,7 +1005,7 @@ pub async fn start_infra_setup(
         None => Default::default(),
     };
     let picks = picks_for_run(state, project_id, &project, &selection).await?;
-    let execution_id = weft_core::new_execution_id();
+    let run_id = weft_core::new_run_id();
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to the
     // completion event.
@@ -1015,11 +1015,11 @@ pub async fn start_infra_setup(
     // Infra reconciliation already holds the project transition lock.
     let source_version = super::versions::record_program_source_locked(state, project_id, &program).await?;
     let entry_node = kick_place(&project, &kicks[0]);
-    start_queued_execution_with(
+    start_queued_run_with(
         state,
         &project.defaults,
         weft_journal::birth::Birth {
-            execution_id,
+            run_id,
             project_id,
             phase: weft_core::context::Phase::InfraSetup,
             entry_node: &entry_node,
@@ -1041,7 +1041,7 @@ pub async fn start_infra_setup(
         QueueAs { watch_end: true, ..QueueAs::default() },
     )
     .await?;
-    Ok(Some(InfraSetupRun { execution_id, events, heard, project_id }))
+    Ok(Some(InfraSetupRun { run_id, events, heard, project_id }))
 }
 
 /// Why a sync (its InfraSetup, then the landing) did not land.
@@ -1077,15 +1077,15 @@ impl From<SyncNotLanded> for StatusError {
     }
 }
 
-/// Wait for a started InfraSetup sub-execution to settle.
-/// How the infra setup `execution_id` ended, as its journal says: `None`
+/// Wait for a started InfraSetup sub-run to settle.
+/// How the infra setup `run_id` ended, as its journal says: `None`
 /// while it is still in flight.
 async fn setup_ended(
     state: &DispatcherState,
-    execution_id: weft_core::ExecutionId,
+    run_id: weft_core::RunId,
 ) -> anyhow::Result<Option<Result<(), SyncNotLanded>>> {
-    use crate::api::execution::TerminalOutcome;
-    Ok(crate::api::execution::terminal_outcome(&state.pg_pool, execution_id).await?.map(|outcome| match outcome {
+    use crate::api::run::TerminalOutcome;
+    Ok(crate::api::run::terminal_outcome(&state.pg_pool, run_id).await?.map(|outcome| match outcome {
         TerminalOutcome::Completed => Ok(()),
         TerminalOutcome::Cancelled => Err(SyncNotLanded::Cancelled("infra setup cancelled".into())),
         _ => Err(SyncNotLanded::Failed(StatusCode::INTERNAL_SERVER_ERROR, "infra setup failed".into())),
@@ -1096,8 +1096,8 @@ pub(crate) async fn await_infra_setup(
     state: &DispatcherState,
     run: InfraSetupRun,
 ) -> Result<(), SyncNotLanded> {
-    let InfraSetupRun { execution_id, mut events, mut heard, project_id } = run;
-    // Wait for completion. NO deadline: the InfraSetup execution runs
+    let InfraSetupRun { run_id, mut events, mut heard, project_id } = run;
+    // Wait for completion. NO deadline: the InfraSetup run runs
     // user-authored upstream nodes (text -> compute -> infra), and
     // user code may legitimately be slow; a hard cap would refuse
     // legitimate provisioning. Instead, a periodic breadcrumb keeps
@@ -1111,7 +1111,7 @@ pub(crate) async fn await_infra_setup(
     // announced (it is queued watched), and whenever the watch or the bus
     // may have missed something; never on a clock.
     let ended_now = || async {
-        setup_ended(state, execution_id)
+        setup_ended(state, run_id)
             .await
             .map_err(|e| SyncNotLanded::Failed(StatusCode::INTERNAL_SERVER_ERROR, format!("infra setup terminal lookup: {e:#}")))
     };
@@ -1126,7 +1126,7 @@ pub(crate) async fn await_infra_setup(
             heard = heard.next() => {
                 let look = match heard {
                     Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload }) => {
-                        channel == weft_journal::RUN_ENDED_CHANNEL && weft_journal::run_ended_of_payload(&payload).contains(&execution_id)
+                        channel == weft_journal::RUN_ENDED_CHANNEL && weft_journal::run_ended_of_payload(&payload).contains(&run_id)
                     }
                     Ok(weft_task_store::pg_signal::Heard::Recheck | weft_task_store::pg_signal::Heard::Resumed) => true,
                     Ok(weft_task_store::pg_signal::Heard::Lost) => false,
@@ -1144,33 +1144,33 @@ pub(crate) async fn await_infra_setup(
                 tracing::info!(
                     target: "weft_dispatcher::infra_setup",
                     project_id = %project_id,
-                    execution_id = %execution_id,
+                    run_id = %run_id,
                     elapsed_secs = started.elapsed().as_secs(),
-                    "infra setup still running; waiting on the InfraSetup execution \
+                    "infra setup still running; waiting on the InfraSetup run \
                      (cancel it with `weft infra cancel` to unblock)"
                 );
             }
             res = events.recv() => {
                 match res.map(|record| record.event) {
-                    Ok(crate::events::DispatcherEvent::ExecutionCompleted { execution_id: c, .. })
-                        if c == execution_id => return Ok(()),
-                    Ok(crate::events::DispatcherEvent::ExecutionFailed { execution_id: c, error, .. })
-                        if c == execution_id => {
+                    Ok(crate::events::DispatcherEvent::RunCompleted { run_id: c, .. })
+                        if c == run_id => return Ok(()),
+                    Ok(crate::events::DispatcherEvent::RunFailed { run_id: c, error, .. })
+                        if c == run_id => {
                         return Err(SyncNotLanded::Failed(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("infra setup failed: {error}"),
                         ));
                     }
-                    Ok(crate::events::DispatcherEvent::ExecutionCancelled { execution_id: c, reason, .. })
-                        if c == execution_id => {
-                        // The user's infra-cancel (or a per-execution stop)
-                        // interrupted the provisioning execution.
+                    Ok(crate::events::DispatcherEvent::RunCancelled { run_id: c, reason, .. })
+                        if c == run_id => {
+                        // The user's infra-cancel (or a per-run stop)
+                        // interrupted the provisioning run.
                         return Err(SyncNotLanded::Cancelled(format!("infra setup cancelled: {reason}")));
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // The bus dropped a batch that may have held this
-                        // execution's terminal event. The journal is
+                        // run's terminal event. The journal is
                         // authoritative: re-query it rather than wait
                         // blind (which would spuriously time out even
                         // though infra setup already finished).
@@ -1409,7 +1409,7 @@ async fn authorize_project_marked(
 }
 
 /// Aggregate view for `weft status`: registration, listener state,
-/// per-node infra state, a rollup of recent executions, drift (when the
+/// per-node infra state, a rollup of recent runs, drift (when the
 /// desired hashes ride the query), and the verbs valid right now. One
 /// answer, no stitching required by a client.
 pub async fn status(
@@ -1464,7 +1464,7 @@ pub async fn status(
     // program's own runs (from SQL, not capped at a fetched window), the
     // set `weft tree` lists, and the first row is the latest for the
     // `last_*` fields. The runs that set it up are counted beside them.
-    let runs_of = |phase: Option<weft_core::context::Phase>| crate::journal::ExecutionQuery {
+    let runs_of = |phase: Option<weft_core::context::Phase>| crate::journal::RunListQuery {
         limit: 1,
         offset: 0,
         project_id: Some(id),
@@ -1480,30 +1480,30 @@ pub async fn status(
         below: None,
     };
     let (program_runs, every_run) = (runs_of(Some(weft_core::context::Phase::Fire)), runs_of(None));
-    let (execs, every) = tokio::try_join!(
-        state.journal.list_executions(caller.0.as_str(), &program_runs),
-        state.journal.list_executions(caller.0.as_str(), &every_run),
+    let (runs, every) = tokio::try_join!(
+        state.journal.list_runs(caller.0.as_str(), &program_runs),
+        state.journal.list_runs(caller.0.as_str(), &every_run),
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    let last = execs.executions.first();
+    let last = runs.runs.first();
     let running = state
         .journal
-        .going_execution_ids_for_project(id)
+        .going_run_ids_for_project(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("runs going: {e}")))?;
     // Oldest first, so the LAST is the most recently started. The
     // editor's action bar follows "the latest run" and nothing else on
     // the wire says which that is; sorting these by id, as this used
     // to, made "latest" mean whichever uuid happened to sort highest.
-    let running: Vec<RunningExecution> = running
+    let running: Vec<GoingRun> = running
         .into_iter()
-        .map(|(execution_id, phase)| RunningExecution { execution_id: execution_id.to_string(), phase })
+        .map(|(run_id, phase)| GoingRun { run_id: run_id.to_string(), phase })
         .collect();
-    let executions = ProjectExecutionsSummary {
-        total: execs.total as usize,
-        setup: every.total.saturating_sub(execs.total) as usize,
+    let runs = ProjectRunsSummary {
+        total: runs.total as usize,
+        setup: every.total.saturating_sub(runs.total) as usize,
         last_completed_at: last.and_then(|l| l.completed_at),
-        last_execution_id: last.map(|l| l.execution_id.to_string()),
+        last_run_id: last.map(|l| l.run_id.to_string()),
         last_status: last.map(|l| l.status),
         running,
     };
@@ -1567,7 +1567,7 @@ pub async fn status(
         listener_running,
         has_triggers,
         infra,
-        executions,
+        runs,
         has_infra,
         built: binary_hash.is_some(),
         builds: crate::build::ledger::running(&state.pg_pool, Some(id))
@@ -1607,7 +1607,7 @@ pub async fn status(
         limited: limited_entries(&state, id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("limit refusals: {e}")))?,
-        runs: trigger_runs(&state, id)
+        trigger_runs: trigger_runs(&state, id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("run counts: {e}")))?,
         unanswered: unanswered_for(&state, id).await?,
@@ -1883,7 +1883,7 @@ pub(crate) async fn gather_action_snapshot(
     };
 
     // Infra-op-in-flight fact the rollup can't always see (a claimed
-    // stop mid-drain; a provisioning execution before any row flips).
+    // stop mid-drain; a provisioning run before any row flips).
     let infra_busy = crate::infra_lifecycle_command::any_in_flight(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("commands in flight: {e}")))?
@@ -1906,7 +1906,7 @@ pub(crate) async fn gather_action_snapshot(
     };
     let running_now = state
         .journal
-        .going_execution_ids_for_project(id)
+        .going_run_ids_for_project(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("runs going: {e}")))?
         .len();
@@ -2161,7 +2161,7 @@ pub(crate) struct ActionInputs<'a> {
     pub infra_rollup: &'a str,
     /// An infra operation is in flight: an uncompleted lifecycle
     /// command (apply / stop / terminate) or a running InfraSetup
-    /// provisioning execution. Transitional per the master rule even
+    /// provisioning run. Transitional per the master rule even
     /// BEFORE the supervisor flips any node status (the window where
     /// the rollup alone would still read as stable), so a drain in
     /// progress is never starved by new runs.
@@ -2267,7 +2267,7 @@ fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
     // Master rule, infra axis: either the derived rollup reports a
     // transitional state, or an infra operation is in flight that the
     // rollup can't see yet (a claimed stop still draining, a
-    // provisioning execution before any node row flips). Only
+    // provisioning run before any node row flips). Only
     // meaningful when infra state exists at all.
     let infra_live = inputs.has_infra || inputs.orphaned_infra;
     if infra_live
@@ -2515,13 +2515,13 @@ pub(crate) async fn require_trigger_infra(
     ))
 }
 
-/// What a trigger setup does first to executions still running on an
+/// What a trigger setup does first to runs still running on an
 /// older image.
 enum StaleWorkerChoice {
     /// Settle them under the caller's running policy and drain cap (see
     /// [`reconcile_worker`]); the caller's choice, never a fixed one here,
     /// because a `wait` sits inside the request for as long as those
-    /// executions run.
+    /// runs run.
     Replace(crate::infra_lifecycle_command::RunningPolicy, u64),
     /// Leave them be and only ready the new image: the setup runs on it
     /// either way. A re-arm from an instance's change of values takes this,
@@ -2703,13 +2703,13 @@ async fn activate_trigger_setup_window(
     };
 
     // A binary-hash change must kill the stale-image worker before the
-    // activate's TriggerSetup exec runs, otherwise it's dispatched
+    // activate's TriggerSetup run goes, otherwise it's dispatched
     // against a worker that doesn't know about the new trigger nodes.
     // Idempotent (kill-by-binary-hash + respawn). It runs inside the
     // claim, so from the moment the verb is taken the triggers read
     // `activating` (a worker move can take a while), and a failure puts
     // them back as they were. The request's running policy says what
-    // happens to the stale worker's executions (cancel unless the
+    // happens to the stale worker's runs (cancel unless the
     // caller asked to wait); either way the replacement is loud, never a
     // silent kill.
     //
@@ -2756,7 +2756,7 @@ async fn activate_trigger_setup_window(
         let Some(capture) = bake.captured.get(&key.trigger) else { continue };
         let arming = crate::task_kinds::register_signal::RegisterSignalExecutor::arm(state,
             crate::task_kinds::register_signal::RegisterSignalPayload {
-                execution_id: bake.execution_id, node_id: key.trigger.clone(), frames: Vec::new(),
+                run_id: bake.run_id, node_id: key.trigger.clone(), frames: Vec::new(),
                 spec: capture.spec.clone(), is_resume: false, call_index: 0,
                 port_snapshot: Some(capture.ports.clone()),
                 asked_at_unix_ms: chrono::Utc::now().timestamp_millis(),
@@ -2783,7 +2783,7 @@ async fn activate_trigger_setup_window(
     };
 
     // Reconcile what the listener holds of this project with the durable
-    // signal table (resume signals belong to suspended executions whose
+    // signal table (resume signals belong to suspended runs whose
     // workers are gone). /rehydrate is idempotent, and fails only on this
     // project's own rows.
     if let Err(e) = state.listener.rehydrate(id, &orphans).await {
@@ -2814,7 +2814,7 @@ async fn activate_trigger_setup_window(
     // cancel_activate that ended the activation: in that case the cancel
     // already wiped its signals, so we surrender with no further
     // rollback. The setup run is terminal by now (`run_trigger_setup`
-    // returned on its terminal), so the execution the flip clears is only
+    // returned on its terminal), so the run the flip clears is only
     // bookkeeping. A re-arm's values are stored in the same transaction:
     // until the flip, the triggers' fires park (an activating trigger's
     // are not visible yet), and the drain after it routes them with the
@@ -3027,7 +3027,7 @@ pub(crate) async fn activate_with(
         return Err(ActivateError::Failed(
             StatusCode::PRECONDITION_FAILED,
             "project has no trigger nodes; nothing to activate. \
-             Use `weft run` to fire an execution directly."
+             Use `weft run` to fire a run directly."
                 .into(),
         ));
     }
@@ -3092,8 +3092,8 @@ pub(crate) async fn activate_with(
     // dispatcher, a double-click, CLI + extension racing, a program
     // activating the same instance twice) bails here with 409 BEFORE any
     // signal cleanup. Every later write is guarded by this activation's
-    // reserved execution.
-    let activation = weft_core::new_execution_id();
+    // reserved run.
+    let activation = weft_core::new_run_id();
     let previous = state
         .activations
         .try_begin_activating(id, &keys, activation, rearm.is_some().then_some(crate::activation_store::ProjectStatus::Active), resync)
@@ -3137,16 +3137,16 @@ pub(crate) async fn activate_with(
             // when an arm could not be taken back and nothing kept would
             // be lost. Both are idempotent and safe if a concurrent
             // cancel/success already ended the activation.
-            let cause = weft_core::exec::CancelCause::Runtime {
+            let cause = weft_core::run::CancelCause::Runtime {
                 detail: "the activation failed and rolled back its setup run".into(),
             };
             let rb = match rollback {
                 ActivateRollback::Restore => match state.activations.restore(id, activation, &previous).await {
-                    // The reserved execution may not have started yet. Cancellation
-                    // is harmless for an ownerless execution and fences any born run.
-                    Ok(true) => crate::api::execution::cancel_execution_id(state, activation, &cause)
+                    // The reserved run may not have started yet. Cancellation
+                    // is harmless for an ownerless run and fences any born run.
+                    Ok(true) => crate::api::run::cancel_run_id(state, activation, &cause)
                         .await
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_execution_id: {e}"))),
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_run_id: {e}"))),
                     Ok(false) => Ok(()),
                     Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("restore the triggers: {e}"))),
                 },
@@ -3225,7 +3225,7 @@ async fn project_address(state: &DispatcherState, id: uuid::Uuid) -> Option<weft
 /// in the source. Called after TriggerSetup so any trigger the user
 /// removed while it was down has its leftover signal row dropped.
 /// Resume rows (per-suspension) skip this: the corresponding suspended
-/// execution is the source of truth for them.
+/// run is the source of truth for them.
 async fn orphan_entry_tokens(
     state: &DispatcherState,
     project_id: uuid::Uuid,
@@ -3303,7 +3303,7 @@ async fn activation_write(
     let mut tx = state.pg_pool.begin().await?;
     let owned: Vec<(String,)> = sqlx::query_as(
         "SELECT trigger FROM trigger_activation \
-         WHERE project_id = $1 AND status = 'activating' AND activating_execution_id = $2 FOR UPDATE",
+         WHERE project_id = $1 AND status = 'activating' AND activating_run_id = $2 FOR UPDATE",
     ).bind(project_id).bind(activation).fetch_all(&mut *tx).await?;
     anyhow::ensure!(!owned.is_empty(), "activation {activation} no longer owns any trigger of project {project_id}");
     Ok(tx)
@@ -3346,7 +3346,7 @@ async fn apply_reactivate_choice(
     match choice {
         ReactivateChoice::ExecuteParkedKeepSuspended => {}
         ReactivateChoice::KeepSuspendedOnly => {
-            sqlx::query("DELETE FROM parked_fire WHERE token = ANY($1) AND execution_id IS NULL")
+            sqlx::query("DELETE FROM parked_fire WHERE token = ANY($1) AND run_id IS NULL")
                 .bind(&governed)
                 .execute(&mut *tx)
                 .await
@@ -3355,16 +3355,16 @@ async fn apply_reactivate_choice(
         ReactivateChoice::WipeAll => {
             let target = crate::take_down::TakeDownTarget::Activations(keys.to_vec());
             let runs = crate::take_down::live_runs(state, project_id).await.map_err(|e| internal("live runs", e))?;
-            cancelled = crate::take_down::affected_runs(&target, &runs, None).into_iter().map(|r| r.execution_id).collect();
+            cancelled = crate::take_down::affected_runs(&target, &runs, None).into_iter().map(|r| r.run_id).collect();
             removed = crate::journal::postgres::remove_signals(&mut *tx, &governed).await
                 .map_err(|e| internal("clear activation signals", e))?;
         }
     }
     tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("apply activation choice: {e}")))?;
     state.listener.unregister_many(&removed).await;
-    let cause = weft_core::exec::CancelCause::User;
-    let targets: Vec<_> = cancelled.iter().map(|execution_id| (*execution_id, &cause)).collect();
-    crate::api::execution::cancel_execution_ids(state, &targets).await
+    let cause = weft_core::run::CancelCause::User;
+    let targets: Vec<_> = cancelled.iter().map(|run_id| (*run_id, &cause)).collect();
+    crate::api::run::cancel_run_ids(state, &targets).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation's prior runs: {e}")))?;
     Ok(choice != ReactivateChoice::WipeAll && !governed.is_empty())
 }
@@ -3377,7 +3377,7 @@ pub(crate) async fn wipe_activating_state(
     state: &DispatcherState,
     id: uuid::Uuid,
     activation: uuid::Uuid,
-    cause: &weft_core::exec::CancelCause,
+    cause: &weft_core::run::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
     let Some(removed) = state.activations.end_activating(
         id, activation, &crate::activation_store::ActivationLifecycle::wiped(), true, None,
@@ -3385,7 +3385,7 @@ pub(crate) async fn wipe_activating_state(
         return Ok(());
     };
     state.listener.unregister_many(&removed).await;
-    crate::api::execution::cancel_execution_id(state, activation, cause)
+    crate::api::run::cancel_run_id(state, activation, cause)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation {id}: {e}")))?;
     Ok(())
@@ -3400,7 +3400,7 @@ pub(crate) async fn end_unfinished_activation(
     state: &DispatcherState,
     id: uuid::Uuid,
     activation: uuid::Uuid,
-    cause: &weft_core::exec::CancelCause,
+    cause: &weft_core::run::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
     let Some(removed) = state
         .activations
@@ -3411,7 +3411,7 @@ pub(crate) async fn end_unfinished_activation(
         return Ok(());
     };
     state.listener.unregister_many(&removed).await;
-    crate::api::execution::cancel_execution_id(state, activation, cause)
+    crate::api::run::cancel_run_id(state, activation, cause)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation {id}: {e:#}")))
 }
@@ -3843,7 +3843,7 @@ pub(crate) async fn resync_owner(
     // triggers down). It asks nobody what to do with what the take-down
     // kept: like every combined off-and-on, it carries it over (the
     // default `ReactivateChoice`). The person answered "what about the
-    // running executions" ONCE, in the picker, and the answer, kept in the
+    // running runs" ONCE, in the picker, and the answer, kept in the
     // plan, governs the reactivate's worker replacement as much as the
     // trigger-side drain above. The port stays the one the project has (a
     // resync names none). Triggers already back (an earlier run of the
@@ -3863,9 +3863,9 @@ pub(crate) async fn resync_owner(
 /// Settle what the project's workers still run on an older image, once a
 /// new image went live.
 ///
-/// Every execution runs on the image it was born with (its run row
+/// Every run runs on the image it was born with (its run row
 /// carries the binary hash), so a new image never disturbs anything by
-/// itself: new executions go to the new image's workers, and one parked on
+/// itself: new runs go to the new image's workers, and one parked on
 /// the old image resumes there. What the person chooses is the fate of the
 /// work going on an older image right now (`crate::drain`, the runs the
 /// older images' workers drive and the ones queued for them):
@@ -3965,7 +3965,7 @@ pub async fn quiesce(
 }
 
 /// `POST /projects/{id}/cancel-running`. Force a waiting deactivation
-/// to finish now: cancel every running, non-suspended execution the
+/// to finish now: cancel every running, non-suspended run the
 /// named deactivating activations are waiting for (every shared one by
 /// default). The drain-watcher then lands them Inactive. Nothing to do
 /// when none of them is deactivating.
@@ -3989,7 +3989,7 @@ pub async fn cancel_running(
         .map(|a| a.key)
         .collect();
     let scope = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::Triggers(&draining), except: None };
-    crate::drain::cancel_left(&state, &scope, &weft_core::exec::CancelCause::User)
+    crate::drain::cancel_left(&state, &scope, &weft_core::run::CancelCause::User)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
@@ -4102,7 +4102,7 @@ pub async fn cancel_activate(
     let activations: std::collections::BTreeSet<uuid::Uuid> = rows
         .into_iter()
         .filter(|a| keys.contains(&a.key))
-        .filter_map(|a| a.lifecycle.activating_execution_id)
+        .filter_map(|a| a.lifecycle.activating_run_id)
         .collect();
     if activations.is_empty() && given_up.is_none() {
         return Err((
@@ -4112,7 +4112,7 @@ pub async fn cancel_activate(
     }
     // The cause is the person's: they pressed Cancel.
     for activation in activations {
-        end_unfinished_activation(&state, id, activation, &weft_core::exec::CancelCause::User).await?;
+        end_unfinished_activation(&state, id, activation, &weft_core::run::CancelCause::User).await?;
     }
     state
         .events
@@ -4122,10 +4122,10 @@ pub async fn cancel_activate(
     Ok(Json(weft_core::activation::CancelActivateResponse { resync_given_up }))
 }
 
-/// Spawn a worker for the TriggerSetup sub-execution and block
-/// until it settles. The run's execution is recorded on the project row
+/// Spawn a worker for the TriggerSetup sub-run and block
+/// until it settles. The run is recorded on the project row
 /// before it starts, so a rollback (or a cancel-activate, or the
-/// reaper) cancels just THIS execution and never touches
+/// reaper) cancels just THIS run and never touches
 /// suspended/running work from prior cycles.
 async fn run_trigger_setup(
     state: &DispatcherState,
@@ -4146,7 +4146,7 @@ async fn run_trigger_setup(
     // it); nothing for every other setup.
     overlay: Option<&weft_core::instance::ValueChanges>,
 ) -> Result<crate::journal::TriggerBake, (StatusCode, String)> {
-    let execution_id = activation.unwrap_or_else(weft_core::new_execution_id);
+    let run_id = activation.unwrap_or_else(weft_core::new_run_id);
     let places = key_places(project, keys);
     let selection = weft_core::project::selection::RunSelection::setup(project, &places)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
@@ -4163,12 +4163,12 @@ async fn run_trigger_setup(
     // the completion event.
     let mut events = state.events.subscribe_project(project_id).await;
 
-    // The activation reserved this execution when it began. A cancelled
+    // The activation reserved this run when it began. A cancelled
     // driver cannot replace a newer activation's identity.
     let owned = |activations: Vec<crate::activation_store::Activation>| {
         activations.iter().any(|a| {
             a.lifecycle.status == crate::activation_store::ProjectStatus::Activating
-                && a.lifecycle.activating_execution_id == Some(execution_id)
+                && a.lifecycle.activating_run_id == Some(run_id)
         })
     };
     let recorded = activation.is_none() || owned(
@@ -4186,16 +4186,16 @@ async fn run_trigger_setup(
     }
 
     // The birth is one transaction, so a start failure leaves no journal
-    // rows and no task; the execution the row recorded above then names a
+    // rows and no task; the run the row recorded above then names a
     // run that never existed, which the rollback's cancel finds ownerless
     // and skips.
     let entry_node = kick_place(project, &kicks[0]);
-    start_queued_execution(
+    start_queued_run(
         state,
         program,
         &project.defaults,
         weft_journal::birth::Birth {
-            execution_id,
+            run_id,
             project_id,
             phase: weft_core::context::Phase::TriggerSetup,
             entry_node: &entry_node,
@@ -4226,15 +4226,15 @@ async fn run_trigger_setup(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("activations: {e}")))?,
     );
     if !still_ours {
-        crate::api::execution::cancel_execution_id(
+        crate::api::run::cancel_run_id(
             state,
-            execution_id,
-            &weft_core::exec::CancelCause::Runtime {
+            run_id,
+            &weft_core::run::CancelCause::Runtime {
                 detail: "the activation ended before this trigger setup run started".into(),
             },
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_execution_id: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_run_id: {e}")))?;
         return Err((
             StatusCode::CONFLICT,
             "the activation was cancelled as trigger setup started".into(),
@@ -4249,21 +4249,21 @@ async fn run_trigger_setup(
     // client-side patience budget.
     loop {
         match events.recv().await.map(|record| record.event) {
-            Ok(crate::events::DispatcherEvent::ExecutionCompleted { execution_id: c, .. })
-                if c == execution_id =>
+            Ok(crate::events::DispatcherEvent::RunCompleted { run_id: c, .. })
+                if c == run_id =>
             {
                 break;
             }
-            Ok(crate::events::DispatcherEvent::ExecutionFailed { execution_id: c, error, .. })
-                if c == execution_id =>
+            Ok(crate::events::DispatcherEvent::RunFailed { run_id: c, error, .. })
+                if c == run_id =>
             {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("trigger setup failed: {error}"),
                 ));
             }
-            Ok(crate::events::DispatcherEvent::ExecutionCancelled { execution_id: c, reason, .. })
-                if c == execution_id =>
+            Ok(crate::events::DispatcherEvent::RunCancelled { run_id: c, reason, .. })
+                if c == run_id =>
             {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -4272,18 +4272,18 @@ async fn run_trigger_setup(
             }
             Ok(_) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Dropped batch may have held this execution's terminal.
+                // Dropped batch may have held this run's terminal.
                 // The journal is authoritative: re-query rather than
                 // fail the trigger-setup on a transient lag.
-                match crate::api::execution::terminal_outcome(&state.pg_pool, execution_id).await {
-                    Ok(Some(crate::api::execution::TerminalOutcome::Completed)) => break,
-                    Ok(Some(crate::api::execution::TerminalOutcome::Failed)) => {
+                match crate::api::run::terminal_outcome(&state.pg_pool, run_id).await {
+                    Ok(Some(crate::api::run::TerminalOutcome::Completed)) => break,
+                    Ok(Some(crate::api::run::TerminalOutcome::Failed)) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "trigger setup failed".into(),
                         ))
                     }
-                    Ok(Some(crate::api::execution::TerminalOutcome::Cancelled)) => {
+                    Ok(Some(crate::api::run::TerminalOutcome::Cancelled)) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "trigger setup cancelled".into(),
@@ -4306,7 +4306,7 @@ async fn run_trigger_setup(
             }
         }
     }
-    let events = state.journal.events_log(execution_id).await
+    let events = state.journal.events_log(run_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read trigger setup: {error:#}")))?;
     let program = state.run_program_identity(&events).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
@@ -4314,12 +4314,12 @@ async fn run_trigger_setup(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| (StatusCode::CONFLICT, "trigger setup did not complete successfully".into()))?;
     bake.targets = keys.iter().map(|key| key.trigger.clone()).collect();
-    state.journal.finish_trigger_setup(execution_id, Some(&bake)).await
+    state.journal.finish_trigger_setup(run_id, Some(&bake)).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("publish trigger bake: {error:#}")))?;
     Ok(bake)
 }
 
-/// After a trigger-setup sub-exec, collect every persisted signal
+/// After a trigger-setup sub-run, collect every persisted signal
 /// for the project that has a user-facing URL. These become the
 /// `urls` in ActivateResponse.
 async fn collect_listener_urls(
@@ -4520,7 +4520,7 @@ mod trigger_kick_tests {
         // TriggerX ──► StepX      TriggerY ──► StepY
         // Nothing joins the two, so firing one records a subgraph holding
         // only its own path: the graph view dims the rest of the program
-        // for that execution, the same way it does for an authored cut.
+        // for that run, the same way it does for an authored cut.
         let p = project(
             &[
                 ("trigger_x", true, &[]),
@@ -5324,7 +5324,7 @@ mod available_actions_tests {
 
     #[test]
     fn infra_op_in_flight_is_transitional_even_with_a_stable_rollup() {
-        // A claimed stop still draining (or an InfraSetup execution
+        // A claimed stop still draining (or an InfraSetup run
         // before any node row flips) leaves the rollup reading
         // "running"; the in-flight fact must still collapse the row
         // to cancel-only, or new runs would starve the drain.
@@ -5728,7 +5728,7 @@ mod infra_entries_tests {
     }
 
     /// A program with no infra node lists none, which is the one case the
-    /// CLI says no node declares `requires_infra`.
+    /// CLI says no node declares `requiresInfra`.
     #[test]
     fn a_program_without_infra_lists_none() {
         let project = super::infra_kick_and_dep_tests::project(&[("plain", false, false)], &[]);

@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct NotNode;
@@ -25,7 +25,7 @@ impl Node for NotNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: bool = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", serde_json::Value::Bool(!value)))
             .await

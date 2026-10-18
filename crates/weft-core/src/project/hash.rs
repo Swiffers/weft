@@ -34,7 +34,7 @@ use crate::frames::Located;
 /// A hex-encoded SHA-256 digest. 64 chars.
 pub type SourceHash = String;
 
-/// Immutable graph and production-code identity captured with an execution.
+/// Immutable graph and production-code identity captured with a run.
 /// Definition storage remains keyed by its graph hash alone.
 // SYNC: ProgramIdentity <-> packages/weft-graph/src/run-spec.ts ProgramIdentity
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +120,7 @@ impl ProgramIdentity {
 /// source spans and layout positions are stripped before hashing.
 ///
 /// Used as the resync drift signal AND as the identity key the
-/// worker fetches the definition with at execution claim time
+/// worker fetches the definition with at run claim time
 /// (`(project_id, definition_hash)`).
 ///
 /// PURE over the definition (no filesystem access): the browser WASM

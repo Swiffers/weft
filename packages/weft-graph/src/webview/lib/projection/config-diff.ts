@@ -49,7 +49,7 @@ export function sameConfigValue(a: unknown, b: unknown): boolean {
   if (aUnset || bUnset) return aUnset && bUnset;
   // Object/array values (form schemas, JSON configs) are recreated per render and
   // may come back with keys in a different order, so identity can't be trusted and
-  // a key-order-sensitive compare would emit a phantom setConfig op (the exact
+  // a key-order-sensitive compare would emit a phantom set_config op (the exact
   // toggle regression this module prevents). Compare structurally via a key-sorted
   // canonical form. Scalars fall through to their own token compare.
   if (typeof a === 'object' && typeof b === 'object') {
@@ -73,11 +73,11 @@ export function diffConfigOps(
     if (NON_SOURCE_KEYS.has(key)) continue;
     if (sameConfigValue(value, current[key])) continue;
     if (value === undefined || value === null) {
-      ops.push(isLoopConfig ? { op: 'removeLoopConfig', loopId: nodeId, key } : { op: 'removeConfig', node: nodeId, key });
+      ops.push(isLoopConfig ? { op: 'remove_loop_config', loopId: nodeId, key } : { op: 'remove_config', node: nodeId, key });
     } else {
       ops.push(isLoopConfig
-        ? { op: 'setLoopConfig', loopId: nodeId, key, value: formatConfigValue(value) }
-        : { op: 'setConfig', node: nodeId, key, value: formatConfigValue(value) });
+        ? { op: 'set_loop_config', loopId: nodeId, key, value: formatConfigValue(value) }
+        : { op: 'set_config', node: nodeId, key, value: formatConfigValue(value) });
     }
   }
   return ops;
@@ -113,14 +113,14 @@ export function diffPortLiteralOps(
     if (sameConfigValue(value, current[key])) continue;
     const form = spans[key]?.origin ?? firstForm;
     if (value === undefined || value === null) {
-      ops.push({ op: 'removeConfig', node: nodeId, key, form });
+      ops.push({ op: 'remove_config', node: nodeId, key, form });
     } else {
-      ops.push({ op: 'setConfig', node: nodeId, key, value: formatConfigValue(value), form });
+      ops.push({ op: 'set_config', node: nodeId, key, value: formatConfigValue(value), form });
     }
   }
   for (const key of Object.keys(current)) {
     if (!(key in updated) && !installPicked(current[key])) {
-      ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? firstForm });
+      ops.push({ op: 'remove_config', node: nodeId, key, form: spans[key]?.origin ?? firstForm });
     }
   }
   return ops;

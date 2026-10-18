@@ -9,14 +9,14 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::signal::{PollEndpoint, Predicate};
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct AwaitJobNode;
 
 #[async_trait]
 impl Node for AwaitJobNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
         let answer = ctx
             .await_signal(PollEndpoint {

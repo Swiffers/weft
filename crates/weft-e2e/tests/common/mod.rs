@@ -2,7 +2,7 @@
 //! verbs and read what the CLI printed: the `lifecycle` fixture's graph
 //! shapes, the HoldGate release protocol, the drive/observe helpers built
 //! on them (`lifecycle_transitions.rs`, `version_tree_edges.rs`), and the
-//! readers of a `weft run`'s output (an execution id, a summary, the
+//! readers of a `weft run`'s output (a run id, a summary, the
 //! warnings, the version tree) that the run, include and version-tree
 //! suites share. One definition, used by every test binary that needs it.
 //!
@@ -41,7 +41,7 @@ pub fn graph_infra() -> String {
 }
 
 /// Graph: MiniService + the HoldGate chain, both roots. A run fires both; the
-/// svc branch settles fast, the hold branch keeps the execution running until
+/// svc branch settles fast, the hold branch keeps the run running until
 /// the rig releases it.
 pub fn graph_infra_hold(release_url: &str) -> String {
     format!(
@@ -57,7 +57,7 @@ pub fn graph_infra_hold(release_url: &str) -> String {
 }
 
 /// Graph: SSE trigger -> HoldGate -> Debug. A pushed event starts a Fire
-/// execution that holds until released.
+/// run that holds until released.
 pub fn graph_trigger_hold(sse_url: &str, event_name: &str, release_url: &str) -> String {
     format!(
         "start = TestSseTrigger -> (value: String) {{\n\
@@ -133,26 +133,26 @@ pub const LIFECYCLE_GATE: &str = "is not available right now";
 /// places that are down.
 pub const INFRA_GATE: &str = "infra not running for";
 
-/// The current status string of one execution (`running` /
+/// The current status string of one run (`running` /
 /// `waiting_for_input` / `completed` / `cancelled` / `failed`), read live
 /// (no settle wait).
-pub async fn exec_status(disp: &Dispatcher, execution_id: Uuid) -> anyhow::Result<String> {
-    let v: Value = disp.get_json(&format!("/executions/{execution_id}")).await?;
+pub async fn run_status(disp: &Dispatcher, run_id: Uuid) -> anyhow::Result<String> {
+    let v: Value = disp.get_json(&format!("/runs/{run_id}")).await?;
     Ok(v.get("status").and_then(Value::as_str).unwrap_or("").to_string())
 }
 
-/// Fire the SSE trigger and wait for the ONE new execution it starts.
+/// Fire the SSE trigger and wait for the ONE new run it starts.
 ///
 /// The push happens after `wait_for_subscriber` confirms a connection is reading,
 /// so a single push is delivered (not lost on a stale reader). We then wait the
-/// FULL worker-settle deadline for the execution to appear, because a trigger fire
+/// FULL worker-settle deadline for the run to appear, because a trigger fire
 /// cold-starts a worker (spawn + image pull + fold + run) and is legitimately
 /// slow. We do NOT re-push on a short timeout: pushing again while the first push's
-/// execution is still cold-starting would start a SECOND execution and make the
-/// "exactly one new execution" contract fail. A second push is attempted ONLY after
-/// a full-deadline timeout with zero new executions (evidence the push was genuinely
+/// run is still cold-starting would start a SECOND run and make the
+/// "exactly one new run" contract fail. A second push is attempted ONLY after
+/// a full-deadline timeout with zero new runs (evidence the push was genuinely
 /// dropped, e.g. a reactivation reconnect blip), re-confirming a reader first.
-pub async fn fire_until_execution(
+pub async fn fire_until_run(
     feed: &SseFake,
     disp: &Dispatcher,
     pid: &Uuid,
@@ -166,12 +166,12 @@ pub async fn fire_until_execution(
         // Full settle deadline: only a genuine "nothing ever started" times out
         // here, so a timeout is real evidence the push was dropped, not just a slow
         // cold start.
-        match run::wait_for_triggered_execution(disp, pid, before, run::RUN_SETTLE_DEADLINE).await {
-            Ok(execution_id) => return Ok(execution_id),
+        match run::wait_for_triggered_run(disp, pid, before, run::RUN_SETTLE_DEADLINE).await {
+            Ok(run_id) => return Ok(run_id),
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap().context("no execution started after repeated trigger pushes"))
+    Err(last_err.unwrap().context("no run started after repeated trigger pushes"))
 }
 
 // ----- reading a `--json` command's NDJSON --------------------------------
@@ -180,20 +180,20 @@ pub async fn fire_until_execution(
 // verbatim copy in two test files, which is how two readers of one
 // output format stop agreeing.
 
-/// The execution returned by run or bake.
-pub fn execution_id_of(stdout: &str) -> anyhow::Result<Uuid> {
+/// The run returned by run or bake.
+pub fn run_id_of(stdout: &str) -> anyhow::Result<Uuid> {
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        let execution_id = if v.get("verb").and_then(Value::as_str) == Some("bake") {
-            v.pointer("/detail/result/execution_id")
+        let run_id = if v.get("verb").and_then(Value::as_str) == Some("bake") {
+            v.pointer("/detail/result/runId")
         } else {
-            v.pointer("/detail/execution_id")
+            v.pointer("/detail/runId")
         };
-        if let Some(c) = execution_id.and_then(Value::as_str) {
+        if let Some(c) = run_id.and_then(Value::as_str) {
             return Ok(c.parse()?);
         }
     }
-    anyhow::bail!("no execution in command output:\n{stdout}")
+    anyhow::bail!("no run in command output:\n{stdout}")
 }
 
 /// The one-line summary on the terminal event.
@@ -233,5 +233,5 @@ pub async fn tree_of(project: &weft_e2e::project::Project) -> anyhow::Result<Val
 /// spelled the way the source reads (`triage.up` is the file's node
 /// under the call `triage`).
 pub fn inherited(run: &weft_e2e::run::SettledRun, node: &str) -> bool {
-    run.events_of(node).any(|e| e.field("inherited_from").is_some())
+    run.events_of(node).any(|e| e.field("inheritedFrom").is_some())
 }

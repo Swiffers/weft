@@ -221,6 +221,7 @@ impl Copies {
 /// instance's trigger reading through its connection). `None` wherever it
 /// is carried is the author, or a run for no instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceScope {
     pub project_id: uuid::Uuid,
     pub instance: InstanceId,
@@ -299,7 +300,7 @@ pub fn instance_filled_fields(node: &crate::project::NodeDefinition) -> impl Ite
     node.port_literals.iter().filter_map(|(field, value)| Some((field.as_str(), as_instance_filled(value)?)))
 }
 
-/// One instance's values: field -> value, for the step at one place.
+/// One instance's values: field -> value, for the node at one place.
 pub type PlaceValues = std::collections::BTreeMap<String, serde_json::Value>;
 
 /// An instance's values for a run: place (`read`, `one.read`) -> its fields.
@@ -518,7 +519,7 @@ pub fn filled_node(node: &crate::project::NodeDefinition, values: Option<&PlaceV
 /// [`LookupConnection::NotConnected`], with why: the field listing shows
 /// the field as unconnected, the lookup door refuses with that reason.
 /// `Err` is only a program that cannot look anything up. The same walk the editor does over its canvas, over the
-/// compiled program, so an instance's dropdown lists what the step's run
+/// compiled program, so an instance's dropdown lists what the node's run
 /// would reach.
 pub fn lookup_connection(
     project: &crate::project::ProjectDefinition,

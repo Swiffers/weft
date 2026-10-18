@@ -184,7 +184,7 @@ fn source_asset_references_include_nested_and_key_selected_files_but_not_generat
             "inputs": [{"name": "photos", "portType": "List[Image]", "required": true}],
             "portLiterals": {"photos": [
                 file(own_key.clone()), file(own_key.clone()),
-                file("t/exec/c/generated".into()),
+                file("t/run/c/generated".into()),
                 file(shared_key.clone())
             ]}
         }]

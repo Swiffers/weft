@@ -26,7 +26,7 @@ use serde_json::json;
 use weft::bus::{BusOptions, BusPayloadKind};
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{node_error, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct AudioStreamNode;
@@ -129,7 +129,7 @@ fn chunk_bytes(rate: u32) -> usize {
 
 #[async_trait]
 impl Node for AudioStreamNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let file = ctx.inputs.get("audio")?;
         let (_meta, bytes) = ctx.storage(StorageScope::Project).get_bytes(&file).await?;
         let (rate, pcm) = parse_wav(&bytes).map_err(node_error)?;

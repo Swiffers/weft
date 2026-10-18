@@ -341,14 +341,14 @@ async fn door_let_go(
     Json(req): Json<DoorLetGoRequest>,
 ) -> Resp<DoorLetGo> {
     let (tenant, project, replica) = worker(&caller)?;
-    let released = let_go(&state.pool, DoorWorker { tenant, project, replica }, req.execution_id, req.why)
+    let released = let_go(&state.pool, DoorWorker { tenant, project, replica }, req.run_id, req.why)
         .await
         .map_err(|e| unavailable_or_internal(e.context("let go of a run")))?;
     // A run parked whole that another worker drives already is that
     // worker's: nothing to let go of. One handed back must be the asking
     // worker's, or it would be queued by a worker that does not drive it.
     if !released && req.why == LetGo::HandedBack {
-        return Err((StatusCode::CONFLICT, format!("execution {} is not this worker's to hand back", req.execution_id)));
+        return Err((StatusCode::CONFLICT, format!("run {} is not this worker's to hand back", req.run_id)));
     }
     Ok(Json(DoorLetGo {}))
 }
@@ -360,16 +360,16 @@ pub struct DoorWorker<'a> {
     pub replica: &'a str,
 }
 
-/// `worker` lets go of `execution_id` for `why` (`DoorLetGoRequest`), in
+/// `worker` lets go of `run_id` for `why` (`DoorLetGoRequest`), in
 /// one transaction: the run is `parked` on its wait or `queued` for another
 /// worker, with no owner, only while `worker` drives it. A parked run with
 /// answers already waiting for it wakes the drain that hands them over,
 /// and a queued one the delivery that hands it to a worker. Answers
 /// whether the run was that worker's to let go of, or already let go of (a
 /// retry whose first answer was lost).
-pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, execution_id: weft_core::ExecutionId, why: LetGo) -> anyhow::Result<bool> {
+pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_core::RunId, why: LetGo) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
-    let Some(locked) = weft_journal::record::lock_in(&mut tx, execution_id).await? else { return Ok(false) };
+    let Some(locked) = weft_journal::record::lock_in(&mut tx, run_id).await? else { return Ok(false) };
     if locked.project_id != worker.project {
         return Ok(false);
     }
@@ -384,8 +384,8 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, execution_id: w
     if locked.owner.as_deref() != Some(worker.replica) || locked.state != "running" {
         return Ok(false);
     }
-    sqlx::query("UPDATE run SET state = $2, owner = NULL, delivered_until = NULL WHERE execution_id = $1")
-        .bind(execution_id)
+    sqlx::query("UPDATE run SET state = $2, owner = NULL, delivered_until = NULL WHERE run_id = $1")
+        .bind(run_id)
         .bind(to)
         .execute(&mut *tx)
         .await?;
@@ -393,7 +393,7 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, execution_id: w
     // An answer handed to the run while its worker drove it, and not taken
     // before it let go, goes on its record now, and the run is queued to
     // carry on with it.
-    let resolved = weft_journal::record::resolve_handed_in(&mut tx, execution_id, &locked, worker.replica).await?;
+    let resolved = weft_journal::record::resolve_handed_in(&mut tx, run_id, &locked, worker.replica).await?;
     if why == LetGo::HandedBack && !resolved {
         weft_journal::record::notify_queued_in(&mut tx, worker.project).await?;
     }

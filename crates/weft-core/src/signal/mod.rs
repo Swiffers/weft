@@ -4,7 +4,7 @@
 //! a node." Each kind (timer, form, sse_subscribe, route, socket, ...) is
 //! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
-//! `ctx.await_signal(...)` (mid-execution resume). The framework
+//! `ctx.await_signal(...)` (mid-run resume). The framework
 //! projects the typed kind onto the internal `SignalSpec` wire
 //! shape via the `Signal` trait.
 //!
@@ -99,7 +99,7 @@ use crate::primitive::{AccessRef, SignalSpec};
 ///
 /// `is_resume` is NOT on the trait. Whether a registration is a
 /// fresh entry or a paused-firing resume is decided by which
-/// `ExecutionContext` method the author called.
+/// `RunContext` method the author called.
 #[cfg(feature = "runtime")]
 pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// Kind tag stored on the wire (`"timer"`, `"route"`, ...).

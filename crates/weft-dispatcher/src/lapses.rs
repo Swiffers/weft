@@ -193,17 +193,17 @@ async fn end_stuck_activations(state: &DispatcherState, now: i64) -> anyhow::Res
         tracing::warn!(
             target: "weft_dispatcher::lapses",
             project_id = %stuck.project_id,
-            activation = %stuck.execution_id,
+            activation = %stuck.run_id,
             "activation orphaned (driver heartbeat stale); ending it"
         );
         if let Err((code, msg)) = crate::api::project::end_unfinished_activation(
             state,
             stuck.project_id,
-            stuck.execution_id,
+            stuck.run_id,
             // The activation's driver died mid-transition and this look
             // is repairing the row; nothing superseded the run and no
             // person stopped it.
-            &weft_core::exec::CancelCause::Runtime {
+            &weft_core::run::CancelCause::Runtime {
                 detail: "the activation's driver died mid-transition; weft ended it".into(),
             },
         )
@@ -233,12 +233,12 @@ async fn end_stuck_activations(state: &DispatcherState, now: i64) -> anyhow::Res
 /// while it goes. Past it its claimant, which takes the claim back as its
 /// run ends, died.
 fn resting_claim_lapses_at(rest: &str) -> String {
-    format!("CASE WHEN r.execution_id IS NULL THEN 0 WHEN r.state = 'ended' THEN r.ended_at + {rest} END")
+    format!("CASE WHEN r.run_id IS NULL THEN 0 WHEN r.state = 'ended' THEN r.ended_at + {rest} END")
 }
 
 /// The task claims resting on a run, `t` with its run left-joined as `r`.
 const RESTING_CLAIMS: &str =
-    "task t LEFT JOIN run r ON r.execution_id = t.claim_rests_on WHERE t.status = 'claimed' AND t.claim_rests_on IS NOT NULL";
+    "task t LEFT JOIN run r ON r.run_id = t.claim_rests_on WHERE t.status = 'claimed' AND t.claim_rests_on IS NOT NULL";
 
 /// Put back to be claimed every task whose resting claim lapsed
 /// ([`resting_claim_lapses_at`]). Answers how many. Announced as a task

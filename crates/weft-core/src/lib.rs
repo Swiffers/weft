@@ -1,7 +1,7 @@
 // First, so every module below can use the macros it exports.
 mod wire_enum;
 
-// Runtime modules: the execution context, buses, storage streaming, caller
+// Runtime modules: the run context, buses, storage streaming, caller
 // connections, cancellation, timer signals, and signed routing tokens. Pull
 // tokio/futures/bytes (no wasm32 support), so they are gated behind the
 // `runtime` feature (default on). The browser WASM parse build turns `runtime`
@@ -20,6 +20,7 @@ pub mod builds;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
 pub mod door_fire;
+pub mod casing;
 pub mod comma_list;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
@@ -30,7 +31,6 @@ pub mod context;
 pub mod deactivation;
 pub mod deref;
 pub mod error;
-pub mod exec;
 #[cfg(feature = "runtime")]
 pub mod file_lock;
 pub mod frames;
@@ -66,6 +66,7 @@ pub mod projects;
 pub mod pulse;
 pub mod route;
 pub mod rules;
+pub mod run;
 pub mod run_settings;
 pub mod run_spec;
 pub mod running_policy;
@@ -182,7 +183,7 @@ pub use generator::{Generator, StreamEnd, TryNext};
 pub use cancellation::CancellationFlag;
 #[cfg(feature = "runtime")]
 pub use context::{
-    ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, Phase, ValueBag,
+    ContextHandle, EndpointHandle, EndpointMethod, RunContext, Phase, ValueBag,
     StorageHandle,
 };
 pub use access::spec::{AccessSpec, AppRegistration};
@@ -212,10 +213,10 @@ pub use node::{Node, NodeCatalog};
 #[cfg(feature = "runtime")]
 pub use node_test::{
     fixture_spec, fixture_spec_like, with_cleanup, EndpointCall, FakeRig, LiveRig, NodeTest,
-    NodeTestInfo, RunOutcome, SentRequest, TestTier,
+    NodeTestInfo, RigOutcome, SentRequest, TestTier,
 };
 #[cfg(feature = "runtime")]
-pub use primitive::ExecutionSnapshot;
+pub use primitive::RunSnapshot;
 pub use primitive::{
     AwaitedEntry, AwaitedEntryKind, KickedNode, SignalAuth, SignalRouting, SignalSpec,
     SignalSurface, SuspensionInfo,
@@ -229,29 +230,29 @@ pub use running_policy::{
     default_drain_timeout_secs, trigger_choice_required, DeactivateSpec, DeactivationMode, RunningChoice,
     RunningPolicy, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_GRACE_MINUTES, TRIGGER_CHOICE_REQUIRED_HEADER,
 };
-pub use exec::CancelCause;
+pub use run::CancelCause;
 pub use tag::StopSelf;
 #[cfg(feature = "runtime")]
 pub use storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta, StoredFile};
 pub use weft_type::{WeftPrimitive, WeftType};
 
-/// The identity of ONE execution. An execution IS an execution: every
-/// execution is minted exactly one execution at `ExecutionStarted`, every
+/// The identity of ONE run. A run IS a run: every
+/// run is minted exactly one run at `RunStarted`, every
 /// journal event / pulse / node firing carries it, and when the
-/// execution terminates the execution is spent forever (a re-run is a new
-/// execution with a NEW execution). So "per execution" always means "per
-/// execution", never "per project" or "per anything reused across
-/// runs". At most one worker drives a given execution at a time (the
-/// one-worker-per-execution invariant keeps that execution's journal a single
-/// coherent stream); there is nothing to retry "across executions".
-pub type ExecutionId = uuid::Uuid;
+/// run terminates the run is spent forever (a re-run is a new
+/// run with a NEW run). So "per run" always means "per
+/// run", never "per project" or "per anything reused across
+/// runs". At most one worker drives a given run at a time (the
+/// one-worker-per-run invariant keeps that run's journal a single
+/// coherent stream); there is nothing to retry "across runs".
+pub type RunId = uuid::Uuid;
 
 /// A new run's id. Time-ordered (UUIDv7), so a run born now lands at the
 /// right edge of every index keyed by it instead of on a random page; every
 /// birth of a new run mints it here. A fire's run is the exception: its id
 /// comes from the fire's (`door_fire::run_of_fire`), so an event sent twice
 /// is born once.
-pub fn new_execution_id() -> ExecutionId {
+pub fn new_run_id() -> RunId {
     uuid::Uuid::now_v7()
 }
 

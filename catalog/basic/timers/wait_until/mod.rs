@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use weft::signal::{Timer, TimerSpec};
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::timers::output_after;
 
@@ -43,7 +43,7 @@ impl Node for WaitUntilNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let when: String = ctx.inputs.get("when")?;
         let value: Option<Value> = ctx.inputs.raw("value").cloned();
         // "Already past" is the signal's rule, checked where the run

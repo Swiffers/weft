@@ -5,7 +5,7 @@ and tools.
 
 Running an agent puts one model in charge of the whole job, and you wait while
 it works. Weft goes the other way. You break the job into a graph of small
-steps, called nodes. A node can run a model, open a webhook, ask a person, call
+pieces, called nodes. A node can run a model, open a webhook, ask a person, call
 an API or keep a database. Each one sees only what you wired to it, and the
 graph does the coordinating. The compiler checks every connection before the
 run, and every value that passes between nodes is written down where you can
@@ -26,9 +26,9 @@ weft new hello --assistant claude-code --remember
 That puts Tangle in the project, and `--remember` makes Claude Code the default
 so your next `weft new` needs no flag. Tangle is our weft specialist: it knows the
 language, reads the catalog on your disk before it wires anything, writes any
-step you are missing, and will build you a web frontend if you ask for one.
+node you are missing, and will build you a web frontend if you ask for one.
 It also tests what it builds. It runs one piece at a time on a real input, looks
-at what came out, and goes back to fix the step that got it wrong. You can hand
+at what came out, and goes back to fix the node that got it wrong. You can hand
 it a job and find the program working when you come back.
 
 Open the project in your assistant and ask it to show you around, or just say

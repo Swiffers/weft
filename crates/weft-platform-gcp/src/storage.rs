@@ -178,6 +178,34 @@ impl ObjectStore for GcsObjectStore {
         Ok(())
     }
 
+    async fn copy(&self, from: &str, to: &str) -> Result<()> {
+        // `rewrite`, not `copyTo`: it copies objects of any size, one
+        // call per chunk the service chooses, carrying its token on.
+        #[derive(serde::Deserialize)]
+        struct Rewrite {
+            done: bool,
+            #[serde(default, rename = "rewriteToken")]
+            token: Option<String>,
+        }
+        let url = format!(
+            "https://{HOST}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
+            self.bucket,
+            encode(from),
+            self.bucket,
+            encode(to)
+        );
+        let mut token: Option<String> = None;
+        loop {
+            let query: Vec<(&str, String)> = token.iter().map(|t| ("rewriteToken", t.clone())).collect();
+            let resp = self.request(Method::POST, &url, &query).await?;
+            let rewrite: Rewrite = Self::ok(&format!("copy {from} -> {to}"), resp).await?.json().await?;
+            if rewrite.done {
+                return Ok(());
+            }
+            token = Some(rewrite.token.ok_or_else(|| anyhow::anyhow!("copy {from} -> {to}: an unfinished rewrite carried no token"))?);
+        }
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectEntry>> {
         #[derive(serde::Deserialize)]
         struct Page {

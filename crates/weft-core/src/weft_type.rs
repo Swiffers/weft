@@ -1191,7 +1191,7 @@ impl WeftType {
     /// `Some(BusMode)` on success, `None` if the value is not a Bus
     /// marker OR the mode field is missing OR the field carries an
     /// unrecognised string. Callers MUST treat `None` as "this is not
-    /// a routable bus marker for THIS execution"; do NOT default to
+    /// a routable bus marker for THIS run"; do NOT default to
     /// `Journaled`, since silently misclassifying ephemeral as
     /// journaled would route a frame-rate stream into permanent
     /// journal storage.
@@ -1917,7 +1917,7 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
             // the string on purpose: a stored project or journal row
             // must deserialize with no registry (and must keep
             // deserializing after the declaration is edited, so a
-            // resumed execution gets the exact shape it started on);
+            // resumed run gets the exact shape it started on);
             // agreement between same-named restatements is an
             // AUTHORING rule, enforced by the compiler's
             // `named-type-conflict` validation.

@@ -39,7 +39,7 @@ impl SocketMessage {
     pub fn into_text(self) -> WeftResult<String> {
         match self {
             SocketMessage::Text(text) => Ok(text),
-            SocketMessage::Binary(bytes) => Err(crate::error::WeftError::NodeExecution(format!(
+            SocketMessage::Binary(bytes) => Err(crate::error::WeftError::NodeFailed(format!(
                 "the session sent a {}-byte binary frame; this endpoint speaks text frames",
                 bytes.len()
             ))),

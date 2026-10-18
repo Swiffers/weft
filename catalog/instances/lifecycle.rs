@@ -8,12 +8,12 @@
 use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::program::InfraDownAnswer;
-use weft::{node_bail, DeactivateSpec, DeactivationMode, ExecutionContext, RunningPolicy, StopSelf, WeftResult};
+use weft::{node_bail, DeactivateSpec, DeactivationMode, RunContext, RunningPolicy, StopSelf, WeftResult};
 
 /// The instance id a node was handed, checked the way every instance id
 /// is (`InstanceId::new`: never blank, a plain id), so a bad one fails
 /// here naming the input.
-pub fn instance(ctx: &ExecutionContext) -> WeftResult<InstanceId> {
+pub fn instance(ctx: &RunContext) -> WeftResult<InstanceId> {
     let instance: String = ctx.inputs.get("instance")?;
     match InstanceId::new(instance) {
         Ok(id) => Ok(id),
@@ -26,7 +26,7 @@ pub fn instance(ctx: &ExecutionContext) -> WeftResult<InstanceId> {
 /// copies. A given id is checked like [`instance`], so an empty one (a
 /// value that never arrived) fails rather than reaching the program's
 /// own copies by accident.
-pub fn instance_if_given(ctx: &ExecutionContext) -> WeftResult<Option<InstanceId>> {
+pub fn instance_if_given(ctx: &RunContext) -> WeftResult<Option<InstanceId>> {
     match ctx.inputs.opt::<String>("instance")? {
         None => Ok(None),
         Some(given) => match InstanceId::new(given) {
@@ -39,7 +39,7 @@ pub fn instance_if_given(ctx: &ExecutionContext) -> WeftResult<Option<InstanceId
 /// What a take-down does to the triggers it reaches (`triggers`: park,
 /// hibernate or wipe) and to the runs they fired (`running`: wait or
 /// cancel). Waiting before a wipe is refused, as everywhere else.
-pub fn take_down_spec(ctx: &ExecutionContext) -> WeftResult<DeactivateSpec> {
+pub fn take_down_spec(ctx: &RunContext) -> WeftResult<DeactivateSpec> {
     // Read typed: a word outside the enum fails naming the input, the
     // word, and the words it takes.
     let mode: DeactivationMode = ctx.inputs.get("triggers")?;
@@ -62,7 +62,7 @@ pub fn take_down_spec(ctx: &ExecutionContext) -> WeftResult<DeactivateSpec> {
 
 /// Whether the run doing the take-down goes too, when it is among what
 /// the take-down reaches.
-pub fn stop_self(ctx: &ExecutionContext) -> WeftResult<StopSelf> {
+pub fn stop_self(ctx: &RunContext) -> WeftResult<StopSelf> {
     Ok(if ctx.inputs.get::<bool>("includeSelf")? { StopSelf::Include } else { StopSelf::Keep })
 }
 

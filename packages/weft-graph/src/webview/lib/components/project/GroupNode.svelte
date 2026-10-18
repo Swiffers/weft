@@ -2,7 +2,7 @@
 	import { Handle, Position, NodeResizer, useEdges, type ResizeParams } from "@xyflow/svelte";
 	import { Group, RotateCw, Maximize2, Minimize2, ChevronDown, ChevronRight } from '@lucide/svelte';
 	import { isLoopNodeType, containerHasConfigStrip, ownValue } from "../../types";
-	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
+	import type { NodeDataUpdates, PortDefinition, NodeFiring, FieldDefinition } from "../../types";
 	import { isFilledIn } from '../../utils/port-specs';
 	import { getPortTypeColor } from "../../constants/colors";
 	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx, expandedContainerMinPx } from "../../constants/container-layout";
@@ -10,7 +10,7 @@
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
 	import { filledMarkerStyle, portMarkerStyle } from '../../utils/port-marker';
-	import ExecutionInspector from './ExecutionInspector.svelte';
+	import FiringInspector from './FiringInspector.svelte';
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
@@ -56,7 +56,7 @@
 			/// read-only view, which hides the gesture instead of
 			/// offering a dead one.
 			onToggleGate?: () => void;
-			executions?: NodeExecution[];
+			firings?: NodeFiring[];
 			/// Aggregated IRC logs over every node inside this group:
 			/// one entry per bus any member node touched. Empty `[]`
 			/// when no member node has used a bus.
@@ -65,19 +65,19 @@
 				events: import('../../../../protocol').BusInspectorEvent[];
 				meta?: import('../../../../protocol').BusMeta;
 			}>;
-			/// Execution-wide journal corruptions. Empty in the normal
+			/// Run-wide journal corruptions. Empty in the normal
 			/// case. The inspector renders a muted collapsed disclosure
 			/// at the bottom when non-empty.
 			journalCorruptions?: Array<{
 				site: import('../../../../protocol').CorruptionSite;
 				reason: string;
 			}>;
-			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// The run's own tags (`ctx.tag_run`), the same on
 			/// every node; the inspector footer shows them.
-			executionTags?: string[];
+			runTags?: string[];
 			/// How the run ended, the same on every node; the inspector
 			/// footer names a cancel's cause from it.
-			runTerminal?: import('../../types').ExecutionTerminal;
+			runTerminal?: import('../../types').RunTerminal;
 			/// Loop-specific inspector events for this loop group.
 			/// Empty for ordinary groups.
 			loopEvents?: import('../../../../protocol').LoopInspectorEvent[];
@@ -133,14 +133,14 @@
 	const groupDescription = $derived((data.config?.description as string) ?? '');
 	let descExpanded = $state(false);
 
-	const executions = $derived(data.executions ?? []);
+	const firings = $derived(data.firings ?? []);
 	/// The latest launch of this container was taken from the seed run.
-	const inherited = $derived(Boolean(executions[executions.length - 1]?.inheritedFrom));
+	const inherited = $derived(Boolean(firings[firings.length - 1]?.inheritedFrom));
 	// Aggregated bus logs over every node inside the group; the
 	// group's inspector shows the combined IRC view per bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
-	const executionTags = $derived(data.executionTags ?? []);
+	const runTags = $derived(data.runTags ?? []);
 	const runTerminal = $derived(data.runTerminal);
 	const loopEvents = $derived(data.loopEvents ?? []);
 
@@ -234,7 +234,7 @@
 	// change only: send just the `height` key, NOT the whole spread config. The
 	// host update handler turns width/height/expanded into a layout-file write and
 	// every OTHER config key into a source edit op; spreading the full config here
-	// would emit a no-op `setConfig` for every existing value (needless source
+	// would emit a no-op `set_config` for every existing value (needless source
 	// churn) and split this into a source+layout action. A bare `{height}` is a
 	// clean layout-only update that persists through the layout path.
 	let lastEnforcedMinH = 0;
@@ -640,7 +640,7 @@
 			<span class="header-label" ondblclick={startEditLabel} title="Double-click to rename">{data.label || 'Group'}</span>
 		{/if}
 		<div class="flex items-center gap-0.5" style="margin-left: auto;">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
+			<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 			<button class="expand-toggle" onclick={toggleExpand} title="Collapse group">
 				<Minimize2 size={12} />
 			</button>
@@ -916,7 +916,7 @@
 <div class="simplified-node rounded-lg select-none" class:selected class:node-inherited-glow={inherited}
 	style="width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: {SIMPLIFIED_SQUARE_PAD_PX}px; background: rgba(255,255,255,0.95); border: 1px solid {selected ? containerColor : 'rgba(0,0,0,0.08)'}; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);">
 	<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan">
-		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
+		<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 		<button class="expand-toggle" onclick={toggleExpand} title="Expand group"><Maximize2 size={12} /></button>
 	</div>
 	<!-- Fixed-width content column so a collapsed container measures as a uniform
@@ -954,7 +954,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
+			<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 			<button class="expand-toggle" onclick={toggleExpand} title="Expand group">
 				<Maximize2 size={12} />
 			</button>

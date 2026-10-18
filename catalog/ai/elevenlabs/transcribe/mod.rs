@@ -39,7 +39,7 @@ use weft::access::socket::SocketMessage;
 use weft::bus::{BusHandle, BusOptions};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::{node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{detected_entity, store_json, text_input, WS_API};
 
@@ -82,7 +82,7 @@ struct Session {
 }
 
 impl Session {
-    fn read(ctx: &ExecutionContext) -> WeftResult<Self> {
+    fn read(ctx: &RunContext) -> WeftResult<Self> {
         Ok(Self {
             model: ctx.inputs.get("model")?,
             commit_strategy: ctx.inputs.get("commitStrategy")?,
@@ -423,7 +423,7 @@ impl Transcript {
 /// or fail on a refusal. True when the session said nothing was left to
 /// transcribe.
 async fn relay(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     bus: &BusHandle,
     transcript: &mut Transcript,
     word: ServerWord,
@@ -483,7 +483,7 @@ impl Node for ElevenLabsTranscribeNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let session = Session::read(&ctx)?;
         if let Some(refusal) = session.refusal() {

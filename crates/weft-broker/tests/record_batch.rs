@@ -17,7 +17,7 @@ use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
 use weft_dispatcher::journal::{Journal, Lost};
 use weft_journal::frame::{Batch, BatchHead, RunHead};
 use weft_journal::record::{record_batch, Born, Fate, Written};
-use weft_journal::ExecEvent;
+use weft_journal::RunEvent;
 
 const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
 const TENANT: &str = "t1";
@@ -37,16 +37,16 @@ async fn schema(pool: &PgPool) {
     .expect("project row");
 }
 
-fn birth(execution_id: weft_core::ExecutionId, keeping: Keeping) -> ExecEvent {
-    ExecEvent::ExecutionStarted {
-        execution_id,
+fn birth(run_id: weft_core::RunId, keeping: Keeping) -> RunEvent {
+    RunEvent::RunStarted {
+        run_id,
         project_id: PROJECT,
         entry_node: "route".into(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
         binary_hash: Some("bin-1".into()),
         source_version: Some("v1".into()),
-        run_kind: weft_core::exec::RunKind::Execution,
+        run_kind: weft_core::run::RunKind::Project,
         selection: None,
         seed: None,
         instance: None,
@@ -59,17 +59,17 @@ fn birth(execution_id: weft_core::ExecutionId, keeping: Keeping) -> ExecEvent {
     }
 }
 
-fn started(execution_id: weft_core::ExecutionId, node: &str) -> ExecEvent {
-    ExecEvent::NodeStarted { execution_id, node_id: node.into(), frames: Vec::new(), at_unix: 2 }
+fn started(run_id: weft_core::RunId, node: &str) -> RunEvent {
+    RunEvent::NodeStarted { run_id, node_id: node.into(), frames: Vec::new(), at_unix: 2 }
 }
 
-fn completed(execution_id: weft_core::ExecutionId) -> ExecEvent {
-    ExecEvent::ExecutionCompleted { execution_id, at_unix: 3 }
+fn completed(run_id: weft_core::RunId) -> RunEvent {
+    RunEvent::RunCompleted { run_id, at_unix: 3 }
 }
 
-fn cost(execution_id: weft_core::ExecutionId) -> ExecEvent {
-    ExecEvent::CostReported {
-        execution_id,
+fn cost(run_id: weft_core::RunId) -> RunEvent {
+    RunEvent::CostReported {
+        run_id,
         node_id: "llm".into(),
         frames: Vec::new(),
         cost_id: "c1".into(),
@@ -87,14 +87,14 @@ fn cost(execution_id: weft_core::ExecutionId) -> ExecEvent {
 /// One run's share of a batch: its rows from `first_seq` on, under
 /// `epoch`.
 struct Part {
-    execution_id: weft_core::ExecutionId,
+    run_id: weft_core::RunId,
     epoch: i32,
     first_seq: i32,
-    rows: Vec<Vec<ExecEvent>>,
+    rows: Vec<Vec<RunEvent>>,
 }
 
-fn part(execution_id: weft_core::ExecutionId, epoch: i32, first_seq: i32, rows: Vec<Vec<ExecEvent>>) -> Part {
-    Part { execution_id, epoch, first_seq, rows }
+fn part(run_id: weft_core::RunId, epoch: i32, first_seq: i32, rows: Vec<Vec<RunEvent>>) -> Part {
+    Part { run_id, epoch, first_seq, rows }
 }
 
 /// Write `parts` as one batch of `writer`'s lane `lane`, the way the broker
@@ -119,7 +119,7 @@ async fn answers_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, par
             .iter()
             .zip(&encoded)
             .map(|(part, rows)| RunHead {
-                execution_id: part.execution_id,
+                run_id: part.run_id,
                 epoch: part.epoch,
                 first_seq: part.first_seq,
                 row_sizes: rows.iter().map(|row| row.len() as u32).collect(),
@@ -141,7 +141,7 @@ async fn answers_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, par
 #[sqlx::test]
 async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: PgPool) {
     schema(&pool).await;
-    let (early, ended) = (weft_core::new_execution_id(), weft_core::new_execution_id());
+    let (early, ended) = (weft_core::new_run_id(), weft_core::new_run_id());
     let mut conn = pool.acquire().await.unwrap();
     let answers = answers_on(
         &mut conn,
@@ -161,27 +161,27 @@ async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: Pg
     .execute(&pool)
     .await
     .unwrap();
-    let watched = weft_core::new_execution_id();
+    let watched = weft_core::new_run_id();
     let answers = answers_on(&mut conn, "w2", "w2:0", &[part(watched, 1, 0, vec![vec![birth(watched, Keeping::Fast)]])]).await;
     assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Accepted, false)]);
 
     sqlx::query("DELETE FROM project").execute(&pool).await.unwrap();
-    let orphan = weft_core::new_execution_id();
+    let orphan = weft_core::new_run_id();
     let answers = answers_on(&mut conn, "w1", "w1:0", &[part(orphan, 1, 0, vec![vec![birth(orphan, Keeping::Fast)]])]).await;
     assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Refused, false)]);
 }
 
 /// A run's row as the tests read it: state, owner, epoch, last row, cost.
-async fn row(pool: &PgPool, execution_id: weft_core::ExecutionId) -> (String, Option<String>, i32, i32, i64) {
-    sqlx::query_as("SELECT state, owner, epoch, last_seq, cost_micro_usd FROM run WHERE execution_id = $1")
-        .bind(execution_id)
+async fn row(pool: &PgPool, run_id: weft_core::RunId) -> (String, Option<String>, i32, i32, i64) {
+    sqlx::query_as("SELECT state, owner, epoch, last_seq, cost_micro_usd FROM run WHERE run_id = $1")
+        .bind(run_id)
         .fetch_one(pool)
         .await
         .expect("the run's row")
 }
 
-async fn rows_of(pool: &PgPool, execution_id: weft_core::ExecutionId) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM run_log WHERE execution_id = $1").bind(execution_id).fetch_one(pool).await.unwrap()
+async fn rows_of(pool: &PgPool, run_id: weft_core::RunId) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM run_log WHERE run_id = $1").bind(run_id).fetch_one(pool).await.unwrap()
 }
 
 /// A run is born by its first batch, owned by its writer; the next batch
@@ -190,8 +190,8 @@ async fn rows_of(pool: &PgPool, execution_id: weft_core::ExecutionId) -> i64 {
 #[sqlx::test]
 async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: PgPool) {
     schema(&pool).await;
-    let run = weft_core::new_execution_id();
-    let quick = weft_core::new_execution_id();
+    let run = weft_core::new_run_id();
+    let quick = weft_core::new_run_id();
     let fates = send(
         &pool,
         "w1",
@@ -202,7 +202,7 @@ async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: PgPool) {
     assert_eq!(fates, [Fate::Accepted, Fate::Accepted]);
     assert_eq!(row(&pool, run).await, ("running".into(), Some("w1".into()), 1, 0, 0));
     assert_eq!(row(&pool, quick).await, ("ended".into(), None, 1, 0, 0));
-    let outcome: Option<String> = sqlx::query_scalar("SELECT outcome FROM run WHERE execution_id = $1").bind(quick).fetch_one(&pool).await.unwrap();
+    let outcome: Option<String> = sqlx::query_scalar("SELECT outcome FROM run WHERE run_id = $1").bind(quick).fetch_one(&pool).await.unwrap();
     assert_eq!(outcome.as_deref(), Some("completed"));
 
     let fates = send(&pool, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "a")], vec![cost(run)]])]).await;
@@ -218,7 +218,7 @@ async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: PgPool) {
 #[sqlx::test]
 async fn a_batch_sent_again_changes_nothing(pool: PgPool) {
     schema(&pool).await;
-    let run = weft_core::new_execution_id();
+    let run = weft_core::new_run_id();
     let first = [part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])];
     let paid = [part(run, 1, 1, vec![vec![cost(run)]])];
     let ending = [part(run, 1, 2, vec![vec![completed(run)]])];
@@ -239,7 +239,7 @@ async fn a_batch_sent_again_changes_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn a_run_two_workers_bore_is_the_first_ones(pool: PgPool) {
     schema(&pool).await;
-    let run = weft_core::new_execution_id();
+    let run = weft_core::new_run_id();
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])]).await, [Fate::Accepted]);
     let other = [part(run, 1, 0, vec![vec![birth(run, Keeping::Fast), started(run, "b")]])];
     assert_eq!(send(&pool, "w2", "w2:0", &other).await, [Fate::BornElsewhere]);
@@ -253,7 +253,7 @@ async fn a_run_two_workers_bore_is_the_first_ones(pool: PgPool) {
 #[sqlx::test]
 async fn a_batch_that_does_not_follow_on_is_refused(pool: PgPool) {
     schema(&pool).await;
-    let run = weft_core::new_execution_id();
+    let run = weft_core::new_run_id();
     send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])]).await;
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 2, vec![vec![started(run, "gap")]])]).await, [Fate::Refused], "a gap");
     assert_eq!(send(&pool, "w2", "w2:0", &[part(run, 1, 1, vec![vec![started(run, "x")]])]).await, [Fate::Refused], "not its writer");
@@ -267,7 +267,7 @@ async fn a_batch_that_does_not_follow_on_is_refused(pool: PgPool) {
 #[sqlx::test]
 async fn two_lanes_counting_one_version_never_block_each_other(pool: PgPool) {
     schema(&pool).await;
-    let (a, b) = (weft_core::new_execution_id(), weft_core::new_execution_id());
+    let (a, b) = (weft_core::new_run_id(), weft_core::new_run_id());
     let mut open = pool.begin().await.unwrap();
     assert_eq!(send_on(&mut open, "w1", "w1:0", &[part(a, 1, 0, vec![vec![birth(a, Keeping::Fast)]])]).await, [Fate::Accepted]);
     let other = tokio::time::timeout(
@@ -284,7 +284,7 @@ async fn two_lanes_counting_one_version_never_block_each_other(pool: PgPool) {
 
 /// Claim `run` for `owner` on a lapsed lease, the way a worker that then
 /// died had it.
-async fn driven_by_a_dead_worker(pool: &PgPool, run: weft_core::ExecutionId) {
+async fn driven_by_a_dead_worker(pool: &PgPool, run: weft_core::RunId) {
     sqlx::query(
         "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix) VALUES ('w1', $1, $2, 0) \
          ON CONFLICT (replica) DO NOTHING",
@@ -303,7 +303,7 @@ async fn driven_by_a_dead_worker(pool: &PgPool, run: weft_core::ExecutionId) {
 async fn a_late_batch_after_the_lost_sweep_is_refused(pool: PgPool) {
     schema(&pool).await;
     let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
-    let run = weft_core::new_execution_id();
+    let run = weft_core::new_run_id();
     driven_by_a_dead_worker(&pool, run).await;
     assert_eq!(journal.let_go_of_lost(run, i64::MAX, None).await.unwrap(), Lost::Requeued);
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "late")]])]).await, [Fate::Refused]);
@@ -317,7 +317,7 @@ async fn a_late_batch_after_the_lost_sweep_is_refused(pool: PgPool) {
 async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: PgPool) {
     schema(&pool).await;
     let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
-    let run = weft_core::new_execution_id();
+    let run = weft_core::new_run_id();
     driven_by_a_dead_worker(&pool, run).await;
     let mut open = pool.begin().await.unwrap();
     assert_eq!(send_on(&mut open, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "late")]])]).await, [Fate::Accepted]);
@@ -336,9 +336,9 @@ async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: 
 #[sqlx::test]
 async fn a_given_up_run_books_its_open_charge_unknown(pool: PgPool) {
     schema(&pool).await;
-    let run = weft_core::new_execution_id();
-    let opened = ExecEvent::ChargeOpened {
-        execution_id: run,
+    let run = weft_core::new_run_id();
+    let opened = RunEvent::ChargeOpened {
+        run_id: run,
         node_id: "dub".into(),
         frames: Vec::new(),
         service: "jobs".into(),
@@ -356,14 +356,14 @@ async fn a_given_up_run_books_its_open_charge_unknown(pool: PgPool) {
 
     let mut conn = pool.acquire().await.unwrap();
     let events = weft_journal::record::read_record(&mut conn, run, None).await.unwrap().events(run).unwrap();
-    let costs: Vec<&ExecEvent> = events.iter().filter(|event| matches!(event, ExecEvent::CostReported { .. })).collect();
+    let costs: Vec<&RunEvent> = events.iter().filter(|event| matches!(event, RunEvent::CostReported { .. })).collect();
     assert_eq!(costs.len(), 1, "{events:?}");
     assert!(
-        matches!(costs[0], ExecEvent::CostReported { node_id, service, charge: Some(charge), amount_usd: None, model: Some(model), .. }
+        matches!(costs[0], RunEvent::CostReported { node_id, service, charge: Some(charge), amount_usd: None, model: Some(model), .. }
             if node_id == "dub" && service == "jobs" && charge == "job-1" && model == "m"),
         "{:?}", costs[0]
     );
-    assert!(matches!(&events[events.len() - 2..], [ExecEvent::CostReported { .. }, ExecEvent::ExecutionFailed { .. }]), "{events:?}");
+    assert!(matches!(&events[events.len() - 2..], [RunEvent::CostReported { .. }, RunEvent::RunFailed { .. }]), "{events:?}");
     assert_eq!(weft_journal::ChargeBook::of_record(&events).into_open().count(), 0, "the record holds no open charge");
     assert_eq!(row(&pool, run).await.0, "ended");
 }

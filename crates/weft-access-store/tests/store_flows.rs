@@ -202,8 +202,8 @@ fn oauth_spec(base: &str, grants: &str) -> AccessSpec {
         "acquisition": {
             "kind": "oauth2",
             "grant": { "kind": "authorization_code",
-                       "auth_url": format!("{base}/authorize"), "pkce": true },
-            "token_url": format!("{base}/token")
+                       "authUrl": format!("{base}/authorize"), "pkce": true },
+            "tokenUrl": format!("{base}/token")
         },
         "permissions": [
             { "id": "read", "label": "Read", "description": "Read things.", "default": true },
@@ -253,7 +253,7 @@ async fn full_consent(
     Ok(done.grant)
 }
 
-/// A paste connect on a CONSENT service (the `own_page.paste`
+/// A paste connect on a CONSENT service (the `ownPage.paste`
 /// section): the stored snapshot is the static variant, so the row
 /// resolves like a natively pasted credential and never refreshes
 /// through an app.
@@ -861,7 +861,7 @@ async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
     let lookup_spec: weft_core::node::Lookup = serde_json::from_value(json!({
         "get": format!("{base}/channels?q={{query}}&team={{team}}"),
         "items": "channels", "label": "name", "value": "id",
-        "page": { "cursor_param": "cursor", "cursor_path": "meta.next" }
+        "page": { "cursorParam": "cursor", "cursorPath": "meta.next" }
     }))
     .unwrap();
     let parents: BTreeMap<String, String> =
@@ -1096,32 +1096,32 @@ fn events_spec(base: &str) -> AccessSpec {
                 "account": { "value": "user", "path": "account" },
                 "webhook": {
                     "verify": { "kind": "token_echo" },
-                    "route_by": "subscription",
-                    "id_path": "header:X-Chan-Id",
-                    "token_path": "header:X-Chan-Token",
+                    "routeBy": "subscription",
+                    "idPath": "header:X-Chan-Id",
+                    "tokenPath": "header:X-Chan-Token",
                     "subscribe": {
                         "subscribe": {
                             "url": format!("{base}/watch/{{target}}"),
                             "method": "POST",
-                            "body": { "id": "{subscription_id}",
-                                      "address": "{receiver_url}",
-                                      "token": "{subscription_token}" },
+                            "body": { "id": "{subscriptionId}",
+                                      "address": "{receiverUrl}",
+                                      "token": "{subscriptionToken}" },
                             "auth": [{ "kind": "header", "name": "Authorization",
                                        "value": "Bearer {token}" }],
                             "captures": [
-                                { "name": "expires_at", "path": "expiration" },
-                                { "name": "resource_id", "path": "resourceId" }
+                                { "name": "expiresAt", "path": "expiration" },
+                                { "name": "resourceId", "path": "resourceId" }
                             ]
                         },
                         "unsubscribe": {
                             "url": format!("{base}/stop"),
                             "method": "POST",
-                            "body": { "id": "{subscription_id}",
-                                      "resourceId": "{resource_id}" },
+                            "body": { "id": "{subscriptionId}",
+                                      "resourceId": "{resourceId}" },
                             "auth": [{ "kind": "header", "name": "Authorization",
                                        "value": "Bearer {token}" }]
                         },
-                        "renew_margin_secs": 60
+                        "renewMarginSecs": 60
                     }
                 }
             }
@@ -1306,7 +1306,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
         "a replay at another topic's endpoint finds nothing"
     );
     assert_eq!(sub.tenant_id, TENANT_A);
-    assert_eq!(sub.captures.get("resource_id").map(String::as_str), Some("res-file-9"));
+    assert_eq!(sub.captures.get("resourceId").map(String::as_str), Some("res-file-9"));
     assert!(watch_calls[0].contains(&sub.token), "the minted token traveled to the provider");
 
     // A healthy subscription is idempotent: no second provider call.
@@ -1424,7 +1424,7 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
     let base = fake.serve().await;
 
     // The events fixture, with a socket recipe whose mint call names
-    // {app_token}: exactly the value an operator might (wrongly or
+    // {appToken}: exactly the value an operator might (wrongly or
     // for their own use) write beside the shared app.
     let mut spec = events_spec(&base);
     let socket_topic: weft_core::access::events::EventsSpec = serde_json::from_value(json!({
@@ -1435,7 +1435,7 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
                 "url": format!("{base}/token"),
                 "method": "POST",
                 "auth": [{ "kind": "header", "name": "Authorization",
-                           "value": "Bearer {app_token}" }],
+                           "value": "Bearer {appToken}" }],
                 "captures": [{ "name": "url", "path": "url" }]
             }
         }
@@ -1447,7 +1447,7 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
     let mut registration = oauth_app();
     registration
         .extra
-        .insert("app_token".to_string(), "xapp-the-operators".to_string());
+        .insert("appToken".to_string(), "xapp-the-operators".to_string());
 
     // Two grants to the same app snapshot: one through each door.
     for (id, door) in [(uuid::Uuid::new_v4(), "shared"), (uuid::Uuid::new_v4(), "own")] {
@@ -1472,11 +1472,11 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
                 .unwrap();
         match door {
             "shared" => assert!(
-                !source.recipe_values.contains_key("app_token"),
+                !source.recipe_values.contains_key("appToken"),
                 "the operator's app token must never serve a shared-door connection"
             ),
             _ => assert_eq!(
-                source.recipe_values.get("app_token").map(String::as_str),
+                source.recipe_values.get("appToken").map(String::as_str),
                 Some("xapp-the-operators"),
                 "an own-door grant's app values are the user's own and do serve"
             ),
@@ -1887,7 +1887,7 @@ async fn only_a_publish_that_changes_the_connection_announces_it(pool: PgPool) {
     assert!(heard_it(&mut heard).await, "a new password is news");
 
     // A pick is the project's own: announced for the project alone.
-    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, step, field, grant_id) VALUES ($1, $2, 'db', 'access', $3::uuid)")
+    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'db', 'access', $3::uuid)")
         .bind(TENANT_A)
         .bind(PROJECT_1)
         .bind(&published.connection_id)
@@ -1922,7 +1922,7 @@ async fn a_published_recipe_describes_something_the_project_runs(pool: PgPool) {
                 "account": { "value": "host", "path": "body.host" },
                 "webhook": {
                     "verify": { "kind": "hmac",
-                                "signature_header": "X-Sig",
+                                "signatureHeader": "X-Sig",
                                 "concat": "{body}" }
                 }
             }},
@@ -1956,7 +1956,7 @@ async fn a_published_recipe_describes_something_the_project_runs(pool: PgPool) {
             "acquisition": {
                 "kind": "oauth2",
                 "grant": { "kind": "client_credentials" },
-                "token_url": "http://attacker.invalid/token",
+                "tokenUrl": "http://attacker.invalid/token",
             },
         })),
     )
@@ -2094,14 +2094,14 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     assert!(list_grants(&pool, TENANT_A, None, GrantOwnerScope::Author).await.unwrap().is_empty(),
         "the author's list holds no instance's connection");
 
-    let pick = |step: &str, grant: uuid::Uuid, service: &str| InstanceValueWrite {
-        step: step.into(),
+    let pick = |node: &str, grant: uuid::Uuid, service: &str| InstanceValueWrite {
+        node: node.into(),
         field: "account".into(),
         value: serde_json::json!({ "id": grant }),
         connection: Some(ConnectionValue { grant_id: grant, service: service.into() }),
     };
-    let plain = |step: &str, value: serde_json::Value| InstanceValueWrite {
-        step: step.into(),
+    let plain = |node: &str, value: serde_json::Value| InstanceValueWrite {
+        node: node.into(),
         field: "sheet".into(),
         value,
         connection: None,
@@ -2262,8 +2262,8 @@ async fn the_install_keeps_the_authors_picks(pool: PgPool) {
         .await
         .expect("ada connects")
         .grant;
-    let pick = |step: &str, grant: uuid::Uuid, service: &str| PickWrite {
-        step: step.into(),
+    let pick = |node: &str, grant: uuid::Uuid, service: &str| PickWrite {
+        node: node.into(),
         field: "account".into(),
         grant_id: grant,
         service: service.into(),
@@ -2322,7 +2322,7 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
         &mut conn,
         TENANT_A,
         PROJECT_1,
-        &[PickWrite { step: "chat.agent".into(), field: "account".into(), grant_id: mine.id, service: "fakestatic".into() }],
+        &[PickWrite { node: "chat.agent".into(), field: "account".into(), grant_id: mine.id, service: "fakestatic".into() }],
         &[],
     )
     .await
@@ -2333,7 +2333,7 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
         PROJECT_1,
         &ada,
         &[InstanceValueWrite {
-            step: "chat.agent".into(),
+            node: "chat.agent".into(),
             field: "other".into(),
             value: serde_json::json!({ "id": adas.id }),
             connection: Some(ConnectionValue { grant_id: adas.id, service: "fakestatic".into() }),
@@ -2347,7 +2347,7 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
     assert_eq!((picks, values), (1, 1));
     let mut stored = stored_fields(&pool, TENANT_A, PROJECT_1).await.unwrap();
     stored.sort_by(|a, b| a.field.cmp(&b.field));
-    assert!(stored.iter().all(|s| s.step == "studio.chat.agent"), "{stored:?}");
+    assert!(stored.iter().all(|s| s.node == "studio.chat.agent"), "{stored:?}");
     assert_eq!(stored[0].instance, None);
     assert_eq!(stored[0].service.as_deref(), Some("fakestatic"));
     assert_eq!(stored[1].instance, Some(ada));

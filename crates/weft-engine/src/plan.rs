@@ -33,8 +33,8 @@ use weft_core::project::{DeclaredInfra, ProgramIndex, NodeDefinition};
 use weft_core::pulse::PulseTable;
 use weft_core::run_spec::KickPlan;
 use weft_core::weft_type::WeftType;
-use weft_core::{ExecutionId, ProjectDefinition};
-use weft_journal::ExecEvent;
+use weft_core::{RunId, ProjectDefinition};
+use weft_journal::RunEvent;
 
 use crate::door::{DoorBroker, HeldTrigger};
 
@@ -89,17 +89,17 @@ impl ProgramTables {
     }
 
     /// The nodes ready to fire on `pulses`, in the program's order: what
-    /// `weft_core::exec::find_ready_nodes` answers, asking only the nodes
+    /// `weft_core::run::find_ready_nodes` answers, asking only the nodes
     /// some pending pulse waits at (a node with none is never ready)
     /// instead of every node of the program.
-    pub(crate) fn ready(&self, pulses: &PulseTable) -> Vec<(String, weft_core::exec::ReadyGroup)> {
+    pub(crate) fn ready(&self, pulses: &PulseTable) -> Vec<(String, weft_core::run::ReadyGroup)> {
         let mut waited_at: Vec<usize> = pulses
             .iter()
             .filter(|(_, bucket)| bucket.iter().any(|pulse| pulse.status.is_pending()))
             .filter_map(|(id, _)| self.index.position(id))
             .collect();
         waited_at.sort_unstable();
-        weft_core::exec::ready::find_ready_among(
+        weft_core::run::ready::find_ready_among(
             &self.project,
             waited_at.into_iter().map(|at| &self.project.nodes[at]),
             pulses,
@@ -213,15 +213,15 @@ impl Startable {
             .collect()
     }
 
-    /// The birth of run `execution_id` of `plan`, whose call brought
-    /// `payload`: its `ExecutionStarted`, its kicks and the values it reads
+    /// The birth of run `run_id` of `plan`, whose call brought
+    /// `payload`: its `RunStarted`, its kicks and the values it reads
     /// baked, in the order its record keeps them.
-    pub(crate) fn birth(&self, plan: &RunPlan, execution_id: ExecutionId, payload: &Value, at_unix: u64) -> Vec<ExecEvent> {
+    pub(crate) fn birth(&self, plan: &RunPlan, run_id: RunId, payload: &Value, at_unix: u64) -> Vec<RunEvent> {
         let program = &self.program;
         let ready = &self.ready;
         let kicks = self.kicks_with(payload);
         let (start, kicks) = weft_journal::birth::birth_events(weft_journal::birth::Birth {
-            execution_id,
+            run_id,
             project_id: program.project.id,
             phase: weft_core::context::Phase::Fire,
             entry_node: &plan.trigger.node_id,
@@ -238,15 +238,15 @@ impl Startable {
             settings: plan.entry.spec.settings,
             at_unix,
         });
-        let baked = weft_journal::birth::baked_rows(&program.project, execution_id, &self.baked, at_unix);
+        let baked = weft_journal::birth::baked_rows(&program.project, run_id, &self.baked, at_unix);
         std::iter::once(start).chain(kicks).chain(baked).collect()
     }
 
-    /// The first state of run `execution_id`, whose call brought `payload`:
+    /// The first state of run `run_id`, whose call brought `payload`:
     /// its roots kicked, and the values it reads baked already on their
     /// wires. Built from the plan, never from a fold of its birth. A baked
     /// value that does not fit its wires is the program's shape broken.
-    pub(crate) fn opening(&self, execution_id: ExecutionId, payload: &Value) -> Result<Opening, String> {
+    pub(crate) fn opening(&self, run_id: RunId, payload: &Value) -> Result<Opening, String> {
         let kicked = self
             .kicks_with(payload)
             .into_iter()
@@ -266,8 +266,8 @@ impl Startable {
         let mut pulses = PulseTable::new();
         if !self.baked.is_empty() {
             let program = &self.program;
-            let rows = weft_journal::birth::baked_rows(&program.project, execution_id, &self.baked, 0);
-            weft_journal::fold::provided_pulses(&program.project, &program.index, execution_id, &rows, &mut pulses)?;
+            let rows = weft_journal::birth::baked_rows(&program.project, run_id, &self.baked, 0);
+            weft_journal::fold::provided_pulses(&program.project, &program.index, run_id, &rows, &mut pulses)?;
         }
         Ok(Opening { kicked, pulses })
     }
@@ -510,11 +510,11 @@ pub(crate) mod tests {
         let project = chain();
         let plan = plan_of(&project, "trig", &Default::default());
         let startable = plan.start.as_ref().map_err(|_| "unready").expect("a plan that starts");
-        let execution_id = ExecutionId::from_u128(4);
+        let run_id = RunId::from_u128(4);
         let payload = json!({ "tick": 1 });
-        let opening = startable.opening(execution_id, &payload).unwrap();
-        let birth = startable.birth(&plan, execution_id, &payload, 7);
-        let folded = weft_journal::fold_to_snapshot(execution_id, project.clone(), &birth);
+        let opening = startable.opening(run_id, &payload).unwrap();
+        let birth = startable.birth(&plan, run_id, &payload, 7);
+        let folded = weft_journal::fold_to_snapshot(run_id, project.clone(), &birth);
         assert!(folded.corruptions.is_empty(), "{:?}", folded.corruptions);
         let kicks = |kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>| {
             let mut kicks: Vec<(String, String)> =
@@ -560,7 +560,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let program = ProgramTables::new(project.clone(), None);
-        let execution_id = ExecutionId::from_u128(5);
+        let run_id = RunId::from_u128(5);
         let targets = [("join", "a"), ("join", "b"), ("tail", "a")];
         // A small linear congruential generator: the same tables every run.
         let mut seed: u64 = 0x5eed;
@@ -574,9 +574,9 @@ pub(crate) mod tests {
                 let (node, port) = targets[next(targets.len() as u64) as usize];
                 let id = uuid::Uuid::from_u128(u128::from(next(u64::MAX)));
                 let mut pulse = if next(4) == 0 {
-                    weft_core::pulse::Pulse::closure(id, execution_id, Vec::new(), node, port)
+                    weft_core::pulse::Pulse::closure(id, run_id, Vec::new(), node, port)
                 } else {
-                    weft_core::pulse::Pulse::new(id, execution_id, Vec::new(), node, port, Arc::new(json!("x")))
+                    weft_core::pulse::Pulse::new(id, run_id, Vec::new(), node, port, Arc::new(json!("x")))
                 };
                 if next(3) == 0 {
                     pulse.absorb();
@@ -584,7 +584,7 @@ pub(crate) mod tests {
                 pulses.entry(node.to_string()).or_default().push(pulse);
             }
             let asked: Vec<(String, Vec<uuid::Uuid>)> = program.ready(&pulses).into_iter().map(|(id, group)| (id, group.pulse_ids)).collect();
-            let scanned: Vec<(String, Vec<uuid::Uuid>)> = weft_core::exec::find_ready_nodes(&project, &pulses, &program.index, None)
+            let scanned: Vec<(String, Vec<uuid::Uuid>)> = weft_core::run::find_ready_nodes(&project, &pulses, &program.index, None)
                 .into_iter()
                 .map(|(id, group)| (id, group.pulse_ids))
                 .collect();

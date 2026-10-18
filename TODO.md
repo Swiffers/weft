@@ -130,7 +130,7 @@ which promised this primitive before it existed.
 how many run at once: a 10k-element list launches 10k concurrent
 iterations, and a stream-driven parallel loop launches a lane per
 arriving item the same way (the producer's buffer cap gives no
-backpressure, because items launch instead of buffering). `max_iters`
+backpressure, because items launch instead of buffering). `maxIters`
 caps the TOTAL, which is a different question from "how many in
 flight".
 

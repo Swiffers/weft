@@ -60,12 +60,12 @@ async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// `ttl_days` reads as on every storage node: an execution file given
+/// `ttlDays` reads as on every storage node: a run file given
 /// one outlives its run for that long.
 async fn ttl_keeps_a_run_file(rig: FakeRig) -> WeftResult<()> {
     rig.respond_raw("GET", "/files/logo.png", 200, "image/png", b"PNG!".to_vec());
     let outcome = rig
-        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/logo.png", "ttl_days": 2 }))
+        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/logo.png", "ttlDays": 2 }))
         .await
         .ok()?;
     let key = weft::storage::StoredFile::from_value(&outcome.outputs["file"])?.key;

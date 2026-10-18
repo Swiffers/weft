@@ -12,7 +12,7 @@ use weft::infra::{
     Container, ContainerPort, Endpoint, EndpointTarget, Expose, Image, InfraSpec, Limits, Probe, Protocol, Unit,
 };
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::{RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MiniServiceNode;
@@ -63,7 +63,7 @@ impl Node for MiniServiceNode {
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // Resolve the endpoint, read its /outputs, and emit them plus the bare
         // URL. The `/outputs` key set (status) matches the declared output port.
         let api = ctx.endpoint("api").await?;

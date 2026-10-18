@@ -37,7 +37,7 @@ fn patterned(len: usize) -> Vec<u8> {
 }
 
 /// Run the single-fetch `storage_file` fixture against a fake serving `content`,
-/// and assert the kept file downloads back byte-exact. Returns the run's execution
+/// and assert the kept file downloads back byte-exact. Returns the run
 /// so a caller can probe platform state for it.
 async fn fetch_and_verify(
     disp: &weft_e2e::Dispatcher,
@@ -51,7 +51,7 @@ async fn fetch_and_verify(
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
 
-    let prefix = format!("exec/{}/", settled.execution_id);
+    let prefix = format!("run/{}/", settled.run_id);
     let key = storage::assert_file_contents(disp, &prefix, &content).await?;
     eprintln!("[{label}] {} bytes round-tripped at {key}", content.len());
     project.finish().await
@@ -106,29 +106,29 @@ async fn an_interrupted_upload_leaves_no_leftover() -> anyhow::Result<()> {
     settled.failed_with("storage")?;
 
     // The tenant this run stored under (OSS `local`, but read it rather than
-    // hardcode). If the execution has NO runtime rows at all, the abort already
+    // hardcode). If the run has NO runtime rows at all, the abort already
     // deleted everything, which is exactly the success condition.
-    let execution_id = settled.execution_id;
-    let pending = platform.runtime_pending_uploads_for_execution_id(&execution_id).await?;
+    let run_id = settled.run_id;
+    let pending = platform.runtime_pending_uploads_for_run_id(&run_id).await?;
     anyhow::ensure!(
         pending == 0,
-        "interrupted upload left {pending} pending row(s) for execution {execution_id}; \
+        "interrupted upload left {pending} pending row(s) for run {run_id}; \
          the abort should have deleted the reservation"
     );
 
-    if let Some(tenant) = platform.runtime_tenant_for_execution_id(&execution_id).await? {
+    if let Some(tenant) = platform.runtime_tenant_for_run_id(&run_id).await? {
         // Any surviving charge would be a leaked reservation. (Other completed
         // files from earlier scenarios could contribute, so this asserts only
-        // that THIS execution contributes nothing: its rows are gone, checked
+        // that THIS run contributes nothing: its rows are gone, checked
         // above, so the only honest cross-check is that no pending bytes remain
-        // under the execution. The pending==0 check already proves the reservation
+        // under the run. The pending==0 check already proves the reservation
         // was freed; this reads the tenant total for the diagnostic.)
         let charged = platform.runtime_charged_bytes(&tenant).await?;
         eprintln!("[interrupted] tenant {tenant} charged {charged} bytes after abort");
     }
 
     // Nothing became downloadable under the run's scope.
-    let prefix = format!("exec/{}/", execution_id);
+    let prefix = format!("run/{}/", run_id);
     let files = storage::list_prefix(&disp, &prefix).await?;
     anyhow::ensure!(
         files.is_empty(),
@@ -170,7 +170,7 @@ async fn concurrent_uploads_stay_isolated_and_consistent() -> anyhow::Result<()>
 
     // Each distinct payload must appear EXACTLY as stored (byte-exact download),
     // and each is a different size, so a mixed-up part would fail the match.
-    let prefix = format!("exec/{}/", settled.execution_id);
+    let prefix = format!("run/{}/", settled.run_id);
     for (payload, label) in [(&a, "a"), (&b, "b"), (&c, "c")] {
         let key = storage::assert_file_contents(&disp, &prefix, payload)
             .await
@@ -180,7 +180,7 @@ async fn concurrent_uploads_stay_isolated_and_consistent() -> anyhow::Result<()>
 
     // Usage consistency: the three kept files sum to their exact total under the
     // run's tenant (each upload charged once, none lost or double-charged).
-    if let Some(tenant) = platform.runtime_tenant_for_execution_id(&settled.execution_id).await? {
+    if let Some(tenant) = platform.runtime_tenant_for_run_id(&settled.run_id).await? {
         let charged = platform.runtime_charged_bytes(&tenant).await?;
         let expected = (a.len() + b.len() + c.len()) as i64;
         anyhow::ensure!(
@@ -191,7 +191,7 @@ async fn concurrent_uploads_stay_isolated_and_consistent() -> anyhow::Result<()>
     }
 
     // No in-flight leftovers after a clean completion.
-    let pending = platform.runtime_pending_uploads_for_execution_id(&settled.execution_id).await?;
+    let pending = platform.runtime_pending_uploads_for_run_id(&settled.run_id).await?;
     anyhow::ensure!(pending == 0, "completed run left {pending} pending upload(s)");
 
     project.finish().await

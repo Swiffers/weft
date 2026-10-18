@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
 
 use super::voice_previews::{emit_previews, line_refusal, preview_request};
 
@@ -23,7 +23,7 @@ impl Node for ElevenLabsRemixVoiceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let voice: String = ctx.inputs.get("voice")?;
         let description: String = ctx.inputs.get("description")?;

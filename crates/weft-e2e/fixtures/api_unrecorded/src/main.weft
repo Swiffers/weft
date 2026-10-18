@@ -1,5 +1,5 @@
 # Two routes that do not record their runs (`recorded: false`). The rig calls
-# each and asserts what the executions listing keeps.
+# each and asserts what the runs listing keeps.
 #
 #   GET status   answers every time; its runs leave nothing behind, and
 #                each one gives its at-once slot back as it ends

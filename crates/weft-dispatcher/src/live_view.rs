@@ -6,7 +6,7 @@
 //! rows. When nobody here follows that project, the announcement is
 //! dropped after reading its first id. When somebody does, each of its runs
 //! is read past the last row this process painted, folded into the run's
-//! projection (`crate::projection::ExecutionProjector`), and the events it
+//! projection (`crate::projection::RunProjector`), and the events it
 //! paints are published to this process's subscribers. A run first seen
 //! here (it started before anybody watched, or this process just started
 //! watching it) is read and painted from its birth: the screen dedups by
@@ -27,11 +27,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use weft_core::ExecutionId;
-use weft_journal::ExecEvent;
+use weft_core::RunId;
+use weft_journal::RunEvent;
 use weft_task_store::pg_signal::Heard;
 
-use crate::projection::{execution_program, ExecutionProjector, ProgramLookup};
+use crate::projection::{run_program, RunProjector, ProgramLookup};
 use crate::state::DispatcherState;
 
 /// A projection that has painted no row for this long is dropped: a run
@@ -42,7 +42,7 @@ const IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 /// One run this process paints.
 struct LiveRun {
     project_id: uuid::Uuid,
-    projector: ExecutionProjector,
+    projector: RunProjector,
     /// The last record row painted.
     painted: i32,
     last_row_at: Instant,
@@ -51,7 +51,7 @@ struct LiveRun {
 /// Every run this process paints right now.
 #[derive(Default)]
 struct Views {
-    runs: HashMap<ExecutionId, LiveRun>,
+    runs: HashMap<RunId, LiveRun>,
 }
 
 /// Paint the runs of the projects followed on this process, for the
@@ -90,57 +90,57 @@ pub async fn run(state: DispatcherState) {
 
 impl Views {
     /// `runs` of `project_id` got rows.
-    async fn logged(&mut self, state: &DispatcherState, project_id: uuid::Uuid, runs: &[ExecutionId]) -> anyhow::Result<()> {
+    async fn logged(&mut self, state: &DispatcherState, project_id: uuid::Uuid, runs: &[RunId]) -> anyhow::Result<()> {
         if !state.events.watched(project_id).await {
             self.runs.retain(|_, live| live.project_id != project_id);
             return Ok(());
         }
-        for execution_id in runs {
-            self.paint(state, *execution_id, project_id).await?;
+        for run_id in runs {
+            self.paint(state, *run_id, project_id).await?;
         }
         Ok(())
     }
 
     /// Read every run painted here past its last painted row.
     async fn recheck(&mut self, state: &DispatcherState) -> anyhow::Result<()> {
-        let open: Vec<(ExecutionId, uuid::Uuid)> = self.runs.iter().map(|(id, live)| (*id, live.project_id)).collect();
-        for (execution_id, project_id) in open {
+        let open: Vec<(RunId, uuid::Uuid)> = self.runs.iter().map(|(id, live)| (*id, live.project_id)).collect();
+        for (run_id, project_id) in open {
             if state.events.watched(project_id).await {
-                self.paint(state, execution_id, project_id).await?;
+                self.paint(state, run_id, project_id).await?;
             } else {
-                self.runs.remove(&execution_id);
+                self.runs.remove(&run_id);
             }
         }
         Ok(())
     }
 
-    /// Paint the rows of `execution_id` past the last one painted, opening
+    /// Paint the rows of `run_id` past the last one painted, opening
     /// its projection from its birth when it has none here.
-    async fn paint(&mut self, state: &DispatcherState, execution_id: ExecutionId, project_id: uuid::Uuid) -> anyhow::Result<()> {
-        let after = self.runs.get(&execution_id).map(|live| live.painted);
+    async fn paint(&mut self, state: &DispatcherState, run_id: RunId, project_id: uuid::Uuid) -> anyhow::Result<()> {
+        let after = self.runs.get(&run_id).map(|live| live.painted);
         let record = {
             let mut conn = state.pg_pool.acquire().await?;
-            weft_journal::record::read_record(&mut conn, execution_id, after).await?
+            weft_journal::record::read_record(&mut conn, run_id, after).await?
         };
         let Some(last) = record.rows.last().map(|row| row.seq) else { return Ok(()) };
-        let rows = match record.decode(execution_id) {
+        let rows = match record.decode(run_id) {
             Ok(rows) => rows,
             Err(reason) => {
                 // The run paints only what needs no program from here on;
                 // its corruption is said once, as its projection opens.
                 publish_unreadable(
                     state,
-                    execution_id,
+                    run_id,
                     project_id,
                     weft_core::primitive::CorruptionSite::UndecodableRow,
-                    format!("a row of this execution no longer decodes: {reason}"),
+                    format!("a row of this run no longer decodes: {reason}"),
                 )
                 .await;
                 self.runs.insert(
-                    execution_id,
+                    run_id,
                     LiveRun {
                         project_id,
-                        projector: ExecutionProjector::new(execution_id, ProgramLookup::Unreadable(String::new()), project_id),
+                        projector: RunProjector::new(run_id, ProgramLookup::Unreadable(String::new()), project_id),
                         painted: last,
                         last_row_at: Instant::now(),
                     },
@@ -148,13 +148,13 @@ impl Views {
                 return Ok(());
             }
         };
-        let mut live = match self.runs.remove(&execution_id) {
+        let mut live = match self.runs.remove(&run_id) {
             Some(live) => live,
-            None => LiveRun { project_id, projector: open_projection(state, execution_id, project_id, &rows).await?, painted: -1, last_row_at: Instant::now() },
+            None => LiveRun { project_id, projector: open_projection(state, run_id, project_id, &rows).await?, painted: -1, last_row_at: Instant::now() },
         };
         let mut ended = false;
         for row in &rows {
-            ended |= row.event.is_execution_terminal();
+            ended |= row.event.is_run_terminal();
             for event in crate::events::IdentifiedEvent::recorded(row.seq, row.index, ()).project(|()| live.projector.project(&row.event)) {
                 state.events.publish_local(event).await;
             }
@@ -163,7 +163,7 @@ impl Views {
         live.last_row_at = Instant::now();
         // An ended run gets no more rows.
         if !ended {
-            self.runs.insert(execution_id, live);
+            self.runs.insert(run_id, live);
         }
         Ok(())
     }
@@ -176,38 +176,38 @@ impl Views {
     }
 }
 
-/// Open the projection of `execution_id`, whose record starts with `rows`.
+/// Open the projection of `run_id`, whose record starts with `rows`.
 /// Only the database itself is an error. Anything permanent about the run
 /// (its program cannot be found, its seed cannot be read) degrades its
 /// projection to the program-free painting and publishes why.
 async fn open_projection(
     state: &DispatcherState,
-    execution_id: ExecutionId,
+    run_id: RunId,
     project_id: uuid::Uuid,
     rows: &[weft_journal::JournalRow],
-) -> anyhow::Result<ExecutionProjector> {
+) -> anyhow::Result<RunProjector> {
     // Whatever stops this run from painting whole, say it once, here. The
     // projector then carries a reason-less copy of the same state, so it
     // does not say it again on every later row.
-    let found = execution_program(state, execution_id).await?;
+    let found = run_program(state, run_id).await?;
     let program = match found.unpaintable() {
         Some((site, reason)) => {
-            publish_unreadable(state, execution_id, project_id, site, reason.to_string()).await;
+            publish_unreadable(state, run_id, project_id, site, reason.to_string()).await;
             found.without_reason()
         }
         None => found,
     };
-    let birth: Vec<ExecEvent> = rows.iter().take(1).map(|row| row.event.clone()).collect();
-    let inheritance = match crate::projection::execution_inheritance(state, &birth, &program).await {
+    let birth: Vec<RunEvent> = rows.iter().take(1).map(|row| row.event.clone()).collect();
+    let inheritance = match crate::projection::run_inheritance(state, &birth, &program).await {
         Ok(chain) => chain,
         Err(reason) => {
             // A cleaned seed leaves the run's own rows paintable and its
             // inherited nodes empty on the screen.
-            publish_unreadable(state, execution_id, project_id, weft_core::primitive::CorruptionSite::UndecodableRow, reason).await;
+            publish_unreadable(state, run_id, project_id, weft_core::primitive::CorruptionSite::UndecodableRow, reason).await;
             weft_journal::SeedChain::default()
         }
     };
-    Ok(ExecutionProjector::new(execution_id, program, project_id).with_inheritance(inheritance))
+    Ok(RunProjector::new(run_id, program, project_id).with_inheritance(inheritance))
 }
 
 /// A run whose record cannot be read back: logged, and published as the
@@ -215,19 +215,19 @@ async fn open_projection(
 /// as unreadable and names `weft clean`.
 pub(crate) async fn publish_unreadable(
     state: &DispatcherState,
-    execution_id: ExecutionId,
+    run_id: RunId,
     project_id: uuid::Uuid,
     site: weft_core::primitive::CorruptionSite,
     reason: String,
 ) {
     tracing::error!(
         target: "weft_dispatcher::live_view",
-        %execution_id, %reason,
-        "this execution's record cannot be read back; its live view paints only what needs no \
-         program. `weft clean` removes the execution."
+        %run_id, %reason,
+        "this run's record cannot be read back; its live view paints only what needs no \
+         program. `weft clean` removes the run."
     );
     let corruption = crate::events::IdentifiedEvent::transient(crate::events::DispatcherEvent::JournalCorruption {
-        execution_id,
+        run_id,
         project_id,
         site,
         reason,

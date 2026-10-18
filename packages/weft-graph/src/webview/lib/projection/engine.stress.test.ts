@@ -208,7 +208,7 @@ function expectConverged(): void {
 describe('model host scenarios (real incident shapes)', () => {
 	it('typing into a node, then deleting that node: config flushes first, both land, no toast', async () => {
 		engine.recordEdit([setConfigOp('a', '"half-typed"')], (l) => l, 'cfg:a');
-		engine.recordEdit([{ op: 'removeNode', node: 'a' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'a' }]);
 		await drain();
 		expectConverged();
 		expect(host.server.nodes.some(n => n.id === 'a')).toBe(false);
@@ -217,7 +217,7 @@ describe('model host scenarios (real incident shapes)', () => {
 
 	it('typing into one node, deleting ANOTHER, then more typing: all land in order', async () => {
 		engine.recordEdit([setConfigOp('a', '"one"')], (l) => l, 'cfg:a');
-		engine.recordEdit([{ op: 'removeNode', node: 'b' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'b' }]);
 		engine.recordEdit([setConfigOp('a', '"two"')], (l) => l, 'cfg:a');
 		await drain();
 		expectConverged();
@@ -242,7 +242,7 @@ describe('model host scenarios (real incident shapes)', () => {
 
 	it('create, delete, recreate the same id back-to-back', async () => {
 		engine.recordEdit([addNodeOp('text_2')]);
-		engine.recordEdit([{ op: 'removeNode', node: 'text_2' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'text_2' }]);
 		engine.recordEdit([addNodeOp('text_2')]);
 		await drain();
 		expectConverged();
@@ -255,7 +255,7 @@ describe('model host scenarios (real incident shapes)', () => {
 		engine.recordEdit([addNodeOp('text_2')]);
 		engine.recordEdit([addEdgeOp('text_2', 'b')]);
 		engine.recordEdit([setConfigOp('text_2', '"burst"')], (l) => l, 'cfg:text_2');
-		engine.recordEdit([{ op: 'removeNode', node: 'a' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'a' }]);
 		await drain();
 		expectConverged();
 		expect(host.server.nodes.some(n => n.id === 'text_2')).toBe(true);
@@ -314,7 +314,7 @@ describe('seeded random walks', () => {
 			() => engine.recordEdit([addNodeOp(`n${++minted}`)], (l) => upsertLayout(l, `n${minted}`, minted, minted)),
 			() => {
 				const ids = visibleNodes();
-				if (ids.length > 0) engine.recordEdit([{ op: 'removeNode', node: pick(ids) }]);
+				if (ids.length > 0) engine.recordEdit([{ op: 'remove_node', node: pick(ids) }]);
 			},
 			() => {
 				const sources = visibleTextNodes();

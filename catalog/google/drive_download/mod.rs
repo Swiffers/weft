@@ -9,7 +9,7 @@ use serde_json::Value;
 use weft::access::client::required_str;
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::drive;
 
@@ -36,7 +36,7 @@ impl Node for GoogleDriveDownloadNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let file_id: String = ctx.inputs.get("fileId")?;
         let export_mime: Option<String> = ctx.inputs.opt("exportFormat")?;
@@ -79,7 +79,7 @@ impl Node for GoogleDriveDownloadNode {
 
         let resp = http.get(&url).send().await.node_err("google drive: download")?;
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             .put_response(
                 resp,
                 "google drive: download the file",

@@ -31,5 +31,5 @@
       "description": "True once the whole file has been streamed."
     }
   ],
-  "requires_infra": false
+  "requiresInfra": false
 }

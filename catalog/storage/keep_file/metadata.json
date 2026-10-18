@@ -1,7 +1,7 @@
 {
   "type": "KeepFile",
   "label": "Keep File",
-  "description": "Make a file this run stored outlive the run. Run files are swept when the run ends and unreadable by other runs. `scope: execution` (default) only extends THIS run's file, still unreadable elsewhere; `scope: project` copies it into project storage and emits the NEW reference every later run can read (how an upload in one request is served by the next). For a file not yet in storage (a URL), use FetchToStorage.",
+  "description": "Make a file this run stored outlive the run. Run files are swept when the run ends and unreadable by other runs. `scope: run` (default) only extends THIS run's file, still unreadable elsewhere; `scope: project` copies it into project storage and emits the NEW reference every later run can read (how an upload in one request is served by the next). For a file not yet in storage (a URL), use FetchToStorage.",
   "tags": [
     "storage",
     "keep",
@@ -18,24 +18,24 @@
       "name": "file",
       "type": "File",
       "required": true,
-      "description": "Stored execution file. Kept in place with `execution`; copied (original untouched) with `project`."
+      "description": "Stored run file. Kept in place with `run`; copied (original untouched) with `project`."
     },
     {
       "name": "scope",
       "type": "String",
-      "default": "execution",
+      "default": "run",
       "widget": {
         "kind": "select",
         "options": [
-          "execution",
+          "run",
           "project"
         ]
       },
       "label": "Keep as",
-      "description": "`execution`: survive the end-of-run sweep for `ttl_days`, readable only by this run. `project`: copy into project scope, readable by every later run."
+      "description": "`run`: survive the end-of-run sweep for `ttlDays`, readable only by this run. `project`: copy into project scope, readable by every later run."
     },
     {
-      "name": "ttl_days",
+      "name": "ttlDays",
       "type": "Number",
       "widget": {
         "kind": "number",
@@ -43,14 +43,14 @@
         "step": 1
       },
       "label": "Keep for (days, 0 = forever)",
-      "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: 30 days for an execution file, no expiry for a project copy."
+      "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: 30 days for a run file, no expiry for a project copy."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "File",
-      "description": "`execution`: the same reference, now kept. `project`: the NEW project copy (same name, type, size); later runs read this one."
+      "description": "`run`: the same reference, now kept. `project`: the NEW project copy (same name, type, size); later runs read this one."
     },
     {
       "name": "filename",

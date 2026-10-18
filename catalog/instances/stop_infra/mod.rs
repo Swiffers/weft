@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::{instance_if_given, stop_self, take_down_spec, taken_down};
 
@@ -21,7 +21,7 @@ impl Node for StopInfraNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let node: String = ctx.inputs.get("node")?;
         let spec = take_down_spec(&ctx)?;
         let mut copy = ctx.infra(node);

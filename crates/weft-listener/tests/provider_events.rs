@@ -144,7 +144,7 @@ async fn spawn_broker(gateway_url: String, multi_account: bool, mint_open: bool)
                     "values": { "token": "tok-api" },
                     "auth": [{ "kind": "header", "name": "Authorization",
                                "value": "Bearer {token}" }],
-                    "recipe_values": { "app_token": "xapp-1" },
+                    "recipe_values": { "appToken": "xapp-1" },
                     // The connection's own provider account, what an
                     // account-scoped subscriber is matched against on
                     // a multi-account socket.
@@ -159,13 +159,13 @@ async fn spawn_broker(gateway_url: String, multi_account: bool, mint_open: bool)
                                     "url": mint_url,
                                     "method": "POST",
                                     "auth": [{ "kind": "header", "name": "Authorization",
-                                               "value": "Bearer {app_token}" }],
+                                               "value": "Bearer {appToken}" }],
                                     "captures": [{ "name": "url", "path": "url" }]
                                 },
-                                "replies": [{ "when_field": "envelope_id",
+                                "replies": [{ "whenField": "envelope_id",
                                               "frame": "{\"envelope_id\":\"{value}\"}" }],
-                                "event_path": "payload.event",
-                                "multi_account": multi_account
+                                "eventPath": "payload.event",
+                                "multiAccount": multi_account
                             }
                         }
                     }
@@ -265,7 +265,7 @@ async fn register_subscription(
     // Brought up from its row, the way a restarted listener does.
     let row = json!({
         "token": token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
-        "spec_json": serde_json::to_string(&spec).unwrap(), "is_resume": false, "execution_id": null,
+        "spec_json": serde_json::to_string(&spec).unwrap(), "is_resume": false, "run_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
         "auth_config": null, "kind_state": {}, "kind_state_seq": 1, "holds": true, "serving": null
     });
@@ -493,6 +493,6 @@ impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
             anyhow::bail!("no worker answers at {address}");
         }
         self.fired.lock().unwrap().push(fire.clone());
-        Ok(weft_core::door_fire::Fired::Started { execution_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
+        Ok(weft_core::door_fire::Fired::Started { run_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
     }
 }

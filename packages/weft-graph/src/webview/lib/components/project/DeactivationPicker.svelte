@@ -64,12 +64,12 @@
 	}> = [
 		{
 			value: 'cancel',
-			label: 'Cancel running executions',
-			detail: 'Kills every running, non-suspended execution right away.',
+			label: 'Cancel the runs still going',
+			detail: 'Kills every running, non-suspended run right away.',
 		},
 		{
 			value: 'wait',
-			label: 'Wait for running executions',
+			label: 'Wait for the runs still going',
 			detail:
 				'New work waits as the mode says; the runs going now finish first. You can cancel them anytime.',
 		},
@@ -82,7 +82,7 @@
 
 	/// An emptied number box reads as `null` in Svelte, and sending that
 	/// as a 0 would be the opposite of what the box says: a "wait at most
-	/// 0 seconds" cancels every running execution at once under a Wait
+	/// 0 seconds" cancels every running run at once under a Wait
 	/// label. An empty box means "I did not choose", so the field is left
 	/// out and the server's own default applies.
 	function chosen(value: number | null): number | undefined {
@@ -140,11 +140,11 @@
 
 			{#if mode === 'wipe'}
 				<div class="text-[11px] text-zinc-500">
-					Wipe cancels running executions (waiting before wiping is contradictory).
+					Wipe cancels the runs still going (waiting before wiping is contradictory).
 				</div>
 			{:else}
 				<div class="flex flex-col gap-1.5">
-					<span class="text-[10px] font-medium uppercase tracking-wider text-zinc-500">Running executions</span>
+					<span class="text-[10px] font-medium uppercase tracking-wider text-zinc-500">Runs still going</span>
 					{#each POLICIES as p}
 						<label class="{radioRow} {runningPolicy === p.value ? 'border-zinc-800 bg-zinc-50' : 'border-zinc-200 hover:bg-zinc-50'}">
 							<input type="radio" class="mt-0.5" bind:group={runningPolicy} value={p.value} />

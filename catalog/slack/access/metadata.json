@@ -18,24 +18,24 @@
       "kind": "oauth2",
       "grant": {
         "kind": "authorization_code",
-        "auth_url": "https://slack.com/oauth/v2/authorize",
+        "authUrl": "https://slack.com/oauth/v2/authorize",
         "pkce": false
       },
-      "token_url": "https://slack.com/api/oauth.v2.access",
-      "scope_delimiter": ",",
+      "tokenUrl": "https://slack.com/api/oauth.v2.access",
+      "scopeDelimiter": ",",
       "captures": [
         {
           "name": "team",
           "path": "team.name"
         },
         {
-          "name": "team_id",
+          "name": "teamId",
           "path": "team.id"
         }
       ],
-      "registration_fields": [
+      "registrationFields": [
         {
-          "name": "app_token",
+          "name": "appToken",
           "label": "App-level token (xapp-...)",
           "optional": true,
           "secret": true,
@@ -59,7 +59,7 @@
           "path": "team"
         },
         {
-          "name": "team_id",
+          "name": "teamId",
           "path": "team_id"
         }
       ]
@@ -133,12 +133,12 @@
         "description": "Resolve a workspace member from their email address."
       }
     ],
-    "all_permissions_url": "https://docs.slack.dev/reference/scopes",
+    "allPermissionsUrl": "https://docs.slack.dev/reference/scopes",
     "verification": {
       "rung": "reports_permissions",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "paste": {
         "fields": [
           {
@@ -147,7 +147,7 @@
             "placeholder": "xoxb-..."
           },
           {
-            "name": "app_token",
+            "name": "appToken",
             "label": "App-level token (xapp-...)",
             "optional": true,
             "secret": true,
@@ -179,7 +179,7 @@
           "workspace": "team"
         },
         "account": {
-          "value": "team_id",
+          "value": "teamId",
           "path": "team_id"
         },
         "socket": {
@@ -190,7 +190,7 @@
               {
                 "kind": "header",
                 "name": "Authorization",
-                "value": "Bearer {app_token}"
+                "value": "Bearer {appToken}"
               }
             ],
             "captures": [
@@ -202,12 +202,12 @@
           },
           "replies": [
             {
-              "when_field": "envelope_id",
+              "whenField": "envelope_id",
               "frame": "{\"envelope_id\":\"{value}\"}"
             }
           ],
-          "event_path": "payload.event",
-          "multi_account": true
+          "eventPath": "payload.event",
+          "multiAccount": true
         },
         "webhook": {
           "handshake": {
@@ -216,12 +216,12 @@
           },
           "verify": {
             "kind": "hmac",
-            "signature_header": "X-Slack-Signature",
-            "timestamp_header": "X-Slack-Request-Timestamp",
+            "signatureHeader": "X-Slack-Signature",
+            "timestampHeader": "X-Slack-Request-Timestamp",
             "concat": "v0:{timestamp}:{body}",
             "prefix": "v0="
           },
-          "event_path": "event"
+          "eventPath": "event"
         }
       },
       "reactions": {
@@ -234,7 +234,7 @@
           "messageUser": "item_user"
         },
         "account": {
-          "value": "team_id",
+          "value": "teamId",
           "path": "team_id"
         },
         "socket": {
@@ -245,7 +245,7 @@
               {
                 "kind": "header",
                 "name": "Authorization",
-                "value": "Bearer {app_token}"
+                "value": "Bearer {appToken}"
               }
             ],
             "captures": [
@@ -257,12 +257,12 @@
           },
           "replies": [
             {
-              "when_field": "envelope_id",
+              "whenField": "envelope_id",
               "frame": "{\"envelope_id\":\"{value}\"}"
             }
           ],
-          "event_path": "payload.event",
-          "multi_account": true
+          "eventPath": "payload.event",
+          "multiAccount": true
         },
         "webhook": {
           "handshake": {
@@ -271,12 +271,12 @@
           },
           "verify": {
             "kind": "hmac",
-            "signature_header": "X-Slack-Signature",
-            "timestamp_header": "X-Slack-Request-Timestamp",
+            "signatureHeader": "X-Slack-Signature",
+            "timestampHeader": "X-Slack-Request-Timestamp",
             "concat": "v0:{timestamp}:{body}",
             "prefix": "v0="
           },
-          "event_path": "event"
+          "eventPath": "event"
         }
       },
       "interactions": {
@@ -292,7 +292,7 @@
           "responseUrl": "response_url"
         },
         "account": {
-          "value": "team_id",
+          "value": "teamId",
           "path": "team.id"
         },
         "socket": {
@@ -303,7 +303,7 @@
               {
                 "kind": "header",
                 "name": "Authorization",
-                "value": "Bearer {app_token}"
+                "value": "Bearer {appToken}"
               }
             ],
             "captures": [
@@ -315,17 +315,17 @@
           },
           "replies": [
             {
-              "when_field": "envelope_id",
+              "whenField": "envelope_id",
               "frame": "{\"envelope_id\":\"{value}\"}"
             }
           ],
-          "event_path": "payload"
+          "eventPath": "payload"
         },
         "webhook": {
           "verify": {
             "kind": "hmac",
-            "signature_header": "X-Slack-Signature",
-            "timestamp_header": "X-Slack-Request-Timestamp",
+            "signatureHeader": "X-Slack-Signature",
+            "timestampHeader": "X-Slack-Request-Timestamp",
             "concat": "v0:{timestamp}:{body}",
             "prefix": "v0="
           },
@@ -333,7 +333,7 @@
             "path": "payload",
             "encoding": "form_json"
           },
-          "event_path": ""
+          "eventPath": ""
         }
       },
       "files": {
@@ -344,7 +344,7 @@
           "user": "user_id"
         },
         "account": {
-          "value": "team_id",
+          "value": "teamId",
           "path": "team_id"
         },
         "socket": {
@@ -355,7 +355,7 @@
               {
                 "kind": "header",
                 "name": "Authorization",
-                "value": "Bearer {app_token}"
+                "value": "Bearer {appToken}"
               }
             ],
             "captures": [
@@ -367,12 +367,12 @@
           },
           "replies": [
             {
-              "when_field": "envelope_id",
+              "whenField": "envelope_id",
               "frame": "{\"envelope_id\":\"{value}\"}"
             }
           ],
-          "event_path": "payload.event",
-          "multi_account": true
+          "eventPath": "payload.event",
+          "multiAccount": true
         },
         "webhook": {
           "handshake": {
@@ -381,12 +381,12 @@
           },
           "verify": {
             "kind": "hmac",
-            "signature_header": "X-Slack-Signature",
-            "timestamp_header": "X-Slack-Request-Timestamp",
+            "signatureHeader": "X-Slack-Signature",
+            "timestampHeader": "X-Slack-Request-Timestamp",
             "concat": "v0:{timestamp}:{body}",
             "prefix": "v0="
           },
-          "event_path": "event"
+          "eventPath": "event"
         }
       }
     }

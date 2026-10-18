@@ -129,7 +129,7 @@ impl ContextHandle for PureHandle {
         self.inner.log(level, message).await
     }
 
-    async fn tag_execution(&self, _tags: Vec<String>) -> WeftResult<()> {
+    async fn tag_run(&self, _tags: Vec<String>) -> WeftResult<()> {
         self.refused("tag its run")
     }
 
@@ -204,7 +204,7 @@ impl ContextHandle for PureHandle {
         declared_size: Option<u64>,
     ) -> WeftResult<Value> {
         match (scope, keep) {
-            (crate::storage::StorageScope::Execution, None) => {
+            (crate::storage::StorageScope::Run, None) => {
                 self.inner.storage_put(scope, identity, data, mime_type, filename, keep, declared_size).await
             }
             _ => self.refused("store a file beyond this run"),

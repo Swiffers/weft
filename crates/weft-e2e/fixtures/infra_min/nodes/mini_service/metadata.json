@@ -34,7 +34,7 @@
       "type": "String"
     }
   ],
-  "requires_infra": true,
+  "requiresInfra": true,
   "images": [
     "images/mini_service"
   ],

@@ -2,7 +2,7 @@
 
 The human-in-the-loop surface: pending tasks from running Weft programs
 (approvals, forms) show up here, and answering them resumes the suspended
-execution.
+run.
 
 Build, install, and connect instructions live in
 [docs/src/running/browser-extension.md](../docs/src/running/browser-extension.md).

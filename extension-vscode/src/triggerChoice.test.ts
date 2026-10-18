@@ -4,7 +4,7 @@ import { isTriggerChoiceRefusal, triggerChoiceIntent } from './triggerChoice';
 describe('isTriggerChoiceRefusal', () => {
   it('recognizes the flagged error event', () => {
     expect(isTriggerChoiceRefusal({
-      ts_unix: 1,
+      tsUnix: 1,
       verb: 'infra_stop',
       phase: 'error',
       detail: { message: 'triggers are on', daemonUnreachable: false, needsTriggerChoice: true },
@@ -13,13 +13,13 @@ describe('isTriggerChoiceRefusal', () => {
 
   it('ignores any other failure, and the flag on a non-error phase', () => {
     expect(isTriggerChoiceRefusal({
-      ts_unix: 1,
+      tsUnix: 1,
       phase: 'error',
       detail: { message: 'project not registered', needsTriggerChoice: false },
     })).toBe(false);
-    expect(isTriggerChoiceRefusal({ ts_unix: 1, phase: 'error' })).toBe(false);
+    expect(isTriggerChoiceRefusal({ tsUnix: 1, phase: 'error' })).toBe(false);
     expect(isTriggerChoiceRefusal({
-      ts_unix: 1,
+      tsUnix: 1,
       phase: 'warning',
       detail: { needsTriggerChoice: true },
     })).toBe(false);

@@ -21,7 +21,7 @@ Fill in the services you expect to use often, and leave the rest alone. We
 recommend at least [OpenRouter](https://openrouter.ai/keys), because a single
 key there reaches most models.
 
-A service you set up here becomes one click forever after: a step that calls it
+A service you set up here becomes one click forever after: a node that calls it
 picks the key up on its own, and your AI assistant can wire one in without
 stopping to ask you for anything. A service you skip asks you for a credential
 the first time you need it, which is fine for the ones you touch once.

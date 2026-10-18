@@ -16,7 +16,7 @@ use weft::caller::CallerHandle;
 use weft::node::NodeOutput;
 use weft::signal::DataType;
 use weft::storage::StoredFile;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::wire;
 
@@ -33,7 +33,7 @@ impl Node for ReplyNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let body: Value = ctx.inputs.get("body")?;
         let status: u16 = ctx.inputs.get("status")?;
         let headers: Option<Value> = ctx.inputs.opt("headers")?;

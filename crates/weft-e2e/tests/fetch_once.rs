@@ -2,7 +2,7 @@
 //! the real worker-to-broker wire, plus everything that run carries with
 //! it: the cron default registers on activate; Format and Wait do their
 //! jobs and the document reaches a real chat; and the run reads back the
-//! way `weft executions`, `weft events` and `weft logs` read it, with a
+//! way `weft runs`, `weft events` and `weft logs` read it, with a
 //! phase on the summary and on the listing filter, and a node on a log
 //! line.
 //!
@@ -71,24 +71,24 @@ async fn one_file_two_fetches_and_a_run_that_reads_back() -> Result<()> {
 
     // The summary carries its phase, the listing filters by it, and the
     // activate left a setup run behind.
-    let execution_id = settled.execution_id;
-    let one: Value = disp.get_json(&format!("/executions/{execution_id}")).await?;
+    let run_id = settled.run_id;
+    let one: Value = disp.get_json(&format!("/runs/{run_id}")).await?;
     anyhow::ensure!(one["phase"] == "fire", "the manual run is a fire: {one}");
     let fires: Value =
-        disp.get_json(&format!("/executions?project_id={pid}&phase=fire&limit=50")).await?;
+        disp.get_json(&format!("/runs?project_id={pid}&phase=fire&limit=50")).await?;
     anyhow::ensure!(
-        fires["executions"].as_array().is_some_and(|rows| rows.iter().any(|r| r["execution_id"] == execution_id.to_string())),
+        fires["runs"].as_array().is_some_and(|rows| rows.iter().any(|r| r["runId"] == run_id.to_string())),
         "the fire listing holds the run: {fires}"
     );
     let setups: Value =
-        disp.get_json(&format!("/executions?project_id={pid}&phase=trigger_setup&limit=50")).await?;
+        disp.get_json(&format!("/runs?project_id={pid}&phase=trigger_setup&limit=50")).await?;
     anyhow::ensure!(setups["total"].as_u64().unwrap_or(0) >= 1, "activate made a setup run: {setups}");
 
     // A log line names the node that wrote it (Debug logs what it saw).
     // The worker hands each line over as a task that a dispatcher writes
     // into the journal when it gets to it, so a line can land after the
     // run already reads as finished: wait for it rather than read once.
-    let path = format!("/executions/{execution_id}/logs");
+    let path = format!("/runs/{run_id}/logs");
     let seen = std::sync::Mutex::new(Value::Null);
     weft_e2e::poll_until_describing(
         "the Debug node's log line, naming it",

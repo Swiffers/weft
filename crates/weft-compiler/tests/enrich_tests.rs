@@ -178,8 +178,8 @@ my = Loop(items: List[String], threshold: Number) -> (results: List[String | Nul
     parallel: false
     over: ["items"]
     carry: ["acc"]
-    max_iters: 50
-    trim_on_mismatch: true
+    maxIters: 50
+    trimOnMismatch: true
     p = Text {}
     p.value = self.items
     self.results = p.value
@@ -203,8 +203,8 @@ my = Loop(items: List[String], threshold: Number) -> (results: List[String | Nul
     assert_eq!(in_node.config["parallel"], serde_json::json!(false));
     assert_eq!(in_node.config["over"], serde_json::json!(["items"]));
     assert_eq!(in_node.config["carry"], serde_json::json!(["acc"]));
-    assert_eq!(in_node.config["max_iters"], serde_json::json!(50));
-    assert_eq!(in_node.config["trim_on_mismatch"], serde_json::json!(true));
+    assert_eq!(in_node.config["maxIters"], serde_json::json!(50));
+    assert_eq!(in_node.config["trimOnMismatch"], serde_json::json!(true));
     assert_eq!(out_node.config["parentId"], serde_json::json!(in_node.config["parentId"]));
     assert!(out_node.config.get("parallel").is_none(), "LoopOut must not carry the loop config; LoopIn is authoritative");
     assert!(out_node.config.get("over").is_none());
@@ -262,7 +262,7 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
 
 #[test]
 fn loop_config_defaults_round_trip() {
-    // Optional knobs (`max_iters`, `trim_on_mismatch`) are absent in the
+    // Optional knobs (`maxIters`, `trimOnMismatch`) are absent in the
     // source; the runtime applies its defaults at fire time. The wire
     // shape just preserves what the user wrote.
     let source = r#"
@@ -277,8 +277,8 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
     let in_node = project.nodes.iter().find(|n| n.node_type == "LoopIn").expect("LoopIn");
-    assert!(in_node.config.get("max_iters").is_none(), "unset max_iters absent from wire");
-    assert!(in_node.config.get("trim_on_mismatch").is_none(), "unset trim_on_mismatch absent from wire");
+    assert!(in_node.config.get("maxIters").is_none(), "unset maxIters absent from wire");
+    assert!(in_node.config.get("trimOnMismatch").is_none(), "unset trimOnMismatch absent from wire");
 }
 
 // ─── Container nesting matrix ──────────────────────────────────────────────
@@ -421,7 +421,7 @@ fn human_trigger_derives_ports_from_minimal_fields() {
     // The editor emits fields as `{ kind, key }` ONLY: render + config
     // are inherited from the node's port specs at enrich time, never
     // duplicated into the source. This proves the minimal shape derives the
-    // full set of ports (approve_reject -> {key}_approved/{key}_rejected
+    // full set of ports (approve_reject -> {key}Approved/{key}Rejected
     // Booleans; text_input -> {key} String), so a lean source is not a lossy
     // one. Regression guard for the "emit render/config baggage" bug.
     let source = r#"
@@ -444,10 +444,10 @@ out.data = human.answer
     // text_input adds a String OUTPUT named after the key; approve_reject adds
     // the two Boolean decision outputs.
     assert!(out_names.contains(&"answer"), "text_input output missing; got {out_names:?}");
-    assert!(out_names.contains(&"review_approved"), "approve output missing; got {out_names:?}");
-    assert!(out_names.contains(&"review_rejected"), "reject output missing; got {out_names:?}");
+    assert!(out_names.contains(&"reviewApproved"), "approve output missing; got {out_names:?}");
+    assert!(out_names.contains(&"reviewRejected"), "reject output missing; got {out_names:?}");
 
-    let approved = human.outputs.iter().find(|p| p.name == "review_approved").unwrap();
+    let approved = human.outputs.iter().find(|p| p.name == "reviewApproved").unwrap();
     assert_eq!(approved.port_type.to_string(), "Boolean");
     let answer = human.outputs.iter().find(|p| p.name == "answer").unwrap();
     assert_eq!(answer.port_type.to_string(), "String");
@@ -457,17 +457,17 @@ out.data = human.answer
 fn human_trigger_accepts_a_matching_declared_port_header() {
     // A hand-authored `.weft` MAY re-declare the form-derived ports in the
     // header. That is optional, and accepted IFF each declared port matches a
-    // derived one by name AND type (here `test_approved`/`test_rejected` are
+    // derived one by name AND type (here `testApproved`/`testRejected` are
     // exactly the Booleans `approve_reject` derives). This must NOT error as a
     // "custom output port" even though HumanTrigger forbids custom ports.
     let source = r#"
 
-human = HumanTrigger() -> (test_approved: Boolean, test_rejected: Boolean) {
+human = HumanTrigger() -> (testApproved: Boolean, testRejected: Boolean) {
   fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug
 
-out.data = human.test_approved
+out.data = human.testApproved
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("a matching header must enrich cleanly");
@@ -476,11 +476,11 @@ out.data = human.test_approved
     let out_names: Vec<&str> = human.outputs.iter().map(|p| p.name.as_str()).collect();
     // No duplicate ports from the redeclaration.
     assert_eq!(
-        out_names.iter().filter(|n| **n == "test_approved").count(),
+        out_names.iter().filter(|n| **n == "testApproved").count(),
         1,
         "declared port must merge with the derived one, not duplicate; got {out_names:?}"
     );
-    assert!(out_names.contains(&"test_rejected"));
+    assert!(out_names.contains(&"testRejected"));
 }
 
 #[test]
@@ -491,11 +491,11 @@ fn human_trigger_rejects_a_mismatched_declared_port() {
     // genuine custom-port error. Both must surface.
     let wrong_type = r#"
 
-human = HumanTrigger() -> (test_approved: String) {
+human = HumanTrigger() -> (testApproved: String) {
   fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug
-out.data = human.test_rejected
+out.data = human.testRejected
 "#;
     let mut project = compile(wrong_type, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
@@ -507,7 +507,7 @@ human = HumanTrigger() -> (not_a_field: Boolean) {
   fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug
-out.data = human.test_approved
+out.data = human.testApproved
 "#;
     let mut project = compile(unknown_port, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
@@ -572,12 +572,12 @@ out.data = pick.value
     let created: Vec<&str> = pick
         .inputs
         .iter()
-        .filter(|p| !weft_core::exec::skip::is_gate_port(&p.name))
+        .filter(|p| !weft_core::run::skip::is_gate_port(&p.name))
         .map(|p| p.name.as_str())
         .collect();
     assert_eq!(created, vec!["zebra", "apple"], "written order, not alphabetical");
     assert!(
-        pick.inputs.iter().all(|p| weft_core::exec::skip::is_gate_port(&p.name) || !p.required),
+        pick.inputs.iter().all(|p| weft_core::run::skip::is_gate_port(&p.name) || !p.required),
         "FirstInOrder's created inputs are optional by nature: a cut branch must not skip it"
     );
 }

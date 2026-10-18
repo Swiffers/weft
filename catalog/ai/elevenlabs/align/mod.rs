@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use weft::access::client::{json_call, Multipart};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::{store_json, API};
 
@@ -26,12 +26,12 @@ impl Node for ElevenLabsAlignNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let audio: FileHandle = ctx.inputs.get("audio")?;
         let transcript: String = ctx.inputs.get("transcript")?;
 
-        let storage = ctx.storage(StorageScope::Execution);
+        let storage = ctx.storage(StorageScope::Run);
         let (meta, bytes) = storage.get_bytes(&audio).await?;
         let (content_type, body) = Multipart::form_data()
             .text("text", &transcript)

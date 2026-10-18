@@ -5,9 +5,9 @@ The runtime has four roles, each with one job.
 | | What it does | What it never does |
 |---|---|---|
 | **Worker** | Runs your compiled program | Touch Postgres: it goes through the broker |
-| **Dispatcher** | Decides what runs, and answers every request about a project or a run | Run your step code |
-| **Listener** | Holds the timers, the open sockets and the subscriptions | Run your step code, or know which project it serves |
-| **Supervisor** | Creates and watches the machines and containers your program asked for | Run your step code, or change a project's infrastructure while another supervisor is changing it |
+| **Dispatcher** | Decides what runs, and answers every request about a project or a run | Run your node code |
+| **Listener** | Holds the timers, the open sockets and the subscriptions | Run your node code, or know which project it serves |
+| **Supervisor** | Creates and watches the machines and containers your program asked for | Run your node code, or change a project's infrastructure while another supervisor is changing it |
 
 The dispatcher, listener and supervisor, together with the broker, are parts of one
 binary, `weft-runtime`, and on your machine one `weft-runtime` process runs
@@ -105,7 +105,7 @@ project's worker settings (`weft workers set` or `reset`), every run still
 queued is handed out at once, with its tries forgotten.
 
 If a trigger starts a fast run and its worker dies straight away, the run may
-never show up in `weft executions`, because a fast run's record trails a few
+never show up in `weft runs`, because a fast run's record trails a few
 milliseconds behind it and may not have reached the database yet.
 
 ## Where a call goes
@@ -202,11 +202,11 @@ your machine none of these four does anything: there is no Cloud Run sending
 calls or starting copies, and weft puts no CPU or memory limit on a worker.
 
 On a cloud install, if a run keeps working after its caller has gone (a Route
-with `outlivesCaller` that replies and carries on), the steps it was running
+with `outlivesCaller` that replies and carries on), the nodes it was running
 when the caller left finish on that copy, and the rest of the run moves under
 a call weft holds open (for how, go and read [how a run is
 kept](../language/triggers-and-routes.md#how-a-run-is-kept)). Cloud Run
-throttles the CPU the moment the answer goes out, so if those last steps are
+throttles the CPU the moment the answer goes out, so if those last nodes are
 heavy, turn on `weft workers set --cpu-always-allocated true`. With it, the
 copy is billed for as long as it is up.
 
@@ -567,7 +567,7 @@ before it pauses, so a new worker picks it up when the wait ends. That
 exception does not hold while a caller is still on the line and the route
 leaves `outlivesCaller` off, or while a bus between its nodes is open: such a
 run holds its worker instead of pausing. Nobody can
-tell which of a fast run's steps ran after the last row that reached the
+tell which of a fast run's nodes ran after the last row that reached the
 database, and running it again could repeat them, so a fast run whose worker
 died ends cancelled and is not run again, with this reason: `the worker running this run went away; a fast run lives in its
 worker's memory, so it is not run again (make its trigger durable for a run
@@ -613,20 +613,20 @@ first wait would have given up.
 
 In that same check, a durable run whose worker died is queued again, and the
 dispatcher hands it to another worker at once, which carries it on from its
-record. A step that had started but not finished is failed on the new worker
-rather than run again, apart from some steps of pure nodes. For which ones,
-and what to do about a failed step, go and read [surviving a
-restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step).
+record. A node that had started but not finished is failed on the new worker
+rather than run again, apart from some pure nodes. For which ones,
+and what to do about a failed node, go and read [surviving a
+restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
 On a cloud install, when Cloud Run replaces a worker or scales one away, it
 sends the worker `SIGTERM`, the signal that asks a process to stop on its own,
 and kills it 10 seconds later. Every run on the worker then leaves it if it
 can:
 
-- A run that can pause starts no new step. Once the steps it is running have
+- A run that can pause starts no new node. Once the nodes it is running have
   ended, its record is written whole and it is handed back, so another worker
-  carries it on straight away. A step still running 5 seconds after the
-  `SIGTERM` is stopped where it is, and the next worker fails that step, the
+  carries it on straight away. A node still running 5 seconds after the
+  `SIGTERM` is stopped where it is, and the next worker fails that node, the
   same as if the worker had died. If its caller is still on the line (a route
   with `outlivesCaller` on), the run carries on with nobody there, and the
   caller hears `the copy of the program serving this request is stopping, so
@@ -634,7 +634,7 @@ can:
 - Three kinds of run cannot pause: an unrecorded run, a run tied to the caller
   still on the line (a route without `outlivesCaller`), and a run with a bus
   open, since a bus lives in its worker's memory alone. Each keeps running,
-  starting new steps as usual, until the platform stops the process. If it has
+  starting new nodes as usual, until the platform stops the process. If it has
   not ended by then, that is the same as its worker dying: a fast run ends
   cancelled, and a durable one is carried on by another worker. An unrecorded
   run that nothing had written down yet leaves no trace.

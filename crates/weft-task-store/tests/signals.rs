@@ -29,7 +29,7 @@ fn task(dedup: &str) -> tasks::NewTask {
         kind: weft_task_store::TaskKind::RegisterSignal,
         project_id: None,
         dedup_key: Some(dedup.to_string()),
-        execution_id: None,
+        run_id: None,
         tenant_id: "tenant-1".to_string(),
         payload: json!({}),
     }

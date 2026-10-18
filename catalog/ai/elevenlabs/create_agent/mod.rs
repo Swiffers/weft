@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{merge_json, API};
 use super::flows::set_some;
@@ -51,7 +51,7 @@ impl Node for ElevenLabsCreateAgentNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         // Built (and refused) in full before the account is opened.
         let body = request(&ctx)?;
@@ -63,7 +63,7 @@ impl Node for ElevenLabsCreateAgentNode {
 }
 
 /// The JSON object on `port`, or an empty one when it is not set.
-fn json_input(ctx: &ExecutionContext, port: &str) -> WeftResult<Value> {
+fn json_input(ctx: &RunContext, port: &str) -> WeftResult<Value> {
     Ok(Value::Object(ctx.inputs.opt::<Map<String, Value>>(port)?.unwrap_or_default()))
 }
 
@@ -75,7 +75,7 @@ fn has_keys(value: &Value) -> bool {
 /// The whole create request: each JSON input with the typed inputs
 /// merged on top, refusing before anything is sent what ElevenLabs
 /// would refuse.
-fn request(ctx: &ExecutionContext) -> WeftResult<Value> {
+fn request(ctx: &RunContext) -> WeftResult<Value> {
     let mut config = json_input(ctx, "conversationConfig")?;
     merge_json(&mut config, conversation_config(ctx)?);
     // The compiler refuses the written pair; this is the floor for a
@@ -122,7 +122,7 @@ fn request(ctx: &ExecutionContext) -> WeftResult<Value> {
 /// `conversation_config` from the typed inputs, holding only what was
 /// set, so the merge leaves every other key of `conversationConfig`
 /// as it was written.
-fn conversation_config(ctx: &ExecutionContext) -> WeftResult<Value> {
+fn conversation_config(ctx: &RunContext) -> WeftResult<Value> {
     let mut agent = json!({ "prompt": prompt_config(ctx)? });
     set_some(&mut agent, "first_message", ctx.inputs.opt::<String>("firstMessage")?);
     set_some(&mut agent, "language", ctx.inputs.opt::<String>("language")?);
@@ -161,7 +161,7 @@ fn conversation_config(ctx: &ExecutionContext) -> WeftResult<Value> {
 }
 
 /// `conversation_config.agent.prompt` from the typed inputs.
-fn prompt_config(ctx: &ExecutionContext) -> WeftResult<Value> {
+fn prompt_config(ctx: &RunContext) -> WeftResult<Value> {
     let mut prompt = json!({ "prompt": ctx.inputs.get::<String>("prompt")? });
     set_some(&mut prompt, "llm", ctx.inputs.opt::<String>("llm")?);
     set_some(&mut prompt, "temperature", ctx.inputs.opt::<f64>("temperature")?);
@@ -239,7 +239,7 @@ impl Document {
 
 /// `platform_settings` from the typed inputs, holding only what was
 /// set.
-fn platform_settings(ctx: &ExecutionContext) -> WeftResult<Value> {
+fn platform_settings(ctx: &RunContext) -> WeftResult<Value> {
     let mut platform = json!({});
     if let Some(items) = ctx.inputs.opt::<Map<String, Value>>("dataCollection")? {
         let mut collection = Map::new();

@@ -466,8 +466,8 @@ async fn verify_and_route(
     let named_event = topic.named_event(&event, &req.headers);
 
     // Routing follows the recipe's OWN declaration, never the
-    // verification scheme: `route_by` is the one switch (validation
-    // already ties `subscription` routing to a declared `id_path`).
+    // verification scheme: `routeBy` is the one switch (validation
+    // already ties `subscription` routing to a declared `idPath`).
     // The token-echo proof happens to look its subscription up during
     // verification; any other scheme routing by subscription looks it
     // up here, by the same (id, service, topic) key.
@@ -629,7 +629,7 @@ static JWKS_CACHE: tokio::sync::Mutex<
 const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Verify a signed OIDC identity token: signature against the keys
-/// published at the recipe's `jwks_url`, audience, expiry (the
+/// published at the recipe's `jwksUrl`, audience, expiry (the
 /// library refuses expired tokens), the recipe's issuers. Claim
 /// policy beyond that is [`check_identity_claims`]'s.
 async fn verify_identity_token(
@@ -716,7 +716,7 @@ mod tests {
             serde_json::json!({
                 "verify": { "kind": "oidc",
                             "issuers": ["https://accounts.google.com"],
-                            "jwks_url": "https://www.googleapis.com/oauth2/v3/certs" },
+                            "jwksUrl": "https://www.googleapis.com/oauth2/v3/certs" },
                 "decode": { "path": "message.data", "encoding": "base64_json" }
             }),
         )
@@ -746,8 +746,8 @@ mod tests {
         let recipe: weft_core::access::events::WebhookRecipe = serde_json::from_value(
             serde_json::json!({
                 "verify": { "kind": "hmac",
-                            "signature_header": "X-Slack-Signature",
-                            "timestamp_header": "X-Slack-Request-Timestamp",
+                            "signatureHeader": "X-Slack-Signature",
+                            "timestampHeader": "X-Slack-Request-Timestamp",
                             "concat": "v0:{timestamp}:{body}",
                             "prefix": "v0=" },
                 "decode": { "path": "payload", "encoding": "form_json" }

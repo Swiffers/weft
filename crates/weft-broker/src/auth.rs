@@ -6,7 +6,7 @@
 //! module's: a worker acts for its own project only; a weft role acts for
 //! any tenant, and says which of its surfaces a call is for in the
 //! `ROLE_HEADER`. The process replica a call comes from travels in the
-//! `REPLICA_HEADER`, and that is what ties a worker's claims, the execution it
+//! `REPLICA_HEADER`, and that is what ties a worker's claims, the run it
 //! drives and the journal rows it writes to one running copy.
 
 use std::num::NonZeroUsize;
@@ -241,14 +241,14 @@ pub async fn extract_identity(state: &Arc<BrokerState>, headers: &HeaderMap) -> 
 /// (`CallerAuth`), the identity behind the runtime-file plane's prefix
 /// wall:
 ///   - the dispatcher -> ControlPlane (the CLI admin verbs).
-///   - a worker -> Worker { tenant, project, execution }, verifying any
-///     claimed `execution_id` the way its records are: the run must be the
+///   - a worker -> Worker { tenant, project, run }, verifying any
+///     claimed `run_id` the way its records are: the run must be the
 ///     caller's project's, running, and driven by the calling replica.
 /// Any other weft role has no runtime-storage identity (403).
 pub async fn resolve_storage_caller(
     state: &Arc<BrokerState>,
     headers: &HeaderMap,
-    execution_id: Option<&str>,
+    run_id: Option<&str>,
 ) -> Result<weft_core::storage::key::CallerAuth, (StatusCode, String)> {
     use weft_core::storage::key::CallerAuth;
     match verified_principal(state, headers).await? {
@@ -258,41 +258,41 @@ pub async fn resolve_storage_caller(
         },
         Principal::Worker { tenant, project } => {
             let replica = replica_of(headers);
-            let (execution_id, instance) = match execution_id {
+            let (run_id, instance) = match run_id {
                 None => (None, None),
-                Some(execution_id) => {
-                    let parsed: weft_core::ExecutionId =
-                        execution_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("not an execution id: {e}")))?;
+                Some(run_id) => {
+                    let parsed: weft_core::RunId =
+                        run_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("not a run id: {e}")))?;
                     // The worker writes a run's record before any call that
                     // names it, so the row is there.
                     let row = sqlx::query_as::<_, (String, uuid::Uuid, Option<String>, Option<String>)>(
-                        "SELECT tenant_id, project_id, owner, instance_id FROM run WHERE execution_id = $1 AND state = 'running'",
+                        "SELECT tenant_id, project_id, owner, instance_id FROM run WHERE run_id = $1 AND state = 'running'",
                     )
                     .bind(parsed)
                     .fetch_optional(&state.pool)
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-                    let Some((execution_id_tenant, execution_id_project, owner, instance)) = row else {
+                    let Some((run_id_tenant, run_id_project, owner, instance)) = row else {
                         return Err((StatusCode::FORBIDDEN, "no such run is running".into()));
                     };
-                    if execution_id_tenant != tenant || execution_id_project != project {
+                    if run_id_tenant != tenant || run_id_project != project {
                         tracing::warn!(
                             target: "weft_broker::scope",
                             caller_project = %project,
-                            execution_id = %execution_id,
-                            "runtime storage rejected cross-project execution claim"
+                            run_id = %run_id,
+                            "runtime storage rejected cross-project run claim"
                         );
-                        return Err((StatusCode::FORBIDDEN, "execution belongs to a different project".into()));
+                        return Err((StatusCode::FORBIDDEN, "run belongs to a different project".into()));
                     }
                     // Same gate as its records: only the replica driving the
                     // run acts for it.
                     if replica.is_none() || owner.as_deref() != replica.as_deref() {
-                        return Err((StatusCode::FORBIDDEN, "execution is not driven by the calling replica".into()));
+                        return Err((StatusCode::FORBIDDEN, "run is not driven by the calling replica".into()));
                     }
-                    (Some(execution_id.to_string()), instance)
+                    (Some(run_id.to_string()), instance)
                 }
             };
-            Ok(CallerAuth::Worker { tenant, project_id: project.to_string(), execution_id, instance })
+            Ok(CallerAuth::Worker { tenant, project_id: project.to_string(), run_id, instance })
         }
         Principal::InfraCopy { .. } => Err(infra_copy_refused()),
     }

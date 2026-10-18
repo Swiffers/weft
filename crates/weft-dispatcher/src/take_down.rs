@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use weft_core::activation::ActivationKey;
 use weft_core::instance::InstanceId;
 use weft_core::running_policy::{DeactivateSpec, DeactivationMode, RunningPolicy};
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 use crate::activation_store::{ActivationLifecycle, LifecycleWrite, ProjectStatus, SignalsGoing};
 pub use weft_broker_client::activation::{DownWith, WentDown};
@@ -44,7 +44,7 @@ pub enum TakeDownAsker {
     /// A person, a lifecycle command or one of the dispatcher's loops.
     Outside,
     /// A program's run: never among the runs the take-down reaches.
-    Run(ExecutionId),
+    Run(RunId),
     /// A resync taking down the triggers it brings back, under its drive
     /// (`crate::task_kinds::resync::ResyncPlan::driver`): it goes through
     /// only while that drive holds the project.
@@ -53,7 +53,7 @@ pub enum TakeDownAsker {
 
 impl TakeDownAsker {
     /// The run that asked, if one did.
-    pub fn run(self) -> Option<ExecutionId> {
+    pub fn run(self) -> Option<RunId> {
         match self {
             TakeDownAsker::Run(run) => Some(run),
             TakeDownAsker::Outside | TakeDownAsker::Resync(_) => None,
@@ -83,7 +83,7 @@ pub enum TakenDown {
 /// What a take-down needs to know about one live run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFacts {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// Who the run is for.
     pub instance: Option<InstanceId>,
     /// The trigger that fired it (`None` for a run started by hand).
@@ -102,9 +102,9 @@ impl RunFacts {
 
 /// The live runs `target` reaches, never the run that asked (`asked_by`):
 /// that one's fate is its own `StopSelf`, carried out by the asker.
-pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by: Option<ExecutionId>) -> Vec<&'a RunFacts> {
+pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by: Option<RunId>) -> Vec<&'a RunFacts> {
     runs.iter()
-        .filter(|run| Some(run.execution_id) != asked_by)
+        .filter(|run| Some(run.run_id) != asked_by)
         .filter(|run| match target {
             TakeDownTarget::WholeProject => true,
             TakeDownTarget::Activations(keys) => keys.iter().any(|key| run.fired_by(key)),
@@ -119,10 +119,10 @@ pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by
 pub fn runs_using_copies<'a>(
     copies: &weft_core::instance::Copies,
     runs: &'a [RunFacts],
-    asked_by: Option<ExecutionId>,
+    asked_by: Option<RunId>,
 ) -> Vec<&'a RunFacts> {
     runs.iter()
-        .filter(|run| Some(run.execution_id) != asked_by)
+        .filter(|run| Some(run.run_id) != asked_by)
         .filter(|run| match copies {
             weft_core::instance::Copies::Instance(m) => run.instance.as_ref() == Some(m),
             weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => true,
@@ -149,17 +149,17 @@ pub fn landing_lifecycle(spec: &DeactivateSpec, now_unix: i64, went_down: Option
 /// Every run of the project that has not ended, with what a take-down
 /// needs to know.
 pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<RunFacts>> {
-    let rows: Vec<(ExecutionId, Option<String>, Option<String>, bool)> = sqlx::query_as(
-        "SELECT execution_id, instance_id, fired_by, state = 'parked' FROM run \
-         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, execution_id",
+    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT run_id, instance_id, fired_by, state = 'parked' FROM run \
+         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
     )
     .bind(project_id)
     .fetch_all(&state.pg_pool)
     .await?;
     rows.into_iter()
-        .map(|(execution_id, instance, fired_by, suspended)| {
-            let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {execution_id} holds a broken instance: {e}"))?;
-            Ok(RunFacts { execution_id, instance, fired_by, suspended })
+        .map(|(run_id, instance, fired_by, suspended)| {
+            let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {run_id} holds a broken instance: {e}"))?;
+            Ok(RunFacts { run_id, instance, fired_by, suspended })
         })
         .collect()
 }
@@ -257,16 +257,16 @@ pub async fn take_down(
     let runs = live_runs(state, project_id).await.map_err(|e| internal("live runs", e))?;
     let affected = affected_runs(target, &runs, asked_by);
 
-    let user = weft_core::exec::CancelCause::User;
+    let user = weft_core::run::CancelCause::User;
     if spec.mode == DeactivationMode::Wipe {
         // Every run the target reaches, parked ones too. Cancelling
         // strips a run's own waits.
-        let targets: Vec<(ExecutionId, &weft_core::exec::CancelCause)> = affected.iter().map(|r| (r.execution_id, &user)).collect();
-        crate::api::execution::cancel_execution_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
+        let targets: Vec<(RunId, &weft_core::run::CancelCause)> = affected.iter().map(|r| (r.run_id, &user)).collect();
+        crate::api::run::cancel_run_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
     } else if spec.running_policy == RunningPolicy::Cancel {
-        let targets: Vec<(ExecutionId, &weft_core::exec::CancelCause)> =
-            affected.iter().filter(|r| !r.suspended).map(|r| (r.execution_id, &user)).collect();
-        crate::api::execution::cancel_execution_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
+        let targets: Vec<(RunId, &weft_core::run::CancelCause)> =
+            affected.iter().filter(|r| !r.suspended).map(|r| (r.run_id, &user)).collect();
+        crate::api::run::cancel_run_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
     }
 
     // Nothing of the project takes work any more: its front goes.
@@ -291,9 +291,9 @@ mod tests {
     use super::*;
     use weft_core::instance::Owner;
 
-    fn run(execution_id: u128, instance: Option<&str>, fired_by: Option<&str>) -> RunFacts {
+    fn run(run_id: u128, instance: Option<&str>, fired_by: Option<&str>) -> RunFacts {
         RunFacts {
-            execution_id: ExecutionId::from_u128(execution_id),
+            run_id: RunId::from_u128(run_id),
             instance: instance.map(|m| InstanceId::new(m).unwrap()),
             fired_by: fired_by.map(str::to_string),
             suspended: false,
@@ -304,12 +304,12 @@ mod tests {
     fn an_instances_copy_going_reaches_that_instances_runs_and_never_the_asker() {
         let runs = [run(1, Some("a"), None), run(2, Some("b"), None), run(3, None, None), run(4, Some("a"), None)];
         let a = weft_core::instance::Copies::Instance(InstanceId::new("a").unwrap());
-        assert_eq!(execution_ids(runs_using_copies(&a, &runs, Some(ExecutionId::from_u128(4)))), vec![1]);
-        assert_eq!(execution_ids(runs_using_copies(&weft_core::instance::Copies::Shared, &runs, None)), vec![1, 2, 3, 4]);
+        assert_eq!(run_ids(runs_using_copies(&a, &runs, Some(RunId::from_u128(4)))), vec![1]);
+        assert_eq!(run_ids(runs_using_copies(&weft_core::instance::Copies::Shared, &runs, None)), vec![1, 2, 3, 4]);
     }
 
-    fn execution_ids(runs: Vec<&RunFacts>) -> Vec<u128> {
-        runs.into_iter().map(|r| r.execution_id.as_u128()).collect()
+    fn run_ids(runs: Vec<&RunFacts>) -> Vec<u128> {
+        runs.into_iter().map(|r| r.run_id.as_u128()).collect()
     }
 
     fn instance(id: &str) -> Owner {
@@ -329,9 +329,9 @@ mod tests {
             run(5, Some("a"), Some("cron")),
         ];
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", instance("a"))]);
-        assert_eq!(execution_ids(affected_runs(&target, &runs, None)), vec![1]);
+        assert_eq!(run_ids(affected_runs(&target, &runs, None)), vec![1]);
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", Owner::Shared)]);
-        assert_eq!(execution_ids(affected_runs(&target, &runs, None)), vec![3]);
+        assert_eq!(run_ids(affected_runs(&target, &runs, None)), vec![3]);
     }
 
     /// The whole project reaches every run, and the asker is never among
@@ -339,10 +339,10 @@ mod tests {
     #[test]
     fn the_asker_is_never_affected() {
         let runs = [run(1, Some("a"), Some("receive")), run(2, None, None)];
-        assert_eq!(execution_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, None)), vec![1, 2]);
-        assert_eq!(execution_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, Some(ExecutionId::from_u128(1)))), vec![2]);
+        assert_eq!(run_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, None)), vec![1, 2]);
+        assert_eq!(run_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, Some(RunId::from_u128(1)))), vec![2]);
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", instance("a"))]);
-        assert!(affected_runs(&target, &runs, Some(ExecutionId::from_u128(1))).is_empty());
+        assert!(affected_runs(&target, &runs, Some(RunId::from_u128(1))).is_empty());
     }
 
     #[test]

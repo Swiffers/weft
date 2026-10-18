@@ -1,15 +1,15 @@
 # Connecting an account
 
-A step that sends a Slack message needs a Slack account. You connect it once,
+A node that sends a Slack message needs a Slack account. You connect it once,
 weft keeps the credential, and your program passes around a reference to it
 rather than the secret itself.
 
 ## Do it in the graph
 
-A step that talks to an outside service has a blue **Connect Slack...** button
+A node that talks to an outside service has a blue **Connect Slack...** button
 in its body, named after whatever service it needs. Until you pick something,
-that step will not fold shut: where the fold arrow normally sits it says
-**Pick a connection first**.
+that node will not fold shut: the fold arrow is greyed out, and hovering it
+says **Pick a connection first**.
 
 Click it and you get your existing connections for that service, then, under
 **+ Add a connection**, the ways to make a new one:
@@ -41,35 +41,37 @@ application avoids it.
 weft connect
 ```
 
-Run it in the project folder, pick the step, and answer the prompts. `weft
+Run it in the project folder, pick the node, and answer the prompts. `weft
 connect --list` prints what is already stored and changes nothing. `weft
-connect --node account` goes straight to one step. `--disconnect` clears a
-step's pick and leaves the stored account alone, and `--forget <id>` deletes
+connect --node account` goes straight to one node. `--disconnect` clears a
+node's pick and leaves the stored account alone, and `--forget <id>` deletes
 the stored account for good.
 
 ## Picked on each install
 
-Which connection a step uses is kept by the install you picked it on, never
+Which connection a node uses is kept by the install you picked it on, never
 written in your `.weft` files. A connection lives in one install, so its id
 means nothing on another: your machine and your cloud each have their own
-accounts, and each keeps its own pick. If you want a step connected on your
+accounts, and each keeps its own pick. If you want a node connected on your
 cloud install, run `weft connect --on prod` there (it is the same
-walkthrough). A step inside a file you include twice is two steps, one per
+walkthrough). A node inside a file you include twice is two nodes, one per
 place, and each place gets its own pick.
 
-If you run a program with a step nobody connected on this install, the run
-is refused before it starts, naming the step and the `weft connect` that
-fixes it. `weft activate` and `weft resync` check every step of the program
+If you run a program with a node nobody connected on this install, the run
+is refused before it starts, naming the node and the `weft connect` that
+fixes it. `weft activate` and `weft resync` check every node of the program
 the same way before any trigger moves, so a missing pick is caught there and
 not at the first call. Forgetting a stored connection takes every pick of it
 with it.
 
-A pick is kept under the step's full address, and the file a step is written
+A pick is kept under the node's full address, and the file a node is written
 in is part of that address. So if you move `chat.weft` into a `studio/`
-folder, the step that was `chat.send.agent` is now `studio.chat.send.agent`,
-and its pick stays behind under the old name. weft never guesses where a step
-went. When a step of the same kind now has no pick, activating refuses and
-names both addresses:
+folder, the node that was `chat.send.agent` is now `studio.chat.send.agent`,
+and its pick stays behind under the old name. weft never guesses where a node
+went. If a node in the program can hold every field the old one kept (the same
+field, picked the same way, on the install or `@instance_filled`, and
+connecting to the same service; extra fields are fine) and nothing is stored
+for those fields there yet, activating refuses and names both addresses:
 
 ```
 'chat.send.agent' has connections or values stored on this install and is no
@@ -78,18 +80,19 @@ longer in the program; did you move it to 'studio.chat.send.agent'?
 ```
 
 `weft connect --move <old> <new>` carries the program's pick and every
-instance's values for that step across in one go. It refuses if the new step
-already has some, or if it takes different connections, since then it is not
-the same kind of step.
+instance's values for that node across in one go. It refuses if nothing is
+stored at the old address, if the new address is not in the program this
+install last built, if the new node already has something stored, or if it
+cannot hold every field the old one kept.
 
 If a build refuses a line like `account: {"id": "...", "identity": "..."}`
 with "that was the old way of connecting a node", the connection was written
-into the source by an older weft. Erase that line and connect the step again;
+into the source by an older weft. Erase that line and connect the node again;
 the install keeps the pick from then on.
 
-## Never paste a key into a step's field
+## Never paste a key into a node's field
 
-Values written into a step travel through the journal and render in the
+Values written into a node travel through the journal and render in the
 inspector as plain text, where anybody who can open the project reads them.
 That is also true of anything you paste into a chat with your assistant.
 
@@ -102,25 +105,24 @@ what moves along the wire is a small reference with no secret in it.
     "accessId": "connection-id",
     "service": "slack",
     "identity": "Acme Corp",
-    "requiresPermissions": ["chat:write"],
-    "requiresValues": []
+    "requiresPermissions": ["chat:write"]
   }
 }
 ```
 
-Every step that consumes it stamps on what it needs, and a connection that
-falls short is refused when the step opens it rather than failing halfway
-through a call.
+When a node consumes it, the runtime adds what that node needs onto it. When
+the node opens it, a missing stored value is refused, and so is a missing permission on a verified
+connection, rather than failing halfway through a call.
 
 ## What weft can tell you before a call fails
 
 Providers differ in how honest they are. Some state exactly what they granted,
-and weft blocks a step whose permission is missing. Others only confirm the
+and weft blocks a node whose permission is missing. Others only confirm the
 credential is alive, or say nothing at all until a real call comes back
 refused, and then weft lets the call through because it has nothing to block
 on.
 
-So a bad credential sometimes shows up for the first time when a step tries to
+So a bad credential sometimes shows up for the first time when a node tries to
 use it. For the whole picture, go and read
 [how connections work](../connections/how-they-work.md).
 

@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 
 use weft::storage::FileHandle;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct DownloadLinkNode;
@@ -26,7 +26,7 @@ impl Node for DownloadLinkNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // Validate the value carries a resolvable handle (key or url),
         // which is exactly what parsing into a FileHandle checks.
         let _handle: FileHandle = ctx.inputs.get("file")?;

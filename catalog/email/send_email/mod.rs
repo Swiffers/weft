@@ -9,7 +9,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SendEmailNode;
@@ -24,7 +24,7 @@ impl Node for SendEmailNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let to = weft::comma_list(ctx.inputs.list::<String>("to")?);
         let subject: String = ctx.inputs.get("subject")?;
@@ -73,7 +73,7 @@ impl Node for SendEmailNode {
         } else {
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&server.host)
         }
-        .map_err(|e| weft::WeftError::NodeExecution(format!("the SMTP server address is unusable: {e}")))?
+        .map_err(|e| weft::WeftError::NodeFailed(format!("the SMTP server address is unusable: {e}")))?
         .port(server.port)
         .credentials(Credentials::new(server.user, server.password))
         .build();
@@ -81,7 +81,7 @@ impl Node for SendEmailNode {
         transport
             .send(email)
             .await
-            .map_err(|e| weft::WeftError::NodeExecution(format!("the SMTP server refused the send: {e}")))?;
+            .map_err(|e| weft::WeftError::NodeFailed(format!("the SMTP server refused the send: {e}")))?;
 
         ctx.pulse_downstream(NodeOutput::new().set("messageId", message_id)).await
     }

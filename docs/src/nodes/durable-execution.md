@@ -95,8 +95,8 @@ the line (and the route does not outlive it), an unrecorded run, a run with a
 bus open. There, `ctx.await_signal` does not suspend. It holds in your call,
 on the same worker, and returns the answer when it comes, without replaying
 anything. If the run stays quiet for its trigger's `holdSecs`, the call fails
-with `WeftError::WaitGaveUp`, saying why. That is an outcome of your step
-like any other: if your node can do something sensible without the answer,
+with `WeftError::WaitGaveUp`, saying why. That is an outcome like any
+other: if your node can do something sensible without the answer,
 match it and carry on.
 
 ```rust
@@ -149,7 +149,7 @@ logic in ctx.run.
 If your body can take a different path on a replay, whatever decides that path
 goes inside a `ctx.run` so the decision is remembered rather than remade.
 
-## When the worker dies mid-step
+## When the worker dies mid-run
 
 What happens depends on the trigger's `durable` setting. For what that setting
 does, go and read [how a run is
@@ -159,10 +159,10 @@ kept](../language/triggers-and-routes.md#how-a-run-is-kept).
 again (go and read [what happens when something
 dies](../running/architecture.md#what-happens-when-something-dies)).
 
-**A durable run carries on in another worker.** Each step's start (except a
+**A durable run carries on in another worker.** Each node's start (except a
 pure node's, below) is on record before its body runs, so the next worker
-knows exactly which steps were running when the first one went away. weft cannot tell how much of such a
-step's work already happened, so the next worker fails it and says why:
+knows exactly which nodes were running when the first one went away. weft cannot tell how much of such a
+node's work already happened, so the next worker fails it and says why:
 
 ```text
 the worker running 'billing' went away while it was running; it was not run
@@ -170,37 +170,37 @@ again, because it may have partly happened. Re-run from here once you have
 checked what it did.
 ```
 
-A step that was reading a stream says `went away while it was reading a
+A node that was reading a stream says `went away while it was reading a
 stream` instead: the items it had read are gone from the stream, so the
 message tells you to run the whole run again to start the stream over.
 
-If you want to run that step again once you have checked, `weft run --from
+If you want to run that node again once you have checked, `weft run --from
 <node>=<json>` starts a run there with the inputs you hand it. If the node
 sets `catchErrors` and you wired its `error` output, this failure goes there
 like any other, and that branch carries on; otherwise the run fails.
 
-If the step that was running belongs to a pure node that does not read a
+If the node that was running is a pure one that does not read a
 stream, and had not passed a value on yet, the next worker runs it again instead of failing it. A
 pure node does nothing outside the run (for what that means, go and read the `pure` flag in
 [metadata.json](metadata.md#features)), so running it twice changes nothing. One that had passed a value on
-is failed like any step, because running it again would pass that value a
+is failed like any other, because running it again would pass that value a
 second time.
 
 A run parked whole on `ctx.await_signal` survives its worker even when it is
 fast, unless a caller is still on the line and its trigger leaves
 `outlivesCaller` off, or a bus between its nodes is open (for why, go and read [how a run is
-kept](../language/triggers-and-routes.md#how-a-run-is-kept)). When its answer comes, the waiting step replays from the top, and its
+kept](../language/triggers-and-routes.md#how-a-run-is-kept)). When its answer comes, the waiting node replays from the top, and its
 `ctx.run` calls give back their saved results. A fast run with one branch
 waiting while another still ran ends cancelled like any other fast run.
 
-In a durable run, if a step emitted a value before the crash and the step
+In a durable run, if a node emitted a value before the crash and the node
 reading it had not started yet, that value is still delivered and the reading
-step runs.
+node runs.
 
 ## When ctx.run cannot save its result
 
 `ctx.run` writes its result down after the closure finishes. If that write
-fails, the action has happened but nothing recorded it, and the step fails
+fails, the action has happened but nothing recorded it, and the node fails
 with:
 
 ```text
@@ -209,14 +209,14 @@ action may already have happened; inspect this run before repeating it.
 ```
 
 Two things are deliberately **not** wrapped, because they are already safe to
-repeat on a replay: `ctx.tag_execution` keeps its place in the order, and
+repeat on a replay: `ctx.tag_run` keeps its place in the order, and
 `ctx.stop_tagged` finds its targets already gone.
 
 ## What a resume actually does
 
 The new worker fetches your program by hash, reads the journal to see where the
-run had got to, and carries on from there: a step that was running is failed,
-a step that was waiting replays, and every step whose inputs are ready starts.
+run had got to, and carries on from there: a node that was running is failed,
+a node that was waiting replays, and every node whose inputs are ready starts.
 
 ## When the worker stays
 

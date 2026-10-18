@@ -39,7 +39,7 @@
       "rung": "reports_validity",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "guide": {
         "link": "https://platform.openai.com/api-keys",
         "steps": [
@@ -65,7 +65,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "connection",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",

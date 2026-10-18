@@ -42,10 +42,10 @@
 	let provided = $state<Record<string, string>>({});
 	let missing = $state<CrossingPort[]>([]);
 	/// Each input crossing into the run, under the start it is handed at:
-	/// the first start its value would pass (`hand_at`), which for a
+	/// the first start its value would pass (`handAt`), which for a
 	/// group inside another is that group, not the outer door the wire
 	/// lands on. One with no start on its way is listed on its own.
-	const handedAt = (port: CrossingPort) => port.hand_at ?? { node: port.node, port: port.port };
+	const handedAt = (port: CrossingPort) => port.handAt ?? { node: port.node, port: port.port };
 	const missingAt = (start: string) => missing.filter(port => handedAt(port).node === start);
 	const missingElsewhere = $derived(missing.filter(port => {
 		const at = handedAt(port).node;
@@ -174,7 +174,7 @@
 
 	/// Write it to `examples/` and nothing else. Saving used to run it
 	/// too, so writing down a spec you were not ready for started a real
-	/// execution.
+	/// run.
 	function save(): void {
 		const current = currentSpec();
 		if (current.badJson.length) {
@@ -292,6 +292,6 @@
 
 {#snippet crossings(ports: CrossingPort[], named = false)}
 	{#each ports as port}
-		<span class="text-amber-700">{named ? `${port.node}.${port.port}` : handedAt(port).port}: {port.needed_by ? `needed by ${port.needed_by}` : 'nothing in this run needs it'}{port.supplied ? ', supplied here' : ''}, fed upstream by {port.source_node}.{port.source_port}</span>
+		<span class="text-amber-700">{named ? `${port.node}.${port.port}` : handedAt(port).port}: {port.neededBy ? `needed by ${port.neededBy}` : 'nothing in this run needs it'}{port.supplied ? ', supplied here' : ''}, fed upstream by {port.sourceNode}.{port.sourcePort}</span>
 	{/each}
 {/snippet}

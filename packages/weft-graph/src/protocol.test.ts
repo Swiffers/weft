@@ -36,8 +36,8 @@ describe('parseFileValue', () => {
 
 	it('parses a key-backed file value from any concrete marker', () => {
 		for (const marker of ['__weft_image__', '__weft_video__', '__weft_audio__', '__weft_blob__']) {
-			const parsed = parseFileValue({ [marker]: { key: 'exec/c1/f1', ...meta } });
-			expect(parsed, marker).toEqual({ key: 'exec/c1/f1', ...meta });
+			const parsed = parseFileValue({ [marker]: { key: 'run/c1/f1', ...meta } });
+			expect(parsed, marker).toEqual({ key: 'run/c1/f1', ...meta });
 		}
 	});
 
@@ -56,7 +56,7 @@ describe('parseFileValue', () => {
 		expect(parseFileValue({ __weft_image__: { data: 'aGk=', ...meta } })).toBeNull();
 		expect(parseFileValue({ __weft_image__: { key: '', ...meta } })).toBeNull();
 		expect(parseFileValue({ notAMarker: { key: 'k', ...meta } })).toBeNull();
-		expect(parseFileValue('exec/c1/f1')).toBeNull();
+		expect(parseFileValue('run/c1/f1')).toBeNull();
 		expect(parseFileValue(null)).toBeNull();
 	});
 });
@@ -72,7 +72,7 @@ describe('catalog wire fixture', () => {
 		const fixture: CatalogEntry = {
 			type: 'Fixture', label: 'Fixture', description: 'd',
 			tags: ['a'], icon: 'Zap', color: '#123456',
-			requires_infra: true,
+			requiresInfra: true,
 			inputs: [
 				{ name: 'code', type: 'String', required: true, accepts: ['literal', 'wire'],
 				  widget: { kind: 'code', language: 'python' } },
@@ -85,7 +85,7 @@ describe('catalog wire fixture', () => {
 				  requiresScopes: ['s.read'], requiresValues: ['host'] },
 				{ name: 'sheet', type: 'String', accepts: ['literal', 'wire'],
 				  widget: { kind: 'remote_select', access: 'grant',
-				            sources: [{ kind: 'granted', from: 'sheets', label: 'label', value: 'id' }], depends_on: ['pick'] } },
+				            sources: [{ kind: 'granted', from: 'sheets', label: 'label', value: 'id' }], dependsOn: ['pick'] } },
 				{ name: 'img', type: 'Image', accepts: ['literal', 'wire'],
 				  widget: { kind: 'file_drop', type: 'Image', accept: 'image/png' } },
 			],

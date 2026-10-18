@@ -1,5 +1,5 @@
 //! Provider-side event subscriptions: the rows behind
-//! `route_by: subscription` services, and the declared subscribe /
+//! `routeBy: subscription` services, and the declared subscribe /
 //! renew / unsubscribe calls that keep them alive.
 //!
 //! One subscription serves one registered signal. Weft mints the id
@@ -287,7 +287,7 @@ pub async fn drop_subscriptions_for_signal(
     .await
 }
 
-/// The subscription a push names, for `route_by: subscription`
+/// The subscription a push names, for `routeBy: subscription`
 /// routing. Keyed by the minted id (an unguessable UUID weft minted;
 /// the token check on top of it is the verification) AND the
 /// endpoint's service + topic, so a push replayed at another
@@ -561,15 +561,15 @@ mod tests {
     #[test]
     fn params_never_replace_stored_or_minted_values() {
         let auth = BTreeMap::from([("token".to_string(), "t1".to_string())]);
-        let recipe = BTreeMap::from([("app_token".to_string(), "xapp".to_string())]);
+        let recipe = BTreeMap::from([("appToken".to_string(), "xapp".to_string())]);
 
         let fresh = BTreeMap::from([("target".to_string(), "file-9".to_string())]);
         let v = call_values(&auth, &recipe, &fresh).unwrap();
         assert_eq!(v["token"], "t1");
-        assert_eq!(v["app_token"], "xapp");
+        assert_eq!(v["appToken"], "xapp");
         assert_eq!(v["target"], "file-9");
 
-        for stolen in ["token", "app_token", MINTED_TOKEN] {
+        for stolen in ["token", "appToken", MINTED_TOKEN] {
             let params = BTreeMap::from([(stolen.to_string(), "override".to_string())]);
             let err = call_values(&auth, &recipe, &params).unwrap_err().to_string();
             assert!(err.contains(stolen), "{err}");

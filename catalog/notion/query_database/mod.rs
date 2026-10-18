@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::notion::{data_source_id, API};
 
@@ -23,7 +23,7 @@ impl Node for NotionQueryDatabaseNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let database: String = ctx.inputs.get("database")?;
         let source: Option<String> = ctx.inputs.opt("source")?;

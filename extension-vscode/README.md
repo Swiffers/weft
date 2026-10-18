@@ -4,7 +4,7 @@ The editor side of [Weft](https://weavemindai.github.io/weft/), a
 programming language and framework for AI orchestration: as flexible as
 an agent, as reliable as code. Open a `.weft` file and the extension
 shows it as a live graph; run it, and the graph lights up with the
-execution as it happens.
+run as it happens.
 
 Weft is made by [Weavemind](https://weavemind.ai) and developed in the
 open at [github.com/WeaveMindAI/weft](https://github.com/WeaveMindAI/weft).
@@ -16,7 +16,7 @@ open at [github.com/WeaveMindAI/weft](https://github.com/WeaveMindAI/weft).
   graph follows, change the graph and the text follows.
 - **Projects panel.** The projects registered with your local weft
   runtime, with run / stop / open right there.
-- **Executions panel.** Past and running executions, each one
+- **Runs panel.** Past and running runs, each one
   inspectable node by node in the graph.
 - **Live diagnostics.** The weft compiler checks your file as you
   type and reports through the Problems panel.

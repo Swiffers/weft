@@ -55,7 +55,7 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Config, Row};
 
 use weft::access::OpenedConnection;
-use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 /// Where and how to dial, read off the connection. Pure, so the
 /// vocabulary and every refusal are testable without a database.
@@ -138,7 +138,7 @@ async fn dial_with(config: &Config) -> WeftResult<(tokio_postgres::Client, Conne
         } else {
             ""
         };
-        WeftError::NodeExecution(format!("postgres: connect: {}{hint}", pg_detail(&e)))
+        WeftError::NodeFailed(format!("postgres: connect: {}{hint}", pg_detail(&e)))
     })
 }
 
@@ -233,7 +233,7 @@ async fn clear_session(client: &tokio_postgres::Client) -> Result<(), tokio_post
 /// worker holds for it: an idle one, or a new one dialed when none is
 /// idle. The connection task of a new one lives as long as the client
 /// does.
-pub async fn connect(ctx: &ExecutionContext, access: &weft::access::Access) -> WeftResult<Pooled> {
+pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftResult<Pooled> {
     let pool = ctx.shared(access, |opened| async move { Pool::new(&opened) }).with_limit(MOST_AT_ONCE).await?;
     loop {
         let idle = pool.idle.lock().expect("pool poisoned").pop();
@@ -262,7 +262,7 @@ pub async fn connect(ctx: &ExecutionContext, access: &weft::access::Access) -> W
 /// one for as long as it watches (it would hold a pooled one away from
 /// every other run). Its task ends when the client drops or the run is
 /// cancelled.
-pub async fn connect_alone(ctx: &ExecutionContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
+pub async fn connect_alone(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
     let (client, connection) = dial(conn).await?;
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
@@ -296,7 +296,7 @@ pub enum ListenEvent {
 /// the client drops or the run is cancelled, and the stream ends with
 /// it.
 pub async fn connect_listening(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     conn: &OpenedConnection,
     channel: &str,
 ) -> WeftResult<(tokio_postgres::Client, tokio::sync::mpsc::UnboundedReceiver<ListenEvent>)> {
@@ -334,7 +334,7 @@ pub async fn connect_listening(
     client
         .batch_execute(&format!("LISTEN {}", quote_ident(channel)?))
         .await
-        .map_err(|e| WeftError::NodeExecution(format!("postgres: LISTEN {channel}: {}", pg_detail(&e))))?;
+        .map_err(|e| WeftError::NodeFailed(format!("postgres: LISTEN {channel}: {}", pg_detail(&e))))?;
     Ok((client, rx))
 }
 

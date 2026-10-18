@@ -1,5 +1,5 @@
 <script lang="ts">
-	// `label` names WHAT is copied (e.g. "Copy execution state"): it becomes the
+	// `label` names WHAT is copied (e.g. "Copy run state"): it becomes the
 	// resting tooltip and the copied-confirmation. Omitted, the button falls back
 	// to the generic "Copy" / "Copied!".
 	let {

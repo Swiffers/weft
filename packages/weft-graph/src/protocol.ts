@@ -468,6 +468,7 @@ export interface NodeFeaturesWire {
   oneOfRequired?: string[][];
   canAddInputPorts?: boolean;
   canAddOutputPorts?: boolean;
+  addedPortsAreDataKeys?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
@@ -578,7 +579,7 @@ export interface GroupDefinition {
   /// enum (GroupKind), so a loop always carries its config and a
   /// payload missing `kind` fails Rust deserialization.
   kind: 'group' | 'loop' | 'call' | 'body';
-  /// Loop config fields (parallel/over/carry/max_iters/trim_on_mismatch).
+  /// Loop config fields (parallel/over/carry/maxIters/trimOnMismatch).
   /// Always present when `kind === 'loop'`, never for the others.
   loopConfig?: Record<string, unknown> | null;
   /// For a `call`: the id of the shared `body` group (the included
@@ -700,7 +701,7 @@ export interface CatalogEntry {
   color?: string;
   inputs: InputSpec[];
   outputs: OutputSpec[];
-  requires_infra?: boolean;
+  requiresInfra?: boolean;
   features?: NodeFeaturesWire;
   /** The node's declared inline per-firing display (a media player, a
    *  file card) and which port it shows. */
@@ -791,7 +792,7 @@ export type SpecFieldWire = {
 } & (
   | { shape: 'typed'; valueType: string }
   | { shape: 'value' }
-  | { shape: 'valueList' }
+  | { shape: 'value_list' }
   | { shape: 'number' }
   | { shape: 'element' }
   | { shape: 'regex' }
@@ -836,7 +837,7 @@ export interface ParseResponse {
 /// Why a firing did not run. A DECISION (the author's `_should_flow` said no)
 /// reads differently from a CONSEQUENCE (an input it needed never arrived), so
 /// the journal carries which one it was.
-// SYNC: SkipReason <-> crates/weft-core/src/exec/skip.rs SkipReason
+// SYNC: SkipReason <-> crates/weft-core/src/run/skip.rs SkipReason
 /// `failure` on a closure-caused reason is the failure the closure carried:
 /// the node skipped because something before it BROKE rather than
 /// declined, and its own closures went out with that same failure.
@@ -860,21 +861,21 @@ export interface Failure {
   error: string;
 }
 
-/// Why an execution was cancelled: a person, a sibling run's
+/// Why a run was cancelled: a person, a sibling run's
 /// `ctx.stop_tagged` (naming the run and the tag), the live caller
-/// dropping, the runtime itself, or a time limit running out. Rides the `execution_cancelled`
+/// dropping, the runtime itself, or a time limit running out. Rides the `run_cancelled`
 /// event beside its text `reason`; absent only on a journal row written
 /// before the field existed.
-// SYNC: CancelCause <-> crates/weft-core/src/exec/cancel.rs CancelCause
+// SYNC: CancelCause <-> crates/weft-core/src/run/cancel.rs CancelCause
 export type CancelCause =
   | { kind: 'user' }
-  | { kind: 'execution'; by: string; tag: string }
+  | { kind: 'run'; by: string; tag: string }
   | { kind: 'caller_gone' }
   | { kind: 'runtime'; detail: string }
   | { kind: 'limit'; detail: string };
 
 /// The port every node carries, deciding whether it runs at all.
-// SYNC: SHOULD_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
+// SYNC: SHOULD_FLOW_PORT <-> crates/weft-core/src/run/skip.rs SHOULD_FLOW_PORT,
 // docs/src/language/syntax.md (reserved keys),
 // packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
 export const SHOULD_FLOW_PORT = '_should_flow';
@@ -883,7 +884,7 @@ export const SHOULD_FLOW_PORT = '_should_flow';
 /// wired here did NOT happen (a closed input is the yes). A node uses
 /// one spelling or the other; wiring both is a compile error, so the
 /// editor draws ONE gate port and toggles which name it wires.
-// SYNC: SHOULD_NOT_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_NOT_FLOW_PORT,
+// SYNC: SHOULD_NOT_FLOW_PORT <-> crates/weft-core/src/run/skip.rs SHOULD_NOT_FLOW_PORT,
 // docs/src/language/syntax.md (reserved keys),
 // packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
 export const SHOULD_NOT_FLOW_PORT = '_should_not_flow';
@@ -893,14 +894,14 @@ export function isGatePort(name: string): boolean {
   return name === SHOULD_FLOW_PORT || name === SHOULD_NOT_FLOW_PORT;
 }
 
-// SYNC: NodeExecutionStatus <-> crates/weft-core/src/exec/execution.rs NodeExecutionStatus
+// SYNC: NodeFiringStatus <-> crates/weft-core/src/run/firing.rs NodeFiringStatus
 /// Adding a state requires adding it on both sides; the UI lookup
 /// tables in `webview/lib/utils/status.ts` exhaust this union so
 /// drift compiles as an error. The earlier shape had ghost variants
 /// (`pending` / `suspended` / `accumulating`) the dispatcher never
 /// emitted; they painted states the engine could not produce and
 /// `suspended` doubled-up with the real `waiting_for_input` event.
-export type NodeExecutionStatus =
+export type NodeFiringStatus =
   | 'running'
   | 'waiting_for_input'
   | 'completed'
@@ -913,10 +914,10 @@ export type NodeExecutionStatus =
 // messages when we need them.
 //
 // `input` and `output` carry the per-node payload verbatim from
-// the dispatcher event when the exec follower has it. The modal
+// the dispatcher event when the run follower has it. The modal
 // inspector renders them as JSON trees; without these filled in
 // it falls back to "(none)" for every node, even when the
-// execution actually moved data.
+// run actually moved data.
 
 /// One level of the dynamic structure a firing is inside: an iteration
 /// of a loop (`{index}`), or a call of an included file through the site
@@ -1005,10 +1006,10 @@ export interface ConnectionHandle {
 // SYNC: Picks <-> crates/weft-core/src/picks.rs Picks
 export type Picks = Record<string, Record<string, ConnectionHandle>>;
 
-/// One pick to keep: `connection` for `field` of the node at `step`.
+/// One pick to keep: `connection` for `field` of the node at `node`.
 // SYNC: PickInput <-> crates/weft-core/src/picks.rs PickInput
 export interface PickInput {
-  step: string;
+  node: string;
   field: string;
   connection: string;
   service: string;
@@ -1018,7 +1019,7 @@ export interface PickInput {
 // SYNC: ChangePicks <-> crates/weft-core/src/picks.rs ChangePicks
 export interface ChangePicks {
   set?: PickInput[];
-  clear?: { step: string; field: string }[];
+  clear?: { node: string; field: string }[];
 }
 
 /// The literal `@instance_filled` (or `@instance_filled(<fallback>)`) lowers to.
@@ -1085,9 +1086,9 @@ export interface Seed {
 import type { RunSpec, ResolveSpecResponse } from './run-spec';
 export type { RunSpec, ResolveSpecResponse } from './run-spec';
 
-export interface NodeExecEvent {
+export interface NodeFiringEvent {
   nodeId: string;
-  state: NodeExecutionStatus;
+  state: NodeFiringStatus;
   /// The journal's stamp for this transition (unix seconds), so a
   /// replay renders when the firing started and ended rather than
   /// when it was read.
@@ -1100,7 +1101,7 @@ export interface NodeExecEvent {
   resumed?: boolean;
   /// Frame stack: empty when the firing is not inside any loop;
   /// `[{index:2}]` when inside iteration 2 of a single loop; nested
-  /// loops extend the array. Used as part of the execution-card key so
+  /// loops extend the array. Used as part of the run-card key so
   /// parallel iterations don't cross-correlate.
   frames: Frame[];
   error?: string;
@@ -1118,7 +1119,7 @@ export interface NodeExecEvent {
   /// needed closed) with it.
   skipReason?: SkipReason;
   output?: unknown;
-  /// The run this firing was taken from when the execution was seeded
+  /// The run this firing was taken from when the run was seeded
   /// (`weft run --seed`) and reused it instead of firing the node
   /// again. The graph marks the node inherited. Absent on the run's
   /// own firings.
@@ -1129,7 +1130,7 @@ export interface NodeExecEvent {
   /// them as provided by hand.
   // SYNC: providedPorts <-> crates/weft-core/src/live_event.rs DispatcherEvent provided_ports
   providedPorts?: string[];
-  // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
+  // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
   backupPorts?: string[];
   inheritedPorts?: Record<string, string>;
 }
@@ -1148,13 +1149,13 @@ export type LoopTerminationReason =
   | 'failed';
 
 export type LoopInspectorEvent =
-  // SYNC: LoopInspectorEvent 'instantiated' <-> crates/weft-core/src/live_event.rs LoopInstantiated, extension-vscode/src/execFollower.ts loop_instantiated
+  // SYNC: LoopInspectorEvent 'instantiated' <-> crates/weft-core/src/live_event.rs LoopInstantiated, extension-vscode/src/runFollower.ts loop_instantiated
   | {
       kind: 'instantiated';
       groupId: string;
       parentFrames: Frame[];
       /// Effective iteration cap; null for an uncapped loop (done- or
-      /// stream-driven with no max_iters), whose count is unknowable
+      /// stream-driven with no maxIters), whose count is unknowable
       /// up front.
       iterCap: number | null;
       parallel: boolean;
@@ -1198,8 +1199,8 @@ export type WirePayload =
   | { kind: 'json'; data: unknown }
   | { kind: 'bytes'; data: string };
 
-// SYNC: BusInspectorEvent 'message' <-> crates/weft-core/src/bus.rs WindowedBusMessage, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' messages
-// SYNC: BusInspectorEvent 'window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' totals
+// SYNC: BusInspectorEvent 'message' <-> crates/weft-core/src/bus.rs WindowedBusMessage, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' messages
+// SYNC: BusInspectorEvent 'window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' totals
 export type BusInspectorEvent =
   | { kind: 'joined'; busId: string; offset: number; name: string; atUnix: number }
   | { kind: 'left'; busId: string; offset: number; name: string; atUnix: number }
@@ -1223,7 +1224,7 @@ export type BusInspectorEvent =
   /// from <sender>"). `offset` is the window's first offset (the
   /// dedup key the log store uses). Journaled buses never produce
   /// this: their windows unpack into per-message `message` events.
-  // SYNC: BusInspectorEvent 'window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
+  // SYNC: BusInspectorEvent 'window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window'
   | {
       kind: 'window';
       busId: string;
@@ -1235,7 +1236,7 @@ export type BusInspectorEvent =
   | { kind: 'closed'; busId: string; offset: number; atUnix: number };
 
 /// One live-caller-connection event the inspector replays. One caller
-/// per execution (no busId; the execution id is the identity).
+/// per run (no busId; the run id is the identity).
 /// `payload` is the same tagged `WirePayload` shape a bus window's
 /// messages carry.
 /// Which way one message of the conversation went. A bus names its
@@ -1258,7 +1259,7 @@ export interface WindowedCallerMessage {
   atUnix: number;
 }
 
-// SYNC: CallerInspectorEvent 'window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-core/src/live_event.rs CallerWindow, extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+// SYNC: CallerInspectorEvent 'window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-core/src/live_event.rs CallerWindow, extension-vscode/src/runFollower.ts DispatcherEvent 'caller_window'
 export type CallerInspectorEvent =
   | { kind: 'connected'; offset: number; protocol: string; atUnix: number }
   | {
@@ -1363,7 +1364,7 @@ export type NodeFeedState =
 //
 // Backend state flows to the webview through exactly two channels:
 //   - actionBarState: the host's state-machine projection (idle /
-//     cli_running / execution_running / error). Driven by status
+//     cli_running / run_running / error). Driven by status
 //     fetches + CLI NDJSON events.
 //   - statusSnapshot: the latest `weft status --json` payload
 //     (drift bits, available actions, per-node infra status). Used
@@ -1425,7 +1426,7 @@ export interface ActionAvailability {
   /// - `definitionDrift`: runtime project shape changed (topology,
   ///   per-node configs). Resolved by Resync (a new project_definition
   ///   row + pointer advance; the running worker keeps the old
-  ///   shape, the next execution picks up the new).
+  ///   shape, the next run picks up the new).
   /// - `infraDrift`: infra-closure changed. Resolved by Upgrade.
   binaryDrift: boolean;
   definitionDrift: boolean;
@@ -1455,8 +1456,8 @@ export interface ActionAvailability {
   /// Unix-second deadline after which fires flip from parked to
   /// refused. Only set during hibernate's grace window.
   firesDeadlineUnix?: number;
-  /// Count of running, non-suspended executions. Drives the
-  /// deactivating-state UI: shows "draining N executions...".
+  /// Count of running, non-suspended runs. Drives the
+  /// deactivating-state UI: shows "draining N runs...".
   runningCount: number;
   /// The program's own triggers that are off while the project is
   /// active (an infra stop took down the ones reading it): what the
@@ -1538,10 +1539,10 @@ export type CliPhase =
   | 'trigger_register_start'
   | 'trigger_register_done'
   /// Periodic heartbeat while an infra verb waits on the supervisor
-  /// (unbounded: draining executions). Detail carries `elapsedSeconds`.
+  /// (unbounded: draining runs). Detail carries `elapsedSeconds`.
   | 'infra_wait'
   /// The call about to be made will wait for the project's running
-  /// executions to finish before it lands. Detail carries `capSeconds`
+  /// runs to finish before it lands. Detail carries `capSeconds`
   /// when the person set a cap. Sent before the call, because the wait
   /// happens on the dispatcher: without it the command looks hung.
   | 'drain_wait'
@@ -1559,7 +1560,7 @@ export type BarPhase = CliPhase | 'preflight';
 
 /// One NDJSON line emitted by the CLI in --json mode.
 export interface CliEvent {
-  ts_unix: number;
+  tsUnix: number;
   /// Absent on the one event a verb with no progress channel (a reader
   /// such as `events` or `logs`) emits under `--json`: its `error`.
   verb?: ActionVerb;
@@ -1576,8 +1577,8 @@ export interface CliEvent {
 ///
 ///   2. `overlay`: what user-action the bar is currently locked
 ///      into. `idle` when waiting for input, `cli_running` while a
-///      CLI verb is in flight, `execution_running` when the user is
-///      following a live execution, `pending` while an HTTP verb
+///      CLI verb is in flight, `run_running` when the user is
+///      following a live run, `pending` while an HTTP verb
 ///      (Stop) awaits backend confirmation. Exactly one slot owns
 ///      the spinner per overlay; sibling slots stay readable but
 ///      may disable their actions to avoid conflicts.
@@ -1588,8 +1589,8 @@ export interface CliEvent {
 ///
 /// Transitions:
 ///   - status fetch result      -> backend updated, overlay unchanged
-///   - SSE execution_started    -> overlay may flip to execution_running
-///   - SSE execution_finished   -> overlay flips back to idle
+///   - SSE run_started    -> overlay may flip to run_running
+///   - SSE run_finished   -> overlay flips back to idle
 ///   - CLI start                -> overlay = cli_running
 ///   - CLI complete             -> overlay = idle
 ///   - CLI error                -> overlay = idle, error set
@@ -1614,7 +1615,7 @@ export type ActionBarState = {
 /// spawned, then everything the CLI wrote to stderr (cargo, docker, the
 /// supervisor's progress) and any stdout line that was not an NDJSON
 /// event. That is the part of a verb nobody can see from the graph. A
-/// run's execution log is NOT in here: it arrives over SSE and the graph
+/// run's own log is NOT in here: it arrives over SSE and the graph
 /// already paints it.
 ///
 /// Set when a verb starts, appended to as it prints, dropped when the
@@ -1791,7 +1792,7 @@ export type InfraRollup =
 export type ActionBarOverlay =
   | { kind: 'idle' }
   | { kind: 'cli_running'; verb: ActionVerb; phase: BarPhase; detail?: Record<string, unknown> }
-  | { kind: 'execution_running'; executionId: string }
+  | { kind: 'run_running'; runId: string }
   | { kind: 'pending'; verb: ActionVerb; message: string };
 
 /// A verb whose trigger-deactivation choice the dispatcher may ask for.
@@ -1891,25 +1892,25 @@ export type HostMessage =
   /// The run reached a terminal. A cancel carries WHY (`reason` is the
   /// text, `cause` the structured value), so a run stopped by a sibling
   /// through `ctx.stop_tagged` reads as that, never as a bare failure.
-  | { kind: 'execTerminal'; executionId: string; state: 'completed' | 'failed' | 'cancelled'; reason?: string; cause?: CancelCause; atUnix: number }
-  /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
+  | { kind: 'runTerminal'; runId: string; state: 'completed' | 'failed' | 'cancelled'; reason?: string; cause?: CancelCause; atUnix: number }
+  /// The run tagged itself (`ctx.tag_run`). `tags` is one call's
   /// list; the webview accumulates the run's set.
-  | { kind: 'execTags'; executionId: string; tags: string[] }
+  | { kind: 'runTags'; runId: string; tags: string[] }
   /// The run's scope, off its birth row: the places it is held to
   /// (`locatedKey`s; `null` = the whole graph), so every other node
   /// paints as not in this run, and the run it was seeded from with
   /// what it re-ran.
-  // SYNC: execScope <-> crates/weft-core/src/live_event.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
-  | { kind: 'execScope'; executionId: string; subgraph: string[] | null; seed: Seed | null }
+  // SYNC: runScope <-> crates/weft-core/src/live_event.rs DispatcherEvent::RunStarted (subgraph, seed)
+  | { kind: 'runScope'; runId: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
   /// disk are (`null` when the disk matches no recorded version), so the
   /// graph can say "this run is from version X, your code differs".
-  | { kind: 'execVersion'; executionId: string; version: string | null; diskVersion: string | null }
+  | { kind: 'runVersion'; runId: string; version: string | null; diskVersion: string | null }
   /// No run is on screen any more: the person stopped looking at one,
   /// or the one they were looking at was deleted. Everything a run
   /// painted (statuses, values, scope dimming, the version banner)
   /// goes, and the canvas waits for the next run to start.
-  | { kind: 'execCleared' }
+  | { kind: 'runCleared' }
   /// The answer to a `resolveSpec` request.
   | { kind: 'specResolved'; requestId: number; result: ResolveSpecResponse }
   /// The project's `examples/*.json`, for the Run menu.
@@ -1924,7 +1925,7 @@ export type HostMessage =
   /// the whole catalog is missing; `warnings` carries per-node soft
   /// failures when the catalog loaded but some nodes were skipped.
   | { kind: 'catalogError'; error?: string; warnings?: string[] }
-  | { kind: 'execEvent'; event: NodeExecEvent }
+  | { kind: 'firingEvent'; event: NodeFiringEvent }
   /// One metered call's cost record for a firing (a provider meter's
   /// figure). `costId` is the record's stable identity: the same record can
   /// arrive via both the replay and the live stream, so the reducer dedups
@@ -1936,14 +1937,14 @@ export type HostMessage =
   /// this run was seeded from that one and reused its work: the money
   /// is real but it was not spent again, so a total that adds it is
   /// counting it twice.
-  // SYNC: execCost <-> extension-vscode/src/execFollower.ts DispatcherEvent 'cost_reported', crates/weft-core/src/live_event.rs CostReported
-  | { kind: 'execCost'; nodeId: string; frames: Frame[]; costId: string; service: string; inheritedFrom: string | null; amountUsd: number | null; origin: CredentialOwner }
+  // SYNC: runCost <-> extension-vscode/src/runFollower.ts DispatcherEvent 'cost_reported', crates/weft-core/src/live_event.rs CostReported
+  | { kind: 'runCost'; nodeId: string; frames: Frame[]; costId: string; service: string; inheritedFrom: string | null; amountUsd: number | null; origin: CredentialOwner }
   /// One change a firing made to a stored file's content in place, for
   /// the inspector's "Files edited" card. The same change can arrive via
   /// both the replay and the live stream; the reducer dedups on the file's
   /// key and the version the change produced (each version is reached
-  /// once). `inheritedFrom` as on `execCost`.
-  // SYNC: execFileEdit <-> extension-vscode/src/execFollower.ts DispatcherEvent 'file_edited', crates/weft-core/src/live_event.rs FileEdited
+  /// once). `inheritedFrom` as on `runCost`.
+  // SYNC: execFileEdit <-> extension-vscode/src/runFollower.ts DispatcherEvent 'file_edited', crates/weft-core/src/live_event.rs FileEdited
   | { kind: 'execFileEdit'; nodeId: string; frames: Frame[]; inheritedFrom: string | null; edit: FileEditWire }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
@@ -1952,7 +1953,7 @@ export type HostMessage =
   /// graph, not of the live bus stream.
   | { kind: 'busEvent'; event: BusInspectorEvent }
   /// One live-caller-connection event (live or replay). One caller per
-  /// execution, so unlike `busEvent` there is no busId; the inspector
+  /// run, so unlike `busEvent` there is no busId; the inspector
   /// renders a single "caller" panel for the run replaying what the
   /// program said to and heard from the caller.
   | { kind: 'callerEvent'; event: CallerInspectorEvent }
@@ -1968,8 +1969,8 @@ export type HostMessage =
   /// One journal row the dispatcher could not apply during fold
   /// (replay-time corruption check). The inspector aggregates these
   /// into a muted "N journal rows corrupted" line; not alarming,
-  /// not red, just visible if the user looks. Per-execution; the
-  /// webview groups by execution and renders the list
+  /// not red, just visible if the user looks. Per-run; the
+  /// webview groups by run and renders the list
   /// behind a collapsed disclosure.
   | { kind: 'journalCorruption'; site: CorruptionSite; reason: string }
   /// What one node is showing, off its `/live`: the container's for an
@@ -1977,20 +1978,20 @@ export type HostMessage =
   /// node's body panel.
   | ({ kind: 'nodeDisplay'; nodeId: string } & NodeFeedState)
   | { kind: 'followStatus'; status: FollowStatus }
-  /// The live execution SSE stream ended or broke before the
-  /// execution reached a terminal state. `reason` is 'closed' (server
+  /// The live run SSE stream ended or broke before the
+  /// run reached a terminal state. `reason` is 'closed' (server
   /// cleanly ended the stream) or 'error' (connection/read failure).
-  /// The webview stops presenting the execution as live (so it isn't
+  /// The webview stops presenting the run as live (so it isn't
   /// stuck showing "running" forever) WITHOUT falsely marking nodes
   /// completed: the per-node rows keep their last known state, the
-  /// run is just no longer being followed. Distinct from execTerminal
-  /// (which IS the run finishing) and from execReset (a fresh follow).
-  | { kind: 'followLost'; executionId: string; reason: 'closed' | 'error' }
-  | { kind: 'execReset' }
+  /// run is just no longer being followed. Distinct from runTerminal
+  /// (which IS the run finishing) and from runReset (a fresh follow).
+  | { kind: 'followLost'; runId: string; reason: 'closed' | 'error' }
+  | { kind: 'runReset' }
   /// Pushed from the host whenever the action-bar state machine
   /// transitions. The webview is a pure renderer that reads the
   /// latest state from this message. State transitions come from
-  /// either status fetches (idle/execution_running) or live CLI
+  /// either status fetches (idle/run_running) or live CLI
   /// events (cli_running/error/complete).
   | { kind: 'actionBarState'; state: ActionBarState }
   /// Latest `weft status --json` snapshot. Drives the action bar's
@@ -2033,17 +2034,17 @@ export type HostMessage =
 ///   - off: no run on the canvas; runs that start are counted.
 export type FollowMode = 'following' | 'locked' | 'off';
 
-/// What an execution is for: a run of the graph (`fire`), or the setup
+/// What a run is for: a run of the graph (`fire`), or the setup
 /// an `infra start` (`infra_setup`) or an activation (`trigger_setup`)
 /// runs. The action bar shows a setup as its verb working, never as a
 /// run to stop.
-// SYNC: EXECUTION_PHASES <-> crates/weft-core/src/primitive.rs Phase
-export const EXECUTION_PHASES = ['fire', 'trigger_setup', 'infra_setup'] as const;
-export type ExecutionPhase = (typeof EXECUTION_PHASES)[number];
+// SYNC: RUN_PHASES <-> crates/weft-core/src/primitive.rs Phase
+export const RUN_PHASES = ['fire', 'trigger_setup', 'infra_setup'] as const;
+export type RunPhase = (typeof RUN_PHASES)[number];
 
 export interface FollowStatus {
   mode: FollowMode;
-  executionId: string | undefined;
+  runId: string | undefined;
   /// Runs that started while not following, so not shown.
   pendingCount: number;
 }
@@ -2093,7 +2094,7 @@ export type WebviewMessage =
   | { kind: 'saveFileRef'; path: string; content: string }
   /// Navigate into an `@include`d file (project-root-relative path). `alias`
   /// is the include node's id (the call-site name), accumulated into the
-  /// execution-id prefix so journal values for the sub-graph (keyed
+  /// run-id prefix so journal values for the sub-graph (keyed
   /// `alias.node`) render when navigated in. The host opens that file's graph
   /// in the same panel and pushes the current view onto a back-stack.
   | { kind: 'openInclude'; path: string; alias: string }
@@ -2113,7 +2114,7 @@ export type WebviewMessage =
   /// dialog resolves the spec WITH seeding to decide it is runnable.
   | { kind: 'runSpec'; spec: RunSpec; seeded?: boolean }
   /// Write a spec to `examples/<name>.json` and nothing else. Saving used
-  /// to run it too, so writing one down started a real execution.
+  /// to run it too, so writing one down started a real run.
   | { kind: 'saveSpec'; spec: RunSpec }
   /// Run `examples/<name>.json` (`weft run <name>`).
   | { kind: 'runSpecFile'; name: string }
@@ -2152,7 +2153,7 @@ export type WebviewMessage =
   /// User clicked Cancel Running while the project is in the
   /// `deactivating` state. Host shells out to `weft cancel-running`,
   /// which POSTs the dispatcher's dedicated `/cancel-running`
-  /// endpoint. That cancels every running, non-suspended execution;
+  /// endpoint. That cancels every running, non-suspended run;
   /// the lifecycle target the original deactivate wrote stays in
   /// place; the drain-watcher CASes status to inactive once the
   /// running set empties.
@@ -2160,7 +2161,7 @@ export type WebviewMessage =
   /// User clicked Cancel during status=Activating. Host shells out
   /// to `weft cancel-activate`, which POSTs the dispatcher's
   /// `/cancel-activate` endpoint. That cancels the TriggerSetup
-  /// execution, wipes every signal row registered so far, CAS-flips
+  /// run, wipes every signal row registered so far, CAS-flips
   /// status Activating → Inactive.
   | { kind: 'cancelActivate' }
   /// User clicked Resume Active while in `deactivating`. Host POSTs
@@ -2189,13 +2190,13 @@ export type WebviewMessage =
   /// The person picked a follow mode on the toolbar toggle (or the
   /// "new runs" chip, which picks `following`).
   | { kind: 'followSetMode'; mode: FollowMode }
-  /// Replay a PAST execution onto the canvas: the host loads that execution's
-  /// recorded events and feeds them as the editor's execution state (so the
-  /// graph shows that run's final node statuses + outputs). `executionId` is the
-  /// execution to replay, or `null` to drop the replay and return to live
-  /// follow. A host that surfaces past executions another way (the VS Code
+  /// Replay a PAST run onto the canvas: the host loads that run's
+  /// recorded events and feeds them as the editor's run state (so the
+  /// graph shows that run's final node statuses + outputs). `runId` is the
+  /// run to replay, or `null` to drop the replay and return to live
+  /// follow. A host that surfaces past runs another way (the VS Code
   /// extension has its own history) leaves this unhandled.
-  | { kind: 'replayExecution'; executionId: string | null }
+  | { kind: 'replayRun'; runId: string | null }
   /// User clicked a diagnostic's file:line:column in the error details
   /// modal. Host opens that file as a text tab beside the graph with the
   /// cursor on the position; a tab already showing the file is revealed
@@ -2204,7 +2205,7 @@ export type WebviewMessage =
   /// User clicked the action bar's Stop / Cancel affordance. The
   /// host inspects the current ActionBarState to decide:
   ///   - cli_running       -> SIGTERM the spawned CLI process group.
-  ///   - execution_running -> POST /executions/{executionId}/cancel.
+  ///   - run_running -> POST /runs/{runId}/cancel.
   ///   - any other state   -> ignored (button shouldn't be shown).
   | { kind: 'stopAction' }
   /// User pressed a button one of a node's display items carries
@@ -2360,22 +2361,22 @@ export type EditOp =
   // (a wired-only port's literal next to a same-named config field):
   // 'inline' touches only the braces field, 'connection' only the
   // statement line. Absent auto-routes (prefers the statement).
-  | { op: 'setConfig'; node: string; key: string; value: string; form?: 'inline' | 'connection' }
-  | { op: 'removeConfig'; node: string; key: string; form?: 'inline' | 'connection' }
-  | { op: 'setLabel'; node: string; label: string | null }
+  | { op: 'set_config'; node: string; key: string; value: string; form?: 'inline' | 'connection' }
+  | { op: 'remove_config'; node: string; key: string; form?: 'inline' | 'connection' }
+  | { op: 'set_label'; node: string; label: string | null }
   // Add or remove the node's `@per_instance` line: the node then exists
   // once per instance of the program. Offered only on a node that may
   // carry it (`canBePerInstance`).
-  | { op: 'setPerInstance'; node: string; perInstance: boolean }
-  | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
-  | { op: 'removeNode'; node: string }
-  | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null; path?: string[] }
-  | { op: 'removeEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
-  | { op: 'addGroup'; label: string; parentGroup: string | null }
-  | { op: 'removeGroup'; group: string }
-  | { op: 'renameGroup'; group: string; newLabel: string }
-  | { op: 'moveNodeScope'; node: string; targetGroup: string | null }
-  | { op: 'moveGroupScope'; group: string; targetGroup: string | null }
+  | { op: 'set_per_instance'; node: string; perInstance: boolean }
+  | { op: 'add_node'; id: string; nodeType: string; parentGroup: string | null }
+  | { op: 'remove_node'; node: string }
+  | { op: 'add_edge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null; path?: string[] }
+  | { op: 'remove_edge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
+  | { op: 'add_group'; label: string; parentGroup: string | null }
+  | { op: 'remove_group'; group: string }
+  | { op: 'rename_group'; group: string; newLabel: string }
+  | { op: 'move_node_scope'; node: string; targetGroup: string | null }
+  | { op: 'move_group_scope'; group: string; targetGroup: string | null }
   // A NODE's header declares only its CUSTOM/OVERRIDDEN ports (the catalog
   // provides the node type's own), so `inputs`/`outputs` carry that surface
   // and `removedInputs`/`removedOutputs` name the ports the gesture DELETED:
@@ -2388,26 +2389,26 @@ export type EditOp =
   // The removed lists are REQUIRED (empty when nothing was deleted): an
   // omitted list would read as "sweep nothing" and leave a deleted
   // port's wires in source, silently; Rust refuses a missing one too.
-  // SYNC: EditOp updateNodePorts <-> crates/weft-compiler/src/edit.rs EditOp::UpdateNodePorts
-  | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[]; removedInputs: string[]; removedOutputs: string[]; revertedInputs: RevertedPortSig[]; revertedOutputs: RevertedPortSig[] }
-  | { op: 'updateGroupPorts'; group: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  // SYNC: EditOp update_node_ports <-> crates/weft-compiler/src/edit.rs EditOp::UpdateNodePorts
+  | { op: 'update_node_ports'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[]; removedInputs: string[]; removedOutputs: string[]; revertedInputs: RevertedPortSig[]; revertedOutputs: RevertedPortSig[] }
+  | { op: 'update_group_ports'; group: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
   // A group's description is the plain `# ...` comment on its first body line
   // (the single description concept; the old single-file `# Project:` header is
   // dropped, a file's identity is its filename). `description: null` clears it.
-  | { op: 'setGroupDescription'; group: string; description: string | null }
+  | { op: 'set_group_description'; group: string; description: string | null }
   // Loop ops mirror the Rust EditOp variants.
-  | { op: 'addLoop'; label: string; parentGroup: string | null }
-  | { op: 'removeLoop'; loopId: string }
-  | { op: 'renameLoop'; loopId: string; newLabel: string }
-  | { op: 'moveLoopScope'; loopId: string; targetGroup: string | null }
-  | { op: 'updateLoopPorts'; loopId: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  | { op: 'add_loop'; label: string; parentGroup: string | null }
+  | { op: 'remove_loop'; loopId: string }
+  | { op: 'rename_loop'; loopId: string; newLabel: string }
+  | { op: 'move_loop_scope'; loopId: string; targetGroup: string | null }
+  | { op: 'update_loop_ports'; loopId: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
   // Rewrite which SOURCE FORM a body-set port value is written in
   // ('inline' = a `key: value` braces field, 'connection' = a
   // `node.key = value` statement). The form-toggle marker sends this.
-  // SYNC: setValueForm.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
-  | { op: 'setValueForm'; node: string; key: string; form: 'inline' | 'connection' }
-  | { op: 'setLoopConfig'; loopId: string; key: string; value: string }
-  | { op: 'removeLoopConfig'; loopId: string; key: string };
+  // SYNC: set_value_form.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
+  | { op: 'set_value_form'; node: string; key: string; form: 'inline' | 'connection' }
+  | { op: 'set_loop_config'; loopId: string; key: string; value: string }
+  | { op: 'remove_loop_config'; loopId: string; key: string };
 
 // SYNC: EditPortSig <-> crates/weft-compiler/src/edit.rs PortSig
 // (`rendered` is projection-only and deliberately absent on the Rust side.)

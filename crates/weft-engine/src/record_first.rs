@@ -18,10 +18,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta};
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_task_store::{InfraReader, TaskStoreClient};
 
-use crate::context::{AccessBroker, ExecutionSteeringClient};
+use crate::context::{AccessBroker, RunSteeringClient};
 use crate::journal_writer::WorkerJournal;
 use crate::storage::WorkerStorageOps;
 
@@ -37,13 +37,13 @@ impl<T: ?Sized> RecordFirst<T> {
         Arc::new(Self { inner, writer })
     }
 
-    async fn first(&self, execution_id: ExecutionId) -> anyhow::Result<()> {
-        self.writer.record_first(execution_id).await
+    async fn first(&self, run_id: RunId) -> anyhow::Result<()> {
+        self.writer.record_first(run_id).await
     }
 
     /// [`Self::first`] for a storage call, whose failure is a node's.
-    async fn first_for_storage(&self, execution_id: ExecutionId) -> WeftResult<()> {
-        self.first(execution_id).await.map_err(|e| WeftError::NodeExecution(format!("storage: {e:#}")))
+    async fn first_for_storage(&self, run_id: RunId) -> WeftResult<()> {
+        self.first(run_id).await.map_err(|e| WeftError::NodeFailed(format!("storage: {e:#}")))
     }
 }
 
@@ -51,8 +51,8 @@ impl<T: ?Sized> RecordFirst<T> {
 #[async_trait]
 impl TaskStoreClient for RecordFirst<dyn TaskStoreClient> {
     async fn enqueue_dedup(&self, spec: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-        if let Some(execution_id) = spec.execution_id {
-            self.first(execution_id).await?;
+        if let Some(run_id) = spec.run_id {
+            self.first(run_id).await?;
         }
         self.inner.enqueue_dedup(spec).await
     }
@@ -69,7 +69,7 @@ impl AccessBroker for RecordFirst<dyn AccessBroker> {
         req: &weft_broker_client::protocol::ResolveConnectionRequest,
         run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse> {
-        self.first(req.execution_id).await?;
+        self.first(req.run_id).await?;
         self.inner.resolve_connection(req, run_instance).await
     }
 
@@ -77,7 +77,7 @@ impl AccessBroker for RecordFirst<dyn AccessBroker> {
         &self,
         req: &weft_broker_client::protocol::ReleaseConnectionRequest,
     ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse> {
-        self.first(req.execution_id).await?;
+        self.first(req.run_id).await?;
         self.inner.release_connection(req).await
     }
 
@@ -86,7 +86,7 @@ impl AccessBroker for RecordFirst<dyn AccessBroker> {
         req: &weft_broker_client::protocol::PublishAccessRequest,
         run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse> {
-        self.first(req.execution_id).await?;
+        self.first(req.run_id).await?;
         self.inner.publish_access(req, run_instance).await
     }
 
@@ -95,7 +95,7 @@ impl AccessBroker for RecordFirst<dyn AccessBroker> {
         req: &weft_broker_client::protocol::PublishedAccessRequest,
         run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse> {
-        self.first(req.execution_id).await?;
+        self.first(req.run_id).await?;
         self.inner.published_access(req, run_instance).await
     }
 
@@ -103,7 +103,7 @@ impl AccessBroker for RecordFirst<dyn AccessBroker> {
         &self,
         req: &weft_broker_client::protocol::ProgramMintInstanceTokenRequest,
     ) -> anyhow::Result<weft_core::program::MintedInstanceToken> {
-        self.first(req.execution_id).await?;
+        self.first(req.run_id).await?;
         self.inner.mint_instance_token(req).await
     }
 }
@@ -112,36 +112,36 @@ impl AccessBroker for RecordFirst<dyn AccessBroker> {
 impl InfraReader for RecordFirst<dyn InfraReader> {
     async fn endpoint_address(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         run_instance: Option<&weft_core::instance::InstanceId>,
         infra: &weft_core::infra::InfraHandle,
     ) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> {
-        self.first(execution_id).await?;
-        self.inner.endpoint_address(execution_id, run_instance, infra).await
+        self.first(run_id).await?;
+        self.inner.endpoint_address(run_id, run_instance, infra).await
     }
 
     async fn baked_outputs(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         run_instance: Option<&weft_core::instance::InstanceId>,
         place: &str,
         copy: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
-        self.first(execution_id).await?;
-        self.inner.baked_outputs(execution_id, run_instance, place, copy).await
+        self.first(run_id).await?;
+        self.inner.baked_outputs(run_id, run_instance, place, copy).await
     }
 }
 
 #[async_trait]
-impl ExecutionSteeringClient for RecordFirst<dyn ExecutionSteeringClient> {
-    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> anyhow::Result<()> {
-        self.first(execution_id).await?;
-        self.inner.tag_execution(execution_id, tags).await
+impl RunSteeringClient for RecordFirst<dyn RunSteeringClient> {
+    async fn tag_run(&self, run_id: RunId, tags: Vec<String>) -> anyhow::Result<()> {
+        self.first(run_id).await?;
+        self.inner.tag_run(run_id, tags).await
     }
 
-    async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool> {
-        self.first(execution_id).await?;
-        self.inner.stop_tagged(execution_id, tag, stop_self).await
+    async fn stop_tagged(&self, run_id: RunId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool> {
+        self.first(run_id).await?;
+        self.inner.stop_tagged(run_id, tag, stop_self).await
     }
 }
 
@@ -152,7 +152,7 @@ impl ExecutionSteeringClient for RecordFirst<dyn ExecutionSteeringClient> {
 impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
     async fn put(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         scope: &StorageScope,
         identity: Option<&str>,
         mime_type: &str,
@@ -161,55 +161,55 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         declared_size: Option<u64>,
         data: ByteStream,
     ) -> WeftResult<Value> {
-        self.writer.stored_files(execution_id);
-        self.first_for_storage(execution_id).await?;
-        self.inner.put(execution_id, scope, identity, mime_type, filename, keep, declared_size, data).await
+        self.writer.stored_files(run_id);
+        self.first_for_storage(run_id).await?;
+        self.inner.put(run_id, scope, identity, mime_type, filename, keep, declared_size, data).await
     }
     async fn replace(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         key: &str,
         expected_version: Option<u64>,
         declared_size: Option<u64>,
         data: ByteStream,
     ) -> WeftResult<weft_core::storage::ReplaceOutcome> {
-        self.writer.stored_files(execution_id);
-        self.first_for_storage(execution_id).await?;
-        self.inner.replace(execution_id, key, expected_version, declared_size, data).await
+        self.writer.stored_files(run_id);
+        self.first_for_storage(run_id).await?;
+        self.inner.replace(run_id, key, expected_version, declared_size, data).await
     }
-    async fn get(&self, execution_id: ExecutionId, key: &str, range: Option<ByteRange>) -> WeftResult<(StoredFileMeta, ByteStream)> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.get(execution_id, key, range).await
+    async fn get(&self, run_id: RunId, key: &str, range: Option<ByteRange>) -> WeftResult<(StoredFileMeta, ByteStream)> {
+        self.first_for_storage(run_id).await?;
+        self.inner.get(run_id, key, range).await
     }
-    async fn delete(&self, execution_id: ExecutionId, key: &str) -> WeftResult<()> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.delete(execution_id, key).await
+    async fn delete(&self, run_id: RunId, key: &str) -> WeftResult<()> {
+        self.first_for_storage(run_id).await?;
+        self.inner.delete(run_id, key).await
     }
-    async fn list(&self, execution_id: ExecutionId, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.list(execution_id, scope).await
+    async fn list(&self, run_id: RunId, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
+        self.first_for_storage(run_id).await?;
+        self.inner.list(run_id, scope).await
     }
-    async fn find(&self, execution_id: ExecutionId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.find(execution_id, scope, identity).await
+    async fn find(&self, run_id: RunId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
+        self.first_for_storage(run_id).await?;
+        self.inner.find(run_id, scope, identity).await
     }
-    async fn keep(&self, execution_id: ExecutionId, key: &str, ttl: KeepTtl) -> WeftResult<()> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.keep(execution_id, key, ttl).await
+    async fn keep(&self, run_id: RunId, key: &str, ttl: KeepTtl) -> WeftResult<()> {
+        self.first_for_storage(run_id).await?;
+        self.inner.keep(run_id, key, ttl).await
     }
-    async fn presign(&self, execution_id: ExecutionId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.presign(execution_id, key, ttl_secs).await
+    async fn presign(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
+        self.first_for_storage(run_id).await?;
+        self.inner.presign(run_id, key, ttl_secs).await
     }
     async fn public_link(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         key: &str,
         ttl_secs: Option<u64>,
         reach: weft_core::storage::LinkReach,
     ) -> WeftResult<Option<String>> {
-        self.first_for_storage(execution_id).await?;
-        self.inner.public_link(execution_id, key, ttl_secs, reach).await
+        self.first_for_storage(run_id).await?;
+        self.inner.public_link(run_id, key, ttl_secs, reach).await
     }
 }
 
@@ -228,7 +228,7 @@ mod tests {
     #[async_trait]
     impl TaskStoreClient for SeeingTasks {
         async fn enqueue_dedup(&self, spec: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-            self.seen.lock().unwrap().push(self.record.log(spec.execution_id.expect("names a run")));
+            self.seen.lock().unwrap().push(self.record.log(spec.run_id.expect("names a run")));
             Ok(weft_task_store::tasks::DedupOutcome::Inserted(uuid::Uuid::nil()))
         }
         async fn wait_for_terminal(&self, _: uuid::Uuid, _: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
@@ -250,32 +250,32 @@ mod tests {
         let seeing = Arc::new(SeeingTasks { record: record.clone(), seen: Default::default() });
         let tasks = RecordFirst::new(seeing.clone() as Arc<dyn TaskStoreClient>, writer.clone());
         for recorded in [true, false] {
-            let run = weft_core::new_execution_id();
+            let run = weft_core::new_run_id();
             let settings = weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, recorded).unwrap();
             let drive = writer.run(RunSpec {
-                execution_id: run,
+                run_id: run,
                 settings,
                 keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
                 epoch: 1,
                 next_seq: 0,
                 redaction: Default::default(),
             });
-            let mut birth: weft_journal::ExecEvent = serde_json::from_value(serde_json::json!({
-                "kind": "execution_started", "project_id": run, "entry_node": "a", "phase": "fire", "at_unix": 0
+            let mut birth: weft_journal::RunEvent = serde_json::from_value(serde_json::json!({
+                "kind": "run_started", "project_id": run, "entry_node": "a", "phase": "fire", "at_unix": 0
             }))
             .unwrap();
-            if let weft_journal::ExecEvent::ExecutionStarted { execution_id, settings: kept, .. } = &mut birth {
-                *execution_id = run;
+            if let weft_journal::RunEvent::RunStarted { run_id, settings: kept, .. } = &mut birth {
+                *run_id = run;
                 *kept = settings;
             }
-            let event = weft_journal::ExecEvent::NodeStarted { execution_id: run, node_id: "a".into(), frames: Vec::new(), at_unix: 0 };
+            let event = weft_journal::RunEvent::NodeStarted { run_id: run, node_id: "a".into(), frames: Vec::new(), at_unix: 0 };
             weft_journal::JournalClient::record_events(drive.as_ref(), &[birth, event], Some("w")).await.unwrap();
             tasks
                 .enqueue_dedup(weft_task_store::tasks::NewTask {
                     kind: weft_task_store::kinds::TaskKind::RegisterSignal,
                     project_id: None,
                     dedup_key: None,
-                    execution_id: Some(run),
+                    run_id: Some(run),
                     tenant_id: "t".into(),
                     payload: Value::Null,
                 })
@@ -284,7 +284,7 @@ mod tests {
         }
         assert_eq!(
             *seeing.seen.lock().unwrap(),
-            vec![vec!["execution_started".to_string(), "a".to_string()], vec!["execution_started".to_string()]]
+            vec![vec!["run_started".to_string(), "a".to_string()], vec!["run_started".to_string()]]
         );
     }
 }

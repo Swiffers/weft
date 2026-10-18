@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -21,7 +21,7 @@ impl Node for TelegramEditMessageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         // Read as an integer directly: a fractional id is a loud type

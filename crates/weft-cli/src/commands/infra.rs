@@ -38,7 +38,7 @@ pub enum InfraAction {
     ListDoors,
     /// Cancel in-flight infra work (claimed lifecycle commands halt
     /// between platform calls; unclaimed ones cancel outright; the
-    /// provisioning execution is interrupted). HALT, not rollback.
+    /// provisioning run is interrupted). HALT, not rollback.
     Cancel,
     /// Ask the supervisor to look at the infra again.
     Look,
@@ -185,14 +185,14 @@ async fn infra_cancel(ctx: &Ctx, progress: &Progress, instance: Option<&weft_cor
     };
     progress.dispatcher_call_start(&path);
     client.post_empty(&path).await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": project_id }));
     Ok(())
 }
 
 async fn infra_look(ctx: &Ctx) -> Result<()> {
     let (client, project_id, _name) = super::resolve_project(ctx)?;
     client.post_empty(&format!("/projects/{project_id}/infra/look")).await?;
-    if ctx.json_out(&serde_json::json!({ "project_id": project_id }))? {
+    if ctx.json_out(&serde_json::json!({ "projectId": project_id }))? {
         return Ok(());
     }
     println!("Asked the supervisor to look at the infra again; `{}` shows what it finds.", super::weft_on(ctx.on(), "status"));
@@ -256,7 +256,7 @@ async fn infra_node_verb(
     progress.dispatcher_call_start(&path);
     // 202 Accepted with the command it runs as.
     let issued = issued_command(client.post_json(&path, &serde_json::to_value(&body)?).await?, verb)?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id, "node": place }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": project_id, "node": place }));
     let command_id = issued.command_id;
     // Wait on the command, not a per-node status: a NoOp unit staying
     // up means the node never reaches "stopped", so the command
@@ -281,7 +281,7 @@ async fn infra_sync(
     let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
 
     // A START never deactivates: an active project's triggers stay
-    // live while infra comes up (only executions that actually touch
+    // live while infra comes up (only runs that actually touch
     // the not-yet-running infra fail, loudly, at the node), so it asks
     // no deactivation questions. An UPGRADE of an ACTIVE project takes
     // live infra down (the server's stop leg), so it collects the
@@ -347,7 +347,7 @@ async fn infra_sync(
             drain_timeout,
         )
         .await?;
-        progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
+        progress.dispatcher_call_done(serde_json::json!({ "projectId": handle.id }));
         let issued = issued_command(answer, "upgrade")?;
         wait_for_command(progress, ctx.on(), &handle.client, &handle.id, issued.command_id, "upgrade").await?;
         infra_status_of(&handle.client, &handle.id).await?
@@ -361,7 +361,7 @@ async fn infra_sync(
             async |elapsed| progress.infra_wait("start", elapsed.as_secs(), &changing_now(&handle.client, &handle.id).await),
         )
         .await?;
-        progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
+        progress.dispatcher_call_done(serde_json::json!({ "projectId": handle.id }));
         serde_json::from_value(answer).context("read the infra status the sync answered")?
     };
     progress.infra_provision_done();
@@ -395,7 +395,7 @@ async fn infra_terminate(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Res
 /// whether a trigger reading this infra is on (the program's or a
 /// instance's), asks for it and `post_with_trigger_choice` prompts or
 /// names the flags. The running-work choice goes on the body either
-/// way, because with no trigger on there can still be executions
+/// way, because with no trigger on there can still be runs
 /// running on this infra and `wait` is how they get to land first. Waits on the COMMAND's completion (not the
 /// rollup): a stop where a NoOp unit stays up never drives the rollup
 /// to "stopped", so the command outcome is the only honest done
@@ -432,7 +432,7 @@ async fn infra_destroy(
     let answer =
         super::deactivate::post_with_trigger_choice(&client, &path, body, ctx.json(), given, running_policy, drain_timeout)
             .await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
     let issued = issued_command(answer, verb)?;
     wait_for_command(progress, ctx.on(), &client, &id, issued.command_id, verb).await?;
     if !ctx.json() {
@@ -448,7 +448,7 @@ async fn infra_destroy(
 /// command between steps, so the verb did NOT do what was asked and a
 /// zero exit would lie about it (infra is left as-is, per-node state
 /// intact). UNBOUNDED: an infra command (stop / terminate / start)
-/// can depend on draining in-flight executions, which is a user-facing
+/// can depend on draining in-flight runs, which is a user-facing
 /// wait that may legitimately last hours; a hard deadline would turn a
 /// correct slow operation into a spurious failure (same rule as
 /// `wait_for_drain`). The wait stays legible via an `InfraWait`

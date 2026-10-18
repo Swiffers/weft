@@ -11,7 +11,7 @@
 //! `weft_compiler.rs`); enrich does not consult the catalog for them
 //! (it `continue`s past these node types).
 
-use weft_core::exec::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
+use weft_core::run::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
 use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
 use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
 use weft_core::node::Accepts;
@@ -334,7 +334,7 @@ pub fn enrich_collecting(
         // catalog. Without it the editor reads an include as an empty box
         // and hides the Activate button on a project whose only trigger
         // is inside one. The include node itself gets neither
-        // `requires_infra` nor `is_trigger`: those drive real per-node
+        // `requiresInfra` nor `is_trigger`: those drive real per-node
         // work (a provisioned infra slot, a trigger's mount URL) and the
         // alias is not the node that does it.
         if let Some(contents) = &mut node.include_contents {

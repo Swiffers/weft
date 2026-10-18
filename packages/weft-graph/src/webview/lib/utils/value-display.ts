@@ -1,4 +1,4 @@
-// How one execution value is shown in the inspector: what its badge
+// How one run value is shown in the inspector: what its badge
 // says, and the tokens its JSON renders as.
 //
 // The tokens are built by WALKING the value, never by regex over

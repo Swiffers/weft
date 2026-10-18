@@ -1,6 +1,6 @@
 //! KeepFile self-tests: the keep flag lands and the exact marker
 //! passes through; a project copy is a new file with the same shape,
-//! living until deleted unless `ttl_days` gives it a lifetime.
+//! living until deleted unless `ttlDays` gives it a lifetime.
 
 use serde_json::json;
 
@@ -14,7 +14,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("keeps_and_passes_the_marker_through", keeps),
         NodeTest::fake("project_scope_copies_the_file_and_emits_the_copy", copies_into_project),
         NodeTest::fake("ttl_days_gives_the_project_copy_a_lifetime", ttl_in_project),
-        NodeTest::fake("ttl_days_sets_how_long_a_kept_run_file_lives", ttl_in_execution),
+        NodeTest::fake("ttl_days_sets_how_long_a_kept_run_file_lives", ttl_in_run),
     ]
 }
 
@@ -51,37 +51,37 @@ async fn copies_into_project(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A project copy with `ttl_days` expires once idle that long; without
+/// A project copy with `ttlDays` expires once idle that long; without
 /// one (the previous case) it lives until deleted.
 async fn ttl_in_project(rig: FakeRig) -> WeftResult<()> {
     let file = rig.store_file("upload.png", "image/png", b"PNG!".to_vec());
     let outcome = rig
-        .run(&KeepFileNode, json!({ "file": file, "scope": "project", "ttl_days": 7 }))
+        .run(&KeepFileNode, json!({ "file": file, "scope": "project", "ttlDays": 7 }))
         .await
         .ok()?;
     let copy = rig.stored_meta(&StoredFile::from_value(&outcome.outputs["file"])?.key)?;
     assert_eq!(copy.keep_ttl_secs, Some(7 * 24 * 3600), "the copy lives 7 idle days");
-    assert!(!copy.keep, "the run-end flag is an execution file's alone");
+    assert!(!copy.keep, "the run-end flag is a run file's alone");
     let forever = rig.store_file("b.png", "image/png", b"PNG!".to_vec());
     let outcome = rig.run(&KeepFileNode, json!({ "file": forever, "scope": "project" })).await.ok()?;
     let copy = rig.stored_meta(&StoredFile::from_value(&outcome.outputs["file"])?.key)?;
-    assert_eq!(copy.keep_ttl_secs, None, "no ttl_days: the project copy lives until deleted");
+    assert_eq!(copy.keep_ttl_secs, None, "no ttlDays: the project copy lives until deleted");
     Ok(())
 }
 
 /// On a run file: empty is the storage default, 0 is forever, a number
 /// is that many idle days.
-async fn ttl_in_execution(rig: FakeRig) -> WeftResult<()> {
+async fn ttl_in_run(rig: FakeRig) -> WeftResult<()> {
     for (ttl_days, expected) in [(None, Some(30 * 24 * 3600)), (Some(0), None), (Some(2), Some(2 * 24 * 3600))] {
         let file = rig.store_file("keeper.txt", "text/plain", b"data".to_vec());
         let mut inputs = json!({ "file": file.clone() });
         if let Some(days) = ttl_days {
-            inputs["ttl_days"] = json!(days);
+            inputs["ttlDays"] = json!(days);
         }
         rig.run(&KeepFileNode, inputs).await.ok()?;
         let meta = rig.stored_meta(&StoredFile::from_value(&file)?.key)?;
         assert!(meta.keep);
-        assert_eq!(meta.keep_ttl_secs, expected, "ttl_days {ttl_days:?}");
+        assert_eq!(meta.keep_ttl_secs, expected, "ttlDays {ttl_days:?}");
     }
     Ok(())
 }

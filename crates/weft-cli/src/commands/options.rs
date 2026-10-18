@@ -1,8 +1,8 @@
-//! `weft options <step> <field>`: print the choices a `remote_select`
+//! `weft options <node> <field>`: print the choices a `remote_select`
 //! field offers, the same list the graph editor's dropdown shows when a
 //! person searches that field (`ResourceSelect.svelte` over
 //! `editor-connect.ts`'s `editorResources`). The connection signing the
-//! call is the one the editor traces: the install's pick on the step's
+//! call is the one the editor traces: the install's pick on the node's
 //! own access field, or on the access node wired into its Access input.
 
 use std::collections::{BTreeMap, HashSet};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use weft_core::access::lookup::{GrantedQuery, LookupItem, LookupPage, LookupRequest};
 use weft_core::node::{Lookup, MetadataCatalog, ResourceSource, Widget};
 
-use crate::commands::connect::{install_picks, list_grants, resolve_step, AccessTarget, Doorway, Pick, Step};
+use crate::commands::connect::{install_picks, list_grants, resolve_any_node, AccessTarget, Doorway, Pick, ResolvedNode};
 use crate::commands::Ctx;
 
 /// The connection a field's sources are signed with.
@@ -25,18 +25,18 @@ struct Signing {
     scopes: Vec<String>,
 }
 
-pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -> Result<()> {
+pub async fn run(ctx: Ctx, node_name: &str, field: &str, search: Option<&str>) -> Result<()> {
     let project = ctx.project()?;
     let catalog = weft_compiler::build::build_project_catalog(&project.root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
-    let step = resolve_step(project, &catalog, step_name)?;
-    let meta = MetadataCatalog::lookup(&catalog, &step.node_type)
-        .with_context(|| format!("'{}' is a {}, a type the catalog does not know", step.spelling, step.node_type))?;
+    let resolved = resolve_any_node(project, &catalog, node_name)?;
+    let meta = MetadataCatalog::lookup(&catalog, &resolved.node_type)
+        .with_context(|| format!("'{}' is a {}, a type the catalog does not know", resolved.spelling, resolved.node_type))?;
     let input = meta.inputs.iter().find(|i| i.name == field).with_context(|| {
         format!(
             "'{}' ({}) has no input '{field}' (its inputs are: {})",
-            step.spelling,
-            step.node_type,
+            resolved.spelling,
+            resolved.node_type,
             meta.inputs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")
         )
     })?;
@@ -44,7 +44,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
         bail!(
             "'{}.{field}' is not a searchable field (its widget is {}); only a \
              remote_select field has a list of choices to print",
-            step.spelling,
+            resolved.spelling,
             input.effective_widget().kind_name()
         );
     };
@@ -55,7 +55,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
     let client = ctx.client()?;
     crate::commands::ensure::ensure_project_known(&ctx).await?;
     let picks = install_picks(&client, project.id()).await?;
-    let signing = match traced_access(&step, &access, own_widget, &picks)? {
+    let signing = match traced_access(&resolved, &access, own_widget, &picks)? {
         Some((target, id)) => {
             let grants = list_grants(&client, Doorway::Owner, Some(&target.spec.service)).await?;
             let grant = grants.into_iter().find(|g| g.id == id).with_context(|| {
@@ -70,12 +70,12 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
         }
         None => None,
     };
-    let node = step
+    let node = resolved
         .program
         .nodes
         .iter()
-        .find(|n| n.id == step.node)
-        .context("the resolved step is missing from the program")?;
+        .find(|n| n.id == resolved.node)
+        .context("the resolved node is missing from the program")?;
     let parents = parent_values(&depends_on, |name| node.written_value(name));
     let query = search.unwrap_or("").trim();
 
@@ -106,7 +106,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
         let Some(ResourceSource::List { lookup, .. }) =
             usable.iter().find(|s| matches!(s, ResourceSource::List { .. }))
         else {
-            bail!("{}", nothing_to_list(&step, field, &access, own_widget, &sources, signing.is_some(), query, ctx.on()));
+            bail!("{}", nothing_to_list(&resolved, field, &access, own_widget, &sources, signing.is_some(), query, ctx.on()));
         };
         let mut cursor: Option<String> = None;
         // Every cursor the service has handed out: one coming back is a
@@ -133,7 +133,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
         }
     }
 
-    if ctx.json_out(&json!({ "step": step.spelling, "field": field, "pages": pages }))? {
+    if ctx.json_out(&json!({ "node": resolved.spelling, "field": field, "pages": pages }))? {
         return Ok(());
     }
     let items: Vec<&LookupItem> = pages.iter().flat_map(|p| &p.items).collect();
@@ -151,23 +151,23 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
 }
 
 /// The access node and picked connection the field is signed with, the
-/// editor's structural trace: the step's own access field, or the
+/// editor's structural trace: the node's own access field, or the
 /// access node wired into its Access input (followed through group
 /// boundaries, whose passthroughs share one port name on both sides).
 /// `None` when nothing is picked. The pick read is the install's at the
-/// access node's place in the same call as the step.
+/// access node's place in the same call as the node.
 fn traced_access<'a>(
-    step: &'a Step,
+    resolved: &'a ResolvedNode,
     access: &str,
     own_widget: bool,
     picks: &weft_core::picks::Picks,
 ) -> Result<Option<(&'a AccessTarget, Uuid)>> {
     let source = if own_widget {
-        step.node.clone()
+        resolved.node.clone()
     } else {
-        let mut at = (step.node.clone(), access.to_string());
+        let mut at = (resolved.node.clone(), access.to_string());
         loop {
-            let Some(edge) = step
+            let Some(edge) = resolved
                 .program
                 .edges
                 .iter()
@@ -175,7 +175,7 @@ fn traced_access<'a>(
             else {
                 return Ok(None);
             };
-            let is_boundary = step
+            let is_boundary = resolved
                 .program
                 .nodes
                 .iter()
@@ -186,7 +186,7 @@ fn traced_access<'a>(
             }
         }
     };
-    let Some(target) = step.targets.iter().find(|t| t.node == source) else {
+    let Some(target) = resolved.targets.iter().find(|t| t.node == source) else {
         return Ok(None);
     };
     match &target.picked {
@@ -197,9 +197,10 @@ fn traced_access<'a>(
         ),
         Pick::WrittenInSource => bail!("{}", crate::commands::connect::written_in_source(target)),
         Pick::None | Pick::Handle(_) => {
-            // The access node's place in the step's call: the step's
-            // spelling up to its own name, then the node's.
-            let prefix = step.spelling.rsplit_once('.').map(|(call, _)| format!("{call}.")).unwrap_or_default();
+            // The access node's place in the asked node's call: the
+            // asked node's spelling up to its own name, then the access
+            // node's.
+            let prefix = resolved.spelling.rsplit_once('.').map(|(call, _)| format!("{call}.")).unwrap_or_default();
             let place = target
                 .spellings()
                 .iter()
@@ -233,7 +234,7 @@ fn usable_sources<'a>(sources: &'a [ResourceSource], signing: Option<&Signing>) 
         .collect()
 }
 
-/// Each `depends_on` parent's picked id, as the step's source holds it;
+/// Each `dependsOn` parent's picked id, as the node's source holds it;
 /// an unset or empty parent is left out.
 fn parent_values<'a>(depends_on: &[String], written: impl Fn(&str) -> Option<&'a Value>) -> BTreeMap<String, String> {
     depends_on
@@ -287,7 +288,7 @@ fn narrow(lookup: &Lookup, query: &str, items: Vec<LookupItem>) -> Vec<LookupIte
 /// `list` source is left and the granted choices (if any) gave nothing.
 #[allow(clippy::too_many_arguments)]
 fn nothing_to_list(
-    step: &Step,
+    resolved: &ResolvedNode,
     field: &str,
     access: &str,
     own_widget: bool,
@@ -296,7 +297,7 @@ fn nothing_to_list(
     query: &str,
     on: Option<&str>,
 ) -> String {
-    let at = format!("'{}.{field}'", step.spelling);
+    let at = format!("'{}.{field}'", resolved.spelling);
     let weft = |verb: &str| super::weft_on(on, verb);
     let has_list = sources.iter().any(|s| matches!(s, ResourceSource::List { .. }));
     let has_granted = sources.iter().any(|s| matches!(s, ResourceSource::Granted { .. }));
@@ -309,8 +310,8 @@ fn nothing_to_list(
     if !connected {
         return if own_widget {
             format!(
-                "{at} needs a connection first: pick one on this step with `{}`, then `--grant <id>`",
-                weft(&format!("connect --node {} --list", step.spelling))
+                "{at} needs a connection first: pick one on this node with `{}`, then `--grant <id>`",
+                weft(&format!("connect --node {} --list", resolved.spelling))
             )
         } else {
             format!(
@@ -368,7 +369,7 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "access_id": id,
+                "accessId": id,
                 "service": "github",
                 "lookup": { "get": "https://x/items?q={query}&repo={repo}", "items": "data", "label": "name", "value": "id" },
                 "query": "abc",
@@ -379,7 +380,7 @@ mod tests {
         let whole = lookup("https://x/items");
         let body = serde_json::to_value(lookup_request(&whole, None, "abc", &BTreeMap::new(), None)).unwrap();
         assert_eq!(body["query"], "");
-        assert_eq!(body["access_id"], Value::Null);
+        assert_eq!(body["accessId"], Value::Null);
         assert_eq!(body["service"], Value::Null);
         assert_eq!(body["cursor"], Value::Null);
     }

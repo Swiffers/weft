@@ -43,11 +43,11 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
     // the file's node.
     let setups: serde_json::Value = project
         .dispatcher()
-        .get_json(&format!("/executions?project_id={}&phase=infra_setup", project.id()))
+        .get_json(&format!("/runs?project_id={}&phase=infra_setup", project.id()))
         .await?;
-    let entries: Vec<&str> = setups["executions"]
+    let entries: Vec<&str> = setups["runs"]
         .as_array()
-        .map(|runs| runs.iter().filter_map(|r| r["entry_node"].as_str()).collect())
+        .map(|runs| runs.iter().filter_map(|r| r["entryNode"].as_str()).collect())
         .unwrap_or_default();
     anyhow::ensure!(
         !entries.is_empty() && entries.iter().all(|e| *e == "one.svc" || *e == "two.svc"),
@@ -57,8 +57,8 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
     // A run reaches each call's own placement, and each call's rows
     // carry that call's frame. Observed with the program in hand, so the
     // names below are read through their sites.
-    let execution_id = run::start(&mut project).await?;
-    let settled = project.settled(execution_id).await?;
+    let run_id = run::start(&mut project).await?;
+    let settled = project.settled(run_id).await?;
     settled.completed()?;
     settled.assert_input("first", "data", &json!("ready"))?;
     settled.assert_input("second", "data", &json!("ready"))?;

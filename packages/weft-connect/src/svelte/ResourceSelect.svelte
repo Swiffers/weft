@@ -51,7 +51,7 @@
 		/** The connection's granted permissions, when known (for dropping
 		 *  `list` sources whose `requires` are not held); null = unknown. */
 		grantedScopes?: string[] | null;
-		/** Picked parent ids for drill-down (`depends_on`). */
+		/** Picked parent ids for drill-down (`dependsOn`). */
 		parents?: Record<string, string>;
 		/** What to say when no source is usable yet. */
 		connectFirst?: string;
@@ -157,7 +157,7 @@
 			const page = await transport.list(listSource.index, listSource.source, serverFiltered ? query : '', parents, cursor ?? null);
 			if (seq !== searchSeq) return;
 			items = cursor ? [...items, ...page.items] : page.items;
-			nextCursor = page.next_cursor;
+			nextCursor = page.nextCursor;
 			loaded = true;
 		} catch (e) {
 			if (seq !== searchSeq) return;

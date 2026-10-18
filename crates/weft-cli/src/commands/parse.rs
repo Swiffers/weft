@@ -41,10 +41,11 @@ struct ParseResponse {
 #[derive(Debug, Serialize)]
 struct ValidateResponse {
     diagnostics: Vec<Diagnostic>,
-    /// One line per catalog folder left out and why (a broken
-    /// `metadata.json`, a node with no code yet, an empty package), the
-    /// same lines `weft describe-nodes` warns with. Never a failure on
-    /// their own: a program naming a left-out node gets its own
+    /// The catalog's warnings, the same lines `weft describe-nodes` warns
+    /// with: one per folder left out and why (a broken `metadata.json`, a
+    /// node with no code yet, an empty package), and one per name a node
+    /// spells off the weft way (that node still loads). Never a failure
+    /// on their own: a program naming a left-out node gets its own
     /// diagnostic.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
@@ -134,7 +135,7 @@ struct ServerRequest {
     /// edited source is then parsed so the UI re-renders in one round-trip.
     #[serde(default)]
     ops: Vec<weft_compiler::edit::EditOp>,
-    /// A raw text edit to replay (only for `kind: "applyEdit"`, the undo/redo
+    /// A raw text edit to replay (only for `kind: "apply_edit"`, the undo/redo
     /// path). Applied to `source`, then parsed, like `edit`.
     #[serde(default, rename = "textEdit")]
     text_edit: Option<weft_compiler::edit::TextEdit>,
@@ -147,19 +148,19 @@ struct ServerRequest {
     #[serde(default)]
     mode: Option<ValidationMode>,
     /// The run spec to resolve against the parsed program (only for
-    /// `kind: "resolveSpec"`): the editor's spec dialog asks on every
+    /// `kind: "resolve_spec"`): the editor's spec dialog asks on every
     /// change, so every missing input is a field before the run starts.
     #[serde(default)]
     spec: Option<weft_core::run_spec::RunSpec>,
     #[serde(default)]
     bakes: Vec<weft_core::run_spec::BakeSummary>,
-    /// Seed history is evaluated at execution preparation, not by the local parser.
+    /// Seed history is evaluated at run preparation, not by the local parser.
     #[serde(default)]
     seeded: bool,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 enum ServerRequestKind {
     Parse,
     Validate,
@@ -173,7 +174,7 @@ enum ServerRequestKind {
     ResolveSpec,
 }
 
-/// Response payload for a `resolveSpec` request: what the spec resolves
+/// Response payload for a `resolve_spec` request: what the spec resolves
 /// to, or why it cannot run. One of the two is set.
 // SYNC: ResolveSpecResponse <-> packages/weft-graph/src/run-spec.ts ResolveSpecResponse
 #[derive(Debug, Serialize)]
@@ -184,7 +185,7 @@ struct ResolveSpecResponse {
     refusal: Option<weft_core::run_spec::Refusal>,
 }
 
-/// Response payload for an `edit`/`applyEdit` request: the new source, the parse
+/// Response payload for an `edit`/`apply_edit` request: the new source, the parse
 /// of it, and the INVERSE text edit (apply it to `source` to restore the prior
 /// source). The frontend writes `source`, re-renders from `parse`, and stores
 /// `inverse` as the action's undo. One round-trip.
@@ -285,7 +286,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
         }
         ServerRequestKind::ResolveSpec => {
             let Some(spec) = req.spec else {
-                return ServerResponse { id, payload: None, error: Some("resolveSpec requires a spec".into()) };
+                return ServerResponse { id, payload: None, error: Some("resolve_spec requires a spec".into()) };
             };
             match resolve_source(&req.source, project.as_ref(), req.file.as_deref(), catalogs, req.reload_catalog) {
                 Ok(mut definition) => {
@@ -383,7 +384,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
             // `inverse` is the edit that undoes THIS replay (so undo<->redo
             // round-trips without recomputing).
             let Some(text_edit) = &req.text_edit else {
-                return ServerResponse { id, payload: None, error: Some("applyEdit requires a textEdit".into()) };
+                return ServerResponse { id, payload: None, error: Some("apply_edit requires a textEdit".into()) };
             };
             let new_source = match weft_compiler::edit::apply_text_edit(&req.source, text_edit) {
                 Ok(s) => s,
@@ -397,7 +398,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
 }
 
 /// Build the `{source, parse, inverse}` response shared by `edit` and
-/// `applyEdit`: parse the new source (lenient, like a normal parse), or surface
+/// `apply_edit`: parse the new source (lenient, like a normal parse), or surface
 /// a catalog error loudly.
 fn edit_envelope(
     id: u64,
@@ -587,11 +588,12 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
     // from the project we already resolved, not a second `ctx.project()` call.
     let anchor = anchor_for(file.as_deref(), Some(project.root.as_path()));
     // Runtime: the terminal command is the complete pre-flight check (graph
-    // shape plus runtime rules like missing credentials); callers that want
+    // shape plus runtime rules like a provider with no model named); callers that want
     // the structural tier go through the parse-server's mode field.
     let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime);
-    // The catalog's left-out folders go to stderr either way, as
-    // `weft describe-nodes` does; the JSON on stdout carries them too.
+    // The catalog's warnings (left-out folders, misspelled names) go
+    // to stderr either way, as `weft describe-nodes` does; the JSON on
+    // stdout carries them too.
     for warning in &resp.warnings {
         eprintln!("warning: {warning}");
     }
@@ -603,7 +605,7 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
 /// command and the parse-server. The compile -> enrich -> validate pipeline
 /// (and its error-to-diagnostic mapping) lives in `compile_strict`; the caller
 /// picks the mode (`Structural` for the editor's Problems panel, `Runtime`
-/// for pre-flight checks that must also catch missing credentials).
+/// for pre-flight checks that must also catch the runtime rules, like a provider with no model named).
 fn do_validate(
     source: &str,
     id: uuid::Uuid,
@@ -623,7 +625,7 @@ fn do_validate(
         mode,
         source_id.as_deref(),
     );
-    ValidateResponse { diagnostics, warnings: catalog.warnings().to_vec() }
+    ValidateResponse { diagnostics, warnings: catalog.warnings().iter().map(ToString::to_string).collect() }
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
@@ -702,7 +704,7 @@ mod tests {
     #[test]
     fn a_resolve_spec_request_carries_its_spec() {
         let req: ServerRequest = serde_json::from_str(
-            r#"{"id":3,"kind":"resolveSpec","source":"","spec":{"name":"x","from":{"a":{}}},"seeded":true}"#,
+            r#"{"id":3,"kind":"resolve_spec","source":"","spec":{"name":"x","from":{"a":{}}},"seeded":true}"#,
         )
         .unwrap();
         assert!(matches!(req.kind, ServerRequestKind::ResolveSpec));

@@ -16,7 +16,7 @@ use weft::node::NodeOutput;
 use weft::reqwest::StatusCode;
 use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{FileHandle, StorageScope, StoredFile};
-use weft::{node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{link_filename, API};
 use super::flows::store_download;
@@ -36,7 +36,7 @@ impl Node for ElevenLabsDubNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let file: Option<FileHandle> = ctx.inputs.opt("file")?;
         let source_url: Option<String> = ctx.inputs.opt("sourceUrl")?;
@@ -85,7 +85,7 @@ impl Node for ElevenLabsDubNode {
                 let mut form = Multipart::form_data().text("model_id", &model);
                 let filename = match &recording {
                     Recording::File(file) => {
-                        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(file).await?;
+                        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(file).await?;
                         form = form.file("file", &meta.filename, &meta.mime_type, bytes);
                         meta.filename
                     }
@@ -265,7 +265,7 @@ fn refusal(model: &str, cloning: bool, source_language: bool, transcript: Option
 /// Read the dub target that just ended and store its audio, or fail with
 /// what ElevenLabs said went wrong.
 async fn finished(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     http: &Client,
     projects: &str,
     project: &str,
@@ -311,7 +311,7 @@ async fn finished(
 /// deleted (the body can replay after a crash that followed the delete);
 /// one that cannot be deleted never fails the node, since the dub it
 /// served is already paid for: it is named on the node's log instead.
-async fn discard(ctx: &ExecutionContext, http: &Client, projects: &str, project: &str) -> WeftResult<()> {
+async fn discard(ctx: &RunContext, http: &Client, projects: &str, project: &str) -> WeftResult<()> {
     let refused = match http.delete(format!("{projects}/{project}")).send().await {
         Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::NOT_FOUND => return Ok(()),
         Ok(resp) => {

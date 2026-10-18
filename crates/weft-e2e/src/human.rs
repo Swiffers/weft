@@ -1,10 +1,10 @@
 //! Human-in-the-loop, driven with no browser.
 //!
-//! A `HumanQuery` node suspends the execution and registers a `form` signal.
+//! A `HumanQuery` node suspends the run and registers a `form` signal.
 //! The rig plays the human: it enumerates pending forms via an api token,
-//! submits an answer to `POST /signal/{token}`, and the suspended execution
+//! submits an answer to `POST /signal/{token}`, and the suspended run
 //! resumes with that answer. A `HumanTrigger` form is the entry variant (a fresh
-//! execution per submission) and uses the same submit path.
+//! run per submission) and uses the same submit path.
 //!
 //! This module is a thin, intent-named layer over [`crate::signal`]: discover a
 //! form, answer it. The resume itself is asserted through the normal replay
@@ -50,7 +50,7 @@ pub async fn wait_for_form_by_node(
 }
 
 /// Answer a discovered form: submit `answer` (a JSON object keyed by the form's
-/// field keys) to the form's signal token. The suspended execution resumes with
+/// field keys) to the form's signal token. The suspended run resumes with
 /// this value.
 pub async fn answer_form(
     disp: &Dispatcher,

@@ -36,7 +36,7 @@ shape. The ambition is for it to prove things about how a program behaves,
 through richer node metadata. A node that acts in the world says so and says how
 big the action is. A node that verifies says what strength it gives. An
 autonomous node says so. Then the compiler can check a claim across the graph:
-every path from an autonomous step to a high-stakes action passes through a
+every path from an autonomous node to a high-stakes action passes through a
 verification of at least this strength, or a critical action has three separate
 human approvals in front of it, and a program that does not hold up does not
 build. None of it works if the labels are decoration, so the other half is

@@ -40,7 +40,7 @@ error rather than a trigger that quietly never fires.
 
 | Field | Type | What it is |
 |---|---|---|
-| `execution_id` | `ExecutionId` (a UUID) | This run's id |
+| `run_id` | `RunId` (a UUID) | This run's id |
 | `project_id` | `Uuid` | The project it belongs to |
 | `node_id` | `String` | This node's id in the graph |
 | `node_type` | `String` | Its catalog type, such as `ExecPython` |
@@ -118,7 +118,7 @@ you like until you close it.
 
 `ctx.run` is how you stop a replay from doing an expensive thing twice. A body
 replays only after a wait. If the worker dies while the body is running, the
-step is not replayed: a durable run fails it, and a fast run ends cancelled
+node is not replayed: a durable run fails it, and a fast run ends cancelled
 (go and read [surviving a restart](durable-execution.md)).
 
 ## Connections
@@ -218,12 +218,7 @@ and what `list` sees; `get`, `delete`, `keep` and `presign` act on whatever
 scope the key itself belongs to, so a later node can read a file without
 knowing where it came from.
 
-| Scope | Where it lives, and how long |
-|---|---|
-| `Execution` (the default) | This run only, swept after it ends unless you keep it |
-| `Project` | Outlives runs, gone on `weft clean` or `weft rm`, or when a lifetime you gave it runs out |
-| `Shared { name }` | Shared across projects that name the same space, until removed or its lifetime runs out |
-| `Asset` | The project's published assets. Readable, and the worker refuses writes |
+For every scope, go and read [Storage](storage.md).
 
 | Call | What it does |
 |---|---|
@@ -290,7 +285,7 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 | Call | What it does | It fails when |
 |---|---|---|
 | `log(level, message).await` | Writes a line into the run's log. `Trace`, `Debug`, `Info`, `Warn`, `Error` | The write fails |
-| `tag_execution(["user_7"]).await` | Tags this run. Additive and safe to repeat. Any string works: one that is not already a tag is turned into one (see below) | The list is empty, or a tag is empty |
+| `tag_run(["user_7"]).await` | Tags this run. Additive and safe to repeat. Any string works: one that is not already a tag is turned into one (see below) | The list is empty, or a tag is empty |
 | `stop_tagged("user_7", StopSelf::Keep).await` | Queues a stop for every live run of this project carrying that tag, turned into a tag the same way | The tag is empty |
 | `is_cancelled()` | Whether this run was cancelled. Cheap enough to poll | never |
 | `cancellation()` | The flag itself, to `select!` against your own work | never |
@@ -317,8 +312,8 @@ instance's copy instead of the shared one; `values()`, `connections()` and
 | `infra("bridge").copies().await` | Every copy: the shared one and each instance's |
 | `trigger("receive").activate().await` | Turns one trigger on |
 | `triggers().deactivate(spec, stop_self).await` | Turns off every trigger of the program (or of one instance, with `.instance(id)`); if you want only some, name them with `.only([..])` |
-| `values().instance(id).get().await` | The instance's values for the program's `@instance_filled` fields, by step and field |
-| `values().instance(id).set(step, field, value).clear(step, field).apply().await` | Gives and clears values in one change, each checked against its node's rules; the instance's live triggers reading one are set up again, and their names come back |
+| `values().instance(id).get().await` | The instance's values for the program's `@instance_filled` fields, by node and field |
+| `values().instance(id).set(node, field, value).clear(node, field).apply().await` | Sets and clears values in one change, all or none, each checked against its field and its node's rules first. Any live trigger of the instance that reads one is set up again, and `apply` returns those triggers' names |
 | `values().instance(id).forget().await` | Forgets every value the instance was given |
 | `connections().instance(id).list() / forget()` | Lists an instance's connections, or forgets all of them (the values naming them go too) |
 | `instances().list().await` | Every instance weft holds anything for, one entry each: how many values, connections and live tokens, its infra copies, and its triggers, each with the events waiting on a field not yet filled and why |
@@ -334,4 +329,4 @@ For what `spec` and `stop_self` decide, go and read
 ## What is not here
 
 `ContextHandle`, the trait underneath, is the seam the runtime implements. Your
-node only ever sees the `ExecutionContext` wrappers on this page.
+node only ever sees the `RunContext` wrappers on this page.

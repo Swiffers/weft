@@ -1,7 +1,7 @@
 //! Live caller connection: the node-facing surface for a held connection
 //! to an outside caller (see `crate::signal::live_connection`).
 //!
-//! Two execution worlds exist. The DURABLE world (`ctx.await_signal`) is
+//! Two run worlds exist. The DURABLE world (`ctx.await_signal`) is
 //! a disconnected wait: the worker parks, dies, journals, and a fresh
 //! worker resumes later. The LIVE world (this module) is a caller
 //! attached over a held connection for the life of the request/session;
@@ -18,7 +18,7 @@
 //!   engine wires one onto the `ContextHandle` for runs that have a live
 //!   connection; runs without one expose `None`.
 //! - [`CallerHandle`] is the ergonomic author-facing wrapper
-//!   `ExecutionContext::caller()` returns. Talk methods are
+//!   `RunContext::caller()` returns. Talk methods are
 //!   protocol-specific (an HTTP handle has no `receive`), so the wrapper
 //!   is an enum over the two protocol shapes: the interface is honest
 //!   about what each protocol can do.
@@ -56,6 +56,7 @@ use crate::signal::{Backpressure, DataType, ErrorMode, LiveConnectionConfig, Pro
 /// route pattern's captures for it (`{"room": "room7"}`); `caller` is
 /// the identity the auth gate established (`None` on an open route).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LiveRequest {
     /// Absent reads as empty rather than refusing, so a trigger whose
     /// method is fixed by the protocol can leave it out of what it
@@ -379,9 +380,9 @@ pub const DEFAULT_INBOUND_WINDOW: usize = 64;
 /// outlives its caller keeps running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectAction {
-    /// Cancel THIS execution (via the per-execution cancel-by-execution
+    /// Cancel THIS run (via the per-run cancel-by-run
     /// path). Never the process, which multiplexes many runs.
-    CancelExecution,
+    CancelRun,
     /// Keep running to completion; further sends to the caller go into
     /// the void.
     ContinueIntoVoid,
@@ -393,7 +394,7 @@ pub fn resolve_disconnect(outlives_caller: bool) -> DisconnectAction {
     if outlives_caller {
         DisconnectAction::ContinueIntoVoid
     } else {
-        DisconnectAction::CancelExecution
+        DisconnectAction::CancelRun
     }
 }
 
@@ -558,7 +559,7 @@ pub enum InboundMessage {
 ///     calls, scripts inbound messages.
 ///
 /// All methods take `&self`: a connection is shared (`Arc`) across the
-/// concurrently-running nodes of one execution, which talk to the caller
+/// concurrently-running nodes of one run, which talk to the caller
 /// in parallel. Interior mutability lives in the impl.
 #[async_trait]
 pub trait CallerConnection: Send + Sync {
@@ -728,7 +729,7 @@ pub enum CallerHandle {
 
 impl CallerHandle {
     /// Build the protocol-correct wrapper from a connection. Internal:
-    /// `ExecutionContext::caller()` calls this.
+    /// `RunContext::caller()` calls this.
     pub fn from_connection(conn: Arc<dyn CallerConnection>) -> Self {
         match conn.config().protocol {
             Protocol::Http => CallerHandle::Http(HttpCaller { conn }),
@@ -748,7 +749,7 @@ impl CallerHandle {
 
     /// The handle whose reads are `node`'s waits, registered with the
     /// run's `liveness` (see [`CallerConnection::receive`]). Internal:
-    /// `ExecutionContext::caller()` hands each firing its own.
+    /// `RunContext::caller()` hands each firing its own.
     pub fn waited_by(self, liveness: std::sync::Weak<dyn crate::liveness::WaitLiveness>, node: crate::liveness::FiringLocation) -> Self {
         match self {
             CallerHandle::Websocket(ws) => CallerHandle::Websocket(WsCaller { waiter: Waiter { liveness, node: Some(node) }, ..ws }),
@@ -1210,7 +1211,7 @@ impl FakeCallerConnection {
     fn disconnected_outcome(&self) -> Result<(), CallerError> {
         match resolve_disconnect(self.config.outlives_caller) {
             DisconnectAction::ContinueIntoVoid => Ok(()),
-            DisconnectAction::CancelExecution => Err(CallerError::Disconnected),
+            DisconnectAction::CancelRun => Err(CallerError::Disconnected),
         }
     }
 }
@@ -1514,7 +1515,7 @@ mod tests {
     fn who_owns_the_run_decides_what_a_disconnect_does() {
         assert_eq!(
             resolve_disconnect(false),
-            DisconnectAction::CancelExecution,
+            DisconnectAction::CancelRun,
             "a tied run ends with its caller"
         );
         assert_eq!(
@@ -1625,7 +1626,7 @@ mod tests {
         req.base_url = Some("http://127.0.0.1:14111".into());
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["method"], "GET");
-        assert_eq!(v["base_url"], "http://127.0.0.1:14111");
+        assert_eq!(v["baseUrl"], "http://127.0.0.1:14111");
         assert!(v.get("params").is_none(), "empty maps are omitted on the wire");
         assert_eq!(serde_json::from_value::<LiveRequest>(v).unwrap(), req);
 

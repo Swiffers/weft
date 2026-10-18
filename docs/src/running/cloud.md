@@ -371,7 +371,7 @@ the keys you have handed out, run `weft token ls --on prod`, and to cancel
 one right away, `weft token revoke <id> --on prod`.
 
 Every command takes `--on` the same way: `weft status --on prod`,
-`weft executions --on prod`, `weft logs <execution-id> --on prod`. Without it, a
+`weft runs --on prod`, `weft logs <run-id> --on prod`. Without it, a
 command acts on your own machine; nothing makes prod the default.
 
 ### What `activate --on prod` does
@@ -420,18 +420,18 @@ first deploy, so nothing is rebuilt.
 ### Connections
 
 Each install keeps its own connections and its own picks of them: which
-connection a step uses is picked on the install, never written in your
+connection a node uses is picked on the install, never written in your
 files ([picked on each install](../build/connections.md#picked-on-each-install)).
-A step you connected on your machine has no pick on prod until you make one
+A node you connected on your machine has no pick on prod until you make one
 there, with the same walkthrough:
 
 ```bash
 weft connect --on prod
 ```
 
-If a run on prod reaches a step with nothing picked there, it is refused
-before it starts, and the message names the step and
-`weft connect --node <step>`; add `--on prod`. An instance's own connection (a
+If a run on prod reaches a node with nothing picked there, it is refused
+before it starts, and the message names the node and
+`weft connect --node <node>`; add `--on prod`. An instance's own connection (a
 field written `@instance_filled`) lives in the install it was made on, so
 your customers connect through your frontend on prod, the same way they do
 locally.
@@ -442,12 +442,12 @@ If your project names a target, the graph has a switch in its top right
 corner: **local**, then each target. If you want to see what prod is
 running, click **prod**. The graph then shows the program as it was last
 deployed there, along with prod's runs, status and connections. From then
-on, **Run**, **Activate**, the Executions list and the version tree all go
+on, **Run**, **Activate**, the Runs list and the version tree all go
 to prod, as if you had typed `--on prod` on each command.
 
 You cannot edit the program there, because it is a copy of what prod runs.
 You can change its connections, though: **Connect** and **Disconnect** on a
-step change which connection prod uses, and prod sets up again any trigger
+node change which connection prod uses, and prod sets up again any trigger
 that relies on it. If the files in your folder are a different version from
 prod's, a banner at the top says so. **Activate** deploys the files in your
 folder, exactly like `weft activate --on prod`, not the copy you see on
@@ -605,8 +605,8 @@ waiting for it to start.
   weft tells the holders the trigger is there; otherwise weft is starting
   one. If it stays that way, the holders' logs say why.
 - **A run on prod is refused with "has no ... connection picked on this
-  install"**: the step was connected on your machine, not on prod. Run the
-  `weft connect --node <step>` it names, with `--on prod`.
+  install"**: the node was connected on your machine, not on prod. Run the
+  `weft connect --node <node>` it names, with `--on prod`.
 - **An image build fails**: the error quotes the builder's log, with the
   `cargo` or `apt` line that failed. Fix what it names and deploy again;
   only what changed rebuilds.

@@ -105,11 +105,11 @@ pub fn held_check_route(state: Arc<BrokerState>) -> Router {
 /// Every call the broker answers, as a request and on a line alike.
 fn api(state: Arc<BrokerState>) -> Router {
     Router::new()
-        // Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`)
-        .route("/v1/execution/tag", post(handlers::execution_tag))
+        // Run steering (`ctx.tag_run` / `ctx.stop_tagged`)
+        .route("/v1/run/tag", post(handlers::run_tag))
         .route(
-            "/v1/execution/stop_tagged",
-            post(handlers::execution_stop_tagged),
+            "/v1/run/stop_tagged",
+            post(handlers::run_stop_tagged),
         )
         // Tasks
         .route("/v1/task/enqueue_dedup", post(handlers::task_enqueue_dedup))

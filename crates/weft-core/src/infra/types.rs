@@ -504,6 +504,7 @@ pub enum EndpointTarget {
 /// Where one declared endpoint of a running infra node answers: what
 /// `ctx.endpoint(name)` resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EndpointAddress {
     /// The address the project's own workers use.
     pub url: String,

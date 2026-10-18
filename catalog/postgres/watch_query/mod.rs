@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use weft::bus::BusOptions;
 use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::postgres::{
     connect_alone, connect_listening, mistake, plan, query_json, refuse_shadowed_columns,
@@ -68,7 +68,7 @@ impl Node for PostgresWatchQueryNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
         let interval = cadence(ctx.inputs.get("intervalSecs")?)?;
@@ -174,7 +174,7 @@ fn first_row_columns(rows: &[Value], columns: &[String]) -> Vec<(String, Value)>
 
 /// The output ports the author declared beyond `rows`: each names a
 /// column of the watched query, and each becomes its own bus.
-fn declared_columns(ctx: &ExecutionContext) -> Vec<String> {
+fn declared_columns(ctx: &RunContext) -> Vec<String> {
     let mut columns: Vec<String> =
         ctx.data_outputs().into_keys().filter(|name| name != "rows").collect();
     // The declared map has no order of its own; a stable one keeps the

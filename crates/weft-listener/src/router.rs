@@ -101,7 +101,7 @@ async fn prepare(
             tenant_id: req.tenant_id,
             node_id: req.node_id,
             is_resume: req.is_resume,
-            execution_id: req.execution_id,
+            run_id: req.run_id,
             spec: req.spec,
         },
         for_instance,

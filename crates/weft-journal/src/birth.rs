@@ -1,12 +1,12 @@
 //! A run's birth: the events every way of starting a run writes first.
 
-use crate::ExecEvent;
+use crate::RunEvent;
 
-/// Everything an execution is born with. Every start path (manual run,
+/// Everything a run is born with. Every start path (manual run,
 /// setup phases, entry-trigger fire, live-trigger fire) fills one, so a
 /// field added to the birth has one home.
 pub struct Birth<'a> {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     pub project_id: uuid::Uuid,
     pub phase: weft_core::context::Phase,
     pub entry_node: &'a str,
@@ -35,7 +35,7 @@ pub struct Birth<'a> {
     pub fired_trigger: Option<&'a str>,
     /// For a run started by hand through a trigger that answers a caller,
     /// that trigger's spec: its stand-in caller serves the firing kick's
-    /// request (`ExecEvent::ExecutionStarted::stand_in`).
+    /// request (`RunEvent::RunStarted::stand_in`).
     pub stand_in: Option<&'a weft_core::primitive::SignalSpec>,
     /// How the run is kept (`weft_core::run_settings`): the starting
     /// signal's, `weft run`'s flags, or the runtime's bookkeeping settings
@@ -45,24 +45,24 @@ pub struct Birth<'a> {
     pub at_unix: u64,
 }
 
-/// The two event shapes that give an execution its identity: the one
-/// `ExecutionStarted` and one `NodeKicked` per root. How they are written
+/// The two event shapes that give a run its identity: the one
+/// `RunStarted` and one `NodeKicked` per root. How they are written
 /// differs per path (a queued run's first row, a worker's batch); the
 /// events do not.
-pub fn birth_events(birth: Birth<'_>) -> (ExecEvent, Vec<ExecEvent>) {
+pub fn birth_events(birth: Birth<'_>) -> (RunEvent, Vec<RunEvent>) {
     let Birth {
-        execution_id, project_id, phase, entry_node, kicks, definition_hash, binary_hash, selection, seed, source_version, instance, picks,
+        run_id, project_id, phase, entry_node, kicks, definition_hash, binary_hash, selection, seed, source_version, instance, picks,
         fired_trigger, stand_in, settings, at_unix,
     } = birth;
-    let start = ExecEvent::ExecutionStarted {
-        execution_id,
+    let start = RunEvent::RunStarted {
+        run_id,
         project_id,
         entry_node: entry_node.to_string(),
         phase,
         definition_hash: Some(definition_hash.to_string()),
         binary_hash: Some(binary_hash.to_string()),
         source_version: source_version.map(str::to_string),
-        run_kind: weft_core::exec::RunKind::Execution,
+        run_kind: weft_core::run::RunKind::Project,
         selection: selection.cloned(),
         seed,
         instance: instance.map(|m| m.instance.clone()),
@@ -75,8 +75,8 @@ pub fn birth_events(birth: Birth<'_>) -> (ExecEvent, Vec<ExecEvent>) {
     };
     let kick_events = kicks
         .iter()
-        .map(|kick| ExecEvent::NodeKicked {
-            execution_id,
+        .map(|kick| RunEvent::NodeKicked {
+            run_id,
             node_id: kick.node.clone(),
             frames: kick.frames.clone(),
             firing: kick.firing,
@@ -96,10 +96,10 @@ pub fn birth_events(birth: Birth<'_>) -> (ExecEvent, Vec<ExecEvent>) {
 /// source is a node at the frames it emits under, with its values by port.
 pub fn supplied_rows<'a>(
     project: &weft_core::ProjectDefinition,
-    execution_id: weft_core::ExecutionId,
+    run_id: weft_core::RunId,
     sources: impl IntoIterator<Item = (&'a str, &'a weft_core::frames::LoopFrames, std::collections::BTreeMap<&'a str, &'a serde_json::Value>)>,
     at_unix: u64,
-) -> Vec<ExecEvent> {
+) -> Vec<RunEvent> {
     let mut events = Vec::new();
     for (source, frames, ports) in sources {
         let Some(node) = project.nodes.iter().find(|node| node.id == source) else { continue };
@@ -115,9 +115,9 @@ pub fn supplied_rows<'a>(
                 None => vec![],
             };
             for (index, value) in values.into_iter().enumerate() {
-                events.push(ExecEvent::PortEmitted {
-                    execution_id,
-                    emission_id: uuid::Uuid::new_v5(&execution_id, format!("supplied\0{at}\0{}\0{index}", port.name).as_bytes()),
+                events.push(RunEvent::PortEmitted {
+                    run_id,
+                    emission_id: uuid::Uuid::new_v5(&run_id, format!("supplied\0{at}\0{}\0{index}", port.name).as_bytes()),
                     node_id: source.to_string(),
                     frames: frames.clone(),
                     port: port.name.clone(),
@@ -127,9 +127,9 @@ pub fn supplied_rows<'a>(
                 });
             }
             if generator || supplied.is_none() {
-                events.push(ExecEvent::PortClosed {
-                    execution_id,
-                    emission_id: uuid::Uuid::new_v5(&execution_id, format!("supplied-end\0{at}\0{}", port.name).as_bytes()),
+                events.push(RunEvent::PortClosed {
+                    run_id,
+                    emission_id: uuid::Uuid::new_v5(&run_id, format!("supplied-end\0{at}\0{}", port.name).as_bytes()),
                     node_id: source.to_string(),
                     frames: frames.clone(),
                     port: port.name.clone(),
@@ -148,15 +148,15 @@ pub fn supplied_rows<'a>(
 /// it did not run and why.
 pub fn baked_rows(
     project: &weft_core::ProjectDefinition,
-    execution_id: weft_core::ExecutionId,
+    run_id: weft_core::RunId,
     baked: &weft_core::infra::bake::Saved,
     at_unix: u64,
-) -> Vec<ExecEvent> {
+) -> Vec<RunEvent> {
     let frames: Vec<(&weft_core::frames::Located, weft_core::frames::LoopFrames)> = baked.keys().map(|place| (place, place.frames())).collect();
-    let mut rows: Vec<ExecEvent> = frames
+    let mut rows: Vec<RunEvent> = frames
         .iter()
-        .map(|(place, frames)| ExecEvent::LogLine {
-            execution_id,
+        .map(|(place, frames)| RunEvent::LogLine {
+            run_id,
             node_id: place.id.clone(),
             frames: frames.clone(),
             level: "info".to_string(),
@@ -171,7 +171,7 @@ pub fn baked_rows(
         .collect();
     rows.extend(supplied_rows(
         project,
-        execution_id,
+        run_id,
         frames.iter().map(|(place, frames)| (place.id.as_str(), frames, baked[*place].iter().map(|(port, value)| (port.as_str(), value)).collect())),
         at_unix,
     ));
@@ -209,16 +209,16 @@ mod supplied_tests {
             "edges": []
         }))
         .unwrap();
-        let execution_id = weft_core::ExecutionId::from_u128(9);
+        let run_id = weft_core::RunId::from_u128(9);
         let frames = weft_core::frames::LoopFrames::new();
         let value = json!("a1");
         let supplied = || [("db", &frames, std::collections::BTreeMap::from([("access", &value)]))];
-        let rows = supplied_rows(&project, execution_id, supplied(), 5);
-        assert!(matches!(&rows[0], ExecEvent::PortEmitted { node_id, port, value, provided: true, .. }
+        let rows = supplied_rows(&project, run_id, supplied(), 5);
+        assert!(matches!(&rows[0], RunEvent::PortEmitted { node_id, port, value, provided: true, .. }
             if node_id == "db" && port == "access" && **value == json!("a1")));
-        assert!(matches!(&rows[1], ExecEvent::PortClosed { port, provided: true, .. } if port == "status"));
+        assert!(matches!(&rows[1], RunEvent::PortClosed { port, provided: true, .. } if port == "status"));
         assert_eq!(rows.len(), 2);
-        let again = serde_json::to_value(supplied_rows(&project, execution_id, supplied(), 5)).unwrap();
+        let again = serde_json::to_value(supplied_rows(&project, run_id, supplied(), 5)).unwrap();
         assert_eq!(again, serde_json::to_value(&rows).unwrap(), "the same run is born the same");
     }
 }

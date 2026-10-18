@@ -18,7 +18,7 @@
 //!                       # shared code via `use super::<shared_mod>;`.
 //!   src/
 //!     main.rs           # spawns weft-engine; fetches the
-//!                       # ProjectDefinition per execution from the
+//!                       # ProjectDefinition per run from the
 //!                       # broker. NO project.json baked in.
 //!     registry.rs       # NodeCatalog impl: dispatches node_type to
 //!                       # the struct in its `pkg_<name>` crate.
@@ -34,11 +34,11 @@
 //! for the referenced nodes; dead-code analysis in the Rust compiler
 //! prunes unused shared helpers).
 //!
-//! Per-execution project fetch: the worker no longer carries a
+//! Per-run project fetch: the worker no longer carries a
 //! baked-in `ProjectDefinition`. Each `Execute` / `Resume` task
 //! payload carries the `definition_hash` the user clicked Run
 //! against; the worker fetches the matching definition from the
-//! broker, caches by hash so repeated executions of the same shape
+//! broker, caches by hash so repeated runs of the same shape
 //! pay one round trip per shape, and runs the engine on that. A
 //! pure config or topology edit therefore no longer regenerates any
 //! source file in this crate, and the resulting docker image is a
@@ -95,7 +95,7 @@ pub fn emit(
     let packages = group_by_package(catalog, &referenced)?;
 
     // The `ProjectDefinition` is NOT baked into the binary anymore;
-    // workers fetch it from the broker at execution claim time keyed
+    // workers fetch it from the broker at run claim time keyed
     // by `definition_hash`. A pure-config or pure-topology edit
     // therefore no longer re-bakes any source file into the worker
     // crate, and the docker image hash stays cache-hit.
@@ -1108,7 +1108,7 @@ fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
 /// declarations (`type_decls`, one registry entry per line).
 fn worker_main_source(type_decls: &str) -> String {
     format!(
-        r#"//! Project worker binary. Weft calls it once per execution
+        r#"//! Project worker binary. Weft calls it once per run
 //! (`weft_engine::worker`): it serves HTTP until it is told to stop.
 
 use std::sync::Arc;

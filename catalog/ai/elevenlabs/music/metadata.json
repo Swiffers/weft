@@ -40,7 +40,7 @@
       "default": "music_v2_5",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "music_v2_5",
           "music_v2"
@@ -146,7 +146,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -156,8 +156,8 @@
             "value": "id",
             "where": { "status": "completed" },
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "next_cursor"
             }
           }
         ]

@@ -130,7 +130,7 @@
     "query?": "Dict[String, String]",
     "headers?": "List[List[String]]",
     "caller?": "JsonDict",
-    "base_url?": "String"
+    "baseUrl?": "String"
   },
   "features": {
     "isTrigger": true,
@@ -173,7 +173,7 @@
         "kind": "per_instance"
       },
       "then": {
-        "message": "Socket '{id}' would exist once per instance, because {per_instance_reason}, but its public address is one for every instance. Keep the socket shared and pick the instance per call: the `Weft-Instance` header on a socket gated by a connection, or an instance token.",
+        "message": "Socket '{id}' would exist once per instance, because {perInstanceReason}, but its public address is one for every instance. Keep the socket shared and pick the instance per call: the `Weft-Instance` header on a socket gated by a connection, or an instance token.",
         "level": "structural",
         "severity": "error"
       }

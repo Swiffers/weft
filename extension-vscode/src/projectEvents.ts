@@ -1,6 +1,6 @@
 // A persistent, self-reconnecting SSE subscription, and the two the
 // editor holds: the project-level stream (`/events/project/{id}`) that
-// every consumer (auto-follow, executions sidebar, action bar) listens
+// every consumer (auto-follow, runs sidebar, action bar) listens
 // on, and the display stream a graph view opens for the nodes it draws.
 // A single dropped connection must never silence the editor for the
 // rest of the session: the dispatcher may not be up yet when the graph
@@ -12,7 +12,7 @@
 //   - connect listeners: fired on EVERY successful (re)connection.
 //     Messages sent while the stream was down are gone, so a connect is
 //     the signal to resync from authoritative state (refetch status,
-//     refetch the executions list, catch up to a run that started
+//     refetch the runs list, catch up to a run that started
 //     meanwhile).
 //
 // While the person is away from a remote install (see `presence.ts`)
@@ -20,7 +20,7 @@
 // again, and that connect resyncs like any other.
 
 import type { DispatcherClient, SseSubscription } from './dispatcher';
-import type { DispatcherEvent } from './execFollower';
+import type { DispatcherEvent } from './runFollower';
 import type { LivePause } from './presence';
 
 const INITIAL_BACKOFF_MS = 500;

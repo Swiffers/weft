@@ -4,7 +4,7 @@
 //!   - `setup_trigger`: resolve the upstream bridge's handle, register
 //!     an SSE signal on its `/events` stream. The
 //!     listener subscribes; the dispatcher receives `message.received`
-//!     events and fires fresh executions. The node's filter settings
+//!     events and fires fresh runs. The node's filter settings
 //!     become predicates on the signal, so a message they exclude is
 //!     dropped where it arrives and never starts a run.
 //!
@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use weft::infra::InfraHandle;
 use weft::signal::{Predicate, SseSubscribe};
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyReceiveNode;
@@ -32,7 +32,7 @@ impl Node for BaileyReceiveNode {
     }
 
     // Registers the SSE signal; setup emits nothing downstream.
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let ignore_groups: bool = ctx.inputs.get("ignoreGroups")?;
         let message_types: Option<Vec<String>> = ctx.inputs.opt("messageTypes")?;
@@ -66,7 +66,7 @@ impl Node for BaileyReceiveNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The SSE listener delivers the parsed `data:` object as the wake
         // payload. Fan the fields this node declares an output for onto
         // those ports (`isGroup` and `chatId` included); a payload field no

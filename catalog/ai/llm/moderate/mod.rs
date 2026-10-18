@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmModerateNode;
@@ -23,7 +23,7 @@ impl Node for LlmModerateNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The provider's own model is a chat model in the usual setup
         // (one OpenAIProvider for everything); moderation names its own.
         let (_, account) = super::provider::read_for(&ctx, "openai", "moderation")?;

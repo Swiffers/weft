@@ -14,6 +14,7 @@ use crate::running_policy::DeactivateSpec;
 /// program's own triggers) can say that instances' are still listening
 /// and how to take them down too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeactivateResponse {
     pub deactivated: Vec<Owner>,
     pub instances_still_on: Vec<InstanceId>,

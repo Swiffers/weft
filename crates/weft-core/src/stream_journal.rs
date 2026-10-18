@@ -281,6 +281,7 @@ pub enum CallerDirection {
 
 /// One message of a conversation, as the journal keeps it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindowedCallerMessage {
     pub offset: u64,
     pub direction: CallerDirection,

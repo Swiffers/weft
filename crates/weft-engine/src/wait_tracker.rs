@@ -4,7 +4,7 @@
 //! delivery) registers its waits here, so the drive loop's stuck-check
 //! has ONE picture of "which in-flight tasks are parked, and on what".
 //! A second private tracker would let the detector see half the waits
-//! and either hang the execution or close it under live work.
+//! and either hang the run or close it under live work.
 //!
 //! Vocabulary: this code uses "wait" everywhere, not "park". The word
 //! "park" already names `ctx.await_signal` (journal-replay workflow
@@ -21,7 +21,7 @@ use uuid::Uuid;
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::liveness::{wait_on, FiringLocation, WaitId, WaitLiveness, WaitSource};
 
-/// One node execution's wait state in the tracker's liveness map: the
+/// One firing's wait state in the tracker's liveness map: the
 /// set of waits this node is currently inside, keyed by `WaitId`. A
 /// node is one async task but CAN hold several concurrent waits (a body
 /// that `select!`s or `join!`s over two cursors), so `waits` is a map,
@@ -49,7 +49,7 @@ struct WaitState {
     parked: bool,
 }
 
-/// Per-execution wait tracker, owned by the execution's drive and
+/// Per-run wait tracker, owned by the run's drive and
 /// shared with every construct that parks node tasks in-process (the
 /// bus coordinator, the stream runtime's feeds, the delivery gates).
 pub struct WaitTracker {
@@ -58,12 +58,12 @@ pub struct WaitTracker {
     /// The loop doesn't care WHO changed; it just needs to re-check
     /// stuck.
     wait_notify: Notify,
-    /// Per-NODE-EXECUTION wait liveness, keyed by `(node_id, frames)`.
+    /// Per-NODE-RUN wait liveness, keyed by `(node_id, frames)`.
     /// Each entry holds the node's currently-live waits (keyed by
     /// `WaitId`, because one task can `select!`/`join!` over several at
-    /// once). A node execution in a parallel loop has one entry per
+    /// once). A firing in a parallel loop has one entry per
     /// lane (distinct frames), so lanes never conflate. Read by
-    /// `deadlock_provable`: the execution is stuck only when every
+    /// `deadlock_provable`: the run is stuck only when every
     /// in-flight node task is parked here with EVERY one of its waits
     /// at its true `notified.await` AND caught up on that wait's
     /// source's CURRENT generation. A node that is computing (no map
@@ -75,7 +75,7 @@ pub struct WaitTracker {
     /// rather than by a scheduler-fairness bet.
     nodes: Mutex<HashMap<FiringLocation, NodeWaitState>>,
     /// Mint for `WaitId`s. Plain monotone counter; ids are never reused
-    /// within an execution, so a stale `exit_wait` can never address a
+    /// within a run, so a stale `exit_wait` can never address a
     /// later wait.
     next_wait_id: AtomicU64,
     /// The signal waits the run holds in this worker because it cannot
@@ -103,7 +103,7 @@ impl WaitTracker {
         self.wait_notify.notified()
     }
 
-    /// How many node executions are currently fully parked (every one
+    /// How many node firings are currently fully parked (every one
     /// of their concurrent waits at its true park point). Logging /
     /// diagnostics only: the stuck-check reads the map inside
     /// `deadlock_provable`'s locked snapshot, never through this.
@@ -124,7 +124,7 @@ impl WaitTracker {
         !state.waits.is_empty() && state.waits.values().all(|w| w.parked)
     }
 
-    /// Test accessor: how many node executions currently have a
+    /// Test accessor: how many node firings currently have a
     /// liveness entry (>= 1 live wait). Lets tests assert the map shape
     /// directly (e.g. two registrations from one node collapse to one
     /// entry).
@@ -148,7 +148,7 @@ impl WaitTracker {
     }
 
     /// True when EVERY one of the `in_flight` live node tasks (the
-    /// driver's identity set of spawned firings) is a node execution
+    /// driver's identity set of spawned firings) is a firing
     /// PARKED at its true `notified.await` point (not mid-evaluation)
     /// AND has observed its source's CURRENT generation at its last
     /// condition evaluation. Identity matching (not a count): a wait
@@ -159,7 +159,7 @@ impl WaitTracker {
     /// it; the resolution that follows a `true` poisons every source,
     /// which fails such a zombie loudly too. A node holding several
     /// waits is ONE task and ONE map entry, so it counts once: this is
-    /// the whole point of keying liveness on the node execution rather
+    /// the whole point of keying liveness on the firing rather
     /// than on each transient wait.
     ///
     /// - A node behind its source's generation has an event it has not
@@ -193,7 +193,7 @@ impl WaitTracker {
     /// one can resolve a wait this scan just called dead. The DRIVER
     /// therefore pairs this proof with its own "task channel is empty"
     /// check, in that order, before acting on it (see the stuck-check
-    /// in `execution_driver`). Neither half alone is a proof.
+    /// in `run_driver`). Neither half alone is a proof.
     pub fn deadlock_provable<'a>(&self, in_flight: impl IntoIterator<Item = &'a FiringLocation>) -> bool {
         let mut in_flight = in_flight.into_iter().peekable();
         if in_flight.peek().is_none() {
@@ -547,7 +547,7 @@ impl DeliveryGate {
         let source = self.clone() as Arc<dyn WaitSource>;
         let outcome = wait_on(liveness, &Some(node), &source, || self.outcome()).await;
         outcome.map_err(|e| {
-            WeftError::NodeExecution(format!("the emission was not delivered: {e}"))
+            WeftError::NodeFailed(format!("the emission was not delivered: {e}"))
         })
     }
 }

@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::execution_id_of;
+use common::run_id_of;
 
 use weft_e2e::{ensure, project::Project, run::SettledRun};
 
@@ -23,7 +23,7 @@ async fn a_seed_whose_file_moved_on_is_refused() -> anyhow::Result<()> {
     let project = Project::prepare("seed_moved_file", disp).await?;
 
     let stdout = project.weft(&["run", "--json"]).await?;
-    let first = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
+    let first = SettledRun::observe(project.dispatcher(), run_id_of(&stdout)?).await?;
     first.completed()?;
 
     let refused = project.weft_refused(&["run", "--json", "--seed"]).await?;

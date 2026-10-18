@@ -344,7 +344,7 @@ export class ProjectionEngine {
 	/** Persist a layout-only change WITHOUT an undo entry. For positions the user
 	 *  did not author: an automatic re-flow (auto-organize triggered by a node
 	 *  resizing when live-display content arrives) is not a user action, so it must
-	 *  not pollute the undo stack (a streaming execution would otherwise bury real
+	 *  not pollute the undo stack (a streaming run would otherwise bury real
 	 *  edits under dozens of reflow frames). Routes through the SAME durable-layout
 	 *  primitive as `recordEdit`'s layout path, just skipping `pushHistory`. */
 	persistLayoutEdit(mutateLayout: LayoutMutator): void {

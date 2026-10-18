@@ -9,8 +9,8 @@
 // to apply) cannot drift apart.
 //
 // SYNC: op semantics <-> crates/weft-compiler/src/edit/ops.rs apply_op
-// (resolution by exact-scoped-id or unique-local-id, addEdge replaces an
-// existing driver, removeGroup/removeLoop UNGROUP children into the parent
+// (resolution by exact-scoped-id or unique-local-id, add_edge replaces an
+// existing driver, remove_group/remove_loop UNGROUP children into the parent
 // scope, moves reject when the moved decl has connections).
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
@@ -109,7 +109,7 @@ function rewriteSubtreePrefix(project: ProjectDefinition, oldPrefix: string, new
 /** Resolve an edge endpoint ref (`self`, an immediate child, or a top-level id)
  *  container to the xyflow form: scoped node id + handle (`__inner` suffix
  *  for the container's own interface side). */
-/** Resolve an addEdge endpoint the way the server does: `self` is the scope
+/** Resolve an add_edge endpoint the way the server does: `self` is the scope
  *  group's own body side; otherwise probe the scope's immediate child
  *  `{scope}.{ref}`, then the bare top-level `ref` (the lowering's outer-ref
  *  fallthrough). Null when nothing matches; the scope rule then decides
@@ -409,8 +409,8 @@ function ungroup(project: ProjectDefinition, ref: string, expectKind: 'Group' | 
  *  apply; the caller (foldOps) owns batch atomicity via clone-then-adopt. */
 function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCatalog): void {
   switch (op.op) {
-    case 'setConfig':
-    case 'removeConfig': {
+    case 'set_config':
+    case 'remove_config': {
       const node = resolveDecl(project, op.node);
       // Mirror the compiler's enrich normalization so the optimistic
       // projection matches the host's next parse: a value written for an
@@ -427,7 +427,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       if (portHomed) {
         const literals = (node.portLiterals ??= {});
         const spans = (node.portLiteralSpans ??= {});
-        if (op.op === 'setConfig') {
+        if (op.op === 'set_config') {
           literals[op.key] = parseConfigToken(op.value);
           if (!spans[op.key]) {
             // A fresh literal: record the written form so the field's
@@ -446,24 +446,24 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         }
         return;
       }
-      if (op.op === 'setConfig') node.config[op.key] = parseConfigToken(op.value);
+      if (op.op === 'set_config') node.config[op.key] = parseConfigToken(op.value);
       else delete node.config[op.key];
       return;
     }
-    case 'setValueForm': {
+    case 'set_value_form': {
       const node = resolveDecl(project, op.node);
       const spans = (node.portLiteralSpans ??= {});
       const existing = spans[op.key];
       if (existing) spans[op.key] = { ...existing, origin: op.form };
       return;
     }
-    case 'setLoopConfig':
-    case 'removeLoopConfig': {
+    case 'set_loop_config':
+    case 'remove_loop_config': {
       const decl = resolveContainer(project, op.loopId);
       if (containerKindOf(decl.nodeType) !== 'Loop') {
         throw new Error(`a Loop config op called on '${op.loopId}' which is not a Loop decl`);
       }
-      if (op.op === 'setLoopConfig') decl.config[op.key] = parseConfigToken(op.value);
+      if (op.op === 'set_loop_config') decl.config[op.key] = parseConfigToken(op.value);
       else delete decl.config[op.key];
       // The carry list derives the loop's ghost inputs: re-synthesize, then
       // sweep wires bound to a dissolved carry's input side.
@@ -473,7 +473,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       }
       return;
     }
-    case 'setPerInstance': {
+    case 'set_per_instance': {
       const node = resolveDecl(project, op.node);
       if (isContainerNodeType(node.nodeType)) {
         throw new Error(`SetPerInstance called on '${op.node}' which is a container; only a node exists once per instance`);
@@ -484,7 +484,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       else delete node.perInstance;
       return;
     }
-    case 'setLabel': {
+    case 'set_label': {
       const node = resolveDecl(project, op.node);
       if (isContainerNodeType(node.nodeType)) {
         throw new Error(`SetLabel called on '${op.node}' which is a container; containers rename via RenameGroup/RenameLoop`);
@@ -492,7 +492,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       node.label = op.label;
       return;
     }
-    case 'addNode': {
+    case 'add_node': {
       const parent = op.parentGroup == null ? undefined : resolveContainer(project, op.parentGroup);
       const id = scopedId(parent?.id, op.id);
       assertNoDuplicate(project, id);
@@ -513,14 +513,14 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       project.nodes.push(node);
       return;
     }
-    case 'addGroup':
-    case 'addLoop': {
+    case 'add_group':
+    case 'add_loop': {
       const parent = op.parentGroup == null ? undefined : resolveContainer(project, op.parentGroup);
       const id = scopedId(parent?.id, op.label);
       assertNoDuplicate(project, id);
       const node: NodeInstance = {
         id,
-        nodeType: op.op === 'addLoop' ? 'Loop' : 'Group',
+        nodeType: op.op === 'add_loop' ? 'Loop' : 'Group',
         label: op.label,
         config: parent ? { parentId: parent.id } : {},
         position: { x: 0, y: 0 },
@@ -533,7 +533,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       project.nodes.push(node);
       return;
     }
-    case 'removeNode': {
+    case 'remove_node': {
       const node = resolveDecl(project, op.node);
       if (isContainerNodeType(node.nodeType)) {
         throw new Error(`RemoveNode called on '${op.node}' which is a container; containers remove via RemoveGroup/RemoveLoop`);
@@ -542,28 +542,28 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       project.edges = project.edges.filter((e) => e.source !== node.id && e.target !== node.id);
       return;
     }
-    case 'removeGroup':
+    case 'remove_group':
       ungroup(project, op.group, 'Group');
       return;
-    case 'removeLoop':
+    case 'remove_loop':
       ungroup(project, op.loopId, 'Loop');
       return;
-    case 'renameGroup':
+    case 'rename_group':
       renameContainer(project, op.group, op.newLabel, 'Group');
       return;
-    case 'renameLoop':
+    case 'rename_loop':
       renameContainer(project, op.loopId, op.newLabel, 'Loop');
       return;
-    case 'moveNodeScope':
+    case 'move_node_scope':
       moveScope(project, op.node, op.targetGroup, 'Node');
       return;
-    case 'moveGroupScope':
+    case 'move_group_scope':
       moveScope(project, op.group, op.targetGroup, 'Group');
       return;
-    case 'moveLoopScope':
+    case 'move_loop_scope':
       moveScope(project, op.loopId, op.targetGroup, 'Loop');
       return;
-    case 'addEdge': {
+    case 'add_edge': {
       const scope = resolveScopeGroup(project, op.scopeGroup);
       const src = resolveEndpoint(project, op.source, op.sourcePort, scope);
       const tgt = resolveEndpoint(project, op.target, op.targetPort, scope);
@@ -582,7 +582,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       });
       return;
     }
-    case 'removeEdge': {
+    case 'remove_edge': {
       const scope = resolveScopeGroup(project, op.scopeGroup);
       const src = resolveEndpoint(project, op.source, op.sourcePort, scope);
       const tgt = resolveEndpoint(project, op.target, op.targetPort, scope);
@@ -596,7 +596,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       }
       return;
     }
-    case 'updateNodePorts': {
+    case 'update_node_ports': {
       const node = resolveDecl(project, op.node);
       if (isContainerNodeType(node.nodeType)) {
         throw new Error(`UpdateNodePorts called on '${op.node}' which is a container`);
@@ -609,7 +609,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       dropDanglingPortEdges(node, project);
       return;
     }
-    case 'updateGroupPorts': {
+    case 'update_group_ports': {
       const decl = resolveContainer(project, op.group);
       if (containerKindOf(decl.nodeType) !== 'Group') {
         throw new Error(`UpdateGroupPorts called on '${op.group}' which is not a Group decl`);
@@ -618,7 +618,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       dropDanglingPortEdges(decl, project);
       return;
     }
-    case 'updateLoopPorts': {
+    case 'update_loop_ports': {
       const decl = resolveContainer(project, op.loopId);
       if (containerKindOf(decl.nodeType) !== 'Loop') {
         throw new Error(`UpdateLoopPorts called on '${op.loopId}' which is not a Loop decl`);
@@ -630,7 +630,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       dropDanglingPortEdges(decl, project);
       return;
     }
-    case 'setGroupDescription': {
+    case 'set_group_description': {
       // Descriptions live in source comments, not on the rendered node; the
       // op only needs its target to exist.
       resolveContainer(project, op.group);

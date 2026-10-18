@@ -10,12 +10,12 @@ mod common;
 
 use std::time::Duration;
 
-use common::execution_id_of;
+use common::run_id_of;
 use reqwest::Method;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use weft_core::primitive::Phase;
-use weft_core::program::ExecutionPage;
+use weft_core::program::RunPage;
 use weft_e2e::access::{catalog_spec, connect_direct, set_account};
 use weft_e2e::{ensure, infra, live, poll_until, project::Project, Dispatcher, SettledRun};
 
@@ -43,16 +43,16 @@ async fn wait_copy(disp: &Dispatcher, project: Uuid, node: &str, instance: &str,
     .await
 }
 
-/// The executions of the project's fired runs in `instance` (its infra
+/// The runs of the project's fired runs in `instance` (its infra
 /// setups are runs in the instance too, and are left out).
 async fn runs_in(disp: &Dispatcher, project: Uuid, instance: &str) -> anyhow::Result<Vec<Uuid>> {
-    let listed: ExecutionPage =
-        disp.get_json(&format!("/executions?project_id={project}&instance={instance}&limit=100")).await?;
+    let listed: RunPage =
+        disp.get_json(&format!("/runs?project_id={project}&instance={instance}&limit=100")).await?;
     Ok(listed
-        .executions
+        .runs
         .into_iter()
         .filter(|run| run.phase == Phase::Fire)
-        .map(|run| run.execution_id)
+        .map(|run| run.run_id)
         .collect())
 }
 
@@ -83,7 +83,7 @@ fn minted(stdout: &str) -> anyhow::Result<String> {
 /// A node marked `@per_instance` exists once per instance: a run must say
 /// which copy it reads, an instance's copy is started and taken down on
 /// its own, and a run in an instance reads that instance's copy. A plain
-/// step cannot be marked.
+/// node cannot be marked.
 #[tokio::test]
 async fn a_per_instance_infra_node_runs_one_copy_per_instance() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -107,11 +107,11 @@ async fn a_per_instance_infra_node_runs_one_copy_per_instance() -> anyhow::Resul
     let status = project.weft(&["status"]).await?;
     anyhow::ensure!(status.contains("instance infra:") && status.contains("ada"), "{status}");
 
-    let execution_id = execution_id_of(&project.weft(&["run", "--json", "--instance", "ada"]).await?)?;
-    let settled = SettledRun::observe(&disp, execution_id).await?;
+    let run_id = run_id_of(&project.weft(&["run", "--json", "--instance", "ada"]).await?)?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!("ready"))?;
-    anyhow::ensure!(runs_in(&disp, pid, "ada").await? == vec![execution_id], "the run is ada's");
+    anyhow::ensure!(runs_in(&disp, pid, "ada").await? == vec![run_id], "the run is ada's");
     anyhow::ensure!(runs_in(&disp, pid, "bob").await?.is_empty());
     let refused = project.weft_refused(&["run", "--instance", "bob"]).await?;
     anyhow::ensure!(refused.contains("svc (instance 'bob')"), "bob's copy is not ada's: {refused}");
@@ -196,7 +196,7 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     let fields: Value = serde_json::from_str(&fields)?;
     anyhow::ensure!(
         fields.as_array().map(|f| f.len()) == Some(1)
-            && fields[0]["step"] == json!("theirs")
+            && fields[0]["node"] == json!("theirs")
             && fields[0]["field"] == json!("account")
             && fields[0]["needed"] == json!(true),
         "{fields}"
@@ -208,7 +208,7 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     let (status, body) = instance_door(&disp, Method::POST, "connections/direct", &token, Some(&own)).await?;
     anyhow::ensure!(status == 200, "{status}: {body}");
     let grant = serde_json::from_str::<Value>(&body)?["grant"]["id"].as_str().map(str::to_string).expect("a grant id");
-    let give = json!({ "set": [{ "step": "theirs", "field": "account", "value": { "id": grant } }] });
+    let give = json!({ "set": [{ "node": "theirs", "field": "account", "value": { "id": grant } }] });
     let (status, body) = instance_door(&disp, Method::PUT, "values", &token, Some(&give)).await?;
     anyhow::ensure!(status.is_success(), "{status}: {body}");
 
@@ -226,7 +226,7 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     let (status, body) = call(vec![("Weft-Instance-Token", token.clone()), ("Weft-Instance", "bob".into())]).await?;
     anyhow::ensure!(status == 400 && body.contains("names instance 'bob'"), "{status}: {body}");
     let (status, runs) = instance_door(&disp, Method::GET, "runs", &token, None).await?;
-    anyhow::ensure!(status == 200 && serde_json::from_str::<Value>(&runs)?["executions"].as_array().map(Vec::len) == Some(2), "{runs}");
+    anyhow::ensure!(status == 200 && serde_json::from_str::<Value>(&runs)?["runs"].as_array().map(Vec::len) == Some(2), "{runs}");
 
     // The open route and the bare address never take an instance.
     let (status, _, body) =
@@ -249,7 +249,7 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     anyhow::ensure!(status == 403 && body.contains("this door takes an instance token"), "{status}: {body}");
 
     // Clearing its value puts the refusal back.
-    let clear = json!({ "clear": [{ "step": "theirs", "field": "account" }] });
+    let clear = json!({ "clear": [{ "node": "theirs", "field": "account" }] });
     let (status, body) = instance_door(&disp, Method::PUT, "values", &token, Some(&clear)).await?;
     anyhow::ensure!(status.is_success(), "{status}: {body}");
     let (status, body) = call(vec![("Weft-Instance", "ada".into())]).await?;
@@ -356,8 +356,8 @@ wipeReply.body = gone.done
         Ok((serde_json::from_slice::<Value>(&body)? == json!("running")).then_some(()))
     })
     .await?;
-    let execution_id = execution_id_of(&project.weft(&["run", "--json", "--instance", "ada"]).await?)?;
-    SettledRun::observe(&disp, execution_id).await?.completed()?.assert_input("out", "data", &json!("ready"))?;
+    let run_id = run_id_of(&project.weft(&["run", "--json", "--instance", "ada"]).await?)?;
+    SettledRun::observe(&disp, run_id).await?.completed()?.assert_input("out", "data", &json!("ready"))?;
 
     let token = ask("mint").await?.as_str().map(str::to_string).expect("a token");
     let (status, body) = instance_door(&disp, Method::GET, "fields", &token, None).await?;
@@ -396,13 +396,13 @@ async fn an_instances_value_reaches_its_live_trigger() -> anyhow::Result<()> {
 
     // A value the Cron node's own rule refuses is refused as it is given,
     // naming the rule, and nothing changes.
-    let bad = json!({ "set": [{ "step": "tick", "field": "cron", "value": "0 7 * * *" }] });
+    let bad = json!({ "set": [{ "node": "tick", "field": "cron", "value": "0 7 * * *" }] });
     let (status, body) = instance_door(&disp, Method::PUT, "values", &token, Some(&bad)).await?;
     anyhow::ensure!(status == 422 && body.contains("needs six fields"), "{status}: {body}");
     anyhow::ensure!(fires().await?.starts_with("0 0 3 * * *"), "a refused value changes nothing");
 
     // A good one re-arms its live trigger on it before the answer.
-    let good = json!({ "set": [{ "step": "tick", "field": "cron", "value": "0 0 7 * * *" }] });
+    let good = json!({ "set": [{ "node": "tick", "field": "cron", "value": "0 0 7 * * *" }] });
     let (status, body) = instance_door(&disp, Method::PUT, "values", &token, Some(&good)).await?;
     anyhow::ensure!(status == 200, "{status}: {body}");
     anyhow::ensure!(serde_json::from_str::<Value>(&body)?["rearmed"] == json!(["tick"]), "{body}");

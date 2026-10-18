@@ -29,12 +29,12 @@
           "placeholder": "us-east-1"
         },
         {
-          "name": "access_key_id",
+          "name": "accessKeyId",
           "label": "Access key ID",
           "secret": false
         },
         {
-          "name": "secret_access_key",
+          "name": "secretAccessKey",
           "label": "Secret access key"
         }
       ]
@@ -50,8 +50,8 @@
           "kind": "sigv4",
           "service": "s3",
           "region": "{region}",
-          "access_key_id": "{access_key_id}",
-          "secret_access_key": "{secret_access_key}"
+          "accessKeyId": "{accessKeyId}",
+          "secretAccessKey": "{secretAccessKey}"
         }
       }
     ],

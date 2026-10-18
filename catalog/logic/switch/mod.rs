@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SwitchNode;
@@ -160,7 +160,7 @@ impl Node for SwitchNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: Value = ctx.inputs.get("value")?;
         let cases = read_cases(&ctx.inputs.get("cases")?)?;
 

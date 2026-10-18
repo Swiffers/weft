@@ -76,7 +76,7 @@
 		infraNodes,
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
-		executionState,
+		runState,
 		autoOrganizeOnMount = false,
 		displayByNode,
 		onOpenInclude = () => {},
@@ -133,7 +133,7 @@
 		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
-		executionState?: import('../../types').ExecutionState;
+		runState?: import('../../types').RunState;
 		autoOrganizeOnMount?: boolean;
 		/// What each node is showing, keyed by node id. Consumed by the
 		/// nodes that have a display: an infra node serving `/live`, and
@@ -183,7 +183,7 @@
 		{infraNodes}
 		{hasInfraInGraph}
 		{hasTriggersInGraph}
-		{executionState}
+		{runState}
 		{autoOrganizeOnMount}
 		{displayByNode}
 		{onOpenInclude}

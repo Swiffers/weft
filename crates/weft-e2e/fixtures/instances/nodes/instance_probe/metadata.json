@@ -26,5 +26,5 @@
       "type": "JsonDict"
     }
   ],
-  "requires_infra": false
+  "requiresInfra": false
 }

@@ -127,7 +127,7 @@ fn a_name_on_an_input_is_held_to_the_programs_nodes() {
 fn a_field_named_on_an_input_is_held_to_the_programs_fields() {
     let field = |filled: Option<bool>| {
         let named = match filled {
-            Some(b) => json!({ "field": { "instance_filled": b } }),
+            Some(b) => json!({ "field": { "instanceFilled": b } }),
             None => json!({ "field": {} }),
         };
         let when = json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": named } });
@@ -158,7 +158,7 @@ fn a_field_an_instance_fills_is_one_written_instance_filled() {
     m.port_literals.clear();
     m.port_literals.insert("model".into(), instance_filled_literal(None));
     p.nodes.push(m);
-    let when = |b: bool| json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "field": { "instance_filled": b } } } });
+    let when = |b: bool| json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "field": { "instanceFilled": b } } } });
     assert!(!fires_on(&p, &rule(when(true))));
     assert!(fires_on(&p, &rule(when(false))));
 }

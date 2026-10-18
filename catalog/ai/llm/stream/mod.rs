@@ -16,7 +16,7 @@ use serde_json::json;
 
 use weft::bus::BusOptions;
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::call;
 
@@ -33,7 +33,7 @@ impl Node for LlmStreamNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let llm = call::assemble(&ctx).await?;
         let leaf = call::to_wire(&ctx, &llm).await?;
 

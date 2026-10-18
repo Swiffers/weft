@@ -53,8 +53,8 @@ fn fmt_remaining(secs: i64) -> String {
     }
 }
 
-/// `weft files ls [PREFIX]`: list, organized by scope (project
-/// spaces / shared spaces / past-execution survivors + scratch).
+/// `weft files ls [PREFIX]`: list, organized by scope (project,
+/// instance, asset and shared spaces, past-run survivors + scratch).
 pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
     let files: Vec<_> = list_files(&ctx.client()?)
         .await?
@@ -79,10 +79,14 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
         groups.entry(space).or_default().push(f);
     }
     for (space, entries) in groups {
-        let label = if space.starts_with("exec/") {
-            format!("{space}/  (execution scratch / survivors)")
+        let label = if space.starts_with("run/") {
+            format!("{space}/  (run scratch / survivors)")
         } else if space.starts_with("project/") {
             format!("{space}/  (project files)")
+        } else if space.starts_with("instance/") {
+            format!("{space}/  (instance files)")
+        } else if space == "asset" || space.starts_with("asset/") {
+            format!("{space}/  (project assets)")
         } else {
             format!("{space}/  (shared space)")
         };
@@ -494,7 +498,7 @@ mod tests {
     fn scope_key_strips_the_leading_tenant_segment() {
         // A wire key is `<tenant>/<scope>/<owner>/<id>`; the CLI shows the
         // tenant-less `<scope>/<owner>/<id>`.
-        assert_eq!(scope_key("alice/exec/c1/f0"), "exec/c1/f0");
+        assert_eq!(scope_key("alice/run/c1/f0"), "run/c1/f0");
         assert_eq!(scope_key("alice/project/p1/f0"), "project/p1/f0");
         // No slash: nothing to strip, returned as-is.
         assert_eq!(scope_key("bare"), "bare");

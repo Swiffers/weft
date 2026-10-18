@@ -15,7 +15,7 @@ use weft::infra::{
     Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, MachineShape, Mount, Probe,
     Protocol, Unit, Volume, VolumeKind,
 };
-use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::{RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyBridgeNode;
@@ -66,7 +66,7 @@ impl Node for BaileyBridgeNode {
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // Bridge behaves the same on every invocation: resolve the
         // endpoint and emit it. Downstream nodes (trigger setup,
         // fire-time data reads) all need the URL.

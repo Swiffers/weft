@@ -47,7 +47,7 @@ function unquoteString(inner: string): string | null {
 
 /** The one rule for every text-shaped control (text/textarea/password
  *  boxes, code editors): an emptied box means UNSET (null, routed to a
- *  removeConfig / cleared literal), never a stored empty string. Kept
+ *  remove_config / cleared literal), never a stored empty string. Kept
  *  here, next to the unset-vs-token boundary, so the controls cannot
  *  drift apart on it. */
 export function emptyToUnset(value: string): string | null {
@@ -137,7 +137,7 @@ export function fileRefsOf(value: unknown): WeftFileRefValue[] {
  *  `@file("path"[, Type])` (Type omitted when it's the default String).
  *  SYNC: formatConfigValue <-> crates/weft-compiler/src/edit/ops.rs format_string, crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/cst/lexer.rs heredoc_span */
 export function formatConfigValue(value: unknown): string {
-  // Unset is a removeConfig, not a token: an emitted `null`/`undefined` would
+  // Unset is a remove_config, not a token: an emitted `null`/`undefined` would
   // splice garbage into source (or, for undefined, break the string contract).
   // Fail loudly at the source so the caller routes it correctly.
   if (value === null || value === undefined) {
@@ -203,7 +203,7 @@ const JSON_COMPACT_MAX_CHARS = 60;
 
 /** Parse a `.weft` source token back to its in-memory config value: the exact
  *  inverse of `formatConfigValue`, kept next to it so the two can't drift.
- *  Used by the optimistic projection to display a pending `setConfig` op's
+ *  Used by the optimistic projection to display a pending `set_config` op's
  *  value before the host round-trip lands. Throws on a token this module
  *  could not have produced (the projection drops the op loudly).
  *  SYNC: parseConfigToken <-> crates/weft-compiler/src/edit/ops.rs format_string (it inverts what format_string emits), crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/cst/lexer.rs heredoc_span */

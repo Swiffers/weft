@@ -20,7 +20,7 @@ pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
     for spec in &specs {
         let last = tree.runs.iter().rev().find(|r| r.example.as_deref() == Some(spec.name.as_str()));
         let kind = if spec.is_frozen() { "frozen" } else { "spec" };
-        let latest = last.map(|r| format!("{} (run {})", r.status.map_or("unknown", |s| s.as_str()), short(&r.execution_id.to_string())));
+        let latest = last.map(|r| format!("{} (run {})", r.listing.as_ref().map_or("unknown", |l| l.status.as_str()), short(&r.run_id.to_string())));
         rows.push(serde_json::json!({
             "name": spec.name,
             "frozen": spec.is_frozen(),
@@ -28,8 +28,8 @@ pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
             "target": spec.target,
             "before": spec.before,
             "group": spec.group,
-            "last_run": last.map(|r| r.execution_id),
-            "last_status": last.and_then(|r| r.status),
+            "lastRun": last.map(|r| r.run_id),
+            "lastStatus": last.and_then(|r| r.listing.as_ref().map(|l| l.status)),
         }));
         lines.push(format!("{:<24} {kind:<7} {}", spec.name, latest.unwrap_or_else(|| "never run".into())));
     }

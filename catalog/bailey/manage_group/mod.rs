@@ -11,7 +11,7 @@ use serde_json::json;
 
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyManageGroupNode;
@@ -73,7 +73,7 @@ impl Node for BaileyManageGroupNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let action: String = ctx.inputs.get("action")?;
         let group_id: Option<String> = ctx.inputs.opt("groupId")?;

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use weft::access::client::Multipart;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::{audio_file_type, emit_audio, input_file_format, API};
 use super::speech::{query, voice_settings};
@@ -25,7 +25,7 @@ impl Node for ElevenLabsChangeVoiceNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let audio: FileHandle = ctx.inputs.get("audio")?;
         let voice: String = ctx.inputs.get("voice")?;
@@ -40,7 +40,7 @@ impl Node for ElevenLabsChangeVoiceNode {
         // store must refuse before the paid conversion, not after.
         let (extension, mime) = audio_file_type(&output_format)?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&audio).await?;
+        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&audio).await?;
         let file_format = input_file_format(&ctx, &meta.mime_type)?;
         let mut form = Multipart::form_data()
             .text("model_id", &model)

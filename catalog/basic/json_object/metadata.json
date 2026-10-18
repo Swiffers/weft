@@ -23,6 +23,7 @@
   ],
   "features": {
     "pure": true,
-    "canAddInputPorts": true
+    "canAddInputPorts": true,
+    "addedPortsAreDataKeys": true
   }
 }

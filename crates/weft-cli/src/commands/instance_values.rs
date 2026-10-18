@@ -202,7 +202,7 @@ async fn renew_once(client: &DispatcherClient, door: &DispatcherClient, request:
 /// hold dots of its own: `one.read.spreadsheet`) split at its last dot.
 fn field_of(raw: &str) -> Result<(String, String)> {
     match raw.rsplit_once('.') {
-        Some((step, field)) if !step.is_empty() && !field.is_empty() => Ok((step.to_string(), field.to_string())),
+        Some((node, field)) if !node.is_empty() && !field.is_empty() => Ok((node.to_string(), field.to_string())),
         _ => bail!("'{raw}' is not `<node>.<field>` (`read.spreadsheet`, `one.read.spreadsheet`)"),
     }
 }
@@ -211,15 +211,15 @@ fn field_of(raw: &str) -> Result<(String, String)> {
 /// (`5`, `true`, `{"id": ".."}`), a string otherwise.
 fn set_of(raw: &str) -> Result<InstanceValueInput> {
     let (target, value) = raw.split_once('=').with_context(|| format!("--set '{raw}' is not `<node>.<field>=<value>`"))?;
-    let (step, field) = field_of(target)?;
+    let (node, field) = field_of(target)?;
     let value = serde_json::from_str::<Value>(value).unwrap_or_else(|_| Value::String(value.to_string()));
-    Ok(InstanceValueInput { step, field, value })
+    Ok(InstanceValueInput { node, field, value })
 }
 
 pub async fn run(ctx: Ctx, instance: InstanceId, set: Vec<String>, clear: Vec<String>) -> Result<()> {
     let set: Vec<InstanceValueInput> = set.iter().map(|raw| set_of(raw)).collect::<Result<_>>()?;
     let clear: Vec<InstanceFieldRef> =
-        clear.iter().map(|raw| field_of(raw).map(|(step, field)| InstanceFieldRef { step, field })).collect::<Result<_>>()?;
+        clear.iter().map(|raw| field_of(raw).map(|(node, field)| InstanceFieldRef { node, field })).collect::<Result<_>>()?;
     let json = ctx.json();
     let client = ctx.client()?;
     let which = instance.clone();
@@ -250,7 +250,7 @@ pub async fn run(ctx: Ctx, instance: InstanceId, set: Vec<String>, clear: Vec<St
             println!("The program has no field an instance fills (none is `@instance_filled`).");
         }
         for field in fields {
-            let name = format!("{}.{}", field.step, field.field);
+            let name = format!("{}.{}", field.node, field.field);
             let shown = match (&field.value, &field.fallback) {
                 (Some(value), _) => value.to_string(),
                 (None, Some(fallback)) => format!("(not filled; {fallback} stands in)"),

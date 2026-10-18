@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::signal::{Predicate, ProviderEvents};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GoogleDriveWatchNode;
@@ -32,7 +32,7 @@ impl Node for GoogleDriveWatchNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let target: String = ctx.inputs.get("target")?;
         let changes: String = ctx.inputs.get("changes")?;
@@ -54,7 +54,7 @@ impl Node for GoogleDriveWatchNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The push carries only headers (state, what changed, the
         // resource id); the file's current shape is a follow-up read.
         let mut out = ctx.fan_declared(&ctx.wake.record()?);

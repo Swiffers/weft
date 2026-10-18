@@ -33,7 +33,7 @@ out.data = scope.status
     let pid = project.id();
     let running = platform.containers_for_project(&pid, Role::Infra).await?;
     anyhow::ensure!(!running.is_empty(), "a running infra node has containers on this machine");
-    let setups = run::executions(project.dispatcher(), &project.id()).await?;
+    let setups = run::runs(project.dispatcher(), &project.id()).await?;
     anyhow::ensure!(setups.len() == 1, "one infra setup, got {setups:?}");
     SettledRun::observe(project.dispatcher(), *setups.iter().next().unwrap()).await?.completed()?
         .assert_completed("scope.enabled")?.assert_completed("scope.ready")?.assert_completed("scope.svc")?
@@ -166,7 +166,7 @@ out.data = svc.status
     let status: serde_json::Value = disp.get_json(&format!("/projects/{}/infra/status", project.id())).await?;
     let address = status["nodes"]
         .as_array()
-        .and_then(|n| n.iter().find_map(|n| n["public_urls"]["api"].as_str().map(str::to_string)))
+        .and_then(|n| n.iter().find_map(|n| n["publicUrls"]["api"].as_str().map(str::to_string)))
         .ok_or_else(|| anyhow::anyhow!("the public endpoint names its address: {status}"))?;
     let path = &address[address.find("/infra/").ok_or_else(|| anyhow::anyhow!("not a door address: {address}"))?..];
     anyhow::ensure!(path.ends_with("/svc"), "the node's own path closes the address: {address}");

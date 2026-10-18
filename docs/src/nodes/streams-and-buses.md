@@ -143,4 +143,4 @@ A bus lives exactly as long as its worker. It is not rebuilt when a worker
 restarts, and a marker resolved afterwards fails saying the bus is unknown.
 
 It is for nodes that are alive together right now. Anything that has to survive
-goes in [storage](storage.md), or through a step that ends.
+goes in [storage](storage.md), or through a node that ends.

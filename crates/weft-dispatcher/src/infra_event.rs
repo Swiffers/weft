@@ -2,7 +2,7 @@
 //! reads each row as it is announced (`infra_event_bridge`) and fans it
 //! out over SSE.
 //!
-//! Distinct from a run's record: that holds durable execution-graph
+//! Distinct from a run's record: that holds durable run-graph
 //! events. `infra_event` is for control-plane
 //! state changes about the infra itself (a node went flaky, the
 //! supervisor finished a terminate, etc).

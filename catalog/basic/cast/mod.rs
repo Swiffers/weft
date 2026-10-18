@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct CastNode;
@@ -28,7 +28,7 @@ impl Node for CastNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: serde_json::Value = ctx.inputs.get("value")?;
         // The metadata ships MustOverride and the compiler refuses an
         // un-overridden one, so the type is always resolved here.

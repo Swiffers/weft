@@ -39,7 +39,7 @@ tempfile = { workspace = true }
 # User-level CLI settings file (`~/.config/weft/cli.toml`).
 toml = { workspace = true }
 toml_edit = { workspace = true }
-# Local-time rendering of the journal's unix stamps (`weft executions`,
+# Local-time rendering of the journal's unix stamps (`weft runs`,
 # `weft events`, `weft logs`).
 chrono = { workspace = true }
 # Hidden-echo terminal input for pasted credentials (`weft connect`).

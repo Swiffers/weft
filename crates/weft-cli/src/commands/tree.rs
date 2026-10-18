@@ -1,12 +1,12 @@
 //! `weft tree`: the version tree, one line per version (id prefix,
 //! label, what changed against its parent, how many runs its triggers
-//! started) with its runs started by hand beneath (execution prefix,
+//! started) with its runs started by hand beneath (run prefix,
 //! status, seed, scope, example). Head is marked.
 
 use std::collections::BTreeMap;
 
 use super::versions::{fetch_tree_raw, short};
-use weft_core::versions::{RunSummary, VersionSummary, VersionTree};
+use weft_core::versions::{VersionRun, VersionSummary, VersionTree};
 use super::Ctx;
 
 pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
@@ -20,7 +20,7 @@ pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
         let disk = weft_core::project::hash::manifest_version_id(&super::versions::local_manifest(project)?);
         let known = tree.versions.iter().any(|v| v.id == disk);
         if let Some(obj) = raw.as_object_mut() {
-            obj.insert("disk_version".into(), if known { serde_json::Value::String(disk) } else { serde_json::Value::Null });
+            obj.insert("diskVersion".into(), if known { serde_json::Value::String(disk) } else { serde_json::Value::Null });
         }
         ctx.json_out(&raw)?;
         return Ok(());
@@ -41,7 +41,7 @@ pub fn render(tree: &VersionTree, when: &dyn Fn(u64) -> String) -> Vec<String> {
     for v in &tree.versions {
         children.entry(v.parent_id.as_deref()).or_default().push(v);
     }
-    let mut runs_by_version: BTreeMap<&str, Vec<&RunSummary>> = BTreeMap::new();
+    let mut runs_by_version: BTreeMap<&str, Vec<&VersionRun>> = BTreeMap::new();
     for r in &tree.runs {
         runs_by_version.entry(r.version_id.as_str()).or_default().push(r);
     }
@@ -86,7 +86,7 @@ fn render_version<'a>(
     v: &'a VersionSummary,
     depth: usize,
     children: &BTreeMap<Option<&str>, Vec<&'a VersionSummary>>,
-    runs: &BTreeMap<&str, Vec<&'a RunSummary>>,
+    runs: &BTreeMap<&str, Vec<&'a VersionRun>>,
     when: &dyn Fn(u64) -> String,
     // Every version this walk has printed, so the caller can print what
     // it never reached instead of losing it.
@@ -130,31 +130,32 @@ fn render_version<'a>(
     };
     out.push(format!("{indent}{} {}{label}{change}{fired}{mark}", short(&v.id), when(v.created_at)));
     for r in runs.get(v.id.as_str()).cloned().unwrap_or_default() {
-        let head = if tree.head.head_run == Some(r.execution_id) { " <- HEAD run" } else { "" };
-        let seed = r.seed_execution_id.map(|s| format!(" seed {} ({} stale)", short(&s.to_string()), r.stale.len())).unwrap_or_default();
+        let head = if tree.head.head_run == Some(r.run_id) { " <- HEAD run" } else { "" };
+        let seed = r.seed_run_id.map(|s| format!(" seed {} ({} stale)", short(&s.to_string()), r.stale.len())).unwrap_or_default();
         let scope = r.spec.as_ref().map(started_by).unwrap_or_default();
         let example = r.example.as_deref().map(|e| format!(" example {e}")).unwrap_or_default();
-        let ended = r.completed_at.map(|t| format!(" -> {}", when(t))).unwrap_or_default();
+        let listing = r.listing.as_ref();
+        let ended = listing.and_then(|l| l.completed_at).map(|t| format!(" -> {}", when(t))).unwrap_or_default();
         // A cancelled run says who ended it, because a person stopping
         // a run and the runtime cutting one are different stories.
-        let cause = match &r.cancel_cause {
-            Some(weft_core::exec::CancelCause::User) => " (a person stopped it)".to_string(),
-            Some(weft_core::exec::CancelCause::Execution { by, .. }) => {
+        let cause = match listing.and_then(|l| l.cancel_cause.as_ref()) {
+            Some(weft_core::run::CancelCause::User) => " (a person stopped it)".to_string(),
+            Some(weft_core::run::CancelCause::Run { by, .. }) => {
                 format!(" (run {} stopped it)", short(&by.to_string()))
             }
-            Some(weft_core::exec::CancelCause::CallerGone) => {
+            Some(weft_core::run::CancelCause::CallerGone) => {
                 " (the caller went away)".to_string()
             }
-            Some(weft_core::exec::CancelCause::Runtime { detail }) => format!(" ({detail})"),
-            Some(weft_core::exec::CancelCause::Limit { detail }) => format!(" (a time limit: {detail})"),
+            Some(weft_core::run::CancelCause::Runtime { detail }) => format!(" ({detail})"),
+            Some(weft_core::run::CancelCause::Limit { detail }) => format!(" (a time limit: {detail})"),
             None => String::new(),
         };
-        let skipped = if r.skipped_nodes > 0 {
-            format!(" {} skipped", r.skipped_nodes)
-        } else {
-            String::new()
+        let skipped = match listing.map(|l| l.skipped_nodes) {
+            Some(skipped) if skipped > 0 => format!(" {skipped} skipped"),
+            _ => String::new(),
         };
-        out.push(format!("{indent}  run {} {}{ended} {}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.execution_id.to_string()), when(r.started_at), r.status.map_or("unknown", |s| s.as_str())));
+        let status = listing.map_or("unknown", |l| l.status.as_str());
+        out.push(format!("{indent}  run {} {}{ended} {status}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.run_id.to_string()), when(r.started_at)));
     }
     for child in children.get(&Some(v.id.as_str())).cloned().unwrap_or_default() {
         render_version(tree, child, depth + 1, children, runs, when, shown, out);
@@ -190,28 +191,38 @@ mod tests {
         }
     }
 
-    /// An execution id whose first eight characters are `prefix` padded
+    /// A run id whose first eight characters are `prefix` padded
     /// with zeros, which is what a line shows.
     fn run_id(prefix: &str) -> uuid::Uuid {
         format!("{prefix:0<8}-0000-0000-0000-000000000000").parse().expect("a uuid")
     }
 
-    fn run(execution_id: &str, version: &str, seed: Option<&str>, status: &str) -> RunSummary {
-        RunSummary {
-            execution_id: run_id(execution_id),
+    fn run(id: &str, version: &str, seed: Option<&str>, status: &str) -> VersionRun {
+        VersionRun {
+            run_id: run_id(id),
             version_id: format!("{version}00000000"),
             definition_hash: "d".into(),
-            seed_execution_id: seed.map(run_id),
+            seed_run_id: seed.map(run_id),
             stale: vec!["b".into()],
             spec: None,
             example: None,
-            status: weft_core::program::RunStatus::parse(status),
             started_at: 0,
-            completed_at: if status == "completed" { Some(9) } else { None },
-            // A cancelled run in this fixture says a person did it, so
-            // the line that renders a cause is exercised at all.
-            cancel_cause: (status == "cancelled").then_some(weft_core::exec::CancelCause::User),
-            skipped_nodes: 0,
+            listing: weft_core::program::RunStatus::parse(status).map(|status| weft_core::program::RunSummary {
+                run_id: run_id(id),
+                project_id: uuid::Uuid::nil(),
+                entry_node: "n".into(),
+                status,
+                phase: weft_core::primitive::Phase::Fire,
+                started_at: 0,
+                completed_at: if status == weft_core::program::RunStatus::Completed { Some(9) } else { None },
+                tags: vec![],
+                // A cancelled run in this fixture says a person did it, so
+                // the line that renders a cause is exercised at all.
+                cancel_cause: (status == weft_core::program::RunStatus::Cancelled).then_some(weft_core::run::CancelCause::User),
+                error: None,
+                skipped_nodes: 0,
+                instance: None,
+            }),
         }
     }
 

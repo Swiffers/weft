@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::weft_type::{WeftPrimitive, WeftType};
 
-// The `Node` trait is the RUNTIME node interface (it runs against the execution
+// The `Node` trait is the RUNTIME node interface (it runs against the run
 // context + infra provision context), so it is gated behind `runtime`. The
 // browser WASM parse build needs only the node METADATA layer
 // (`NodeMetadata` / `MetadataCatalog`), which is pure and stays below.
@@ -22,7 +22,7 @@ mod node_trait {
     use async_trait::async_trait;
 
     use super::NodeManifest;
-    use crate::context::{ExecutionContext, ValueBag};
+    use crate::context::{RunContext, ValueBag};
     use crate::error::{WeftError, WeftResult};
     use crate::infra::{InfraProvisionContext, InfraSpec};
 
@@ -38,7 +38,7 @@ mod node_trait {
     ///   - every node writes `run`, its normal body;
     ///   - a trigger (`metadata.is_trigger == true`) additionally writes
     ///     `setup_trigger`, called at registration time instead of `run`;
-    ///   - an infra node (`metadata.requires_infra == true`) additionally
+    ///   - an infra node (`metadata.requiresInfra == true`) additionally
     ///     writes `provision_infra`, called at provisioning time before
     ///     `run`.
     #[async_trait]
@@ -52,25 +52,25 @@ mod node_trait {
         /// Build the desired infrastructure for this node. Returns the
         /// desired state as a typed value; the engine has it applied,
         /// then calls `run`. The default impl returns Err; nodes that
-        /// declare `requires_infra=true` MUST override.
+        /// declare `requiresInfra: true` MUST override.
         async fn provision_infra(
             &self,
             _ctx: InfraProvisionContext,
             _input: ValueBag,
         ) -> WeftResult<InfraSpec> {
             Err(WeftError::Config(format!(
-                "node '{}' declared requires_infra=true but did not implement Node::provision_infra",
+                "node '{}' declared requiresInfra: true but did not implement Node::provision_infra",
                 self.node_type()
             )))
         }
 
         /// Register this trigger's wake signal (`ctx.register_signal`).
         /// The engine calls it INSTEAD of `run` when a trigger is being
-        /// set up. Only nodes whose manifest declares `is_trigger=true`
+        /// set up. Only nodes whose manifest declares `features.isTrigger`
         /// implement it; the default fails loud on the mismatch.
-        async fn setup_trigger(&self, _ctx: ExecutionContext) -> WeftResult<()> {
+        async fn setup_trigger(&self, _ctx: RunContext) -> WeftResult<()> {
             Err(WeftError::Config(format!(
-                "node '{}' declared is_trigger=true but did not implement Node::setup_trigger",
+                "node '{}' declared features.isTrigger but did not implement Node::setup_trigger",
                 self.node_type()
             )))
         }
@@ -83,7 +83,7 @@ mod node_trait {
         /// phase (a value feeding a trigger's config must be produced at
         /// setup time too); for a trigger it runs only on a real firing,
         /// with the fire's payload fields on the `ctx.wake` bag.
-        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
+        async fn run(&self, ctx: RunContext) -> WeftResult<()>;
 
         /// The node's self-tests (see `crate::node_test`), declared in
         /// the node folder's `tests.rs` and bridged here:
@@ -173,7 +173,7 @@ pub enum Severity {
 // matters most for the package-root defaults file, where one typo would
 // otherwise make every member quietly miss the shared key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeMetadata {
     /// Stable type identifier (matches `Node::node_type`).
     #[serde(rename = "type")]
@@ -272,7 +272,7 @@ pub struct NodeMetadata {
     /// (HumanQuery and HumanTrigger share one vocabulary); every member
     /// inherits it via the catalog's package-defaults merge unless its
     /// own file carries the key.
-    #[serde(default, rename = "portsFromConfig", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ports_from_config: Option<PortsFromConfig>,
     /// The service recipe, present ONLY on an ACCESS NODE (the node
     /// owning the connect for a service). Declares how a connection is
@@ -293,11 +293,7 @@ pub struct NodeMetadata {
     /// holds secrets (a confidential app goes editor -> store on the
     /// "Your own" page instead). Empty in the shipped catalog.
     // SYNC: NodeMetadata.access_apps <-> packages/weft-graph/src/protocol.ts CatalogEntry.accessApps
-    #[serde(
-        default,
-        rename = "accessApps",
-        skip_serializing_if = "std::collections::BTreeMap::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub access_apps: std::collections::BTreeMap<String, crate::access::spec::AppRegistration>,
     /// User-declared TYPE names this metadata contributes: name to type
     /// string (`"ChatMessage": "{ role: String, ... }"`). Collected
@@ -337,15 +333,12 @@ pub struct NodeMetadata {
     /// Only a trigger is meant to declare it (`features.isTrigger`), and
     /// every trigger is meant to have one: `weft run --fire` prints it
     /// when a payload does not match, which is the only way an author
-    /// learns what to send. No code enforces either half. What holds the
-    /// shipped nodes to both is the repo test
-    /// `weft-compiler/tests/fires_with.rs`, walking the catalog; a
-    /// third-party node is held to neither.
-    #[serde(
-        default,
-        rename = "firesWith",
-        skip_serializing_if = "std::collections::BTreeMap::is_empty"
-    )]
+    /// learns what to send. The load refuses it on a node that is not a
+    /// trigger, and refuses a type it cannot read. Nothing makes a
+    /// trigger declare one: the repo test
+    /// `weft-compiler/tests/fires_with.rs` holds the shipped triggers to
+    /// it; a third-party trigger may leave it out.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fires_with: std::collections::BTreeMap<String, String>,
     /// The public address this node claims when the project goes live,
     /// named by the config fields that hold it. `None` for everything
@@ -360,7 +353,7 @@ pub struct NodeMetadata {
     /// it says which field holds the pattern and which holds the
     /// methods, and route patterns are the language's own vocabulary
     /// (`weft_core::route`), so the check reads no node's mind.
-    #[serde(default, rename = "claimsRoute", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims_route: Option<ClaimsRoute>,
 }
 
@@ -389,11 +382,10 @@ pub struct ClaimsRoute {
 ///
 /// `None` when nothing is declared (every non-trigger, and a trigger
 /// that has not been given a shape yet): nothing to hold a payload to.
-/// An unparseable entry is `Err` with the field named. Nothing calls
-/// this when metadata is loaded: the callers are the fire check at run
-/// time ([`check_fire_payload`]) and the repo test that walks the
-/// shipped catalog (`weft-compiler/tests/fires_with.rs`). So a typo in
-/// a type does reach a run, and fails there rather than at build.
+/// An unparseable entry is `Err` with the field named. The metadata
+/// load calls it ([`NodeMetadata::validate_semantics`]), so a typo in a
+/// type fails there; the fire check at run time ([`check_fire_payload`])
+/// calls it again to build the type it holds a payload to.
 pub fn fire_payload_type(
     fires_with: &std::collections::BTreeMap<String, String>,
 ) -> Result<Option<crate::weft_type::WeftType>, String> {
@@ -720,7 +712,7 @@ impl NodeMetadata {
     }
 
     /// Whether a node of this type may be marked `@per_instance`: it runs a
-    /// container of its own (`requires_infra`), and each instance gets one.
+    /// container of its own (`requiresInfra`), and each instance gets one.
     /// Anything an instance PROVIDES (its connection, its sheet) is a
     /// field written `@instance_filled` instead. The one definition the
     /// compiler's check and the editor's right-click toggle both read.
@@ -820,7 +812,7 @@ impl NodeMetadata {
                 name: port.to_string(),
                 port_type: WeftType::primitive(WeftPrimitive::String),
                 description: Some(
-                    "Why the step failed, when this output is wired. Unwired, a failure stops the run."
+                    "Why the node failed, when this output is wired. Unwired, a failure stops the run."
                         .to_string(),
                 ),
                 baked: false,
@@ -839,6 +831,12 @@ impl NodeMetadata {
     /// `publishes` a service names it the way a service is named, and
     /// declares the `Access` output it hands the connection out on.
     pub fn validate_semantics(&self) -> Result<(), String> {
+        // A fire payload is a trigger's, and its types are read like any
+        // port's: a typo fails the load, never the first firing.
+        if !self.fires_with.is_empty() && !self.features.is_trigger {
+            return Err("firesWith describes what a trigger fires with; only a trigger (features.isTrigger) declares it".into());
+        }
+        fire_payload_type(&self.fires_with)?;
         if !self.requires_infra {
             if let Some(output) = self.outputs.iter().find(|o| o.baked) {
                 return Err(format!(
@@ -888,7 +886,7 @@ impl NodeMetadata {
             // Every node gets `_should_flow` from the language (the port
             // that decides whether it runs). A node type declaring its
             // own would shadow that decision with node data.
-            if crate::exec::skip::is_gate_port(&input.name) {
+            if crate::run::skip::is_gate_port(&input.name) {
                 return Err(format!(
                     "input '{}' is the language's own port (it decides whether a node runs); a node type cannot declare it",
                     input.name
@@ -1012,7 +1010,7 @@ impl NodeMetadata {
                     for parent in depends_on {
                         if !self.inputs.iter().any(|i| i.name == *parent) {
                             return Err(format!(
-                                "input '{}': remote_select depends_on '{}', which is not an \
+                                "input '{}': remote_select dependsOn '{}', which is not an \
                                  input of this node",
                                 input.name, parent
                             ));
@@ -1317,9 +1315,10 @@ impl NodeMetadata {
             if app.client_secret.is_some() {
                 return Err(format!(
                     "accessApps.{service}: a project-declared app must not carry a \
-                     client_secret (project metadata is source, and source never holds \
-                     secrets); declare only a public (PKCE) client here, or connect \
-                     through the editor's \"Your own\" page instead"
+                     client_secret (a metadata.json ships with the node to everyone who \
+                     uses it, so a secret here would go to all of them); declare only a public (PKCE) client here. An app with a \
+                     secret goes in the install's apps file (`access-apps.json`), or is \
+                     pasted on the editor's \"Your own\" page when connecting"
                 ));
             }
         }
@@ -1459,7 +1458,7 @@ pub const COMPACT_KEEP_TOP_LEVEL: [&str; 11] = [
     "description",
     "inputs",
     "outputs",
-    "requires_infra",
+    "requiresInfra",
     "features",
     "validate",
     "portsFromConfig",
@@ -1728,9 +1727,9 @@ pub enum ValidationLevel {
     /// Checked at parse / edit time. Missing these is a code error.
     #[default]
     Structural,
-    /// Not checked when a project is BUILT (e.g. missing
-    /// credentials), so an AI builder or a human can compile a
-    /// project they are still sketching, secrets unfilled. The
+    /// Not checked when a project is BUILT (e.g. a provider with no
+    /// model named yet), so an AI builder or a human can compile a
+    /// project they are still sketching, settings unfilled. The
     /// editor's Problems panel skips them too (it validates in
     /// `ValidationMode::Structural`); they surface in the editor's
     /// pre-flight gate before Run/Activate/Resync and in the terminal
@@ -1818,7 +1817,7 @@ pub enum Condition {
     /// node with `canAddOutputPorts`, written `-> (verdict: String)`).
     /// The ingredient for "added outputs need X": a node whose added
     /// ports only fire under some setting says so with this and a
-    /// `config_equals` on the setting. `{custom_outputs}` in the
+    /// `config_equals` on the setting. `{customOutputs}` in the
     /// message names them.
     /// Braced (`{}`) so a stray field on it is refused like on every
     /// other kind.
@@ -1845,7 +1844,7 @@ pub enum Condition {
     /// an `@instance_filled` field, or reads one of those downstream
     /// (the compiler's per-instance slice). For a node that cannot be
     /// copied per instance, like a trigger serving one public address.
-    /// `{per_instance_reason}` in the message says why, path included
+    /// `{perInstanceReason}` in the message says why, path included
     /// ("it reads 'blender'", "it sits inside group 'work', which
     /// receives 'blender'").
     /// Braced (`{}`) so a stray field on it is refused.
@@ -1871,14 +1870,14 @@ pub enum Condition {
 }
 
 /// What the names of an `input_names` condition name, and what each
-/// must be: `{"node": {"role": "infra", "per_instance": true}}` or
-/// `{"field": {"instance_filled": true}}`. Each narrowing is optional
+/// must be: `{"node": {"role": "infra", "perInstance": true}}` or
+/// `{"field": {"instanceFilled": true}}`. Each narrowing is optional
 /// (`{"node": {}}` is any node).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Named {
     /// A node. `role` narrows it to an infra node or a trigger;
-    /// `per_instance` to a node that is (or is not) per instance.
+    /// `perInstance` to a node that is (or is not) per instance.
     Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<NodeRole>,
@@ -1886,7 +1885,7 @@ pub enum Named {
         per_instance: Option<bool>,
     },
     /// A field of a node, `node.field`: the node exists and has that
-    /// field (an input, or a key written on it). `instance_filled`
+    /// field (an input, or a key written on it). `instanceFilled`
     /// narrows it to a field written (or not written) `@instance_filled`.
     Field {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1898,7 +1897,7 @@ pub enum Named {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeRole {
-    /// A node with infrastructure (`requires_infra`).
+    /// A node with infrastructure (`requiresInfra`).
     Infra,
     /// A trigger (`features.isTrigger`).
     Trigger,
@@ -1939,8 +1938,8 @@ mod condition_tests {
                     { "kind": "downstream_of", "with": { "answersCaller": ["stream"] } },
                     { "kind": "per_instance" },
                     { "kind": "input_names", "port": "node", "names": { "node": {} } },
-                    { "kind": "input_names", "port": "infra", "names": { "node": { "role": "infra", "per_instance": true } } },
-                    { "kind": "input_names", "port": "values", "names": { "field": { "instance_filled": true } } },
+                    { "kind": "input_names", "port": "infra", "names": { "node": { "role": "infra", "perInstance": true } } },
+                    { "kind": "input_names", "port": "values", "names": { "field": { "instanceFilled": true } } },
                     { "kind": "input_names", "port": "clear", "names": { "field": {} } }
                 ] }
             ]
@@ -1954,7 +1953,7 @@ mod condition_tests {
             serde_json::from_value::<Condition>(serde_json::json!({ "kind": "input_names", "port": "x", "names": named }))
         };
         assert!(names(serde_json::json!({ "field": { "role": "infra" } })).is_err(), "a field has no role");
-        assert!(names(serde_json::json!({ "node": { "instance_filled": true } })).is_err(), "a node is not filled");
+        assert!(names(serde_json::json!({ "node": { "instanceFilled": true } })).is_err(), "a node is not filled");
         assert!(names(serde_json::json!("node")).is_err(), "what is named is an object");
     }
 
@@ -2055,6 +2054,13 @@ pub struct NodeFeatures {
     /// Same for outputs.
     #[serde(default, rename = "canAddOutputPorts", skip_serializing_if = "std::ops::Not::not")]
     pub can_add_output_ports: bool,
+    /// The ports a program adds to this node are named after keys of
+    /// data from outside weft (a request body's fields, a table's
+    /// columns, a template's ids, the keys of a JSON object it
+    /// builds), so their spelling is that data's and the compiler's
+    /// `not-camel-case` check leaves them alone.
+    #[serde(default, rename = "addedPortsAreDataKeys", skip_serializing_if = "std::ops::Not::not")]
+    pub added_ports_are_data_keys: bool,
     /// The node's created input ports are OPTIONAL by default (a
     /// closure on one does not skip the node). For node types whose
     /// extra inputs are optional by nature, `FirstInOrder` being the
@@ -2072,8 +2078,8 @@ pub struct NodeFeatures {
     /// meeting at an unresolved port.
     #[serde(default, rename = "customInputType", skip_serializing_if = "Option::is_none")]
     pub custom_input_type: Option<WeftType>,
-    /// Marks the node as a trigger (fires executions from external
-    /// events rather than running as part of an execution).
+    /// Marks the node as a trigger (fires runs from external
+    /// events rather than running as part of a run).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
     /// The node reaches outside (a service, a database, a file, a
@@ -2508,7 +2514,7 @@ impl SpecField {
     }
 
     /// Whether an empty list in this field means the author CHOSE
-    /// NOTHING (a `valueList` of match candidates, a `typed` field
+    /// NOTHING (a `value_list` of match candidates, a `typed` field
     /// whose declared type is a list of choices), which satisfies no
     /// requirement. For every other shape a list is a single VALUE
     /// being matched (`equals: []` legitimately routes an empty list),
@@ -2564,7 +2570,7 @@ impl SpecField {
 /// without knowing what `equals` means.
 // SYNC: SpecShape <-> packages/weft-graph/src/protocol.ts SpecFieldWire.shape
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum SpecShape {
     /// A value of the declared `valueType` (`options: List[String]`).
     Typed,
@@ -2844,7 +2850,6 @@ pub struct InputSpec {
     #[serde(
         default,
         rename = "requiresScopes",
-        alias = "requires_scopes",
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_scopes: Option<Vec<String>>,
@@ -2864,7 +2869,6 @@ pub struct InputSpec {
     #[serde(
         default,
         rename = "requiresValues",
-        alias = "requires_values",
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_values: Option<Vec<String>>,
@@ -2932,7 +2936,7 @@ pub enum CodeLanguage {
 // `moreOptions` count, so its output is never parsed back into a
 // `Widget` (which denies unknown fields).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Widget {
     Text,
     Textarea,
@@ -2947,7 +2951,7 @@ pub enum Widget {
     /// it (`2026-09-03T11:00:00+02:00`), so the source says which
     /// eleven o'clock it means.
     Datetime,
-    /// `free_text`: the options are suggestions, not a closed set (a
+    /// `freeText`: the options are suggestions, not a closed set (a
     /// provider's model ids, voices, effort levels: one released after
     /// the list was written must still pass). The editor still shows
     /// the list and lets the user type a value outside it, and
@@ -2959,7 +2963,7 @@ pub enum Widget {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         free_text: bool,
     },
-    /// `free_text` as on [`Widget::Select`], per item.
+    /// `freeText` as on [`Widget::Select`], per item.
     Multiselect {
         options: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2976,7 +2980,7 @@ pub enum Widget {
     /// `{"id": "<connection id>", "identity": "..."}` handle, never a
     /// secret. `service` and `optional` are COMPILER-STAMPED from the
     /// node metadata's recipe (`service.service` /
-    /// `service.connection_optional`) at enrich time; authors write only
+    /// `service.connectionOptional`) at enrich time; authors write only
     /// `{"kind": "access"}`. `optional` = the node runs without a
     /// connection picked, so the editor neither pins it open nor
     /// synthesizes the "no connection picked" rule for it.
@@ -3075,7 +3079,7 @@ impl Widget {
     /// What a widget's domain refuses: a number below `min`, above
     /// `max`, or off a whole-number `step`; a `Select` value that is not
     /// one of its closed `options`; a `Multiselect` item that is not
-    /// (a `free_text` list is suggestions and refuses nothing). `Ok(())`
+    /// (a `freeText` list is suggestions and refuses nothing). `Ok(())`
     /// for every other widget and for a value of the wrong shape, which
     /// the type check owns.
     ///
@@ -3086,7 +3090,7 @@ impl Widget {
     /// the source. The compiler holds the written constant to it and the
     /// runtime holds the wired value to it, through this one function,
     /// so a program that compiles is a program that runs. A list a
-    /// provider can extend (model ids, voices) is declared `free_text`,
+    /// provider can extend (model ids, voices) is declared `freeText`,
     /// so a value released after the node was written still passes.
     pub fn check_value(&self, value: &Value) -> Result<(), String> {
         let (min, max, step) = match self {
@@ -3244,7 +3248,7 @@ fn file_drop_default_type() -> crate::weft_type::WeftType {
 ///   standing with NO connection (the works-without-signing-in path).
 // SYNC: ResourceSource <-> packages/weft-connect/src/core/wire.ts ResourceSource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum ResourceSource {
     /// Read the options off the connection row itself: `from` names
     /// the stored value (captured at connect) holding a JSON array.
@@ -3308,7 +3312,7 @@ fn granted_default_value() -> String {
 /// The declarative list request behind a `remote_select` widget's
 /// `list` source: ask the service for options given what the user
 /// typed (`{query}`) and what's picked above (`{<parent>}` from
-/// `depends_on`). The dispatcher runs it through the stored access;
+/// `dependsOn`). The dispatcher runs it through the stored access;
 /// the editor only ever sees label/value pairs.
 // SYNC: Lookup <-> packages/weft-connect/src/core/wire.ts Lookup
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3316,7 +3320,7 @@ fn granted_default_value() -> String {
 pub struct Lookup {
     /// GET URL. `{query}` interpolates the user's search text
     /// (url-encoded); `{<parent input name>}` interpolates a
-    /// `depends_on` parent's picked id.
+    /// `dependsOn` parent's picked id.
     pub get: String,
     /// Dotted path to the items array in the response.
     pub items: String,
@@ -3347,7 +3351,7 @@ pub struct Lookup {
 /// or absent = no more pages).
 // SYNC: PageSpec <-> packages/weft-connect/src/core/wire.ts PageSpec
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PageSpec {
     pub cursor_param: String,
     pub cursor_path: String,
@@ -3381,7 +3385,7 @@ impl NodeOutput {
     /// port.
     pub fn set_serialized(self, port: &str, value: &impl Serialize) -> crate::WeftResult<Self> {
         let value = serde_json::to_value(value).map_err(|e| {
-            crate::WeftError::NodeExecution(format!("output '{port}' cannot be serialized: {e}"))
+            crate::WeftError::NodeFailed(format!("output '{port}' cannot be serialized: {e}"))
         })?;
         Ok(self.set(port, value))
     }
@@ -3438,7 +3442,7 @@ impl NodeOutput {
     /// firing says the same thing without the noise, and a port that
     /// declares `Null` among its types still gets the value.
     ///
-    /// Nodes use it through [`crate::ExecutionContext::fan_declared`],
+    /// Nodes use it through [`crate::RunContext::fan_declared`],
     /// which supplies the declared set. Same last-write-wins precedence
     /// as `extend_from_object`.
     // The only caller lives in the runtime-gated context module; without
@@ -3707,15 +3711,15 @@ mod deny_unknown_tests {
         assert!(why.ends_with("'z11', and 8 more"), "{why}");
     }
 
-    /// A `free_text` list is suggestions: a model id released after the
+    /// A `freeText` list is suggestions: a model id released after the
     /// list was written passes, on a select and on each multiselect item,
     /// the flag loads from metadata JSON, and it is not reported under
     /// the options slug.
     #[test]
     fn a_free_text_select_takes_a_value_outside_its_options() {
         let select: Widget =
-            serde_json::from_value(json!({"kind": "select", "options": ["m1"], "free_text": true}))
-                .expect("free_text select loads");
+            serde_json::from_value(json!({"kind": "select", "options": ["m1"], "freeText": true}))
+                .expect("freeText select loads");
         assert_eq!(select, Widget::Select { options: vec!["m1".into()], free_text: true });
         assert_eq!(select.check_value(&json!("m1")), Ok(()));
         assert_eq!(select.check_value(&json!("released_tomorrow")), Ok(()));
@@ -3727,7 +3731,7 @@ mod deny_unknown_tests {
         // Round trip: a closed list serializes without the flag.
         let closed = Widget::Select { options: vec!["a".into()], free_text: false };
         assert_eq!(serde_json::to_value(&closed).unwrap(), json!({"kind": "select", "options": ["a"]}));
-        assert_eq!(serde_json::to_value(&select).unwrap()["free_text"], json!(true));
+        assert_eq!(serde_json::to_value(&select).unwrap()["freeText"], json!(true));
     }
 
     /// A default outside the select's options is a metadata error when
@@ -3935,7 +3939,7 @@ mod catalog_wire_tests {
         let meta: NodeMetadata = serde_json::from_value(serde_json::json!({
             "type": "Fixture", "label": "Fixture", "description": "d",
             "tags": ["a"], "icon": "Zap", "color": "#123456",
-            "requires_infra": true,
+            "requiresInfra": true,
             "inputs": [
                 { "name": "code", "type": "String", "required": true,
                   "widget": { "kind": "code", "language": "python" } },
@@ -3948,7 +3952,7 @@ mod catalog_wire_tests {
                   "requiresScopes": ["s.read"], "requiresValues": ["host"] },
                 { "name": "sheet", "type": "String",
                   "widget": { "kind": "remote_select", "access": "grant",
-                              "sources": [{ "kind": "granted", "from": "sheets" }], "depends_on": ["pick"] } },
+                              "sources": [{ "kind": "granted", "from": "sheets" }], "dependsOn": ["pick"] } },
                 { "name": "img", "type": "Image",
                   "widget": { "kind": "file_drop", "type": "Image", "accept": "image/png" } },
                 { "name": "fields", "type": "List[JsonDict]",
@@ -3987,7 +3991,7 @@ mod catalog_wire_tests {
         assert_eq!(
             keys(&v),
             ["color", "description", "display", "features", "icon",
-             "inputs", "label", "outputs", "portsFromConfig", "requires_infra", "tags", "type"],
+             "inputs", "label", "outputs", "portsFromConfig", "requiresInfra", "tags", "type"],
             "top-level catalog keys are the editor contract"
         );
         // Every resolved input ships the full editor surface, with the
@@ -4012,7 +4016,7 @@ mod catalog_wire_tests {
             keys(&serde_json::to_value(&optional_access).unwrap()),
             ["kind", "optional", "service"]
         );
-        assert_eq!(keys(&v["inputs"][4]["widget"]), ["access", "depends_on", "kind", "sources"]);
+        assert_eq!(keys(&v["inputs"][4]["widget"]), ["access", "dependsOn", "kind", "sources"]);
         assert_eq!(keys(&v["inputs"][5]["widget"]), ["accept", "kind", "type"]);
         assert_eq!(
             keys(&v["features"]),
@@ -4246,6 +4250,23 @@ mod input_semantics_tests {
         assert_eq!(serde_json::to_value(&features).unwrap(), serde_json::json!({ "catchErrors": true }));
         let none: NodeFeatures = serde_json::from_str("{}").unwrap();
         assert!(!none.catch_errors);
+    }
+
+    /// A fire payload is a trigger's, and a type it cannot read fails the
+    /// load: a typo never waits for the first firing to show.
+    #[test]
+    fn fires_with_is_a_triggers_and_its_types_are_read_at_load() {
+        let mut plain = metadata_with(vec![]);
+        plain.fires_with.insert("when".into(), "String".into());
+        assert!(plain.validate_semantics().unwrap_err().contains("only a trigger"));
+
+        let mut trigger = metadata_with(vec![]);
+        trigger.features.is_trigger = true;
+        trigger.fires_with.insert("when".into(), "Strng".into());
+        assert!(trigger.validate_semantics().unwrap_err().contains("firesWith field `when` is not a weft type"));
+
+        trigger.fires_with.insert("when".into(), "String".into());
+        trigger.validate_semantics().expect("a readable payload on a trigger loads");
     }
 
     /// A node whose ports come from a config list: the list has to live
@@ -5324,7 +5345,7 @@ mod compact_view_tests {
                     "widget": {
                         "kind": "remote_select",
                         "access": "account",
-                        "free_text": true,
+                        "freeText": true,
                         "sources": [
                             { "kind": "list", "get": "https://api.example.com/models", "items": "data", "label": "displayName", "value": "id",
                               "where": { "chat": true, "retired_at": null } },
@@ -5377,7 +5398,7 @@ mod compact_view_tests {
                 "inputs",
                 "outputs",
                 "portsFromConfig",
-                "requires_infra",
+                "requiresInfra",
                 "type",
                 "types",
                 "validate",
@@ -5423,7 +5444,7 @@ mod compact_view_tests {
         assert_eq!(sources[1]["label"], "name", "a granted source's display path is data");
         assert_eq!(sources[1]["value"], "id");
         assert_eq!(model["widget"]["access"], "account", "the authenticating input is a wiring fact");
-        assert_eq!(model["widget"]["free_text"], true, "free_text says typing is allowed");
+        assert_eq!(model["widget"]["freeText"], true, "freeText says typing is allowed");
 
         let output = &compact["outputs"][0];
         assert_eq!(output["description"], "True when approved.");

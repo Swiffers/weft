@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use weft::access::client::{checked_send, required_str};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -33,7 +33,7 @@ impl Node for SlackUploadFileNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let file: FileHandle = ctx.inputs.get("file")?;
         let channel: String = ctx.inputs.get("channel")?;
@@ -44,7 +44,7 @@ impl Node for SlackUploadFileNode {
         // The upload URL is minted for an exact length, so the bytes are
         // collected first. Slack caps uploads at 1 GB; a workflow file
         // that size is out of scope for a chat share.
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
+        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
         // Two distinct facts: the WIRE filename (owns the extension
         // Slack derives the preview and download name from) is the
         // stored file's real name; `title` is only the display name on

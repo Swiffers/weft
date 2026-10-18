@@ -299,12 +299,12 @@ OAuth parameter like `client_id`, a provider's field).
 If you add a node to the catalog, or add or rename any name in a node's
 `metadata.json`, run `cargo nextest run -p weft-catalog`. If any name is off,
 the `casing` test fails and lists every one with its node and file, and with
-the spelling to use whenever one can be worked out. If you write one of
-weft's own keys in snake_case (`requires_infra` instead of `requiresInfra`) in
-a node's own `metadata.json`, the `casing` test does not catch it: the node
-fails to load, and `every_stdlib_node_loads_strict` names the key. In a
-package root's `metadata.json` both tests fail: `casing` names the root, and
-`every_stdlib_node_loads_strict` names each member that inherits the key.
+the spelling to use whenever one can be worked out. If you write a key
+weft renamed in its old snake_case spelling (`requires_infra` instead of
+`requiresInfra`), the `casing` test does not catch it: the node fails to load
+with an error naming the new spelling, and `every_stdlib_node_loads_strict`
+fails. In a package root's `metadata.json` the error is reported against the
+root's file, and the package's members are left out.
 
 If you want to change what counts as camelCase, snake_case or any other
 spelling, edit `weft_core::casing`, which both the catalog's spelling check and

@@ -5017,6 +5017,45 @@ each.items = ["a"]
     assert!(casing_warnings(&d).is_empty(), "{d:?}");
 }
 
+/// A node type's own ports are the catalog's to spell: a project node
+/// whose input is snake_case warns in the catalog, on its own
+/// metadata.json, and never on the program nodes that use it, whether
+/// they set the input in the body or narrow it in a header.
+#[test]
+fn a_node_types_own_snake_case_input_is_the_catalogs_warning_not_the_programs() {
+    let nodes = tempfile::tempdir().unwrap();
+    let shout = nodes.path().join("shout");
+    std::fs::create_dir_all(&shout).unwrap();
+    std::fs::write(
+        shout.join("metadata.json"),
+        r#"{"type": "Shout", "label": "Shout", "description": "d",
+            "inputs": [{"name": "user_name", "type": "String"}],
+            "outputs": [{"name": "out", "type": "String"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(shout.join("mod.rs"), "// impl\n").unwrap();
+    let stdlib = stdlib_root().expect("stdlib root");
+    let catalog = FsCatalog::discover_roots(&[stdlib.as_path(), nodes.path()]).expect("catalog");
+    assert!(
+        catalog.warnings().iter().any(|w| w.message.contains("input 'user_name' is not camelCase")),
+        "the catalog owns the warning: {:?}",
+        catalog.warnings()
+    );
+
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let source = r#"
+first = Shout { user_name: "ada" }
+second = Shout(user_name: String) -> (out: String) { user_name: "bob" }
+d = Debug { data: first.out }
+e = Debug { data: second.out }
+"#;
+    let mut project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Full, COMPONENT)
+        .expect("compile ok");
+    enrich(&mut project, &catalog).expect("enrich ok");
+    let d = validate(&project, &catalog);
+    assert!(casing_warnings(&d).is_empty(), "{d:?}");
+}
+
 /// An included file's names are checked once, on that file's own lines,
 /// however many sites call it: the site's ports are the file's, and the
 /// body's id (its path) is not a name anyone wrote.

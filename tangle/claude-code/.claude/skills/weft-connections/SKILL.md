@@ -22,7 +22,7 @@ access nodes do not carry: a model provider holds a connection exactly the
 same way and is tagged by its service instead. One with
 a required, unpicked [connection] pins open in the graph (expanded,
 collapse disabled, "Pick a connection first") until one is picked; a
-`connection_optional` node never pins. A [door] is one way of adding a
+`connectionOptional` node never pins. A [door] is one way of adding a
 [connection]: **shared** (a credential this weft holds) or **own** (the
 user's own); the editor flow below has both in full.
 
@@ -116,7 +116,7 @@ block every pasted key on every service that reports nothing.
 A revoked or expired credential surfaces as a loud "needs reconnecting"
 error naming the fix, never a silent retry. A provider that is busy or
 down while weft refreshes a sign-in (it answers 408, 429 or a 5xx, or
-does not answer) is not a dead credential: the step fails with the
+does not answer) is not a dead credential: the node fails with the
 provider's own answer (`token endpoint answered <status>: ...` or `token
 endpoint unreachable: ...`), never with "needs reconnecting", and the refresh is tried
 again the next time the connection is opened.

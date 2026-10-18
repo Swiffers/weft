@@ -22,10 +22,10 @@ to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
   - **Projects**: one row per `.weft` file in the workspace (label = folder
     name). Click to pin and open its graph; inline buttons "Open in Editor"
     and "Run Project"; title-bar "Refresh".
-  - **Executions**: runs of the pinned project, newest first (paged, "Load
+  - **Runs**: runs of the pinned project, newest first (paged, "Load
     more (N more)" at the bottom). Row = status icon, entry node, time;
-    tooltip = the execution id. Inline "View in Graph" and "Delete"; title-bar
-    "Refresh Executions" and "Clear All Executions".
+    tooltip = the run id. Inline "View in Graph" and "Delete"; title-bar
+    "Refresh Runs" and "Clear All Runs".
 - **The graph panel**, titled "Weft Graph: <project folder name>".
 - **The Problems panel** carries the compiler's live diagnostics.
 
@@ -76,9 +76,9 @@ or off; click to show the newest and follow again), and **"Source"**
 
 The [follow toggle] has three parts, each explained on hover; only the
 active one shows its word:
-- **"Following · <execution-id>"** (eye icon): every run that starts takes over
+- **"Following · <run-id>"** (eye icon): every run that starts takes over
   the graph. The default.
-- **"Locked · <execution-id>"** (lock icon): the graph stays on this run; runs
+- **"Locked · <run-id>"** (lock icon): the graph stays on this run; runs
   that start are counted, not shown. Greyed while no run is on screen.
 - **"Off"** (crossed eye): no run on the graph, just the program.
 
@@ -106,7 +106,7 @@ line) and the verb is not sent, so a build that cannot run never starts.
 - **Run slot**: "Run Project" (or "Run 1 target" / "Run N targets" once
   targets are set). While working the button becomes its own cancel:
   "Building...", "Cached, loading...", "Provisioning infra...",
-  "Running...". While following a live run it is "Stop Execution".
+  "Running...". While following a live run it is "Stop Run".
 - **Trigger slot** (when the source declares triggers): "Activate" /
   "Deactivate" / "Resync" (amber "Out of sync" when the project changed
   since activation). An eye toggle "Show trigger subgraph". A resync
@@ -121,7 +121,7 @@ line) and the verb is not sent, so a build that cannot run never starts.
   (nothing dropped: everything that arrives waits and runs once the
   triggers are back), **Hibernate** (the same for a grace window, questions
   hidden, then refuse), **Wipe** (drop everything, cancels suspended runs), plus what to
-  do with running executions. Reactivating offers "Run what was kept, keep
+  do with the runs still going. Reactivating offers "Run what was kept, keep
   the waiting runs", "Drop the kept events, keep the waiting runs", "Wipe all".
 
 Banners above the bar: red for a failed verb (click for full diagnostics),
@@ -196,7 +196,7 @@ bottom-left controls carry zoom, fit, and lock.
 
 The Run button runs the pinned project's ordinary roots, or the selected
 work when a cut is set. Triggers need an explicit fire or supplied outputs.
-The run lands in the Executions list. Clicking any node opens [the inspector]: status,
+The run lands in the Runs list. Clicking any node opens [the inspector]: status,
 duration, cost ("$0.0123 (own key)"), the exact inputs and outputs of that
 firing as one card per port (a long value expands, copies, and selects
 whole on a double-click), closed ports greyed out, skip reasons in plain
@@ -205,10 +205,10 @@ words ("its `_should_flow` said no", "the required input 'x' closed",
 panels, and a firing navigator ("‹ 2/5 iter 5/2 ›") for nodes that fired
 several times. The Copy button exports the whole inspection.
 
-Past runs: in the Executions view, "View in Graph" replays the run in the
+Past runs: in the Runs view, "View in Graph" replays the run in the
 graph with every value in place and locks the [follow toggle] onto it;
 "N new run(s) · Follow" jumps to the newest. From the terminal the same
-facts are `weft executions`, `weft events <execution-id>`, `weft logs` (the
+facts are `weft runs`, `weft events <run-id>`, `weft logs` (the
 `weft-debugging` skill).
 
 ## Diagnostics and AI edits
@@ -222,6 +222,11 @@ A diagnostic may name another file than the one being edited (a node
 spliced in by `@include` keeps its own file's coordinates). The graph
 keeps showing the last good render with a problems pill ("N problems")
 until the source compiles again (hint on the pill: stale node copies cause
-most catalog errors, run `weft catalog update`). An AI chat extension can
+most catalog errors, run `weft catalog update`). If a node's
+`metadata.json` spells a name in the wrong casing, the pill lists it as "node
+catalog warning" (a weft key written in snake_case is different: that node fails to
+load, and a program that uses it fails to compile, saying the node failed to
+load and why). A name in the source that is not camelCase is a `not-camel-case`
+warning in the Problems panel, and the program still runs. An AI chat extension can
 stream SEARCH/REPLACE edits into the open file and the graph updates as
 each block lands (setting `weft.ai.streamingEditsEnabled`).

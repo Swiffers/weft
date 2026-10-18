@@ -1,6 +1,6 @@
 ---
 name: weft-debugging
-description: "Read when a run failed, did the wrong thing, never started, got stuck or was cancelled, or when you need to read what a past run did: the order to read a run in (executions, logs, events), what each skip and cancel reason means, and the debugging playbook, from a compile error to a daemon that does not answer."
+description: "Read when a run failed, did the wrong thing, never started, got stuck or was cancelled, or when you need to read what a past run did: the order to read a run in (runs, logs, events), what each skip and cancel reason means, and the debugging playbook, from a compile error to a daemon that does not answer."
 ---
 
 # Debugging a run
@@ -13,12 +13,12 @@ whole journal. You read in this order and stop when you hold the failing
 node and the wrong value.
 
 - **If you want to know what ran, or whether your trigger fired since the
-  change**: `weft executions --limit 10 --phase fire`. One line per run:
-  execution id, status (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`), phase, the
+  change**: `weft runs --limit 10 --phase fire`. One line per run:
+  run id, status (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`), phase, the
   start time in UTC, the project id, the entry node (the trigger that fired), the tags. An
   activate, a resync or an infra start creates setup runs, phases
-  `trigger_setup` and `infra_setup`; `--phase fire` hides them. `--project <id>` narrows to one project. A run whose trigger has `recorded: false` is listed only if it failed (with the step that failed and why, nothing before it) or reported a cost or asked weft for something on its behalf, so a route that answered and left nothing here may simply be unrecorded: `weft status` shows how many runs each trigger started in the last minute or two and how many failed, which is how you confirm its runs happen.
-- **If a run failed and you want the reason**: `weft logs <execution-id>`. It
+  `trigger_setup` and `infra_setup`; `--phase fire` hides them. `--project <id>` narrows to one project. A run whose trigger has `recorded: false` is listed only if it failed (with the node that failed and why, nothing before it) or reported a cost or asked weft for something on its behalf, so a route that answered and left nothing here may simply be unrecorded: `weft status` shows how many runs each trigger started in the last minute or two and how many failed, which is how you confirm its runs happen.
+- **If a run failed and you want the reason**: `weft logs <run-id>`. It
   prints what the run's nodes wrote and every failure the journal recorded,
   as `error` and `warn` lines. A line about one node names it (and the loop
   iteration, `llm#3:`); a line about the run itself (the run failing, a
@@ -28,19 +28,19 @@ node and the wrong value.
   that up to 20000, higher is refused. For most failures this is enough and
   you never open the events. `(no logs: ...)` means the run wrote nothing
   and recorded no failure: it did not fail, so you check its status.
-- **If you want the values on the wires**: `weft events <execution-id>`. One line
+- **If you want the values on the wires**: `weft events <run-id>`. One line
   per event: UTC time, kind, node, then everything the row carries as
   `key=value`, each cut to a screen's width (`input=` on `node_started`,
   `output=` on `node_completed`, `error=` on `node_failed`, `reason=` on a
   skip or a cancel, `token=` on a suspension, and so on). You narrow before
   you read: `--kind failed` for the failures (a substring matches, so this
-  catches `node_failed` and `execution_failed`), `--kind node_skipped` for
+  catches `node_failed` and `run_failed`), `--kind node_skipped` for
   what did not run and why, `--node <id>` for every event on one node,
   `--iteration 3` for the fourth time round a loop (counted from 0; `3.0`
   is the first iteration of a loop inside it, outermost first).
 - **If a value on one of those lines is cut off**: it was cut to fit the
-  screen, not stored short. `weft events <execution-id> --node <id> --full` prints
-  it whole, and `--json` gives you the replay rows for `grep` or `jq`. No
+  screen, not stored short. `weft events <run-id> --node <id> --full` prints
+  it whole, and `--json` gives you the replay rows for `grep` or `jq` (their field names are camelCase, like `runId` and `atUnix`, and a kind is a snake_case value, like `node_skipped`). No
   value a run recorded is unreadable, so you never report one as unreadable.
 - **If a node did not run**: its `node_skipped` line carries the reason.
   `did_not_flow`: the node's `_should_flow` said no. `flow_closed`: nothing
@@ -56,7 +56,7 @@ node and the wrong value.
   ends with nothing sent on and what reads it skips: not a bug to chase.
 - **If a `Debug` shows `output=` empty**: correct, a `Debug` has no
   outputs. Its value is on its `node_started` line as `input=`, or `weft
-  events <execution-id> --node <debug id>`.
+  events <run-id> --node <debug id>`.
 - **If a past run shows no values at all**: a run's rows say what happened,
   not what it meant; the editor works out every input and output by
   replaying those rows against the code the run ran, so a run whose code
@@ -65,9 +65,9 @@ node and the wrong value.
   not a viewer bug. The code is kept as long as any run points at it, so
   this is rare. If the files are still on disk, `weft build` puts the
   program back under the hash the run names and the run reads as it did. If
-  not, the run is readable only as its shape, and `weft clean <execution-id>`
+  not, the run is readable only as its shape, and `weft clean <run-id>`
   removes it.
-- In VS Code with the weft extension: the Executions view, "View in Graph"
+- In VS Code with the weft extension: the Runs view, "View in Graph"
   replays the run in the graph, values on every wire; `Debug` nodes render
   their latest value inline. For the full editor surface (inspector, action
   bar, targets, everything clickable), go and read the `weft-editor` skill.
@@ -81,8 +81,8 @@ node and the wrong value.
    catalog (an enrichment error, an unknown field, "a stale base_catalog
    copy") means the stdlib copy lags the installed weft: `weft catalog
    update`, then re-check, before anything else.
-2. **A run failed.** `weft logs <execution-id>` names the node and the error. If
-   that is not enough, `weft events <execution-id> --node <that node>` shows the
+2. **A run failed.** `weft logs <run-id>` names the node and the error. If
+   that is not enough, `weft events <run-id> --node <that node>` shows the
    values that reached it, on its `node_started` line. For the compiler
    error slugs, go and read the `weft-language` skill. A node's own error
    text is written by the node's author. A run, an activate or a resync is
@@ -90,12 +90,12 @@ node and the wrong value.
    naming the `weft connect` that picks it, and a node error saying it has
    no connection picked is the same [the runtime tier] gap, not a source bug: you pick a stored connection yourself (`weft connect
    --node <id> --grant <grant>`) or send the user to the node's Connect
-   button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died mid-step: weft does not run a step again once its start is on
-   record, because the step may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that step by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <execution-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole execution again.
+   button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died while that node was running: weft does not run a node again once its start is on
+   record, because what it did may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that node by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <run-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole run again.
 3. **A value is wrong, not failed.** Work upstream from the output: open the
    run, look at the top-level groups, find the first whose output is already
    wrong, descend, repeat. When you hold the concrete failing case, iterate
-   on that one step (build, run, look) and feed the earlier stages' passing
+   on that one node (build, run, look) and feed the earlier stages' passing
    examples through again.
 4. **Suspended.** Expected for human-in-the-loop: nothing is wrong. A
    suspended run is alive and costs nothing: the `HumanQuery` parks, the
@@ -103,16 +103,16 @@ node and the wrong value.
    browser extension (built with `./setup.sh --browser --no-sign`). If
    nobody should have been asked, the bug is the `_should_flow` that routed
    into the person.
-5. **Cancelled.** Read the reason on `execution_cancelled`. `Cancelled by
+5. **Cancelled.** Read the reason on `run_cancelled`. `Cancelled by
    user` is a person: the Stop button, `weft stop`, a project deactivate or
-   wipe, or a cancel through a signal token. `Stopped by execution <execution-id>
+   wipe, or a cancel through a signal token. `Stopped by run <run-id>
    (tag <tag>)` means another run asked the engine to stop everything
    carrying that tag: look at **that** run, and if no sibling was supposed
    to stop this one, the bug is in whichever node tagged and stopped it
-   (`weft executions` shows each run's tags, so you
-   see which runs shared it). `Caller disconnected` means the live caller this run was answering went away: it hung up, closed its socket (or never opened it), missed its heartbeat, or sent a message the connection refused. `the worker running this run went away; a fast run lives in its worker's memory, so it is not run again` means a fast run lost its worker (a crash, a machine gone): check what it did outside, then start it again (let the trigger fire again, or fire it by hand: `weft bake`, then `weft run --fire <trigger>=<payload>`, with the `payload` on the trigger's `node_kicked` line in `weft events <execution-id>`), and if the trigger's runs have to carry on after a worker dies, set `durable: true` on it. A durable run whose worker stops or dies is never cancelled: another worker picks it up from its record, and only the step that was running fails (item 2). `the run had to leave the copy of the program running it (...), and it cannot be suspended: <why>` means its worker was stopping and this run could not move to another one; the `<why>` names the reason: its trigger has `recorded: false`, its route does not have `outlivesCaller`, or a bus between its nodes was open. Check what it did outside, then start it again the same way as a fast run that lost its worker. A run cut by a platform limit on a cloud install (its hour, or its worker's connection to weft about to be cut while every run on it only waited) says so in words, starting `execution <id> stopped ... before the ... minute limit this platform puts on ...`, and the rest of the sentence says how to stay under it (a pause, or a client that reconnects). `weft tree` marks it `(a time limit: <detail>)`, and a caller still connected was answered `504`. A run whose caller's session reached the route's or socket's `maxSessionSecs` is a time limit too, on any install: `execution <id> stopped when its caller's session reached the <n> second limit its trigger sets (maxSessionSecs), and the caller was told it was a time limit (a 504, or close code 1011 on a socket). A session meant to last longer raises maxSessionSecs, or sets it to 0 for no limit`. An older run cut by a time limit shows the same words without `a time limit:` in front. `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>` and `its project's worker settings kept it from any worker 3 times: <error>` mean a queued run (a `weft run`, a resume) never got going: it got a no three times, 5 s and then 20 s apart, the reason names who said the last one, and the `<error>` is that no. Only an answer counts as a no: from the worker, any error but its busy `503`; from Cloud Run answering in its place, a `4xx` other than `404`, `408` or `429`; from Google Cloud asked to create the worker, a `400`, `401` or `403`, whose words are in the `<error>`; and from weft itself, worker settings that together are a shape no platform could run. A `404`, `408`, `429` or `5xx` from Cloud Run, and a `429`, `5xx` or timeout from Google Cloud, count as no answer. A worker answering busy makes the run wait without spending a try, for as long as the workers answer busy, each wait as long as it has been turned away so far (at least 5 s, at most a minute): once that lasts longer than the install's alert delay (`alert_after_minutes`, 5 minutes by default), `weft status` lists it under `waiting on weft:` (item 11), ending in ``this project's worker has answered busy for <time> (memory full); raise its memory (`weft workers set --memory <size>`)``, and a Google Cloud install emails an alert. A worker still starting makes the run wait for it, and a call that got no answer at all is tried again 5 s and then 20 s later; after a third with no answer the run is not ended but waits, queued, until a worker of its project comes alive or a build of the project registers, and then its tries start over. If the error points at the worker settings, fix them with `weft workers set`: that hands every run of the project still queued to the workers again at once, while this one stays ended, so start it again. `weft status` shows the same under `waiting on weft:` (item 11). Anything else is the runtime's own reason, printed as words.
+   (`weft runs` shows each run's tags, so you
+   see which runs shared it). `Caller disconnected` means the live caller this run was answering went away: it hung up, closed its socket (or never opened it), missed its heartbeat, or sent a message the connection refused. `the worker running this run went away; a fast run lives in its worker's memory, so it is not run again` means a fast run lost its worker (a crash, a machine gone): check what it did outside, then start it again (let the trigger fire again, or fire it by hand: `weft bake`, then `weft run --fire <trigger>=<payload>`, with the `payload` on the trigger's `node_kicked` line in `weft events <run-id>`), and if the trigger's runs have to carry on after a worker dies, set `durable: true` on it. A durable run whose worker stops or dies is never cancelled: another worker picks it up from its record, and only the node that was running fails (item 2). `the run had to leave the copy of the program running it (...), and it cannot be suspended: <why>` means its worker was stopping and this run could not move to another one; the `<why>` names the reason: its trigger has `recorded: false`, its route does not have `outlivesCaller`, or a bus between its nodes was open. Check what it did outside, then start it again the same way as a fast run that lost its worker. A run cut by a platform limit on a cloud install (its hour, or its worker's connection to weft about to be cut while every run on it only waited) says so in words, starting `run <id> stopped ... before the ... minute limit this platform puts on ...`, and the rest of the sentence says how to stay under it (a pause, or a client that reconnects). `weft tree` marks it `(a time limit: <detail>)`, and a caller still connected was answered `504`. A run whose caller's session reached the route's or socket's `maxSessionSecs` is a time limit too, on any install: `run <id> stopped when its caller's session reached the <n> second limit its trigger sets (maxSessionSecs), and the caller was told it was a time limit (a 504, or close code 1011 on a socket). A session meant to last longer raises maxSessionSecs, or sets it to 0 for no limit`. An older run cut by a time limit shows the same words without `a time limit:` in front. `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>` and `its project's worker settings kept it from any worker 3 times: <error>` mean a queued run (a `weft run`, a resume) never got going: it got a no three times, 5 s and then 20 s apart, the reason names who said the last one, and the `<error>` is that no. Only an answer counts as a no: from the worker, any error but its busy `503`; from Cloud Run answering in its place, a `4xx` other than `404`, `408` or `429`; from Google Cloud asked to create the worker, a `400`, `401` or `403`, whose words are in the `<error>`; and from weft itself, worker settings that together are a shape no platform could run. A `404`, `408`, `429` or `5xx` from Cloud Run, and a `429`, `5xx` or timeout from Google Cloud, count as no answer. A worker answering busy makes the run wait without spending a try, for as long as the workers answer busy, each wait as long as it has been turned away so far (at least 5 s, at most a minute): once that lasts longer than the install's alert delay (`alert_after_minutes`, 5 minutes by default), `weft status` lists it under `waiting on weft:` (item 11), ending in ``this project's worker has answered busy for <time> (memory full); raise its memory (`weft workers set --memory <size>`)``, and a Google Cloud install emails an alert. A worker still starting makes the run wait for it, and a call that got no answer at all is tried again 5 s and then 20 s later; after a third with no answer the run is not ended but waits, queued, until a worker of its project comes alive or a build of the project registers, and then its tries start over. If the error points at the worker settings, fix them with `weft workers set`: that hands every run of the project still queued to the workers again at once, while this one stays ended, so start it again. `weft status` shows the same under `waiting on weft:` (item 11). Anything else is the runtime's own reason, printed as words.
 6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
-   bug (a wire the compiler could not catch). The `execution_failed` line
+   bug (a wire the compiler could not catch). The `run_failed` line
    names every firing left holding a pulse and the wired ports it never
    received (`theirs has value, still waiting on go`): walk to whatever
    should have driven the missing port.
@@ -136,7 +136,7 @@ node and the wrong value.
    errors: runs accumulate and the only symptom is a list that keeps
    growing. Every live connection is its own run for as long as the caller
    holds it, so a page anyone can open, or a client that reconnects by
-   itself, can leave one behind per visit. `weft executions` is the check,
+   itself, can leave one behind per visit. `weft runs` is the check,
    and what you look at is the STANDING count of runs still going, not
    whether the one you started finished. Drive the thing, close it, look
    again: the count comes back down, or you have found a leak. Several runs

@@ -42,7 +42,7 @@ included file's own port (`instance-filled-boundary`), nor a key that is not
 an input (`instance-filled-not-an-input`). For a group, loop or include port,
 mark the input of the node inside that reads it.
 
-You never mark the steps downstream: every node reading an instance's
+You never mark the nodes downstream: every node reading an instance's
 container or an instance's value follows it and runs in that instance's runs.
 A trigger reading an instance's container, or a trigger with an
 `@instance_filled` field, is itself per instance.
@@ -89,7 +89,7 @@ wait and go through on the new value.
 
 A `Route` or a `Socket` has one public address for every instance, so it can
 never be per instance: one that reads a per-instance container or value, even
-several steps upstream, is a compile error naming what made it per instance.
+several nodes upstream, is a compile error naming what made it per instance.
 Keep every route shared and pick the instance per call:
 
 - a route gated by a credential (`ApiKeyAuth` on its `auth`), called by the
@@ -118,14 +118,14 @@ instance itself, and the build refuses it.
 
 ```weft
 ask = Route -> (body: JsonDict) { path: "ask", method: "POST" }
-ask_work = @include("work.weft")
-ask_work.request = ask.body
-ask_reply = Reply { body: ask_work.answer }
+askWork = @include("work.weft")
+askWork.request = ask.body
+askReply = Reply { body: askWork.answer }
 
 sum = Route -> (body: JsonDict) { path: "summary", method: "POST" }
-sum_work = @include("work.weft")
-sum_work.request = sum.body
-sum_reply = Reply { body: sum_work.answer }
+sumWork = @include("work.weft")
+sumWork.request = sum.body
+sumReply = Reply { body: sumWork.answer }
 ```
 
 `work.weft` is one `Group(request: JsonDict) -> (answer: JsonDict) { ... }`,
@@ -300,7 +300,7 @@ something they do not cover calls the ctx directly in a node of its own:
 | `ctx.infra("bridge").instance(id).start()` / `.request_start()` / `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` / `.wipe(spec, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too |
 | `ctx.infra("bridge").copies()` | Every copy of the node: the shared one and each instance's (the `ListInstanceInfra` node) |
 | `ctx.triggers().instance(id).activate()` / `.deactivate(spec, stop_self)` | An instance's triggers (`.only([..])` narrows) |
-| `ctx.values().instance(id).get()` / `.set(step, field, value)` / `.clear(step, field)` / `.apply()` / `.forget()` | What was given for an instance's `@instance_filled` fields: read (the `GetInstanceValues` node), change in one go (the `SetInstanceValues` node; `apply()` returns the triggers it set up again), or forget all |
+| `ctx.values().instance(id).get()` / `.set(node, field, value)` / `.clear(node, field)` / `.apply()` / `.forget()` | What was given for an instance's `@instance_filled` fields: read (the `GetInstanceValues` node), change in one go (the `SetInstanceValues` node; `apply()` returns the triggers it set up again), or forget all |
 | `ctx.connections().instance(id).list()` / `.forget()` | An instance's connections (forgetting takes the values naming them) |
 | `ctx.instances().list()` | Every instance weft holds anything for, with counts and states and the events waiting on a field not yet filled (the `ListInstances` node) |
 | `ctx.costs().instance(id).service(s).since(t).list()` | What an instance cost (the `InstanceCosts` node, with the total) |
@@ -336,10 +336,10 @@ mounting it, go and read the `weft-frontend` skill. It draws each field with
 its own control, and a list field (its spreadsheets, its models) is read
 through the instance's own connection. An instance is never offered the
 shared key. To try an instance's path yourself before any website exists:
-`weft connect --instance <id> --node <step>` connects an account for that
+`weft connect --instance <id> --node <node>` connects an account for that
 instance (`--door own --set-env key=ENV_VAR`) or picks one it has (`--grant
 <id>`), and `weft instance-values --instance <id>` lists its fields, with
-`--set step.field=value` / `--clear step.field` changing them. Each command
+`--set <node>.<field>=<value>` / `--clear <node>.<field>` changing them. Each command
 mints its own one-hour instance token and revokes it when done, so the
 instance's own tokens are untouched.
 
@@ -353,7 +353,7 @@ and each instance's triggers under `triggers:`, with the events a trigger
 holds for a missing field. A plain `weft activate` turns on the shared
 triggers and names the per-instance ones it left off; `weft activate
 --instance <id>` (or `ActivateTriggers` given the instance) turns those on. `weft
-executions --instance <id>` lists an instance's runs. To try the per-instance
+runs --instance <id>` lists an instance's runs. To try the per-instance
 path yourself, start a container (`weft infra start --instance test-1`), turn
 on its triggers (`weft activate --instance test-1`), and run with `--instance
 test-1`.

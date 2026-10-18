@@ -17,7 +17,7 @@
       "weft bake*": "allow",
       "weft wake*": "allow",
       "weft describe-nodes*": "allow",
-      "weft executions*": "allow",
+      "weft runs*": "allow",
       "weft events*": "allow",
       "weft logs*": "allow",
       "weft status*": "allow",

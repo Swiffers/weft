@@ -20,19 +20,8 @@ const LEVEL: i32 = 1;
 
 /// `events`, all of one run, as the row a write of them is stored as.
 pub fn encode(events: &[RunEvent]) -> Vec<u8> {
-    row_of_json(&serde_json::to_vec(events).expect("an event serializes"))
-}
-
-/// The row that stores `json`, a JSON array of events as [`encode`]
-/// writes them.
-pub fn row_of_json(json: &[u8]) -> Vec<u8> {
-    zstd::bulk::compress(json, LEVEL).expect("zstd compresses a buffer it holds")
-}
-
-/// The JSON array of events a stored row holds, uncompressed and not
-/// decoded: what a carry-over between generations rewrites.
-pub fn json_of_row(row: &[u8]) -> std::io::Result<Vec<u8>> {
-    zstd::stream::decode_all(row)
+    let json = serde_json::to_vec(events).expect("an event serializes");
+    zstd::bulk::compress(&json, LEVEL).expect("zstd compresses a buffer it holds")
 }
 
 /// The events of one stored row of `run_id`, in order, its id set
@@ -41,7 +30,7 @@ pub fn json_of_row(row: &[u8]) -> std::io::Result<Vec<u8>> {
 /// decode fails with the one wording every reader shares, which names the
 /// run and how to remove it.
 pub fn decode(run_id: RunId, selection: Option<&RecordedSelection>, row: &[u8]) -> Result<Vec<RunEvent>, String> {
-    let json = json_of_row(row).map_err(|e| undecodable(run_id, &e))?;
+    let json = zstd::stream::decode_all(row).map_err(|e| undecodable(run_id, &e))?;
     let mut events: Vec<RunEvent> = RecordedSelection::resolving(selection.map(std::slice::from_ref).unwrap_or_default(), || {
         serde_json::from_slice(&json)
     })

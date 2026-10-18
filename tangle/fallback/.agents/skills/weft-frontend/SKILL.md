@@ -560,14 +560,14 @@ The shape, unless the user asks for another:
   weft editor shows, restyled to the site, and never the author's shared key.
   A save that changes a value one of their live triggers reads re-arms it
   before it answers, and the page says so; nothing else to call. The page
-  titles each step with the program's own label and each field with the
+  titles each node with the program's own label and each field with the
   node's own name for it ("Value"), both written for the program's author,
   so you name every field a person sees in your own words:
   `<InstanceSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
-  a step's id for its title and `step.field` for a field (`door.fields()`
+  a node's name for its title and `node.field` for a field (`door.fields()`
   lists both). If the page
   must look different, build it from `door.fields()`, `door.setValues(..)` and
-  `ResourceSelect` over `door.resources(step, field)` instead. The library is not a package you install: you run
+  `ResourceSelect` over `door.resources(node, field)` instead. The library is not a package you install: you run
   `weft connect-lib` from the project root, which copies it into
   `front/src/lib/weft-connect` (`--into <dir>` for another folder), then
   import it from `$lib/weft-connect` and `$lib/weft-connect/svelte` (and

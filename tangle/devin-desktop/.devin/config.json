@@ -13,7 +13,7 @@
       "Exec(weft build)",
       "Exec(weft run)",
       "Exec(weft describe-nodes)",
-      "Exec(weft executions)",
+      "Exec(weft runs)",
       "Exec(weft events)",
       "Exec(weft logs)",
       "Exec(weft status)",

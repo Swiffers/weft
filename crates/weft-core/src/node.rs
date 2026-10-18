@@ -288,10 +288,11 @@ pub struct NodeMetadata {
     /// by service name. A package root declares its apps here once and
     /// every member node inherits them (via [`merge_package_defaults`]);
     /// at connect the "Your own" door uses the project's app when the
-    /// user pastes none. An entry carrying a `client_secret` fails the
-    /// metadata load: project metadata is source, and source never
-    /// holds secrets (a confidential app goes editor -> store on the
-    /// "Your own" page instead). Empty in the shipped catalog.
+    /// user pastes none. The catalog holds each entry to
+    /// [`crate::access::spec::AppRegistration::check_shipped`] once every
+    /// service is known (a shipped app is public, so it holds no secret,
+    /// and it names a service whose connect takes an app). Empty in the
+    /// shipped catalog.
     // SYNC: NodeMetadata.access_apps <-> packages/weft-graph/src/protocol.ts CatalogEntry.accessApps
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub access_apps: std::collections::BTreeMap<String, crate::access::spec::AppRegistration>,
@@ -689,7 +690,184 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
             }
         }
     }
-    Ok(())
+    refuse_renamed_metadata_keys(value)
+}
+
+/// The `metadata.json` keys that were snake_case and are camelCase now
+/// (`requires_infra` is `requiresInfra`), old spelling first. The old
+/// spelling is refused, never read as an alias; this table only lets the
+/// refusal name the new one instead of serde's bare "unknown field".
+pub const RENAMED_METADATA_KEYS: &[(&str, &str)] = &[
+    ("requires_infra", "requiresInfra"),
+    ("per_instance", "perInstance"),
+    ("instance_filled", "instanceFilled"),
+    ("free_text", "freeText"),
+    ("depends_on", "dependsOn"),
+    ("mime_types", "mimeTypes"),
+    ("cursor_param", "cursorParam"),
+    ("cursor_path", "cursorPath"),
+    ("connection_optional", "connectionOptional"),
+    ("own_page", "ownPage"),
+    ("all_permissions_url", "allPermissionsUrl"),
+    ("own_only", "ownOnly"),
+    ("token_url", "tokenUrl"),
+    ("scope_delimiter", "scopeDelimiter"),
+    ("auth_params", "authParams"),
+    ("extra_params", "extraParams"),
+    ("registration_fields", "registrationFields"),
+    ("token_auth", "tokenAuth"),
+    ("jwt_ttl_secs", "jwtTtlSecs"),
+    ("auth_url", "authUrl"),
+    ("token_path", "tokenPath"),
+    ("expires_path", "expiresPath"),
+    ("expect_status", "expectStatus"),
+    ("access_key_id", "accessKeyId"),
+    ("secret_access_key", "secretAccessKey"),
+    ("consumer_key", "consumerKey"),
+    ("consumer_secret", "consumerSecret"),
+    ("token_secret", "tokenSecret"),
+    ("when_field", "whenField"),
+    ("url_from", "urlFrom"),
+    ("event_path", "eventPath"),
+    ("multi_account", "multiAccount"),
+    ("id_path", "idPath"),
+    ("route_by", "routeBy"),
+    ("signature_header", "signatureHeader"),
+    ("timestamp_header", "timestampHeader"),
+    ("jwks_url", "jwksUrl"),
+    ("renew_margin_secs", "renewMarginSecs"),
+];
+
+/// Refuse every metadata key still spelled the way
+/// [`RENAMED_METADATA_KEYS`] says it no longer is, at any depth that holds
+/// metadata keys ([`METADATA_PLACES`] says where the rest is data), naming
+/// where each sits and its new spelling, all in one message, sorted.
+fn refuse_renamed_metadata_keys(value: &serde_json::Value) -> Result<(), String> {
+    fn walk<'a>(path: &mut Vec<&'a str>, value: &'a serde_json::Value, found: &mut Vec<String>) {
+        let place = metadata_place_at(path);
+        if matches!(place, Some(MetadataPlace::Data)) {
+            return;
+        }
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let segment = match place {
+                        Some(MetadataPlace::NamesAre(..)) => "*",
+                        _ => key.as_str(),
+                    };
+                    if segment != "*" {
+                        if let Some((_, new)) = RENAMED_METADATA_KEYS.iter().find(|(old, _)| old == key) {
+                            let under = if path.is_empty() { String::new() } else { format!(" (under `{}`)", path.join(".")) };
+                            found.push(format!("`{key}`{under} is spelled `{new}` now"));
+                        }
+                    }
+                    path.push(segment);
+                    walk(path, child, found);
+                    path.pop();
+                }
+            }
+            serde_json::Value::Array(items) => {
+                path.push("[]");
+                for item in items {
+                    walk(path, item, found);
+                }
+                path.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(&mut Vec::new(), value, &mut found);
+    // In one order whatever order the document's keys come in.
+    found.sort();
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}: every metadata.json key is camelCase, and the old spelling is no longer read. Rename {}",
+        found.join("; "),
+        if found.len() == 1 { "it" } else { "them" }
+    ))
+}
+
+/// What the value at one place in a `metadata.json` holds, when it is not
+/// metadata keys all the way down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataPlace {
+    /// Free data: neither its keys nor anything below them are metadata
+    /// keys.
+    Data,
+    /// A map whose keys are NAMES of something (a type, a field, a topic)
+    /// rather than metadata keys, spelled `casing`, described as `what`.
+    /// Each entry's value is metadata again, at the segment `*`.
+    NamesAre(crate::casing::Casing, &'static str),
+}
+
+/// Where a `metadata.json` holds something other than metadata keys. A
+/// pattern is the path from the file's root, one segment per item: map
+/// keys, `[]` for any list item, `*` for any one key, `**` for any run of
+/// segments. Each entry says why. Written pre-split, so a walk over every
+/// node discovery loads never allocates to match one. Every reader of
+/// "is this a metadata key" asks here: the catalog's spelling check and
+/// the refusal of a renamed key.
+pub const METADATA_PLACES: &[(&[&str], MetadataPlace, &str)] = {
+    use crate::casing::Casing;
+    use MetadataPlace::{Data, NamesAre};
+    &[
+        (&["inputs", "[]", "default"], Data, "the value an input gets when nothing drives it: the node's data"),
+        (
+            &["validate", "**", "equals"],
+            Data,
+            "the JSON value a `config_equals` rule compares a setting against: the setting's data",
+        ),
+        (
+            &["inputs", "[]", "widget", "sources", "[]", "where"],
+            Data,
+            "dotted paths into the PROVIDER's list items (`can_do_text_to_speech`): the provider's names",
+        ),
+        (&["service", "**", "body"], Data, "the request body sent to the provider as written: the provider's names"),
+        (&["service", "ownPage", "mint", "payload"], Data, "the app-creation payload sent to the provider as written"),
+        (
+            &["service", "acquisition", "authParams"],
+            Data,
+            "extra consent-URL parameters (`access_type`): the OAuth provider's parameter names",
+        ),
+        (&["service", "acquisition", "extraParams"], Data, "extra token-request parameters: the provider's names"),
+        (&["service", "acquisition", "claims"], Data, "JWT claims (`iss`, `sub`): the JWT standard's names"),
+        (
+            &["accessApps", "*"],
+            Data,
+            "an OAuth app's registration as the token exchange sends it: `client_id` and `client_secret` are \
+             OAuth's parameter names, and the extras are named by the service's `registrationFields`, \
+             which are checked where the service declares them",
+        ),
+        // A service name is a value of a fixed set (the services weft
+        // knows): a node names it as a value (`"service": "google"`), so it
+        // takes the snake_case every fixed-set value takes.
+        (&["accessApps"], NamesAre(Casing::Snake, "service name"), ""),
+        (&["types"], NamesAre(Casing::Pascal, "declared type"), ""),
+        (&["firesWith"], NamesAre(Casing::Camel, "fire payload field"), ""),
+        (&["service", "events", "*", "fields"], NamesAre(Casing::Camel, "event field"), ""),
+        // A topic is a value of a fixed set (the service's event kinds): a
+        // trigger names it as a value (`"drive_changes"`), so it takes the
+        // snake_case every fixed-set value takes.
+        (&["service", "events"], NamesAre(Casing::Snake, "event topic"), ""),
+    ]
+};
+
+fn place_matches(pattern: &[&str], path: &[&str]) -> bool {
+    match (pattern.split_first(), path.split_first()) {
+        (None, None) => true,
+        (Some((&"**", rest)), _) => place_matches(rest, path) || (!path.is_empty() && place_matches(pattern, &path[1..])),
+        (Some((p, rest)), Some((s, tail))) => (*p == "*" || p == s) && place_matches(rest, tail),
+        _ => false,
+    }
+}
+
+/// What [`METADATA_PLACES`] says the value at `path` holds; `None` is
+/// metadata keys.
+pub fn metadata_place_at(path: &[&str]) -> Option<MetadataPlace> {
+    METADATA_PLACES.iter().find_map(|(pattern, place, _)| place_matches(pattern, path).then_some(*place))
 }
 
 impl NodeMetadata {
@@ -1304,21 +1482,6 @@ impl NodeMetadata {
                 return Err(format!(
                     "a node declaring a `service` recipe needs exactly ONE input with the \
                      `access` widget (the connect control); found {connect_inputs}"
-                ));
-            }
-        }
-        // A project-declared app is source that ships with the project,
-        // so it may never carry a secret: only a public (PKCE) client
-        // is shareable this way. A confidential app belongs on the
-        // "Your own" page, where its secret goes editor -> store.
-        for (service, app) in &self.access_apps {
-            if app.client_secret.is_some() {
-                return Err(format!(
-                    "accessApps.{service}: a project-declared app must not carry a \
-                     client_secret (a metadata.json ships with the node to everyone who \
-                     uses it, so a secret here would go to all of them); declare only a public (PKCE) client here. An app with a \
-                     secret goes in the install's apps file (`access-apps.json`), or is \
-                     pasted on the editor's \"Your own\" page when connecting"
                 ));
             }
         }
@@ -4641,6 +4804,37 @@ mod input_semantics_tests {
         assert!(refuse_removed_metadata_keys(&clean).is_ok());
     }
 
+    /// A key that became camelCase is refused naming its new spelling and
+    /// where it sits, every one at once; the same word as DATA (an
+    /// input's default, a provider's parameter) is left alone.
+    #[test]
+    fn renamed_metadata_keys_are_refused_naming_the_new_spelling() {
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "requires_infra": true,
+            "inputs": [{ "name": "x", "type": "String", "free_text": true }] });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert_eq!(
+            e,
+            "`free_text` (under `inputs.[]`) is spelled `freeText` now; `requires_infra` is spelled \
+             `requiresInfra` now: every metadata.json key is camelCase, and the old spelling is no \
+             longer read. Rename them"
+        );
+
+        let doc = json!({ "service": { "acquisition": { "kind": "oauth2", "token_url": "u" } } });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.starts_with("`token_url` (under `service.acquisition`) is spelled `tokenUrl` now:"), "{e}");
+
+        let data = json!({ "type": "T", "label": "T", "description": "",
+            "inputs": [{ "name": "x", "type": "JsonDict", "default": { "free_text": 1 } }],
+            "service": { "acquisition": { "authParams": { "access_key_id": "a" } } },
+            "firesWith": { "own_page": "String" } });
+        assert!(refuse_removed_metadata_keys(&data).is_ok());
+
+        for (old, new) in RENAMED_METADATA_KEYS {
+            assert_eq!(crate::casing::Casing::Camel.spell(old), *new, "{old}");
+        }
+    }
+
     /// The type-derived widget: file-valued types get the drop control,
     /// Boolean a checkbox, Number a number box, everything else a
     /// textarea (JSON typed as in source). Containers of files are NOT
@@ -4891,36 +5085,6 @@ mod input_semantics_tests {
             free_text: false,
         });
         assert!(metadata_with(vec![account, field]).validate_semantics().is_ok());
-    }
-
-    /// A project-declared app may never carry a secret: project
-    /// metadata is source, and source never holds secrets.
-    #[test]
-    fn validate_semantics_rejects_a_confidential_project_app() {
-        let mut meta = metadata_with(vec![]);
-        meta.access_apps.insert(
-            "google".into(),
-            crate::access::spec::AppRegistration {
-                label: "My app".into(),
-                client_id: "cid".into(),
-                client_secret: Some("sec".into()),
-                extra: Default::default(),
-            },
-        );
-        let e = meta.validate_semantics().unwrap_err();
-        assert!(e.contains("client_secret"), "{e}");
-
-        let mut public = metadata_with(vec![]);
-        public.access_apps.insert(
-            "google".into(),
-            crate::access::spec::AppRegistration {
-                label: "My app".into(),
-                client_id: "cid".into(),
-                client_secret: None,
-                extra: Default::default(),
-            },
-        );
-        assert!(public.validate_semantics().is_ok());
     }
 
     /// One name = one input; a duplicate is a metadata error.

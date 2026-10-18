@@ -3242,10 +3242,18 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         if meta.is_some_and(|m| m.features.added_ports_are_data_keys) {
             continue;
         }
+        // A port the node type's catalog entry declares is the catalog's
+        // to spell (its spelling check names the node's own file), so a
+        // header that only narrows one, or a program using a node whose
+        // own port is off, adds nothing here.
         let ports = node
             .inputs
             .iter()
-            .filter(|p| !p.from_spec && !p.port.synthesized_from_carry)
+            .filter(|p| {
+                !p.from_spec
+                    && !p.port.synthesized_from_carry
+                    && !meta.is_some_and(|m| m.inputs.iter().any(|i| i.name == p.port.name))
+            })
             .map(|p| &p.port)
             .chain(node.outputs.iter().filter(|p| {
                 p.declared_type.is_some()

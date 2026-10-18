@@ -27,8 +27,6 @@ weft-core = { workspace = true }
 weft-dispatcher = { path = "../weft-dispatcher" }
 weft-broker = { path = "../weft-broker" }
 weft-broker-client = { path = "../weft-broker-client" }
-weft-journal = { workspace = true }
-weft-access-store = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-infra-supervisor = { path = "../weft-infra-supervisor" }
 weft-task-store = { workspace = true, features = ["serve"] }
@@ -43,7 +41,6 @@ hex = "0.4"
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 tokio = { workspace = true }
@@ -55,7 +52,6 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 tempfile = { workspace = true }
-bytes = { workspace = true }
 # Calling the tick route in its tests (`oneshot`).
 tower = { workspace = true, features = ["util"] }
 # `#[sqlx::test]`: a fresh database per test against $DATABASE_URL.

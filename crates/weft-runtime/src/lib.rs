@@ -20,9 +20,7 @@
 //! - `schema`: every table group the install's database holds.
 //! - `log_file`: a local install's bounded log file.
 //! - `unit_agent`: the agent beside every infra unit.
-//! - `carry`: carrying a local install's database into this generation.
 
-pub mod carry;
 pub mod guard;
 pub mod log_file;
 pub mod platform;

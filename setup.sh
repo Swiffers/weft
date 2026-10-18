@@ -82,8 +82,8 @@
 #
 # Questions:
 #   --yes         answer yes to what an install asks before it wipes
-#                 something (run history stored in a shape this version
-#                 cannot read, an older weft on this machine), for
+#                 something (an older weft on this machine, or this
+#                 install's database from before runs were renamed), for
 #                 scripts and machines with no terminal.
 #
 # Escape hatch:
@@ -1957,47 +1957,6 @@ if [[ $refresh_daemon -eq 0 && -x "${installed_bin}" ]]; then
   record_checkout_install
 fi
 
-# ---- run history in a shape this version cannot read --------------------
-#
-# Runs are stored as a row each (`run`) and their records (`run_log`); the
-# shape before it (`exec_event`) is not carried over: the migration that
-# brings the database forward drops it. So an install whose database still
-# holds it says what goes and asks first, then wipes it before the daemon
-# refresh runs that migration. Only the default install can be that old:
-# a branch's install is made by this version. (A `--migration --release`
-# earlier in this run cannot run it either: the generator refuses a live
-# database in neither the shape before its release nor the shape after.)
-if [[ $refresh_daemon -eq 1 && $on_default_install -eq 1 ]] && command -v docker >/dev/null 2>&1; then
-  if ! old_run_history="$(weft_old_run_history)"; then
-    fail "could not reach the install's Postgres (the weft-postgres container) to check how it stores runs; see: docker logs weft-postgres"
-    exit 1
-  fi
-  if [[ "${old_run_history}" == "yes" ]]; then
-    section "Run history"
-    warn "This upgrade changes how weft stores past runs, and the runs already"
-    warn "stored cannot be carried over. Upgrading wipes:"
-    warn "  - every past run, its events, logs and search entries"
-    warn "  - events waiting for a parked trigger"
-    warn "It keeps everything else: your projects and their code, their settings,"
-    warn "connections, installs, infra and its data."
-    if [[ $assume_yes -eq 0 ]]; then
-      if [[ ! -t 0 ]]; then
-        fail "no terminal to ask on; run ./setup.sh --yes to wipe the run history and upgrade"
-        exit 1
-      fi
-      # End of input (Ctrl-D) is a no: under set -e a failed read would
-      # otherwise end the run without a word.
-      read -r -p "  Wipe the run history and upgrade? [y/N] " answer || answer=n
-      if [[ "${answer}" != "y" && "${answer}" != "Y" ]]; then
-        hint "nothing changed; run ./setup.sh again when you are ready (--yes answers this for you)"
-        exit 1
-      fi
-    fi
-    weft_wipe_old_run_history || { fail "the run history could not be wiped; nothing changed (it is one transaction); see above"; exit 1; }
-    ok "the run history is wiped; upgrading"
-  fi
-fi
-
 # ---- daemon refresh / start ------------------------------------------
 #
 # One verb whether weft is running or not: `weft daemon start` brings the
@@ -2017,6 +1976,39 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # the same one from this checkout, and saying so keeps every child
     # it starts on it too.
     install_env_cmd=(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${installed_bin}")
+
+    # A database from before runs were renamed cannot be carried forward:
+    # the runtime refuses to boot on one. So this install's database is
+    # wiped first (asked, unless --yes), and the start below builds a
+    # fresh one. Only this install's: its config, its keys and every
+    # other install stay as they are.
+    # SYNC: resource names <-> crates/weft-core/src/infra/install.rs (resource_prefix)
+    if [[ "${install_env}" == "default" ]]; then pg_container="weft-postgres"; else pg_container="weft-${install_env}-postgres"; fi
+    if ! stale_db="$(weft_database_before_runs "${pg_container}")"; then
+      fail "could not read the database in ${pg_container} to check its age; see docker, then run ./setup.sh again"
+      exit 1
+    fi
+    if [[ "${stale_db}" == "yes" ]]; then
+      warn "this install's database (${install_env}) was built by a weft from before runs were renamed,"
+      warn "and this version cannot carry it forward. It is going to be wiped: the projects on your"
+      warn "disk are not touched, but their run history, versions and stored connections are."
+      if [[ $assume_yes -eq 0 ]]; then
+        if [[ ! -t 0 ]]; then
+          fail "no terminal to ask on; run ./setup.sh --yes to wipe it and install"
+          exit 1
+        fi
+        # End of input (Ctrl-D) is a no.
+        read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
+        if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
+          hint "nothing wiped and the daemon not started; run ./setup.sh again when you are ready"
+          exit 1
+        fi
+      fi
+      "${install_env_cmd[@]}" daemon stop >/dev/null 2>&1 || true
+      weft_wipe_database "${pg_container}" "${install_dir}" || { fail "the database of ${install_env} could not be removed; see above, then run ./setup.sh again"; exit 1; }
+      ok "the old database of ${install_env} is gone; starting on a fresh one"
+    fi
+
     # In the build slot: a start whose runtime or builder-base image
     # moved compiles it (cargo, inside docker), as heavy as the CLI build.
     spin_passthrough "weft daemon start" \

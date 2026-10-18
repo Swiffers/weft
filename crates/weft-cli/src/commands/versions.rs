@@ -373,7 +373,7 @@ pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunS
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let mut spec: RunSpec = serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    let mut spec = RunSpec::parse_file(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     spec.name = path.file_stem().context("example filename")?.to_string_lossy().into_owned();
     Ok(Some(spec))
 }
@@ -449,7 +449,7 @@ pub fn list_specs(project: &Project) -> Result<(Vec<RunSpec>, Vec<String>)> {
         // or one file with the wrong permissions, stopped `weft prune`
         // dead with a bare "Is a directory (os error 21)" and no path.
         match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| {
-            serde_json::from_str::<RunSpec>(&text).map_err(|e| format!("is not a spec ({e})"))
+            RunSpec::parse_file(&text).map_err(|e| format!("is not a spec ({e})"))
         }) {
             Ok(mut spec) => {
                 // The filename is the runnable name; an edited display name
@@ -824,6 +824,33 @@ mod tests {
         let (listed, errors) = list_specs(&project).unwrap();
         assert!(errors.is_empty());
         assert_eq!(listed, vec![spec]);
+    }
+
+    /// A spec an older weft saved, with keys spelled the old way, is
+    /// refused naming the file, each old key and its spelling now.
+    #[test]
+    fn a_spec_with_an_old_spelling_is_refused_naming_the_file_and_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        std::fs::create_dir_all(examples_dir(&project)).unwrap();
+        let path = spec_path(&project, "old");
+        std::fs::write(
+            &path,
+            r#"{"name":"old","frozen_from":{"version":"v","execution_id":"00000000-0000-0000-0000-000000000002","definition_hash":"h"},"settings":{"keep_for":"1d"}}"#,
+        )
+        .unwrap();
+        let error = read_spec(&project, "old").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "parse {}: this spec was saved by an older weft, and these keys are spelled differently now: \
+                 `frozen_from` is `frozenFrom`, `frozen_from.execution_id` is `runId`, \
+                 `frozen_from.definition_hash` is `definitionHash`, `settings.keep_for` is `keepFor`. \
+                 The old spelling is no longer read; rename them",
+                path.display()
+            )
+        );
     }
 
     fn version(id: &str, label: Option<&str>) -> VersionSummary {

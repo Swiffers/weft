@@ -3,7 +3,7 @@
     "commands": [
       "weft status",
       "weft ps",
-      "weft executions",
+      "weft runs",
       "weft events",
       "weft logs",
       "weft describe-nodes",
@@ -38,7 +38,7 @@
       "weft run",
       "weft events",
       "weft logs",
-      "weft executions",
+      "weft runs",
       "weft status",
       "weft daemon logs"
     ]
@@ -70,7 +70,7 @@
       "weft bake",
       "weft events",
       "weft logs",
-      "weft executions",
+      "weft runs",
       "weft status",
       "weft daemon logs",
       "weft infra start",

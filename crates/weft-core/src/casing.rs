@@ -91,23 +91,29 @@ fn words(name: &str, sep: char, allowed: impl Fn(char) -> bool) -> bool {
         && name.split(sep).all(|w| !w.is_empty() && w.chars().all(&allowed))
 }
 
-/// `name`'s words in lower case.
+/// `name`'s words in lower case. A word starts at `_`, `-` or a space,
+/// at each lower-to-upper step, and at the last capital of a run of
+/// capitals that a lower case letter follows (`XMLHttp` is `xml`,
+/// `http`).
 fn split_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
     let mut out: Vec<String> = Vec::new();
     let mut word = String::new();
-    let mut prev: Option<char> = None;
-    for c in name.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         if c == '_' || c == '-' || c == ' ' {
             if !word.is_empty() {
                 out.push(std::mem::take(&mut word));
             }
-        } else {
-            if c.is_ascii_uppercase() && prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit()) && !word.is_empty() {
-                out.push(std::mem::take(&mut word));
-            }
-            word.push(c.to_ascii_lowercase());
+            continue;
         }
-        prev = Some(c);
+        let prev = i.checked_sub(1).map(|j| chars[j]);
+        let next = chars.get(i + 1).copied();
+        let after_lower = prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit());
+        let ends_acronym = prev.is_some_and(|p| p.is_ascii_uppercase()) && next.is_some_and(|n| n.is_ascii_lowercase());
+        if c.is_ascii_uppercase() && (after_lower || ends_acronym) && !word.is_empty() {
+            out.push(std::mem::take(&mut word));
+        }
+        word.push(c.to_ascii_lowercase());
     }
     if !word.is_empty() {
         out.push(word);
@@ -156,6 +162,16 @@ mod tests {
         assert_eq!(Snake.spell("waitingForInput"), "waiting_for_input");
         assert_eq!(Kebab.spell("runningPolicy"), "running-policy");
         assert_eq!(ScreamingSnake.spell("weftInstall"), "WEFT_INSTALL");
+    }
+
+    #[test]
+    fn a_run_of_capitals_ends_before_the_capital_that_starts_the_next_word() {
+        assert_eq!(Camel.spell("XMLHttp_request"), "xmlHttpRequest");
+        assert_eq!(Pascal.spell("HTTPServer_x"), "HttpServerX");
+        assert_eq!(Camel.spell("parse_URL"), "parseUrl");
+        assert_eq!(Camel.spell("LLM_model"), "llmModel");
+        assert_eq!(Snake.spell("getHTTPResponse"), "get_http_response");
+        assert_eq!(Camel.check("port", "XMLHttp_request").unwrap_err(), "port 'XMLHttp_request' is not camelCase: write 'xmlHttpRequest'");
     }
 
     #[test]

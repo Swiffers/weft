@@ -136,51 +136,46 @@ weft_old_install_present() {
   [[ -n "$(docker ps -aq --filter name=^weft-local-control-plane$ 2>/dev/null)" ]]
 }
 
-# Whether the install's database still holds run history in the shape
-# weft stored it in before runs moved to `run` / `run_log`: its
-# `exec_event` table. A Postgres container that is stopped is started to
-# look (the install starts it next anyway); no container, no history.
-# Prints `yes` or `no`; fails when the database cannot be asked, which
-# the caller must not read as "nothing to wipe". The default install's
-# database only: a branch's install is made by a version that never
-# stored runs that way.
-# SYNC: weft-postgres, weft, weft <-> crates/weft-cli/src/commands/daemon.rs (postgres_container, PG_USER, PG_DB)
-weft_old_run_history() {
-  if ! docker container inspect weft-postgres >/dev/null 2>&1; then
+# Whether the database in Postgres container `container` was built before
+# the current schema history (the rename of executions to runs): it holds
+# weft's tables but not the history's start. The runtime refuses to boot
+# on one, so setup.sh offers to wipe it first. Prints yes or no; fails
+# when the container exists but its database cannot be asked.
+# SYNC: the history's start <-> crates/weft-task-store/src/schema_guard.rs (HISTORY_EPOCH, HISTORY_GROUP)
+weft_database_before_runs() { # container
+  if ! docker container inspect "$1" >/dev/null 2>&1; then
     echo no
     return 0
   fi
-  if [[ "$(docker inspect -f '{{.State.Running}}' weft-postgres 2>/dev/null)" != "true" ]]; then
-    docker start weft-postgres >/dev/null 2>&1 || return 1
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" != "true" ]]; then
+    docker start "$1" >/dev/null 2>&1 || return 1
   fi
   local waited=0
-  until docker exec weft-postgres pg_isready -U weft -d weft >/dev/null 2>&1; do
+  until docker exec "$1" pg_isready -U weft -d weft >/dev/null 2>&1; do
     [[ ${waited} -ge 30 ]] && return 1
     sleep 1
     waited=$((waited + 1))
   done
   local found
-  found="$(docker exec weft-postgres psql -U weft -d weft -tAc "SELECT to_regclass('public.exec_event') IS NOT NULL")" || return 1
+  found="$(docker exec "$1" psql -U weft -d weft -tAc \
+    "SELECT to_regclass('public.weft_schema_stamp') IS NOT NULL
+        AND EXISTS (SELECT 1 FROM weft_schema_stamp)
+        AND NOT EXISTS (SELECT 1 FROM weft_migration WHERE group_name = '_history' AND id = 'run')")" || return 1
   if [[ "${found}" == "t" ]]; then echo yes; else echo no; fi
 }
 
-# Wipe the run history [weft_old_run_history] found, in one transaction,
-# before the migration that drops its tables runs: what the old shape
-# kept about runs in the tables that stay (their tags, their waits, the
-# setups in flight, the queued work naming them, a version tree's head
-# run) goes with it, so nothing left points at a run that is gone.
-# Projects, their code, settings, connections, installs and infra stay.
-# SYNC: the tables <-> crates/weft-task-store/migrations/ (the release that drops exec_event)
-weft_wipe_old_run_history() {
-  docker exec -i weft-postgres psql -U weft -d weft -v ON_ERROR_STOP=1 -q <<'SQL'
-BEGIN;
-TRUNCATE exec_event, execution, version_run, execution_tag, trigger_setup;
-DELETE FROM signal WHERE is_resume;
-UPDATE signal SET parked_fires = '[]'::jsonb WHERE parked_fires <> '[]'::jsonb;
-DELETE FROM task;
-UPDATE project SET head_run = NULL WHERE head_run IS NOT NULL;
-COMMIT;
-SQL
+# Delete the database of the install whose Postgres container is
+# `container` and whose directory is `dir`: the container and its files
+# (`dir/postgres-data`, owned by Postgres's own user, so removed from a
+# container when a plain rm cannot). The install's config and keys stay,
+# and its next start builds a fresh database. Stop its runtime first.
+weft_wipe_database() { # container dir
+  docker rm -f "$1" >/dev/null 2>&1 || true
+  [[ -d "$2/postgres-data" ]] || return 0
+  if ! rm -rf "$2/postgres-data" 2>/dev/null; then
+    docker run --rm -v "$2:/d" alpine:3 sh -c 'rm -rf /d/postgres-data' >/dev/null 2>&1 || return 1
+  fi
+  [[ ! -d "$2/postgres-data" ]]
 }
 
 # The named installs on this machine (branches' installs, test cells), comma separated,

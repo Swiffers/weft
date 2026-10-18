@@ -137,6 +137,12 @@ Your project folders stay, and `weft run` registers them again. If
 `./setup.sh` has no terminal to ask on, run `scripts/scrub-old-install.sh`
 yourself first.
 
+If your install's database was built before executions were renamed runs,
+that update starts it over too. `./setup.sh` asks before wiping that one
+install's database: its run history, versions and stored connections go,
+while your project folders, the install's settings and every other install
+stay. Without a terminal to ask on, run `./setup.sh --yes`.
+
 **To remove it**, run `./setup.sh --uninstall`. It stops the runtime and
 removes the CLI and the editor extension. Your database, stored connections
 and your programs' infrastructure stay, so a later `./setup.sh` brings

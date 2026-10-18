@@ -194,20 +194,51 @@ const validate = async (root: string, target: string, nodeEdit: boolean) => {
   }
 
   try {
-    const diagnostics = JSON.parse(stdout).diagnostics ?? []
+    const answer = JSON.parse(stdout)
+    const diagnostics = answer.diagnostics ?? []
+    // Errors, minus the rule-runtime findings (a provider with no model named
+    // yet, and cousins): those are fixed by a pick, never by a source edit.
+    // One warning rides along: `level-too-large`, the compiler saying a level
+    // of the graph is becoming a wall.
     let findings = diagnostics.filter((diagnostic: any) =>
       (diagnostic.severity === "error" && diagnostic.code !== "rule-runtime") ||
       (diagnostic.severity === "warning" && diagnostic.code === "level-too-large"),
     )
     if (nodeEdit) findings = await dropUnwritten(root, target, findings)
-    if (!findings.length) return
-    return "weft validation feedback:\n" + findings.map((diagnostic: any) =>
-      `  ${diagnostic.file ?? target}:${diagnostic.line ?? "?"}:${diagnostic.column ?? "?"} [${diagnostic.code ?? "diagnostic"}] ${diagnostic.message ?? ""}`,
-    ).join("\n")
+    // Names the model chose that are spelled off the weft way: the
+    // compiler's `not-camel-case` (the program's names), and, after a node
+    // edit, the catalog's spelling warnings (a node's metadata.json). The
+    // catalog lines carry no code, so they are told apart by the spelling
+    // message every one of them ends with. They get their own heading, so
+    // the model tells law-breaking from spelling at a glance.
+    const spelling = diagnostics.filter((diagnostic: any) =>
+      diagnostic.severity === "warning" && diagnostic.code === "not-camel-case",
+    )
+    const catalogSpelling: string[] = nodeEdit
+      ? (answer.warnings ?? []).filter((warning: unknown): warning is string =>
+          typeof warning === "string" && SPELLING.test(warning),
+        )
+      : []
+    if (!findings.length && !spelling.length && !catalogSpelling.length) return
+    const sections: string[] = []
+    if (findings.length) sections.push("weft validation feedback:\n" + findings.map(formatFinding(target)).join("\n"))
+    if (spelling.length || catalogSpelling.length) {
+      const count = spelling.length + catalogSpelling.length
+      sections.push(
+        `weft: ${count} spelling warning${count === 1 ? "" : "s"} (the program runs; rename to the spelling given):\n` +
+          [...spelling.map(formatFinding(target)), ...catalogSpelling.map((warning) => `  ${warning}`)].join("\n"),
+      )
+    }
+    return sections.join("\n")
   } catch {
     return
   }
 }
+
+const SPELLING = /is not (camelCase|PascalCase|snake_case)/
+
+const formatFinding = (target: string) => (diagnostic: any) =>
+  `  ${diagnostic.file ?? target}:${diagnostic.line ?? "?"}:${diagnostic.column ?? "?"} [${diagnostic.code ?? "diagnostic"}] ${diagnostic.message ?? ""}`
 
 const plugin = async ({ directory }: { directory: string }) => ({
   "tool.execute.after": async (input: { tool: string; args?: any }, output: { output: string; metadata?: any }) => {

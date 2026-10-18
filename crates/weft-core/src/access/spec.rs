@@ -443,23 +443,74 @@ impl AppRegistration {
         m
     }
 
-    /// Refuse an app missing a declared `registration_field`. `client_id`
-    /// is structurally required (the type demands it); this checks the
-    /// service's declared extras are all present, so a half-filled app
-    /// fails at connect with a clear message, not at the token call.
+    /// The connect path's check, for an app somebody pastes or registers
+    /// (it may hold a secret): a label and a `client_id`, every declared
+    /// `registration_field` present, and no key the service does not
+    /// declare, so a half-filled app fails at connect with a clear
+    /// message, not at the token call. An app a node SHIPS is held to
+    /// [`AppRegistration::check_shipped`] instead.
     pub fn validate(&self, fields: &[CredentialField]) -> Result<(), String> {
+        self.check_named()?;
+        if let Some(f) = fields.iter().find(|f| !f.optional && self.lacks(&f.name)) {
+            return Err(format!("the app is missing the required field '{}'", f.name));
+        }
+        self.check_keys(fields, false)
+    }
+
+    /// Every rule for an app a node's `metadata.json` ships (`accessApps`).
+    /// A metadata.json ships with the node to everyone who uses it, so the
+    /// app is public: it holds no `client_secret` and no field the service
+    /// marks secret, and a service that REQUIRES a secret field cannot
+    /// ship one at all. Beyond that it is whole: a label, a `client_id`,
+    /// every required field, and no key the service does not declare.
+    /// `fields` are the service's `registrationFields`.
+    pub fn check_shipped(&self, fields: &[CredentialField]) -> Result<(), String> {
+        const ELSEWHERE: &str = "an app with a secret goes in the install's apps file \
+            (`access-apps.json`), or is pasted on the editor's \"Your own\" page when connecting";
+        if let Some(f) = fields.iter().find(|f| f.secret && !f.optional) {
+            return Err(format!(
+                "this service needs '{}', a secret, in every app, so it cannot ship a public app at \
+                 all (a metadata.json ships with the node to everyone who uses it); remove this \
+                 app: {ELSEWHERE}",
+                f.name
+            ));
+        }
+        self.check_named()?;
+        if self.client_secret.is_some() {
+            return Err(format!(
+                "a shipped app must not carry a client_secret (a metadata.json ships with the node \
+                 to everyone who uses it, so a secret here would go to all of them); declare only a \
+                 public (PKCE) client here: {ELSEWHERE}"
+            ));
+        }
+        if let Some(f) = fields.iter().find(|f| f.secret && self.extra.contains_key(&f.name)) {
+            return Err(format!(
+                "'{}' is a secret, and a metadata.json ships with the node to everyone who uses it; \
+                 leave it out here: {ELSEWHERE}",
+                f.name
+            ));
+        }
+        self.check_keys(fields, true)?;
+        if let Some(f) = fields.iter().find(|f| !f.optional && self.lacks(&f.name)) {
+            return Err(format!("the app is missing the required field '{}'", f.name));
+        }
+        Ok(())
+    }
+
+    /// A label and a `client_id`, both non-empty.
+    fn check_named(&self) -> Result<(), String> {
         if self.label.trim().is_empty() {
             return Err("the app needs a name (shown in the connection list)".to_string());
         }
         if self.client_id.trim().is_empty() {
             return Err("the app's client_id is empty".to_string());
         }
-        for f in fields {
-            if !f.optional && self.extra.get(&f.name).is_none_or(|value| value.trim().is_empty()) {
-                return Err(format!("the app is missing the required field '{}'", f.name));
-            }
-        }
-        self.check_keys(fields, false)
+        Ok(())
+    }
+
+    /// Whether the extra `name` is absent or blank.
+    fn lacks(&self, name: &str) -> bool {
+        self.extra.get(name).is_none_or(|value| value.trim().is_empty())
     }
 
     /// Refuse a key the service does not declare. Every key beyond
@@ -469,7 +520,7 @@ impl AppRegistration {
     /// declared registration fields. `shipped` is an app a node's
     /// metadata ships, which is public: the keys it may hold leave out
     /// the secret ones, so the message never offers one.
-    pub fn check_keys(&self, fields: &[CredentialField], shipped: bool) -> Result<(), String> {
+    fn check_keys(&self, fields: &[CredentialField], shipped: bool) -> Result<(), String> {
         match self.extra.keys().find(|key| !fields.iter().any(|f| f.name == **key)) {
             None => Ok(()),
             Some(key) => {
@@ -1952,6 +2003,47 @@ mod tests {
             extra: BTreeMap::new(),
         };
         assert!(unnamed.validate(&[]).unwrap_err().contains("name"));
+    }
+
+    /// A shipped app is public and whole: every rule `check_shipped` holds,
+    /// one refusal each, and a public app with its required field passes.
+    #[test]
+    fn a_shipped_app_is_public_and_whole() {
+        let field = |name: &str, secret: bool, optional: bool| CredentialField {
+            name: name.into(),
+            label: None,
+            optional,
+            secret,
+            placeholder: None,
+        };
+        let app = |secret: Option<&str>, extra: &[(&str, &str)]| AppRegistration {
+            label: "Ours".into(),
+            client_id: "cid".into(),
+            client_secret: secret.map(Into::into),
+            extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        };
+        let fields = vec![field("accountId", false, false), field("appToken", true, true)];
+
+        assert_eq!(app(None, &[("accountId", "a")]).check_shipped(&fields), Ok(()));
+        let e = app(Some("s"), &[("accountId", "a")]).check_shipped(&fields).unwrap_err();
+        assert!(e.contains("must not carry a client_secret") && e.contains("access-apps.json"), "{e}");
+        let e = app(None, &[("accountId", "a"), ("appToken", "t")]).check_shipped(&fields).unwrap_err();
+        assert!(e.starts_with("'appToken' is a secret") && e.contains("\"Your own\""), "{e}");
+        let e = app(None, &[("accountId", "a"), ("acountId", "a")]).check_shipped(&fields).unwrap_err();
+        assert_eq!(e, "the app has a field 'acountId' its service does not declare (known: label, client_id, accountId)");
+        let e = app(None, &[]).check_shipped(&fields).unwrap_err();
+        assert_eq!(e, "the app is missing the required field 'accountId'");
+        let mut unnamed = app(None, &[("accountId", "a")]);
+        unnamed.label = " ".into();
+        assert!(unnamed.check_shipped(&fields).unwrap_err().contains("needs a name"));
+
+        // A service that needs a secret in every app cannot ship one.
+        let needs_secret = vec![field("signingSecret", true, false)];
+        let e = app(None, &[]).check_shipped(&needs_secret).unwrap_err();
+        assert!(e.contains("cannot ship a public app at all") && e.contains("access-apps.json"), "{e}");
+
+        // The connect path takes what a shipped app may not hold.
+        assert_eq!(app(Some("s"), &[("accountId", "a"), ("appToken", "t")]).validate(&fields), Ok(()));
     }
 
     fn slack_spec() -> AccessSpec {

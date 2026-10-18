@@ -36,10 +36,12 @@ field of a request body you send to a provider. Inside an `accessApps` entry,
 `client_id` keeps OAuth's spelling, and any other registration key is spelled
 exactly as the service names it in its `registrationFields`.
 
-A snake_case spelling of a key weft defines (`requires_infra`) is an unknown
-key, so the node fails to load and gets no spelling warning. In a package root's `metadata.json` (the defaults its
-members inherit), the root gets a spelling warning instead, and every member
-that inherits the key fails to load. For how those defaults work, go and read
+If you write a key weft renamed in its old snake_case spelling
+(`requires_infra`), the node fails to load, and the error names the new
+spelling: "`requires_infra` is spelled `requiresInfra` now ... Rename it". In
+a package root's `metadata.json` (the defaults its members inherit), the error
+is reported against the root's file, and the package's members are left out.
+For how those defaults work, go and read
 [Package defaults](#package-defaults).
 
 If any other name in a `metadata.json` breaks these rules, the node still loads
@@ -59,15 +61,10 @@ same line without `warning: `:
 warning: <NodeType> (<path to metadata.json>): <message>
 ```
 
-If a name is off in a package root's `metadata.json`, the warning names the
-root, not each member, and starts
-`package '<name>' defaults (<path>)` instead of a node type. Ports a member
-inherits are the exception. Their names, the record fields of a type written
-inline in one of them, the stored value names in their `requiresValues`, and an
-inherited `portsFromConfig` spec are checked on each member, so a bad one in
-the root gives every member that inherits it a warning of its own, naming that
-member. A declared type's
-fields are checked once, where it is declared.
+If a name is off in a package root's `metadata.json`, including a port it gives
+its members and that port's record fields, the warning names the root, not
+each member, and starts `package '<name>' defaults (<path>)` instead of a node
+type. A declared type's fields are checked once, where it is declared.
 
 If you are changing a node that ships with weft, the catalog's `casing` test
 fails on any such warning. For the command, go and read the Code style section
@@ -370,23 +367,28 @@ Each app needs a `label` (the name shown in the connection list) and a
 "accessApps": { "google": { "label": "Acme", "client_id": "1234.apps.googleusercontent.com" } }
 ```
 
-If one of those is missing or empty, or you write any other key, the app is
-refused with a message naming what is wrong (an unknown key also gets the list
-of keys the service knows). A missing `label` or `client_id` fails the file's
-load whatever service it names, because those keys have no default. The other
-checks (an empty value, a missing registration field, an unknown key) run when
-the catalog loads if the service is in the same catalog (and the node is then
-left out of it), and otherwise when somebody connects. A project's catalog
-holds its copy of the standard nodes (`nodes/base_catalog`, which `weft new`
-copies in), so a standard service is always checked when the catalog loads.
+Every check on an app here runs when the catalog loads, and an app that fails
+one leaves its node out of the catalog, with a message naming what is wrong:
+- the key under `accessApps` names no service any node of the project
+  declares (`no node in this project declares a service named 'slak'`);
+- the service connects without an app, because it does not sign in through
+  OAuth;
+- `label` or `client_id` is missing or empty, a required registration field
+  is missing or empty, or the app has a key the service does not declare (the
+  message lists the keys it knows).
+
+An app a package root gives its members is reported once, against the root's
+file, unless it leaves out `label` or `client_id` entirely: then every member
+that inherits it fails to load, each against its own file. A project's catalog holds its copy of the standard nodes
+(`nodes/base_catalog`, which `weft new` copies in), so the standard services
+count as declared.
 
 An app here is a public client, one that signs in with no secret (OAuth's PKCE
-flow). If you write a `client_secret` here, the
-file is refused when it loads: a `metadata.json` ships with the node to
-everyone who uses it, so the secret would go to all of them. A registration
-field is secret unless the service marks it `"secret": false`, and a secret one
-is refused too, but only when the catalog loads: a connect cannot tell a
-shipped app from a pasted one. An app with a secret goes in
+flow). A `metadata.json` ships with the node to everyone who uses it, so a
+secret written here would go to all of them: a `client_secret` is refused, and
+so is any registration field the service marks secret (a field is secret
+unless the service marks it `"secret": false`). A service that needs a secret
+field in every app cannot ship a public app at all. An app with a secret goes in
 the install's [apps file](../connections/the-apps-file.md) (`access-apps.json`),
 or is pasted on the "Your own" page when somebody connects.
 

@@ -60,7 +60,7 @@ outside every group that receives a per-instance value, and sends its work
 into that group through the group's inputs.
 
 1. **The per-instance part**: what you mark `@instance_filled` (and
-   `@per_instance` on an infra node), and the steps that follow. When an
+   `@per_instance` on an infra node), and the nodes that follow. When an
    instance's trigger reads a value filled per instance (a schedule, a
    sheet), give that field a fallback if one makes sense, so the trigger can
    be turned on the moment the instance is created.
@@ -98,8 +98,8 @@ user picked on the install, on the user's bill. Ask the user which they want
 for each paid service before you write it.
 
 To try a person's path before any website exists, give a test instance the
-values a person would: `weft connect --instance alice --node <step>` and
-`weft instance-values --instance alice --set step.field=value`, then run with
+values a person would: `weft connect --instance alice --node <node>` and
+`weft instance-values --instance alice --set <node>.<field>=<value>`, then run with
 `--instance alice`.
 
 ## Billing people

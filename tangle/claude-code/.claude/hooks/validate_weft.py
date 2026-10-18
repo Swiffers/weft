@@ -20,12 +20,16 @@ After every Edit or Write this runs `weft validate` (strict pipeline) and
 keeps tier-1 findings: severity "error" minus the rule-runtime slug. Exit 2
 makes Claude Code show stderr to the model as blocking feedback.
 
-One warning rides along: `level-too-large` (a level of the graph holding
-more than fifteen items). It is not an error, the program still runs, but
-the model is the one writing the graph, and this is the compiler's way of
-saying the file is becoming a wall. It is printed under its own heading so
-the model can tell law-breaking (errors) from unreadability (this) at a
-glance.
+Two kinds of warning ride along. `level-too-large` (a level of the graph
+holding more than fifteen items) is not an error, the program still runs,
+but the model is the one writing the graph, and this is the compiler's way
+of saying the file is becoming a wall. Spelling warnings are the other: a
+name the program chose that is not camelCase (`not-camel-case`, with the
+fix), and, after an edit under `nodes/`, the catalog's warnings about a
+name a node's `metadata.json` spells off the weft way. The model chose
+those names, so it is the one to fix them while the file is open. Each
+kind is printed under its own heading so the model can tell law-breaking
+(errors) from unreadability and spelling at a glance.
 
 Silence means clean: exit 0 with no output when there is nothing to say,
 when the edit touched nothing weft-related, or when the toolchain needed to
@@ -141,8 +145,8 @@ def validate(root: str, target: str, node_edit: bool = False):
         return None
     diags = out.get("diagnostics") or []
     # Tier 1 only: `weft validate` runs the strict pipeline in runtime
-    # mode, which adds rule-runtime findings (an unpicked connection and
-    # cousins). Those are runtime rules: a build deliberately skips them,
+    # mode, which adds rule-runtime findings (a provider with no model
+    # named yet, and cousins). Those are runtime rules: a build deliberately skips them,
     # and a run, an activate or a resync is refused before it starts
     # while one is open, fixed by a pick rather than a source edit.
     # Blocking the edit loop on them would trap the model on an error it
@@ -161,7 +165,22 @@ def validate(root: str, target: str, node_edit: bool = False):
         d for d in diags
         if d.get("severity") == "warning" and d.get("code") == "level-too-large"
     ]
-    if not errors and not level_warnings:
+    # Names the model chose that are spelled off the weft way: the
+    # compiler's `not-camel-case` (the program's names), and, after a node
+    # edit, the catalog's spelling warnings (a node's metadata.json). The
+    # catalog lines carry no code, so they are told apart by the spelling
+    # message every one of them ends with.
+    spelling = [
+        d for d in diags
+        if d.get("severity") == "warning" and d.get("code") == "not-camel-case"
+    ]
+    catalog_spelling = []
+    if node_edit:
+        catalog_spelling = [
+            w for w in (out.get("warnings") or [])
+            if isinstance(w, str) and SPELLING.search(w)
+        ]
+    if not errors and not level_warnings and not spelling and not catalog_spelling:
         return None
     lines = []
     if errors:
@@ -174,8 +193,18 @@ def validate(root: str, target: str, node_edit: bool = False):
             len(level_warnings), "" if len(level_warnings) == 1 else "s"))
         for d in level_warnings:
             lines.append(_format_finding(d, target))
+    if spelling or catalog_spelling:
+        count = len(spelling) + len(catalog_spelling)
+        lines.append("weft: {} spelling warning{} (the program runs; rename to the spelling given):".format(
+            count, "" if count == 1 else "s"))
+        for d in spelling:
+            lines.append(_format_finding(d, target))
+        for w in catalog_spelling:
+            lines.append("  " + w)
     return "\n".join(lines)
 
+
+SPELLING = re.compile(r"is not (camelCase|PascalCase|snake_case)")
 
 UNWRITTEN = (
     re.compile(r"unknown node type:? '([^']+)'"),

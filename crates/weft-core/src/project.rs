@@ -418,7 +418,6 @@ pub struct NodeDefinition {
     /// no longer skips the node. Only meaningful on a node type that
     /// accepts created ports; enrich rejects the marker anywhere else,
     /// where it would silently mean nothing.
-    // SYNC: optional_ports <-> packages/weft-graph/src/protocol.ts NodeDefinition.optionalPorts
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty", rename = "optionalPorts")]
     pub optional_ports: std::collections::BTreeSet<String>,
     /// Source ranges + written form for `port_literals` entries, keyed

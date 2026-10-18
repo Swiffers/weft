@@ -3,6 +3,42 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## Unreleased
+
+**An execution is now called a run everywhere, and every name follows one
+casing rule. Your install's database starts over, and some of your own
+files need renaming.**
+
+When you run `./setup.sh`, it finds that your install's database was built
+before this release and asks before wiping it. Your run history, versions
+and stored connections go, so connect your services again afterwards. Your
+project folders stay, and `weft run` registers them again. Other installs
+on the machine are not touched until you run `./setup.sh` in their
+checkout. If there is no terminal to ask on, run `./setup.sh --yes`.
+
+What to rename in your own projects:
+
+- In the CLI, `weft executions` is `weft runs`, and every `<execution-id>`
+  argument is a run id.
+- In a node's `metadata.json`, every key is camelCase: `requires_infra` is
+  `requiresInfra`, `free_text` is `freeText`, and so on. A node still using
+  an old key fails to load, and the error names the new spelling. For the
+  copy of the standard nodes under `nodes/base_catalog`, run
+  `weft catalog update` in the project.
+- In Rust node code, `ExecutionContext` is `RunContext`, `ctx.execution_id`
+  is `ctx.run_id`, and `ctx.tag_execution` is `ctx.tag_run`.
+- A loop's settings are `maxIters` and `trimOnMismatch`.
+- A saved `examples/<name>.json` that uses an old spelling (`frozen_from`,
+  `gave_up`, `keep_for`) is refused, and the error names each new spelling.
+- If a script reads weft's JSON (`--json`, the API), the fields are
+  camelCase now: `runId`, not `execution_id`. Values from a fixed list stay
+  snake_case (`waiting_for_input`).
+- The compiler now warns `not-camel-case` on a node, group or port name you
+  chose that is not camelCase, with the spelling to use. The program still
+  runs.
+- Run `weft tangle update` in each project, so its assistant learns the new
+  names.
+
 ## 2026-10-13 (0.2.269)
 
 **Each branch of a checkout can now run its own install. If your checkout is

@@ -110,7 +110,9 @@ weft freeze angry-customer
 ```
 
 `--save` writes the starting parameters. `freeze` takes a run that completed
-and records its accepted outputs alongside them.
+and records its accepted outputs alongside them. If a saved file still uses a
+spelling an older weft wrote (`frozen_from`, `gave_up`, `keep_for`), it is
+refused with a message naming each new spelling, so you can rename them.
 
 Then, after a change:
 

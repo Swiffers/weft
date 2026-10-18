@@ -33,10 +33,7 @@ impl DiscoveredSignal {
     }
     /// The trigger node id.
     pub fn node_id(&self) -> Option<&str> {
-        self.0
-            .get("nodeId")
-            .or_else(|| self.0.get("node_id"))
-            .and_then(Value::as_str)
+        self.0.get("nodeId").and_then(Value::as_str)
     }
     /// The signal kind tag (`form`, `route`, `socket`, ...).
     pub fn kind(&self) -> Option<&str> {

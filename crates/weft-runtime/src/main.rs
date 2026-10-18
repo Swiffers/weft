@@ -30,15 +30,6 @@ enum Command {
         #[arg(long)]
         log: Option<PathBuf>,
     },
-    /// Carry a local install's database from the previous generation into
-    /// this one, finishing whatever an interrupted carry left; nothing on a
-    /// database already of this generation. `weft daemon start` runs it
-    /// with the runtime stopped.
-    Carry {
-        /// The install config.
-        #[arg(long, env = "WEFT_CONFIG")]
-        config: PathBuf,
-    },
     /// The agent beside an infra unit.
     UnitAgent {
         #[command(subcommand)]
@@ -61,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
     let args = Args::parse();
     let config = match &args.command {
-        Command::Serve { config, .. } | Command::Carry { config } => Some(weft_platform_traits::InstallConfig::load(config)?),
+        Command::Serve { config, .. } => Some(weft_platform_traits::InstallConfig::load(config)?),
         Command::UnitAgent { .. } => None,
     };
     // Every weft crate at info. The alert line is the platform's to write
@@ -90,17 +81,6 @@ async fn main() -> anyhow::Result<()> {
             let config = config.expect("the config of `serve` is read above");
             let role = role.as_deref().map(weft_platform_traits::CoreRole::parse).transpose().map_err(anyhow::Error::msg)?;
             weft_runtime::serve(config, role).await
-        }
-        Command::Carry { .. } => {
-            let config = config.expect("the config of `carry` is read above");
-            let install = weft_runtime::carry::install(&config).await?;
-            match weft_runtime::carry::carry(&install).await? {
-                weft_runtime::carry::Done::Nothing => {}
-                weft_runtime::carry::Done::Carried { runs, files } => {
-                    println!("carried the database into this generation: {runs} run(s), {files} run file(s)")
-                }
-            }
-            Ok(())
         }
         Command::UnitAgent { command } => match command {
             AgentCommand::Serve => weft_runtime::unit_agent::serve().await,

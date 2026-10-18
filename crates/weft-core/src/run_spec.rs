@@ -104,6 +104,75 @@ pub struct RunSpec {
     pub settings: crate::run_settings::SettingsChoice,
 }
 
+/// The keys a saved spec file once spelled snake_case, and their spelling
+/// now: `(where, old, new)`, `where` the path of the object holding the
+/// key (`[]` for any list item). The old spelling is refused, never read
+/// as an alias; this only lets the refusal name the new one.
+const RENAMED_SPEC_KEYS: &[(&[&str], &str, &str)] = &[
+    (&[], "frozen_from", "frozenFrom"),
+    (&["frozenFrom"], "execution_id", "runId"),
+    (&["frozen_from"], "execution_id", "runId"),
+    (&["frozenFrom"], "definition_hash", "definitionHash"),
+    (&["frozen_from"], "definition_hash", "definitionHash"),
+    (&["answers", "[]"], "gave_up", "gaveUp"),
+    (&["settings"], "keep_for", "keepFor"),
+    (&["settings"], "hold_secs", "holdSecs"),
+];
+
+impl RunSpec {
+    /// A saved spec file's text as a spec (the `name` is the caller's to
+    /// set from the file name). When it does not fit and the reason is a
+    /// key an older weft spelled differently, the refusal names every
+    /// such key and its spelling now instead of serde's bare "unknown
+    /// field".
+    pub fn parse_file(text: &str) -> Result<Self, String> {
+        serde_json::from_str(text).map_err(|error| {
+            let renamed = serde_json::from_str::<Value>(text).map(|value| renamed_spec_keys(&value)).unwrap_or_default();
+            if renamed.is_empty() {
+                error.to_string()
+            } else {
+                format!(
+                    "this spec was saved by an older weft, and these keys are spelled differently now: {}. \
+                     The old spelling is no longer read; rename them",
+                    renamed.join(", ")
+                )
+            }
+        })
+    }
+}
+
+/// Every [`RENAMED_SPEC_KEYS`] key `value` still holds, as "`at.old` is
+/// `new`".
+fn renamed_spec_keys(value: &Value) -> Vec<String> {
+    fn at<'a>(value: &'a Value, path: &[&str]) -> Vec<(String, &'a serde_json::Map<String, Value>)> {
+        match path.split_first() {
+            None => value.as_object().map(|o| vec![(String::new(), o)]).unwrap_or_default(),
+            Some((&"[]", rest)) => value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .flat_map(|(i, item)| at(item, rest).into_iter().map(move |(p, o)| (format!("[{i}]{p}"), o)))
+                .collect(),
+            Some((key, rest)) => value
+                .get(*key)
+                .map(|child| at(child, rest).into_iter().map(|(p, o)| (format!(".{key}{p}"), o)).collect())
+                .unwrap_or_default(),
+        }
+    }
+    let mut out = Vec::new();
+    for (path, old, new) in RENAMED_SPEC_KEYS {
+        for (place, object) in at(value, path) {
+            if object.contains_key(*old) {
+                let place = place.trim_start_matches('.');
+                let old = if place.is_empty() { (*old).to_string() } else { format!("{place}.{old}") };
+                out.push(format!("`{old}` is `{new}`"));
+            }
+        }
+    }
+    out
+}
+
 fn deserialize_unique<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(deserializer: D) -> Result<T, D::Error> {
     let UniqueValue(value) = UniqueValue::deserialize(deserializer)?;
     serde_json::from_value(value).map_err(D::Error::custom)
@@ -1195,6 +1264,26 @@ mod tests {
             assert_eq!(serde_json::to_value(&answer).unwrap(), file);
             assert_eq!(serde_json::from_value::<Answer>(file).unwrap(), answer);
         }
+    }
+
+    /// A saved spec with a key an older weft spelled snake_case is refused
+    /// naming each one and its spelling now; any other refusal is serde's,
+    /// and a current file parses.
+    #[test]
+    fn a_spec_file_with_an_old_spelling_names_the_new_one() {
+        let old = r#"{"name":"x","answers":[{"node":"review","gave_up":"quiet"}],"settings":{"hold_secs":5}}"#;
+        assert_eq!(
+            RunSpec::parse_file(old).unwrap_err(),
+            "this spec was saved by an older weft, and these keys are spelled differently now: \
+             `answers[0].gave_up` is `gaveUp`, `settings.hold_secs` is `holdSecs`. The old spelling is \
+             no longer read; rename them"
+        );
+        let other = RunSpec::parse_file(r#"{"name":"x","bogus":1}"#).unwrap_err();
+        assert!(other.contains("unknown field `bogus`"), "{other}");
+        let current = RunSpec::parse_file(r#"{"name":"x","answers":[{"node":"review","gaveUp":"quiet"}],"settings":{"holdSecs":5}}"#);
+        assert!(current.is_ok(), "{current:?}");
+        let dup = RunSpec::parse_file(r#"{"name":"x","from":{"a":{"v":1,"v":2}}}"#).unwrap_err();
+        assert!(dup.contains("duplicate key 'v'"), "duplicate keys are still caught: {dup}");
     }
 
     /// A file saying two endings at once, or none, is refused by name;

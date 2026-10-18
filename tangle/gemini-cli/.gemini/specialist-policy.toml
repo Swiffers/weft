@@ -103,7 +103,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "node-smith"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft test-node", "weft node-test-hash", "weft run", "weft bake", "weft stop", "weft cancel-running", "weft catalog update", "weft new", "weft infra start", "weft infra stop", "weft infra upgrade", "weft infra rebake", "weft infra terminate"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft test-node", "weft node-test-hash", "weft run", "weft bake", "weft stop", "weft cancel-running", "weft catalog update", "weft new", "weft infra start", "weft infra stop", "weft infra upgrade", "weft infra rebake", "weft infra terminate"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]
@@ -192,7 +192,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "group-builder"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "weft stop", "weft cancel-running"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "weft stop", "weft cancel-running"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]
@@ -281,7 +281,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "frontend-builder"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "weft infra press", "weft infra env", "weft connect-lib", "node --env-file=.env build", "pnpm install", "pnpm add", "pnpm run", "pnpm exec playwright", "pnpm exec auth"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "weft infra press", "weft infra env", "weft connect-lib", "node --env-file=.env build", "pnpm install", "pnpm add", "pnpm run", "pnpm exec playwright", "pnpm exec auth"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]
@@ -534,7 +534,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "prompt-engineer"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "mktemp -d"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "mktemp -d"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]
@@ -623,7 +623,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "run-digger"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]
@@ -695,7 +695,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "red-teamer"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]
@@ -758,7 +758,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "deployer"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft activate", "weft resync", "weft deactivate", "weft cancel-activate", "weft infra start", "weft infra stop", "weft infra terminate", "weft infra env", "weft connect", "weft target list", "weft domain", "weft frontend ls"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft activate", "weft resync", "weft deactivate", "weft cancel-activate", "weft infra start", "weft infra stop", "weft infra terminate", "weft infra env", "weft connect", "weft target list", "weft domain", "weft frontend ls"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]

@@ -7,7 +7,7 @@ otherwise run anything Tangle may run. This hook gives each specialist its
 own list instead, kept in specialist_commands.json beside it: a key per agent
 name (the `name` in its .codex/agents/ file), and under it the commands that
 agent may run, each as the words a command starts with ("weft events" allows
-`weft events <run id> --node x`).
+`weft events <run-id> --node x`).
 
 Codex puts `agent_id` and `agent_type` (the agent's name) on a hook's input
 only inside a subagent. A shell call from a specialist the file names is

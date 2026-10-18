@@ -307,83 +307,35 @@ fn edited_after_running(
         .collect()
 }
 
-/// Where the migration history starts: a generation. A generation begins
-/// when a release changes what weft has stored in ways no migration can
-/// carry (names inside compressed run records, inside sealed connection
-/// values, in object keys): every group's `origin.sql` is frozen again from
-/// the canonical DDL of that day and the migrations before it are deleted.
-/// Every database built since records this id (under [`HISTORY_GROUP`])
-/// when its first group is built. One from [`PREVIOUS_GENERATION`] is
-/// carried into a fresh database by `weft-runtime carry` (which `weft
-/// daemon start` runs before the runtime); one older still is refused with
-/// the way out.
-///
-/// The generations so far: `serverless`, from the move off Kubernetes;
-/// `run`, from the rename of execution to run.
-pub const HISTORY_EPOCH: &str = "run";
-/// The generation `weft-runtime carry` reads from.
-pub const PREVIOUS_GENERATION: &str = "serverless";
+/// Where the migration history starts. The history has restarted twice,
+/// when weft moved off Kubernetes and when executions were renamed runs:
+/// each time every group's `origin.sql` was frozen again from the canonical
+/// DDL of that day and the migrations before it were deleted, so no
+/// database built earlier can be carried forward. Every database built
+/// since records this id (under [`HISTORY_GROUP`]) when its first group is
+/// built, and one without it is refused with the way out.
+const HISTORY_EPOCH: &str = "run";
 const HISTORY_GROUP: &str = "_history";
-
-/// Which generation a database belongs to, as its `_history` record says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Generation {
-    /// Nothing built in it yet.
-    Empty,
-    /// [`HISTORY_EPOCH`].
-    Current,
-    /// [`PREVIOUS_GENERATION`]: `weft-runtime carry` carries it over.
-    Previous,
-    /// Older than that: nothing carries it over.
-    Older,
-}
-
-/// The generation of the database `conn` is on.
-pub async fn generation(conn: &mut sqlx::PgConnection) -> anyhow::Result<Generation> {
-    let (ledgers,): (bool,) =
-        sqlx::query_as("SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL")
-            .fetch_one(&mut *conn)
-            .await?;
-    if !ledgers {
-        return Ok(Generation::Empty);
-    }
-    let (built, current, previous): (bool, bool, bool) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
-                EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2), \
-                EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $3)",
-    )
-    .bind(HISTORY_GROUP)
-    .bind(HISTORY_EPOCH)
-    .bind(PREVIOUS_GENERATION)
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(match (built, current, previous) {
-        (false, _, _) => Generation::Empty,
-        (true, true, _) => Generation::Current,
-        (true, false, true) => Generation::Previous,
-        (true, false, false) => Generation::Older,
-    })
-}
 
 /// Record the history's start on a new database, and refuse one that was
 /// built before it.
 async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
-    let generation = generation(tx).await?;
+    let (built, current): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
+                EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2)",
+    )
+    .bind(HISTORY_GROUP)
+    .bind(HISTORY_EPOCH)
+    .fetch_one(&mut **tx)
+    .await?;
     anyhow::ensure!(
-        generation != Generation::Previous,
-        "this database was built by a weft from before runs were renamed, and has to be \
-         carried into a fresh one first: run ./setup.sh (or `weft daemon start`), which \
-         carries every project, connection, run and file across and keeps the old database \
-         until the copy is complete."
+        !built || current,
+        "this database was built by an older weft (from before runs were renamed, or before \
+         it moved off Kubernetes), and its tables cannot be carried forward. Run ./setup.sh, \
+         which offers to wipe it (this deletes its projects' run history, versions and stored \
+         connections; your project folders are untouched), or wipe everything weft left on \
+         this machine with scripts/scrub-old-install.sh."
     );
-    anyhow::ensure!(
-        generation != Generation::Older,
-        "this database was built by a weft from before it moved off Kubernetes, and its \
-         tables cannot be carried forward. Wipe the old install with \
-         scripts/scrub-old-install.sh (this deletes its projects' run history and stored \
-         connections; your project folders are untouched), then run ./setup.sh."
-    );
-    let built = generation != Generation::Empty;
     if !built {
         sqlx::query("INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING")
             .bind(HISTORY_GROUP)

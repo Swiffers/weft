@@ -104,6 +104,7 @@ pub const SCOPE_TAGS: [&str; 5] = ["run", "project", "shared", "asset", "instanc
 /// (`instance/<project>/<instance>/<id>`), and 2 for the asset scope, whose
 /// id must be a content hash (`asset/<sha256>`), so a project folder named
 /// `asset` is never mistaken for one.
+// SYNC: is_scope_key <-> packages/weft-graph/src/webview/lib/utils/storage-key.ts isScopeKey
 pub fn is_scope_key(s: &str) -> bool {
     let parts: Vec<&str> = s.split('/').collect();
     match parts.as_slice() {

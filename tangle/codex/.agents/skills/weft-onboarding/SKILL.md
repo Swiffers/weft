@@ -1,6 +1,6 @@
 ---
 name: weft-onboarding
-description: "Read when someone asks to be taught, shown around or onboarded, asks what a thing on screen means, or opens a project they have clearly just made: the guided tour of the two views, the graph, building in it, running, the three things that are alive, executions, triggers, infra, connections, a public address and people in the loop, in plain words for a total beginner."
+description: "Read when someone asks to be taught, shown around or onboarded, asks what a thing on screen means, or opens a project they have clearly just made: the guided tour of the two views, the graph, building in it, running, the three things that are alive, runs, triggers, infra, connections, a public address and people in the loop, in plain words for a total beginner."
 ---
 
 # Onboarding a user
@@ -20,7 +20,7 @@ screen, never a lecture about what is not.
   points at a real box on their canvas or a real line in their file. If
   you catch yourself explaining a thing nothing on their screen shows,
   stop and write: "Wait. Their screen." Then point at what is there.
-- **Plain words, always.** A node is "a step that does one thing". A wire
+- **Plain words, always.** A node is "a box that does one thing". A wire
   is "where the result goes next". A trigger is "what starts this on its
   own". "Subgraph", "idempotent" and "orchestration" are never words you type
   here. Say it the
@@ -29,7 +29,7 @@ screen, never a lecture about what is not.
   then click it" beats describing what running does. Every stop of [the
   tour] has a thing to do; you offer it.
 - **Answer the feeling behind the question.** "Why is that box dark?" is
-  a question about the skip rule: a step goes dark when its on/off switch
+  a question about the skip rule: a node goes dark when its on/off switch
   said no, or when a value it needed never arrived, and that is the program
   working, not breaking.
 - **Never dump the whole map.** [the tour] is your itinerary; their
@@ -46,17 +46,17 @@ screen, never a lecture about what is not.
 
 | They see | It is |
 |---|---|
-| a box | a node: one step that does one thing (ask a model, send a message, wait for a person) |
-| an arrow | a wire: where a step's result goes next; the color says what kind of value it carries |
+| a box | a node: one thing the program does (ask a model, send a message, wait for a person) |
+| an arrow | a wire: where a node's result goes next; the color says what kind of value it carries |
 | the dots on a box's edges | ports: the named places values come in and go out |
 | the small amber arrow top-left of a box | the on/off switch: filled means something said "run this", hollow means nothing did |
-| a big box holding smaller boxes | a group: steps bundled into one named step, collapsible like a folder |
-| a violet box with a rotate icon | a loop: the same steps run once per item of a list |
+| a big box holding smaller boxes | a group: nodes bundled into one named box, collapsible like a folder |
+| a violet box with a rotate icon | a loop: the same nodes run once per item of a list |
 | the white bar at the bottom of the canvas | the action bar: Run in the middle, infra on the left, triggers on the right |
 | a trigger | what starts the program on its own (a message arriving, a schedule, a form); the action bar grows an Activate button when one is in the program |
 | a node with a status pill | infra: the program's own long-running service (its own Postgres, the WhatsApp bridge) that stays up between runs |
 | a node with "Connect ..." | an access node: where an account gets attached; the credential lives outside the code |
-| the run list in the sidebar | executions: the runs of this program, step by step with their values (a trigger with `recorded` off shows only the runs that failed or reported a cost) |
+| the run list in the sidebar | runs: every run of this program, node by node with their values (a trigger with `recorded` off shows only the runs that failed or reported a cost) |
 | a cyan box mid-run | waiting: the run paused for a person or an event and costs nothing while it waits |
 
 ## The tour, in order
@@ -88,14 +88,14 @@ project has the thing to show, or they ask.
    they remember: a container costs money while it is up, and switching the
    listening on registers things inside other people's accounts. Neither is
    something a Run button should decide for them.
-5. **The sidebar.** "Projects" lists every program; "Executions" lists
+5. **The sidebar.** "Projects" lists every program; "Runs" lists
    every run. "View in Graph" on an old run replays it, values included,
    and a replayed run looks exactly like a live one. Tell them the same
-   list exists as `weft executions` and `weft events <execution-id>` in a
+   list exists as `weft runs` and `weft events <run-id>` in a
    terminal.
 6. **Build something.** This is the stop that turns a reader into a user,
    so do it with them rather than describing it. Ctrl+P (Cmd+P) opens the
-   palette: every step they can add, plus Undo, Duplicate, Fit View and
+   palette: every node they can add, plus Undo, Duplicate, Fit View and
    Auto Organize Layout. Pick one and it lands on the canvas. Drag from a
    dot on one box's right edge to a dot on another's left edge to wire it,
    and the drop is refused when the types do not fit, when the two boxes
@@ -141,7 +141,7 @@ project has the thing to show, or they ask.
     one, which is when a provider has to push events at them rather than
     weft going and fetching. `./setup.sh --public-url` opens it, and what
     it exposes is two paths and nothing else: the event pushes and the
-    links that answer a waiting step. Everything else on that address
+    links that answer a waiting node. Everything else on that address
     answers 404, and their dispatcher, their projects and their runs are
     not on it at all. `weft daemon status` prints the address. Warn them
     once: it changes when the tunnel restarts, and anything they
@@ -151,7 +151,7 @@ project has the thing to show, or they ask.
     cyan, the task appears in the browser extension, the answer resumes
     the run. The wait costs nothing, however long, and there is no
     deadline on it: ending one is somebody's decision, through "Cancel
-    run" on the card or `weft stop <execution-id>`. Extension setup, including
+    run" on the card or `weft stop <run-id>`. Extension setup, including
     minting the token it needs, is in the `weft-people-in-the-loop` skill.
 14. **When it breaks.** The Problems panel fills as they type, the red
     banner names what failed, and a failed box is clickable like any

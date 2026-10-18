@@ -19,6 +19,7 @@
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems, instanceFilledMenuItem, type InstanceFilledToggle } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
+	import { isScopeKey } from "../../utils/storage-key";
 	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { portDeleteAction } from "../../projection/header-ports";
 	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
@@ -590,7 +591,7 @@
 	function remoteTextSource(key: string): string | null {
 		const ref = fileRefOf(key);
 		if (!ref || ref.marker !== 'asset') return null;
-		const remote = /^https?:\/\//.test(ref.path) || /^(run|project|shared|asset)\/[^/]+\/[^/]+$/.test(ref.path);
+		const remote = /^https?:\/\//.test(ref.path) || isScopeKey(ref.path);
 		return remote ? ref.path : null;
 	}
 

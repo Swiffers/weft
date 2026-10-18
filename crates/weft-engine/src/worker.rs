@@ -24,8 +24,8 @@
 //! the runs it drives, so a `weft stop` reaches it at once. When the
 //! platform stops the replica, every run it drives has to leave it, and
 //! goes the way a run that pauses does: one that can be suspended starts
-//! no new step and, once the steps it runs have ended, is handed back
-//! whole for another worker to carry on from its record (a step still
+//! no new node and, once the nodes it runs have ended, is handed back
+//! whole for another worker to carry on from its record (a node still
 //! running `HAND_BACK_GRACE` later is stopped where it is, and the next
 //! worker fails it as cut short); one that cannot (unrecorded, tied to
 //! the caller on the line, or with a bus open) carries on as if nothing
@@ -116,8 +116,8 @@ pub struct WorkerConfig {
     pub resume_when_caller_leaves: bool,
 }
 
-/// How long a run on a worker told to stop has to end the steps
-/// it is running and hand itself back whole, before those steps are
+/// How long a run on a worker told to stop has to end the nodes
+/// it is running and hand itself back whole, before those nodes are
 /// stopped where they are and the run is handed back without them. Half
 /// of the ten seconds Cloud Run waits between its stop and its kill, so
 /// the run's last rows and its hand-back still land.
@@ -152,7 +152,7 @@ struct Worker {
     /// Fired when the platform tells the worker to stop: every run it
     /// drives has to leave (see the module doc), and no run is born here.
     stopping: tokio_util::sync::CancellationToken,
-    /// Fired [`HAND_BACK_GRACE`] after [`Self::stopping`]: the steps still
+    /// Fired [`HAND_BACK_GRACE`] after [`Self::stopping`]: the nodes still
     /// running are stopped where they are and their runs handed back.
     stopping_overdue: tokio_util::sync::CancellationToken,
     run_cap: Option<std::time::Duration>,
@@ -1180,9 +1180,9 @@ enum CutLook {
 }
 
 /// Once [`Worker::stopping`] fired, which takes no new run and hands back
-/// every run that can be suspended once its running steps end: fire
+/// every run that can be suspended once its running nodes end: fire
 /// [`Worker::stopping_overdue`] [`HAND_BACK_GRACE`] later, which stops
-/// the steps still running.
+/// the nodes still running.
 async fn overdue_after_grace(worker: &Worker) {
     tokio::time::sleep(HAND_BACK_GRACE).await;
     worker.stopping_overdue.cancel();
@@ -1194,7 +1194,7 @@ fn stop_on_signal(worker: &Worker) {
     let worker = worker.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        tracing::info!(target: "weft_engine::worker", "told to stop: every run that can be suspended is handed back once its running steps end; the others carry on until the process goes");
+        tracing::info!(target: "weft_engine::worker", "told to stop: every run that can be suspended is handed back once its running nodes end; the others carry on until the process goes");
         worker.stopping.cancel();
         overdue_after_grace(&worker).await;
     });
@@ -2082,7 +2082,7 @@ mod tests {
         let left = format!("{} seconds", RUN_CAP_MARGIN.as_secs());
         assert!(ended_at_the_cut(&waiting.flag, &left), "the waiting run ends naming the time left: {:?}", waiting.flag.cause());
         tokio::time::sleep(HAND_BACK_GRACE).await;
-        assert!(worker.stopping_overdue.is_cancelled(), "steps still running are stopped after the grace");
+        assert!(worker.stopping_overdue.is_cancelled(), "nodes still running are stopped after the grace");
         drop((waiting, quiet));
     }
 

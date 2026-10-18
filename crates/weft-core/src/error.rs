@@ -27,13 +27,13 @@ pub enum WeftError {
     /// A wait the run could not pause on, held in its worker, ran out of
     /// its hold (`holdSecs`) with nothing moving in the run, or was asked
     /// for where the hold is zero. Returned by the waiting `ctx` call, so
-    /// the node may handle it like any outcome of its step.
+    /// the node may handle it like any outcome of its firing.
     #[error("{0}")]
     WaitGaveUp(String),
 
     /// A person skipped what the waiting `ctx` call waited on (a form's
-    /// skip): the step does not run on, it ends skipped with every output
-    /// closed, the way a step whose input closed does. Returned by the
+    /// skip): the node does not run on, its firing ends skipped with every
+    /// output closed, the way a node whose input closed does. Returned by the
     /// waiting call, so a body passing errors on with `?` needs no code
     /// of its own for it.
     #[error("{0}")]

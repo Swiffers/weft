@@ -1,7 +1,7 @@
     //! Layer 3: an infra node with baked outputs runs like any node. A
     //! baked output its body emits nothing on carries what its copy
     //! saved; one it emits on carries the body's value. An infra setup
-    //! saves what went out on them before its step completes.
+    //! saves what went out on them before its firing completes.
 
     use super::*;
     use super::engine_test_rig::{catalog, clients, drive_on, test_manifest, MemJournal};

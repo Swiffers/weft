@@ -2125,9 +2125,9 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     .await
     .unwrap();
     change_instance_values(&mut conn, TENANT_A, PROJECT_1, &bob, &[pick("post", bobs.id, "fakestatic")], &[]).await.unwrap();
-    let steps = |values: weft_core::instance::InstanceValues| values.into_keys().collect::<Vec<_>>();
+    let nodes = |values: weft_core::instance::InstanceValues| values.into_keys().collect::<Vec<_>>();
     let adas_values = instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap();
-    assert_eq!(steps(adas_values.clone()), vec!["post", "read", "reply"]);
+    assert_eq!(nodes(adas_values.clone()), vec!["post", "read", "reply"]);
     assert_eq!(adas_values["post"]["account"]["id"], serde_json::json!(adas.id));
     assert!(adas_values["post"]["account"].get("identity").is_some(), "a connection value reads back as its handle");
     assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-1"));
@@ -2135,7 +2135,7 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     let clear = [("reply".to_string(), "account".to_string())];
     change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
     change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
-    assert_eq!(steps(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()), vec!["post", "read"]);
+    assert_eq!(nodes(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()), vec!["post", "read"]);
 
     let err = delete_grant(&pool, TENANT_A, adas.id, GrantOwnerScope::Instance { project_id: PROJECT_1, instance: &bob })
         .await
@@ -2144,11 +2144,11 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     assert!(delete_grant(&pool, TENANT_A, adas.id, GrantOwnerScope::Author).await.is_err(), "the author cannot forget it either");
     delete_grant(&pool, TENANT_A, adas.id, as_ada).await.unwrap();
     assert_eq!(
-        steps(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()),
+        nodes(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()),
         vec!["read"],
         "the connection values went with the connection, the plain one stays"
     );
-    assert_eq!(steps(instance_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap()), vec!["post"]);
+    assert_eq!(nodes(instance_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap()), vec!["post"]);
     change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &[("read".to_string(), "sheet".to_string())])
         .await
         .unwrap();

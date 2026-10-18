@@ -1979,11 +1979,13 @@ if [[ $refresh_daemon -eq 1 ]]; then
 
     # A database from before runs were renamed cannot be carried forward:
     # the runtime refuses to boot on one. So this install's database is
-    # wiped first (asked, unless --yes), and the start below builds a
-    # fresh one. Only this install's: its config, its keys and every
-    # other install stay as they are.
+    # wiped first (asked, unless --yes), with everything only it gave a
+    # meaning to (its stored files, its projects' workers and infra), and
+    # the start below builds a fresh one. Only this install's: its config,
+    # its keys and every other install stay as they are.
     # SYNC: resource names <-> crates/weft-core/src/infra/install.rs (resource_prefix)
-    if [[ "${install_env}" == "default" ]]; then pg_container="weft-postgres"; else pg_container="weft-${install_env}-postgres"; fi
+    if [[ "${install_env}" == "default" ]]; then install_prefix="weft"; else install_prefix="weft-${install_env}"; fi
+    pg_container="${install_prefix}-postgres"
     if ! stale_db="$(weft_database_before_runs "${pg_container}")"; then
       fail "could not read the database in ${pg_container} to check its age; see docker, then run ./setup.sh again"
       exit 1
@@ -1991,7 +1993,8 @@ if [[ $refresh_daemon -eq 1 ]]; then
     if [[ "${stale_db}" == "yes" ]]; then
       warn "this install's database (${install_env}) was built by a weft from before runs were renamed,"
       warn "and this version cannot carry it forward. It is going to be wiped: the projects on your"
-      warn "disk are not touched, but their run history, versions and stored connections are."
+      warn "disk are not touched, but their run history, versions, stored connections, stored files"
+      warn "and running infra are."
       if [[ $assume_yes -eq 0 ]]; then
         if [[ ! -t 0 ]]; then
           fail "no terminal to ask on; run ./setup.sh --yes to wipe it and install"
@@ -2005,7 +2008,7 @@ if [[ $refresh_daemon -eq 1 ]]; then
         fi
       fi
       "${install_env_cmd[@]}" daemon stop >/dev/null 2>&1 || true
-      weft_wipe_database "${pg_container}" "${install_dir}" || { fail "the database of ${install_env} could not be removed; see above, then run ./setup.sh again"; exit 1; }
+      weft_wipe_database "${pg_container}" "${install_dir}" "${install_env}" "${install_prefix}" || { fail "the database of ${install_env} could not be removed; see above, then run ./setup.sh again"; exit 1; }
       ok "the old database of ${install_env} is gone; starting on a fresh one"
     fi
 

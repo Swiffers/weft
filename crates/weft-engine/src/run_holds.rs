@@ -26,10 +26,10 @@ use weft_core::RunId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Quiet {
     /// When its quiet ends at most (unix seconds): its hold gives up, or,
-    /// for a step waiting on its caller, its own cap or the caller's
+    /// for a node waiting on its caller, its own cap or the caller's
     /// session cap ends ([`RunHold::quiet_on_caller`]).
     pub(crate) until: i64,
-    /// Whether it could pause right now (steps waiting on each other
+    /// Whether it could pause right now (nodes waiting on each other
     /// beside a suspended one), so a stopping worker hands it back, rather
     /// than holding its waits in the worker
     /// (`crate::held_waits::Unsuspendable`).
@@ -98,7 +98,7 @@ pub(crate) struct RunHold {
 }
 
 impl RunHold {
-    /// The run only waits, and one of its steps waits on its caller's next
+    /// The run only waits, and one of its nodes waits on its caller's next
     /// message, which no hold gives up: it is quiet until the first of its
     /// own cap and its caller's session cap (`session_ends`), and with
     /// neither it is not quiet at all, so its worker keeps ticking.

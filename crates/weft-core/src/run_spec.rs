@@ -299,7 +299,7 @@ struct AnswerFile {
     payload: Option<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     skipped: bool,
-    /// The error the waiting step failed with when the run gave the wait up.
+    /// The error the waiting node failed with when the run gave the wait up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gave_up: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

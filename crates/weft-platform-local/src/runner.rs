@@ -50,7 +50,7 @@ const START_DEADLINE: Duration = Duration::from_secs(120);
 
 /// How long a worker being replaced (a front giving way to the next, one
 /// that stopped answering) gets to let its runs go (`weft_engine::worker`:
-/// five seconds for a step to end, then its record written) before it is
+/// five seconds for a firing to end, then its record written) before it is
 /// killed.
 const WORKER_STOP_GRACE_SECS: u64 = 10;
 

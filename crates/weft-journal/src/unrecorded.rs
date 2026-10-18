@@ -7,7 +7,7 @@
 //!
 //! What is written of it, through its writer lane like any run's record
 //! and marked as not recorded on its row:
-//! - when it fails, its birth and its failure, which names the step that
+//! - when it fails, its birth and its failure, which names the node that
 //!   failed and why: nothing of what ran before;
 //! - before it does something that names it to the install (asks for a
 //!   stored file, a connection or an infrastructure address its worker

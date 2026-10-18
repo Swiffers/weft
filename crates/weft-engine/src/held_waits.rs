@@ -11,13 +11,13 @@
 //!   whole story is written by the call that waits);
 //! - giving up, once nothing moved in the run for its `holdSecs`
 //!   (`weft_core::run_settings::RunSettings::hold_secs`): the call fails,
-//!   and the node may handle that like any outcome of its step;
+//!   and the node may handle that like any outcome of its firing;
 //! - pausing after all, once the run can (the last bus between its nodes
 //!   closed): the call suspends the way it would have from the start.
 //!
 //! A held wait is one more in-process wait of the run, so it reports to
 //! the run's [`crate::wait_tracker::WaitTracker`] like a bus read does:
-//! the drive sees when every step left is waiting, which is when the hold
+//! the drive sees when every running node waits, which is when the hold
 //! clock runs.
 
 use std::collections::{HashMap, HashSet};
@@ -179,14 +179,14 @@ impl HeldWaits {
             // Answered already: the first answer stands.
             Some(Some(HeldEnd::Answered(_))) => {}
             // Pausing (its call has not seen it yet) or not held: kept for
-            // the step, which suspends on it or holds it next.
+            // the node, which suspends on it or holds it next.
             Some(Some(_)) | None => {
                 state.early.insert(token.to_string(), value);
             }
         }
     }
 
-    /// The answers kept for waits that turned out to be suspended steps
+    /// The answers kept for waits that turned out to be suspended nodes
     /// (their tokens in `suspended`), for the drive to resume them with.
     pub(crate) fn early_for(&self, suspended: &HashSet<&str>) -> Vec<(String, WaitAnswer)> {
         let mut state = self.lock();
@@ -329,11 +329,11 @@ mod tests {
         assert_eq!(held.give_up("again"), 0);
     }
 
-    /// An answer kept for a wait nobody held goes to the step that
+    /// An answer kept for a wait nobody held goes to the node that
     /// suspended on it, and one for a wait given up without a hold is
     /// dropped.
     #[test]
-    fn an_early_answer_waits_for_its_step() {
+    fn an_early_answer_waits_for_its_node() {
         let held = HeldWaits::new();
         held.answer("suspends", given(serde_json::json!(1)));
         held.answer("zero", given(serde_json::json!(2)));
@@ -345,7 +345,7 @@ mod tests {
     }
 
     /// Once the run can pause, every held wait suspends, and an answer
-    /// that comes before its call saw the pause is kept for the step.
+    /// that comes before its call saw the pause is kept for the node.
     #[tokio::test]
     async fn a_run_that_can_pause_again_pauses_its_held_waits() {
         let (_tracker, weak) = liveness();
@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(held.early_for(&HashSet::from(["t"])), vec![("t".to_string(), given(serde_json::json!("yes")))]);
     }
 
-    /// A held wait is parked to the run's tracker: a run whose only step
+    /// A held wait is parked to the run's tracker: a run whose only running node
     /// is holding is provably waiting on the outside.
     #[tokio::test]
     async fn a_held_wait_counts_as_parked() {

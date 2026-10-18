@@ -27,7 +27,7 @@
 //!
 //! Nothing here is memoized with `ctx.run`, and it does not need to
 //! be: the body never waits, so it is never replayed, and every call
-//! it makes is safe to repeat when somebody runs the step again. Reading the password is a
+//! it makes is safe to repeat when somebody runs the node again. Reading the password is a
 //! read; publishing REPLACES one row keyed by this node; retiring is
 //! the same request with the same password, which the credential
 //! server answers the same way however many times it arrives.

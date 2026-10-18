@@ -392,7 +392,7 @@ pub struct StoredFile {
     /// Which write of the file's content this value names. A key is
     /// never reused and every change of the bytes bumps the version, so
     /// (key, version) is one exact content: what an edit compares
-    /// before it writes, and what a re-run that reuses a step's output
+    /// before it writes, and what a re-run that reuses a node's output
     /// checks the file still holds.
     #[serde(default = "first_file_version")]
     pub version: u64,

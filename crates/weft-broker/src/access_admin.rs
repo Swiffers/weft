@@ -67,7 +67,7 @@ async fn shared_credentials(
     control_plane(&state, &headers).await?;
     let mut available = Vec::new();
     for service in req.services {
-        if state.credentials.available(&service).await {
+        if state.credentials.available(&service).await.map_err(shared_app_err)? {
             available.push(service);
         }
     }
@@ -155,7 +155,11 @@ async fn connect_direct(
             inner.registration = Some(app);
             inner.permissions = covers;
         } else {
-            let available = state.credentials.available(&decided.service).await;
+            let available = state
+                .credentials
+                .available(&decided.service)
+                .await
+                .map_err(shared_app_err)?;
             shared_key_gate(&decided.service, available)
                 .map_err(|e| (StatusCode::PRECONDITION_FAILED, e))?;
         }
@@ -230,7 +234,11 @@ async fn doors(
     } else {
         Ok(Json(DoorsAnswer {
             shared_apps: vec![],
-            shared_credential: state.credentials.available(&q.spec.service).await,
+            shared_credential: state
+                .credentials
+                .available(&q.spec.service)
+                .await
+                .map_err(shared_app_err)?,
         }))
     }
 }

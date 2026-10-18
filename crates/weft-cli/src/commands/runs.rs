@@ -1204,9 +1204,9 @@ mod tests {
     /// an inner loop's rows under the outer iteration they ran in.
     #[test]
     fn events_filter_narrows_by_loop_iteration() {
-        let outer_three = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 3}]}));
-        let inner = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 3}, {"site": "auth"}, {"index": 0}]}));
-        let outer_one = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 1}]}));
+        let outer_three = replay_row(json!({"kind": "node_completed", "node": "double", "frames": [{"index": 3}]}));
+        let inner = replay_row(json!({"kind": "node_completed", "node": "double", "frames": [{"index": 3}, {"site": "auth"}, {"index": 0}]}));
+        let outer_one = replay_row(json!({"kind": "node_completed", "node": "double", "frames": [{"index": 1}]}));
         let run_level = replay_row(json!({"kind": "run_completed"}));
         let third = EventsFilter { iteration: super::parse_iteration("3").unwrap(), ..Default::default() };
         assert!(keeps(&third, &outer_three) && keeps(&third, &inner) && !keeps(&third, &outer_one) && !keeps(&third, &run_level));

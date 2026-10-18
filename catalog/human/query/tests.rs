@@ -78,7 +78,7 @@ async fn label_and_placeholder(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A person skipping the form: the wait ends skipped, which ends the step
+/// A person skipping the form: the wait ends skipped, which ends the firing
 /// skipped with every output closed, whatever its fields are (an
 /// approve/reject one included).
 async fn skipped_form(rig: FakeRig) -> WeftResult<()> {

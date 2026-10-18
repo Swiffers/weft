@@ -20,9 +20,9 @@ async fn sequential_map_doubles_each_element() -> anyhow::Result<()> {
     // fixture's Python source) or `0.0` (a Rust node).
     settled.assert_input("out", "data", &json!([0, 2, 4, 6, 8]))?;
     // The unwired `factor` inside the loop fired once per iteration and
-    // never once more at the loop's own level (which left `step` holding
+    // never once more at the loop's own level (which left `double` holding
     // a `by` with no `n`, and the run stuck, before the fix).
-    for node in ["doubler.factor", "doubler.step"] {
+    for node in ["doubler.factor", "doubler.double"] {
         let fired = settled.node_outputs(node).len();
         anyhow::ensure!(fired == 5, "{node} fired {fired} times, expected one per iteration");
     }

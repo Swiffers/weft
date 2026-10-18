@@ -2,7 +2,7 @@
 //! hand.
 //!
 //! The run that applies a copy's infra (an infra setup) runs the node's
-//! body, and the step saves what went out on its baked outputs before it
+//! body, and its firing saves what went out on its baked outputs before it
 //! completes (`weft_engine`'s run driver, through the broker's
 //! `/v1/infra/bake`), so a setup that ended has saved its bake. That
 //! happens whenever the copy's infra setup runs (`weft infra start`,

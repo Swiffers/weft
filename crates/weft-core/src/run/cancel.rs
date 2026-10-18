@@ -48,7 +48,7 @@ pub enum CancelCause {
 
 impl CancelCause {
     /// A fast run whose worker went away mid-run. Its record trails it,
-    /// so nothing can tell which of its steps already ran, and it ends
+    /// so nothing can tell which of its firings already ran, and it ends
     /// rather than repeat them. The dispatcher's sweep for runs whose
     /// worker went away says it.
     pub fn fast_run_lost() -> Self {

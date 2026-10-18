@@ -626,7 +626,7 @@ pub fn required_inputs<'a>(
 /// needs has the instance's value or a fallback; it is left out of the
 /// bag itself ([`fill_input_from_literals`]) only until the engine puts
 /// that value in. The ONE reading both the pulse path and a kicked
-/// scope root use: reading it off the bag instead made a step whose
+/// scope root use: reading it off the bag instead made a node whose
 /// every setting is `@instance_filled` look like it had nothing, and skip.
 pub fn literal_filled_ports<'a>(
     node: &'a NodeDefinition,

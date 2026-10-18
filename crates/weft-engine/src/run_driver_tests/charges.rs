@@ -28,7 +28,7 @@
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [{
-                "id": "step", "nodeType": "Done", "label": null, "config": null, "position": {"x": 0.0, "y": 0.0},
+                "id": "node", "nodeType": "Done", "label": null, "config": null, "position": {"x": 0.0, "y": 0.0},
                 "inputs": [], "outputs": [],
                 "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
             }],
@@ -38,7 +38,7 @@
         .unwrap()
     }
 
-    /// A run born and kicked, with a charge `step` opened on the meter the
+    /// A run born and kicked, with a charge `node` opened on the meter the
     /// metering tests register (`queued`) and nothing closing it: the
     /// record an earlier drive left when it let go of the run.
     fn rows(project: &ProjectDefinition, run_id: RunId) -> Vec<RunEvent> {
@@ -46,7 +46,7 @@
             RunEvent::RunStarted {
                 run_id,
                 project_id: project.id,
-                entry_node: "step".into(),
+                entry_node: "node".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
                 binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
@@ -55,12 +55,12 @@
                 settings: Default::default(),
             },
             RunEvent::NodeKicked {
-                run_id, node_id: "step".into(), frames: vec![], firing: false,
+                run_id, node_id: "node".into(), frames: vec![], firing: false,
                 payload: None, port_snapshot: None, at_unix: 0,
             },
             RunEvent::ChargeOpened {
                 run_id,
-                node_id: "step".into(),
+                node_id: "node".into(),
                 frames: vec![],
                 service: "queued".into(),
                 charge: "job-1".into(),
@@ -90,7 +90,7 @@
         let (outcome, events) =
             drive_journal(project, catalog(vec![("Done", Box::new(Done))]), run_id, rows, CancellationFlag::new_arc()).await;
         assert!(matches!(outcome.expect("the drive runs"), RunOutcome::Completed));
-        assert_eq!(costs(&events), vec![("step".to_string(), None, Some("job-1".to_string()))], "{events:?}");
+        assert_eq!(costs(&events), vec![("node".to_string(), None, Some("job-1".to_string()))], "{events:?}");
         assert_eq!(weft_journal::ChargeBook::of_record(&events).into_open().count(), 0, "the record closed it");
     }
 
@@ -111,5 +111,5 @@
         let (outcome, events) =
             drive_journal(project, catalog(vec![("Done", Box::new(Done))]), run_id, rows, cancellation).await;
         assert!(matches!(outcome.expect("the drive runs"), RunOutcome::Cancelled { .. }));
-        assert_eq!(costs(&events), vec![("step".to_string(), None, Some("job-1".to_string()))], "{events:?}");
+        assert_eq!(costs(&events), vec![("node".to_string(), None, Some("job-1".to_string()))], "{events:?}");
     }

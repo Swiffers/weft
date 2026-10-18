@@ -1155,8 +1155,8 @@ impl FakeRig {
 
     /// Make the node's next `ctx.await_signal` end the way a person
     /// skipping it does (the `/skip` door, `WeftError::WaitSkipped`),
-    /// queued in order with [`Self::signal`]: in production the step then
-    /// ends skipped with every output closed.
+    /// queued in order with [`Self::signal`]: in production the node's
+    /// firing then ends skipped with every output closed.
     pub fn signal_skipped(&self) {
         self.state.signals.lock().unwrap().push_back(AwaitEnd::Skipped);
     }
@@ -2102,7 +2102,7 @@ impl Capture {
     fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
         let mut outputs = self.outputs.into_inner().unwrap();
         // The runtime's catch, decided by the same function the engine
-        // reads: a caught failure lands on `error` and the step ends
+        // reads: a caught failure lands on `error` and the firing ends
         // well, so a node's test of its caught path tests what runs.
         let result = match result {
             Err(error) => match crate::context::caught_failure(

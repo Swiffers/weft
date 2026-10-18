@@ -2250,7 +2250,7 @@ pub struct NodeFeatures {
     /// want to handle. The language gives it an [`ERROR_PORT`]
     /// output ([`NodeMetadata::add_language_ports`]) and the runtime
     /// does the catching (`context::caught_failure`): with
-    /// `error` wired, the failure's message goes there and the step
+    /// `error` wired, the failure's message goes there and the firing
     /// completes; unwired, the failure stops the run. The node's own
     /// code writes no error handling.
     #[serde(default, rename = "catchErrors", skip_serializing_if = "std::ops::Not::not")]
@@ -2262,7 +2262,7 @@ pub struct NodeFeatures {
     /// read and store the run's files. So running it twice changes nothing
     /// anybody can see: a
     /// durable run starts its body without first putting what came before
-    /// on record, and a step of it whose worker died runs again instead of
+    /// on record, and a firing of it whose worker died runs again instead of
     /// failing. Every ctx call that reaches outside fails on a pure node,
     /// naming this flag, so a wrong `pure` cannot quietly break that.
     #[serde(default, rename = "pure", skip_serializing_if = "std::ops::Not::not")]

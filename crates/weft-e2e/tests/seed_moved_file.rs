@@ -1,14 +1,14 @@
-//! A seeded run never reuses a step whose saved output names a file that
+//! A seeded run never reuses a node whose saved output names a file that
 //! has changed since. Every stored file value carries the version of the
-//! content it names, so the saved result of a step that made a file says
-//! which write it handed out; once a later step (or another run) edits the
+//! content it names, so the saved result of a node that made a file says
+//! which write it handed out; once a later node (or another run) edits the
 //! file in place, reusing that result would hand on a file that no longer
-//! holds what the step made.
+//! holds what the node made.
 //!
 //! Shape: the `seed_moved_file` fixture starts a conversation file and
-//! adds a message to it in a second step. The first run completes; a
-//! seeded run, which would reuse both steps, is refused before it starts,
-//! naming the step, the port, the file and both ways out.
+//! adds a message to it in a second node. The first run completes; a
+//! seeded run, which would reuse both nodes, is refused before it starts,
+//! naming the node, the port, the file and both ways out.
 #![cfg(feature = "e2e")]
 
 mod common;

@@ -2,7 +2,7 @@
 //! parks and branches. The `version_tree_grow` fixture holds four
 //! branches off one source: an `@include`, a HumanQuery, a Wait on a
 //! timer, and a Loop. The rig proves an included file as its group,
-//! runs a saved example, answers its human step, reviews its outputs, wakes a
+//! runs a saved example, answers its human query, reviews its outputs, wakes a
 //! timer (and is refused on a form), and sees a loop go stale whole.
 #![cfg(feature = "e2e")]
 
@@ -38,7 +38,7 @@ async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::R
 
     for (endpoint, member, source, after) in [
         ("triage", "triage.up", "src", "shout"),
-        ("echoes", "echoes.step", "nums", "total"),
+        ("echoes", "echoes.double", "nums", "total"),
     ] {
         let stdout = project.weft(&["run", "--json", "--target", endpoint]).await?;
         let run = project.settled(run_id_of(&stdout)?).await?;
@@ -53,9 +53,9 @@ async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::R
             .assert_completed(source)?.assert_untouched(member)?.assert_untouched(after)?;
     }
 
-    // A port a step inside needs, handed nothing, is refused before the
+    // A port a node inside needs, handed nothing, is refused before the
     // run starts (running it would only skip everything behind it), and
-    // the refusal names the port and the step. It never widens the group.
+    // the refusal names the port and the node. It never widens the group.
     let refused = project.weft_refused(&["run", "--group", "triage"]).await?;
     anyhow::ensure!(
         refused.contains("triage.text gets nothing in this run") && refused.contains("triage.first.text"),
@@ -91,12 +91,12 @@ async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::R
     let stdout = project.weft(&["run", "--json", "--target", "total"]).await?;
     let settled = project.settled(run_id_of(&stdout)?).await?;
     settled.completed()?.assert_loop_iterations("echoes", 2)?.assert_input("total", "data", &json!([2, 4]))?;
-    project.weft_refused(&["run", "--seed", "--seed-before", "echoes.step"]).await?;
+    project.weft_refused(&["run", "--seed", "--seed-before", "echoes.double"]).await?;
     let stdout = project.weft(&["run", "--json", "--target", "total", "--seed", "--seed-until", "nums"]).await?;
     let settled = project.settled(run_id_of(&stdout)?).await?;
     settled.completed()?.assert_loop_iterations("echoes", 2)?.assert_input("total", "data", &json!([2, 4]))?;
     anyhow::ensure!(inherited(&settled, "nums"), "the loop's source is inherited");
-    anyhow::ensure!(!inherited(&settled, "echoes.step"), "the loop body ran again");
+    anyhow::ensure!(!inherited(&settled, "echoes.double"), "the loop body ran again");
 
     project.finish().await
 }
@@ -127,7 +127,7 @@ async fn finite_supplied_streams_freeze_and_run_without_the_original_producer() 
             "running and comparing cannot replace accepted evidence");
     }
     for flag in ["--from", "--target", "--before", "--emit"] {
-        let node = if flag == "--emit" { r#"doubler.step={"out":1}"# } else { "doubler.step" };
+        let node = if flag == "--emit" { r#"doubler.double={"out":1}"# } else { "doubler.double" };
         let refused = project.weft_refused(&["run", flag, node]).await?;
         anyhow::ensure!(refused.contains("inside loop"), "{refused}");
     }

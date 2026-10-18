@@ -593,20 +593,20 @@ fn a_created_port_takes_the_type_of_what_feeds_it() {
     let source = r#"
 words = Text { value: "hi" }
 
-step = ExecPython -> (out: String) {
+py = ExecPython -> (out: String) {
   code: "return {'out': text}"
   text: words.value
   limit: 3
   flag: true
 }
 out = Debug
-out.data = step.out
+out.data = py.out
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
-    let step = project.nodes.iter().find(|n| n.id == "step").unwrap();
+    let py = project.nodes.iter().find(|n| n.id == "py").unwrap();
     let port_type = |name: &str| {
-        step.inputs.iter().find(|p| p.name == name).map(|p| p.port_type.to_string()).unwrap()
+        py.inputs.iter().find(|p| p.name == name).map(|p| p.port_type.to_string()).unwrap()
     };
     assert_eq!(port_type("text"), "String", "a wired port takes its source's type");
     assert_eq!(port_type("limit"), "Number", "a literal port takes the literal's type");
@@ -649,25 +649,25 @@ fn the_optional_marker_applies_to_created_ports_only() {
     let source = r#"
 words = Text { value: "hi" }
 
-step = ExecPython -> (out: String) {
+py = ExecPython -> (out: String) {
   code: "return {'out': text}"
   text?: words.value
 }
 out = Debug
-out.data = step.out
+out.data = py.out
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &catalog()).expect("enrich");
-    let step = project.nodes.iter().find(|n| n.id == "step").unwrap();
-    let text = step.inputs.iter().find(|p| p.name == "text").unwrap();
+    let py = project.nodes.iter().find(|n| n.id == "py").unwrap();
+    let text = py.inputs.iter().find(|p| p.name == "text").unwrap();
     assert!(!text.required, "`text?:` created an optional port");
 
     let on_a_declared_key = r#"
-step = ExecPython -> (out: String) {
+py = ExecPython -> (out: String) {
   code?: "return {'out': 1}"
 }
 out = Debug
-out.data = step.out
+out.data = py.out
 "#;
     let mut project =
         compile(on_a_declared_key, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");

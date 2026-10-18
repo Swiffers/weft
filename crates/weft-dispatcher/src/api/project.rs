@@ -4517,22 +4517,22 @@ mod trigger_kick_tests {
 
     #[test]
     fn a_fire_carves_out_the_other_trigger_s_own_path() {
-        // TriggerX ──► StepX      TriggerY ──► StepY
+        // TriggerX ──► NodeX      TriggerY ──► NodeY
         // Nothing joins the two, so firing one records a subgraph holding
         // only its own path: the graph view dims the rest of the program
         // for that run, the same way it does for an authored cut.
         let p = project(
             &[
                 ("trigger_x", true, &[]),
-                ("step_x", false, &[]),
+                ("node_x", false, &[]),
                 ("trigger_y", true, &[]),
-                ("step_y", false, &[]),
+                ("node_y", false, &[]),
             ],
-            &[("trigger_x", "step_x"), ("trigger_y", "step_y")],
+            &[("trigger_x", "node_x"), ("trigger_y", "node_y")],
         );
         let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::Null);
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string()]);
-        assert_eq!(sorted(&subgraph), vec!["step_x", "trigger_x"]);
+        assert_eq!(sorted(&subgraph), vec!["node_x", "trigger_x"]);
     }
 
     #[test]

@@ -140,8 +140,9 @@ yourself first.
 If your install's database was built before executions were renamed runs,
 that update starts it over too. `./setup.sh` asks before wiping that one
 install's database: its run history, versions and stored connections go,
-while your project folders, the install's settings and every other install
-stay. Without a terminal to ask on, run `./setup.sh --yes`.
+and so does everything only that database gave a meaning to (the files the
+install stored, and the workers and infra of its projects). Your project
+folders, the install's settings and every other install stay. Without a terminal to ask on, run `./setup.sh --yes`.
 
 **To remove it**, run `./setup.sh --uninstall`. It stops the runtime and
 removes the CLI and the editor extension. Your database, stored connections

@@ -100,9 +100,10 @@ pub trait CredentialSource: Send + Sync {
     /// all? Drives whether the editor offers the shared door of a key
     /// service; the real gate stays [`Self::resolve`], asked per call.
     /// Default `false`: a source that does not say is one with nothing
-    /// to offer.
-    async fn available(&self, _service: &str) -> bool {
-        false
+    /// to offer. An error is a source that cannot tell (a credentials
+    /// file that does not parse), answered as such, never as "none".
+    async fn available(&self, _service: &str) -> Result<bool> {
+        Ok(false)
     }
 
     /// The runtime gives a granted access back (the node that opened it
@@ -118,9 +119,9 @@ pub trait CredentialSource: Send + Sync {
 /// Self-hosting means the configured key is the operator's own, every
 /// node of every tenant on this install may use it (a single operator
 /// has no policy to enforce), and calls go straight to the service.
-/// Holds ONE file provider, so lookups share its mtime-keyed snapshot
-/// (same freshness contract as the OAuth apps: an edit takes effect
-/// without a restart).
+/// Holds ONE file provider, so lookups share its snapshot, keyed on
+/// the file's bytes (same freshness contract as the OAuth apps: an edit
+/// takes effect without a restart).
 pub struct FileCredentialSource {
     provider: crate::app_provider::FileAppProvider,
 }
@@ -159,11 +160,11 @@ impl CredentialSource for FileCredentialSource {
         }
     }
 
-    async fn available(&self, service: &str) -> bool {
-        matches!(
-            self.provider.api_key(service).await,
-            Ok(Some(entry)) if !entry.key.is_empty()
-        )
+    async fn available(&self, service: &str) -> Result<bool> {
+        Ok(matches!(
+            self.provider.api_key(service).await?,
+            Some(entry) if !entry.key.is_empty()
+        ))
     }
 }
 

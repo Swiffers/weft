@@ -3094,12 +3094,12 @@ fn a_loop_reading_the_enclosing_groups_self_is_told_to_thread_it_in() {
 outer = Group(db: String, items: List[String]) -> (done: List[String | Null]) {
     run = Loop(items: List[String]) -> (results: List[String | Null]) {
         over: ["items"]
-        step = ExecPython(row: String, db: String) -> (out: String) {
+        py = ExecPython(row: String, db: String) -> (out: String) {
             code: "return {'out': row + db}"
             row: self.items
             db: self.db
         }
-        self.results = step.out
+        self.results = py.out
     }
     run.items = self.items
     self.done = run.results
@@ -3889,7 +3889,7 @@ fn a_trigger_name_follows_whose_triggers_the_node_acts_on() {
 
 /// `input_names` with a field: SetInstanceValues keys its `values` and
 /// lists its `clear` by `node.field`, and each must be a field this
-/// program writes `@instance_filled`. Renaming the step leaves the old
+/// program writes `@instance_filled`. Renaming the node leaves the old
 /// name behind, and the compiler says so.
 #[test]
 fn set_instance_values_names_fields_an_instance_fills() {
@@ -3931,11 +3931,11 @@ fn a_wired_gate_silences_the_all_optional_inputs_warning() {
         validate(&parse_enrich(source), &catalog()).iter().any(|d| d.code.as_deref() == Some("no-required-skip"))
     };
     let base = "t = Route { path: \"gone\", method: \"DELETE\" }\n\
-                step = ExecPython(method: String) -> (why: String, ok: Boolean) { code: \"return {'why': 'x', 'ok': False}\" }\n\
-                step.method = t.method\n\
-                bye = Close { status: 404 }\nbye.reason = step.why\n";
+                py = ExecPython(method: String) -> (why: String, ok: Boolean) { code: \"return {'why': 'x', 'ok': False}\" }\n\
+                py.method = t.method\n\
+                bye = Close { status: 404 }\nbye.reason = py.why\n";
     assert!(warned(base), "all of Close's wired inputs are optional and nothing gates it");
-    assert!(!warned(&format!("{base}bye._should_flow = step.ok\n")), "the gate is the author's decision");
+    assert!(!warned(&format!("{base}bye._should_flow = py.ok\n")), "the gate is the author's decision");
 }
 
 /// Close's two wires have one field each, and the pair that cannot work
@@ -3948,12 +3948,12 @@ fn close_says_at_edit_time_which_wire_its_fields_belong_to() {
     };
     let route = "t = Route { path: \"gone\", method: \"DELETE\" }\nstep = ExecPython(method: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.method = t.method\nbye = Close ";
     // A reason under a 204 cannot reach the caller.
-    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
-    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
-    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = step.n\n"), "carries no body"));
+    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = py.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = py.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = py.n\n"), "carries no body"));
     // A socket's close code behind a Route, and an HTTP status behind a socket.
-    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = step.n\n"), "WebSocket close code"));
-    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = step.n\n";
+    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = py.n\n"), "WebSocket close code"));
+    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = py.n\n";
     assert!(says(socket, "an HTTP status"));
     assert!(!says(socket, "WebSocket close code"));
 }

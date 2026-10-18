@@ -109,7 +109,7 @@ fn check_run_settings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// of its own, which the node's metadata says, never its name: an infra
 /// node (`requiresInfra`), one container per instance. What an instance
 /// provides (its connection, its sheet) is a field written
-/// `@instance_filled`, and a step that reads a per-instance value runs per
+/// `@instance_filled`, and a node that reads a per-instance value runs per
 /// instance without a mark, which the compiler already follows.
 fn check_per_instance(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
     for node in project.nodes.iter().filter(|n| n.per_instance == Some(weft_core::instance::PerInstance::Marked)) {
@@ -3154,7 +3154,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 Severity::Warning,
                 "no-required-skip",
                 format!(
-                    "node '{name}' runs even when nothing arrives on its wires: none of its wired inputs is required, so if the steps feeding it do not run, it still runs, with those inputs empty. If it should wait for one of them, mark that input required or add `@require_one_of(<inputs>)`."
+                    "node '{name}' runs even when nothing arrives on its wires: none of its wired inputs is required, so if the nodes feeding it do not run, it still runs, with those inputs empty. If it should wait for one of them, mark that input required or add `@require_one_of(<inputs>)`."
                 ),
             );
         }

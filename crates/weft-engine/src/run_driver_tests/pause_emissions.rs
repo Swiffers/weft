@@ -58,7 +58,7 @@
     }
 
     /// Runs until told to stop: keeps the drive going while another
-    /// step pauses, so an answer resumes that step in place.
+    /// node pauses, so an answer resumes that node in place.
     struct Holder {
         stop: Arc<tokio::sync::Notify>,
     }
@@ -255,7 +255,7 @@
                 async move { run_checked(project, catalog, run_id, journal, c, CancellationFlag::new_arc(), None).await }
             });
 
-            // The step paused (its wait registered) while `holder` keeps
+            // The node paused (its wait registered) while `holder` keeps
             // the drive going, and the run read its answers once.
             let token = tasks.await_token().await;
             for _ in 0..2000 {

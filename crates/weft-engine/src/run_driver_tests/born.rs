@@ -184,10 +184,10 @@
         }
     }
 
-    /// A durable run's step is on record before its body runs: the node
+    /// A durable run's firing is on record before its body runs: the node
     /// finds its own start already written.
     #[tokio::test]
-    async fn a_durable_runs_step_is_on_record_before_its_body_runs() {
+    async fn a_durable_runs_firing_is_on_record_before_its_body_runs() {
         let project = project();
         let run_id = weft_core::new_run_id();
         let durable = weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Durable,
@@ -252,7 +252,7 @@
     }
 
     struct Pass;
-    test_manifest!(Pass, "Step");
+    test_manifest!(Pass, "Pass");
     #[async_trait]
     impl Node for Pass {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
@@ -293,7 +293,7 @@
             hand_back: None,
             hold: None,
         };
-        let catalog = catalog(vec![("Trig", Box::new(Answer)), ("Step", Box::new(Pass))]);
+        let catalog = catalog(vec![("Trig", Box::new(Answer)), ("Pass", Box::new(Pass))]);
         let drove = crate::run_driver::run_one_observed(catalog, &clients, drive, "instance-test", "tenant-test")
             .await
             .expect("the drive ends");
@@ -319,7 +319,7 @@
     }
 
     /// A durable run whose answer is its last act writes once after its
-    /// step started: the answer, the step's end and the run's ending go
+    /// node started: the answer, the node's end and the run's ending go
     /// on record together, and the answer leaves only once they are there.
     #[tokio::test]
     async fn a_durable_answer_that_ends_its_run_shares_the_endings_write() {
@@ -412,7 +412,7 @@
         let (first, ended) = heard.await.unwrap();
         assert!(matches!(first, Some(crate::caller_conn::Outbound::Terminate(Some(_), _))), "the answer: {first:?}");
         assert!(ended, "the answer left only once the run's ending was on record");
-        // The step's start (its body waits for it), then one write for the
+        // The node's start (its body waits for it), then one write for the
         // rest.
         assert_eq!(journal.batches.load(std::sync::atomic::Ordering::SeqCst), 2);
     }

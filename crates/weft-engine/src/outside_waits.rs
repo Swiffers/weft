@@ -104,7 +104,7 @@ async fn answers_once_told(
     }
 }
 
-/// How long a run has been quiet (every step it runs waits, and only the
+/// How long a run has been quiet (every node it runs waits, and only the
 /// outside can end one of those waits), and when its hold gives up: its
 /// `holdSecs` after the last time anything moved in it.
 pub(crate) struct HoldClock<'a> {
@@ -130,7 +130,7 @@ impl<'a> HoldClock<'a> {
     }
 
     /// How long the run has been quiet, while the hold `counts` (it never
-    /// does while a step waits on its caller: a silent caller is never cut),
+    /// does while a node waits on its caller: a silent caller is never cut),
     /// which also settles when the hold gives up ([`Self::until`]).
     pub(crate) fn quiet_for(&mut self, counts: bool) -> Option<Duration> {
         let quiet_for = self.quiet_since.filter(|_| counts).map(|since| self.clock.now().saturating_duration_since(since));

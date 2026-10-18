@@ -440,8 +440,8 @@ pub enum AwaitEnd {
     /// The run held it in its worker and gave it up
     /// (`SuspensionGaveUp`): the call failed with `error`.
     GaveUp { error: String },
-    /// A person skipped it (`SuspensionSkipped`): the call ends its step
-    /// skipped ([`crate::error::WeftError::WaitSkipped`]).
+    /// A person skipped it (`SuspensionSkipped`): the call ends its node's
+    /// firing skipped ([`crate::error::WeftError::WaitSkipped`]).
     Skipped,
 }
 
@@ -467,7 +467,7 @@ impl WaitAnswer {
 
 /// The error a waiting call returns when a person skipped it.
 pub fn wait_skipped() -> crate::error::WeftError {
-    crate::error::WeftError::WaitSkipped("a person skipped what this step was waiting for".into())
+    crate::error::WeftError::WaitSkipped("a person skipped what this node was waiting for".into())
 }
 
 /// What a body's `ctx.await_signal` finds in its journal at its call

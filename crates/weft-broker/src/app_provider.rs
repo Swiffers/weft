@@ -19,8 +19,8 @@
 //! ```json
 //! { "google":     [ { "kind": "oauth_app", "label": "Google Drive",
 //!                     "covers": ["..."],
-//!                     "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
-//!                     "token_url": "https://oauth2.googleapis.com/token",
+//!                     "authUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+//!                     "tokenUrl": "https://oauth2.googleapis.com/token",
 //!                     "client_id": "...", "client_secret": "..." } ],
 //!   "openrouter": [ { "kind": "api_key", "label": "Runtime key", "key": "sk-or-..." } ] }
 //! ```
@@ -31,6 +31,11 @@
 //! out an in-place rewrite rather than seeing it half-written). Absent
 //! file = nothing configured, which is the honest state the access
 //! node turns into "no one-click door; bring your own".
+//!
+//! Every key weft defines here is camelCase (`authUrl`, `tokenUrl`,
+//! `events.signingSecret`); OAuth's own `client_id` and `client_secret`
+//! keep OAuth's spelling. An entry still holding a key an older weft
+//! spelled snake_case is refused naming each one ([`RENAMED_APPS_KEYS`]).
 //!
 //! `covers` entries are validated against the service's permission
 //! catalogue wherever a spec is in hand (the door probe and every
@@ -53,13 +58,14 @@ pub use weft_core::access::spec::APPS_FILE_ENV;
 /// "everything": that default would let a typo'd permission name
 /// silently grant a door that then dies at the consent screen).
 ///
-/// `token_url` (and `auth_url` for consent services) pin where this
+/// `tokenUrl` (and `authUrl` for consent services) pin where this
 /// app's credentials are sent: a shared connect only ever talks to the
 /// addresses written beside the app in this file, whatever a connect
 /// request's recipe says. The operator registered the app at these
 /// addresses, so writing them here is copying two lines they already
 /// have.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RegisteredApp {
     pub covers: Vec<String>,
     /// Present iff this app RECEIVES the service's event pushes: the
@@ -84,6 +90,7 @@ pub struct RegisteredApp {
 /// verification scheme needs a different subset; what a scheme
 /// actually requires is refused loudly at verify time when missing.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppEvents {
     /// The shared secret an HMAC scheme keys on (Slack hands one out
     /// beside the client secret).
@@ -263,6 +270,8 @@ impl FileAppProvider {
     /// otherwise lie about which credential a connection used), and a
     /// service holds at most ONE `api_key` entry (the runtime-key
     /// door is a single option; two keys would be an ambiguous grant).
+    /// Before any of that, a key an older weft spelled differently
+    /// refuses the whole file ([`refuse_renamed_apps_keys`]).
     fn parse_all(
         raw: &str,
         path: &Path,
@@ -273,6 +282,7 @@ impl FileAppProvider {
         }
         let named: BTreeMap<String, serde_json::Value> = serde_json::from_str(raw)
             .with_context(|| format!("parse access apps file {}", path.display()))?;
+        refuse_renamed_apps_keys(&named, path)?;
         let mut services = BTreeMap::new();
         for (service, value) in named {
             if service.starts_with('_') {
@@ -343,6 +353,59 @@ impl FileAppProvider {
                 SharedCredential::OauthApp(_) => None,
             }))
     }
+}
+
+/// The apps-file keys an older weft spelled snake_case, and their
+/// spelling now: `(where, old, new)`, `where` the path inside one entry
+/// of the object holding the key. The old spelling is refused, never read
+/// as an alias: an entry flattens its registration, whose open map would
+/// otherwise take an old `auth_url` as a registration value and leave the
+/// app silently unpinned.
+const RENAMED_APPS_KEYS: &[(&[&str], &str, &str)] = &[
+    (&[], "auth_url", "authUrl"),
+    (&[], "token_url", "tokenUrl"),
+    (&[], "_setup_events", "_setupEvents"),
+    (&["events"], "signing_secret", "signingSecret"),
+    (&["events"], "public_key", "publicKey"),
+    (&["events"], "push_email", "pushEmail"),
+];
+
+/// Refuse a file in which any entry still holds a [`RENAMED_APPS_KEYS`]
+/// key, naming every one (where it sits, and its spelling now) in one
+/// message, in file order.
+fn refuse_renamed_apps_keys(
+    named: &BTreeMap<String, serde_json::Value>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut found = Vec::new();
+    for (service, value) in named.iter().filter(|(service, _)| !service.starts_with('_')) {
+        for (i, entry) in value.as_array().into_iter().flatten().enumerate() {
+            let label = entry
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(|l| format!(" (the '{}' entry)", l.trim()))
+                .unwrap_or_default();
+            for (at, old, new) in RENAMED_APPS_KEYS {
+                let holder = at.iter().try_fold(entry, |v, key| v.get(*key));
+                if holder.and_then(serde_json::Value::as_object).is_some_and(|o| o.contains_key(*old)) {
+                    let place = at.iter().map(|k| format!(".{k}")).collect::<String>();
+                    found.push(format!("`{service}[{i}]{place}.{old}`{label} is `{new}`"));
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the access apps file {} was written for an older weft, and these keys are spelled \
+         differently now: {}. Every key weft defines in this file is camelCase, and the old \
+         spelling is no longer read; rename {} (`client_id` and `client_secret` are OAuth's \
+         own names and stay as they are)",
+        path.display(),
+        found.join("; "),
+        if found.len() == 1 { "it" } else { "them" }
+    )
 }
 
 #[async_trait::async_trait]
@@ -483,9 +546,9 @@ pub fn check_endpoints(spec: &AccessSpec, app: &RegisteredApp) -> anyhow::Result
                 spec.service,
             ),
             None => anyhow::bail!(
-                "the registered '{}' app for '{}' pins no auth_url in the apps file, but \
-                 the service signs in through a browser consent; add the app's auth_url \
-                 beside its token_url",
+                "the registered '{}' app for '{}' pins no `authUrl` in the apps file, but \
+                 the service signs in through a browser consent; add the app's `authUrl` \
+                 beside its `tokenUrl`",
                 app.app.label,
                 spec.service,
             ),
@@ -584,7 +647,7 @@ mod tests {
     /// A registered app's credentials only ever travel to the
     /// addresses pinned beside it in the file: a recipe naming any
     /// other token/consent address is refused loudly, and a consent
-    /// service whose app pins no auth_url is a config error, never a
+    /// service whose app pins no `authUrl` is a config error, never a
     /// consent at an unpinned page.
     #[test]
     fn check_endpoints_holds_the_recipe_to_the_pins() {
@@ -604,7 +667,7 @@ mod tests {
         let mut unpinned = good;
         unpinned.auth_url = None;
         let err = check_endpoints(&spec, &unpinned).unwrap_err().to_string();
-        assert!(err.contains("auth_url"), "{err}");
+        assert!(err.contains("`authUrl`"), "{err}");
     }
 
     /// A declared renewal call runs with the app's credentials in
@@ -645,10 +708,10 @@ mod tests {
             "apps.json",
             r#"{ "google": [
                    { "kind": "oauth_app", "label": "Google Drive", "covers": ["drive.file"],
-                     "auth_url": "https://a/x", "token_url": "https://a/t",
+                     "authUrl": "https://a/x", "tokenUrl": "https://a/t",
                      "client_id": "cid", "client_secret": "sec" },
                    { "kind": "oauth_app", "label": "Google Calendar", "covers": ["calendar"],
-                     "auth_url": "https://a/x", "token_url": "https://a/t",
+                     "authUrl": "https://a/x", "tokenUrl": "https://a/t",
                      "client_id": "cid2" }
                  ] }"#,
         );
@@ -673,7 +736,7 @@ mod tests {
             "creds.json",
             r#"{ "openrouter": [{ "kind": "api_key", "label": "Runtime key", "key": "sk-x" }],
                  "slack": [{ "kind": "oauth_app", "label": "Slack", "covers": [],
-                             "token_url": "https://a/t", "client_id": "c" }] }"#,
+                             "tokenUrl": "https://a/t", "client_id": "c" }] }"#,
         );
         let provider = FileAppProvider::at(&path);
         let key = provider.api_key("openrouter").await.unwrap().expect("key declared");
@@ -724,7 +787,7 @@ mod tests {
             dir.path(),
             "trim.json",
             r#"{ "slack": [{ "kind": "oauth_app", "label": "  Slack Bot  ", "covers": [],
-                             "token_url": "https://a/t", "client_id": "c" }] }"#,
+                             "tokenUrl": "https://a/t", "client_id": "c" }] }"#,
         ));
         let apps = provider.apps("slack").await.unwrap();
         assert_eq!(apps[0].app.label, "Slack Bot", "stored trimmed");
@@ -735,9 +798,9 @@ mod tests {
             "casedup.json",
             r#"{ "slack": [
                 { "kind": "oauth_app", "label": "Slack", "covers": [],
-                  "token_url": "https://a/t", "client_id": "a" },
+                  "tokenUrl": "https://a/t", "client_id": "a" },
                 { "kind": "oauth_app", "label": " sLaCk ", "covers": [],
-                  "token_url": "https://a/t", "client_id": "b" } ] }"#,
+                  "tokenUrl": "https://a/t", "client_id": "b" } ] }"#,
         ));
         let err = format!("{:#}", dup.apps("slack").await.unwrap_err());
         assert!(err.contains("share the label"), "{err}");
@@ -782,28 +845,28 @@ mod tests {
             (
                 "nolabel.json",
                 r#"{ "google": [{ "kind": "oauth_app", "covers": [],
-                                  "token_url": "https://a/t", "client_id": "c" }] }"#,
+                                  "tokenUrl": "https://a/t", "client_id": "c" }] }"#,
                 "label",
             ),
             (
                 "nocovers.json",
                 r#"{ "google": [{ "kind": "oauth_app", "label": "X",
-                                  "token_url": "https://a/t", "client_id": "c" }] }"#,
+                                  "tokenUrl": "https://a/t", "client_id": "c" }] }"#,
                 "covers",
             ),
             (
                 "notoken.json",
                 r#"{ "google": [{ "kind": "oauth_app", "label": "X", "covers": [],
                                   "client_id": "c" }] }"#,
-                "token_url",
+                "tokenUrl",
             ),
             (
                 "dup.json",
                 r#"{ "google": [
                     { "kind": "oauth_app", "label": "X", "covers": [],
-                      "token_url": "https://a/t", "client_id": "a" },
+                      "tokenUrl": "https://a/t", "client_id": "a" },
                     { "kind": "oauth_app", "label": "X", "covers": [],
-                      "token_url": "https://a/t", "client_id": "b" } ] }"#,
+                      "tokenUrl": "https://a/t", "client_id": "b" } ] }"#,
                 "share the label",
             ),
         ];
@@ -813,6 +876,61 @@ mod tests {
             let msg = format!("{err:#}");
             assert!(msg.contains(needle), "{name}: {msg}");
         }
+    }
+
+    /// A file an older weft wrote is refused whole, naming every old
+    /// key, where it sits and its spelling now, never parsed with an old
+    /// `auth_url` swallowed as a registration value.
+    #[tokio::test]
+    async fn an_old_spelling_is_refused_naming_each_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = FileAppProvider::at(write(
+            dir.path(),
+            "old.json",
+            r#"{ "openrouter": [{ "kind": "api_key", "label": "Runtime key", "key": "k" }],
+                 "slack": [{ "kind": "oauth_app", "label": "Slack", "covers": [],
+                             "auth_url": "https://a/x", "token_url": "https://a/t",
+                             "_setup_events": "a note", "client_id": "c",
+                             "events": { "signing_secret": "s", "push_email": "e" } }] }"#,
+        ));
+        let err = format!("{:#}", provider.api_key("openrouter").await.unwrap_err());
+        for needle in [
+            "`slack[0].auth_url` (the 'Slack' entry) is `authUrl`",
+            "`slack[0].token_url` (the 'Slack' entry) is `tokenUrl`",
+            "`slack[0]._setup_events` (the 'Slack' entry) is `_setupEvents`",
+            "`slack[0].events.signing_secret` (the 'Slack' entry) is `signingSecret`",
+            "`slack[0].events.push_email` (the 'Slack' entry) is `pushEmail`",
+            "old.json",
+        ] {
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        assert!(!err.contains("public_key"), "only the keys present are named: {err}");
+
+        // The new spelling parses, and an unknown events key is refused
+        // rather than ignored.
+        let new = FileAppProvider::at(write(
+            dir.path(),
+            "new.json",
+            r#"{ "slack": [{ "kind": "oauth_app", "label": "Slack", "covers": [],
+                             "authUrl": "https://a/x", "tokenUrl": "https://a/t",
+                             "_setupEvents": "a note", "client_id": "c",
+                             "events": { "signingSecret": "s", "pushEmail": "e" } }] }"#,
+        ));
+        let apps = new.apps("slack").await.unwrap();
+        assert_eq!(apps[0].auth_url.as_deref(), Some("https://a/x"));
+        assert!(apps[0].app.extra.is_empty(), "{:?}", apps[0].app.extra);
+        let events = apps[0].events.as_ref().expect("events block");
+        assert_eq!(events.signing_secret.as_deref(), Some("s"));
+        assert_eq!(events.push_email.as_deref(), Some("e"));
+        let typo = FileAppProvider::at(write(
+            dir.path(),
+            "typo.json",
+            r#"{ "slack": [{ "kind": "oauth_app", "label": "Slack", "covers": [],
+                             "tokenUrl": "https://a/t", "client_id": "c",
+                             "events": { "signingSecert": "s" } }] }"#,
+        ));
+        let err = format!("{:#}", typo.apps("slack").await.unwrap_err());
+        assert!(err.contains("signingSecert"), "{err}");
     }
 
     /// `_` keys are notes at both levels, never data; the bytes-keyed
@@ -826,7 +944,7 @@ mod tests {
             "apps.json",
             r#"{ "_readme": ["a note"],
                  "slack": [{ "_setup": "do this", "kind": "oauth_app", "label": "Slack",
-                             "covers": [], "token_url": "https://a/t",
+                             "covers": [], "tokenUrl": "https://a/t",
                              "client_id": "first" }] }"#,
         );
         let provider = FileAppProvider::at(&path);
@@ -839,7 +957,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{ "slack": [{ "kind": "oauth_app", "label": "Slack", "covers": [],
-                             "token_url": "https://a/t", "client_id": "second" }] }"#,
+                             "tokenUrl": "https://a/t", "client_id": "second" }] }"#,
         )
         .unwrap();
         // The cache keys on the file's BYTES, so the rewrite lands with
@@ -855,7 +973,7 @@ mod tests {
     async fn a_mid_rewrite_read_never_answers_empty() {
         let dir = tempfile::tempdir().unwrap();
         let content = r#"{ "slack": [{ "kind": "oauth_app", "label": "Slack", "covers": [],
-                            "token_url": "https://a/t", "client_id": "c1" }] }"#;
+                            "tokenUrl": "https://a/t", "client_id": "c1" }] }"#;
         let path = write(dir.path(), "apps.json", content);
         let provider = FileAppProvider::at(&path);
         assert_eq!(provider.apps("slack").await.unwrap().len(), 1);

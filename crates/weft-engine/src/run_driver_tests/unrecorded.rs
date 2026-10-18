@@ -134,7 +134,7 @@
         }
     }
 
-    /// A run whose one step reads its caller's next message, its own cap
+    /// A run whose one node reads its caller's next message, its own cap
     /// ending at `cap_ends` and its caller's session capped at
     /// `max_session_secs` (0 for none), and a caller silent for two
     /// minutes, then speaking: how the run's worker saw it at two minutes

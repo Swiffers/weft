@@ -502,7 +502,7 @@ million rows.
 
 **Direction.** Write stream items in windows, the way a bus already
 batches its appends. This belongs with the packed record format of the
-current performance work (one write per step for a durable run, one
+current performance work (one write per firing for a durable run, one
 compact row per run for a fast one), which cuts the rows per item for
 the same reason it cuts them per run.
 
@@ -541,7 +541,7 @@ async fn ping(request) {
 
 **Measured on 2026-10-08**, after the performance round (fast and durable
 runs, callers straight to the worker, one journal writer per worker, the
-program's facts worked out once per program, a step that ends at once run on
+program's facts worked out once per program, a firing that ends at once run on
 the drive's own task). The bench project (40 nodes, `bench/weft-project`),
 its unrecorded ping (`Route` to `JsonObject` to `Reply`):
 
@@ -552,7 +552,7 @@ its unrecorded ping (`Route` to `JsonObject` to `Reply`):
   CPU per call (axum in Docker: about 50 µs). A profile of that worker,
   taken before unrecorded runs stopped keeping their history, put about
   half of its CPU in the drive loop (readiness, settling boundaries,
-  building each step's input bag, applying emissions) and the rest around
+  building each firing's input bag, applying emissions) and the rest around
   it: serving the call, the door, the run's birth, the record.
 - Throughput: 23,181 unrecorded and 12,092 fast pings a second, against
   axum's 36,996 behind Docker's port relay; 0.6 ms and 0.7 ms at one caller
@@ -570,7 +570,7 @@ measure again (`bench/README.md` has the worker-side profile).
 1. **Keep the interpreter, precompile its plan.** Everything the loop
    works out at run time (who feeds whom, which inputs are required,
    which ports are wired) becomes plain numbers decided at compile time:
-   no name lookups, no scan of every node each step, and a straight
+   no name lookups, no scan of every node on every pass, and a straight
    chain runs in place instead of starting a task per node. Pausing and
    resuming do not change.
 2. **Compile the wiring fully**, as in the sketch: a wire costs what a

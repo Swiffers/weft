@@ -648,7 +648,7 @@ pub trait CallerConnection: Send + Sync {
     /// user-controlled wait. It ends only on a message, a disconnect
     /// (`Disconnected`), or the session cap firing (which disconnects).
     /// The wait is `node`'s, registered with the run's `liveness` like any
-    /// in-process wait ([`crate::liveness::wait_on`]): a run whose steps all
+    /// in-process wait ([`crate::liveness::wait_on`]): a run whose running nodes all
     /// wait on their caller is waiting on the outside, never stuck.
     /// `Err(WrongProtocol)` on HTTP.
     async fn receive(

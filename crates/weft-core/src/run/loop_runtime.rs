@@ -2052,7 +2052,7 @@ mod tests {
     // ----- The pure derivations the engine and the fold share ----------
 
     /// `feed.items` / `feed.seed` feed the LoopIn; the body is one
-    /// node `step` plus a root `lonely` nothing feeds; the LoopOut
+    /// node `add` plus a root `lonely` nothing feeds; the LoopOut
     /// gathers `res` and carries `acc` out to `sink`.
     fn loop_project() -> ProjectDefinition {
         let node = |id: &str, ty: &str, inputs: Vec<serde_json::Value>, outputs: Vec<(&str, &str)>, scope: Vec<&str>, boundary: serde_json::Value, config: serde_json::Value| {
@@ -2074,7 +2074,7 @@ mod tests {
                     vec![("items", "Number"), ("acc", "Number"), ("index", "Number")], vec![],
                     serde_json::json!({ "groupId": "lp", "role": "In" }),
                     serde_json::json!({ "parallel": false, "over": ["items"], "carry": ["acc"] })),
-                node("step", "T", vec![inp("item", "Number", true), inp("acc", "Number", true)], vec![("acc", "Number"), ("res", "Number")], vec!["lp"], serde_json::Value::Null, serde_json::Value::Null),
+                node("add", "T", vec![inp("item", "Number", true), inp("acc", "Number", true)], vec![("acc", "Number"), ("res", "Number")], vec!["lp"], serde_json::Value::Null, serde_json::Value::Null),
                 node("lonely", "T", vec![], vec![("out", "Number")], vec!["lp"], serde_json::Value::Null, serde_json::Value::Null),
                 node("lp__out", "LoopOut",
                     vec![inp("acc", "Number", false), inp("res", "Number", false), inp("done", "Boolean", false)],
@@ -2086,10 +2086,10 @@ mod tests {
             "edges": [
                 { "id": "e0", "source": "feed", "sourceHandle": "items", "target": "lp__in", "targetHandle": "items" },
                 { "id": "e1", "source": "feed", "sourceHandle": "seed", "target": "lp__in", "targetHandle": "acc" },
-                { "id": "e2", "source": "lp__in", "sourceHandle": "items", "target": "step", "targetHandle": "item" },
-                { "id": "e3", "source": "lp__in", "sourceHandle": "acc", "target": "step", "targetHandle": "acc" },
-                { "id": "e4", "source": "step", "sourceHandle": "acc", "target": "lp__out", "targetHandle": "acc" },
-                { "id": "e5", "source": "step", "sourceHandle": "res", "target": "lp__out", "targetHandle": "res" },
+                { "id": "e2", "source": "lp__in", "sourceHandle": "items", "target": "add", "targetHandle": "item" },
+                { "id": "e3", "source": "lp__in", "sourceHandle": "acc", "target": "add", "targetHandle": "acc" },
+                { "id": "e4", "source": "add", "sourceHandle": "acc", "target": "lp__out", "targetHandle": "acc" },
+                { "id": "e5", "source": "add", "sourceHandle": "res", "target": "lp__out", "targetHandle": "res" },
                 { "id": "e6", "source": "lp__out", "sourceHandle": "res", "target": "sink", "targetHandle": "res" },
                 { "id": "e7", "source": "lp__out", "sourceHandle": "acc", "target": "sink", "targetHandle": "acc" }
             ],
@@ -2149,16 +2149,16 @@ mod tests {
         let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses).unwrap();
         assert_eq!(launch.body_frames, vec![Frame::Loop { index: 1 }]);
         assert_eq!(launch.roots, vec!["lonely".to_string()]);
-        let step = pending_at(&pulses, "step");
-        let value = |port: &str| step.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
+        let add = pending_at(&pulses, "add");
+        let value = |port: &str| add.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
         assert_eq!(value("item"), Some(serde_json::json!(20)), "the over slice at the index");
         assert_eq!(value("acc"), Some(serde_json::json!(5)), "the current carry");
-        assert!(step.iter().all(|p| p.frames == launch.body_frames));
+        assert!(add.iter().all(|p| p.frames == launch.body_frames));
         assert_eq!(rt.get(&firing.key).unwrap().launched, vec![1]);
         // The same launch replayed puts nothing new on the wires.
-        let before = pulses["step"].len();
+        let before = pulses["add"].len();
         launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses).unwrap();
-        assert_eq!(pulses["step"].len(), before, "derived ids make a replay idempotent");
+        assert_eq!(pulses["add"].len(), before, "derived ids make a replay idempotent");
         assert!(launch_iteration(&mut rt, &firing.key, 7, None, &project, &program_idx, &mut pulses).is_err(), "past the list is drift, not null");
     }
 

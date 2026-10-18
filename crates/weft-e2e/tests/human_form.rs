@@ -48,7 +48,7 @@ async fn human_query_resumes_with_approval() -> anyhow::Result<()> {
 /// approve/reject field included), its outputs close, what reads them
 /// skips, and the run still completes.
 #[tokio::test]
-async fn a_skipped_question_skips_its_step_and_the_run_completes() -> anyhow::Result<()> {
+async fn a_skipped_question_skips_its_node_and_the_run_completes() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("human_form", disp.clone()).await?;
     let pid = project.id();

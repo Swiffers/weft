@@ -173,18 +173,55 @@ weft_database_before_runs() { # container
   if [[ "${found}" == "t" ]]; then echo yes; else echo no; fi
 }
 
-# Delete the database of the install whose Postgres container is
-# `container` and whose directory is `dir`: the container and its files
-# (`dir/postgres-data`, owned by Postgres's own user, so removed from a
-# container when a plain rm cannot). The install's config and keys stay,
-# and its next start builds a fresh database. Stop its runtime first.
-weft_wipe_database() { # container dir
-  docker rm -f "$1" >/dev/null 2>&1 || true
+# Delete the database of one install, and everything that only meant
+# something to it: its Postgres container and files (`dir/postgres-data`,
+# owned by Postgres's own user, so removed from a container when a plain
+# rm cannot), the workers and infra units of its projects with their
+# volumes (docker objects carrying the install's label), and its bucket on
+# the object store (every stored file and asset). The install's config,
+# keys and tunnel stay, and its next start builds a fresh database and
+# bucket. Stop its runtime first.
+# SYNC: what an install owns <-> crates/weft-cli/src/commands/daemon.rs (remove, delete_bucket)
+weft_wipe_database() { # postgres-container dir install-label bucket
+  local name role v
+  docker rm -f -v "$1" >/dev/null 2>&1 || true
+  while IFS=$'\t' read -r name role; do
+    case "${role}" in
+      worker|long|infra) docker rm -f -v "${name}" >/dev/null 2>&1 || return 1 ;;
+    esac
+  done < <(docker ps -a --filter "label=weft-install=$3" --format '{{.Names}}\t{{.Label "weft.role"}}')
+  for v in $(docker volume ls -q --filter "label=weft-install=$3"); do
+    docker volume rm -f "${v}" >/dev/null 2>&1 || return 1
+  done
+  weft_delete_bucket "$4" || return 1
   [[ -d "$2/postgres-data" ]] || return 0
   if ! rm -rf "$2/postgres-data" 2>/dev/null; then
     docker run --rm -v "$2:/d" alpine:3 sh -c 'rm -rf /d/postgres-data' >/dev/null 2>&1 || return 1
   fi
   [[ ! -d "$2/postgres-data" ]]
+}
+
+# Delete one bucket from the machine's object store, starting the store
+# if it is stopped. No store, or no such bucket, is nothing to do. The
+# store's shell exits 0 on errors, so the listing afterwards says whether
+# the bucket is gone.
+# SYNC: weft-object-store <-> crates/weft-cli/src/commands/daemon.rs (OBJECT_STORE_CONTAINER, delete_bucket)
+weft_delete_bucket() { # bucket
+  docker container inspect weft-object-store >/dev/null 2>&1 || return 0
+  if [[ "$(docker inspect -f '{{.State.Running}}' weft-object-store 2>/dev/null)" != "true" ]]; then
+    docker start weft-object-store >/dev/null 2>&1 || return 1
+  fi
+  local listing waited=0
+  until listing="$(docker exec weft-object-store sh -c 'echo s3.bucket.list | weed shell' 2>/dev/null)" && [[ "${listing}" == *">"* ]]; do
+    [[ ${waited} -ge 30 ]] && return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+  # The listing prints one bucket per line, its name first.
+  awk '{print $1}' <<<"${listing//>/ }" | grep -qx "$1" || return 0
+  docker exec weft-object-store sh -c "echo 's3.bucket.delete -name $1' | weed shell" >/dev/null 2>&1 || return 1
+  listing="$(docker exec weft-object-store sh -c 'echo s3.bucket.list | weed shell' 2>/dev/null)" || return 1
+  ! awk '{print $1}' <<<"${listing//>/ }" | grep -qx "$1"
 }
 
 # The named installs on this machine (branches' installs, test cells), comma separated,

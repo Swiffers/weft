@@ -2350,7 +2350,7 @@
         );
     }
 
-    /// The node may handle a wait given up like any outcome of its step,
+    /// The node may handle a wait given up like any outcome of its firing,
     /// and the run goes on.
     #[tokio::test]
     async fn a_node_handles_a_wait_given_up() {
@@ -2385,7 +2385,7 @@
 
     /// A wait given up earlier in the run does not make a later, unrelated
     /// failure a time limit: what the caller hears is decided by the error
-    /// of the step that failed the run.
+    /// of the node that failed the run.
     #[tokio::test]
     async fn a_failure_after_a_wait_given_up_and_handled_is_the_programs() {
         let catalog: Arc<dyn NodeCatalog> =
@@ -2407,7 +2407,7 @@
     }
 
     /// The hold clock runs only while the run is quiet: a run whose other
-    /// step keeps talking holds its wait past `holdSecs`, and the answer
+    /// node keeps talking holds its wait past `holdSecs`, and the answer
     /// that comes then is taken.
     #[tokio::test]
     async fn a_wait_holds_while_the_run_is_busy() {

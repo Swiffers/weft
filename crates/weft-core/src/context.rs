@@ -82,7 +82,7 @@ pub use crate::node::ERROR_PORT;
 
 /// The message a failed body hands to [`ERROR_PORT`] if it is caught,
 /// or `None` for a failure that is never caught. An outcome of the
-/// step (a [`WeftError::NodeFailed`], a [`WeftError::Runtime`], or a
+/// firing (a [`WeftError::NodeFailed`], a [`WeftError::Runtime`], or a
 /// wait it gave up, [`WeftError::WaitGaveUp`]) may be caught; a bad
 /// config, input or type, a suspension and a cancel
 /// never are: those are the program's own shape or the runtime's
@@ -866,7 +866,7 @@ impl RunContext {
     ///
     /// The stop is asynchronous: this call returns once the request is
     /// durably queued, and the runtime carries it out. A node that
-    /// needs the siblings gone before its next step has no such
+    /// needs the siblings gone before it goes on has no such
     /// guarantee and should not be written to depend on one.
     ///
     /// `tag` is normalized the way [`Self::tag_run`] normalizes,
@@ -2811,7 +2811,7 @@ mod caught_failure_tests {
     }
 
     /// Caught only with the flag on, `error` wired, and an outcome of
-    /// the step; every other combination stays a failure of the run.
+    /// the firing; every other combination stays a failure of the run.
     #[test]
     fn only_an_outcome_on_a_wired_catching_node_is_caught() {
         for (error, outcome) in every_kind() {

@@ -18,6 +18,8 @@ first time they need it, which is fine for something you touch once.
 
 A service name maps to a **list**, always, even with one entry. Keys starting
 with `_` are ignored, which is how the example file carries its own notes.
+Every key weft defines is camelCase (`tokenUrl`, `signingSecret`), while
+`client_id` and `client_secret` keep the spelling OAuth gave them.
 
 ```json
 {
@@ -48,11 +50,11 @@ keep the file private.
     "kind": "oauth_app",
     "label": "Slack",
     "covers": ["chat:write", "channels:read", "channels:history"],
-    "auth_url": "https://slack.com/oauth/v2/authorize",
-    "token_url": "https://slack.com/api/oauth.v2.access",
+    "authUrl": "https://slack.com/oauth/v2/authorize",
+    "tokenUrl": "https://slack.com/api/oauth.v2.access",
     "client_id": "...",
     "client_secret": "...",
-    "events": { "signing_secret": "..." }
+    "events": { "signingSecret": "..." }
   }]
 }
 ```
@@ -61,9 +63,9 @@ keep the file private.
 |---|---|
 | `label` | Unique within the service |
 | `covers` | Exactly the permissions this app asks for, by their ids from the service's catalogue |
-| `auth_url`, `token_url` | The provider addresses this app signs in against, copied from the recipe |
+| `authUrl`, `tokenUrl` | The provider addresses this app signs in against, copied from the recipe |
 | `client_id`, `client_secret` | From the provider. `client_secret` is absent for a public PKCE app |
-| `events` | Only if this app receives pushes. Whatever the recipe needs to verify them, like a signing secret |
+| `events` | Only if this app receives pushes. Whatever the recipe verifies them with: `signingSecret` (Slack), `publicKey` (Discord, SendGrid), or for a signed identity token, `audience` and `pushEmail` |
 
 **Permissions are fixed per app.** People pick an application rather than
 ticking boxes, which is why you can list several for one service: a cheap tier
@@ -100,8 +102,13 @@ node the operator thought was configured.
 - More than one `api_key` for a service
 - An OAuth app with no `covers`
 - A permission in `covers` that the service's catalogue does not have
-- An `events` block on a service with no webhook transport
-- Invalid JSON, or a file you configured that is not there
+- An `events` block on a service with no webhook transport, or a key in it
+  weft does not know
+- A key an older weft spelled snake_case (`auth_url`, `token_url`,
+  `events.signing_secret`, `events.public_key`, `events.push_email`,
+  `_setup_events`). The error names each one, where it sits and its spelling
+  now, so an old file tells you exactly what to rename
+- Invalid JSON
 
 ## Apps a node ships
 

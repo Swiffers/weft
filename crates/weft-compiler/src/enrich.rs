@@ -784,7 +784,7 @@ pub fn enrich_collecting(
 /// node, `@instance_filled` on a field); whatever sits downstream of one along the
 /// wires reads that instance's value, so it exists per instance as well: a
 /// trigger reading an instance's bridge address is armed once per instance,
-/// and a step reading an instance's connection runs in that instance's runs.
+/// and a node reading an instance's connection runs in that instance's runs.
 /// Group, loop and include boundaries are ordinary nodes after
 /// flattening, so the walk crosses them without knowing they exist. A
 /// node an include's body shares between call sites is one node, so one

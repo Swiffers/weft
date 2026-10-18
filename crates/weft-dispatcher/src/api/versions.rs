@@ -378,8 +378,8 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
 }
 
 /// Refuse a seed that would reuse an output naming a stored file the
-/// file has moved on from: a reused step's saved result says what the
-/// step made, and a file edited since (by a later step, by another run)
+/// file has moved on from: a reused node's saved result says what the
+/// node made, and a file edited since (by a later node, by another run)
 /// or gone no longer holds it. Every such output is named at once, so
 /// one refusal says everything to hand in or re-run.
 async fn refuse_moved_files(
@@ -399,8 +399,8 @@ async fn refuse_moved_files(
                 Err(e) => return Err(internal("read a reused output's file", e)),
             };
             let place = wire.place();
-            let step = weft_core::project::address_of(project, &place.id, &place.path);
-            refusals.extend(weft_core::seeding::moved_file_refusal(&step, &wire.port, &file, now));
+            let node = weft_core::project::address_of(project, &place.id, &place.path);
+            refusals.extend(weft_core::seeding::moved_file_refusal(&node, &wire.port, &file, now));
         }
     }
     if refusals.is_empty() {
@@ -581,7 +581,7 @@ pub async fn run(
     // An instance's run reaching a `@instance_filled` field runs on what that
     // instance provides there: read and checked now, refused naming every
     // field left unfilled or filled wrong, rather than failing at the
-    // step mid-run. The run carries what was read.
+    // node mid-run. The run carries what was read.
     let instance_values = match &spec.instance {
         Some(instance) => {
             crate::api::project::instance_values_for_run(&state, id, &project, &resolved.selection, instance, None).await?

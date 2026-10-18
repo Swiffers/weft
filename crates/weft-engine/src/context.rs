@@ -1413,14 +1413,14 @@ pub enum NodeTaskOutcome {
     /// its baked outputs (`weft_core::infra::bake`), read for a node that
     /// has any: each one the body emitted nothing on carries it.
     Completed { saved: std::collections::BTreeMap<String, serde_json::Value> },
-    /// The step failed. `message` is what the run's failure reads;
-    /// `catchable` is what the step's `error` output carries if the
+    /// The firing failed. `message` is what the run's failure reads;
+    /// `catchable` is what the node's `error` output carries if the
     /// failure is caught (`weft_core::context::catchable_message`),
-    /// `None` for a failure that never is. `gave_up_wait`: the step
+    /// `None` for a failure that never is. `gave_up_wait`: the firing
     /// failed on a wait it gave up (`WeftError::WaitGaveUp`), a time
     /// limit its run's caller hears as one.
     Failed { message: String, catchable: Option<String>, gave_up_wait: bool },
-    /// The step ended skipped, for `reason`: what it waited on was
+    /// The firing ended skipped, for `reason`: what it waited on was
     /// skipped by a person (`WeftError::WaitSkipped`). Every output it
     /// did not emit closes, as for any skip.
     Skipped(weft_core::run::skip::SkipReason),
@@ -1527,7 +1527,7 @@ pub struct RunnerHandle {
     baked_emitted: std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
     /// The infra nodes whose infra setup made a connection this firing
     /// opened (`ResolveConnectionResponse::published_by`): what a failure
-    /// of the step names the way out for.
+    /// of the firing names the way out for.
     infra_made: std::sync::Mutex<std::collections::BTreeSet<String>>,
     node_id: String,
     /// The PLACE this firing runs at, spelled the way a person writes
@@ -1936,7 +1936,7 @@ impl RunnerHandle {
         }
         let nodes: Vec<&str> = made.iter().map(String::as_str).collect();
         format!(
-            "{failure}\n(this step used a connection the infra of {} made; if its values changed where weft could not see, \
+            "{failure}\n(this node used a connection the infra of {} made; if its values changed where weft could not see, \
              such as a password reset whose report never arrived, `weft infra rebake {}` makes it again)",
             nodes.join(", "),
             nodes[0],

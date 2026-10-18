@@ -196,8 +196,8 @@ mod tests {
     #[test]
     fn one_entry_per_frame_stack_and_the_iteration_in_the_text() {
         let p = project(
-            vec![node("src", &[]), node("step", &["a", "b"])],
-            &[("src", "step", "a"), ("src", "step", "b")],
+            vec![node("src", &[]), node("join", &["a", "b"])],
+            &[("src", "join", "a"), ("src", "join", "b")],
         );
         let idx = ProgramIndex::build(&p);
         let run_id = uuid::Uuid::new_v4();
@@ -205,18 +205,18 @@ mod tests {
         let f5 = vec![Frame::Loop { index: 5 }];
         let mut pulses = PulseTable::new();
         pulses.insert(
-            "step".into(),
+            "join".into(),
             vec![
-                pulse(run_id, f2.clone(), "step", "a"),
-                pulse(run_id, f5.clone(), "step", "a"),
-                pulse(run_id, f5.clone(), "step", "b"),
+                pulse(run_id, f2.clone(), "join", "a"),
+                pulse(run_id, f5.clone(), "join", "a"),
+                pulse(run_id, f5.clone(), "join", "b"),
             ],
         );
         let report = stuck_report(&p, &idx, &pulses);
         assert_eq!(report.firings.len(), 2);
         let text = report.to_string();
-        assert!(text.contains("step#2 has a, still waiting on b"), "{text}");
-        assert!(text.contains("step#5 has a, b, every wired input arrived"), "{text}");
+        assert!(text.contains("join#2 has a, still waiting on b"), "{text}");
+        assert!(text.contains("join#5 has a, b, every wired input arrived"), "{text}");
         assert!(text.starts_with("run stuck: 2 firings hold pulses"), "{text}");
     }
 

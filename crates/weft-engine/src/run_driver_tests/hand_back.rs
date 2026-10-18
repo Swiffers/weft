@@ -1,5 +1,5 @@
     //! Layer 3: a run asked to let go of its worker (`hand_back`) starts
-    //! no new step, lets the running ones end, and ends `HandedBack` with
+    //! no new node, lets the running ones end, and ends `HandedBack` with
     //! its whole record written, which the next drive carries on from.
 
     use super::*;
@@ -92,7 +92,7 @@
     }
 
     weft_core::stress_test! {
-        name: a_run_handed_back_ends_its_running_step_starts_no_other_and_carries_on_from_its_record,
+        name: a_run_handed_back_ends_its_running_node_starts_no_other_and_carries_on_from_its_record,
         runs: 20,
         worker_threads: 4,
         async fn body() {
@@ -129,8 +129,8 @@
             let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), drive).await.expect("the drive hung").unwrap().unwrap();
             assert!(matches!(outcome, RunOutcome::HandedBack), "{outcome:?}");
             let events = journal.events_of(run_id);
-            assert!(events.iter().any(|e| matches!(e, RunEvent::NodeCompleted { node_id, .. } if node_id == "gate")), "the running step ended on record");
-            assert!(!started(&events, "sink"), "no step started once asked to let go");
+            assert!(events.iter().any(|e| matches!(e, RunEvent::NodeCompleted { node_id, .. } if node_id == "gate")), "the running node ended on record");
+            assert!(!started(&events, "sink"), "no node started once asked to let go");
             assert!(!events.iter().any(RunEvent::is_run_terminal), "a run handed back has not ended");
 
             // The next worker carries it on from that record: the sink runs,
@@ -148,14 +148,14 @@
             let events = journal.events_of(run_id);
             assert!(started(&events, "sink"));
             let gate_starts = events.iter().filter(|e| matches!(e, RunEvent::NodeStarted { node_id, .. } if node_id == "gate")).count();
-            assert_eq!(gate_starts, 1, "the step that ended before the hand-back is not run again");
+            assert_eq!(gate_starts, 1, "the node that ended before the hand-back is not run again");
         }
     }
 
     /// A run with nothing left to start when it is asked to let go ends
     /// the way it ended: nothing is handed back.
     #[tokio::test]
-    async fn a_run_that_finishes_its_last_step_while_letting_go_completes() {
+    async fn a_run_that_finishes_its_last_node_while_letting_go_completes() {
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [{
@@ -192,11 +192,11 @@
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
     }
 
-    /// A step still running when the hand-back is overdue is stopped where
-    /// it is, the run is handed back, and the next worker fails that step
+    /// A node still running when the hand-back is overdue is stopped where
+    /// it is, the run is handed back, and the next worker fails its firing
     /// as cut short rather than running it again.
     #[tokio::test]
-    async fn a_step_still_running_when_the_hand_back_is_overdue_is_failed_by_the_next_worker() {
+    async fn a_node_still_running_when_the_hand_back_is_overdue_is_failed_by_the_next_worker() {
         let project = project();
         let run_id = weft_core::new_run_id();
         let birth = birth(&project, run_id);
@@ -241,9 +241,9 @@
         // A fast run lets go of its record once its ending is handed over.
         next_clients.writer.written().await;
         let events = journal.events_of(run_id);
-        assert!(events.iter().any(|e| matches!(e, RunEvent::NodeFailed { node_id, .. } if node_id == "gate")), "the cut step is failed");
+        assert!(events.iter().any(|e| matches!(e, RunEvent::NodeFailed { node_id, .. } if node_id == "gate")), "the cut node is failed");
         let gate_starts = events.iter().filter(|e| matches!(e, RunEvent::NodeStarted { node_id, .. } if node_id == "gate")).count();
-        assert_eq!(gate_starts, 1, "a step cut short is not run again");
+        assert_eq!(gate_starts, 1, "a node cut short is not run again");
     }
 
     /// A run asked to leave that cannot be suspended carries on as if

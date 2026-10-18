@@ -478,7 +478,7 @@ pub struct RunFlags {
     /// Which instance the run is in (`--instance`).
     pub instance: Option<weft_core::instance::InstanceId>,
     pub clear: Vec<String>,
-    /// Write each step before the next (`--durable`).
+    /// Write what the run did down before each node starts (`--durable`).
     pub durable: bool,
     /// Never wait for the record except to pause (`--fast`), over a
     /// durable trigger.

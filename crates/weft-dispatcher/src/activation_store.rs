@@ -94,7 +94,7 @@ pub struct ValuesStore<'a> {
     pub tenant: &'a str,
     pub instance: &'a InstanceId,
     pub writes: &'a [weft_access_store::InstanceValueWrite],
-    /// The `(step, field)` pairs the change forgets.
+    /// The `(node, field)` pairs the change forgets.
     pub cleared: &'a [(String, String)],
 }
 

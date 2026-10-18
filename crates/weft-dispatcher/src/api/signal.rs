@@ -101,7 +101,7 @@ pub async fn fire_signal(
 }
 
 /// `POST /signal/{token}/skip`. A person declines what a waiting run
-/// asked: the waiting step ends skipped, every output of it closed, and
+/// asked: the waiting node ends skipped, every output of it closed, and
 /// what reads them skips in turn. Sibling firings of the same run
 /// keep going. Only a waiting run's question can be skipped; an entry
 /// has nothing to decline. The answer is weft's own

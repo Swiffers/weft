@@ -486,10 +486,10 @@ pub(crate) mod tests {
                     { "id": "trig", "nodeType": "Trig", "position": { "x": 0.0, "y": 0.0 },
                       "outputs": [{ "name": "value", "portType": "String", "required": false }],
                       "features": { "isTrigger": true } },
-                    { "id": "a", "nodeType": "Step", "position": { "x": 1.0, "y": 0.0 },
+                    { "id": "a", "nodeType": "Pass", "position": { "x": 1.0, "y": 0.0 },
                       "inputs": [{ "name": "value", "portType": "String", "required": true }],
                       "outputs": [{ "name": "value", "portType": "String", "required": false }] },
-                    { "id": "b", "nodeType": "Step", "position": { "x": 2.0, "y": 0.0 },
+                    { "id": "b", "nodeType": "Pass", "position": { "x": 2.0, "y": 0.0 },
                       "inputs": [{ "name": "value", "portType": "String", "required": true }],
                       "outputs": [{ "name": "value", "portType": "String", "required": false }] }
                 ],
@@ -599,8 +599,8 @@ pub(crate) mod tests {
         assert!(matches!(plan.start, Err(Unready::Refused(_))));
     }
 
-    /// A run that reaches a step per instance is planned for the instance
-    /// its call names: with none it is refused, naming the step, and with
+    /// A run that reaches a node per instance is planned for the instance
+    /// its call names: with none it is refused, naming the node, and with
     /// one its plan (and the birth of its runs) is for that instance.
     #[test]
     fn a_plan_is_for_the_instance_its_call_names() {

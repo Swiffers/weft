@@ -37,8 +37,8 @@ pub async fn start(project: &mut Project) -> Result<Uuid> {
     start_with(project, &[]).await
 }
 
-/// [`start`], as a DURABLE run (`weft run --durable`): each step is on
-/// record before the next starts, so another worker carries it on.
+/// [`start`], as a DURABLE run (`weft run --durable`): what the run did is
+/// on record before each node starts, so another worker carries it on.
 pub async fn start_durable(project: &mut Project) -> Result<Uuid> {
     start_with(project, &["--durable"]).await
 }
@@ -237,9 +237,9 @@ pub async fn wait_for_status(disp: &Dispatcher, run_id: Uuid, status: &str) -> R
 }
 
 /// Poll until every one of `nodes` has started in `run_id`: the
-/// moment a test that acts on a step mid-body (killing its worker, say)
+/// moment a test that acts on a node mid-body (killing its worker, say)
 /// waits for. Bails as soon as the run settles first, since then the
-/// steps can no longer be caught running.
+/// nodes can no longer be caught running.
 pub async fn wait_for_nodes_started(disp: &Dispatcher, run_id: Uuid, nodes: &[&str]) -> Result<()> {
     let path = format!("/runs/{run_id}/replay");
     poll_until(

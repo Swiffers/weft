@@ -340,7 +340,7 @@ pub struct LiveCallerConnection {
 ///
 /// A reader waits through the shared wait protocol
 /// (`weft_core::liveness::wait_on`), the log being its source: its
-/// generation moves on each message and on the close, so a run whose steps
+/// generation moves on each message and on the close, so a run whose running nodes
 /// all wait on the caller reads as waiting on the outside, never stuck
 /// (`crate::run_driver`).
 pub(crate) struct InboundLog {
@@ -493,7 +493,7 @@ impl ConnInner {
 }
 
 impl LiveCallerConnection {
-    /// Whether, with the caller still connected, a step of the run whose
+    /// Whether, with the caller still connected, a node of the run whose
     /// waits `waits` holds waits on the caller's next message: the outside
     /// can move the run, so it is not stuck.
     pub(crate) fn waited_on(&self, waits: &crate::wait_tracker::WaitTracker) -> bool {
@@ -1311,7 +1311,7 @@ fn exchange_ended(conn: &LiveCallerConnection, outbound: &OutboundQueue, cancell
 /// on to a task of its own once the answer leaves with work left
 /// ([`Self::carry_on`]); dropped with the call before that (the caller
 /// went away), it ends the exchange as the caller's and still goes on to
-/// its end on a task of its own, so a run never stops mid-step because
+/// its end on a task of its own, so a run never stops mid-firing because
 /// its caller left.
 struct RunHere {
     run: Option<futures::future::BoxFuture<'static, ()>>,

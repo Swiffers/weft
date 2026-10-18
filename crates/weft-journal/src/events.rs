@@ -250,7 +250,7 @@ pub enum RunEvent {
         ///   entry for `token`.
         /// - `None`: a group boundary the worker was firing when it
         ///   went away, re-fired by the next worker (its state is all
-        ///   journaled, so the re-fire is safe; a STEP a dead worker
+        ///   journaled, so the re-fire is safe; a NODE a dead worker
         ///   left running is failed, never re-run). No suspension
         ///   token to clear.
         /// Either way the fold absorbs every pulse pending at the
@@ -464,7 +464,7 @@ pub enum RunEvent {
     },
 
     /// A person skipped the wait `token` (its `/skip` door): the waiting
-    /// `ctx` call ends its step skipped, and a replay of its body ends the
+    /// `ctx` call ends its node's firing skipped, and a replay of its body ends the
     /// same call the same way. The wait's other ending, an answer, is
     /// `SuspensionResolved`; the first one on record stands.
     SuspensionSkipped {

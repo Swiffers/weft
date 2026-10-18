@@ -43,7 +43,7 @@ import type {
 export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
 
 /** How a wait ended: its answer, a person skipping it, or the run giving
- *  it up (the waiting step failed with `error`). */
+ *  it up (the waiting node failed with `error`). */
 // SYNC: AwaitEnd <-> crates/weft-core/src/primitive.rs AwaitEnd
 export type AwaitEnd = { type: 'answered'; value: unknown } | { type: 'skipped' } | { type: 'gave_up'; error: string };
 

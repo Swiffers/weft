@@ -1940,7 +1940,7 @@ mod tests {
     }
 
     /// `gen.rows` streams into loop `lp` over its `rows` port; the body
-    /// `step` reads `item` and writes `res`.
+    /// `add` reads `item` and writes `res`.
     fn stream_loop_project() -> Arc<ProjectDefinition> {
         project(
             vec![
@@ -1954,7 +1954,7 @@ mod tests {
                     json!({ "groupId": "lp", "role": "In" }),
                     json!({ "parallel": false, "over": ["rows"], "carry": [] }),
                 ),
-                node("step", "T", &[("item", "Number", true)], &[("res", "Number")], &["lp"], Value::Null, Value::Null),
+                node("add", "T", &[("item", "Number", true)], &[("res", "Number")], &["lp"], Value::Null, Value::Null),
                 node(
                     "lp__out",
                     "LoopOut",
@@ -1968,8 +1968,8 @@ mod tests {
             ],
             vec![
                 edge("gen", "rows", "lp__in", "rows"),
-                edge("lp__in", "rows", "step", "item"),
-                edge("step", "res", "lp__out", "res"),
+                edge("lp__in", "rows", "add", "item"),
+                edge("add", "res", "lp__out", "res"),
                 edge("lp__out", "res", "sink", "res"),
             ],
         )
@@ -2007,9 +2007,9 @@ mod tests {
         ];
         let snap = fold_to_snapshot(run_id(), stream_loop_project(), &events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        let step = pending(&snap, "step");
-        assert_eq!(step.len(), 1, "the item (the implicit index has no wire here): {step:?}");
-        let item = step.iter().find(|p| p.target_port == "item").expect("the item reached the body");
+        let add = pending(&snap, "add");
+        assert_eq!(add.len(), 1, "the item (the implicit index has no wire here): {add:?}");
+        let item = add.iter().find(|p| p.target_port == "item").expect("the item reached the body");
         assert_eq!(*item.value, json!(7));
         assert_eq!(item.frames, vec![frame(0)]);
         let loop_in: Vec<Uuid> = snap.pulses["lp__in"].iter().map(|p| p.id).collect();
@@ -2316,7 +2316,7 @@ mod tests {
     }
 
     /// `items` feeds loop `lp` over `items` with carry `acc`; the body
-    /// `step` reads `item` and `acc` and writes `acc` and `res`.
+    /// `add` reads `item` and `acc` and writes `acc` and `res`.
     fn loop_project(parallel: bool) -> Arc<ProjectDefinition> {
         project(
             vec![
@@ -2330,7 +2330,7 @@ mod tests {
                     json!({ "groupId": "lp", "role": "In" }),
                     json!({ "parallel": parallel, "over": ["items"], "carry": ["acc"] }),
                 ),
-                node("step", "T", &[("item", "Number", true), ("acc", "Number", true)], &[("acc", "Number"), ("res", "Number")], &["lp"], Value::Null, Value::Null),
+                node("add", "T", &[("item", "Number", true), ("acc", "Number", true)], &[("acc", "Number"), ("res", "Number")], &["lp"], Value::Null, Value::Null),
                 node(
                     "lp__out",
                     "LoopOut",
@@ -2345,10 +2345,10 @@ mod tests {
             vec![
                 edge("feed", "items", "lp__in", "items"),
                 edge("feed", "seed", "lp__in", "acc"),
-                edge("lp__in", "items", "step", "item"),
-                edge("lp__in", "acc", "step", "acc"),
-                edge("step", "acc", "lp__out", "acc"),
-                edge("step", "res", "lp__out", "res"),
+                edge("lp__in", "items", "add", "item"),
+                edge("lp__in", "acc", "add", "acc"),
+                edge("add", "acc", "lp__out", "acc"),
+                edge("add", "res", "lp__out", "res"),
                 edge("lp__out", "res", "sink", "res"),
                 edge("lp__out", "acc", "sink", "acc"),
             ],
@@ -2422,7 +2422,7 @@ mod tests {
         assert!(snap.pulses["lp__in"].iter().any(|p| p.id == items), "the named pulse stays in the LoopIn's bucket");
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
         assert!(inst.launched.is_empty(), "no iteration was recorded: {:?}", inst.launched);
-        assert!(pending(&snap, "step").is_empty(), "no body pulse was put on a wire");
+        assert!(pending(&snap, "add").is_empty(), "no body pulse was put on a wire");
     }
 
     /// A loop resumed between instantiation and its first LoopOut
@@ -2439,11 +2439,11 @@ mod tests {
         assert_eq!(*inst.carry_values["acc"], json!(1));
         assert_eq!(*inst.outer_input["items"], json!([10, 20, 30]));
         assert!(!inst.outer_input.contains_key("_should_flow"));
-        let step = pending(&snap, "step");
-        let by_port = |port: &str| step.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
+        let add = pending(&snap, "add");
+        let by_port = |port: &str| add.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
         assert_eq!(by_port("item"), Some(json!(10)));
         assert_eq!(by_port("acc"), Some(json!(1)));
-        assert!(step.iter().all(|p| p.frames == vec![frame(0)]));
+        assert!(add.iter().all(|p| p.frames == vec![frame(0)]));
     }
 
     /// LoopOut's writes come off its own firing's pulses; the next
@@ -2454,10 +2454,10 @@ mod tests {
         let mut events = loop_prefix();
         let body = |i: u32, acc: i64, res: i64| {
             vec![
-                started("step", vec![frame(i)], 2),
-                emitted(Uuid::new_v4(), "step", vec![frame(i)], "acc", json!(acc)),
-                emitted(Uuid::new_v4(), "step", vec![frame(i)], "res", json!(res)),
-                completed("step", vec![frame(i)], 2),
+                started("add", vec![frame(i)], 2),
+                emitted(Uuid::new_v4(), "add", vec![frame(i)], "acc", json!(acc)),
+                emitted(Uuid::new_v4(), "add", vec![frame(i)], "res", json!(res)),
+                completed("add", vec![frame(i)], 2),
                 started("lp__out", vec![frame(i)], 3),
                 loop_row_out_fired(i),
                 completed("lp__out", vec![frame(i)], 3),
@@ -2470,9 +2470,9 @@ mod tests {
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
         assert_eq!(inst.out_fired, vec![0]);
         assert_eq!(*inst.carry_values["acc"], json!(11));
-        let step1: Vec<_> = pending(&snap, "step").into_iter().filter(|p| p.frames == vec![frame(1)]).collect();
-        assert_eq!(*step1.iter().find(|p| p.target_port == "acc").unwrap().value, json!(11), "iteration 1 carries the write");
-        assert_eq!(*step1.iter().find(|p| p.target_port == "item").unwrap().value, json!(20));
+        let add1: Vec<_> = pending(&snap, "add").into_iter().filter(|p| p.frames == vec![frame(1)]).collect();
+        assert_eq!(*add1.iter().find(|p| p.target_port == "acc").unwrap().value, json!(11), "iteration 1 carries the write");
+        assert_eq!(*add1.iter().find(|p| p.target_port == "item").unwrap().value, json!(20));
 
         events.extend(body(1, 22, 200));
         events.push(loop_row_launched(2));
@@ -2493,13 +2493,13 @@ mod tests {
         assert_eq!(by_port("res"), Some(json!([100, 200, 300])));
         assert_eq!(by_port("acc"), Some(json!(33)));
         let mut definition = loop_project(false).as_ref().clone();
-        definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["step"]})).unwrap());
+        definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["add"]})).unwrap());
         let eligible = weft_core::seeding::inheritable_nodes(&definition, &snap);
-        assert!(["lp__in", "step", "lp__out"].iter().all(|node| eligible.contains(&Located::top(*node))));
+        assert!(["lp__in", "add", "lp__out"].iter().all(|node| eligible.contains(&Located::top(*node))));
         let mut missing_iteration = snap.clone();
-        missing_iteration.firings.get_mut("step").unwrap().retain(|record| record.frames != vec![frame(1)]);
+        missing_iteration.firings.get_mut("add").unwrap().retain(|record| record.frames != vec![frame(1)]);
         let eligible = weft_core::seeding::inheritable_nodes(&definition, &missing_iteration);
-        assert!(["lp__in", "step", "lp__out"].iter().all(|node| !eligible.contains(&Located::top(*node))), "one missing iteration invalidates the whole loop");
+        assert!(["lp__in", "add", "lp__out"].iter().all(|node| !eligible.contains(&Located::top(*node))), "one missing iteration invalidates the whole loop");
         // Replaying the terminal row puts nothing on the wires twice.
         events.push(events.last().unwrap().clone());
         let again = fold_to_snapshot(run_id(), loop_project(false), &events);
@@ -2509,7 +2509,7 @@ mod tests {
     #[test]
     fn a_zero_iteration_loop_reuses_its_empty_result_without_inventing_body_firings() {
         let mut definition = loop_project(false).as_ref().clone();
-        definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["step"]})).unwrap());
+        definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["add"]})).unwrap());
         let project = Arc::new(definition);
         let mut source = Fold::new(run_id(), project.clone()).with_output_history();
         for row in [
@@ -2519,7 +2519,7 @@ mod tests {
             started("lp__in", vec![], 1), loop_row_instantiated(), completed("lp__in", vec![], 1),
             RunEvent::LoopTerminated { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::OverExhausted, at_unix: 2 },
         ] { assert!(!source.apply(&row).rejected()); }
-        let members = BTreeSet::from([Located::top("lp__in"), Located::top("step"), Located::top("lp__out")]);
+        let members = BTreeSet::from([Located::top("lp__in"), Located::top("add"), Located::top("lp__out")]);
         let eligible = weft_core::seeding::inheritable_nodes(&project, source.snapshot());
         assert!(members.iter().all(|node| eligible.contains(node)));
         let mut selection = weft_core::project::selection::RunSelection::carve(&project,
@@ -2530,7 +2530,7 @@ mod tests {
         let mut child = Fold::new(Uuid::new_v4(), project);
         child.apply(&birth);
         child.inherit(&source, &members).unwrap();
-        assert!(!child.snapshot().firings.contains_key("step"));
+        assert!(!child.snapshot().firings.contains_key("add"));
         assert!(!child.snapshot().firings.contains_key("lp__out"));
         let result = pending(child.snapshot(), "sink").into_iter().find(|pulse| pulse.target_port == "res").unwrap();
         assert_eq!(result.value.as_ref(), &json!([]));
@@ -2593,9 +2593,9 @@ mod tests {
         events.insert(events.len() - 1, loop_row_launched(1));
         events.insert(events.len() - 1, loop_row_launched(2));
         events.extend(vec![
-            started("step", vec![frame(2)], 2),
-            emitted(Uuid::new_v4(), "step", vec![frame(2)], "res", json!(300)),
-            completed("step", vec![frame(2)], 2),
+            started("add", vec![frame(2)], 2),
+            emitted(Uuid::new_v4(), "add", vec![frame(2)], "res", json!(300)),
+            completed("add", vec![frame(2)], 2),
             started("lp__out", vec![frame(2)], 3),
             loop_row_out_fired(2),
             completed("lp__out", vec![frame(2)], 3),
@@ -2605,7 +2605,7 @@ mod tests {
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
         assert_eq!(inst.launched, vec![0, 1, 2]);
         assert_eq!(inst.out_fired, vec![2]);
-        let lanes: HashSet<u32> = pending(&snap, "step").iter().map(|p| p.frames[0].loop_index().expect("a loop frame")).collect();
+        let lanes: HashSet<u32> = pending(&snap, "add").iter().map(|p| p.frames[0].loop_index().expect("a loop frame")).collect();
         assert_eq!(lanes, [0, 1].into_iter().collect(), "lanes 0 and 1 still wait; lane 2 absorbed");
         // A closed write records as Closed, a null slot in the list.
         assert_eq!(inst.gather_lists["res"][&2], weft_core::run::loop_runtime::LoopWrite::Value(Arc::new(json!(300))));
@@ -2892,8 +2892,8 @@ mod tests {
         };
         let events = vec![
             // A resume, and a suspension, of a firing that never opened.
-            RunEvent::NodeResumed { run_id: run_id(), node_id: "step".into(), frames: vec![], token: None, at_unix: 0 },
-            RunEvent::NodeSuspended { run_id: run_id(), node_id: "step".into(), frames: vec![], token: "t".into(), at_unix: 0 },
+            RunEvent::NodeResumed { run_id: run_id(), node_id: "add".into(), frames: vec![], token: None, at_unix: 0 },
+            RunEvent::NodeSuspended { run_id: run_id(), node_id: "add".into(), frames: vec![], token: "t".into(), at_unix: 0 },
             started("feed", vec![], 0),
             // A second start over a firing still open.
             started("feed", vec![], 0),
@@ -2998,10 +2998,10 @@ mod tests {
     fn a_loop_out_row_votes_once_its_writes_landed() {
         let mut events = loop_prefix();
         events.extend(vec![
-            started("step", vec![frame(0)], 2),
-            emitted(Uuid::new_v4(), "step", vec![frame(0)], "acc", json!(11)),
-            emitted(Uuid::new_v4(), "step", vec![frame(0)], "res", json!(100)),
-            completed("step", vec![frame(0)], 2),
+            started("add", vec![frame(0)], 2),
+            emitted(Uuid::new_v4(), "add", vec![frame(0)], "acc", json!(11)),
+            emitted(Uuid::new_v4(), "add", vec![frame(0)], "res", json!(100)),
+            completed("add", vec![frame(0)], 2),
             started("lp__out", vec![frame(0)], 3),
         ]);
         let mut fold = Fold::new(run_id(), loop_project(false));

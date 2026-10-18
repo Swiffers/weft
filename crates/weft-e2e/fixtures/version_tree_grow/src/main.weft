@@ -45,11 +45,11 @@ echoes = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   parallel: false
   over: ["values"]
 
-  step = ExecPython(n: Number) -> (out: Number) {
+  double = ExecPython(n: Number) -> (out: Number) {
     code: "return {'out': n * 2}"
   }
-  step.n = self.values
-  self.results = step.out
+  double.n = self.values
+  self.results = double.out
 }
 echoes.values = nums.items
 

@@ -259,7 +259,7 @@ function checkRunSpec(value: unknown): RunSpec {
 
 /** How one wait ended, as a frozen example holds it: the value the person
  *  gave as `payload` (`null` included), `skipped: true` for a person
- *  skipping it, or `gaveUp` with the error the waiting step failed with
+ *  skipping it, or `gaveUp` with the error the waiting node failed with
  *  when the run gave the wait up. Exactly one of the three. */
 // SYNC: Answer <-> crates/weft-core/src/run_spec.rs Answer
 export type Answer = {

@@ -859,7 +859,7 @@ pub enum Leaving {
 ///
 /// **Waiting for it.** [`Self::flush`] answers once everything handed so
 /// far is on record. Only the commit points ask: a durable run before a
-/// step that reaches outside starts and before an answer leaves, any run
+/// node that reaches outside starts and before an answer leaves, any run
 /// before it pauses ([`Self::leave`]), and any run before a broker call
 /// that names it ([`WorkerJournal::record_first`]). A fast run that ends
 /// does not wait: it hands its ending over and lets go, and its record
@@ -1101,9 +1101,9 @@ mod tests {
             let mut tasks = Vec::new();
             for (run, drive) in runs.clone() {
                 tasks.push(tokio::spawn(async move {
-                    for step in 0..25 {
-                        drive.record_event(&started(run, &step.to_string()), Some("w")).await.unwrap();
-                        if step % 7 == 0 {
+                    for node in 0..25 {
+                        drive.record_event(&started(run, &node.to_string()), Some("w")).await.unwrap();
+                        if node % 7 == 0 {
                             drive.flush().await.unwrap();
                         }
                     }
@@ -1113,7 +1113,7 @@ mod tests {
                 task.await.unwrap();
             }
             writer.written().await;
-            let want: Vec<String> = (0..25).map(|step| step.to_string()).collect();
+            let want: Vec<String> = (0..25).map(|node| node.to_string()).collect();
             for (run, _) in &runs {
                 assert_eq!(record.log(*run), want);
             }

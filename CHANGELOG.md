@@ -11,7 +11,8 @@ files need renaming.**
 
 When you run `./setup.sh`, it finds that your install's database was built
 before this release and asks before wiping it. Your run history, versions
-and stored connections go, so connect your services again afterwards. Your
+and stored connections go, with the install's stored files and its
+projects' running infra, so connect your services again afterwards. Your
 project folders stay, and `weft run` registers them again. Other installs
 on the machine are not touched until you run `./setup.sh` in their
 checkout. If there is no terminal to ask on, run `./setup.sh --yes`.
@@ -30,6 +31,13 @@ What to rename in your own projects:
 - A loop's settings are `maxIters` and `trimOnMismatch`.
 - A saved `examples/<name>.json` that uses an old spelling (`frozen_from`,
   `gave_up`, `keep_for`) is refused, and the error names each new spelling.
+- In `access-apps.json` (on a cloud install, the `WEFT_ACCESS_APPS` secret),
+  `auth_url` is `authUrl`, `token_url` is `tokenUrl`, and under `events`,
+  `signing_secret` is `signingSecret`, `public_key` is `publicKey` and
+  `push_email` is `pushEmail`; the `_setup_events` note is `_setupEvents`.
+  `client_id` and `client_secret` keep OAuth's spelling. Until the file is
+  renamed, its shared connections stop working, and the error names each old
+  key, where it is, and its new spelling.
 - If a script reads weft's JSON (`--json`, the API), the fields are
   camelCase now: `runId`, not `execution_id`. Values from a fixed list stay
   snake_case (`waiting_for_input`).
@@ -374,7 +382,7 @@ reads every error shape those four read.
 **On Google Cloud, a run waiting on a person lets the database sleep.**
 
 A run that cannot pause (a route still answering its caller, a trigger with
-`recorded: false`, a live stream between steps) keeps its question in its
+`recorded: false`, a live stream between nodes) keeps its question in its
 worker while it waits. Until now that kept the database awake for the whole
 wait. Now nothing touches the database until the answer or a cancel arrives:
 the answer reaches the worker through a news topic weft creates in your
@@ -405,18 +413,18 @@ headers".
 
 **A program built before this version needs one rebuild.**
 
-How a waiting step receives its answer changed, so a worker built before this
-version fails when a waiting step gets its answer. Resync each program once:
+How a waiting node receives its answer changed, so a worker built before this
+version fails when a waiting node gets its answer. Resync each program once:
 `weft resync` if its triggers are on, `weft build` otherwise. Either one
 builds the worker again on this version of weft and moves the program to it.
 
-**Skipping a question ends the step that asked it.**
+**Skipping a question ends the node that asked it.**
 
 When a person skips a waiting question (Skip in the browser extension, or
-`POST /signal/{token}/skip`), the step that asked now ends skipped: its
-outputs close and the steps reading them skip too. It used to answer the
+`POST /signal/{token}/skip`), the node that asked now ends skipped: its
+outputs close and the nodes reading them skip too. It used to answer the
 question with null, so if your program reads a null answer as "skipped", it
-now sees the step skipped instead. Skipping a trigger is refused with a `409`;
+now sees the node skipped instead. Skipping a trigger is refused with a `409`;
 it used to fire the trigger.
 
 **A Google connection can hold Gmail alone.**
@@ -547,13 +555,13 @@ or `WEFT_POSTGRES_PORT`). Weft saves the ports it runs on in
 the CLI and the VS Code extension find it there.
 `WEFT_SEAWEED_PORT` moves the object store, and is read on every run.
 
-**A step the worker was running is never run again by itself.**
+**A node the worker was running is never run again by itself.**
 
-If a worker went away while a step was running, the next worker used to run
-that step again from the top, so an email, a post or a paid call could happen
-twice. Now it fails the step instead, saying the worker went away and the step
-was not run again. Check what the step did, then re-run from there with
-`weft run --seed`, which reuses every step that completed. A step that was
+If a worker went away while a node was running, the next worker used to run
+that node again from the top, so an email, a post or a paid call could happen
+twice. Now it fails the node instead, saying the worker went away and the node
+was not run again. Check what the node did, then re-run from there with
+`weft run --seed`, which reuses every node that completed. A node that was
 waiting on an answer still carries on when the answer comes, as before.
 
 **Nodes that catch their failures say so with `catchErrors`.**
@@ -572,13 +580,13 @@ have a `history` input or output. If a program wires `history`, wire
 `historyFile` instead: each call adds its turn to that one file and passes the
 same file on. If a call gets no file and its `historyFile` output is wired, it
 starts a new one. The graph shows each change to the file under "Files
-edited" on the step that made it.
+edited" on the node that made it.
 
 **A node changes a stored file with `edit`.**
 
 `ctx.storage(scope).edit(&file, |old| ...)` changes a file in place without
 losing another write's change. `replace` still overwrites.
 `replace_stream` is gone. Every stored file value now carries a `version`. A
-seeded run that would reuse a step whose file was edited since is refused,
-naming the step, the port and the file, and offering `--emit` or
+seeded run that would reuse a node whose file was edited since is refused,
+naming the node, the port and the file, and offering `--emit` or
 `--seed-before`.

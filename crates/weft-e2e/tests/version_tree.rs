@@ -361,7 +361,7 @@ async fn a_fired_trigger_uses_baked_inputs_and_emit_bypasses_its_body() -> anyho
 
     // Standing in for it: the declared value reaches what the trigger
     // feeds, and the trigger itself never runs. This is the way past a
-    // step whose act you do not want performed at all.
+    // node whose act you do not want performed at all.
     let stdout = project
         .weft(&["run", "--json", "--emit", "wired={\"scheduledTime\":\"2026-03-03T00:00:00Z\"}"])
         .await?;

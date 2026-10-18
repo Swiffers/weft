@@ -1,7 +1,7 @@
 //! A route that does not record its runs (`recorded: false`): a page
 //! polling it answers every time and leaves nothing in the runs
 //! listing, and a call that fails leaves its failure on record, so it
-//! lists with the step that failed and why.
+//! lists with the node that failed and why.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;

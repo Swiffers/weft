@@ -121,7 +121,7 @@
 
     type Applied = (PulseTable, NodeFiringTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>, Vec<FiringLocation>);
 
-    /// The tables `apply_snapshot` leaves, and the steps it hands back
+    /// The tables `apply_snapshot` leaves, and the firings it hands back
     /// to be failed.
     fn apply_with_crashed(events: &[RunEvent]) -> Applied {
         let project = await_project();
@@ -136,12 +136,12 @@
         let crashed = apply_snapshot(
             &program, snap, &mut pulses, &mut firings, &mut kicked, &mut awaited, &mut loops,
         );
-        (pulses, firings, kicked, crashed.into_iter().map(|step| step.loc).collect())
+        (pulses, firings, kicked, crashed.into_iter().map(|firing| firing.loc).collect())
     }
 
     fn apply(events: &[RunEvent]) -> (PulseTable, NodeFiringTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
         let (pulses, firings, kicked, crashed) = apply_with_crashed(events);
-        assert!(crashed.is_empty(), "no step is left running in these fixtures: {crashed:?}");
+        assert!(crashed.is_empty(), "no node is left running in these fixtures: {crashed:?}");
         (pulses, firings, kicked)
     }
 
@@ -154,7 +154,7 @@
     }
 
     /// Project with a real stream edge plus a LoopIn boundary that
-    /// also declares a generator input, for the crashed-step routing
+    /// also declares a generator input, for the crashed-firing routing
     /// tests below.
     fn stream_project() -> Arc<ProjectDefinition> {
         Arc::new(serde_json::from_value(json!({
@@ -198,7 +198,7 @@
         vec![started(node)]
     }
 
-    /// The steps `apply_snapshot` hands back to be failed, as
+    /// The firings `apply_snapshot` hands back to be failed, as
     /// (location, read a stream).
     fn apply_stream(events: &[RunEvent]) -> Vec<(FiringLocation, bool)> {
         let project = stream_project();
@@ -211,7 +211,7 @@
             &mut HashMap::new(), &mut HashMap::new(), &mut LoopRuntime::new(),
         )
         .into_iter()
-        .map(|step| (step.loc, step.consumed_a_stream))
+        .map(|firing| (firing.loc, firing.consumed_a_stream))
         .collect()
     }
 
@@ -254,7 +254,7 @@
         assert_eq!(events.iter().filter(|e| e.is_run_terminal()).count(), 1);
     }
 
-    /// A step a dead worker left running is handed back to be failed,
+    /// A firing a dead worker left running is handed back to be failed,
     /// never re-run; one reading a stream says so in its message.
     #[test]
     fn a_crashed_stream_consumer_is_failed() {
@@ -264,9 +264,9 @@
         );
     }
 
-    /// A plain step is failed too: nothing says how far its body got.
+    /// A plain node is failed too: nothing says how far its body got.
     #[test]
-    fn a_crashed_plain_step_is_failed() {
+    fn a_crashed_plain_node_is_failed() {
         assert_eq!(
             apply_stream(&crashed_running("producer")),
             vec![(FiringLocation::new("producer", vec![]), false)],

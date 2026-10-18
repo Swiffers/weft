@@ -102,8 +102,8 @@ impl Node for ExecPythonNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        // An exception the script raises is a failure of the step,
-        // which the runtime puts on `error` when it is wired. A mistake
+        // An exception the script raises fails this firing, and the
+        // runtime puts it on `error` when it is wired. A mistake
         // in the program itself (the code does not compile, the answer
         // is not a dict of declared outputs of the right types) is an
         // input or type error, which fails the run whether or not

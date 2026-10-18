@@ -10,7 +10,7 @@ use weft_core::frames::Located;
 use weft_core::run_spec::{refuse_unfed, resolve_spec, RunSpec};
 
 /// `hear` holds a group `note` that reads both of `hear`'s inputs, and a
-/// step `other` that only reads `db`. `db` also feeds `elsewhere`, a
+/// node `other` that only reads `db`. `db` also feeds `elsewhere`, a
 /// branch outside `hear` altogether, and `after`, which reads `hear`'s
 /// result AND `db`: so a run downstream of `hear.note` reaches `db` on its
 /// own, as the program Tangle hit this in does. `text` comes out of a

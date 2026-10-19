@@ -2086,8 +2086,9 @@ pub struct ListenerResolveRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerInfraAddressRequest {
     /// The signal the listener is connecting for. The broker reads its
-    /// project off the held row, so the answer looks at that project's
-    /// infra alone, and a token that is not held is refused.
+    /// project off the held row (or, for a cancelled wait whose last call
+    /// is being sent, off that call's task), so the answer looks at that
+    /// project's infra alone, and any other token is refused.
     pub signal_token: String,
     /// `host:port`, as the trigger's URL or address names it.
     pub authority: String,

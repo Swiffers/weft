@@ -1,6 +1,7 @@
 //! Reconstruct chosen history under each ancestor's immutable program.
-//! History never runs through the child's scheduling rules. Only the chosen
-//! sources' outputs cross into the child's executable selection.
+//! History never runs through the child's scheduling rules: the child
+//! imports the records of what it reuses, and what of them its cut needs
+//! stands in for itself there (`weft_core::project::Given`).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -68,16 +69,15 @@ impl SeedChain {
 pub fn import_origins(fold: &mut Fold, seed: &Seed, sources: &BTreeMap<RunId, Fold>, at_unix: u64) -> Result<FoldEffects> {
     let mut by_origin: BTreeMap<RunId, BTreeSet<Located>> = BTreeMap::new();
     for (place, origin) in &seed.origins { by_origin.entry(*origin).or_default().insert(place.clone()); }
-    let mut effects = FoldEffects::default();
     for (origin, nodes) in by_origin {
         let source = sources.get(&origin).ok_or_else(|| anyhow::anyhow!("seed names origin {origin} outside its ancestor chain"))?;
-        effects.emissions.extend(fold.inherit(source, &nodes)?.emissions);
+        fold.inherit(source, &nodes)?;
     }
-    let settled = fold.settle(at_unix);
-    effects.emissions.extend(settled.emissions);
-    effects.boundaries.extend(settled.boundaries);
-    effects.rejections.extend(settled.rejections);
-    Ok(effects)
+    if !seed.answers.is_empty() {
+        let parent = sources.get(&seed.parent).ok_or_else(|| anyhow::anyhow!("seed parent {} is outside its ancestor chain", seed.parent))?;
+        fold.take_answers(parent, &seed.answers);
+    }
+    Ok(fold.settle(at_unix))
 }
 
 fn apply_history<'a>(
@@ -200,10 +200,11 @@ mod tests {
     use std::collections::HashMap;
     use serde_json::json;
     use uuid::Uuid;
-    use weft_core::project::selection::{RunSelection, SelectionBounds};
+    use weft_core::project::{Given, GivenOrigin, GivenPort, StandIn};
 
     fn run_id(n: u8) -> RunId { Uuid::from_bytes([n; 16]) }
 
+    /// `a -> b -> c`, each node one `out`.
     fn program() -> Arc<ProjectDefinition> {
         Arc::new(serde_json::from_value(json!({
             "id": Uuid::nil(), "nodes": (["a", "b", "c"].map(|id| json!({
@@ -220,16 +221,38 @@ mod tests {
         })).unwrap())
     }
 
-    fn birth(run_id: RunId, seed: Option<Seed>, from: &str) -> RunEvent {
-        let mut selection = RunSelection::carve(&program(), &SelectionBounds { from: vec![from.into()], ..Default::default() }).unwrap();
-        if let Some(seed) = &seed {
-            selection.nodes.retain(|place| !seed.origins.contains_key(place));
-            selection.suppliers.extend(seed.origins.keys().cloned());
+    /// The program cut to `keep`, where each of `stand_ins` (a node, what
+    /// it sent, the run it came from) stands in for itself, and what a run
+    /// of it is given: the program a seeded run runs, and its values.
+    fn cut(keep: &[&str], stand_ins: &[(&str, &str, RunId)]) -> (Arc<ProjectDefinition>, Given) {
+        let mut program = program().as_ref().clone();
+        program.nodes.retain(|node| keep.contains(&node.id.as_str()));
+        program.edges.retain(|edge| keep.contains(&edge.source.as_str()) && keep.contains(&edge.target.as_str()));
+        let mut given = Given::default();
+        for (node, value, run) in stand_ins {
+            given.outputs.insert(Located::top(*node), StandIn {
+                ports: [("out".to_string(), GivenPort::Value { value: json!(value) })].into(),
+                origin: GivenOrigin::Inherited { run: *run },
+            });
         }
+        program.given = given.places();
+        (Arc::new(program), given)
+    }
+
+    fn seed(parent: RunId, origins: &[(&str, RunId)]) -> Option<Seed> {
+        Some(Seed {
+            parent,
+            origins: origins.iter().map(|(node, run)| (Located::top(*node), *run)).collect(),
+            answers: Default::default(),
+        })
+    }
+
+    fn birth(run_id: RunId, seed: Option<Seed>, from: &str, program: &ProjectDefinition, given: &Given) -> RunEvent {
         RunEvent::RunStarted {
+            given: Box::new(given.clone()),
             run_id, project_id: Uuid::nil(), entry_node: from.into(),
-            phase: weft_core::context::Phase::Fire, definition_hash: Some(weft_core::project::hash::compute_definition_hash(&program()).unwrap()),
-            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, selection: Some(weft_core::project::selection::RecordedSelection::new(selection)), seed, instance: None, stand_in: None, fired_trigger: None, settings: Default::default(), instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            phase: weft_core::context::Phase::Fire, definition_hash: Some(weft_core::project::hash::compute_definition_hash(program).unwrap()),
+            binary_hash: None, cut_from: None, source_version: None, run_kind: weft_core::run::RunKind::Project, seed, instance: None, stand_in: None, fired_trigger: None, settings: Default::default(), instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         }
     }
 
@@ -237,42 +260,55 @@ mod tests {
         vec![
             RunEvent::NodeStarted { run_id, node_id:node.into(), frames:vec![], at_unix:1 },
             RunEvent::PortEmitted { run_id, emission_id:Uuid::new_v4(), node_id:node.into(), frames:vec![],
-                port:"out".into(), value:Arc::new(json!(value)), provided:false, at_unix:2 },
+                port:"out".into(), value:Arc::new(json!(value)), at_unix:2 },
             RunEvent::NodeCompleted { run_id, node_id:node.into(), frames:vec![], at_unix:3 },
         ]
     }
 
-    async fn chain(rows: &[RunEvent], runs: &HashMap<RunId, Vec<RunEvent>>) -> Result<SeedChain> {
+    /// The seed chain of `rows`, reading each ancestor's program among
+    /// `programs` by its hash.
+    async fn chain(rows: &[RunEvent], runs: &HashMap<RunId, Vec<RunEvent>>, programs: &[Arc<ProjectDefinition>]) -> Result<SeedChain> {
         seed_chain(rows, |run_id| async move { Ok(runs.get(&run_id).cloned().unwrap_or_default()) },
-            |_, _| async { Ok(program()) }).await
+            |_, hash| async move {
+                programs.iter().find(|program| weft_core::project::hash::compute_definition_hash(program).unwrap() == hash)
+                    .cloned().ok_or_else(|| anyhow::anyhow!("no program {hash}"))
+            }).await
     }
 
+    /// A child cut at `c` that reuses `a` and `b`: both records come over
+    /// marked inherited, nothing of them goes on a wire, and `b`, which
+    /// the cut reads, stands in and sends what it sent.
     #[tokio::test]
     async fn history_before_the_child_cut_survives_and_only_the_frontier_is_pending() {
         let (parent, child) = (run_id(1), run_id(2));
-        let mut parent_rows = vec![birth(parent, None, "a")];
+        let mut parent_rows = vec![birth(parent, None, "a", &program(), &Given::default())];
         parent_rows.extend(result(parent, "a", "A"));
         parent_rows.extend(result(parent, "b", "B"));
-        let rows = vec![birth(child, Some(Seed { parent, origins:BTreeMap::from([(Located::top("a"), parent),(Located::top("b"), parent)]) }), "c")];
-        let chain = chain(&rows, &HashMap::from([(parent,parent_rows)])).await.unwrap();
+        let (cut, given) = cut(&["b", "c"], &[("b", "B", parent)]);
+        let rows = vec![birth(child, seed(parent, &[("a", parent), ("b", parent)]), "c", &cut, &given)];
+        let chain = chain(&rows, &HashMap::from([(parent, parent_rows)]), &[program()]).await.unwrap();
         assert!(matches!(chain.ancestors[0].rows[0], RunEvent::RunStarted { .. }));
-        let snapshot = fold_seeded(child, program(), &chain, &rows).unwrap();
+        let snapshot = fold_seeded(child, cut, &chain, &rows).unwrap();
         assert_eq!(snapshot.firings["a"][0].inherited_from, Some(parent));
         assert_eq!(snapshot.firings["b"][0].received.input["in"].as_ref(), &json!("A"));
         assert!(!snapshot.pulses.contains_key("a") && !snapshot.pulses.contains_key("b"));
         assert_eq!(snapshot.pulses["c"][0].value.as_ref(), &json!("B"));
     }
 
+    /// A grandchild names each result's original run, and each comes
+    /// from there, never through the run in between.
     #[tokio::test]
     async fn explicit_origins_reconstruct_a_grandchild_without_replaying_parent_inputs() {
         let (a,b,c) = (run_id(1),run_id(2),run_id(3));
-        let mut a_rows = vec![birth(a,None,"a")];
+        let mut a_rows = vec![birth(a,None,"a", &program(), &Given::default())];
         a_rows.extend(result(a,"a","A"));
-        let mut b_rows = vec![birth(b,Some(Seed { parent:a, origins:BTreeMap::from([(Located::top("a"), a)]) }),"b")];
+        let (b_cut, b_given) = cut(&["a","b","c"], &[("a","A",a)]);
+        let mut b_rows = vec![birth(b,seed(a,&[("a",a)]),"b",&b_cut,&b_given)];
         b_rows.extend(result(b,"b","B"));
-        let rows = vec![birth(c,Some(Seed { parent:b, origins:BTreeMap::from([(Located::top("a"), a),(Located::top("b"), b)]) }),"c")];
-        let chain = chain(&rows,&HashMap::from([(a,a_rows),(b,b_rows)])).await.unwrap();
-        let snapshot = fold_seeded(c,program(),&chain,&rows).unwrap();
+        let (c_cut, c_given) = cut(&["b","c"], &[("b","B",b)]);
+        let rows = vec![birth(c,seed(b,&[("a",a),("b",b)]),"c",&c_cut,&c_given)];
+        let chain = chain(&rows,&HashMap::from([(a,a_rows),(b,b_rows)]),&[program(),b_cut]).await.unwrap();
+        let snapshot = fold_seeded(c,c_cut,&chain,&rows).unwrap();
         assert_eq!(snapshot.firings["a"][0].inherited_from,Some(a));
         assert_eq!(snapshot.firings["b"][0].inherited_from,Some(b));
         assert_eq!(snapshot.firings["b"][0].received.input["in"].as_ref(),&json!("A"));
@@ -280,15 +316,15 @@ mod tests {
 
     #[tokio::test]
     async fn absent_and_cyclic_ancestors_are_refused() {
-        let rows = vec![birth(run_id(2),Some(Seed { parent:run_id(1), origins:BTreeMap::new() }),"a")];
-        assert!(chain(&rows,&HashMap::new()).await.unwrap_err().to_string().contains("no journal rows"));
-        let ancestor = vec![birth(run_id(1),Some(Seed { parent:run_id(2), origins:BTreeMap::new() }),"a")];
-        assert!(chain(&rows,&HashMap::from([(run_id(1),ancestor)])).await.unwrap_err().to_string().contains("loops"));
+        let rows = vec![birth(run_id(2),seed(run_id(1),&[]),"a",&program(),&Given::default())];
+        assert!(chain(&rows,&HashMap::new(),&[program()]).await.unwrap_err().to_string().contains("no journal rows"));
+        let ancestor = vec![birth(run_id(1),seed(run_id(2),&[]),"a",&program(),&Given::default())];
+        assert!(chain(&rows,&HashMap::from([(run_id(1),ancestor)]),&[program()]).await.unwrap_err().to_string().contains("loops"));
     }
 
     #[tokio::test]
     async fn a_fresh_run_reads_no_ancestors() {
-        let rows = vec![birth(run_id(1),None,"a")];
+        let rows = vec![birth(run_id(1),None,"a", &program(), &Given::default())];
         let chain = seed_chain(&rows, |_| async { bail!("unexpected journal read") },
             |_,_| async { bail!("unexpected definition read") }).await.unwrap();
         assert!(chain.is_empty());
@@ -297,11 +333,11 @@ mod tests {
     #[tokio::test]
     async fn chosen_failed_result_is_refused_without_searching_for_older_success() {
         let parent = run_id(1);
-        let mut parent_rows = vec![birth(parent,None,"a")];
+        let mut parent_rows = vec![birth(parent,None,"a", &program(), &Given::default())];
         parent_rows.push(RunEvent::NodeStarted {run_id:parent,node_id:"a".into(),frames:vec![],at_unix:1});
         parent_rows.push(RunEvent::NodeFailed {run_id:parent,node_id:"a".into(),frames:vec![],error:"failed".into(),gave_up_wait:false,at_unix:2});
-        let rows = vec![birth(run_id(2),Some(Seed {parent,origins:BTreeMap::from([(Located::top("a"), parent)])}),"b")];
-        let chain = chain(&rows,&HashMap::from([(parent,parent_rows)])).await.unwrap();
+        let rows = vec![birth(run_id(2),seed(parent,&[("a",parent)]),"b",&program(),&Given::default())];
+        let chain = chain(&rows,&HashMap::from([(parent,parent_rows)]),&[program()]).await.unwrap();
         assert!(fold_seeded(run_id(2),program(),&chain,&rows).err().unwrap().to_string().contains("no complete reusable result"));
     }
 
@@ -334,28 +370,29 @@ mod tests {
     #[tokio::test]
     async fn a_start_then_the_rest_folds_like_the_whole_record() {
         let parent = run_id(1);
-        let mut parent_rows = vec![birth(parent, None, "a")];
+        let mut parent_rows = vec![birth(parent, None, "a", &program(), &Given::default())];
         parent_rows.extend(result(parent, "a", "A"));
         let fresh = {
-            let mut rows = vec![birth(run_id(2), None, "a")];
+            let mut rows = vec![birth(run_id(2), None, "a", &program(), &Given::default())];
             rows.extend(result(run_id(2), "a", "A"));
             rows.extend(result(run_id(2), "b", "B"));
             rows.extend(result(run_id(2), "c", "C"));
             rows
         };
+        let (seeded_cut, seeded_given) = cut(&["a", "b", "c"], &[("a", "A", parent)]);
         let seeded = {
-            let mut rows = vec![birth(run_id(3), Some(Seed { parent, origins: BTreeMap::from([(Located::top("a"), parent)]) }), "b")];
+            let mut rows = vec![birth(run_id(3), seed(parent, &[("a", parent)]), "b", &seeded_cut, &seeded_given)];
             rows.extend(result(run_id(3), "b", "B"));
             rows.extend(result(run_id(3), "c", "C"));
             rows
         };
         let runs = HashMap::from([(parent, parent_rows)]);
-        for events in [fresh, seeded] {
+        for (events, program) in [(fresh, program()), (seeded, seeded_cut)] {
             let run = events[0].run_id();
-            let chain = chain(&events, &runs).await.unwrap();
-            let whole = said(&fold_seeded(run, program(), &chain, &events).unwrap());
+            let chain = chain(&events, &runs, &[self::program()]).await.unwrap();
+            let whole = said(&fold_seeded(run, program.clone(), &chain, &events).unwrap());
             for split in 1..=events.len() {
-                let mut live = LiveFold::start(run, program(), &chain, &events[..split]).unwrap();
+                let mut live = LiveFold::start(run, program.clone(), &chain, &events[..split]).unwrap();
                 live.catch_up(&events).unwrap();
                 assert_eq!(said(&live.snapshot()), whole, "split at {split}");
             }

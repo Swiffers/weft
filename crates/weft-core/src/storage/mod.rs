@@ -42,17 +42,111 @@ pub const MAX_WIRE_VALUE_BYTES: usize = 100 * 1024;
 /// apart from a conflict that will not resolve on its own.
 pub const COMPLETING_HEADER: &str = "x-weft-completing";
 
-/// Whether `value` may travel a wire from port `port` of node `node`:
-/// the refusal names the port, the weight and where bytes belong.
-pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX);
-    if bytes <= MAX_WIRE_VALUE_BYTES {
-        return Ok(());
+/// What `value` weighs on a wire: its compact JSON, in bytes. The one
+/// measure [`check_wire_value`] holds to [`MAX_WIRE_VALUE_BYTES`], so a
+/// node that bounds its own output with it can never disagree with the
+/// refusal. A value that does not serialize weighs `usize::MAX`.
+pub fn wire_weight<T: Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |v| v.len())
+}
+
+/// The longest start of `text`, cut between two characters, that
+/// weighs at most `budget` on a wire as a JSON string ([`wire_weight`]:
+/// its UTF-8 bytes, the two quotes, and every escape JSON writes, so a
+/// newline counts two). For a node that keeps a text under the limit
+/// itself and says it cut it. A budget below 2, the weight of the empty
+/// string, has no answer and is the caller's bug: it panics.
+pub fn cut_to_weight(text: &str, budget: usize) -> &str {
+    assert!(budget >= 2, "cut_to_weight: a budget of {budget} bytes holds not even the empty string's two quotes");
+    if wire_weight(text) <= budget {
+        return text;
     }
+    // Every place `text` can be cut, the empty start included.
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let fits = |i: usize| wire_weight(&text[..ends[i]]) <= budget;
+    // The weight only grows with the length, so a binary search finds
+    // the last cut that fits: `lo` fits (or is the empty start), `hi`
+    // does not.
+    let (mut lo, mut hi) = (0, ends.len() - 1);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    &text[..ends[lo]]
+}
+
+/// `text` cut to at most `max_chars` characters, and further, with
+/// [`cut_to_weight`], to what one port carries when even that weighs
+/// more than a wire takes, with whether anything was cut. The shape of
+/// a node's text setting like `maxChars` paired with a `truncated`
+/// output.
+pub fn cap_text(text: &str, max_chars: usize) -> (&str, bool) {
+    let by_chars = match text.char_indices().nth(max_chars) {
+        Some((i, _)) => &text[..i],
+        None => text,
+    };
+    let cut = cut_to_weight(by_chars, MAX_WIRE_VALUE_BYTES);
+    (cut, cut.len() < text.len())
+}
+
+/// A weight said the way every refusal over the limit says it: "117
+/// KB, and a wire carries at most 100 KB". A refusal puts it after its
+/// own subject ("port 'x' of 'y' carries ...", "the rows weigh ...")
+/// and adds its own fix.
+pub fn wire_weight_said(bytes: usize) -> String {
+    format!("{} KB, and a wire carries at most {} KB", bytes.div_ceil(1024), MAX_WIRE_VALUE_BYTES / 1024)
+}
+
+/// When `value` weighs more than a wire carries, its weight said
+/// ([`wire_weight_said`]); `None` when it fits.
+pub fn over_wire<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    let bytes = wire_weight(value);
+    (bytes > MAX_WIRE_VALUE_BYTES).then(|| wire_weight_said(bytes))
+}
+
+/// Where a page of a list ends: the items from `offset` (past the end
+/// is an empty page at the end) that one wire carries as a list, at
+/// most `max` of them. `Err(index)` when the page's first item, at
+/// `index`, weighs more than a wire on its own: no page can hold it,
+/// so the caller decides, once, whether to refuse it or cut it. `max`
+/// is at least 1: an empty page would never move a cursor on, so a
+/// page size of 0 is the caller's bug and panics (a node refuses such a
+/// setting where it reads it).
+pub fn wire_page(items: &[Value], offset: usize, max: usize) -> Result<std::ops::Range<usize>, usize> {
+    assert!(max >= 1, "wire_page: a page of at most 0 items never moves on");
+    let start = offset.min(items.len());
+    // The list's own brackets, then each item and the comma before it.
+    let mut total = 2;
+    let mut end = start;
+    for item in items[start..].iter().take(max) {
+        let added = wire_weight(item) + usize::from(end > start);
+        if total + added > MAX_WIRE_VALUE_BYTES {
+            break;
+        }
+        total += added;
+        end += 1;
+    }
+    if end == start && start < items.len() {
+        return Err(start);
+    }
+    Ok(start..end)
+}
+
+/// Whether `value` may travel a wire from port `port` of node `node`:
+/// the refusal names the port, the weight, the limit, and the two ways
+/// out, since what fits depends on what the value is.
+pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
+    let Some(weight) = over_wire(value) else {
+        return Ok(());
+    };
     Err(format!(
-        "port '{port}' of '{node}' carries {} KB; a wire carries at most {} KB. Bytes belong in a stored file: put the data in storage and send the file value",
-        bytes.div_ceil(1024),
-        MAX_WIRE_VALUE_BYTES / 1024
+        "port '{port}' of '{node}' carries {weight}. Return less: one page of it with where the next \
+         one starts, or a part that says it was cut. Or store the data and send the stored file \
+         instead, whose value weighs a few hundred bytes whatever the file holds"
     ))
 }
 
@@ -1114,7 +1208,7 @@ pub struct SweepRunResponse {
 ///
 /// This is the one place the language looks at BYTES to name a type. The
 /// stored MIME of a synced asset comes from here first (a PNG named
-/// `.txt` is still `image/png`), and [`check_declared_kind`] holds an
+/// `.txt` is still `image/png`), and [`received_file`] holds an
 /// `@asset` declaration to it; it never picks a marker.
 pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
     let starts = |sig: &[u8]| head.starts_with(sig);
@@ -1204,54 +1298,125 @@ pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// The kind of file a byte prefix announces itself as: [`sniff_mime`]
-/// read as a kind, and only for the media kinds (a PDF or a zip has a
-/// signature but is a `Blob`, which no `@asset` declaration is held to).
-pub fn sniff_file_kind(head: &[u8]) -> Option<crate::weft_type::FileKind> {
+/// What a file handed over for a place declared `declared` (a caller's
+/// upload, an `@asset` in source) is stored as: its media type and the
+/// kind of file value it becomes, or why the place cannot take it. An
+/// `Image` declaration over video bytes is refused naming both kinds,
+/// bytes with no known signature cannot be a declared media kind, and a
+/// union is held to its file members (`Image | Null` takes only an
+/// image, `Media` any of image, video, audio).
+///
+/// The error names WHAT is wrong and nothing about where it came from:
+/// a caller must never be shown a piece of weft syntax their request has
+/// nothing to do with. Each caller frames it.
+///
+/// The stored type is the one the sender stated (`claimed`: a request's
+/// `Content-Type`, a `data:` link's), so a `.csv` stays `text/csv`. The
+/// first bytes only fill it in when none was stated (two containers hold
+/// either video or audio, WebM and MP4, and the declaration picks which),
+/// and catch a stated media kind the bytes plainly are not (`image/png`
+/// over an mp3). With nothing stated and nothing recognized, the file is
+/// `application/octet-stream`. A place that admits `Blob` but not the kind
+/// the bytes are takes them as plain bytes when nothing was stated; a
+/// stated type the place does not admit is refused. A declaration that is
+/// not a file type takes the file as it is (its caller decides).
+pub fn received_file(
+    bytes: &[u8],
+    claimed: Option<&str>,
+    declared: &crate::weft_type::WeftType,
+) -> Result<(String, crate::weft_type::FileKind), String> {
     use crate::weft_type::FileKind;
-    match FileKind::from_mime(sniff_mime(head)?) {
-        FileKind::Blob => None,
-        kind => Some(kind),
+    let admitted = declared.admitted_file_kinds();
+    let expected = || admitted.iter().map(|k| k.primitive().to_string()).collect::<Vec<_>>().join(" or ");
+    let sniffed = sniff_mime(bytes);
+    // Every kind the bytes could be: one, or either of a container's two.
+    let byte_kinds: Vec<FileKind> = match sniffed {
+        Some(mime) if audio_or_video(mime).is_some() => vec![FileKind::Video, FileKind::Audio],
+        Some(mime) => vec![FileKind::from_mime(mime)],
+        None => Vec::new(),
+    };
+    // A media place holds the bytes to its kinds whatever was stated.
+    if !admitted.is_empty() && !admitted.contains(&FileKind::Blob) && !byte_kinds.iter().any(|k| admitted.contains(k)) {
+        return Err(match byte_kinds.first() {
+            Some(found) => format!("the bytes are {}, not the {} that was declared", found.primitive(), expected()),
+            None => format!(
+                "the bytes carry no {} signature this weft knows (declare it Blob to skip the check)",
+                expected()
+            ),
+        });
     }
+    // A stated type that names no media kind (`application/octet-stream`,
+    // curl's form type) says nothing about bytes that ARE a media kind a
+    // place needs: those are read off the bytes, as when nothing was
+    // stated. Any other statement stands.
+    let stated = claimed.map(str::trim).filter(|mime| !mime.is_empty()).filter(|mime| {
+        FileKind::from_mime(mime) != FileKind::Blob
+            || admitted.is_empty()
+            || admitted.contains(&FileKind::Blob)
+            || !byte_kinds.iter().any(|k| admitted.contains(k))
+    });
+    let mime = match (stated, sniffed) {
+        // The media type itself is case-blind (`Image/PNG` is `image/png`):
+        // it is stored lower-cased, its parameters as sent. A container
+        // stated as the half the place does not take (`video/webm` over a
+        // voice clip for an Audio place) is the half it does.
+        (Some(stated), _) => {
+            let (essence, params) = stated.split_once(';').map_or((stated, ""), |(e, p)| (e, p));
+            let essence = essence.trim().to_ascii_lowercase();
+            let essence = match sniffed.and_then(audio_or_video) {
+                Some((video, audio)) if [video, audio].contains(&essence.as_str()) => {
+                    let kind = FileKind::from_mime(&essence);
+                    let other = if kind == FileKind::Audio { (FileKind::Video, video) } else { (FileKind::Audio, audio) };
+                    if !admitted.is_empty() && !admitted.contains(&kind) && admitted.contains(&other.0) {
+                        other.1.to_string()
+                    } else {
+                        essence
+                    }
+                }
+                _ => essence,
+            };
+            if params.is_empty() { essence } else { format!("{essence};{params}") }
+        }
+        (None, Some(sniffed)) => {
+            let fits = |kind: FileKind| admitted.is_empty() || admitted.contains(&kind);
+            match audio_or_video(sniffed) {
+                Some((_, audio)) if fits(FileKind::Audio) && !fits(FileKind::Video) => audio.to_string(),
+                Some((video, _)) if fits(FileKind::Video) => video.to_string(),
+                _ if fits(FileKind::from_mime(sniffed)) => sniffed.to_string(),
+                _ => OCTET_STREAM.to_string(),
+            }
+        }
+        (None, None) => OCTET_STREAM.to_string(),
+    };
+    let kind = FileKind::from_mime(&mime);
+    if !admitted.is_empty() && !admitted.contains(&kind) {
+        return Err(format!("it was sent as {mime}, which is not the {} that was declared", expected()));
+    }
+    if kind != FileKind::Blob && !byte_kinds.is_empty() && !byte_kinds.contains(&kind) {
+        return Err(format!("it was sent as {mime}, but the bytes are {}", byte_kinds[0].primitive()));
+    }
+    Ok((mime, kind))
 }
 
-/// Hold a file's bytes to the kind something declared for them: an
-/// `Image` declaration over video bytes is a loud error naming both
-/// kinds, and bytes with no known signature cannot be the declared kind
-/// either. `Blob` checks nothing (it is the declaration for "bytes of
-/// any shape"), and so does a declaration that is not a file type.
-///
-/// The error names WHAT is wrong and nothing about where it came from,
-/// because the same check runs over an `@asset` in source and over a
-/// caller's upload, and a caller must never be shown a piece of weft
-/// syntax their request has nothing to do with. Each caller frames it.
-pub fn check_declared_kind(
-    declared: &crate::weft_type::WeftType,
-    head: &[u8],
-) -> Result<(), String> {
-    use crate::weft_type::FileKind;
-    let Some(kind) = declared.concrete_file_kind() else { return Ok(()) };
-    if kind == FileKind::Blob {
-        return Ok(());
-    }
-    match sniff_file_kind(head) {
-        Some(found) if found == kind => Ok(()),
-        Some(found) => Err(format!(
-            "the bytes are {}, not the {} that was declared",
-            found.primitive(),
-            kind.primitive()
-        )),
-        None => Err(format!(
-            "the bytes carry no {} signature this weft knows (declare it Blob to skip \
-             the check)",
-            kind.primitive()
-        )),
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// The (video, audio) media types of a container that holds either,
+/// read from its sniffed type.
+fn audio_or_video(sniffed: &str) -> Option<(&'static str, &'static str)> {
+    match sniffed {
+        "video/webm" => Some(("video/webm", "audio/webm")),
+        "video/mp4" | "audio/mp4" => Some(("video/mp4", "audio/mp4")),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod sniff_tests {
-    use super::{check_declared_kind, sniff_file_kind, sniff_mime};
+    use super::{received_file, sniff_mime};
+
+    fn check_declared_kind(declared: &WeftType, head: &[u8]) -> Result<(), String> {
+        received_file(head, None, declared).map(|_| ())
+    }
     use crate::weft_type::{FileKind, WeftPrimitive, WeftType};
 
     #[test]
@@ -1281,6 +1446,7 @@ mod sniff_tests {
 
     #[test]
     fn signatures_name_their_kind() {
+        let sniff_file_kind = |head: &[u8]| sniff_mime(head).map(FileKind::from_mime).filter(|k| *k != FileKind::Blob);
         assert_eq!(sniff_file_kind(b"\x89PNG\r\n\x1a\n...."), Some(FileKind::Image));
         assert_eq!(sniff_file_kind(b"\xff\xd8\xff\xe0JFIF"), Some(FileKind::Image));
         assert_eq!(sniff_file_kind(b"RIFF\0\0\0\0WEBPVP8 "), Some(FileKind::Image));
@@ -1307,6 +1473,60 @@ mod sniff_tests {
         // Blob and text declarations check nothing.
         assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::Blob), b"just text").is_ok());
         assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::String), b"ID3").is_ok());
+    }
+
+    /// A union is held to its file members: an optional image still
+    /// takes only an image, and `Media` takes any media kind but no
+    /// unrecognized bytes. `File` admits Blob, so it checks nothing.
+    #[test]
+    fn a_union_is_held_to_its_file_members() {
+        let optional_image = WeftType::parse("Image | Null").unwrap();
+        assert!(check_declared_kind(&optional_image, b"\x89PNG\r\n\x1a\n").is_ok());
+        let e = check_declared_kind(&optional_image, b"ID3\x04").unwrap_err();
+        assert!(e.contains("are Audio, not the Image"), "{e}");
+        let media = WeftType::parse("Media").unwrap();
+        assert!(check_declared_kind(&media, b"ID3\x04").is_ok());
+        let e = check_declared_kind(&media, b"just text").unwrap_err();
+        assert!(e.contains("no Image or Video or Audio signature"), "{e}");
+        assert!(check_declared_kind(&WeftType::parse("File").unwrap(), b"just text").is_ok());
+    }
+
+    /// The bytes decide the stored type; a sender's claim only picks
+    /// audio or video in a container that holds either.
+    #[test]
+    fn a_received_file_keeps_the_type_it_was_sent_as() {
+        use crate::weft_type::FileKind;
+        let file = WeftType::parse("File").unwrap();
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(received_file(png, Some("image/x-anything"), &file).unwrap(), ("image/x-anything".into(), FileKind::Image));
+        assert_eq!(received_file(b"a,b\n1,2", Some("text/csv"), &file).unwrap(), ("text/csv".into(), FileKind::Blob));
+        // Nothing stated: the bytes fill it in, else plain bytes.
+        assert_eq!(received_file(png, None, &file).unwrap(), ("image/png".into(), FileKind::Image));
+        assert_eq!(received_file(b"a,b\n1,2", None, &file).unwrap(), ("application/octet-stream".into(), FileKind::Blob));
+        // A generic statement over a picture for an Image place: the
+        // bytes decide; an upper-case statement reads as its kind.
+        let image = WeftType::parse("Image").unwrap();
+        assert_eq!(received_file(png, Some("application/octet-stream"), &image).unwrap(), ("image/png".into(), FileKind::Image));
+        assert_eq!(received_file(png, Some("Image/PNG"), &image).unwrap(), ("image/png".into(), FileKind::Image));
+        // A stated media kind the bytes plainly are not is refused.
+        let e = received_file(b"ID3\x04 an mp3", Some("image/png"), &file).unwrap_err();
+        assert!(e.contains("sent as image/png, but the bytes are Audio"), "{e}");
+        // A Blob place takes unrecognized or unstated bytes as plain bytes,
+        // and refuses a stated type it does not admit.
+        let blob = WeftType::parse("Blob").unwrap();
+        assert_eq!(received_file(png, None, &blob).unwrap(), ("application/octet-stream".into(), FileKind::Blob));
+        let e = received_file(png, Some("image/png"), &blob).unwrap_err();
+        assert!(e.contains("sent as image/png, which is not the Blob"), "{e}");
+        // WebM holds either: the statement, then the declaration, picks.
+        let webm = b"\x1aE\xdf\xa3\x01\x00\x00\x00";
+        let audio = WeftType::parse("Audio").unwrap();
+        assert_eq!(received_file(webm, Some("audio/webm"), &file).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        assert_eq!(received_file(webm, None, &audio).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        assert_eq!(received_file(webm, None, &file).unwrap(), ("video/webm".into(), FileKind::Video));
+        // Stated as the container's other half, it is the half the place takes.
+        assert_eq!(received_file(webm, Some("video/webm"), &audio).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        let e = received_file(webm, Some("audio/webm"), &WeftType::parse("Image").unwrap()).unwrap_err();
+        assert!(e.contains("not the Image"), "{e}");
     }
 
     /// The reason says what is wrong with the bytes and nothing about
@@ -1368,8 +1588,85 @@ mod tests {
         assert!(check_wire_value("n", "out", &at_cap).is_ok(), "the cap itself passes");
         let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
         let refusal = check_wire_value("pic", "bytes", &over).unwrap_err();
-        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB; a wire carries at most 100 KB"), "{refusal}");
-        assert!(refusal.contains("stored file"), "{refusal}");
+        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB, and a wire carries at most 100 KB"), "{refusal}");
+        let less = refusal.find("Return less: one page of it").expect("the way out any node or script has");
+        let stored = refusal.find("send the stored file").expect("the way out for bytes");
+        assert!(less < stored, "returning less comes first: {refusal}");
+    }
+
+    #[test]
+    fn wire_weight_is_the_measure_the_refusal_uses() {
+        // `"x...x"` weighs its length and the two quotes.
+        let fits = "x".repeat(MAX_WIRE_VALUE_BYTES - 2);
+        assert_eq!(wire_weight(fits.as_str()), MAX_WIRE_VALUE_BYTES);
+        assert!(check_wire_value("n", "out", &json!(fits)).is_ok());
+        let over = "x".repeat(MAX_WIRE_VALUE_BYTES - 1);
+        assert_eq!(wire_weight(&json!(over)), MAX_WIRE_VALUE_BYTES + 1);
+        assert!(check_wire_value("n", "out", &json!(over)).is_err());
+        // A newline is two bytes of JSON, a slice weighs as a list.
+        assert_eq!(wire_weight("a\nb"), 6);
+        assert_eq!(wire_weight(&[json!(1), json!(2)][..]), 5);
+    }
+
+    #[test]
+    fn a_cut_lands_between_characters_and_fits_its_budget() {
+        // "é" is two bytes: a budget of 5 holds the quotes and one "é",
+        // and never half of the next.
+        assert_eq!(cut_to_weight("ééé", 5), "é");
+        assert_eq!(cut_to_weight("ééé", 6), "éé");
+        assert_eq!(cut_to_weight("abc", 100), "abc", "what fits stays whole");
+        assert_eq!(cut_to_weight("abc", 2), "", "only the quotes fit");
+        assert_eq!(cut_to_weight("a\nb", 5), "a\n", "an escape counts what it weighs");
+        let long = "x".repeat(MAX_WIRE_VALUE_BYTES * 2);
+        assert_eq!(wire_weight(cut_to_weight(&long, MAX_WIRE_VALUE_BYTES)), MAX_WIRE_VALUE_BYTES);
+    }
+
+    #[test]
+    fn a_wire_page_stops_at_its_size_and_at_what_a_wire_carries() {
+        let small: Vec<Value> = (0..5).map(|i| json!({ "n": i })).collect();
+        assert_eq!(wire_page(&small, 0, 2), Ok(0..2), "at most the page size");
+        assert_eq!(wire_page(&small, 4, 2), Ok(4..5), "the last page holds what is left");
+        assert_eq!(wire_page(&small, 9, 2), Ok(5..5), "past the end is an empty page");
+        // Three items of 40 KB: two fit a wire, whatever the page size.
+        let heavy: Vec<Value> = (0..3).map(|_| json!({ "a": "x".repeat(40 * 1024) })).collect();
+        assert_eq!(wire_page(&heavy, 0, 500), Ok(0..2));
+        assert!(wire_weight(&heavy[0..2]) <= MAX_WIRE_VALUE_BYTES);
+        assert_eq!(wire_page(&heavy, 2, 500), Ok(2..3));
+        // An item no page can hold is named, wherever the page starts.
+        let huge = vec![json!(1), json!({ "a": "x".repeat(MAX_WIRE_VALUE_BYTES) })];
+        assert_eq!(wire_page(&huge, 1, 500), Err(1));
+        assert_eq!(wire_page(&huge, 0, 500), Ok(0..1), "a page before it stops short of it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not even the empty string")]
+    fn a_budget_below_the_empty_string_is_a_caller_bug() {
+        cut_to_weight("abc", 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "never moves on")]
+    fn a_page_of_zero_items_is_a_caller_bug() {
+        let _ = wire_page(&[json!(1)], 0, 0);
+    }
+
+    #[test]
+    fn over_wire_says_the_weight_and_the_limit() {
+        assert_eq!(over_wire(&json!({ "a": 1 })), None);
+        let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
+        assert_eq!(over_wire(&over).as_deref(), Some("101 KB, and a wire carries at most 100 KB"));
+    }
+
+    #[test]
+    fn cap_text_counts_characters_then_the_wire_and_says_whether_it_cut() {
+        assert_eq!(cap_text("hello", 10), ("hello", false));
+        assert_eq!(cap_text("héllo", 3), ("hél", true), "characters, not bytes");
+        // Fifty thousand characters of three bytes each: the character
+        // cap keeps them all, and the wire is what cuts.
+        let heavy = "日".repeat(50_000);
+        let (cut, was_cut) = cap_text(&heavy, 50_000);
+        assert!(was_cut);
+        assert!(wire_weight(cut) <= MAX_WIRE_VALUE_BYTES && wire_weight(cut) + 3 > MAX_WIRE_VALUE_BYTES);
     }
 
     #[test]

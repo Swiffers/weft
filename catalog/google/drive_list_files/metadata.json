@@ -1,7 +1,7 @@
 {
   "type": "GoogleDriveListFiles",
   "label": "Google Drive: List Files",
-  "description": "Lists the files a Google account can see (id, name, mime type), optionally filtered by a Drive query.",
+  "description": "Lists the files a Google account can see (id, name, mime type), optionally filtered by a Drive query. One call reads one Drive page of at most `pageSize` files; to read the next, wire `nextPageToken` into the next call's `pageToken` while `hasMore` is true. A page over the 100 KB a wire carries fails the node, catchable by `_error`: lower `pageSize`.",
   "tags": [
     "google",
     "drive",
@@ -36,17 +36,32 @@
         "step": 1
       },
       "default": 25,
-      "label": "Page size"
+      "label": "Page size",
+      "description": "The most files one page holds (Drive may send fewer). A page that weighs more than the 100 KB a wire carries fails the node: lower this."
+    },
+    {
+      "name": "pageToken",
+      "type": "String",
+      "label": "Page token",
+      "description": "Where this page starts: empty for the first page, else the `nextPageToken` the previous call handed out (Google's own token for its next page)."
     }
   ],
   "outputs": [
     {
       "name": "files",
       "type": "List[JsonDict]",
-      "description": "{id, name, mimeType} each."
+      "narrowable": true,
+      "description": "This page's files, {id, name, mimeType} each."
+    },
+    {
+      "name": "nextPageToken",
+      "type": "String",
+      "description": "Google's token for the next page, to wire into the next call's `pageToken`; empty after the last page."
+    },
+    {
+      "name": "hasMore",
+      "type": "Boolean",
+      "description": "True when Google has a page after this one."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

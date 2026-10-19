@@ -1,6 +1,6 @@
 import type { PortDefinition, PortType } from '../types';
-import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
-import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
+import { ERROR_PORT, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
+import { parseWeftType, substituteTypeVars, weftTypeToWireString, type WeftType } from '../types';
 
 // The wire types ARE the webview's types: `PortType` is a plain string,
 // so nothing narrows. The shorter local names stay because this module
@@ -115,41 +115,12 @@ function resolvePortName(template: string, key: string): string {
 // SYNC: AUTO_TYPE_VAR_MARKER <-> crates/weft-core/src/node.rs AUTO_TYPE_VAR
 const AUTO_TYPE_VAR_MARKER = 'T_Auto';
 
-/** Recursively replace every `T_Auto` marker in a parsed WeftType with a
- *  TypeVar scoped to the field key. Every container arm recurses, so a
- *  nested placeholder scopes exactly like a top-level one.
+/** Replace every `T_Auto` marker in a parsed WeftType, at any depth,
+ *  with a TypeVar scoped to the field key.
  *  SYNC: materializeAutoTypeVars <-> crates/weft-core/src/node.rs materialize_auto_type_vars */
 function materializeAutoTypeVars(t: WeftType, key: string): WeftType {
-	switch (t.kind) {
-		case 'typevar':
-			if (t.name === AUTO_TYPE_VAR_MARKER) {
-				return { kind: 'typevar', name: `T__${key}` };
-			}
-			return t;
-		case 'list':
-			return { kind: 'list', inner: materializeAutoTypeVars(t.inner, key) };
-		case 'dict':
-			return {
-				kind: 'dict',
-				key: materializeAutoTypeVars(t.key, key),
-				value: materializeAutoTypeVars(t.value, key),
-			};
-		case 'union':
-			return { kind: 'union', types: t.types.map(x => materializeAutoTypeVars(x, key)) };
-		case 'record':
-			return {
-				kind: 'record',
-				fields: t.fields.map(f => ({ ...f, ty: materializeAutoTypeVars(f.ty, key) })),
-			};
-		case 'generator':
-			return { kind: 'generator', inner: materializeAutoTypeVars(t.inner, key) };
-		// No 'named' case: a declared body is concrete by construction
-		// (the Rust registry and wire parser both refuse a type
-		// variable inside one), so there is never a T_Auto to
-		// materialize beneath an alias.
-		default:
-			return t;
-	}
+	return substituteTypeVars(t, (name) =>
+		name === AUTO_TYPE_VAR_MARKER ? { kind: 'typevar', name: portVar('input', key) } : undefined);
 }
 
 /** Replace T_Auto markers in a port type string with key-scoped TypeVar names.
@@ -231,9 +202,9 @@ export function entryPortCollisions(
 	// Names the node type itself already owns on each side (its catalog
 	// ports): a derived port shadowing one would write a header the
 	// build rejects, so it is refused at the door like an entry-vs-entry
-	// collision. `_should_flow` is reserved on the input side of every
-	// node (the enricher synthesizes it), so it is seeded here rather
-	// than left to each caller.
+	// collision. The language's own ports are reserved on every node
+	// (the gate on the input side, `_error` on the output side), so they
+	// are seeded here rather than left to each caller.
 	reserved: { inputs: string[]; outputs: string[] },
 ): string[] {
 	const collide = (
@@ -253,7 +224,7 @@ export function entryPortCollisions(
 		...collide(
 			deriveOutputsFromEntries([entry], specMap),
 			deriveOutputsFromEntries(others, specMap),
-			reserved.outputs,
+			[...reserved.outputs, ERROR_PORT],
 		),
 	];
 }

@@ -791,11 +791,36 @@ impl Runner for CloudRunRunner {
         self.known.lock().remove(&(names::worker_service(target.project), Self::tag_of(target)));
     }
 
-    async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
+    async fn kill_workers(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
         let value = project.simple().to_string();
-        let all = self.labeled("weft-project", &value).await?;
+        let all = self.labeled("weft-project", &value).await.map_err(|e| anyhow::anyhow!(
+            "could not list the project's worker services ({e:#}); find them with `gcloud run services list \
+             --project {} --region {} --filter=metadata.labels.weft-project={value}` and delete each with \
+             `gcloud run services delete <name> --project {} --region {}`",
+            self.gcp.project, self.gcp.region, self.gcp.project, self.gcp.region,
+        ))?;
         self.known.lock().retain(|_, k| k.project != project);
-        self.delete_all(all).await?;
+        // Deleting a service stops its instances outright. Every one is
+        // tried, so the error names all that are left.
+        let mut left = Vec::new();
+        for name in all {
+            if let Err(e) = self.delete_all(vec![name.clone()]).await {
+                left.push((name.rsplit('/').next().unwrap_or(&name).to_string(), e));
+            }
+        }
+        if left.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = left.iter().map(|(name, _)| name.as_str()).collect();
+        let why: Vec<String> = left.iter().map(|(name, e)| format!("{name}: {e:#}")).collect();
+        anyhow::bail!(
+            "the project's worker services {} are still running ({}); delete them by hand with \
+             `gcloud run services delete <name> --project {} --region {}`",
+            names.join(", "), why.join("; "), self.gcp.project, self.gcp.region,
+        )
+    }
+
+    async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
         crate::accounts::revoke_project_account(&self.google, &self.gcp, project).await
     }
 

@@ -5,14 +5,16 @@
 //!     [`OutboundChunk`]. `json` carries any value; `text` wants a
 //!     string; `bytes` wants a stored file (weft's one representation
 //!     of bytes), whose content the node reads back.
-//!   - IN (`Route`, `Socket`): an [`InboundMessage`] becomes a port
-//!     value. A byte body is stored as a run-scoped file and
-//!     the stored-file value is what flows.
+//!   - IN (`Route`, `Socket`): an [`InboundMessage`] becomes the value
+//!     the program declared it to be ([`take_message`]), or the
+//!     caller's mistake in words the caller can act on. A byte body is
+//!     stored as a run-scoped file and the stored-file value is what
+//!     flows.
 //!
 //! Bytes never travel a wire: a picture a caller sends inside a JSON
-//! body (a `data:` URL or bare base64 on a port declared as a file
+//! body (a `data:` URL or bare base64 in a place declared as a file
 //! kind) is stored on the way in and the stored-file value is what
-//! flows ([`inline_files`]); a stored file inside a JSON answer goes
+//! flows ([`take_inbound`]); a stored file inside a JSON answer goes
 //! out as a link the caller can fetch ([`link_files`]).
 //!
 //! One place, so the four nodes agree and a fifth node an author writes
@@ -21,15 +23,9 @@
 use serde_json::Value;
 
 use weft::caller::{InboundMessage, LiveRequest, OutboundChunk, ResponseHead};
-use weft::node::NodeOutput;
 use weft::signal::DataType;
 use weft::storage::{FileHandle, StorageScope, StoredFile};
 use weft::{RunContext, WeftError, WeftResult, WeftType};
-
-/// The fixed ports both triggers emit from the caller's opening
-/// request. A body key of the same name is shadowed by these (the
-/// request wins), which the trigger docs say.
-pub const REQUEST_PORTS: &[&str] = &["fired", "method", "path", "params", "query", "headers", "caller"];
 
 /// The opening request the trigger woke on, out of the wake payload.
 /// Both triggers read the same payload, so they read it here and a
@@ -42,13 +38,14 @@ pub fn opening_request(ctx: &RunContext) -> WeftResult<LiveRequest> {
 }
 
 /// The fixed request ports' values, as `(port, value)` pairs, from the
-/// caller's opening request. A trigger sets the ones it declares
-/// (`Route` all seven, `Socket` everything but `method`: an upgrade is
-/// always a GET) AFTER the body ports, so a body key cannot shadow
-/// them. `fired` is always true: a port a program can gate on "the
-/// trigger was called" without reading any request part. Header names
-/// are lowercased, as HTTP reads them.
-pub fn request_ports(request: &LiveRequest) -> Vec<(&'static str, Value)> {
+/// caller's opening request, keeping only the ports the trigger's own
+/// metadata declares (`trigger`): `Route` has no `params` (a program
+/// reads a path capture on an output it declares under the capture's
+/// name, which a capture called `params` is too), and `Socket` has no
+/// `method` (an upgrade is always a GET). `fired` is always true: a port
+/// a program can gate on "the trigger was called" without reading any
+/// request part. Header names are lowercased, as HTTP reads them.
+pub fn request_ports(trigger: &weft::NodeMetadata, request: &LiveRequest) -> Vec<(&'static str, Value)> {
     let headers: serde_json::Map<String, Value> = request
         .headers
         .iter()
@@ -63,6 +60,9 @@ pub fn request_ports(request: &LiveRequest) -> Vec<(&'static str, Value)> {
         ("headers", Value::Object(headers)),
         ("caller", request.caller.clone().unwrap_or(Value::Null)),
     ]
+    .into_iter()
+    .filter(|(port, _)| trigger.outputs.iter().any(|o| o.name == *port))
+    .collect()
 }
 
 /// A port value as the wire wants it for `data_type`. A JSON value's
@@ -100,115 +100,116 @@ pub async fn chunk_for(
     }
 }
 
-/// An inbound message as a port value. Bytes are stored (run
-/// scope, swept with the run) under `filename`, and the stored-file
-/// value is what flows.
+/// An inbound message (a route's body, one socket message) as the value
+/// the program declared it to be, `declared`. JSON is held to the type
+/// as [`take_inbound`] holds it (inline pictures stored, open records
+/// trimmed); text is held to it as a String; bytes are stored (run
+/// scope, swept with the run) under `name`, and the stored-file value
+/// is held to it.
 ///
-/// The file's kind comes from its own first bytes, not from what the
-/// caller's `Content-Type` claimed. A header is a caller's word for it,
-/// and a port declaring `Image` would otherwise be handed a zip that
-/// said `image/png`, which is the same trust a JSON body's inline
-/// picture is never given (`inline_files` sniffs and checks). The header
-/// is the fallback for bytes carrying no signature weft knows, and a
-/// socket has no header at all, so without the sniff every binary frame
-/// would be a `Blob` and an `Image` port could never be served.
+/// A byte message is stored as the type the caller's `Content-Type`
+/// states ([`weft::storage::received_file`]); its first bytes fill one in
+/// when none was stated (a socket frame never states one) and hold a
+/// place declared `Image` to bytes that are an image, whatever was stated.
 ///
-/// `declared` is what the port receiving this says it takes, when one
-/// port takes the whole message. Bytes that are not that kind fail here,
-/// naming both kinds, rather than inside whatever node reads the file.
-pub async fn value_of(
+/// `Ok(Err(why))` is the caller's mistake (a message that does not fit
+/// what the program declared), `Err` the node's own failure.
+pub async fn take_message(
     ctx: &RunContext,
     message: InboundMessage,
     content_type: Option<&str>,
-    filename: &str,
-    declared: Option<&WeftType>,
-) -> WeftResult<Value> {
+    name: &str,
+    declared: &WeftType,
+) -> WeftResult<Result<Value, String>> {
     match message {
-        InboundMessage::Json(v) => Ok(v),
-        InboundMessage::Text(s) => Ok(Value::String(s)),
+        InboundMessage::Json(v) => take_inbound(ctx, v, declared, name).await,
+        InboundMessage::Text(s) => Ok(declared
+            .conform_value(Value::String(s))
+            .map_err(|why| format!("{name} does not fit {declared}: {why}"))),
         InboundMessage::Bytes(b) => {
-            if let Some(declared) = declared {
-                weft::storage::check_declared_kind(declared, &b).map_err(|why| {
-                    weft::node_error(format!(
-                        "port '{filename}': the caller's bytes are not what the port declares: {why}"
-                    ))
-                })?;
+            // Bytes only ever become a stored file, so a place that holds
+            // no file kind is refused before anything is written.
+            if declared.admitted_file_kinds().is_empty() {
+                return Ok(Err(format!("{name} is bytes, and it takes {declared}")));
             }
-            let mime = weft::storage::sniff_mime(&b)
-                .or(content_type)
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            ctx.storage(StorageScope::Run).put(b, &mime, filename, None).await
+            let mime = match weft::storage::received_file(&b, content_type, declared) {
+                Ok((mime, _)) => mime,
+                Err(why) => return Ok(Err(format!("{name}: the bytes sent are not what it takes: {why}"))),
+            };
+            let file = ctx.storage(StorageScope::Run).put(b, &mime, name, None).await?;
+            Ok(declared.conform_value(file).map_err(|why| format!("{name} does not fit {declared}: {why}")))
         }
     }
 }
 
-/// The declared ports of a trigger typed as a file kind (`File`,
-/// `Image`, `Video`, `Audio`, `Blob`, or a union of those): where a
-/// caller's inline bytes are stored on the way in.
-fn file_ports(ctx: &RunContext) -> Vec<(String, WeftType)> {
-    // A socket's `inbound` is a stream of messages (`Generator[Image]`):
-    // the element type is what each message is held to.
-    let mut ports: Vec<(String, WeftType)> = ctx
-        .declared_outputs()
-        .iter()
-        .map(|(name, ty)| (name.clone(), ty.as_generator().unwrap_or(ty).clone()))
-        .filter(|(_, ty)| ty.is_file_valued())
-        .collect();
-    ports.sort_by(|a, b| a.0.cmp(&b.0));
-    ports
-}
-
-/// Turn every inline picture a JSON body put on a file-kind port into a
-/// stored file, so the value that flows is the stored-file marker and
-/// never the bytes. A `data:<mime>;base64,<payload>` URL keeps its
-/// media type; a bare base64 string is typed by its own bytes (a PNG
-/// signature says `image/png`) and `application/octet-stream` when
-/// they say nothing. The bytes are held to the port's declared kind
-/// (base64 of a video on an `Image` port fails loud). A value that is
-/// already a stored-file marker passes; anything else on a file port
-/// is refused by name. Files land at run scope, swept with the
-/// run: the program keeps what it wants at project scope.
-pub async fn inline_files(ctx: &RunContext, output: NodeOutput) -> WeftResult<NodeOutput> {
-    let mut out = output;
-    for (port, declared) in file_ports(ctx) {
-        let Some(value) = out.get(&port).cloned() else { continue };
-        let stored = match value {
-            Value::String(text) => {
-                let (mime, bytes) = decode_inline(&text).map_err(|why| {
-                    weft::node_error(format!(
-                        "port '{port}' is declared {declared}, so its body key carries a picture as a \
-                         data: URL or base64; {why}"
-                    ))
-                })?;
-                let mime = match mime {
-                    Some(mime) => mime,
-                    None => weft::storage::sniff_mime(&bytes).unwrap_or("application/octet-stream").to_string(),
-                };
-                weft::storage::check_declared_kind(&declared, &bytes).map_err(|why| {
-                    weft::node_error(format!("port '{port}': the caller's bytes are not what the port declares: {why}"))
-                })?;
-                ctx.storage(StorageScope::Run).put(bytes, &mime, &port, None).await?
-            }
-            Value::Object(_) => {
-                StoredFile::from_value(&value).map_err(|e| {
-                    weft::node_error(format!("port '{port}' is declared {declared}; {e}"))
-                })?;
-                value
-            }
-            other => weft::node_bail!(
-                "port '{port}' is declared {declared}, so its body key carries a picture as a data: \
-                 URL, base64 or a stored-file value; got {}",
-                kind_of(&other)
-            ),
-        };
-        out = out.set(port, stored);
+/// A value the caller sent, held to the type the program declared for
+/// it (a route's `body`, one item of a socket's `inbound`): every
+/// picture it carries in a file-typed place as a `data:` URL or bare
+/// base64 is stored on the way in (run scope, swept with the run) and
+/// the stored-file value takes its place, then the whole is held to
+/// the type, which drops what an open record does not declare. The
+/// bytes are held to the kinds their place declares (base64 of a video
+/// in an `Image` or `Image | Null` field is refused), and stored under
+/// the type a `data:` link states, or the one the bytes announce when
+/// none was stated.
+///
+/// A caller never hands over a stored-file value itself: a marker
+/// names a key or a URL, and taking one on the caller's word would let
+/// them point the program at a file of this project or make the worker
+/// fetch an address of their choosing. Any marker anywhere in the
+/// value is refused.
+///
+/// `Ok(Err(why))` is the CALLER's mistake, said in words the caller can
+/// act on; `Err` is the node's own failure (storage refusing a write).
+pub async fn take_inbound(
+    ctx: &RunContext,
+    value: Value,
+    declared: &WeftType,
+    name: &str,
+) -> WeftResult<Result<Value, String>> {
+    if weft::storage::media::holds_file_marker(&value) {
+        return Ok(Err(format!(
+            "{name} carries a stored-file object; send a file's bytes as a data: URL or base64 instead"
+        )));
     }
-    Ok(out)
+    let mut stored = std::collections::HashMap::new();
+    for weft::storage::media::TypedSlot { at, value: slot, ty: slot_ty } in
+        weft::storage::media::typed_media_slots(&value, declared)
+    {
+        // The place inside the value, so a body with two pictures says
+        // which one was wrong.
+        let place = if at.is_empty() { name.to_string() } else { format!("{name}.{at}") };
+        let text = match &slot {
+            Value::String(text) => text,
+            // Anything else in a file place (a null, a number) is held
+            // to the type with the rest of the value just below.
+            _ => continue,
+        };
+        let (mime, bytes) = match decode_inline(text) {
+            Ok(decoded) => decoded,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "{place}: a place declared {slot_ty} takes a picture as a data: URL or base64; {why}"
+                )))
+            }
+        };
+        let mime = match weft::storage::received_file(&bytes, mime.as_deref(), &slot_ty) {
+            Ok((mime, _)) => mime,
+            Err(why) => {
+                return Ok(Err(format!(
+                    "{place}: the bytes sent for a place declared {slot_ty} are not what it takes: {why}"
+                )))
+            }
+        };
+        let file = ctx.storage(StorageScope::Run).put(bytes, &mime, name, None).await?;
+        stored.insert(slot.to_string(), file);
+    }
+    let value = weft::storage::media::substitute_media(&value, declared, &stored);
+    Ok(declared.conform_value(value).map_err(|why| format!("{name} does not fit {declared}: {why}")))
 }
 
-/// The bytes an inline body key carries, and the media type when the
-/// key said one: a `data:` URL names it, bare base64 does not.
+/// The bytes an inline picture carries, and the media type when it said
+/// one: a `data:` URL names it, bare base64 does not.
 fn decode_inline(text: &str) -> Result<(Option<String>, Vec<u8>), String> {
     if let Some(rest) = text.strip_prefix("data:") {
         let (mime, payload) = rest

@@ -82,7 +82,6 @@
   ],
   "outputs": [],
   "features": {
-    "catchErrors": true,
     "canAddInputPorts": true,
     "canAddOutputPorts": true,
     "addedPortsAreDataKeys": true

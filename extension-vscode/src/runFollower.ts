@@ -35,7 +35,10 @@ import type {
   LoopTerminationReason,
   NodeFiringEvent,
   Seed,
+  ScopeDecidedEvent,
+  ScopeState,
   SkipReason,
+  StreamEnd,
 } from '../../packages/weft-graph/src/protocol';
 
 // A replay may stall while live updates keep arriving. Bound the waiting
@@ -55,9 +58,11 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'run_started'; runId: string; entryNode: string; phase: RunPhase; subgraph?: string[]; seed?: Seed; projectId: string; atUnix: number }
   // `inheritedFrom` is set when the firing was taken from the run this
   // one was seeded from (`weft run --seed`); `providedPorts` names the
-  // input ports supplied at a run's `--from` or `--group` start.
+  // input ports the run was given (a value handed in at a `--from` or
+  // `--group` start, or an output a node stood in with), `inheritedPorts`
+  // the ones a seed's saved result sent.
   // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
-  | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: unknown; closedPorts: string[]; providedPorts?: string[]; backupPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
+  | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: unknown; closedPorts: string[]; providedPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_suspended'; runId: string; node: string; frames: Frame[]; token: string; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_resumed'; runId: string; node: string; frames: Frame[]; token: string | null; inheritedFrom?: string; projectId: string; atUnix: number }
   // A wait of the firing ended, the first ending on record. A wait the run
@@ -68,6 +73,11 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'node_completed'; runId: string; node: string; frames: Frame[]; output: unknown; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_failed'; runId: string; node: string; frames: Frame[]; error: string; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_skipped'; runId: string; node: string; frames: Frame[]; closedPorts: string[]; reason: SkipReason; inheritedFrom?: string; projectId: string; atUnix: number }
+  // A copy of a scope (a group, an include's call site, an included
+  // body, a loop's iteration, at `frames`) was decided: open, or skipped
+  // with why. A group is no node, so the graph paints it from these.
+  // SYNC: DispatcherEvent scope_decided <-> crates/weft-core/src/live_event.rs DispatcherEvent::ScopeDecided, packages/weft-graph/src/protocol.ts ScopeDecidedEvent
+  | ({ kind: 'scope_decided'; runId: string; projectId: string; scope: string; frames: Frame[]; inheritedFrom?: string; atUnix: number } & ScopeState)
   | { kind: 'run_completed'; runId: string; projectId: string; outputs: unknown; atUnix: number }
   | { kind: 'run_failed'; runId: string; projectId: string; error: string; atUnix: number }
   | { kind: 'run_cancelled'; runId: string; projectId: string; reason: string; cause?: CancelCause; atUnix: number }
@@ -76,6 +86,11 @@ export type DispatcherEvent = { eventId: string } & (
   // journal and the questions it was parked on with it. No atUnix:
   // nothing was journaled, the journal is what went.
   | { kind: 'run_deleted'; runId: string; projectId: string }
+  // The run parked: every firing still open waits on a signal (a
+  // person, an outside job, a timer) and no worker drives it until an
+  // answer comes. Parking writes no journal row: a replay ends with it
+  // when the run is parked at the time of the read.
+  | { kind: 'run_parked'; runId: string; projectId: string }
   // Infra lifecycle. Emitted by the dispatcher's infra_event_bridge
   // from supervisor-written rows; drive action-bar refresh so
   // transient `stopping` / `terminating` states show up in the UI.
@@ -126,7 +141,8 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'bus_left'; runId: string; projectId: string; busId: string; offset: number; name: string; atUnix: number }
   // SYNC: DispatcherEvent 'bus_window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window'
   | { kind: 'bus_window'; runId: string; projectId: string; busId: string; firstOffset: number; lastOffset: number; messages: Array<{ offset: number; from: string; msgKind: string; payload?: WirePayload; payloadByteSize: number; trimmed?: boolean; atUnix: number }>; totals: Array<{ from: string; msgKind: string; count: number; bytes: number }>; atUnix: number }
-  | { kind: 'bus_closed'; runId: string; projectId: string; busId: string; offset: number; atUnix: number }
+  // SYNC: DispatcherEvent 'bus_closed' <-> crates/weft-journal/src/events.rs BusClosed, crates/weft-core/src/live_event.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed'
+  | { kind: 'bus_closed'; runId: string; projectId: string; busId: string; offset: number; end: StreamEnd; atUnix: number }
   // Live caller connection events. One caller per run (keyed by
   // run, no busId). The webview replays the caller exchange the same
   // way it replays a bus; `payload` is the same tagged WirePayload a
@@ -167,6 +183,13 @@ function identifiedEvent(value: unknown): DispatcherEvent {
 
 export type PostFn = (msg: HostMessage) => void;
 
+/** A followed run that has not ended, with the project it belongs to:
+ *  a display stream asks for its waits only on that project's stream. */
+export interface LiveRun {
+  runId: string;
+  projectId: string;
+}
+
 export class RunFollower implements vscode.Disposable {
   private eventSource: { close: () => void } | undefined;
   private generation = 0;
@@ -175,6 +198,18 @@ export class RunFollower implements vscode.Disposable {
   /// The run being followed, kept across a pause so coming back
   /// reopens it; cleared when the follow stops or is lost.
   private runId: string | undefined;
+  /// The followed run while it has not ended: its history is applied
+  /// and holds no terminal event, and no live one arrived since. What
+  /// `onLiveRun` listeners hear about.
+  private liveRun: LiveRun | undefined;
+  /// The project the followed run belongs to, from the first of its
+  /// events (every run event carries it); undefined until one arrived.
+  private runProject: string | undefined;
+  /// The followed run's history is applied: live events follow it.
+  private historyApplied = false;
+  /// The followed run's history or live stream carried its end.
+  private ended = false;
+  private readonly liveRunListeners: Array<(run: LiveRun | undefined) => void> = [];
 
   constructor(
     private readonly client: DispatcherClient,
@@ -185,6 +220,31 @@ export class RunFollower implements vscode.Disposable {
       if (paused) this.close();
       else if (this.runId) void this.start(this.runId);
     });
+  }
+
+  /** Hear which followed run has not ended yet, every time that
+   *  changes: a run once its history is applied without an end in it,
+   *  and once one of its events said which project it belongs to,
+   *  then undefined when it ends, the follow is lost or stopped, or
+   *  another run is followed. The graph asks for the displays of that
+   *  run's waits while it is set. */
+  onLiveRun(listener: (run: LiveRun | undefined) => void): void {
+    this.liveRunListeners.push(listener);
+  }
+
+  private setLiveRun(run: LiveRun | undefined): void {
+    // A run's project never changes, so its id says whether this changed.
+    if (run?.runId === this.liveRun?.runId) return;
+    this.liveRun = run;
+    for (const listener of this.liveRunListeners) listener(run);
+  }
+
+  /** Name the followed run live once its history is applied without an
+   *  end and its project is known. */
+  private announceLive(): void {
+    if (this.historyApplied && !this.ended && this.runId && this.runProject) {
+      this.setLiveRun({ runId: this.runId, projectId: this.runProject });
+    }
   }
 
   /** Hydrate a past run by replaying every journaled event up
@@ -203,6 +263,10 @@ export class RunFollower implements vscode.Disposable {
   private async start(runId: string): Promise<void> {
     this.close();
     this.runId = runId;
+    this.runProject = undefined;
+    this.historyApplied = false;
+    this.ended = false;
+    this.setLiveRun(undefined);
     this.post({ kind: 'runReset' });
     // Coming back opens it.
     if (this.pause.paused()) return;
@@ -313,12 +377,15 @@ export class RunFollower implements vscode.Disposable {
       buffering = false;
       for (const e of buffer) applyLive(e);
       buffer.length = 0;
+      this.historyApplied = true;
+      this.announceLive();
     }
   }
 
   /** Stop following: nothing reopens it. */
   stop(): void {
     this.runId = undefined;
+    this.setLiveRun(undefined);
     this.close();
   }
 
@@ -339,6 +406,7 @@ export class RunFollower implements vscode.Disposable {
   }
 
   private apply(e: DispatcherEvent): void {
+    this.runProject ??= e.projectId;
     switch (e.kind) {
       case 'node_started': {
         const firingEvent: NodeFiringEvent = {
@@ -349,7 +417,6 @@ export class RunFollower implements vscode.Disposable {
           input: e.input,
           closedPorts: e.closedPorts,
           providedPorts: e.providedPorts,
-          backupPorts: e.backupPorts,
           inheritedPorts: e.inheritedPorts,
           inheritedFrom: e.inheritedFrom,
         };
@@ -438,8 +505,18 @@ export class RunFollower implements vscode.Disposable {
         this.post({ kind: 'firingEvent', event: firingEvent });
         break;
       }
+      case 'scope_decided': {
+        const copy = { scope: e.scope, frames: e.frames, inheritedFrom: e.inheritedFrom, atUnix: e.atUnix };
+        const event: ScopeDecidedEvent = e.state === 'open'
+          ? { ...copy, state: 'open' }
+          : { ...copy, state: 'skipped', reason: e.reason };
+        this.post({ kind: 'scopeDecided', event });
+        break;
+      }
       case 'run_completed':
       case 'run_failed':
+        this.ended = true;
+        this.setLiveRun(undefined);
         this.post({
           kind: 'runTerminal',
           runId: e.runId,
@@ -448,6 +525,8 @@ export class RunFollower implements vscode.Disposable {
         });
         break;
       case 'run_cancelled':
+        this.ended = true;
+        this.setLiveRun(undefined);
         // A cancel carries why: the text and, on every row written since
         // the cause existed, the structured value (a sibling run's stop
         // names the run and the tag).
@@ -466,6 +545,12 @@ export class RunFollower implements vscode.Disposable {
       case 'run_deleted':
         // Nothing to paint: the host drops the follow if this was the
         // run on screen, and the tree and the bar re-read.
+        break;
+      case 'run_parked':
+        // Nothing to paint: every open firing already shows waiting
+        // from its own `node_suspended`, and the waits keep their
+        // displays. The host re-reads the bar and the runs tree, where
+        // the run now reads waiting.
         break;
       case 'bus_joined':
         // Forward `offset` on every bus event so the inspector can
@@ -529,7 +614,7 @@ export class RunFollower implements vscode.Disposable {
       case 'bus_closed':
         this.post({
           kind: 'busEvent',
-          event: { kind: 'closed', busId: e.busId, offset: e.offset, atUnix: e.atUnix },
+          event: { kind: 'closed', busId: e.busId, offset: e.offset, end: e.end, atUnix: e.atUnix },
         });
         break;
       case 'bus_participant':
@@ -695,5 +780,7 @@ export class RunFollower implements vscode.Disposable {
         return _exhaustive;
       }
     }
+    // A run whose history held no event learns its project here.
+    this.announceLive();
   }
 }

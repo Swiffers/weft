@@ -28,7 +28,7 @@ async fn an_include_runs_as_its_group_and_a_loop_goes_stale_whole() -> anyhow::R
     let settled = project.settled(run_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("triage.up")?.assert_completed("triage.unrelated")?.assert_untouched("src")?.assert_untouched("shout")?;
     settled.assert_input("triage.up", "text", &json!("quiet"))?;
-    anyhow::ensure!(summary_of(&stdout).contains("1 input backup"), "{}", summary_of(&stdout));
+    anyhow::ensure!(summary_of(&stdout).contains("1 handed value"), "{}", summary_of(&stdout));
 
     let stdout = project.weft(&["run", "--json", "--group", r#"triage={"text":"quiet"}"#, "--seed"]).await?;
     let reused = project.settled(run_id_of(&stdout)?).await?;

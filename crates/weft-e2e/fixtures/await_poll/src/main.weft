@@ -3,9 +3,10 @@
 # and the run resumes with the first answer whose status says done. Debug
 # receives the job's result.
 #
-# __E2E_FAKE_URL__ is substituted by the test with the job fake's status URL.
+# __E2E_FAKE_URL__ and __E2E_CANCEL_URL__ are substituted by the test with
+# the job fake's status and cancel URLs.
 
-job = AwaitJob { url: "__E2E_FAKE_URL__" }
+job = AwaitJob { url: "__E2E_FAKE_URL__", cancelUrl: "__E2E_CANCEL_URL__" }
 
 out = Debug
 out.data = job.result

@@ -21,9 +21,11 @@
 /// `includes_other`. Stopping at whitespace too means a bare `@name` whose
 /// `(args)` split off across a space (the lexer never folds a spaced paren into
 /// the token) still yields the clean name `name`, so the consumer matches the
-/// directive and then fails loud on the now-missing args.
+/// directive and then fails loud on the now-missing args. Text that does
+/// not start with `@` names no directive (empty): `"file"` written as a
+/// value is the word, never a broken `@file`.
 pub fn directive(marker_text: &str) -> &str {
-    let after_at = marker_text.trim_start().trim_start_matches('@');
+    let Some(after_at) = marker_text.trim_start().strip_prefix('@') else { return "" };
     let end = after_at
         .find(|c: char| c == '(' || c.is_whitespace())
         .unwrap_or(after_at.len());

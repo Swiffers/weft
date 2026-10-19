@@ -133,9 +133,9 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_page(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&NotionCreatePageNode, page_inputs(&rig)).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("Could not find page"), "{error}");
     for port in ["pageId", "url"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");

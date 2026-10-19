@@ -336,6 +336,8 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/runs/{run_id}/cancel", post(run::cancel))
         // Resolve a pure time wait now (`weft wake`).
         .route("/runs/{run_id}/wake/{node}", post(run::wake))
+        // Where one node of the run stands (`weft node-state`).
+        .route("/runs/{run_id}/nodes/{node}/state", get(run::node_state))
         .route("/runs/{run_id}/logs", get(run::list_logs))
         .route("/runs/{run_id}/replay", get(run::replay))
         .route("/runs/{run_id}/outputs", get(run::outputs))

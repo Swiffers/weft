@@ -18,11 +18,11 @@
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems, instanceFilledMenuItem, type InstanceFilledToggle } from "../../utils/port-context-menu";
-	import { portMarkerStyle } from "../../utils/port-marker";
+	import { portMarkerStyle, requirednessNote } from "../../utils/port-marker";
 	import { isScopeKey } from "../../utils/storage-key";
 	import { nodeIsTrigger } from "../../utils/node-roles";
-	import { portDeleteAction } from "../../projection/header-ports";
-	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
+	import { declarationRule, nodeInputRequiredness, portDeleteAction } from "../../projection/header-ports";
+	import { errorMarker, fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputRows, outputsOf } from "../../utils/input-field";
 	import FiringInspector from './FiringInspector.svelte';
 	import PayloadCards from './PayloadCards.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
@@ -30,12 +30,14 @@
 	import FileDropField from './FileDropField.svelte';
 	import AccessField from './AccessField.svelte';
 	import { changeInstallPick, effectiveAccessValue } from './install-picks.svelte';
+	import { accessFeedingEdge } from '../../utils/access-trace';
 	import RemoteSelectField from './RemoteSelectField.svelte';
 	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import FlowDock from './FlowDock.svelte';
+	import ErrorDock from './ErrorDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -60,6 +62,9 @@
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: NodeFeatures;
+			/// The bounds on the node's type variables, each with what it
+			/// resolved to; absent on a node not parsed yet.
+			typeParams?: import('../../../../protocol').TypeParamWire[];
 			/// The unconnected-access pin (view state from buildNodes,
 			/// never a config key): drawn open, collapse disabled.
 			pinnedOpen?: boolean;
@@ -392,11 +397,14 @@
 	}
 
 	// Inputs only: requiredness has no runtime meaning on an output, and
-	// the menu offers the row on inputs alone.
+	// the menu offers the row on inputs alone. Either way the port ends up
+	// WRITTEN: `x:` (required) or `x?:` (optional, even when wired).
 	function setInputPortRequired(portName: string, required: boolean) {
-		const newInputs = inputs.map((p: PortDefinition) =>
-			p.name === portName ? { ...p, required } : { ...p }
-		);
+		const newInputs = inputs.map((p: PortDefinition) => {
+			if (p.name !== portName) return { ...p };
+			const { optional: _was, ...rest } = p;
+			return required ? { ...rest, required } : { ...rest, required, optional: true };
+		});
 		data.onUpdate?.({ inputs: newInputs });
 	}
 	
@@ -420,7 +428,11 @@
 			return buildPortMenuItems({
 				port,
 				...(side === 'input'
-					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					? {
+						side,
+						requiredness: nodeInputRequiredness(port, typeConfig.defaultInputs.find((d) => d.name === port.name)),
+						onSetRequired: (required: boolean) => setInputPortRequired(portName, required),
+					}
 					: { side }),
 				deleteAction: portDeleteAction(port, provided, canAddPorts),
 				// Derived-ness is per PORT (only the ports the config list
@@ -430,6 +442,7 @@
 				configDerived: derivedNames.some((d) => d.name === port.name)
 					&& port.declaredType === undefined,
 				onSetType: (newType) => setPortType(portName, side, newType),
+				typeRule: declarationRule(side, provided.find((d) => d.name === port.name), data.typeParams ?? typeConfig.typeParams),
 				instanceFilled: side === 'input' ? instanceFilledToggle(portName) ?? undefined : undefined,
 				onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
 			});
@@ -480,12 +493,17 @@
 		(p: PortDefinition) => acceptsWire(p) && !isGatePort(p.name)
 	));
 	const outputs = $derived(outputsOf(data.outputs));
+	/** Outputs that render a ROW: all but `_error`, which docks on the
+	 *  right edge as a marker (`errorDock`). `outputs` stays the
+	 *  COMPLETE list (edits round-trip the full set). */
+	const rowOutputs = $derived(outputRows(outputs));
+	const errorDockState = $derived(errorMarker(id, outputs, edgesState.current));
 
 	// Dynamic min resize height: header + ports + fixed buffer for at least one config line
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
 	const PORT_ROW_HEIGHT = 25;
 	const minResizeHeight = $derived(
-		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, outputs.length) * PORT_ROW_HEIGHT + 80
+		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, rowOutputs.length) * PORT_ROW_HEIGHT + 80
 	);
 	
 	// Check if node allows adding ports based on its features
@@ -943,9 +961,7 @@
 				handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 			return typeof grantId === 'string' ? { accessId: grantId, service } : null;
 		}
-		const edge = edgesState.current.find(
-			(e: Edge) => e.target === id && e.targetHandle === accessInput,
-		);
+		const edge = accessFeedingEdge(edgesState.current as Edge[], id, accessInput);
 		if (!edge) return null;
 		const src = nodesState.current.find((n) => n.id === edge.source);
 		if (!src) return null;
@@ -1359,10 +1375,14 @@
 			toast.error(`"${name}" is already an input of this node`);
 			return;
 		}
+		// No type chosen yet: the header names the port alone (`name?`), and
+		// the port holds its own variable until something is wired to it.
 		const newPort: PortDefinition = {
 			name,
-			portType: 'MustOverride',
+			portType: portVar('input', name),
+			declaredType: '',
 			required: false,
+			optional: true,
 		};
 		const newInputs = [...inputs, newPort];
 		if (data.onUpdate) {
@@ -1381,7 +1401,8 @@
 		}
 		const newPort: PortDefinition = {
 			name,
-			portType: 'MustOverride',
+			portType: portVar('output', name),
+			declaredType: '',
 			required: true,
 		};
 		const newOutputs = [...outputs, newPort];
@@ -1659,6 +1680,15 @@
 	/>
 {/snippet}
 
+<!-- Error dock: `_error` carries why this node failed, so it sits apart
+     from the node's own outputs, as a "!" circle on the right edge level
+     with the flow dock. Filled means a wire handles the failure. -->
+{#snippet errorDock()}
+	{#if errorDockState}
+		<ErrorDock top={18} wired={errorDockState.wired} />
+	{/if}
+{/snippet}
+
 {#if data.simplified}
 	<!-- Simplified view. A bare node is a square: icon, type, editable label, one
 	     in/out dot. A node with LIVE DISPLAY content (infra feed, debug preview,
@@ -1924,9 +1954,9 @@
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						class="relative flex items-center gap-1 group pl-3"
-						title={input.requiredWhenWired
-							? `${input.name}: required when wired (if its wire delivers nothing, this node skips); optional while unwired`
-							: !input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+						title={!input.required && oneOfRequiredPorts.has(input.name)
+							? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}`
+							: requirednessNote(input, wiredInputPorts.has(input.name)) ?? input.name}
 						oncontextmenu={(e) => {
 							e.preventDefault();
 							e.stopPropagation();
@@ -1978,7 +2008,7 @@
 			
 			<!-- Output Ports -->
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
-				{#each outputs as output}
+				{#each rowOutputs as output}
 				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
 				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, canAddOutputPorts)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2439,6 +2469,7 @@
 </div>
 
 {@render flowDock()}
+{@render errorDock()}
 
 {/if}
 

@@ -235,8 +235,12 @@ async fn part_bytes(
 /// A fetched message, decomposed for node outputs.
 pub struct ReadMessage {
     pub msg: Value,
+    /// The text body, cut at the node's `maxBodyChars` and to what a
+    /// wire carries.
     pub body: String,
     pub body_is_html: bool,
+    /// Whether `body` was cut.
+    pub body_truncated: bool,
     /// Stored-file values, one per attachment (empty when not asked).
     pub files: Vec<Value>,
 }
@@ -254,22 +258,27 @@ impl ReadMessage {
             .set("date", header(payload, "Date").unwrap_or_default().to_string())
             .set("body", self.body)
             .set("bodyIsHtml", self.body_is_html)
+            .set("bodyTruncated", self.body_truncated)
             .set("threadId", self.msg["threadId"].as_str().unwrap_or_default().to_string())
             .set("snippet", self.msg["snippet"].as_str().unwrap_or_default().to_string())
-            .set("labels", self.msg["labelIds"].clone())
+            // Google's JSON leaves an empty list out, so a message with
+            // no label carries no `labelIds` at all.
+            .set("labels", if self.msg["labelIds"].is_null() { Value::Array(Vec::new()) } else { self.msg["labelIds"].clone() })
             .set("attachments", Value::Array(self.files))
     }
 }
 
 /// Fetch one message (format=full) and decompose it: the best text
-/// body, and (optionally) every attachment pulled into run
-/// storage. Shared by the get node and the new-email trigger so the
-/// two emit identical shapes.
+/// body, cut at `max_body_chars` characters and to what one wire
+/// carries (an HTML newsletter alone can weigh more), and (optionally)
+/// every attachment pulled into run storage. Shared by the get node and
+/// the new-email trigger so the two emit identical shapes.
 pub async fn read_message(
     ctx: &weft::RunContext,
     http: &weft::reqwest_middleware::ClientWithMiddleware,
     id: &str,
     include_attachments: bool,
+    max_body_chars: usize,
 ) -> WeftResult<ReadMessage> {
     use weft::access::client::get_json;
     let msg: Value = get_json(
@@ -279,13 +288,15 @@ pub async fn read_message(
     )
     .await?;
     let payload = &msg["payload"];
-    let (body, body_is_html) = match body_leaf(payload) {
+    let (body, body_is_html, body_truncated) = match body_leaf(payload) {
         Some((leaf, is_html)) => {
             // No bytes at all is Gmail's shape for an empty part.
             let bytes = part_bytes(http, id, leaf, "the message body").await?.unwrap_or_default();
-            (String::from_utf8_lossy(&bytes).into_owned(), is_html)
+            let text = String::from_utf8_lossy(&bytes);
+            let (kept, cut) = weft::storage::cap_text(&text, max_body_chars);
+            (kept.to_string(), is_html, cut)
         }
-        None => (String::new(), false),
+        None => (String::new(), false, false),
     };
 
     let mut files = Vec::new();
@@ -315,7 +326,7 @@ pub async fn read_message(
             );
         }
     }
-    Ok(ReadMessage { msg, body, body_is_html, files })
+    Ok(ReadMessage { msg, body, body_is_html, body_truncated, files })
 }
 
 // This file is a package-level SHARED helper, not a node, so its unit

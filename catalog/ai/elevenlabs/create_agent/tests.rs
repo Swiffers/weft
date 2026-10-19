@@ -365,7 +365,7 @@ async fn json_inputs_merge(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let servers: Vec<String> = (0..11).map(|i| format!("mcp-{i}")).collect();
     for (extra, says) in [
         (json!({ "mcpServerIds": servers }), "at most 10"),
@@ -389,7 +389,7 @@ async fn refused(rig: FakeRig) -> WeftResult<()> {
         (json!({ "ttsModel": "eleven_multilingual_v2" }), "not 'eleven_multilingual_v2'"),
     ] {
         let err = rig.run(&ElevenLabsCreateAgentNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent");

@@ -112,24 +112,82 @@ sends nothing at all. A key set to `None` sends a real null on an output whose
 type takes `Null` (`last: JsonDict | Null`), and nothing on any other output.
 
 If you want the program to carry on when the script raises (a request it
-makes fails, or it raises on purpose), wire the node's `error` output: the
+makes fails, or it raises on purpose), wire the node's `_error` output: the
 exception's type, message and traceback come out there, and the other outputs
 send nothing. Left unwired, the exception fails the run. A mistake in the
 program fails the run either way: code that does not compile, a script that
 ends without returning a dictionary, a key that is not one of its outputs, or a
-value of the wrong type for its output. `error` counts as a key it may not
-return, since weft fills it; to fail on purpose, raise.
+value of the wrong type for its output. `_error` counts as a key it may not
+return, since weft fills it; to fail on purpose, raise. `_error` is not only
+for scripts: every node has one. For which failures reach it, go and read
+[when a node fails](how-a-program-runs.md#when-a-node-fails).
 
 You can only declare the ports a node leaves open for you. Ports whose types
 are already fixed keep them. Declare inputs, outputs, or both:
 
 ```weft
-answer = LlmInference -> (response: String)
+answer = LlmInferenceJson -> (response: { label: String })
 convert = Cast -> (value: Boolean)
 ```
 
 Those are fragments: the nodes still need their other required inputs before
 they can run.
+
+### Optional and required inputs
+
+A node's metadata says which of its inputs it can run without. Where you use
+the node, you can declare the input yourself: without `?` it is required, and
+with `?` the node runs without it. If the metadata requires that input, the `?`
+is a compile error.
+
+| What the node's metadata says | What the program writes | Result |
+|---|---|---|
+| required | nothing | always required |
+| required | `x?: T` | compile error naming the port: the node's code needs it |
+| optional | nothing | unwired: runs without it. Wired: waits for it, and skips if the wire closes |
+| optional | `x: T` (no `?`) | always required |
+| optional | `x?: T` | runs without it even when wired and the wire closed, whether nothing arrived or the source failed |
+
+A wire closes when its source finished without sending on that port, or
+failed. A node that skips closes its own outputs in turn. A `?` lets a node run
+without a failed source's value, but the failure still fails the run unless
+that source's `_error` is wired (go and read [when a node
+fails](how-a-program-runs.md#when-a-node-fails)).
+
+One exception to the table: an input in one of the node's `oneOfRequired`
+sets (or in a `@require_one_of` you wrote on it) is decided by its set. The
+node skips only when every member of the set closed, unless you declared that
+input without `?`.
+
+If you want the build to refuse a node until something fills an input,
+declare that input without `?`. `SlackSendMessage` takes `text` or `blocks`, so neither is
+required on its own, but this message must have text:
+
+```weft
+send = SlackSendMessage(text: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+}
+```
+
+Leave `text` out and `weft validate` refuses `send`: `required input
+'send.text' has no driver (no edge, no body value, no default)`.
+
+If you want a node to run when a wire into it brings nothing, write the `?`.
+Here `ask` is a `SlackReceiveMessage`, whose `thread` sends nothing when the
+message was not in a thread. With `threadTs?`, such a message gets its answer
+at the top of the channel. Without the `?`, `answer` waits for `threadTs` and
+skips:
+
+```weft
+answer = SlackSendMessage(threadTs?: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+  threadTs: ask.thread
+}
+```
 
 ### Extra inputs
 
@@ -149,9 +207,11 @@ summary = ExecPython -> (out: String) {
 `limit` becomes a `Number`. `text` takes whatever type `draft.answer` has. A
 bare `null` gives it nothing to work from, so that fails.
 
-The `?` on `notes?` makes it optional, so a closed arrow there does not skip
-the node. That spelling only works when you are creating the port; to make a
-port optional in a full signature, write `notes?: String` there instead.
+The `?` on `notes?` works like `x?: T` in the table above: the node runs
+without `notes` even when its wire closes. Without the `?`, a port you create
+this way is required. That spelling only works when you are creating the port;
+for a port the node already has, write the `?` in the signature, like
+`(threadTs?: String)`.
 
 Extra inputs stay in the order you wrote them, which matters for
 `FirstInOrder`, since it takes the first one that supplied a value.
@@ -289,9 +349,9 @@ The gates, `_should_flow` and `_should_not_flow`, are the language's own names,
 so this warning skips them.
 
 If the ports you add are named after data from outside weft, you can keep that
-data's own spelling on a node built for it: `post = Route -> (user_id: String)`
-draws no `not-camel-case` warning for `user_id`, though the name you give the
-node, `post`, is still checked. A few nodes that ship with weft let you do this (`Route` for a request body's fields, `JsonObject` for the keys
+data's own spelling on a node built for it: `body = JsonObject { user_id:
+ask.id }` draws no `not-camel-case` warning for `user_id`, though the name you
+give the node, `body`, is still checked. A few nodes that ship with weft let you do this (`Route` for its path's captures, `JsonObject` for the keys
 of the object it builds, among others), because each one sets
 `addedPortsAreDataKeys` in its `metadata.json`. For the full list, go and read
 [the `addedPortsAreDataKeys` row in the features table](../nodes/metadata.md#features).

@@ -61,6 +61,7 @@
     {
       "name": "message",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The full Telegram message object."
     }
   ],

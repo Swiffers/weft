@@ -1,7 +1,7 @@
 {
   "type": "WebSearch",
   "label": "Web Search",
-  "description": "Search the web (semantic or keyword, picked per query) and get results with their page text, ready for an LLM node. Uses Exa.",
+  "description": "Search the web (semantic or keyword, picked per query) and get results with their page text, ready for an LLM node. Uses Exa. Each text is cut at `maxTextChars`, and the longest ones shorter still when the results would weigh more than the 100 KB a wire carries.",
   "tags": [
     "web",
     "search"
@@ -50,7 +50,7 @@
         "step": 1
       },
       "label": "Text per result",
-      "description": "Max page-text characters per result. `numResults` times this (plus titles and URLs) must stay under the 100 KB wire limit; the default keeps ten results near 40 KB. Ignored when `includeText` is off."
+      "description": "Max page-text characters per result. `numResults` times this must be at most 102,400 (the 100 KB a wire carries), or the node refuses before searching; the default keeps ten results near 40 KB. Text in a script that takes several bytes a character (Chinese, Japanese) weighs more, and the longest texts are then cut shorter to fit. Ignored when `includeText` is off."
     },
     {
       "name": "includeDomains",
@@ -61,15 +61,12 @@
   "outputs": [
     {
       "name": "results",
-      "type": "List[JsonDict]",
+      "type": "List[{ title: String | Null, url: String, publishedDate: String | Null, text: String | Null }]",
       "description": "Each result: title, url, publishedDate, text."
     },
     {
       "name": "count",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

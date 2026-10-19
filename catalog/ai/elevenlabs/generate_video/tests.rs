@@ -148,9 +148,9 @@ async fn failed(rig: FakeRig) -> WeftResult<()> {
 
 async fn failed_caught(rig: FakeRig) -> WeftResult<()> {
     fails(&rig, "video", "v5", "timeout", "Timed out while processing.");
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&ElevenLabsGenerateVideoNode, inputs(&rig, json!({}))).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("timeout"), "{error}");
     assert!(error.contains("Timed out while processing."), "{error}");
     assert!(!outcome.outputs.contains_key("video"), "a caught failure emits no video");

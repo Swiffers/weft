@@ -1,14 +1,17 @@
-//! Layer-4: a `_should_flow` wire from a route into a group's door runs
-//! everything behind the door. The `gated_include` fixture answers one
+//! Layer-4: a `_should_flow` wire from a route onto a group's gate runs
+//! everything in the group. The `gated_include` fixture answers one
 //! route from inside a plain group and another from inside an included
 //! file, and nothing but the `_should_flow` wire connects either to its
 //! route. Before the fix the fire's program held only the route and the
-//! door, and every caller got "the run ended without answering".
+//! gate, and every caller got "the run ended without answering".
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
 use serde_json::{json, Value};
 use weft_e2e::{ensure, live, run, project::Project};
+
+mod common;
+use common::run_id_of;
 
 #[tokio::test]
 async fn a_group_gated_by_a_route_answers_it() -> anyhow::Result<()> {
@@ -36,10 +39,8 @@ async fn a_group_gated_by_a_route_answers_it() -> anyhow::Result<()> {
     for run_id in run_ids {
         let settled = project.settled(run_id).await?;
         settled.completed()?;
-        // `body` has no wire into it: the pre-run root list and the
-        // group's own launcher both kick it, at the same place, and the
-        // two kicks are one firing (a loop body is the case where they
-        // are not, covered by `loops`).
+        // `body` has no wire into it: the group starts it as it opens,
+        // once.
         if settled.events_of("work.answer").next().is_some() {
             seen.0 = true;
             settled.assert_completed("work.body")?;
@@ -56,6 +57,25 @@ async fn a_group_gated_by_a_route_answers_it() -> anyhow::Result<()> {
             anyhow::ensure!(fired == 1, "deep.body fired {fired} times");
         }
     }
-    anyhow::ensure!(seen == (true, true), "one fire per door");
+    anyhow::ensure!(seen == (true, true), "one fire per route");
+    project.finish().await
+}
+
+/// A node inside a group whose gate only the route feeds runs by hand: a
+/// run the route did not start drops the gate's wire, the gate keeps its
+/// default, and the group runs. The route itself never runs.
+#[tokio::test]
+async fn a_node_in_a_group_gated_by_a_route_runs_by_hand_on_the_default_gate() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let project = Project::prepare("gated_include", disp.clone()).await?;
+    project.unique_live_path()?;
+
+    let stdout = project.weft(&["run", "--json", "--from", "work.body", "--target", "work.body"]).await?;
+    let run_id = run_id_of(&stdout)?;
+    let settled = project.settled(run_id).await?;
+    settled.completed()?;
+    settled.assert_completed("work.body")?;
+    settled.assert_untouched("work.answer")?;
+    settled.assert_untouched("grouped")?;
     project.finish().await
 }

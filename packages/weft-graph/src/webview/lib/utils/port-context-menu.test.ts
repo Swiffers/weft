@@ -7,7 +7,7 @@ import type { PortDefinition } from '../types';
 // rows are notes with no action.
 
 const port: PortDefinition = { name: 'data', portType: 'String', required: false };
-const asInput: PortMenuSide = { side: 'input', onSetRequired: () => {} };
+const asInput: PortMenuSide = { side: 'input', requiredness: 'optional', onSetRequired: () => {} };
 
 function build(over: Partial<BasePortMenuOptions> = {}, side: PortMenuSide = asInput): PortMenuItem[] {
 	return buildPortMenuItems({
@@ -39,7 +39,7 @@ describe('buildPortMenuItems', () => {
 		// under the open menu, a toggle would write the opposite of the
 		// row's text. The row asks for exactly the promised state.
 		const written: boolean[] = [];
-		const items = build({}, { side: 'input', onSetRequired: (r) => written.push(r) });
+		const items = build({}, { side: 'input', requiredness: 'optional', onSetRequired: (r) => written.push(r) });
 		const row = items[0];
 		if (row.note !== true) row.onClick();
 		expect(written).toEqual([true]);
@@ -54,12 +54,31 @@ describe('buildPortMenuItems', () => {
 		expect(labels(items)).toContain('an input of the same name conflicts');
 	});
 
-	it('an input required only once wired offers no required toggle, only why', () => {
-		const items = build({ port: { ...port, requiredWhenWired: true } });
-		expect(labels(items)).not.toContain('☑ Make required');
-		expect(labels(items)).not.toContain('☐ Make optional');
-		expect(notes(items).map((n) => n.label)).toEqual(['Required when wired, optional while unwired: its wiring decides.']);
-		expect(labels(items)).toContain('✎ Type: String');
+	it('an input the node requires offers no way to make it optional, only why', () => {
+		const items = build({ port: { ...port, required: true } }, { side: 'input', requiredness: 'node_requires', onSetRequired: () => {} });
+		expect(labels(items)).toEqual(['Required: this node’s code needs it.', '✎ Type: String']);
+		expect(notes(items)).toHaveLength(1);
+	});
+
+	it('an input the program wrote `x:` offers to make it optional, writing `x?:`', () => {
+		const written: boolean[] = [];
+		const items = build({ port: { ...port, required: true } }, { side: 'input', requiredness: 'required', onSetRequired: (r) => written.push(r) });
+		expect(labels(items)).toEqual(['☐ Make optional', '✎ Type: String']);
+		if (items[0].note !== true) items[0].onClick();
+		expect(written).toEqual([false]);
+	});
+
+	it('an input the program never wrote says its wiring decides and offers both written states', () => {
+		const written: boolean[] = [];
+		const items = build({}, { side: 'input', requiredness: 'wiring', onSetRequired: (r) => written.push(r) });
+		expect(labels(items)).toEqual([
+			'Optional while unwired; once wired, the node skips if its wire delivers nothing.',
+			'☑ Make required',
+			'☐ Make optional, even when wired',
+			'✎ Type: String',
+		]);
+		for (const item of actions(items).slice(0, 2)) if (item.note !== true) item.onClick();
+		expect(written).toEqual([true, false]);
 	});
 
 	it('an output has no required toggle', () => {

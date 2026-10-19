@@ -1,0 +1,80 @@
+{
+  "type": "OpenRouterModel",
+  "label": "OpenRouter Model",
+  "description": "Pick an OpenRouter model to serve LLM calls, on the connection an OpenRouter Access node holds; wire the provider output into any LLM node, one model node for however many calls.",
+  "tags": [
+    "ai",
+    "provider",
+    "model",
+    "llm"
+  ],
+  "icon": "Cpu",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "The OpenRouter connection: wire an OpenRouter Access node's `access`."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "access",
+        "freeText": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://openrouter.ai/api/v1/models",
+            "items": "data",
+            "label": "id",
+            "value": "id",
+            "public": true
+          }
+        ]
+      },
+      "label": "Model",
+      "placeholder": "deepseek/deepseek-v4-flash-0731"
+    },
+    {
+      "name": "servingProvider",
+      "type": "String",
+      "label": "Serving provider",
+      "placeholder": "(any)",
+      "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price."
+    },
+    {
+      "name": "providerFallbacks",
+      "type": "Boolean",
+      "label": "Allow provider fallbacks",
+      "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top choice) is unavailable. Off makes the call fail rather than be served and billed by someone else."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "description": "Wire it into an LLM node's provider input."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
+          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+        ]
+      },
+      "then": {
+        "message": "OpenRouterModel '{id}' has no model; name one on the node or wire one in.",
+        "level": "runtime",
+        "field": "model"
+      }
+    }
+  ]
+}

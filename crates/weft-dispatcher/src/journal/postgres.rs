@@ -220,7 +220,7 @@ async fn cancel_unowned_in(
 /// one schema pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "run",
-    tables: &["run", "run_log", "run_selection", "signal_token", "signal", "run_tag", "trigger_setup", "trigger_bake"],
+    tables: &["run", "run_log", "signal_token", "signal", "run_tag", "trigger_setup", "trigger_bake"],
     ddl: &[
         // One row per trigger setup in flight. Several may run at once for
         // one project (each activation claims its own triggers, one instance's
@@ -275,10 +275,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             source_version TEXT,
             -- NULL for a run of no program (a node test).
             definition_hash TEXT,
+            -- For a run of a cut, the registered program it was cut from:
+            -- the program its triggers arm and its results are held against.
+            cut_from TEXT,
             binary_hash TEXT,
-            -- The digest of its selection (`run_selection`), NULL for a run
-            -- of the whole program.
-            selection TEXT,
             -- The run it was seeded from (`weft run --seed`), the places
             -- it ran again rather than inherit, what it was asked to run
             -- (`weft_core::run_spec::RunSpec`, as resolved) and the saved
@@ -420,12 +420,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         // Already compressed: Postgres compressing it again gains nothing.
         r#"ALTER TABLE run_log ALTER COLUMN events SET STORAGE EXTERNAL"#,
-        // Each run selection once, by digest
-        // (`weft_core::project::selection::RecordedSelection`).
-        r#"CREATE TABLE IF NOT EXISTS run_selection (
-            digest TEXT PRIMARY KEY,
-            selection JSONB NOT NULL
-        )"#,
         // signal_token: token-scoped enumeration credential. Allow
         // sets are TEXT[] arrays so parameterized binding gives no
         // SQL-injection surface and the filter SQL is a single `&&`
@@ -777,6 +771,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // waits on it (`p_durable`, a durable run at a commit point); a
         // batch of fast runs commits without waiting for the disk.
         //
+        // The cut programs the batch's births run (`p_programs`) go in with
+        // the runs that went in naming them, in the same transaction, each
+        // once, marked with what they were cut from (`p_born`'s
+        // `cut_from`), so no run is ever on record without its program and
+        // no program is kept that no run on record runs.
         // Per run (the `p_ids` arrays, aligned; `p_born` and `p_ended` are
         // JSON arrays aligned the same way, `null` where it does not apply):
         //   - a run that starts here (`first_seq = 0`) is inserted, already
@@ -809,7 +808,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 p_costs BIGINT[], p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB, p_ended JSONB,
                 p_row_run INTEGER[], p_row_seq INTEGER[], p_row_events BYTEA[],
                 p_resolved_run INTEGER[], p_resolved_token TEXT[],
-                p_selections JSONB
+                p_programs JSONB
             ) RETURNS TABLE (o_run_id UUID, o_fate TEXT, o_project_id UUID, o_tell_end BOOLEAN, o_keep_until BIGINT,
                              o_unwatched BOOLEAN) AS $$
             DECLARE
@@ -818,9 +817,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 v_writer_alive BOOLEAN := TRUE;
             BEGIN
                 PERFORM set_config('synchronous_commit', CASE WHEN p_durable THEN 'on' ELSE 'off' END, true);
-                INSERT INTO run_selection (digest, selection)
-                    SELECT s->>'digest', s->'selection' FROM jsonb_array_elements(p_selections) AS s
-                    ON CONFLICT (digest) DO NOTHING;
                 PERFORM 1 FROM run r WHERE r.run_id = ANY(p_ids) ORDER BY r.run_id FOR UPDATE;
                 SELECT array_agg(CASE
                         WHEN v.first_seq = 0 AND r.run_id IS NULL THEN 'insert'
@@ -835,13 +831,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     LEFT JOIN run r ON r.run_id = v.id;
                 WITH born AS (
                     INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node,
-                                     instance_id, fired_by, source_version, definition_hash, binary_hash, selection,
+                                     instance_id, fired_by, source_version, definition_hash, cut_from, binary_hash,
                                      seed_of, state, owner, epoch, last_seq, started_at, ended_at, outcome, error,
                                      cancel_cause, skipped, wrote_files, cost_micro_usd, keep_for, keep_until,
                                      delivered_until)
                     SELECT v.id, (x.b->>'project_id')::uuid, p_tenant, x.b->>'phase', x.b->>'kind', x.b->>'keeping',
                            (x.b->>'recorded')::boolean, x.b->>'entry_node', x.b->>'instance_id', x.b->>'fired_by',
-                           x.b->>'source_version', x.b->>'definition_hash', x.b->>'binary_hash', x.b->>'selection',
+                           x.b->>'source_version', x.b->>'definition_hash', x.b->>'cut_from', x.b->>'binary_hash',
                            (x.b->>'seed_of')::uuid,
                            CASE WHEN x.e IS NULL THEN 'running' ELSE 'ended' END,
                            CASE WHEN x.e IS NULL THEN p_writer END,
@@ -873,6 +869,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                         LEFT JOIN run r ON r.run_id = v.id
                         LEFT JOIN project p ON p.id = (p_born->(v.n::integer - 1)->>'project_id')::uuid;
                 END IF;
+                -- A cut is kept only for a run born now that runs it,
+                -- marked with the registered program it was cut from: a
+                -- refused birth keeps nothing, and nothing but a cut a
+                -- birth names goes in.
+                INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from)
+                    SELECT r.project_id, r.definition_hash, c->>'project_json', p_now, r.cut_from
+                    FROM jsonb_array_elements(p_programs) AS c
+                        JOIN unnest(p_ids, v_fates) AS v(id, fate) ON v.fate = 'insert'
+                        JOIN run r ON r.run_id = v.id
+                    WHERE r.project_id = (c->>'project_id')::uuid AND r.definition_hash = c->>'definition_hash'
+                      AND r.cut_from IS NOT NULL
+                    ON CONFLICT (project_id, definition_hash) DO NOTHING;
                 UPDATE run r SET
                         last_seq = v.last_seq,
                         cost_micro_usd = r.cost_micro_usd + v.costs,
@@ -949,27 +957,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     ORDER BY v.n;
             END;
             $$ LANGUAGE plpgsql"#),
-        // The write as the previous release's brokers call it, which they
-        // do while an upgrade rolls out: no grace for a run born running
-        // (their workers tick before they bear one), no erase time in the
-        // answer, and a birth for a project being removed answered as
-        // refused, the one fate they read for it. The release after this
-        // one drops it.
-        r#"CREATE OR REPLACE FUNCTION weft_record_batch(
-                p_writer TEXT, p_tenant TEXT, p_lane TEXT, p_now BIGINT, p_durable BOOLEAN,
-                p_ids UUID[], p_epochs INTEGER[], p_first INTEGER[], p_last INTEGER[],
-                p_costs BIGINT[], p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB, p_ended JSONB,
-                p_row_run INTEGER[], p_row_seq INTEGER[], p_row_events BYTEA[],
-                p_resolved_run INTEGER[], p_resolved_token TEXT[],
-                p_selections JSONB
-            ) RETURNS TABLE (o_run_id UUID, o_fate TEXT, o_project_id UUID, o_tell_end BOOLEAN) AS $$
-                SELECT b.o_run_id, CASE WHEN b.o_fate = 'project_removing' THEN 'refused' ELSE b.o_fate END,
-                       b.o_project_id, b.o_tell_end
-                FROM weft_record_batch(p_writer, p_tenant, p_lane, p_now, NULL::bigint, p_durable,
-                                       p_ids, p_epochs, p_first, p_last, p_costs, p_skipped, p_wrote, p_born, p_ended,
-                                       p_row_run, p_row_seq, p_row_events, p_resolved_run, p_resolved_token,
-                                       p_selections) AS b
-            $$ LANGUAGE sql"#,
     ],
     seed: &[],
 };
@@ -1086,14 +1073,10 @@ impl Journal for PostgresJournal {
         // in the same order.
         let locked = weft_journal::record::lock_in(&mut tx, run_id).await?;
         // The wake signals go: a fire that resolves its signal row after
-        // this commits finds nothing to wake.
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
-            .bind(run_id)
-            .fetch_all(&mut *tx)
-            .await
-            .context("cancel_run: strip the run's signals: read a signal row")?;
-        let removed: Vec<SignalRegistration> = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
-        let mut write = CancelWrite { removed, ..CancelWrite::default() };
+        // this commits finds nothing to wake. The run is cancelled, so each
+        // wait's last call is queued with them.
+        let (removed, cancel_calls) = remove_run_waits_in(&mut tx, run_id, true).await.context("cancel_run")?;
+        let mut write = CancelWrite { removed, cancel_calls, ..CancelWrite::default() };
         match locked {
             Some(locked) if locked.state == "ended" => {}
             Some(locked) if locked.owner.is_some() => {
@@ -1140,10 +1123,10 @@ impl Journal for PostgresJournal {
             return Ok(Lost::NotLost);
         }
         // Its owner still holds it (`weft_task_store::run_held_until_sql!`).
-        let held: bool = sqlx::query_scalar(concat!(
+        let (held, cancel_requested): (bool, Option<sqlx::types::Json<weft_core::run::CancelCause>>) = sqlx::query_as(concat!(
             "SELECT ",
             weft_task_store::run_held_until_sql!("r"),
-            " >= $2 FROM run r WHERE r.run_id = $1"
+            " >= $2, r.cancel_requested FROM run r WHERE r.run_id = $1"
         ))
         .bind(run_id)
         .bind(lapsed_before)
@@ -1151,6 +1134,22 @@ impl Journal for PostgresJournal {
         .await?;
         if held {
             return Ok(Lost::NotLost);
+        }
+        // Asked to stop while its worker drove it: nobody is left to write
+        // its ending, so it ends here, for what asked, whatever it keeps.
+        // Queued again, it would only start a worker to read the cancel
+        // off its claim (and one for a project being removed, whose
+        // workers were just killed).
+        if let Some(cause) = cancel_requested {
+            sqlx::query("UPDATE run SET owner = NULL, epoch = epoch + 1, delivered_until = NULL WHERE run_id = $1")
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            locked.owner = None;
+            cancel_unowned_in(&mut tx, run_id, &locked, program, &cause.0).await?;
+            tx.commit().await?;
+            weft_task_store::announce::committed(&self.pool);
+            return Ok(Lost::Ended);
         }
         let durable = locked.keeping == weft_core::run_settings::Keeping::Durable.as_str();
         sqlx::query(
@@ -1276,15 +1275,15 @@ impl Journal for PostgresJournal {
     }
 
     async fn run_owner(&self, run_id: RunId) -> anyhow::Result<Option<RunOwner>> {
-        type OwnerRow = (uuid::Uuid, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+        type OwnerRow = (uuid::Uuid, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
         let row: Option<OwnerRow> = sqlx::query_as(
-            "SELECT project_id, tenant_id, instance_id, fired_by, phase, definition_hash, binary_hash, source_version \
+            "SELECT project_id, tenant_id, instance_id, fired_by, phase, definition_hash, cut_from, binary_hash, source_version \
              FROM run WHERE run_id = $1",
         )
                 .bind(run_id)
                 .fetch_optional(&self.pool)
                 .await?;
-        row.map(|(project_id, tenant, instance, fired_by, phase, definition_hash, binary_hash, source_version)| {
+        row.map(|(project_id, tenant, instance, fired_by, phase, definition_hash, cut_from, binary_hash, source_version)| {
             Ok(RunOwner {
                 project_id,
                 tenant,
@@ -1296,6 +1295,7 @@ impl Journal for PostgresJournal {
                 phase: weft_core::context::Phase::from_tag(&phase)
                     .ok_or_else(|| anyhow::anyhow!("run {run_id} holds an unknown phase '{phase}'"))?,
                 definition_hash,
+                cut_from,
                 binary_hash,
                 source_version,
             })
@@ -1310,16 +1310,13 @@ impl Journal for PostgresJournal {
         // order they were written in.
         let mut conn = self.pool.acquire().await?;
         let record = weft_journal::record::read_record(&mut conn, run_id, None).await?;
-        let selection = record.selection.as_ref().map(|stored| {
-            weft_core::project::selection::RecordedSelection::read(stored.digest.clone(), stored.selection.clone())
-        });
         let written_at: Vec<(i32, i64)> = sqlx::query_as("SELECT seq, written_at FROM run_log WHERE run_id = $1")
             .bind(run_id)
             .fetch_all(&mut *conn)
             .await?;
         let mut entries: Vec<LogEntry> = Vec::new();
         for row in &record.rows {
-            match weft_journal::stored::decode(run_id, selection.as_ref(), &row.events) {
+            match weft_journal::stored::decode(run_id, &row.events) {
                 Ok(events) => entries.extend(events.iter().flat_map(LogEntry::from_event)),
                 Err(e) => {
                     let at = written_at.iter().find(|(seq, _)| *seq == row.seq).map_or(0, |(_, at)| *at);
@@ -1678,12 +1675,25 @@ impl Journal for PostgresJournal {
         &self,
         run_id: RunId,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
-            .bind(run_id)
-            .fetch_all(&self.pool)
-            .await
-            .context("signal_remove_for_run_id: read a signal row")?;
-        rows.into_iter().map(row_to_signal).collect()
+        let mut tx = self.pool.begin().await?;
+        // Whether the run was cancelled, which a wait registered after the
+        // cancel (or a lost fast run, ended cancelled with its waits left
+        // for here) needs to send its last call. Read, never locked: the
+        // caller (`crate::run_ends`) holds the ended run's row in a
+        // transaction of its own while this runs, and an ended run's
+        // outcome no longer moves.
+        // The outcome alone decides: a cancel asked of a run that finished
+        // before its worker saw it left the run completed or failed, and
+        // its waits send nothing.
+        let cancelled: bool = sqlx::query_scalar("SELECT COALESCE(outcome = 'cancelled', FALSE) FROM run WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        let (removed, _) = remove_run_waits_in(&mut tx, run_id, cancelled).await.context("signal_remove_for_run_id")?;
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        Ok(removed)
     }
 
     async fn signal_remove_for_project(
@@ -1692,6 +1702,69 @@ impl Journal for PostgresJournal {
     ) -> anyhow::Result<Vec<SignalRegistration>> {
         remove_project_signals(&self.pool, project_id).await
     }
+}
+
+/// Take every wait of `run_id` down in the caller's transaction, and when
+/// the run was `cancelled`, queue the last call of each wait that carries
+/// one (`weft_task_store::TaskKind::CancelCall`) in the same commit, so the
+/// outside service hears of the cancel even if this process dies right
+/// after. THE removal of a run's waits: the cancel and the ending of a run
+/// that held waits both come through here, so a wait is told of its run's
+/// cancel however it went (registered after the cancel, or ended with its
+/// run lost). Answers the waits removed and how many calls were queued.
+async fn remove_run_waits_in(
+    tx: &mut sqlx::PgConnection,
+    run_id: RunId,
+    cancelled: bool,
+) -> anyhow::Result<(Vec<SignalRegistration>, usize)> {
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
+        .bind(run_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("strip the run's signals: read a signal row")?;
+    let removed: Vec<SignalRegistration> = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
+    let cancel_calls = match cancelled {
+        true => queue_cancel_calls_in(tx, &removed).await?,
+        false => 0,
+    };
+    Ok((removed, cancel_calls))
+}
+
+/// Queue, in the caller's transaction, the last call of each of `waits`
+/// that carries one (`weft_task_store::TaskKind::CancelCall`), for waits
+/// just taken down because their run was cancelled. Answers how many it
+/// queued (a call already queued for the same wait is not queued again).
+async fn queue_cancel_calls_in(tx: &mut sqlx::PgConnection, waits: &[SignalRegistration]) -> anyhow::Result<usize> {
+    let mut queued = 0;
+    for wait in waits {
+        let call = match wait.cancel_call() {
+            Ok(Some(call)) => call,
+            Ok(None) => continue,
+            // Registration validated the spec, so this row was written
+            // past that check; the waits still go.
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_dispatcher::cancel",
+                    run_id = ?wait.run_id, token = %wait.token, error = %format!("{e:#}"),
+                    "a cancelled wait's spec cannot be read, so whether it carries a last call is unknown; none is sent"
+                );
+                continue;
+            }
+        };
+        let task = weft_task_store::tasks::NewTask {
+            kind: weft_task_store::TaskKind::CancelCall,
+            project_id: Some(wait.project_id),
+            dedup_key: Some(weft_task_store::kinds::cancel_call_key(&wait.token)),
+            run_id: wait.run_id,
+            tenant_id: wait.tenant_id.clone(),
+            payload: serde_json::to_value(&call).context("a last call's payload")?,
+        };
+        let outcome = weft_task_store::tasks::enqueue_dedup_in(&mut *tx, task).await.context("queue a last call")?;
+        if matches!(outcome, weft_task_store::tasks::DedupOutcome::Inserted(_)) {
+            queued += 1;
+        }
+    }
+    Ok(queued)
 }
 
 /// Erase every trace of these runs, inside the caller's transaction.
@@ -1755,7 +1828,22 @@ pub(crate) async fn erase_project_runs(tx: &mut sqlx::PgConnection, project_id: 
         .bind(project_id)
         .fetch_all(&mut *tx)
         .await?;
+    // Removing the project ends the runs it had not ended yet (a run whose
+    // cancel its worker had not written when the worker was retired):
+    // their waits go out like a cancelled run's, with their last calls.
+    // A run that ended any other way sends none.
+    let cut_short: std::collections::HashSet<RunId> = sqlx::query_scalar(
+        "SELECT run_id FROM run WHERE project_id = $1 AND (state <> 'ended' OR outcome = 'cancelled')",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
     let removed = erase_run_ids(tx, &run_ids).await?;
+    let cut_short_waits: Vec<SignalRegistration> =
+        removed.iter().filter(|wait| wait.run_id.is_some_and(|run| cut_short.contains(&run))).cloned().collect();
+    queue_cancel_calls_in(tx, &cut_short_waits).await?;
     Ok((run_ids.len(), removed))
 }
 

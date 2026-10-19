@@ -313,29 +313,24 @@ export interface BakeSummary {
   atUnix: number;
 }
 
-/// Every entry is a place: a `locatedKey` (`one/Clean.strip` for a node
-/// of an included file under the site `one`, the bare id at the top),
-/// since a body reached through two sites is two places of a run.
-// SYNC: RunSelection <-> crates/weft-core/src/project/selection.rs RunSelection
-export interface RunSelection {
-  nodes: string[];
-  edges: string[];
-  boundary_ports: Record<string, string[]>;
-  gates: string[];
-  suppliers: string[];
-  input: PortValues;
-  input_origins: Record<string, Record<string, string>>;
-}
-
-// SYNC: Resolved, CrossingPort, Refusal <-> crates/weft-core/src/run_spec.rs Resolved, CrossingPort, Refusal
+/// What a resolved spec runs, for the dialog's preview. Every place is a
+/// `locatedKey` (`one/Clean.strip` for a node of an included file under
+/// the site `one`, the bare id at the top), since a body reached through
+/// two sites is two places of a run.
+// SYNC: Resolved <-> crates/weft-core/src/run_spec.rs Resolved
 export interface Resolved {
-  selection: RunSelection;
+  /// Every place the run's program runs.
+  runs: string[];
   kicks: Array<{ node: string; frames?: Frame[]; firing: boolean; payload: JsonValue | null; port_snapshot?: JsonValue }>;
-  provided: Array<{ sourceNode: string; sourcePort: string; frames?: Frame[]; value: JsonValue; consumers: Array<[string, string]> }>;
   crossings: CrossingPort[];
   warnings: string[];
+  /// The infra places the run reads only the saved outputs of, with
+  /// those values, per output port.
+  baked: Record<string, Record<string, JsonValue>>;
 }
 
+/// A selected input whose wire's source carries nothing in this run.
+// SYNC: CrossingPort <-> crates/weft-core/src/run_spec.rs CrossingPort
 export interface CrossingPort {
   /// The receiving node as the program spells it (`one.strip`), the
   /// same key a `from` entry uses.
@@ -343,6 +338,9 @@ export interface CrossingPort {
   port: string;
   sourceNode: string;
   sourcePort: string;
+  /// The source is a trigger the run does not fire: it runs, and closes
+  /// its outputs.
+  unfiredTrigger?: boolean;
   /// Whether something in the run needs this input (`neededBy` is set).
   required: boolean;
   /// The required input it ends up feeding: its own, or one inside the
@@ -359,6 +357,7 @@ export interface StartPort {
   port: string;
 }
 
+// SYNC: Refusal <-> crates/weft-core/src/run_spec.rs Refusal
 export interface Refusal {
   errors: string[];
 }
@@ -406,7 +405,7 @@ export function specSummary(spec: RunSpec): string {
   if (spec.feed?.length) parts.push(`feeding ${spec.feed.join(', ')}`);
   if (spec.fire) parts.push(`fires ${spec.fire[0]}`);
   const count = Object.values(spec.from ?? {}).reduce((n, ports) => n + Object.keys(ports).length, 0) + Object.keys(spec.group?.[1] ?? {}).length;
-  if (count) parts.push(`${count} input backups`);
+  if (count) parts.push(count === 1 ? '1 handed value' : `${count} handed values`);
   if (isFrozen(spec)) parts.push('frozen');
   return parts.length === 0 ? 'whole graph' : parts.join(', ');
 }
@@ -421,9 +420,9 @@ export function specSummary(spec: RunSpec): string {
 /// the spelling `weft run --group` and `weft events --node` take, and
 /// the key the dispatcher holds a trigger's registration under, so a
 /// display poll built here has to spell exactly what the Rust side
-/// spells. The editor only ever addresses nodes and groups; a group's
-/// compiler-made boundaries (`__in`, `__out`), which the Rust side
-/// reads as the group, never reach this function.
+/// spells. The editor only ever addresses nodes and groups; a loop's
+/// boundaries (`__in`, `__out`), which the Rust side reads as the loop,
+/// never reach this function.
 // SYNC: addressOf <-> crates/weft-core/src/project.rs address_of
 export function addressOf(callPath: readonly string[], id: string): string {
   const local = (scoped: string) => scoped.slice(scoped.indexOf('.') + 1);

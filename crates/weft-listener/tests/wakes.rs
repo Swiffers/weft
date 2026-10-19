@@ -863,7 +863,8 @@ async fn a_wait_polls_until_the_job_is_done_and_resumes_once() {
         assert!(rig.tasks.answers.lock().unwrap().is_empty(), "not done yet: nothing fires");
     }
     let stored = rig.rows.lock().unwrap()["wait"]["kind_state"].clone();
-    assert_eq!(stored, json!({}), "the failure streak cleared on the good poll after it");
+    assert_eq!(stored.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["answer"], "the failure streak cleared on the good poll after it: {stored}");
+    assert_eq!(kept_answer(&stored), json!({ "status": "IN_PROGRESS" }));
     let wakes = rig.alarm.wakes_for("signal:wait");
     assert_eq!(wakes.len(), 4, "armed, then one more per poll");
     assert!(wakes[1].at_unix_ms > asked, "after the first poll, the interval sets the pace");
@@ -875,8 +876,174 @@ async fn a_wait_polls_until_the_job_is_done_and_resumes_once() {
         assert_eq!(fires[0].payload["value"], json!({ "status": "FAILED", "error": "nsfw" }));
     }
     assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 4, "answered: no further poll is set");
-    assert_eq!(rig.rows.lock().unwrap()["wait"]["kind_state"], json!({ "resumed": true }));
+    let stored = rig.rows.lock().unwrap()["wait"]["kind_state"].clone();
+    assert_eq!(stored["resumed"], json!(true));
+    assert_eq!(kept_answer(&stored), json!({ "status": "FAILED", "error": "nsfw" }), "the answer it resumed on is the last one kept");
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+/// The raw last answer a wait's state keeps, parsed back (the wait keeps
+/// it as the text the service sent).
+fn kept_answer(kind_state: &Value) -> Value {
+    serde_json::from_str(kind_state["answer"]["kept"].as_str().expect("an answer is kept")).unwrap()
+}
+
+/// A wait keeps the raw last answer its poll read, written to its row only
+/// when it changed and kept through a failed poll after it; the waiting
+/// node shows it, and a reader of the node's state gets it as the text the
+/// service sent.
+#[tokio::test]
+async fn a_wait_keeps_its_last_answer_and_writes_it_only_when_it_changed() {
+    let rig = rig(false).await;
+    let (url, _) = spawn_status(vec![
+        (200, json!({ "status": "IN_PROGRESS", "progress": 10 })),
+        (200, json!({ "status": "IN_PROGRESS", "progress": 10 })),
+        (200, json!({ "status": "IN_PROGRESS", "progress": 60 })),
+        (503, json!({ "error": "busy" })),
+    ])
+    .await;
+    register_wait(&rig, "wait", &job_wait(&url), now_ms()).await.unwrap();
+    let seq = || rig.rows.lock().unwrap()["wait"]["kind_state_seq"].as_i64().unwrap();
+    let stored = || rig.rows.lock().unwrap()["wait"]["kind_state"].clone();
+
+    wake(&rig.state, due("wait", now_ms())).await.unwrap();
+    assert_eq!((seq(), kept_answer(&stored())), (2, json!({ "status": "IN_PROGRESS", "progress": 10 })));
+    wake(&rig.state, due("wait", now_ms())).await.unwrap();
+    assert_eq!(seq(), 2, "the same answer again writes nothing");
+    wake(&rig.state, due("wait", now_ms())).await.unwrap();
+    assert_eq!((seq(), kept_answer(&stored())), (3, json!({ "status": "IN_PROGRESS", "progress": 60 })));
+    wake(&rig.state, due("wait", now_ms())).await.unwrap();
+    assert_eq!(seq(), 4, "the polls started failing");
+    assert_eq!(kept_answer(&stored()), json!({ "status": "IN_PROGRESS", "progress": 60 }), "a failed poll keeps the last answer");
+
+    assert!(shown(&rig.state, "wait").await.contains("Last answer"), "{}", shown(&rig.state, "wait").await);
+    let sig = weft_listener::registry::held(&rig.state, "wait").await.unwrap().unwrap();
+    let Some(weft_core::signal::listener_protocol::LastAnswer::Kept(raw)) = weft_listener::kinds::last_answer(&sig) else {
+        panic!("the node's state reads the answer");
+    };
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(), json!({ "status": "IN_PROGRESS", "progress": 60 }));
+}
+
+/// An entry trigger keeps no answer: what it read went out as a run.
+#[tokio::test]
+async fn an_entry_poll_keeps_no_answer() {
+    let rig = rig(false).await;
+    let (url, _) = spawn_status(vec![(200, json!({ "status": "RUNNING" }))]).await;
+    register(&rig, "poll", &quiet_poll(&url), now_ms()).await.unwrap();
+    wake(&rig.state, due("poll", this_hour())).await.unwrap();
+    assert!(rig.rows.lock().unwrap()["poll"]["kind_state"].get("answer").is_none());
+}
+
+/// A last call belongs to a run's wait: an entry trigger carrying one is
+/// refused at registration, naming the way to wait with one.
+#[tokio::test]
+async fn an_entry_trigger_with_a_last_call_is_refused() {
+    let rig = rig(false).await;
+    let mut spec = quiet_poll("http://127.0.0.1:1/status");
+    spec.on_cancel = Some(weft_core::signal::CancelCall::delete("http://127.0.0.1:1/jobs/7"));
+    let refused = register(&rig, "poll", &spec, now_ms()).await.unwrap_err().to_string();
+    assert!(refused.contains("await_signal_with_cancel"), "{refused}");
+}
+
+// ---------- The last call of a cancelled wait ----------
+
+/// A service's cancel endpoint: records each call it received (method,
+/// path, body) and answers with `status`.
+async fn spawn_cancel_target(status: u16) -> (String, Arc<Mutex<Vec<(String, String, Value)>>>) {
+    let calls: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
+    let seen = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+        let seen = seen.clone();
+        async move {
+            let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            seen.lock().unwrap().push((method.to_string(), uri.path().to_string(), body));
+            (axum::http::StatusCode::from_u16(status).unwrap(), "cancel answered")
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+fn cancel_request(spec: weft_core::primitive::SignalSpec) -> weft_core::signal::listener_protocol::CancelCallRequest {
+    weft_core::signal::listener_protocol::CancelCallRequest { token: "wait".into(), tenant_id: "tenant-a".into(), for_instance: None, spec }
+}
+
+/// The last call goes once, with its verb and body, to the address the
+/// listener reaches it at, through the listener's own door. An infra
+/// endpoint's address is asked of the broker like a poll's is.
+#[tokio::test]
+async fn a_cancelled_waits_last_call_goes_once_with_its_verb_and_body() {
+    let rig = rig(false).await;
+    let (target, calls) = spawn_cancel_target(202).await;
+    let base = serve(rig.state.clone()).await;
+    let port = target.rsplit(':').next().unwrap();
+    let mut spec = job_wait(&format!("{target}/status"));
+    // Named the way a worker reaches an infra unit: the broker answers
+    // the address the listener reaches it at.
+    spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("http://wi-studio:{port}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
+    let resp = reqwest::Client::new().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "{:?}", resp.text().await);
+    assert_eq!(*calls.lock().unwrap(), vec![("POST".to_string(), "/jobs/7/cancel".to_string(), json!({ "reason": "cancelled" }))]);
+    assert_eq!(rig.asked.load(std::sync::atomic::Ordering::SeqCst), 1, "the infra address was asked of the broker");
+}
+
+/// A service that refuses the last call fails it, naming the call, the
+/// status and what the service said: the job may still run, so nobody is
+/// told it was cancelled.
+#[tokio::test]
+async fn a_refused_last_call_says_who_refused_it_and_why() {
+    let rig = rig(false).await;
+    let (target, calls) = spawn_cancel_target(404).await;
+    let mut spec = job_wait(&format!("{target}/status"));
+    spec.on_cancel = Some(weft_core::signal::CancelCall::delete(format!("{target}/jobs/7")));
+    let refused = weft_listener::kinds::cancel_call(&rig.state, cancel_request(spec)).await.unwrap_err();
+    let said = format!("{refused:#}");
+    assert!(said.contains("DELETE") && said.contains("/jobs/7") && said.contains("404") && said.contains("cancel answered"), "{said}");
+    assert_eq!(calls.lock().unwrap().len(), 1, "sent once, never retried");
+}
+
+/// A cancel takes the wait's row down and ends its next polls: the wake
+/// the alarm delivers in place of the next one polls nothing, and a wake
+/// already being handled when the cancel came makes its one poll, then
+/// finds the moment after it ended too, so the chain stops there.
+#[tokio::test]
+async fn a_waits_polling_stops_when_its_run_is_cancelled() {
+    let rig = rig(false).await;
+    let (url, hits) = spawn_status(vec![(200, json!({ "status": "IN_PROGRESS" }))]).await;
+    let spec = job_wait(&url);
+    register_wait(&rig, "wait", &spec, now_ms()).await.unwrap();
+    wake(&rig.state, due("wait", now_ms())).await.unwrap();
+    let next = rig.alarm.wakes_for("signal:wait").pop().expect("the next poll is set");
+    let in_flight: WakeBody = serde_json::from_value(next.body.clone()).unwrap();
+    assert!(in_flight.row.is_some(), "a poll's wake carries its row, so only an ended name stops it");
+
+    // The cancel: the row goes, and the listener is told.
+    let removed = rig.rows.lock().unwrap().remove("wait").unwrap();
+    let unregistered = weft_core::signal::listener_protocol::UnregisterRequest {
+        token: "wait".into(),
+        tenant_id: "tenant-a".into(),
+        spec,
+        kind_state: removed["kind_state"].clone(),
+        generation: 1,
+        reused: false,
+    };
+    weft_listener::kinds::unregister(&rig.state, unregistered).await.unwrap();
+    let delivered: WakeBody = serde_json::from_value(rig.alarm.under(&next.name()).expect("the next poll's name").body).unwrap();
+    assert!(delivered.ended, "the next poll is ended");
+    let polled = hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(wake(&rig.state, delivered).await.unwrap(), None);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), polled, "the ended wake polls nothing");
+
+    // The wake that was being handled when the cancel came.
+    let mut late = in_flight;
+    late.due_at_ms = now_ms();
+    wake(&rig.state, late).await.unwrap();
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), polled + 1, "its own poll was already on its way");
+    let after = rig.alarm.wakes_for("signal:wait").pop().expect("it sets the moment after its own");
+    let after: WakeBody = serde_json::from_value(rig.alarm.under(&after.name()).expect("taken").body).unwrap();
+    assert!(after.ended, "the moment after it was ended by the cancel, so nothing polls after it");
 }
 
 /// A non-2xx answer is shown on the node as a failed poll while the
@@ -1319,6 +1486,7 @@ fn recording_spec(test: &str, n: u32) -> weft_core::primitive::SignalSpec {
         match_predicates: Vec::new(),
         limits: Default::default(),
         settings: Default::default(),
+        on_cancel: None,
     }
 }
 

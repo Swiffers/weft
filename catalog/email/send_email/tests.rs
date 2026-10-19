@@ -91,19 +91,19 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     unreachable_server(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&SendEmailNode, send_inputs(&rig, "someone@example.com")).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("SMTP server"), "{error}");
     assert!(!outcome.outputs.contains_key("messageId"), "a caught failure emits no messageId");
     Ok(())
 }
 
 /// A malformed address is a mistake in the program, never a value for
-/// `error`.
+/// `_error`.
 async fn bad_address_wired(rig: FakeRig) -> WeftResult<()> {
     unreachable_server(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&SendEmailNode, send_inputs(&rig, "not an address")).await.failure()?;
     assert!(err.starts_with("input error"), "{err}");
     Ok(())

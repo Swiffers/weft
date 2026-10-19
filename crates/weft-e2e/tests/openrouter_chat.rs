@@ -30,13 +30,13 @@ async fn a_conversation_file_carries_turns_and_media() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let conn = connect_direct(
         &disp,
-        catalog_spec("ai/llm", "openrouter")?,
+        catalog_spec("ai/llm", "openrouter_access")?,
         "shared",
         serde_json::json!({}),
     )
     .await?;
     let mut project = Project::prepare("openrouter_chat", disp.clone()).await?;
-    set_account(&project, "prov", conn.handle()).await?;
+    set_account(&project, "openrouter", conn.handle()).await?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;

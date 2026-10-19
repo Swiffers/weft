@@ -53,9 +53,10 @@ pub type LiveEvent = IdentifiedEvent<DispatcherEvent>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum DispatcherEvent {
-    /// `subgraph` is the node set the run is held to (`None` for the
-    /// whole graph): the graph paints every other node as not in this
-    /// run. `seed` names the run this one inherits from and what it
+    /// `subgraph` is every place the run's program runs (its cut of the
+    /// project, `crate::project::cut`; a place that stands in for itself
+    /// is not among them): the graph paints every other node as not in
+    /// this run. `None` when the run's program could not be read. `seed` names the run this one inherits from and what it
     /// re-ran, for the run's banner. `phase` says what the run
     /// is for: a run of the graph (`fire`), or the setup an `infra
     /// start` or an activation runs, which the editor shows as that verb
@@ -100,6 +101,15 @@ pub enum DispatcherEvent {
     /// lists and re-reads the project's verbs, because a run parked on
     /// a question counted as preserved state until now.
     RunDeleted { run_id: RunId, project_id: uuid::Uuid },
+    /// The run parked: every firing still open waits on a signal (a
+    /// person, an outside job, a timer), and no worker drives it until an
+    /// answer comes. Its listing reads `waiting_for_input` from here on.
+    /// Rides NOTIFY like `RunDeleted`: parking writes no record row
+    /// (`weft_broker::door::let_go` publishes it in the transaction that
+    /// parks the run). A run's replay ends with it when the run is parked
+    /// at the time of the read, which is where it stands rather than a
+    /// moment of its history.
+    RunParked { run_id: RunId, project_id: uuid::Uuid },
     /// Every node event carries `inherited_from` when the firing was
     /// not this run's own but taken from the run it was seeded from
     /// (`weft run --seed`): the row is the seed's, painted here so the
@@ -112,11 +122,9 @@ pub enum DispatcherEvent {
         frames: LoopFrames,
         input: serde_json::Value,
         closed_ports: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        provided_ports: Vec<String>,
         // SYNC: input origins <-> extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        backup_ports: Vec<String>,
+        provided_ports: Vec<String>,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         inherited_ports: std::collections::BTreeMap<String, RunId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +153,22 @@ pub enum DispatcherEvent {
     /// (the UI renders "reason not recorded"); every live writer sends
     /// `Some`.
     NodeSkipped { run_id: RunId, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<crate::run::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// A copy of a scope (a group, a call site, an included body, at
+    /// `frames`) was decided: it opened, or it did not run and why
+    /// (`crate::run::scope`). The graph paints a group from these, per
+    /// copy. A copy inside one that did not run is decided with it.
+    // SYNC: ScopeDecided <-> extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts ScopeDecidedEvent
+    ScopeDecided {
+        run_id: RunId,
+        project_id: uuid::Uuid,
+        scope: String,
+        frames: LoopFrames,
+        #[serde(flatten)]
+        state: crate::run::scope::ScopeState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_from: Option<RunId>,
+        at_unix: u64,
+    },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
     // SYNC: LoopInstantiated <-> extension-vscode/src/runFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
@@ -299,13 +323,16 @@ pub enum DispatcherEvent {
         totals: Vec<crate::bus::BusWindowTotal>,
         at_unix: u64,
     },
-    /// The bus was closed. Inspector renders an explicit
-    /// `* the bus closed here` marker; replay cursors stop here.
+    /// The bus was closed, and how it ended. Inspector renders an
+    /// explicit `* the bus closed here` marker, or where it failed and
+    /// why; replay cursors stop here.
+    // SYNC: BusClosed <-> crates/weft-journal/src/events.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_closed'
     BusClosed {
         run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
+        end: crate::bus::StreamEnd,
         at_unix: u64,
     },
     /// A live caller attached to this run. First event in the
@@ -383,6 +410,7 @@ impl DispatcherEvent {
             | Self::RunCancelled { project_id, .. }
             | Self::RunTagged { project_id, .. }
             | Self::RunDeleted { project_id, .. }
+            | Self::RunParked { project_id, .. }
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
@@ -391,6 +419,7 @@ impl DispatcherEvent {
             | Self::NodeCompleted { project_id, .. }
             | Self::NodeFailed { project_id, .. }
             | Self::NodeSkipped { project_id, .. }
+            | Self::ScopeDecided { project_id, .. }
             | Self::LoopInstantiated { project_id, .. }
             | Self::LoopIterationLaunched { project_id, .. }
             | Self::LoopOutFired { project_id, .. }
@@ -420,11 +449,12 @@ impl DispatcherEvent {
         }
     }
 
-    /// The loop and call frames of the one firing this event is about
-    /// (a node's lifecycle, a cost or a file edit at that firing); `None`
-    /// for an event about the run, the project, a loop as a whole, or
-    /// anything else that is not one firing.
-    pub fn firing_frames(&self) -> Option<&LoopFrames> {
+    /// The loop and call frames of the one place this event is about: a
+    /// firing (a node's lifecycle, a cost or a file edit at that firing)
+    /// or a scope's copy being decided; `None` for an event about the
+    /// run, the project, a loop as a whole, or anything else that is not
+    /// one place.
+    pub fn place_frames(&self) -> Option<&LoopFrames> {
         match self {
             Self::NodeStarted { frames, .. }
             | Self::NodeSuspended { frames, .. }
@@ -435,13 +465,15 @@ impl DispatcherEvent {
             | Self::NodeFailed { frames, .. }
             | Self::NodeSkipped { frames, .. }
             | Self::CostReported { frames, .. }
-            | Self::FileEdited { frames, .. } => Some(frames),
+            | Self::FileEdited { frames, .. }
+            | Self::ScopeDecided { frames, .. } => Some(frames),
             Self::RunStarted { .. }
             | Self::RunCompleted { .. }
             | Self::RunFailed { .. }
             | Self::RunCancelled { .. }
             | Self::RunTagged { .. }
             | Self::RunDeleted { .. }
+            | Self::RunParked { .. }
             | Self::LoopInstantiated { .. }
             | Self::LoopIterationLaunched { .. }
             | Self::LoopOutFired { .. }
@@ -486,6 +518,7 @@ impl DispatcherEvent {
             | Self::RunCancelled { run_id, .. }
             | Self::RunTagged { run_id, .. }
             | Self::RunDeleted { run_id, .. }
+            | Self::RunParked { run_id, .. }
             | Self::NodeStarted { run_id, .. }
             | Self::NodeSuspended { run_id, .. }
             | Self::NodeResumed { run_id, .. }
@@ -494,6 +527,7 @@ impl DispatcherEvent {
             | Self::NodeCompleted { run_id, .. }
             | Self::NodeFailed { run_id, .. }
             | Self::NodeSkipped { run_id, .. }
+            | Self::ScopeDecided { run_id, .. }
             | Self::LoopInstantiated { run_id, .. }
             | Self::LoopIterationLaunched { run_id, .. }
             | Self::LoopOutFired { run_id, .. }

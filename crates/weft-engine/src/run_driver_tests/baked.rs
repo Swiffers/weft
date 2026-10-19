@@ -129,20 +129,15 @@
     /// The run's birth in `phase`, `db` kicked.
     fn birth(project: &ProjectDefinition, run_id: RunId, phase: weft_core::context::Phase) -> [RunEvent; 2] {
         [
-            RunEvent::RunStarted {
+            RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "db".into(),
                 phase,
                 definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
                 binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                // A setup names the nodes it brings up; any other run here runs the whole program.
-                selection: (phase == weft_core::context::Phase::InfraSetup).then(|| {
-                    weft_core::project::selection::RecordedSelection::new(
-                        weft_core::project::selection::RunSelection::restricted(project,["db", "a", "b", "c"].iter().map(|n| weft_core::frames::Located::top(*n)).collect())
-                            .expect("valid test selection"),
-                    )
-                }),
+                // Every phase here runs the whole program: `db` and what it feeds.
+                cut_from: None,
                 seed: None, instance: None, stand_in: None, fired_trigger: None,
                 instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 settings: Default::default(),

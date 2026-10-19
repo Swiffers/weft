@@ -521,6 +521,7 @@ pub fn filled_node(node: &crate::project::NodeDefinition, values: Option<&PlaceV
 /// `Err` is only a program that cannot look anything up. The same walk the editor does over its canvas, over the
 /// compiled program, so an instance's dropdown lists what the node's run
 /// would reach.
+// SYNC: lookup_connection (the trace through boundaries) <-> packages/weft-graph/src/webview/lib/utils/access-trace.ts accessFeedingEdge
 pub fn lookup_connection(
     project: &crate::project::ProjectDefinition,
     at: &crate::frames::Located,
@@ -535,13 +536,11 @@ pub fn lookup_connection(
         return Err(format!("'{field}' of '{}' has no list to look up", at.id));
     };
     let (mut place, mut port) = (at.clone(), access.clone());
-    // Upstream along the wire into `port`, through every boundary on
-    // the way, to the node that makes the connection.
+    // Upstream along the wire into `port` (the one taken at this place:
+    // a body's member is wired once per site that calls it), through a
+    // loop's boundary on the way, to the node that makes the connection.
     let source = loop {
-        let Some(edge) = project.edges.iter().find(|e| e.target == place.id && e.target_handle.as_deref() == Some(port.as_str())) else {
-            return Ok(LookupConnection::Unwired);
-        };
-        let Some(from) = crate::project::selection::source_place(project, &place, edge) else {
+        let Some((edge, from)) = crate::project::places::incoming(project, &place).find(|(e, _)| e.target_port() == port) else {
             return Ok(LookupConnection::Unwired);
         };
         let from_node = project.nodes.iter().find(|n| n.id == from.id).ok_or_else(|| format!("no node '{}'", from.id))?;

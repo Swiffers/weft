@@ -2,15 +2,15 @@
 //! again. In a durable run, a node that was mid-body may have partly
 //! happened (an email sent, a row written), so the worker that picks the
 //! run back up fails it with a message saying so instead of starting it
-//! over, and a node that catches its failures hands this one to its wired
-//! `error` like any other. A fast run's record trails it, so it is not
+//! over, and a node with its `_error` wired hands this one there like any
+//! other. A fast run's record trails it, so it is not
 //! picked back up at all: it ends cancelled.
 //!
 //! Shape: the `node_crash` fixture runs two `ExecPython` nodes that sleep
 //! for ten minutes. Once both have started, every worker of the project is
 //! removed (a fake crash). The claim on the run lapses and a fresh worker
 //! takes it. Durable, the run ends failed: `plain` failed with the crash
-//! message, `caught` completed with that message on `error`, `handler`
+//! message, `caught` completed with that message on `_error`, `handler`
 //! received it. Fast, the run ends cancelled, saying its worker went away.
 //! Either way each node started exactly once.
 //!
@@ -55,8 +55,8 @@ async fn a_node_the_worker_died_in_is_failed_never_run_again() -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("'plain' was not failed"))?;
     anyhow::ensure!(plain_failure.contains(WENT_AWAY), "{plain_failure}");
 
-    // The caught one completed, its failure on `error`, and the branch
-    // reading `error` ran with it.
+    // The caught one completed, its failure on `_error`, and the branch
+    // reading `_error` ran with it.
     settled.assert_completed("caught")?;
     let caught = settled
         .input_of("handler")

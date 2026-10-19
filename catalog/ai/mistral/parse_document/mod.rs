@@ -2,13 +2,18 @@
 //! Mistral's OCR. Three calls: upload the stored file (the OCR
 //! endpoint eats URLs, not bytes), mint its short-lived signed URL,
 //! run the OCR, and emit the pages' markdown.
+//!
+//! The markdown comes out as stored files, never as text on a wire: a
+//! long document's markdown weighs far more than the 100 KB a wire
+//! carries, and the OCR it came from is paid for per page, so cutting
+//! it or refusing it would throw paid work away.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
 use weft::access::client::{get_json, json_call, post_json, Multipart};
-use weft::storage::{FileHandle, StorageScope};
+use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
@@ -116,12 +121,33 @@ impl Node for MistralParseDocumentNode {
             .collect::<Vec<_>>()
             .join("\n\n");
         let count = pages.len() as f64;
+        // Kept past the run, like any document a workflow goes on to
+        // read: the default access-bumped lifetime.
+        let storage = ctx.storage(StorageScope::Run);
+        let stem = file_stem(&meta.filename);
+        let markdown = storage
+            .put(markdown.into_bytes(), "text/markdown", &format!("{stem}.md"), Some(KeepTtl::Default))
+            .await?;
+        let pages_json = serde_json::to_vec(&pages).node_err("mistral: write the pages as JSON")?;
+        let pages = storage
+            .put(pages_json, "application/json", &format!("{stem}.pages.json"), Some(KeepTtl::Default))
+            .await?;
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("markdown", markdown)
-                .set("pages", json!(pages))
+                .set("pages", pages)
                 .set("pageCount", count),
         )
         .await
+    }
+}
+
+/// The document's file name without its extension, to name the files
+/// made from it (`report.pdf` gives `report`); a name with no stem of
+/// its own is kept as it is.
+fn file_stem(filename: &str) -> &str {
+    match filename.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => filename,
     }
 }

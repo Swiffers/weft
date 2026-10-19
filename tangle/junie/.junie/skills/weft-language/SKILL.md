@@ -52,11 +52,11 @@ the markers keep theirs too (`@per_instance`, `@instance_filled`,
 `@require_one_of`). A value you pick from a fixed list is written exactly as
 the list spells it (`kind: "photo"`). And on a node whose added ports
 are named after data from outside weft, a port keeps that data's spelling:
-`Route` for a request body's fields, `JsonObject` for the keys of the object
-it builds, the Postgres query nodes for a query's `$` holes and a table's
-columns, among others. `post = Route -> (user_id: String)` draws no warning
-for `user_id`; the name you give the node, `post`, is still checked. Such a
+`Route` for a path's captures, `JsonObject` for the keys of the object it
+builds, the Postgres query nodes for a query's `$` holes, among others. `body = JsonObject { user_id: ask.id }` draws no warning for `user_id`; the name you give the node, `body`, is still checked. Such a
 node shows `addedPortsAreDataKeys` in the `features` block of its wiring view.
+The fields of a record type are not checked for casing anywhere, so a body
+declared as `{ user_id: String }` keeps the caller's spelling too.
 
 ## Connecting
 
@@ -87,12 +87,17 @@ wire alone; a required key absent fails the firing.
 
 ### Narrowing a port to the shape it carries
 
-A port's type is a contract, and you may write a TIGHTER one on the arrow
-where you use the node. The compiler checks yours against the node's own and
-refuses a contradiction (`declared type ... incompatible with catalog type`),
-so a narrowing that compiles is one the node can honour. This is how a loose
-container becomes a shape you can read keys off, and it costs nothing at run
-time: the value is already that shape, the port now says so.
+A port's type is a contract, and on the arrow where you use the node you
+may write a TIGHTER one: on any input, and on an output the node marks
+`narrowable` in its metadata (a query's `rows`, a model's JSON `response`, a
+request's `body`), where only the program knows what shape comes out. Every
+other output takes no type but its own. The compiler checks yours and refuses
+one that does not fit, naming the port (`node 'ask': output port 'query' is
+declared Dict[String, Number], but Route always gives it Dict[String,
+String]: only an output its node marks narrowable takes the type the program
+declares`), so a narrowing that compiles is one the node can honour. This is
+how a loose container becomes a shape you can read keys off, and it costs
+nothing at run time: the value is already that shape, the port now says so.
 
 A port the node already declares takes the tighter type the same way one you
 add on the arrow does. Here the node's own `rows` port is `List[JsonDict]`,
@@ -121,32 +126,35 @@ catch yourself adding a cast to put a shape on a value that already has
 it, stop and write: "Wait. Narrow the port." Then write the type on the
 arrow and delete the cast.
 
-**Narrow only what you control the shape of.** A port fed by the outside
-world (a query string, request headers) holds whatever the caller sent, and
-a record refuses a key it does not declare, at run time, on the real
-request. Narrowing those compiles and then fails the first time somebody
-appends a tracking parameter, and a cast to a record is just as strict (an
-undeclared key fails the cast). So either declare every key the caller may
-send, optional ones with `?`, or leave the port as the loose type the node
-declares and read the one key you want with a node.
+**What the outside world sends is narrowed only where the node lets you.**
+A route's `query` and `headers` are not narrowable: they stay `Dict[String,
+String]`, and you read a key off one with a `Cast` to an open record:
+`utm = Cast -> (value: { utm: String, .. }) { value: ask.query }`, then
+`utm.value.utm`. A request's `body`
+is, and a record declared there judges each request as it arrives: a body
+that does not fit is answered `400` naming the field, and nothing past the
+route runs. A record refuses a key it does not declare, so either declare
+every key the caller may send, optional ones with `?`, or end the record
+with `..` (`{ email: String, .. }`), which drops the keys it does not
+declare. A cast to a record is just as strict: an undeclared key fails the
+cast.
 
-When the opaque value comes from a node that lets you ADD OUTPUT PORTS, name
-the pieces you want on the arrow instead. Each arrives on its own port under
-the type you wrote, so there is nothing to unpack and nothing to cast:
+For a single row, the query node also has `row`, which carries the first row
+and closes when the query answered none. It narrows the same way, and then
+you read a column straight off it:
 
 ```weft
-look = PostgresExecuteQuery(id: String) -> (title: String, seen: Number) {
+look = PostgresExecuteQuery(id: String) -> (row: Card) {
   account: db.access
   query: "select title, seen from cards where id = $id"
 }
 ```
 
-Declare the type you actually want there, a named one included
-(`-> (card: Card)`): the value is checked against it when it arrives, so a
-shape that fits flows and one that does not fails loudly, naming the field.
-Reach for the record type when the source cannot name the pieces for you, and
-prefer a NAMED type over an inline one once more than one node speaks it:
-the name is the contract, and it is written once.
+Now `look.row.title` is a String wire, with nothing to unpack and nothing to
+cast. The row is checked against `Card` when it arrives, so a shape that fits
+flows and one that does not fails loudly, naming the field. An inline record
+works too (`-> (row: { title: String })`), but prefer a NAMED type once more
+than one node speaks it: the name is the contract, and it is written once.
 
 ## Config values
 
@@ -223,8 +231,9 @@ outside on their own lines.
 
 Some node types accept extra inputs beyond the ones they declare, and on
 those a key naming no declared port creates one. A wire types it from the
-source, a literal from its own type, `null` is an error. `key?:` makes the
-created port optional, whatever the node's own default is.
+source, a literal from its own type, `null` is an error. Written `key?:`, the
+node runs without the created port even when it is wired and the wire closes;
+written without `?`, the port is required.
 
 Which types accept them is the node's to say, not this page's: its wiring
 view carries a `features` block, and `canAddInputPorts` there means you may
@@ -312,9 +321,9 @@ from outside.
 
 `_should_not_flow` is the mirror image: wire something into it and the node
 runs when that thing closes instead of when it arrives. It is the only port
-in the language that can start a node on a closure; every other port does the
-opposite, skipping its node once an input closes, which is why running on an
-absence needs a dedicated spelling.
+in the language that can start a node on a closure; on every other port a
+closed input either skips its node or, written `?`, is left out, which is why
+running on an absence needs a dedicated spelling.
 
 Reach for it when the absence is data: a key the caller never sent, an
 optional input nobody filled in. When the absence is a decision a node of
@@ -335,32 +344,52 @@ own ports with that failure too (its skip reason names where it started:
 `the required input 'value' closed because 'query' failed: ...`), so the rule
 holds any number of skips down the line, and every skip in that chain still
 names `query`, the node that broke.
+The one exception is a failing node whose `_error` is wired: it handled its
+failure, so its ports close as plain absences, and a `_should_not_flow` on
+them runs.
 
-### Handling a failure: the `error` output
+### Handling a failure: the `_error` output
 
-If you want the program to do something when a node that reaches outside
-fails (mark a row `error` with the reason, answer the caller with a message,
-try another branch), wire that node's `error` output. A node that declares
-`catchErrors` among its features gets an `error` output added by weft; read
-the node's interface to see whether it has one.
+If you want the program to do something when a node fails (mark a row
+`error` with the reason, answer the caller with a message, try another
+branch), wire that node's `_error` output. Every node has one, triggers
+included: weft adds it, a `String` holding why the node failed. A node never
+declares `_error` itself (a `.weft` file that lists it among a node's outputs
+is a compile error), and `error` without the underscore is an ordinary name a
+node may use for an output of its own.
 
-- Wired: a failure becomes its message on `error`, the run goes on, and the
-  node's other outputs close, so the success branch simply gets nothing.
+- Wired: a failure becomes its message on `_error`, the node completes, and
+  every output it had not sent on closes, so the success branch simply gets
+  nothing.
 - Unwired: the failure fails the run.
 
 A bad setting, a bad input or a type error always fails the run, wired or
-not: those are the program's own shape, never an outcome to route around.
-What counts as a failure for a given node (an answer with an error status,
-say) is in that node's description.
+not: those are the program's own shape, never an outcome to route around. So
+does a failure after the node already sent something on a stream (a bus, a
+generator): its readers hold part of it, so the stream ends failed and the
+run fails, rather than a second answer racing the first. What counts as a
+failure for a given node (an answer with an error status, say) is in that
+node's description.
 
-A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again. With `error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
+To react to a failure without its message, gate on it:
+
+````weft
+fallback = Reply { body: "the backup answered" }
+fallback._should_flow = ask._error
+````
+
+A group has no `_error` of its own. If you want a group's failure to answer
+with your own message, wire out the `_error` of the nodes inside you care
+about through the group's outputs and answer with your own `Reply`.
+
+A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again. With `_error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
 
 ````weft
 ask = LlmInference { provider: prov.provider, prompt: job.text }
 mark = PostgresExecuteQuery(reason: String, id: String) {
   account: db.access
   query: "update jobs set state = 'error', reason = $reason where id = $id::uuid"
-  reason: ask.error
+  reason: ask._error
   id: job.id
 }
 ````
@@ -480,23 +509,26 @@ Types that leave ports open declare them in the declaration:
 calc = ExecPython(a: Number, b: Number) -> (sum: Number, diff: Number) {
   code: "return {'sum': a + b, 'diff': a - b}"
 }
-answer = LlmInference -> (response: String)
+answer = LlmInferenceJson -> (response: { label: String })
 ok     = Cast -> (value: Boolean)
 ````
 
 What the node does with the ports you named is its own business, and its
 description says it (how `ExecPython` hands inputs to the script and reads
-its outputs back is in that node's description). Write only the ports the type leaves open (a `MustOverride`
-output must be pinned once something reads it; one nothing reads can stay
-unpinned). An empty body equals no body.
+its outputs back is in that node's description). Write only the ports the type leaves open. A port
+typed with a type variable (`T`, `T2`) gets its type where the node is used:
+from the type you declare on it, or from what is wired to it. A header port
+written with no type, `(x)`, takes the type of what is wired to it. An empty
+body equals no body.
 
 ## Inline expressions
 
 A node literal as a value, with a mandatory trailing `.port`:
 
 ````weft
+router = OpenRouterAccess
 out.data = Text { value: "hi" }.value
-provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider
+provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider
 ````
 
 It synthesizes an anonymous child with id `{host}__{field}` plus the edge.
@@ -534,7 +566,9 @@ container for that node. `@instance_filled` (or `@instance_filled(<fallback>)`) 
 value goes makes that value each instance's own, a connection included
 (`account: @instance_filled`); the fallback may be a value, `@file(...)` or
 `@asset(...)`; never on a wired field (`instance-filled-wired`) or
-a group's own port (`instance-filled-boundary`). Every node reading either
+a group's own port (`instance-filled-boundary`), nor on a field of a node
+in an included file whose sites give it different types
+(`instance-filled-place-types`). Every node reading either
 follows, per instance. A `Route` or `Socket` that would follow is a compile
 error: routes stay shared and pick the instance per call. The
 `weft-instances` skill has what all of that means and the shape a program
@@ -551,8 +585,7 @@ with instances takes; `weft-members` adds the shape for several people.
 | unions | `String \| Number`, `Number \| Null` |
 | records | `{ role: String, name?: String }`, strict: undeclared keys refused |
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
-| type variables | `T`, unified across a node's ports, must pin to concrete (`unresolved-typevar`) |
-| `MustOverride` | the author pins it in an inline signature; wired and unpinned is `must-override-unmet`, unwired is left alone |
+| type variables | `T`, `T2`, unified across a node's ports, pinned by what is wired to the port or by the type the program declares on it (`Cast`'s output is `T2`: `-> (value: Card)` pins it, and so does the port it feeds); one nothing pins is `unresolved-typevar` |
 | live handles | `Bus`, `Generator[T]`, `Access`; never literals |
 
 A record is usable inline in any signature (`p: { wpm: Number, delay: Number
@@ -584,9 +617,64 @@ on a record field, `notes?: review.notes` on a config key that creates a port.
 On a key, `?` only works when that key CREATES the port (a node like
 `ExecPython` that lets you invent inputs). On a port the node already declares,
 `width?: self.width` is refused with "'width?' marks a port optional, but
-'width' is not a port this node creates": whether a declared port is optional
-is the node's own decision. `here: String?` is refused. An output port takes no `?`: emitting nothing on
+'width' is not a port this node creates. Declare optionality on the port
+itself (`width?: Type`) instead".
+`here: String?` is refused. An output port takes no `?`: emitting nothing on
 it closes it, and no marker changes that.
+
+Whether a node needs an input comes from its metadata and from what the
+program writes on the port:
+
+| What the node's metadata says | What the program writes | Result |
+|---|---|---|
+| required | nothing | always required |
+| required | `x?: T` | compile error naming the port: the node's code needs it |
+| optional | nothing | unwired: runs without it. Wired: waits for it, and skips if the wire closes |
+| optional | `x: T` (no `?`) | always required |
+| optional | `x?: T` | runs without it even when wired and the wire closed, whether nothing arrived or the source failed |
+
+A wire closes when its source finished without sending on that port, or
+failed, and a skipped node closes its own outputs in turn. So a wired input
+skips its node when it closes, unless the program wrote `?` on it.
+
+One exception: an input in one of the node's `oneOfRequired` sets (or in a
+`@require_one_of` you wrote on it) is decided by its set. The node skips only
+when every member of the set closed, unless you declared that input without
+`?`.
+
+If an input the node's metadata leaves optional must be filled before the
+program builds, declare it without `?`. `SlackSendMessage` takes `text` or
+`blocks`, so neither is required alone; declared this way, `text` is:
+
+````weft
+send = SlackSendMessage(text: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+}
+````
+
+Leave `text` out and `weft validate` refuses `send`: `required input
+'send.text' has no driver (no edge, no body value, no default)`.
+
+If the node must run when a wire into it brings nothing, write `?`. Here
+`ask` is a `SlackReceiveMessage`, whose `thread` sends nothing for a message
+that was not in a thread. With `threadTs?` the answer goes to the top of the
+channel; without the `?`, `answer` waits for `threadTs` and skips:
+
+````weft
+answer = SlackSendMessage(threadTs?: String) {
+  account: slack.access
+  channel: "#support"
+  text: draft.answer
+  threadTs: ask.thread
+}
+````
+
+A node whose every wired input is written with `?` has nothing saying when it
+runs, and the compiler refuses it (`run-undecided`): gate it with
+`_should_flow`, drop the `?` from the input it cannot do without, or add
+`@require_one_of`.
 
 A cast CONVERTS a value to the type declared on its output. Any node can be
 one: its metadata names one input and one output under `features.castPorts`,
@@ -632,11 +720,13 @@ the run and
 on frames (loop iterations).
 
 A node that emits on some outputs and not others closes the rest. A [closed]
-pulse on a required input skips the node and closes its outputs; on an
-optional input the node fires anyway; on `_should_flow` the node skips,
-period. Skips cascade forward until a node opted into absence with `?`. A
-failure propagates exactly like a missing value, and a downstream optional
-input is the recovery path.
+pulse on an input the node needs (a required one, or a wired one the program
+did not write `?` on) skips the node and closes its outputs; on an input
+written `?` the node fires anyway; on `_should_flow` the node skips, period.
+Skips cascade forward until a node opted into absence with `?`. A node that
+fails closes its outputs too, and a `?` input downstream runs without them
+just the same, but the failure fails the run unless the failing node's
+`_error` output is wired. Wiring `_error` is how a program recovers.
 
 Branching is only this: a branch in weft is a node that ran or a port that
 closed, and nothing else. Any Boolean reaches a `_should_flow`, so a node of
@@ -683,18 +773,20 @@ node. `FirstInOrder`'s written order is priority, so the fallback goes last.
 
 A node can also branch by ABSENCE, which often needs no deciding node at all.
 A port that emits nothing is closed, and a closed port skips what hangs off
-it, so one query whose columns are null except the one that applies picks the
-branch by itself:
+it. A query's `row` port is the usual case: it closes when the query found
+no row, so it picks the branch by itself:
 
 ```weft
-look = PostgresExecuteQuery(id: String) -> (card: JsonDict, missing: Boolean) {
+look = PostgresExecuteQuery(id: String) -> (row: Card) {
   account: db.access
-  query: "select c.data as card, (c.id is null) as missing from ..."
+  query: "select title, seen from cards where id = $id"
 }
+found = Reply { body: look.row }
+missing = Reply { _should_not_flow: look.row, status: 404, body: "no such card" }
 ```
 
-`card` closes on the rows where the SQL says null, `missing` closes on the
-others, and each one gates its own branch. A port that DECLARES null among
+When a card came back, `found` answers and `missing` skips; when none did,
+the other way round. A port that DECLARES null among
 its types (`String | Null`) is the opposite: a null arrives as data and the
 node runs. And a statement with nothing to say still emits `count` (0) and
 `rows` ([]), so a setup script is gated on `count` without inventing a row
@@ -707,10 +799,10 @@ type refuses fails the node by name, with whatever it already sent still
 sent.
 
 A value on a wire is at most 100 KB, and the check is on the port that EMITS
-it: `port 'results' of 'search' carries 107 KB; a wire carries at most 100
-KB`. A node one hop later cannot trim what already failed, so the bound is
-set on the emitting node (a `WebSearch` keeps each page under `maxTextChars`
-characters, a query keeps its `LIMIT`), and anything that is bytes rather
+it: `port 'results' of 'search' carries 107 KB, and a wire carries at most 100 KB. Return less: one page of it with where the next one starts, or a part that says it was cut. Or store the data and send the stored file instead, whose value weighs a few hundred bytes whatever the file holds`. A node one hop later cannot trim what already failed, so the bound is
+set on the emitting node: it pages (`GoogleSheetsRead` takes `offset` and
+`maxRows` and answers `nextOffset` and `hasMore`), it caps (`FetchPage` cuts
+at `maxChars` and says so on `truncated`, a query keeps its `LIMIT`), and anything that is bytes rather
 than a value (a file, an audio clip, a long document) travels as a stored
 file: the node puts it in storage and emits the file value, a few hundred
 bytes whatever the file weighs. A program that would carry a big value on a
@@ -780,7 +872,7 @@ pay = Route -> (body: JsonDict) {
 
 With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached. A
 run with `recorded: false` cannot be tagged, and `durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
-A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `error`. If the run can pause again (its last bus closed), the wait pauses after all.
+A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `_error`. If the run can pause again (its last bus closed), the wait pauses after all.
 A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for` and `--hold-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
 
 ## Stopping other runs
@@ -915,29 +1007,27 @@ iteration in a loop body), so a group can hold its own source.
 
 A [closed] pulse on a group INPUT does not stop the group. It travels in like
 any other pulse and lands on the nodes that read that input; those skip, and
-everything else in the group runs. Two readers of this page in a row got it
-backwards and one of them reported a working program as a critical bug, so
-here it is worked through. A card whose picture is optional:
+everything else in the group runs. A card whose picture is optional:
 
 ````weft
-look = Route -> (text: String, photo: Image) { path: "cards", method: "POST" }
+look = Route -> (body: { text: String, photo?: Image }) { path: "cards", method: "POST" }
 
-card = Group(body: String, picture?: Image) -> (saved: String) {
+card = Group(text: String, picture?: Image) -> (saved: String) {
   store = ExecPython(text: String, shot?: Image) -> (line: String) {
     code: "return {'line': text + (' with a picture' if shot else '')}"
-    text: self.body
+    text: self.text
     shot: self.picture
   }
   self.saved = store.line
 }
-card.body = look.text
-card.picture = look.photo
+card.text = look.body.text
+card.picture = look.body.photo
 
 answer = Reply { body: card.saved }
 ````
 
-Post a card with no picture. `look` emits nothing on `photo`, so `photo`
-closes; `card.picture` carries that closure in. `store` declares `shot?`, so
+Post a card with no picture. The body has no `photo` field, so the wire
+from `look.body.photo` closes; `card.picture` carries that closure in. `store` declares `shot?`, so
 a closed pulse there does not stop it: it runs with `shot` absent, writes its
 line, and the caller gets an answer. Nothing else in the group noticed.
 
@@ -945,11 +1035,13 @@ Drop the `?` from `shot` and `store` skips instead, `self.saved` never gets a
 value, `saved` closes, `answer` skips, and the caller is left with nothing.
 That one character is the whole difference between "the picture is optional"
 and "there is no card without a picture". Note where it sits: on the port of
-the node that reads the value, never on `look`'s output (an output carries no
-`?`; emitting nothing IS how it says "absent").
+the node that reads the value. The `?` after `photo` in the body's record
+does a different job: without it, a body with no picture is answered 400
+and nothing past the route runs.
 
 The build holds a group's ports to that same rule. A port nothing outside
-connects is fine while only optional inputs inside read it. Once it reaches a
+connects is fine while every input inside that reads it is written `?`
+or is an input of a join node such as `FirstInOrder`, which is optional without one. A default does not help: it fills only an input no wire reaches. Once it reaches a
 required input, or the last member of a `@require_one_of` set that could get a
 value (through any group, loop or included file in between), `weft validate`
 fails with `required-port-unmet`, naming the group's port and the
@@ -975,31 +1067,31 @@ names:
 ```weft
 # src/triage.weft: sorts a message into a lane
 Group(text: String, provider: LlmProvider) -> (lane: String) {
-  sort = LlmInference -> (lane: String) {
+  sort = LlmInferenceJson -> (response: { lane: String }) {
     provider: self.provider
     params: LlmParams { systemPrompt: @file("assets/prompts/triage.md") }.params
     prompt: self.text
-    parseJson: true
   }
-  self.lane = sort.lane
+  self.lane = sort.response.lane
 }
 ```
 
-The model comes in through a port. Every access node and every model
-provider sits at the top of `src/main.weft`, one per service, and is wired
-down into each group and included file that needs it:
+The model comes in through a port. Every access node sits at the top of
+`src/main.weft`, one per service, and so does every model node, one per
+model; each is wired down into each group and included file that needs it:
 
 ```weft
-smart = OpenRouterProvider { model: "z-ai/glm-5.3" }
+router = OpenRouterAccess
+smart = OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }
 triage = @include("triage.weft")
 triage.provider = smart.provider
 triage.text = ask.text
 ```
 
-A provider written inside the file instead would be one more connection to
-pick for every place the file is included. A value each instance fills in
-for itself goes on that top-level node too (`connection: @instance_filled`,
-the `weft-instances` skill), so each person is asked for it once.
+An access node written inside the file instead would be one more connection
+to pick for every place the file is included. A value each instance fills in
+for itself goes on that top-level node too (`account: @instance_filled` on
+`router`, the `weft-instances` skill), so each person is asked for it once.
 
 A trigger inside an included file works like a trigger inside a group: it
 registers when the including program activates, and it is addressed through
@@ -1008,7 +1100,15 @@ its site (`one.door`).
 The file is compiled once and every `@include` of it is a call: a run
 reaching `triage` sends its port values into the file's one body under a
 frame naming the call site, and the results come back to that site alone.
-Includes and loops nest freely.
+Includes and loops nest freely. Only the type check repeats per call site: a
+file holding `Group[T: Media](file: T) -> (out: T)` (`[T: Media]` limits
+`T` to kinds of `Media`; without it, `T` takes any type) can be included once fed an `Image` and once fed a `Video`, and each
+site's `out` keeps the type that went in. That holds however deep you go: for
+a group nested inside the file, for a node's type variable, and for another
+file the file includes. If the file is included as `img` and as `vid`, and it
+includes another file as `inner`, then `img.inner` and `vid.inner` are
+separate sites with their own types. The nodes and their code stay one copy
+each.
 An included file has no name you write or read: a node inside is always
 addressed through the site, the way the source reads. `weft events <run>
 --node triage.classify` shows that one use of it and every row prints its
@@ -1075,18 +1175,18 @@ N: its carried value '<port>' could not be updated because '<node>' failed:
 <error>`. A carry closed because a gate or a branch did not run
 keeps its previous value, and the loop goes on. A gathered output of a failed
 iteration is a `null` slot, and the loop goes on. So if one bad item must not
-end a fold, wire the failing node's `error` output (under Handling a failure)
+end a fold, wire the failing node's `_error` output (under Handling a failure)
 and write the carry on both branches.
 
 ### Trying a node again
 
 If a node can fail for a passing reason (a model whose JSON does not fit the
 shape you asked for, a service that times out now and then), the retry is a
-sequential loop, and `maxIters` is its cap. The node's `error` goes into a
+sequential loop, and `maxIters` is its cap. The node's `_error` goes into a
 carried value, which the next try reads and which comes out holding the last
 failure; `self.done` is written once the node's answer arrived, so a try
 that worked is the last one. A record type on the answer makes a reply with
-a missing key, a wrong type or an extra key a failure on `error`, which is
+a missing key, a wrong type or an extra key a failure on `_error`, which is
 what sends it round again:
 
 ````weft
@@ -1102,14 +1202,13 @@ grade = Loop(text: String, provider: LlmProvider) -> (problem: String, verdicts:
     text: self.text
     problem: self.problem
   }
-  mark = LlmInference -> (response: Verdict) {
+  mark = LlmInferenceJson -> (response: Verdict) {
     provider: self.provider
     prompt: ask.text
-    parseJson: true
   }
   fits = All { verdict: mark.response }
   self.verdicts = mark.response
-  self.problem = mark.error
+  self.problem = mark._error
   self.done = fits.yes
 }
 grade.text = essay.text

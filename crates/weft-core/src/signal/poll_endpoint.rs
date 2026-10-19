@@ -17,7 +17,11 @@
 //!     first successful response resumes it. A non-2xx answer or a failed
 //!     request is not an answer: it is retried at the next poll and shown
 //!     on the node. `delta` is refused here, since its first poll primes
-//!     silently and would swallow the answer.
+//!     silently and would swallow the answer. While it waits, the raw
+//!     last answer it read shows on the waiting node, and
+//!     `ctx.await_signal_with_cancel` names the job's own cancel address,
+//!     called once if the run is cancelled meanwhile
+//!     ([`super::cancel_call`]).
 //!
 //! For a held read-only stream see [`super::SseSubscribe`]; for a
 //! bidirectional socket with a heartbeat see [`super::SocketListen`].

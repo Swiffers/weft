@@ -136,17 +136,17 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_upload(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&S3PutObjectNode, put_inputs(&rig, "a.txt")).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("AccessDenied"), "{error}");
     assert!(!outcome.outputs.contains_key("etag"), "a caught failure emits no etag");
     Ok(())
 }
 
-/// A `..` key is a mistake in the program, never a value for `error`.
+/// A `..` key is a mistake in the program, never a value for `_error`.
 async fn dot_segment_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&S3PutObjectNode, put_inputs(&rig, "a/../b.txt")).await.failure()?;
     assert!(err.starts_with("input error"), "{err}");
     assert!(rig.requests().is_empty(), "nothing was sent");

@@ -167,8 +167,8 @@ impl ContextHandle for PureHandle {
         self.inner.wired_output_ports()
     }
 
-    fn catches_errors(&self) -> bool {
-        self.inner.catches_errors()
+    fn firing_buses(&self) -> &crate::bus::FiringBuses {
+        self.inner.firing_buses()
     }
 
     async fn pulse_downstream(&self, output: crate::node::NodeOutput, wait_delivered: bool) -> WeftResult<()> {

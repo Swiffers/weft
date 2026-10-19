@@ -26,7 +26,7 @@ use crate::infra::{InfraNodeStatus, TerminateDisks};
 use crate::instance_door::ValuesChanged;
 use crate::program::{
     CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, RunPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
-    MintedInstanceToken, PaidBy, ProgramCall, RunFilter, RunsCounted, TokensRevoked, MAX_RUNS_PAGE,
+    MintedInstanceToken, NodeState, PaidBy, ProgramCall, RunFilter, RunsCounted, TokensRevoked, MAX_RUNS_PAGE,
 };
 use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::signal::timer::{Timer, TimerSpec};
@@ -91,6 +91,17 @@ impl RunContext {
     /// with `.list(..)`, counted with `.count()`, deleted with `.clean(..)`.
     pub fn runs(&self) -> RunQuery<'_> {
         RunQuery { ctx: self, instance: None, filter: RunFilter::default() }
+    }
+
+    /// Where one node of a run of this project stands: pending, running,
+    /// waiting (with the raw last answer its wait saw), completed, failed
+    /// (with the error), skipped or cancelled, read from that run's
+    /// record. `node` is spelled the way `--from` takes it (`render`,
+    /// `one.render` inside the file the site `one` includes); a node
+    /// inside a loop fires once per iteration and is refused, while the
+    /// loop itself is read. Pass `self.run_id` for this run's own nodes.
+    pub async fn node_state(&self, run: RunId, node: impl Into<String>) -> WeftResult<NodeState> {
+        self.program_call(ProgramCall::NodeState { run, node: node.into() }, StopSelf::Keep).await
     }
 
     /// Instance tokens: `mint_for_instance` hands a browser or extension

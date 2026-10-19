@@ -1,14 +1,17 @@
 //! `weft run`: compile + register the cwd project, record the code as a
 //! version, start a run under it, stream logs until completion (or
-//! `--detach`).
+//! `--detach`). A run it follows to its end sets its exit code the way
+//! `weft wait` does (`wait::Outcome`): 0 when it completed, non-zero when
+//! it failed or was cancelled. A run it only starts exits 0.
 //!
 //! A run has no entry point of its own: the dispatcher kicks every root
 //! of the graph (a node no wire feeds) and pulses run whatever they
 //! reach. The run is shaped by a spec (`weft_core::run_spec`), read
 //! from `examples/<name>.json` or built from the flags (`--from`,
 //! `--emit`, `--target`, `--before`, `--group`, `--fire`); `--save <name>` writes
-//! the flags as a spec. `--seed` reuses from head's run every node
-//! whose slice of the program did not change. The whole catalog is compiled
+//! the flags as a spec. `--seed` reuses from head's run (or from the run
+//! `--seed=<run>` names) every node whose slice of the program did not
+//! change. The whole catalog is compiled
 //! by default; `--referenced` builds only the types used by this graph.
 
 use anyhow::{bail, Context};
@@ -26,7 +29,8 @@ pub struct RunArgs {
     pub spec: Option<String>,
     pub detach: bool,
     pub node_set: Option<weft_core::builds::NodeSet>,
-    pub seed: bool,
+    /// `--seed`: `Some("")` for head's run, `Some(run)` for the run named.
+    pub seed: Option<String>,
     pub seed_until: Vec<String>,
     pub seed_before: Vec<String>,
     pub root: bool,
@@ -34,7 +38,7 @@ pub struct RunArgs {
     pub save: Option<String>,
 }
 
-pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Run, |progress| async move {
         run_inner(&ctx_inner, &progress, args).await
@@ -58,10 +62,14 @@ fn spec_for(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<Option<RunSpec>> {
     }
 }
 
-async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArgs) -> anyhow::Result<()> {
-    if (!args.seed_until.is_empty() || !args.seed_before.is_empty()) && !args.seed {
+async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
+    if (!args.seed_until.is_empty() || !args.seed_before.is_empty()) && args.seed.is_none() {
         bail!("--seed-until and --seed-before need --seed");
     }
+    let seed_run = match args.seed.as_deref() {
+        Some(run) if !run.is_empty() => Some(super::resolve_run_id(ctx, run).await?.parse().context("a resolved run id")?),
+        _ => None,
+    };
     let mut spec = spec_for(ctx, &args)?;
     if let (Some(name), Some(spec)) = (&args.save, &mut spec) {
         spec.name = name.clone();
@@ -97,7 +105,8 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
         manifest: handle.manifest.clone(),
         definition_hash: handle.definition_hash().to_string(),
         binary_hash: handle.binary_hash().to_string(),
-        seed: args.seed,
+        seed: args.seed.is_some(),
+        seed_run,
         seed_until: args.seed_until.clone(),
         seed_before: args.seed_before.clone(),
         root: args.root,
@@ -129,10 +138,10 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     // the action-bar state machine in `cli_running` while the run is
     // actually `run_running`.
     if args.detach || ctx.json() {
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
-    super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&definition)).await?;
-    Ok(())
+    let outcome = super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&definition)).await?;
+    Ok(outcome.exit_code())
 }
 
 fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<()> {
@@ -141,14 +150,16 @@ fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec
             .map_err(|error| anyhow::anyhow!("the run cannot start:\n{error}"))?;
         // A seeded run can feed a crossing from history, which only the
         // dispatcher reads; it refuses an unfed input after that.
-        if !args.seed {
-            weft_core::run_spec::refuse_unrunnable(definition, &resolved.selection, spec)
+        if args.seed.is_none() {
+            weft_core::run_spec::refuse_unrunnable(definition, &resolved, spec)
                 .map_err(|error| anyhow::anyhow!("the run cannot start:\n{error}"))?;
         }
     }
-    weft_core::project::selection::RunSelection::carve(definition, &weft_core::project::selection::SelectionBounds {
-        target: args.seed_until.clone(), before: args.seed_before.clone(), ..Default::default()
-    }).map_err(anyhow::Error::msg)?;
+    if !args.seed_until.is_empty() || !args.seed_before.is_empty() {
+        weft_core::project::cut::walk(&weft_core::project::graph::ProjectGraph::new(definition), &weft_core::project::cut::SelectionBounds {
+            target: args.seed_until.clone(), before: args.seed_before.clone(), ..Default::default()
+        }).map_err(anyhow::Error::msg)?;
+    }
     Ok(())
 }
 
@@ -185,8 +196,8 @@ pub fn summary_line(started: &RunStarted, spec: Option<&RunSpec>) -> String {
         let mut what = vec![format!("spec {}", spec.name)];
         match spec.from.values().map(|ports| ports.len()).sum::<usize>() + spec.group.as_ref().map(|(_, ports)| ports.len()).unwrap_or(0) {
             0 => {}
-            1 => what.push("1 input backup".to_string()),
-            n => what.push(format!("{n} input backups")),
+            1 => what.push("1 handed value".to_string()),
+            n => what.push(format!("{n} handed values")),
         }
         if let Some((node, _)) = &spec.fire {
             what.push(format!("fired {node}"));
@@ -220,6 +231,6 @@ mod tests {
         let mut spec = RunSpec::whole("angry-customer");
         spec.from.entry("x".into()).or_default().insert("p".into(), serde_json::json!(1));
         spec.fire = Some(("inbound".into(), serde_json::json!({})));
-        assert_eq!(summary_line(&s, Some(&spec)), "spec angry-customer, 1 input backup, fired inbound, 3 nodes");
+        assert_eq!(summary_line(&s, Some(&spec)), "spec angry-customer, 1 handed value, fired inbound, 3 nodes");
     }
 }

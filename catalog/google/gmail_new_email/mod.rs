@@ -57,6 +57,7 @@ impl Node for GmailNewEmailNode {
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let include_attachments: bool = ctx.inputs.get("includeAttachments")?;
+        let max_body_chars = ctx.inputs.get::<f64>("maxBodyChars")? as usize;
 
         let wake = ctx.wake.record()?;
         let id = wake
@@ -66,7 +67,7 @@ impl Node for GmailNewEmailNode {
             .to_string();
 
         let http = ctx.client(&account).await?;
-        let read = read_message(&ctx, &http, &id, include_attachments).await?;
+        let read = read_message(&ctx, &http, &id, include_attachments, max_body_chars).await?;
         ctx.pulse_downstream(read.into_output().set("id", id)).await
     }
 }

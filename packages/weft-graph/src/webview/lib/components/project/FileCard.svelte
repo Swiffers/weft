@@ -7,7 +7,7 @@
 		label: string;
 		file: FileValueWire;
 		/// Where the value came from when it did not travel a wire in
-		/// this run (a backup, a supplied output, the seed run). Shown
+		/// this run (a value given to the run, the seed run). Shown
 		/// beside the file's metadata.
 		note?: string;
 	} = $props();

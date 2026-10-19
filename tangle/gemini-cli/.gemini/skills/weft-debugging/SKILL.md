@@ -18,7 +18,9 @@ node and the wrong value.
   start time in UTC, the project id, the entry node (the trigger that fired), the tags. An
   activate, a resync or an infra start creates setup runs, phases
   `trigger_setup` and `infra_setup`; `--phase fire` hides them. `--project <id>` narrows to one project. A run whose trigger has `recorded: false` is listed only if it failed (with the node that failed and why, nothing before it) or reported a cost or asked weft for something on its behalf, so a route that answered and left nothing here may simply be unrecorded: `weft status` shows how many runs each trigger started in the last minute or two and how many failed, which is how you confirm its runs happen.
-- **If a run failed and you want the reason**: `weft logs <run-id>`. It
+- **If a run failed and you want the reason**: `weft logs <run-id>`. A
+  route's caller only ever hears `Something went wrong`, with the run id in
+  the body's `runId` and the `Weft-Run-Id` header; that id is the one. It
   prints what the run's nodes wrote and every failure the journal recorded,
   as `error` and `warn` lines. A line about one node names it (and the loop
   iteration, `llm#3:`); a line about the run itself (the run failing, a

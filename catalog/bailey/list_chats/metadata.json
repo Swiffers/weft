@@ -20,14 +20,12 @@
   "outputs": [
     {
       "name": "chats",
-      "type": "List[JsonDict]"
+      "type": "List[JsonDict]",
+      "narrowable": true
     },
     {
       "name": "count",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

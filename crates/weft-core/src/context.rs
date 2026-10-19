@@ -72,6 +72,32 @@ pub struct RunContext {
     pub(crate) handle: Arc<dyn ContextHandle>,
 }
 
+/// A producer's bus that is not open yet ([`RunContext::pending_bus`]).
+pub struct PendingBus<'c> {
+    ctx: &'c RunContext,
+    port: String,
+    opts: crate::bus::BusOptions,
+    name: String,
+    bus: Option<crate::bus::BusHandle>,
+}
+
+impl PendingBus<'_> {
+    /// The bus, opened by this call when it is the first
+    /// ([`RunContext::open_bus`]): its marker goes out and its readers
+    /// start. Call it when the first piece is in hand.
+    pub async fn open(&mut self) -> WeftResult<&crate::bus::BusHandle> {
+        if self.bus.is_none() {
+            self.bus = Some(self.ctx.open_bus(&self.port, self.opts.clone(), &self.name).await?);
+        }
+        Ok(self.bus.as_ref().expect("opened above"))
+    }
+
+    /// The bus if it is open, `None` before the first piece.
+    pub fn opened(&self) -> Option<&crate::bus::BusHandle> {
+        self.bus.as_ref()
+    }
+}
+
 /// How long a link minted for a node body stays fetchable. A body
 /// reads its inputs at the start and is done long before this; the
 /// link never leaves the firing (every exit strips it), so a short
@@ -107,13 +133,16 @@ pub fn catchable_message(error: &WeftError) -> Option<String> {
 }
 
 /// Whether a failure goes to [`ERROR_PORT`] instead of stopping the
-/// run, and with what message: only when the node declares
-/// `features.catchErrors`, its `error` output is wired (a caught
-/// failure nobody reads would be silent), and the failure is catchable
+/// run, and with what message: only when the node's `_error` output is
+/// wired (a caught failure nobody reads would be silent), the firing has
+/// no stream open (a bus or a generator something already went out on:
+/// its readers already hold part of it, so it ends failed instead, and a
+/// second answer from a branch gated on `_error` would race the first),
+/// and the failure is catchable
 /// ([`catchable_message`]). The one decision, read by the engine's
 /// failure path and by the node-test rigs alike.
-pub fn caught_failure(catch_errors: bool, catchable: Option<String>, error_wired: bool) -> Option<String> {
-    catchable.filter(|_| catch_errors && error_wired)
+pub fn caught_failure(catchable: Option<String>, opened_a_stream: bool, error_wired: bool) -> Option<String> {
+    catchable.filter(|_| error_wired && !opened_a_stream)
 }
 
 /// Waiting out another write of the same file: short and growing
@@ -282,7 +311,26 @@ impl RunContext {
     ///
     /// Returns the value the fire carried.
     pub async fn await_signal<K: crate::signal::Signal>(&self, kind: K) -> WeftResult<Value> {
+        self.await_spec(crate::signal::to_spec(kind)).await
+    }
+
+    /// [`Self::await_signal`] for a wait on a job running on an outside
+    /// service: if the run is cancelled while it waits, the listener
+    /// sends `on_cancel` once (the service's own cancel address for the
+    /// job), as the connection the signal carries, so the service stops
+    /// working and charging. Never sent when the wait is answered or the
+    /// run ends any other way (`crate::signal::cancel_call`).
+    pub async fn await_signal_with_cancel<K: crate::signal::Signal>(
+        &self,
+        kind: K,
+        on_cancel: crate::signal::CancelCall,
+    ) -> WeftResult<Value> {
         let mut spec = crate::signal::to_spec(kind);
+        spec.on_cancel = Some(on_cancel);
+        self.await_spec(spec).await
+    }
+
+    async fn await_spec(&self, mut spec: SignalSpec) -> WeftResult<Value> {
         // A parked signal outlives the firing's file links.
         spec.config = crate::storage::media::strip_links(&spec.config);
         self.handle.await_signal(spec).await
@@ -389,16 +437,15 @@ impl RunContext {
         self.handle.pulse_downstream(without_links(output), false).await
     }
 
-    /// A node with `features.catchErrors` never touches [`ERROR_PORT`]
-    /// itself: the runtime fills it with the node's failure. Writing
-    /// or closing it from the body is the node's own mistake, a
-    /// [`WeftError::Type`] that is never caught.
+    /// A node never touches [`ERROR_PORT`] itself: the runtime fills it
+    /// with the node's failure. Writing or closing it from the body is
+    /// the node's own mistake, a [`WeftError::Type`] that is never
+    /// caught.
     fn refuse_error_port<'a>(&self, mut ports: impl Iterator<Item = &'a String>) -> WeftResult<()> {
-        if self.handle.catches_errors() && ports.any(|p| p == ERROR_PORT) {
+        if ports.any(|p| p == ERROR_PORT) {
             return Err(WeftError::Type(format!(
                 "node '{}' ({}) touches its '{ERROR_PORT}' output, which the runtime fills \
-                 with the node's failure (features.catchErrors); return the error from the \
-                 body instead",
+                 with the node's failure; return the error from the body instead",
                 self.node_id, self.node_type
             )));
         }
@@ -454,32 +501,17 @@ impl RunContext {
     /// `.set(..)` after it for ports the node computes itself; the later
     /// set wins, so a payload key can't shadow the node's own truth.
     pub fn fan_declared(&self, source: &serde_json::Value) -> crate::node::NodeOutput {
-        crate::node::NodeOutput::new().extend_from_declared(source, &self.data_outputs())
-    }
-
-    /// The declared outputs a node fills from data (a row's columns, a
-    /// response's fields): every declared output but, on a node with
-    /// `features.catchErrors`, [`ERROR_PORT`], which only the runtime
-    /// fills. A field that happens to be called `error` in a model's
-    /// answer or a query's row is then data, never the node's failure.
-    pub fn data_outputs(&self) -> std::collections::HashMap<String, WeftType> {
-        let catches = self.handle.catches_errors();
-        self.handle
-            .declared_output_ports()
-            .iter()
-            .filter(|(name, _)| !(catches && name.as_str() == ERROR_PORT))
-            .map(|(name, ty)| (name.clone(), ty.clone()))
-            .collect()
+        crate::node::NodeOutput::new().extend_from_declared(source, &self.declared_outputs())
     }
 
     /// The declared type of one of THIS instance's output ports, as the
-    /// compiled project resolved it (a metadata `MustOverride` output
-    /// reads as the concrete type the weft source declared on it).
+    /// compiled project resolved it (a narrowable output reads as the
+    /// type the weft source declared on it).
     /// For nodes whose behavior follows their resolved type (Cast, a
     /// node storing a file on a typed port). A port this node does not
     /// declare is the node's own mistake, never an outcome of the run:
     /// the error is a [`WeftError::Type`], which is never caught
-    /// ([`catchable_message`]), so it fails the run even with `error`
+    /// ([`catchable_message`]), so it fails the run even with `_error`
     /// wired. A node that only probes whether a
     /// port exists reads [`Self::declared_outputs`].
     pub fn output_type(&self, port: &str) -> WeftResult<WeftType> {
@@ -497,9 +529,24 @@ impl RunContext {
     /// (`-> (user_id: String)`) on a node that accepts them. For a
     /// node whose behavior is "fan what I received onto whatever ports
     /// the author declared" (a route reading a body, a call reading a
-    /// reply) and that needs the names, not just one type.
-    pub fn declared_outputs(&self) -> &std::collections::HashMap<String, WeftType> {
-        self.handle.declared_output_ports()
+    /// reply, a row's columns) and that needs the names, not just one
+    /// type. [`ERROR_PORT`] is not among them: it is the language's,
+    /// only the runtime fills it, and a field called `_error` in a
+    /// model's answer or a query's row is never taken for the node's
+    /// failure.
+    pub fn declared_outputs(&self) -> std::collections::HashMap<String, WeftType> {
+        self.handle
+            .declared_output_ports()
+            .iter()
+            .filter(|(name, _)| name.as_str() != ERROR_PORT)
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect()
+    }
+
+    /// One of [`Self::declared_outputs`], read without copying the rest:
+    /// the type of output `port` when this instance declares it.
+    pub fn declared_output(&self, port: &str) -> Option<&WeftType> {
+        self.handle.declared_output_ports().get(port).filter(|_| port != ERROR_PORT)
     }
 
     /// Every input port THIS instance declares, with its resolved
@@ -544,11 +591,16 @@ impl RunContext {
     /// `BusOptions { ephemeral: true, .. }` for video / high-rate
     /// streams where dropping old payloads under load is preferable to
     /// growing the journal unboundedly.
+    ///
+    /// The bus ends when this body does, with how it returned
+    /// ([`crate::bus::FiringBuses`]), unless the body closes it first.
     pub fn create_bus(
         &self,
         opts: crate::bus::BusOptions,
     ) -> WeftResult<(crate::bus::BusHandle, Value)> {
-        self.handle.create_bus(opts)
+        let (bus, marker) = self.handle.create_bus(opts)?;
+        self.handle.firing_buses().hold(&bus);
+        Ok((bus, marker))
     }
 
     /// Resolve a Bus-marker JSON value to a fresh handle on the live
@@ -561,42 +613,58 @@ impl RunContext {
     }
 
     /// The whole PRODUCER ritual in one call: create the bus, emit its
-    /// marker on output `port`, and register `name` on it. The returned
-    /// guard CLOSES the bus when dropped, so every exit path of the
-    /// node body (success, error, unwind) ends the stream for readers
-    /// instead of leaving them parked forever; no manual close-on-
-    /// every-path blocks in node code.
+    /// marker on output `port`, and register `name` on it. The bus ends
+    /// when the body does, with how it returned, so every exit path
+    /// (success, error, unwind) ends the stream for readers instead of
+    /// leaving them parked, and a failure reaches them as one; no
+    /// manual close-on-every-path blocks in node code. A body that is
+    /// done sending before it is done working closes it itself
+    /// (`close`, which ends it finished).
+    ///
+    /// Call it on the first piece, not before the work that makes the
+    /// pieces: until the marker goes out the node has opened no bus, so
+    /// a failure before then is caught on `_error` when that is wired
+    /// ([`caught_failure`]) and the port closes as absence, so its
+    /// readers never start and a branch gated on `_error` can answer
+    /// instead. Once a bus is open, a failure fails the node and ends
+    /// the bus failed.
     pub async fn open_bus(
         &self,
         port: &str,
         opts: crate::bus::BusOptions,
         name: &str,
-    ) -> WeftResult<crate::bus::ClosingBus> {
-        let (bus, marker) = self.create_bus(opts)?;
+    ) -> WeftResult<crate::bus::BusHandle> {
+        let (mut bus, marker) = self.create_bus(opts)?;
         self.pulse_downstream(crate::node::NodeOutput::new().set(port, marker)).await?;
-        // Past the marker emission, a reader may already be parked on
-        // this bus: from here EVERY exit closes (the guard's whole
-        // point), including a register failure right below.
-        let mut guard = crate::bus::ClosingBus::new(bus);
-        guard
-            .register(name)
+        bus.register(name)
             .map_err(|e| WeftError::NodeFailed(format!("register '{name}' on the bus: {e}")))?;
-        Ok(guard)
+        Ok(bus)
+    }
+
+    /// A bus on output `port` that opens on the producer's first piece
+    /// ([`PendingBus::open`]), which is when [`Self::open_bus`] belongs:
+    /// the work that makes the pieces (a provider's call, a session's
+    /// handshake, a first query) comes first, so its failure is still
+    /// catchable and the readers start only once there is something to
+    /// read. A producer that never opens it leaves the port closed as
+    /// absence.
+    pub fn pending_bus(&self, port: &str, opts: crate::bus::BusOptions, name: &str) -> PendingBus<'_> {
+        PendingBus { ctx: self, port: port.to_string(), opts, name: name.to_string(), bus: None }
     }
 
     /// The consuming twin of [`Self::open_bus`]: resolve the bus on
-    /// input `port` and register `name` on it, with the same
-    /// close-on-drop guard (a consumer that dies mid-conversation must
-    /// not leave the producer parked on `wait_for`). An observer that
-    /// must NOT close the bus on exit (a debug tap) uses
+    /// input `port` and register `name` on it, held by this firing like
+    /// a bus it created, so a consumer that dies mid-conversation ends
+    /// the bus failed and never leaves the producer parked on
+    /// `wait_for`. An observer that must NOT end the bus on exit (a
+    /// debug tap, a reader streaming it out) uses
     /// [`Self::bus_from_input`] instead.
-    pub fn join_bus(&self, port: &str, name: &str) -> WeftResult<crate::bus::ClosingBus> {
-        let bus = self.bus_from_input(port)?;
-        let mut guard = crate::bus::ClosingBus::new(bus);
-        guard
-            .register(name)
+    pub fn join_bus(&self, port: &str, name: &str) -> WeftResult<crate::bus::BusHandle> {
+        let mut bus = self.bus_from_input(port)?;
+        self.handle.firing_buses().hold(&bus);
+        bus.register(name)
             .map_err(|e| WeftError::NodeFailed(format!("register '{name}' on the bus: {e}")))?;
-        Ok(guard)
+        Ok(bus)
     }
 
     /// Convenience: read input `name` and resolve it to a bus
@@ -1374,29 +1442,6 @@ impl ValueBag {
         self.order.iter().flatten().filter(|name| !self.spec_names.contains(name.as_str()))
     }
 
-    /// Add a declared input port the bag was not built with. The
-    /// production bag reads every port off the compiled node, so only
-    /// the node-test rig needs this: a case declaring a created port
-    /// (`rig.input_type("photo", ...)`) and then NOT delivering on it
-    /// is exactly the "declared, stayed silent" shape, and without
-    /// this the bag could not tell it from a port nobody wrote.
-    pub fn declare_port(&mut self, name: String) {
-        if let Some(order) = self.order.as_mut() {
-            if !order.contains(&name) {
-                order.push(name);
-            }
-        }
-    }
-
-    /// Does the node DECLARE this input, whatever this firing
-    /// delivered on it? The port list behind the bag is every input the
-    /// node has, in written order, so a name in it that is missing from
-    /// the values is a port that stayed silent. A bag with no port list
-    /// behind it (a wake or nested bag) declares nothing.
-    pub fn declares(&self, name: &str) -> bool {
-        self.order.as_ref().is_some_and(|order| order.iter().any(|port| port == name))
-    }
-
     /// The values behind the named holes of a text, in hole order.
     ///
     /// A node whose input ports ARE its parameters (a SQL query
@@ -1443,10 +1488,11 @@ impl ValueBag {
                 values.push(*value);
                 continue;
             }
-            // Declared but silent this firing: the author said it may be
-            // absent, so the hole reads null. Only a hole naming no port
-            // at all is the author's mistake.
-            if self.declares(hole) {
+            // A port the author created that stayed silent this firing:
+            // they said it may be absent, so the hole reads null. A hole
+            // naming no created port is the author's mistake, one naming
+            // the node type's own setting (`{{template}}`) included.
+            if self.created().any(|port| port == hole) {
                 values.push(ABSENT);
                 continue;
             }
@@ -1521,9 +1567,13 @@ impl ValueBag {
 /// node reading a shape it can never hold.
 pub fn node_input_bag(
     node: &crate::project::NodeDefinition,
+    frames: &crate::frames::LoopFrames,
     mut delivered: serde_json::Map<String, Value>,
     closed_ports: &[String],
 ) -> Result<ValueBag, String> {
+    // Each port's type where this firing runs (a node inside an included
+    // file has the types its site gave it).
+    let types = node.types_at(&crate::frames::call_path(frames));
     for input in &node.inputs {
         let Some(default) = &input.default else { continue };
         if closed_ports.iter().any(|p| p == &input.name) {
@@ -1534,7 +1584,7 @@ pub fn node_input_bag(
         // default fills it like an absent input.
         let absent = match delivered.get(&input.name) {
             None => true,
-            Some(Value::Null) => !crate::run::ready::port_admits_null(node, &input.name),
+            Some(Value::Null) => !types.input(&input.name).is_some_and(|ty| ty.port_value_type().contains_null()),
             Some(_) => false,
         };
         if absent {
@@ -2599,9 +2649,11 @@ pub trait ContextHandle: Send + Sync {
     /// Backs [`RunContext::is_output_wired`].
     fn wired_output_ports(&self) -> &std::collections::HashSet<String>;
 
-    /// Whether this node declares `features.catchErrors`, so its
-    /// [`ERROR_PORT`] belongs to the runtime ([`caught_failure`]).
-    fn catches_errors(&self) -> bool;
+    /// The buses this firing ends when its body does
+    /// ([`crate::bus::FiringBuses`]): the ctx holds every bus the body
+    /// creates or joins here, and the runtime ends them with how the
+    /// body returned.
+    fn firing_buses(&self) -> &crate::bus::FiringBuses;
 
     /// Fire downstream with `output`. The engine turns each mentioned
     /// output port into pulses on its outgoing edges, at the firing's
@@ -2792,8 +2844,7 @@ pub trait ContextHandle: Send + Sync {
     }
 }
 
-/// Splitting an endpoint address: the one place that knows a default
-/// port still counts as a port.
+/// Which failures go to `_error`.
 #[cfg(test)]
 mod caught_failure_tests {
     use super::{catchable_message, caught_failure};
@@ -2802,7 +2853,10 @@ mod caught_failure_tests {
     fn every_kind() -> Vec<(WeftError, bool)> {
         vec![
             (WeftError::NodeFailed("x".into()), true),
+            (WeftError::WaitGaveUp("x".into()), true),
             (WeftError::Runtime(anyhow::anyhow!("x")), true),
+            (WeftError::Suspended { token: "x".into() }, false),
+            (WeftError::WaitSkipped("x".into()), false),
             (WeftError::Config("x".into()), false),
             (WeftError::Input("x".into()), false),
             (WeftError::Type("x".into()), false),
@@ -2810,15 +2864,15 @@ mod caught_failure_tests {
         ]
     }
 
-    /// Caught only with the flag on, `error` wired, and an outcome of
+    /// Caught only with `_error` wired, no stream open, and an outcome of
     /// the firing; every other combination stays a failure of the run.
     #[test]
-    fn only_an_outcome_on_a_wired_catching_node_is_caught() {
+    fn only_an_outcome_on_a_wired_node_with_no_open_stream_is_caught() {
         for (error, outcome) in every_kind() {
-            for flag in [false, true] {
+            for opened_a_stream in [false, true] {
                 for wired in [false, true] {
-                    let caught = caught_failure(flag, catchable_message(&error), wired);
-                    assert_eq!(caught.is_some(), outcome && flag && wired, "{error:?} flag={flag} wired={wired}");
+                    let caught = caught_failure(catchable_message(&error), opened_a_stream, wired);
+                    assert_eq!(caught.is_some(), outcome && !opened_a_stream && wired, "{error:?} stream={opened_a_stream} wired={wired}");
                     if let Some(message) = caught {
                         assert_eq!(message, "x");
                     }
@@ -2828,6 +2882,8 @@ mod caught_failure_tests {
     }
 }
 
+/// Splitting an endpoint address: the one place that knows a default
+/// port still counts as a port.
 #[cfg(test)]
 mod endpoint_address_tests {
     use super::{endpoint_host_and_port, endpoint_socket_address};
@@ -3061,7 +3117,7 @@ mod value_bag_tests {
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn wired_output_ports(&self) -> &std::collections::HashSet<String> { unreachable!() }
-        fn catches_errors(&self) -> bool { false }
+        fn firing_buses(&self) -> &crate::bus::FiringBuses { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -3125,7 +3181,7 @@ mod value_bag_tests {
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn wired_output_ports(&self) -> &std::collections::HashSet<String> { unreachable!() }
-        fn catches_errors(&self) -> bool { false }
+        fn firing_buses(&self) -> &crate::bus::FiringBuses { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -3552,21 +3608,21 @@ mod node_input_bag_tests {
     fn access_reads_the_pick_through_the_stamped_port() {
         let picked = access_node(false, json!({}));
         let handle = json!({"account": {"id": "g-1", "identity": "Q"}});
-        let bag = node_input_bag(&picked, delivered(handle), &[]).expect("bag");
+        let bag = node_input_bag(&picked, &Vec::new(), delivered(handle), &[]).expect("bag");
         let marker = bag.access("account").expect("read").expect("picked");
         assert_eq!(marker.service(), "slack");
 
         let optional = access_node(true, json!({}));
-        let bag = node_input_bag(&optional, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&optional, &Vec::new(), delivered(json!({})), &[]).expect("bag");
         assert!(bag.access("account").expect("read").is_none(), "optional + unpicked = None");
 
         let required = access_node(false, json!({}));
-        let bag = node_input_bag(&required, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&required, &Vec::new(), delivered(json!({})), &[]).expect("bag");
         let err = bag.access("account").unwrap_err().to_string();
         assert!(err.contains("no slack connection picked"), "{err}");
 
         let plain = node(&[("prompt", None)], json!({}));
-        let bag = node_input_bag(&plain, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&plain, &Vec::new(), delivered(json!({})), &[]).expect("bag");
         let err = bag.access("prompt").unwrap_err().to_string();
         assert!(err.contains("not an access (connection picker) input"), "{err}");
     }
@@ -3577,7 +3633,7 @@ mod node_input_bag_tests {
     #[test]
     fn only_delivered_values_reach_the_bag() {
         let n = node(&[("to", None)], json!({"label": "x", "to": "braces"}));
-        let bag = node_input_bag(&n, delivered(json!({"to": 10})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"to": 10})), &[]).expect("bag");
         assert_eq!(bag.get::<u64>("to").unwrap(), 10, "the delivered value is the value");
         assert!(bag.raw("label").is_none(), "config is not an input home");
         assert_eq!(bag.object().unwrap().len(), 1);
@@ -3590,8 +3646,7 @@ mod node_input_bag_tests {
     #[test]
     fn a_wired_object_arrives_as_that_object() {
         let n = node(&[("prompt", None), ("config", None)], json!({}));
-        let bag = node_input_bag(
-            &n,
+        let bag = node_input_bag(&n, &Vec::new(),
             delivered(json!({
                 "prompt": "hi",
                 "config": {"model": "from-config-node", "temperature": 0.2}
@@ -3616,7 +3671,7 @@ mod node_input_bag_tests {
             &[("method", Some(json!("GET"))), ("model", Some(json!("base")))],
             json!({}),
         );
-        let bag = node_input_bag(&n, delivered(json!({"model": "wired"})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"model": "wired"})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("method").unwrap(), "GET", "absent input reads its default");
         assert_eq!(bag.get::<String>("model").unwrap(), "wired", "a wired value beats the default");
         // The default shows through the whole-record read too: the bag
@@ -3624,11 +3679,11 @@ mod node_input_bag_tests {
         assert_eq!(bag.object().unwrap().get("method"), Some(&json!("GET")));
 
         let bag =
-            node_input_bag(&n, delivered(json!({})), &["method".to_string()]).expect("bag");
+            node_input_bag(&n, &Vec::new(), delivered(json!({})), &["method".to_string()]).expect("bag");
         assert!(bag.raw("method").is_none(), "a closed input is not defaulted");
 
         // A null on a plain String port is no value: the default fills it.
-        let bag = node_input_bag(&n, delivered(json!({"method": null})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"method": null})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("method").unwrap(), "GET");
         // On a nullable port the null IS the value and stays.
         let nullable: crate::project::NodeDefinition = serde_json::from_value(json!({
@@ -3638,7 +3693,7 @@ mod node_input_bag_tests {
             "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
             "requiresInfra": false, "images": []
         })).unwrap();
-        let bag = node_input_bag(&nullable, delivered(json!({"note": null})), &[]).expect("bag");
+        let bag = node_input_bag(&nullable, &Vec::new(), delivered(json!({"note": null})), &[]).expect("bag");
         assert_eq!(bag.raw("note"), Some(&json!(null)), "null is data on a nullable port");
     }
 
@@ -3651,7 +3706,7 @@ mod node_input_bag_tests {
             &[("url", None)],
             json!({"parentId": "g1", "_label": "My node", "_tags": ["a"]}),
         );
-        let bag = node_input_bag(&n, delivered(json!({"url": "http://x"})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"url": "http://x"})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("url").unwrap(), "http://x");
         assert!(bag.raw("parentId").is_none(), "parentId is compiler plumbing, not input data");
         assert!(bag.raw("_label").is_none(), "_-reserved keys are editor plumbing, not input data");
@@ -3686,7 +3741,7 @@ mod node_input_bag_tests {
             "account": {"id": "grant-1", "identity": "Q @ Acme"},
             "channel": "C42"
         });
-        let bag = node_input_bag(&n, delivered(written), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(written), &[]).expect("bag");
 
         let access: crate::access::Access = bag.get("account").unwrap();
         assert_eq!(access.access_id(), "grant-1");
@@ -3723,15 +3778,15 @@ mod node_input_bag_tests {
 
         let n = make(json!("slack"));
         let pick = json!({"channel": {"id": "C42", "label": "#general"}});
-        let bag = node_input_bag(&n, delivered(pick), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(pick), &[]).expect("bag");
         assert_eq!(bag.get::<String>("channel").unwrap(), "C42", "the object form unwraps");
 
         let bad = json!({"channel": {"label": "#general"}});
-        let e = node_input_bag(&n, delivered(bad), &[]).unwrap_err();
+        let e = node_input_bag(&n, &Vec::new(), delivered(bad), &[]).unwrap_err();
         assert!(e.contains("string `id`"), "{e}");
 
         let n = make(json!(null));
-        let e = node_input_bag(&n, delivered(json!({})), &[]).unwrap_err();
+        let e = node_input_bag(&n, &Vec::new(), delivered(json!({})), &[]).unwrap_err();
         assert!(e.contains("no service stamp"), "{e}");
     }
 
@@ -3752,7 +3807,7 @@ mod node_input_bag_tests {
         }))
         .expect("node json");
         let wired = crate::access::Access::new("grant-1", "google", None).to_value();
-        let bag = node_input_bag(&n, delivered(json!({"account": wired})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"account": wired})), &[]).expect("bag");
         let access: crate::access::Access = bag.get("account").unwrap();
         assert_eq!(access.required_permissions(), ["drive.readonly".to_string()]);
     }
@@ -3777,7 +3832,7 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({"channel": "C-wired"})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"channel": "C-wired"})), &[]).expect("bag");
         assert!(bag.raw("account").is_none(), "unconnected = absent, reads fail loud");
         assert_eq!(bag.get::<String>("channel").unwrap(), "C-wired");
     }
@@ -3798,7 +3853,7 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({"code": "return {}", "a": 7})), &[]).expect("bag");
+        let bag = node_input_bag(&n, &Vec::new(), delivered(json!({"code": "return {}", "a": 7})), &[]).expect("bag");
         let data: Vec<&str> = bag.custom().map(|(k, _)| k.as_str()).collect();
         assert_eq!(data, vec!["a"], "settings are excluded, instance ports remain");
         let settings: Vec<&str> = bag.declared().map(|(k, _)| k.as_str()).collect();

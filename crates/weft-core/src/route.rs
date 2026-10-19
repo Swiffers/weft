@@ -67,6 +67,43 @@ pub fn is_reserved_path(path: &str) -> bool {
 }
 
 impl RoutePattern {
+    /// What is wrong with an output port a program added to a node whose
+    /// added outputs read this path's captures
+    /// (`claimsRoute.capturesAreOutputs`), said after the node's name:
+    /// the port names no capture, or it is typed as something other than
+    /// text. `None` when it is a capture typed to take text. The
+    /// compiler and the node-test rig both hold an added port to it.
+    pub fn capture_port_problem(&self, port: &str, ty: &crate::weft_type::WeftType) -> Option<String> {
+        use crate::weft_type::{WeftPrimitive, WeftType};
+        let captures = self.captures();
+        if !captures.contains(&port) {
+            let captured = if captures.is_empty() {
+                "captures nothing".to_string()
+            } else {
+                format!("captures {}", captures.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
+            };
+            return Some(format!(
+                "declares the output `{port}`, but its path '{}' {captured}: a port added here reads \
+                 the path capture of its name. Add `{{{port}}}` to the path, or drop the port",
+                self.as_str(),
+            ));
+        }
+        (!WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::String), ty)).then(|| {
+            format!("declares the capture `{port}` as {ty}, but a path capture is text: declare it `String`")
+        })
+    }
+
+    /// The names this path captures, in order (`cards/{id}` captures `id`).
+    pub fn captures(&self) -> Vec<&str> {
+        self.segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Param(name) => Some(name.as_str()),
+                Segment::Literal(_) => None,
+            })
+            .collect()
+    }
+
     /// Parse `chat/{room}` into segments. The empty string is the root
     /// pattern (zero segments), which matches only the empty path.
     pub fn parse(raw: &str) -> Result<Self, String> {

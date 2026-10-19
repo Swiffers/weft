@@ -3,7 +3,7 @@
 //! Every act that puts pulses on wires is an EMISSION with an id: a
 //! node body's `pulse_downstream` or `close_port` (written to the
 //! journal on the `PortEmitted` / `PortClosed` row), a firing's
-//! termination sweep, a group boundary forwarding, a loop launching
+//! termination sweep, a scope opening or taken down, a loop launching
 //! an iteration or emitting outward. Every one of those ids is DERIVED
 //! from where the act happens (the node or group, the frames, and for
 //! a stream item or an iteration its number), never minted at random:
@@ -36,30 +36,22 @@ pub struct PulseEmission {
 }
 
 /// The id of the pulse an emission puts on ONE wire: a function of the
-/// emission and the whole wire (the port it left from, the node and
-/// port it lands on), so the fold re-derives it. The source port is
-/// part of it because one emission is one firing's whole bag, and the
-/// id names the wire end to end. A data pulse and a closure on the
-/// same wire from the same emission are two different pulses (an
-/// emission that projects a `?` key delivers a value on one wire and
-/// a closure on another).
-pub fn pulse_id(
-    emission_id: Uuid,
-    source_port: &str,
-    target_node: &str,
-    target_port: &str,
-    closed: bool,
-) -> Uuid {
+/// emission and the wire (its id names it end to end: the port it leaves
+/// from, the group ports it passes, the node and port it lands on), so
+/// the fold re-derives it. One emission is one firing's whole bag, and a
+/// body's member is wired once per site that calls it, so two pulses of
+/// one emission that land on one port are on two wires and get two ids.
+/// A data pulse and a closure on the same wire from the same emission
+/// are two different pulses (an emission that projects a `?` key
+/// delivers a value on one wire and a closure on another).
+pub fn pulse_id(emission_id: Uuid, wire: &str, closed: bool) -> Uuid {
     let tag = if closed { "closed" } else { "value" };
-    Uuid::new_v5(
-        &emission_id,
-        format!("{source_port}\0{target_node}\0{target_port}\0{tag}").as_bytes(),
-    )
+    Uuid::new_v5(&emission_id, format!("{wire}\0{tag}").as_bytes())
 }
 
 /// The emission of a node body's values and closes on its ordinary
 /// output ports, and of what the engine puts on them for the firing (a
-/// caught failure on `error`, a baked value): one id per firing. Each
+/// caught failure on `_error`, a baked value): one id per firing. Each
 /// such port goes out at most once per firing, and the pulse id carries
 /// the port, so one id serves every one of them, and a replay of the
 /// body after a pause that emits a port again lands on the pulse
@@ -87,10 +79,17 @@ pub fn terminal_sweep_emission(node_id: &str, frames: &LoopFrames) -> Uuid {
     derived(&TERMINAL_SWEEP, &[node_id, &frames_key(frames)])
 }
 
-/// The emission of a group boundary firing (a `Passthrough` forwarding
-/// its inputs, or the closures a gated scope owes the outside).
-pub fn boundary_emission(node_id: &str, frames: &LoopFrames) -> Uuid {
-    derived(&BOUNDARY, &[node_id, &frames_key(frames)])
+/// The emission of a scope's copy being decided: what it sends from its
+/// own ports when it opens, or the closures it owes the outside when it
+/// does not run (one copy is decided once, one way).
+pub fn scope_emission(scope: &str, frames: &LoopFrames) -> Uuid {
+    derived(&SCOPE, &[scope, &frames_key(frames)])
+}
+
+/// The emission of a node that stands in for itself sending what it was
+/// given (`ProjectDefinition::given`), in place of its body's.
+pub fn stand_in_emission(node_id: &str, frames: &LoopFrames) -> Uuid {
+    derived(&STAND_IN, &[node_id, &frames_key(frames)])
 }
 
 /// The emission of a loop launching iteration `index` (the body's
@@ -119,7 +118,7 @@ fn derived(namespace: &Uuid, parts: &[&str]) -> Uuid {
 const TERMINAL_SWEEP: Uuid = Uuid::from_bytes([
     0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x01,
 ]);
-const BOUNDARY: Uuid = Uuid::from_bytes([
+const SCOPE: Uuid = Uuid::from_bytes([
     0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x02,
 ]);
 const ITERATION_LAUNCH: Uuid = Uuid::from_bytes([
@@ -134,6 +133,9 @@ const BODY: Uuid = Uuid::from_bytes([
 const STREAM_ITEM: Uuid = Uuid::from_bytes([
     0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x06,
 ]);
+const STAND_IN: Uuid = Uuid::from_bytes([
+    0x5a, 0x1e, 0x9c, 0x0b, 0x7d, 0x2f, 0x4a, 0x8e, 0x9b, 0x3c, 0x1d, 0x6f, 0x2e, 0x8a, 0x4b, 0x07,
+]);
 
 #[cfg(test)]
 mod tests {
@@ -143,16 +145,15 @@ mod tests {
     #[test]
     fn a_pulse_id_is_a_function_of_the_emission_and_the_wire() {
         let emission = Uuid::new_v4();
-        let base = pulse_id(emission, "out", "b", "in", false);
-        assert_eq!(base, pulse_id(emission, "out", "b", "in", false));
-        assert_ne!(base, pulse_id(emission, "out", "c", "in", false));
-        assert_ne!(base, pulse_id(emission, "out", "b", "other", false));
-        assert_ne!(base, pulse_id(emission, "out", "b", "in", true));
-        assert_ne!(base, pulse_id(Uuid::new_v4(), "out", "b", "in", false));
+        let base = pulse_id(emission, "a.out->b.in", false);
+        assert_eq!(base, pulse_id(emission, "a.out->b.in", false));
+        assert_ne!(base, pulse_id(emission, "a.out->c.in", false));
+        assert_ne!(base, pulse_id(emission, "a.out->b.in", true));
+        assert_ne!(base, pulse_id(Uuid::new_v4(), "a.out->b.in", false));
         assert_ne!(
             base,
-            pulse_id(emission, "out2", "b", "in", false),
-            "two output ports into one input port are two wires, two pulses"
+            pulse_id(emission, "a.out@one->b.in", false),
+            "one emission onto one port through two sites is two wires, two pulses"
         );
     }
 
@@ -163,8 +164,9 @@ mod tests {
         let sweep = terminal_sweep_emission("n", &root);
         assert_eq!(sweep, terminal_sweep_emission("n", &root));
         assert_ne!(sweep, terminal_sweep_emission("n", &inner));
-        assert_ne!(sweep, boundary_emission("n", &root), "same parts, different act");
+        assert_ne!(sweep, scope_emission("n", &root), "same parts, different act");
         assert_ne!(sweep, body_emission("n", &root), "same parts, different act");
+        assert_ne!(body_emission("n", &root), stand_in_emission("n", &root), "a stand-in's sending is not the body's");
         assert_eq!(body_emission("n", &inner), body_emission("n", &inner), "a replayed body emits the same act");
         assert_ne!(body_emission("n", &root), body_emission("n", &inner));
         assert_ne!(stream_emission("n", &root, 0), stream_emission("n", &root, 1), "each stream item is its own act");

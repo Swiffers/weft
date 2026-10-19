@@ -71,7 +71,7 @@ pub enum EditOp {
     MoveGroupScope { group: String, target_group: Option<String> },
     /// Rewrite a node's declared port surface. `inputs`/`outputs` are the
     /// header's ports ONLY: custom additions, plus a catalog port whose type
-    /// or requiredness the author overrides (filling a MustOverride output).
+    /// or requiredness the author overrides (narrowing a narrowable output).
     /// The catalog provides the node type's own ports at enrich, so restating
     /// them here would freeze the whole signature into source. A port the
     /// gesture DELETED is named in `removed_inputs`/`removed_outputs`, and
@@ -153,8 +153,8 @@ pub struct PortSig {
     /// would rewrite an author's `name?: Type` as `name: Type`.
     pub required: bool,
     /// Required on the wire for the same reason: a default here would
-    /// write the `MustOverride` placeholder over the author's declared
-    /// type. Where a placeholder is meant, the editor spells it out.
+    /// write some type over the author's declared one. The empty string
+    /// is a port written with no type, written back as the bare name.
     pub port_type: String,
 }
 

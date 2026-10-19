@@ -108,9 +108,6 @@
       "description": "The first generated image."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "image"

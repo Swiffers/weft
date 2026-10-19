@@ -282,8 +282,5 @@
         "port": "promptStrength"
       }
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

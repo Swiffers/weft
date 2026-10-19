@@ -73,6 +73,7 @@
     {
       "name": "page",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The new row, the raw Notion page object."
     },
     {
@@ -86,6 +87,7 @@
     {
       "name": "properties",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The row's property values."
     }
   ],

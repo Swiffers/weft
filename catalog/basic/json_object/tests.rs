@@ -1,16 +1,16 @@
 //! JsonObject self-tests: the wired keys are the object, written order
-//! survives, a value of any shape goes in whole, and a node nobody
-//! wired is refused rather than emitting `{}`.
+//! survives, a value of any shape goes in whole, keys that all stayed
+//! silent make `{}`, and a node with no keys at all is refused rather
+//! than emitting `{}`.
 //!
-//! The "an optional key stayed silent" case is not here and cannot be:
-//! whether an absent input skips the node or arrives absent is the
+//! Whether an absent input skips the node or arrives absent is the
 //! engine's decision, taken before this body runs, and it is proved in
 //! the engine's own skip tests. What this file pins is that whatever
 //! DOES arrive lands under its own name, unchanged.
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{FakeRig, NodeTest, WeftResult, WeftType};
 
 use super::JsonObjectNode;
 
@@ -19,11 +19,21 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("the_wired_keys_are_the_object", keys_are_the_object),
         NodeTest::fake("keys_keep_the_order_they_were_written", written_order),
         NodeTest::fake("a_value_of_any_shape_goes_in_whole", nested_value),
-        NodeTest::fake("nothing_wired_is_refused", nothing_wired),
+        NodeTest::fake("keys_that_all_stayed_silent_make_an_empty_object", all_silent),
+        NodeTest::fake("no_keys_at_all_is_refused", no_keys),
     ]
 }
 
+/// The keys a compiled JsonObject has: one input per key, as the
+/// program wrote them.
+fn keys(rig: &FakeRig, names: &[&str]) {
+    for name in names {
+        rig.input_type(name, WeftType::parse("String | Number | JsonDict | List[String]").expect("parses"));
+    }
+}
+
 async fn keys_are_the_object(rig: FakeRig) -> WeftResult<()> {
+    keys(&rig, &["job", "status"]);
     let outcome = rig
         .run(&JsonObjectNode, json!({ "job": "abc", "status": "running" }))
         .await
@@ -35,6 +45,7 @@ async fn keys_are_the_object(rig: FakeRig) -> WeftResult<()> {
 /// A reply body is read by a person in a network tab, so the keys come
 /// out where the author put them rather than sorted.
 async fn written_order(rig: FakeRig) -> WeftResult<()> {
+    keys(&rig, &["zebra", "apple", "moose"]);
     let outcome = rig
         .run(&JsonObjectNode, json!({ "zebra": 1, "apple": 2, "moose": 3 }))
         .await
@@ -52,6 +63,7 @@ async fn written_order(rig: FakeRig) -> WeftResult<()> {
 /// already an object (or a list, or a stored file's reference) must go
 /// in exactly as it arrived.
 async fn nested_value(rig: FakeRig) -> WeftResult<()> {
+    keys(&rig, &["card", "tags"]);
     let outcome = rig
         .run(
             &JsonObjectNode,
@@ -66,10 +78,21 @@ async fn nested_value(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// An unwired node would hand on `{}` with nothing on screen saying
-/// why, and a caller reading that body sees a successful empty answer.
-async fn nothing_wired(rig: FakeRig) -> WeftResult<()> {
+/// Every key optional and none arriving: the node ran because its gate
+/// said so (the compiler demands one on an all-optional node), and `{}`
+/// is the true answer. A route called with `{}` gets `{}` back.
+async fn all_silent(rig: FakeRig) -> WeftResult<()> {
+    keys(&rig, &["title", "note"]);
+    let outcome = rig.run(&JsonObjectNode, json!({})).await.ok()?;
+    assert_eq!(outcome.outputs["object"], json!({}));
+    Ok(())
+}
+
+/// A JsonObject with no keys at all would hand on `{}` with nothing on
+/// screen saying why, and a caller reading that body sees a successful
+/// empty answer.
+async fn no_keys(rig: FakeRig) -> WeftResult<()> {
     let error = rig.run(&JsonObjectNode, json!({})).await.failure()?;
-    assert!(error.contains("nothing is wired"), "{error}");
+    assert!(error.contains("has no keys"), "{error}");
     Ok(())
 }

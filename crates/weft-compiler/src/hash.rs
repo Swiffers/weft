@@ -745,16 +745,16 @@ mod fs_hashes {
             let catalog = FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
             let empty: ProjectDefinition = serde_json::from_value(serde_json::json!({"id":project.id(),"nodes":[],"edges":[]})).unwrap();
-            let mut grouped = empty.clone();
-            grouped.nodes.push(serde_json::from_value(serde_json::json!({
-                "id":"g__in", "nodeType":"Passthrough", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
-                "groupBoundary":{"groupId":"g","role":"In"}
+            let mut looped = empty.clone();
+            looped.nodes.push(serde_json::from_value(serde_json::json!({
+                "id":"l__in", "nodeType":"LoopIn", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
+                "groupBoundary":{"groupId":"l","role":"In"}
             })).unwrap());
             for set in [weft_core::builds::NodeSet::Full, weft_core::builds::NodeSet::Referenced] {
                 let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
-                let after = implementation_hashes(&grouped, &project, root, &catalog, set).unwrap();
+                let after = implementation_hashes(&looped, &project, root, &catalog, set).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
-                assert!(before.contains_key("Passthrough") && before.contains_key("IncludeIn") && before.contains_key("CallOut"));
+                assert!(before.contains_key("LoopIn") && before.contains_key("LoopOut"));
                 if matches!(set, weft_core::builds::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
         }

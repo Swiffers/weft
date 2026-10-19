@@ -34,7 +34,7 @@
 		/// out and says so, with nothing to expand or copy.
 		closed?: boolean;
 		/// Where the value came from when it did not travel a wire in
-		/// this run (a backup, a supplied output, the seed run). Shown
+		/// this run (a value given to the run, the seed run). Shown
 		/// in the header beside the value's type.
 		note?: string;
 	} = $props();

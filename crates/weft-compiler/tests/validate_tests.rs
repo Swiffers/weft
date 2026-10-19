@@ -337,6 +337,7 @@ out.data = a.value
         source_handle: Some("value".into()),
         target_handle: Some("data".into()),
         path: Vec::new(),
+        via: Vec::new(),
         span: None,
         source_file: None,
     };
@@ -385,7 +386,7 @@ t = Text
             declared_type: None,
         },
         accepts: weft_core::node::Accepts::both(),
-        required_when_wired: false,
+        optional: false,
         widget: None,
         default: None,
         label: None,
@@ -418,7 +419,7 @@ t = Text { value: "ok" }
             declared_type: None,
         },
         accepts: weft_core::node::Accepts::wire_only(),
-        required_when_wired: false,
+        optional: false,
         widget: None,
         default: None,
         label: None,
@@ -534,24 +535,26 @@ fn a_durable_trigger_that_is_not_recorded_is_refused() {
     assert!(!validate(&fine, &catalog()).iter().any(|x| x.code.as_deref() == Some("run-settings")));
 }
 
-/// `LlmInference`'s added output ports only fire with `parseJson: true`:
-/// the metadata says so through `custom_outputs_declared`, so a program
-/// declaring `-> (verdict: String)` without the flag is a structural
-/// error naming the ports, and the same program with the flag, or with
-/// no added ports, is clean.
+/// `LlmInference` answers text on `response` and takes no added output
+/// ports: a program wanting the model's JSON uses LlmInferenceJson and
+/// declares the type of its `response`.
 #[test]
-fn added_llm_output_ports_without_parse_json_are_a_structural_error() {
-    let without = parse_enrich("n = LlmInference -> (verdict: String, score: Number) { prompt: \"judge\" }\n");
-    let d = validate(&without, &catalog());
-    let hit = errors(&d).into_iter().find(|x| x.code.as_deref() == Some("rule-structural")).expect("the rule fires");
-    assert!(hit.message.contains("'n' declares output ports (verdict, score)"), "{}", hit.message);
-    assert!(hit.message.contains("parseJson: true"), "{}", hit.message);
+fn llm_inference_takes_no_added_output_ports() {
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let mut project = compile_with_mode(
+        "n = LlmInference -> (verdict: String) { prompt: \"judge\" }\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        IncludeMode::Full,
+        COMPONENT,
+    )
+    .expect("compile ok");
+    let err = enrich(&mut project, &catalog()).expect_err("an added output is refused");
+    assert!(format!("{err:?}").contains("does not support custom output ports"), "{err:?}");
 
-    let with = parse_enrich("n = LlmInference -> (verdict: String, score: Number) { prompt: \"judge\", parseJson: true }\n");
-    assert!(!codes(&validate(&with, &catalog())).contains(&"rule-structural"), "{:?}", validate(&with, &catalog()));
-
-    let plain = parse_enrich("n = LlmInference -> (response: String) { prompt: \"judge\" }\n");
-    assert!(!codes(&validate(&plain, &catalog())).contains(&"rule-structural"), "{:?}", validate(&plain, &catalog()));
+    let json = parse_enrich("n = LlmInferenceJson -> (response: { verdict: String, score: Number }) { prompt: \"judge\" }\n");
+    let response = json.nodes.iter().find(|n| n.id == "n").and_then(|n| n.outputs.iter().find(|p| p.name == "response")).expect("response");
+    assert_eq!(response.port_type.to_string(), "{verdict: String, score: Number}");
 }
 
 // ─── Loop validate tests ────────────────────────────────────────────────────
@@ -1070,8 +1073,8 @@ fetch = FetchToStorage -> (file: Number)
     assert!(err.is_err(), "narrowing File to Number must be rejected");
     let msg = format!("{:?}", err.unwrap_err());
     assert!(
-        msg.contains("incompatible with catalog type"),
-        "error should explain the narrow is incompatible: {msg}"
+        msg.contains("is declared Number") && msg.contains("widest type"),
+        "error should explain the narrow does not fit: {msg}"
     );
 }
 
@@ -1097,6 +1100,7 @@ out.data = b.value
         source_handle: Some("value".into()),
         target_handle: Some("value".into()),
         path: Vec::new(),
+        via: Vec::new(),
         span: None,
         source_file: None,
     });
@@ -1535,21 +1539,19 @@ out.data = c.value
 }
 
 /// A NESTED typevar port (`List[T]`) wired to a concrete list on both
-/// sides resolves cleanly, and a genuinely unwired one is refused by
-/// the unresolved-typevar diagnostic (the binder and the validator
-/// must agree on what "unresolved" means; a bare-`T`-only binder left
-/// nested vars unresolved forever, which the validator then rejected
-/// on a perfectly wired graph).
+/// sides resolves cleanly (a bare-`T`-only binder left nested vars
+/// unresolved forever, which the validator then rejected on a perfectly
+/// wired graph), and a genuinely unwired one is refused. Both halves sit
+/// on a node's port: a group's port is no node, and enrich binds no
+/// variable on it.
 #[test]
 fn nested_typevar_resolves_through_edges_or_fails_loud() {
     let wired = r#"
 py = ExecPython(a: Number) -> (b: List[Number]) { code: "return {'b': [a]}", a: 1 }
-g = Group(items: List[T]) -> (out: List[T]) {
-    self.out = self.items
-}
-g.items = py.b
+count = ExecPython(items: List[T]) -> (n: Number) { code: "return {'n': len(items)}" }
+count.items = py.b
 sink = Debug
-sink.data = g.out
+sink.data = count.n
 "#;
     let result = weft_compiler::compile_checked(
         wired,
@@ -1561,11 +1563,9 @@ sink.data = g.out
     assert!(result.is_ok(), "a wired List[T] must resolve: {:?}", result.err());
 
     let unwired = r#"
-g = Group(items: List[T]) -> (out: List[T]) {
-    self.out = self.items
-}
+make = ExecPython() -> (items: List[T]) { code: "return {'items': []}" }
 sink = Debug
-sink.data = g.out
+sink.data = make.items
 "#;
     let err = weft_compiler::compile_checked(
         unwired,
@@ -1575,13 +1575,17 @@ sink.data = g.out
         weft_compiler::validate::ValidationMode::Structural,
     )
     .expect_err("an unwired List[T] port must be refused");
-    assert!(format!("{err:?}").contains("'List[T]' unresolved"), "{err:?}");
+    // Nothing binds `T`: the output stays `List[T]`, and the wire out of
+    // it is refused.
+    let err = format!("{err:?}");
+    assert!(err.contains("source port 'make.items' type 'List[T]' unresolved"), "{err}");
 }
 
-/// An un-overridden Cast output wired downstream still dies on the
-/// existing must-override-unmet rule (the cast check does not eat it).
+/// A Cast output nothing pins (no declaration, and it feeds a port of
+/// any type) is the ordinary unresolved type variable: the program has
+/// to say what to cast into.
 #[test]
-fn cast_without_declared_target_is_must_override_unmet() {
+fn cast_without_a_target_is_an_unresolved_typevar() {
     let project = parse_enrich(
         r#"
 src = Text { value: "42" }
@@ -1593,18 +1597,37 @@ out.data = c.value
     );
     let d = validate(&project, &catalog());
     assert!(
-        codes(&d).contains(&"must-override-unmet"),
-        "un-overridden Cast output must be refused: {:?}",
+        codes(&d).contains(&"unresolved-typevar"),
+        "a Cast output nothing pins must be refused: {:?}",
         codes(&d)
     );
+}
+
+/// The port a Cast feeds is a target as good as a declaration: wired
+/// into a Number port it casts into a Number.
+#[test]
+fn cast_takes_its_target_from_the_port_it_feeds() {
+    let project = parse_enrich(
+        r#"
+src = Text { value: "42" }
+c = Cast
+c.value = src.value
+use = ExecPython(n: Number) { code: "return {}" }
+use.n = c.value
+"#,
+    );
+    let c = project.nodes.iter().find(|n| n.id == "c").expect("cast");
+    assert_eq!(c.outputs[0].port_type.to_string(), "Number");
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"unresolved-typevar") && !codes(&d).contains(&"cast-not-allowed"), "{d:?}");
 }
 
 
 // ----- Generator[T] wiring rules -------------------------------------
 
-/// A `Socket` declares `inbound: Generator[MustOverride]` in its metadata:
-/// the author's `-> (inbound: Generator[JsonDict])` resolves the element
-/// type and a Loop over it validates clean, exactly like a Range stream.
+/// A `Socket`'s `inbound` is narrowable: the author's `-> (inbound:
+/// Generator[JsonDict])` restates the item type and a Loop over it
+/// validates clean, exactly like a Range stream.
 #[test]
 fn a_declared_socket_inbound_drives_a_loop_clean() {
     let (project, errs) = parse_enrich_lenient(
@@ -1630,14 +1653,12 @@ bye.code = 1000
     assert!(errors(&d).is_empty(), "expected a clean socket loop, got {:?}", errors(&d));
 }
 
-/// The same wiring with NO declaration on `inbound`: the element type is
-/// still the placeholder, and wiring it is refused (the author must
-/// declare it), never silently accepted as an opaque stream.
+/// With NO declaration, a socket's items are `JsonDict`, wired as such;
+/// a text socket must say its items are `String`, which its own rule
+/// asks at compile time.
 #[test]
-fn an_undeclared_socket_inbound_is_refused_when_wired() {
-    let (project, _) = parse_enrich_lenient(
-        r#"
-sock = Socket { path: "chat" }
+fn an_undeclared_socket_inbound_is_json_and_a_text_one_must_say_string() {
+    let loop_over = r#"
 turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
     parallel: false
     over: ["msg"]
@@ -1646,31 +1667,35 @@ turn = Loop(msg: Generator[JsonDict]) -> (results: List[Boolean | Null]) {
     self.results = say.done
 }
 turn.msg = sock.inbound
-"#,
-    );
+"#;
+    let (project, _) = parse_enrich_lenient(&format!("sock = Socket {{ path: \"chat\" }}\n{loop_over}"));
     let d = validate(&project, &catalog());
-    let hit = errors(&d).iter().any(|x| {
-        matches!(x.code.as_deref(), Some("must-override-unmet") | Some("unresolved-typevar"))
-    });
-    assert!(hit, "an undeclared stream element must be refused, got {:?}", errors(&d));
+    assert!(!codes(&d).contains(&"unresolved-typevar") && !codes(&d).contains(&"type-mismatch"), "{:?}", errors(&d));
+
+    let (project, _) = parse_enrich_lenient("sock = Socket { path: \"chat\", dataType: \"text\" }\n");
+    let d = validate(&project, &catalog());
+    assert!(
+        errors(&d).iter().any(|x| x.message.contains("text messages")),
+        "a text socket left at JsonDict is refused, got {:?}",
+        errors(&d)
+    );
 }
 
-/// A route reading a body declares the keys it wants; one that ignores
-/// its body declares nothing and is still a valid trigger (no
-/// undeclared-port complaint, no must-override complaint on a port
-/// nobody reads).
+/// A route reading a body declares its type and reads a field off it;
+/// one that ignores its body declares nothing and is still a valid
+/// trigger.
 #[test]
-fn a_route_with_declared_body_keys_and_one_with_none_both_validate() {
+fn a_route_with_a_typed_body_and_one_with_none_both_validate() {
     let (project, errs) = parse_enrich_lenient(
         r#"
-hello = Route -> (name: String) { path: "hello", method: "POST" }
+hello = Route -> (body: { name: String }) { path: "hello", method: "POST" }
 answer = Reply { status: 201 }
-answer.body = hello.name
+answer.body = hello.body.name
 "#,
     );
     assert!(errs.is_empty(), "compiles: {errs:?}");
     let d = validate(&project, &catalog());
-    assert!(errors(&d).is_empty(), "a declared body key wires clean, got {:?}", errors(&d));
+    assert!(errors(&d).is_empty(), "a typed body's field wires clean, got {:?}", errors(&d));
 
     let (project, errs) = parse_enrich_lenient(
         r#"
@@ -1690,11 +1715,13 @@ answer.body = ping.path
 fn a_bus_into_a_stream_node_validates_clean() {
     let (project, errs) = parse_enrich_lenient(
         r#"
-ask = Route -> (prompt: String) { path: "chat", method: "POST" }
-prov = OpenRouterProvider { model: "openai/gpt-4.1-nano" }
+ask = Route -> (body: { prompt: String }) { path: "chat", method: "POST" }
+ai = OpenRouterAccess
+prov = OpenRouterModel { model: "openai/gpt-4.1-nano" }
+prov.access = ai.access
 live = LlmStream
 live.provider = prov.provider
-live.prompt = ask.prompt
+live.prompt = ask.body.prompt
 out = Stream { format: "sse" }
 out.bus = live.stream
 "#,
@@ -2030,41 +2057,35 @@ out.data = p.done
     assert!(errors(&d).is_empty(), "a bound generic stream port is clean: {:?}", errors(&d));
 }
 
-/// A MustOverride target (an unknown declared type) behind a stream
-/// source is ONE mistake with one owner: `generator-into-generic-port`
-/// reports it, and `must-override-unmet` stays quiet (its "declare a
-/// concrete type" advice would contradict "declare Generator[T]").
+/// An untyped header port (`(xs)`, typed with its own variable) behind
+/// a stream source is ONE mistake with one owner:
+/// `generator-into-generic-port` reports it, and nothing else stacks on
+/// the edge (an unresolved-typevar's "declare a concrete type" advice
+/// would contradict "declare Generator[T]").
 #[test]
-fn a_stream_into_a_must_override_port_reports_once() {
+fn a_stream_into_an_untyped_port_reports_once() {
     let (project, _) = parse_enrich_lenient(
         r#"
 nums = Range { to: 5 }
-p = ExecPython(xs: Blah) -> (done: Boolean) { code: "return {'done': True}" }
+p = ExecPython(xs) -> (done: Boolean) { code: "return {'done': True}" }
 p.xs = nums.values
 out = Debug
 out.data = p.done
 "#,
     );
     let d = validate(&project, &catalog());
-    assert!(
-        codes(&d).contains(&"generator-into-generic-port"),
-        "expected generator-into-generic-port, got {:?}",
+    assert_eq!(
+        codes(&d).iter().filter(|c| **c == "generator-into-generic-port").count(),
+        1,
+        "the stream edge reports exactly once, got {:?}",
         codes(&d)
     );
-    // The stream edge reports ONCE: no must-override-unmet stacked on
-    // it, and no unresolved-typevar naming its target port. (Other
-    // edges may still report their own problems: the unknown type
-    // aborts enrichment, so Debug's generic stays unbound.)
+    // Nothing else names the stream edge's target port.
     assert!(
-        !codes(&d).contains(&"must-override-unmet"),
-        "the generic-port rule owns the stream edge, got {:?}",
-        codes(&d)
-    );
-    assert!(
-        !d.iter().any(|e| {
-            e.code.as_deref() == Some("unresolved-typevar") && e.message.contains("p.xs")
+        !errors(&d).iter().any(|e| {
+            e.code.as_deref() != Some("generator-into-generic-port") && e.message.contains("p.xs")
         }),
-        "no unresolved-typevar on the stream edge's target, got {d:?}"
+        "the generic-port rule owns the stream edge, got {d:?}"
     );
 }
 
@@ -2556,28 +2577,29 @@ b = Debug { data: sw.rest }
     );
 }
 
-/// The warning is about upstream values arriving dead: a node whose
-/// every wired input is optional gets it, a node built from written
-/// constants alone (an inline `LlmParams`) has no upstream and does not.
+/// The gate rule is about upstream values that may not arrive: a node
+/// whose every wired input is optional must say when it runs, and a
+/// node built from written constants alone (an inline `LlmParams`) has
+/// no upstream and is not asked.
 #[test]
-fn no_required_skip_needs_a_wire_to_warn_about() {
+fn the_gate_rule_needs_a_wire_to_ask_about() {
     let project = parse_enrich(
         r#"
 p = LlmParams { temperature: 0.2 }
 t = Text { value: "hi" }
-loose = Cast(value?: String) -> (value: String) {}
+loose = ExecPython(value?: String) -> (out: String) { code: "return {'out': value or ''}" }
 loose.value = t.value
-out = Debug { data: loose.value }
+out = Debug { data: loose.out }
 "#,
     );
     let d = validate(&project, &catalog());
-    let warned: Vec<&str> = d
+    let asked: Vec<&str> = d
         .iter()
-        .filter(|x| x.code.as_deref() == Some("no-required-skip"))
+        .filter(|x| x.code.as_deref() == Some("run-undecided"))
         .filter_map(|x| x.message.split('\'').nth(1))
         .collect();
-    assert!(warned.contains(&"loose"), "an all-optional wired node warns: {d:?}");
-    assert!(!warned.contains(&"p"), "a constants-only node has no upstream: {d:?}");
+    assert!(asked.contains(&"loose"), "an all-optional wired node is asked: {d:?}");
+    assert!(!asked.contains(&"p"), "a constants-only node has no upstream: {d:?}");
 }
 
 /// A leaf is how a program ends (the last node sends the message,
@@ -2906,7 +2928,7 @@ fn two_declarations_of_one_typevar_must_agree() {
 
 /// `declared_type` is the VERBATIM header annotation, never a re-print of
 /// the parsed type. A re-print would expand a registry alias and, worse,
-/// turn an unparseable annotation into the `MustOverride` placeholder,
+/// turn an unparseable annotation into the port's own type variable,
 /// which the editor's next ports gesture would write back over the
 /// author's text (destroying both the typo and the squiggle naming it).
 #[test]
@@ -2922,7 +2944,7 @@ fn declared_type_is_the_verbatim_header_spelling() {
     let n = project.nodes.iter().find(|n| n.id == "n").expect("node n");
     let data = n.inputs.iter().find(|p| p.name == "data").expect("input data");
     assert_eq!(data.declared_type, Some("Strng".into()), "the typo round-trips as typed");
-    assert_eq!(data.port_type.wire_string(), "MustOverride", "the parsed type is the placeholder");
+    assert_eq!(data.port_type, weft_core::weft_type::WeftType::port_var(weft_core::weft_type::PortSide::Input, "data"), "the parsed type is the port's own variable");
 }
 
 /// An `@include` line declares no ports: the interface node's ports come
@@ -2986,7 +3008,7 @@ fn diagnostics_carry_the_included_file() {
 /// `@require_one_of` on a catalog-typed node survives enrich (the
 /// catalog's features once replaced it wholesale, so it guarded
 /// nothing), a name that is not a port is refused naming the inputs,
-/// and a satisfied group is not warned about as "no required input".
+/// and a satisfied group counts as deciding when the node runs.
 #[test]
 fn require_one_of_survives_the_catalog_merge_and_checks_its_names() {
     let project = parse_enrich(
@@ -3001,7 +3023,7 @@ act = ExecPython(a?: String, b?: String, @require_one_of(a, b)) -> (out: String)
     let act = project.nodes.iter().find(|n| n.id == "act").expect("act");
     assert_eq!(act.features.one_of_required, vec![vec!["a".to_string(), "b".to_string()]]);
     let d = validate(&project, &catalog());
-    assert!(!codes(&d).contains(&"no-required-skip"), "the group counts as a requirement: {d:?}");
+    assert!(!codes(&d).contains(&"run-undecided"), "the group counts as a requirement: {d:?}");
     assert!(!codes(&d).contains(&"require-one-of-unmet"), "a is wired: {d:?}");
 
     // A name that is not a port on a node whose ports are the
@@ -3116,6 +3138,135 @@ outer = Group(db: String, items: List[String]) -> (done: List[String | Null]) {
     assert!(hint.message.contains("run.db = self.db"), "{}", hint.message);
 }
 
+/// The same for a group nested in a group: `self.db` inside `inner` is
+/// `inner`'s own input, which it lacks, and the message names the
+/// enclosing group that has it and how to thread it in. Nothing reaches
+/// that port, so the wire from it exists only for the mistake to be
+/// reported on its own line, once.
+#[test]
+fn a_group_reading_the_enclosing_groups_self_is_told_to_thread_it_in() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+outer = Group(db: String) -> (done: String) {
+    inner = Group() -> (out: String) {
+        py = ExecPython(db: String) -> (out: String) {
+            code: "return {'out': db}"
+            db: self.db
+        }
+        self.out = py.out
+    }
+    self.done = inner.out
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hints: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("unknown-source-port")).collect();
+    assert_eq!(hints.len(), 1, "{d:?}");
+    assert!(hints[0].message.contains("inside the group 'outer.inner'"), "{}", hints[0].message);
+    assert!(hints[0].message.contains("enclosing group 'outer'"), "{}", hints[0].message);
+    assert!(hints[0].message.contains("inner.db = self.db"), "{}", hints[0].message);
+    assert_eq!(hints[0].line, 6, "on the line that reads it: {:?}", hints[0]);
+}
+
+/// A line starting at a group port the group does not declare is reported
+/// on that line, from outside (`g.yy`) and from inside (`self.xx`) alike,
+/// though no wire could start there.
+#[test]
+fn a_line_from_a_missing_group_port_is_reported() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+g = Group(x: String) -> (y: String) {
+    t = Text { value: self.x }
+    self.y = t.value
+}
+g.x = "seed"
+b = Debug
+b.data = g.yy
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("unknown-source-port")).collect();
+    assert_eq!(unknown.len(), 1, "{d:?}");
+    assert!(unknown[0].message.contains("group 'g' has no output 'yy'. Did you mean 'y'?"), "{}", unknown[0].message);
+    assert_eq!(unknown[0].line, 8, "{:?}", unknown[0]);
+
+    let (project, _) = parse_enrich_lenient(
+        r#"
+g = Group(x: String) -> (y: String) {
+    self.y = self.xx
+}
+g.x = "seed"
+b = Debug
+b.data = g.y
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("unknown-source-port")).collect();
+    assert_eq!(unknown.len(), 1, "{d:?}");
+    assert!(unknown[0].message.contains("group 'g' has no input 'xx'. Did you mean 'x'?"), "{}", unknown[0].message);
+    assert_eq!(unknown[0].line, 3, "{:?}", unknown[0]);
+}
+
+/// Group ports joined into a loop with no node on it would pass a value
+/// round for ever: refused once, however many lines make the loop.
+#[test]
+fn a_loop_of_group_ports_alone_is_refused_once() {
+    let (_, errors) = parse_enrich_lenient(
+        r#"
+g = Group(x: String) -> (y: String) {
+    self.y = self.x
+}
+g.x = g.y
+"#,
+    );
+    let loops: Vec<_> = errors.iter().filter(|e| e.message.contains("come back to it without passing any node")).collect();
+    assert_eq!(loops.len(), 1, "{errors:?}");
+}
+
+/// A wrong type on the line into a group's port is reported once, on that
+/// line: the stretch past the port fits, and the wire is not checked end
+/// to end on top.
+#[test]
+fn a_mismatch_into_a_group_port_is_reported_once_on_its_line() {
+    let project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+g = Group(x: Number) -> (out: Number) {
+    m = ExecPython(n: Number) -> (r: Number) { code: "return {'r': n}" }
+    m.n = self.x
+    self.out = m.r
+}
+g.x = a.value
+sink = Debug
+sink.data = g.out
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let mismatches: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("type-mismatch")).collect();
+    assert_eq!(mismatches.len(), 1, "{d:?}");
+    assert_eq!(mismatches[0].line, 8, "on `g.x = a.value`: {:?}", mismatches[0]);
+}
+
+/// Two lines into one port: the one written first is the driver the second
+/// is told about, whatever the order the wires are kept in.
+#[test]
+fn a_second_driver_names_the_first_written() {
+    let project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+b = Text { value: "y" }
+out = Debug
+out.data = b.value
+out.data = a.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let dup: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("duplicate-input-port")).collect();
+    assert_eq!(dup.len(), 1, "{d:?}");
+    assert_eq!(dup[0].line, 6, "{:?}", dup[0]);
+    assert!(dup[0].message.contains("already has a driver at line 5"), "{}", dup[0].message);
+}
+
 /// A container's boundaries hold their ports optional by construction
 /// (a closed group input reaches the inside as a closure; a loop's
 /// gathers are optional), so the "no required input" warning never
@@ -3145,7 +3296,7 @@ out = Debug { data: my.results }
         .collect();
     assert!(on_boundaries.is_empty(), "no diagnostic names a boundary node: {on_boundaries:?}");
     assert!(
-        !d.iter().any(|e| e.code.as_deref() == Some("no-required-skip")),
+        !d.iter().any(|e| e.code.as_deref() == Some("run-undecided")),
         "a container's optional boundary is not a node with no required input: {d:?}"
     );
 
@@ -3232,7 +3383,7 @@ Group(raw?: String) -> (cleaned: String) {
     );
     let d = validate(&component, &catalog());
     assert!(
-        !d.iter().any(|e| e.code.as_deref() == Some("no-required-skip")),
+        !d.iter().any(|e| e.code.as_deref() == Some("run-undecided")),
         "a component's optional input is the includer's to make required: {d:?}"
     );
 }
@@ -3426,16 +3577,11 @@ fn an_anonymous_group_beside_loose_nodes_is_an_ordinary_item() {
         .find(|g| g.anonymous)
         .map(|g| g.id.clone())
         .expect("the anonymous group");
-    project.edges.push(weft_core::project::Edge {
-        id: "z15-root".into(),
-        source: "z15".into(),
-        target: weft_core::project::boundary_in_id(&root),
-        source_handle: Some("data".into()),
-        target_handle: Some("raw".into()),
-        path: Vec::new(),
-        span: None,
-        source_file: None,
-    });
+    // The wire the group's unfed `raw` sent from its own port now comes
+    // from the loose node.
+    let into = project.edges.iter_mut().find(|edge| edge.source == root).expect("the group's own input reaches q");
+    into.source = "z15".into();
+    into.source_handle = Some("data".into());
     let d = validate(&project, &catalog());
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "{d:?}");
@@ -3478,6 +3624,27 @@ fn a_wire_into_a_group_joins_the_group_to_the_branch() {
         "{}",
         warned[0].message
     );
+}
+
+/// A wire through an include site links the site to both of its ends:
+/// eight nodes into the site and eight out of it are one part of
+/// seventeen, though the wires run to the body's member and no node of
+/// this level touches the site.
+#[test]
+fn a_wire_through_an_include_site_joins_the_branch() {
+    let main = format!(
+        "{}alias = @include(\"sub.weft\")\nalias.x = a7.data\n{}",
+        chain("a", 8, None),
+        chain("b", 8, Some("alias.y")).trim_start_matches('\n')
+    );
+    let project = compile_with_files(
+        &main,
+        &[("sub.weft", "Group(x: String) -> (y: String) {\n  t = Text { value: self.x }\n  self.y = t.value\n}\n")],
+    );
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(warned[0].message.contains("one connected part of the top level holds 17 items"), "{}", warned[0].message);
 }
 
 /// A component file's members live under its root group, and that IS
@@ -3760,7 +3927,7 @@ fn a_route_whose_run_answers_nobody_is_flagged_and_a_gated_group_counts() {
         d.iter().any(|x| x.message.contains("answers nobody"))
     };
     // Wired by data: fine both ways.
-    let wired = "t = Route -> (text: String) { path: \"hook\" }\nr = Reply\nr.body = t.text\n";
+    let wired = "t = Route -> (body: { text: String }) { path: \"hook\" }\nr = Reply\nr.body = t.body.text\n";
     assert!(answers(wired) && !orphaned(wired));
     // Nothing behind the route, and a reply nothing reaches.
     let alone = "t = Route { path: \"hook\" }\nr = Reply { body: \"x\" }\n";
@@ -3793,10 +3960,10 @@ fn a_route_that_ended_up_per_instance_is_refused_naming_why() {
 
 /// The refusal tells the path the way it runs. A route reading a group's
 /// port that carries the instance's value reads that value. A route
-/// reading ANOTHER port of a group that receives one is per instance
-/// only because the group is (a group receiving a per-instance value on
-/// any port makes everything reading its ports per instance), so the
-/// message says it sits inside that group.
+/// reading ANOTHER port of that group is shared: each wire through a
+/// group carries only its own value. A group whose gate reads the
+/// instance's value runs once per instance, and so does everything in
+/// it, so the message says the route sits inside that group.
 #[test]
 fn the_per_instance_refusal_names_the_path_through_a_group() {
     let refusal = |source: &str| -> String {
@@ -3808,9 +3975,40 @@ fn the_per_instance_refusal_names_the_path_through_a_group() {
     assert!(m.contains("because it reads 'gate', but"), "{m}");
 
     let beside = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
-    let m = refusal(beside);
-    assert!(m.contains("because it sits inside group 'work', which receives 'gate', but"), "{m}");
+    let found = messages(beside);
+    assert!(!found.iter().any(|m| m.contains("would exist once per instance")), "{found:?}");
+
+    let gated = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.o = shared.access\nwork._should_flow = gate.access\n";
+    let m = refusal(gated);
+    assert!(m.contains("because it sits inside group 'work', whose gate reads 'gate', but"), "{m}");
     assert!(!m.contains("it reads"), "{m}");
+}
+
+/// An included file runs wherever a call site of it runs, so a site whose
+/// gate reads the instance's value runs the file's route once per
+/// instance, and the refusal names that site.
+#[test]
+fn the_per_instance_refusal_names_the_call_site_whose_gate_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hook.weft"),
+        "Group() {\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\n",
+    ).unwrap();
+    let src = "gate = ApiKeyAuth { account: @instance_filled }\none = @include(\"hook.weft\")\none._should_flow = gate.access\n";
+    let found: Vec<String> = entry_program(src, dir.path()).into_iter().map(|d| d.message).collect();
+    let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
+    assert!(m.contains("because it sits inside group 'one', whose gate reads 'gate', but"), "{m}");
+}
+
+/// A loop runs everything inside it once per item its list holds, so a
+/// list made from the instance's value runs the loop's route once per
+/// instance, and the refusal names the loop.
+#[test]
+fn the_per_instance_refusal_names_the_loop_whose_list_reads_it() {
+    let src = "gate = ApiKeyAuth { account: @instance_filled }\nlist = ExecPython(a: Access) -> (items: List[String]) { code: \"x\" }\nlist.a = gate.access\neach = Loop(items: List[String]) -> (seen: List[String | Null]) {\n  parallel: false\n  over: [\"items\"]\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  self.seen = self.items\n}\neach.items = list.items\n";
+    let found = messages(src);
+    let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
+    assert!(m.contains("because it sits inside loop 'each', which runs on what 'gate' gives it, but"), "{m}");
 }
 
 /// `run_reaches` with a capability: a route counts any node declaring
@@ -3904,11 +4102,11 @@ fn set_instance_values_names_fields_an_instance_fills() {
     assert!(refused(&named("set = SetInstanceValues { instance: \"u1\", clear: [\"set.instance\"] }"), "set.instance"), "a field nobody fills");
 }
 
-/// A trigger fires on its event, never on its inputs, so the all-optional
-/// warning never applies to one: a route with only its auth wired is a
-/// correct program.
+/// A trigger fires on its event, never on its inputs, so the gate rule
+/// never applies to one: a route with only its auth wired is a correct
+/// program.
 #[test]
-fn a_trigger_never_gets_the_all_optional_inputs_warning() {
+fn a_trigger_is_never_asked_when_it_runs() {
     let project = parse_enrich(
         r#"
 gate = ApiKeyAuth {}
@@ -3917,25 +4115,23 @@ t.auth = gate.access
 "#,
     );
     let d = validate(&project, &catalog());
-    let warned: Vec<&Diagnostic> = d.iter().filter(|x| x.code.as_deref() == Some("no-required-skip")).collect();
+    let warned: Vec<&Diagnostic> = d.iter().filter(|x| x.code.as_deref() == Some("run-undecided")).collect();
     assert!(warned.is_empty(), "a trigger's inputs are settings, not what fires it: {warned:?}");
 }
 
-/// A node whose gate is wired never gets the all-optional warning: the
-/// author already said when it runs. A Close with its `reason` wired
-/// from upstream and its gate from a Switch's failing case is a
-/// correct program, and the same Close with no gate still warns.
+/// A node whose gate is wired is never asked when it runs: the author
+/// already said. A JsonObject whose every key is optional, gated on the
+/// route, builds `{}` when no key arrives; the same node with no gate is
+/// refused.
 #[test]
-fn a_wired_gate_silences_the_all_optional_inputs_warning() {
-    let warned = |source: &str| -> bool {
-        validate(&parse_enrich(source), &catalog()).iter().any(|d| d.code.as_deref() == Some("no-required-skip"))
+fn a_wired_gate_decides_when_an_all_optional_node_runs() {
+    let undecided = |source: &str| -> bool {
+        validate(&parse_enrich(source), &catalog()).iter().any(|d| d.code.as_deref() == Some("run-undecided"))
     };
-    let base = "t = Route { path: \"gone\", method: \"DELETE\" }\n\
-                py = ExecPython(method: String) -> (why: String, ok: Boolean) { code: \"return {'why': 'x', 'ok': False}\" }\n\
-                py.method = t.method\n\
-                bye = Close { status: 404 }\nbye.reason = py.why\n";
-    assert!(warned(base), "all of Close's wired inputs are optional and nothing gates it");
-    assert!(!warned(&format!("{base}bye._should_flow = py.ok\n")), "the gate is the author's decision");
+    let base = "t = Route -> (body: { why?: String }) { path: \"gone\", method: \"DELETE\" }\n\
+                obj = JsonObject { why?: t.body.why }\n";
+    assert!(undecided(base), "every wired input of the object is optional and nothing gates it");
+    assert!(!undecided(&format!("{base}obj._should_flow = t.fired\n")), "the gate is the author's decision");
 }
 
 /// Close's two wires have one field each, and the pair that cannot work
@@ -3948,12 +4144,12 @@ fn close_says_at_edit_time_which_wire_its_fields_belong_to() {
     };
     let route = "t = Route { path: \"gone\", method: \"DELETE\" }\nstep = ExecPython(method: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.method = t.method\nbye = Close ";
     // A reason under a 204 cannot reach the caller.
-    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = py.n\n"), "carries no body"));
-    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = py.n\n"), "carries no body"));
-    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = py.n\n"), "carries no body"));
+    assert!(says(&format!("{route}{{ status: 204, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 404, reason: \"gone\" }}\nbye._should_flow = step.n\n"), "carries no body"));
+    assert!(!says(&format!("{route}{{ status: 204 }}\nbye._should_flow = step.n\n"), "carries no body"));
     // A socket's close code behind a Route, and an HTTP status behind a socket.
-    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = py.n\n"), "WebSocket close code"));
-    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = py.n\n";
+    assert!(says(&format!("{route}{{ code: 4001 }}\nbye._should_flow = step.n\n"), "WebSocket close code"));
+    let socket = "s = Socket { path: \"chat\" }\nstep = ExecPython(path: String) -> (n: Number) { code: \"return {'n': 1}\" }\nstep.path = s.path\nbye = Close { status: 404 }\nbye._should_flow = step.n\n";
     assert!(says(socket, "an HTTP status"));
     assert!(!says(socket, "WebSocket close code"));
 }
@@ -4100,9 +4296,8 @@ fn one_gate_alone_is_fine_in_either_spelling() {
 }
 
 /// A group takes a gate too (it decides whether the whole subgraph
-/// runs), and flatten homes it on the group's boundary node. Both
-/// gates there is the same mistake, reached through a different door:
-/// one written in the group's body, one filled from outside.
+/// runs). Both gates there is the same mistake as on a node: one
+/// written in the group's body, one filled from outside.
 #[test]
 fn both_gates_on_a_group_are_refused() {
     let p = parse_enrich(
@@ -4116,7 +4311,27 @@ fn both_gates_on_a_group_are_refused() {
     let d = validate(&p, &catalog());
     assert!(
         d.iter().any(|x| x.code.as_deref() == Some("two-gates")),
-        "a boundary node carries one gate like any other node: {d:?}"
+        "a group has one gate like any node: {d:?}"
+    );
+}
+
+/// A group's gate written in its braces and wired from outside has two
+/// drivers, as a node's gate would.
+#[test]
+fn a_group_gate_written_and_wired_is_double_driven() {
+    let p = parse_enrich(
+        "a = Text { value: \"y\" }\n\
+         g = Group() -> (out: String) {\n\
+        \x20   _should_flow: false\n\
+        \x20   p = Text { value: \"x\" }\n\
+        \x20   self.out = p.value\n\
+         }\n\
+         g._should_flow = a.value\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("double-driven-port") && x.message.contains("'_should_flow'")),
+        "{d:?}"
     );
 }
 
@@ -4541,30 +4756,6 @@ fn a_route_in_a_body_nothing_calls_claims_nothing_but_is_still_checked() {
     assert!(invalid.file.as_deref().is_some_and(|file| file.ends_with("lib.weft")), "{invalid:?}");
 }
 
-/// The one that reached production: `select count(*) as count` asks
-/// for a port the node already answers with the number of rows, so an
-/// API served `1` for a page of nine cards with nothing saying so. The
-/// alias is right there in the SQL, so the compiler refuses it before
-/// anything runs; the node keeps its own check for what a regex cannot
-/// see (a `select *` over a table with a column of that name).
-#[test]
-fn a_column_aliased_to_one_of_the_nodes_own_outputs_is_refused() {
-    let refused = |source: &str| -> bool {
-        validate(&parse_enrich(source), &catalog())
-            .iter()
-            .any(|x| x.message.contains("has nowhere to go"))
-    };
-    let q = |sql: &str| format!("q = PostgresExecuteQuery {{ query: \"{sql}\" }}\n");
-    assert!(refused(&q("select count(*) as count from card")));
-    assert!(refused(&q("SELECT count(*) AS \\\"rows\\\" FROM card")));
-    assert!(!refused(&q("select count(*) as total from card")), "the author's own name");
-    assert!(!refused(&q("select n as counted from card")), "a longer word is a different word");
-    assert!(!refused(&q("select count(*) from card")), "unaliased, it never reaches a port");
-
-    let w = "w = PostgresWatchQuery { query: \"select id as rows from card\" }\n";
-    assert!(refused(w), "the watch node answers `rows` too");
-}
-
 // ── output_wired ─────────────────────────────────────────────────────────────
 
 /// `count` is how many rows came BACK. A write with no `RETURNING`
@@ -4646,6 +4837,23 @@ fn a_group_input_a_required_node_needs_must_be_connected() {
 
     let wired = src.replace("g.a = src.value\n", "g.a = src.value\ng.b = src.value\n");
     assert!(unmet_is_empty(&entry_program(&wired, dir.path())));
+}
+
+/// A default fills only an unwired input. Inside, `req.method` is wired
+/// from `g.verb`, so when that port closes the request skips, default or
+/// not, and the port is required.
+#[test]
+fn a_group_input_feeding_a_defaulted_input_must_be_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "g = Group(verb: String) -> (out: Number) {\n\
+          req = HttpRequest { url: \"http://x\", method: self.verb }\n\
+          self.out = req.status\n\
+        }\n\
+        d = Debug { data: g.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'g.verb'") && unmet[0].contains("'g.req.method'"), "{}", unmet[0]);
 }
 
 fn unmet_is_empty(d: &[Diagnostic]) -> bool {
@@ -4816,9 +5024,9 @@ fn a_wired_model_is_a_model() {
             .into_iter()
             .any(|d| d.message.contains("has no model"))
     };
-    assert!(!no_model("m = Text { value: \"openai/gpt-5\" }\np = OpenRouterProvider { model: m.value }\n"));
-    assert!(!no_model("p = OpenRouterProvider { model: \"openai/gpt-5\" }\n"));
-    assert!(no_model("p = OpenRouterProvider\n"));
+    assert!(!no_model("m = Text { value: \"openai/gpt-5\" }\np = OpenRouterModel { model: m.value }\n"));
+    assert!(!no_model("p = OpenRouterModel { model: \"openai/gpt-5\" }\n"));
+    assert!(no_model("p = OpenRouterModel\n"));
 }
 
 /// A cron expression is checked while it is typed: five fields (the
@@ -4899,11 +5107,11 @@ send = BaileySend { bridge: "http://bridge:8090", to: "49151", message: "hi" }
     assert!(hit.is_some_and(|e| e.message.contains("`bridge` accepts: wire")), "a written URL must be refused: {d:?}");
 }
 
-/// An input required only once wired is optional while unwired (no
+/// An input the metadata calls optional is optional while unwired (no
 /// `required-port-unmet`), and counts as required once wired (no
-/// `no-required-skip`: a closed wire skips the node).
+/// `run-undecided`: a closed wire skips the node).
 #[test]
-fn an_input_required_when_wired_is_optional_unwired_and_required_wired() {
+fn an_optional_input_is_optional_unwired_and_required_wired() {
     let unwired = parse_enrich("\nsvc = Text { value: \"x\" }\ns = StartInfra { node: \"svc\" }\n");
     let d = validate(&unwired, &catalog());
     assert!(!codes(&d).contains(&"required-port-unmet"), "{d:?}");
@@ -4911,7 +5119,12 @@ fn an_input_required_when_wired_is_optional_unwired_and_required_wired() {
     let wired = parse_enrich("\nid = Text { value: \"ada\" }\ns = StartInfra { node: \"svc\" }\ns.instance = id.value\n");
     let d = validate(&wired, &catalog());
     assert!(!codes(&d).contains(&"required-port-unmet"), "{d:?}");
-    assert!(!codes(&d).contains(&"no-required-skip"), "a closed wire on `instance` skips the node: {d:?}");
+    assert!(!codes(&d).contains(&"run-undecided"), "a closed wire on `instance` skips the node: {d:?}");
+
+    // Written `?`, the wire no longer decides when it runs.
+    let written_optional = parse_enrich("\nid = Text { value: \"ada\" }\ns = StartInfra(instance?: String) { node: \"svc\" }\ns.instance = id.value\n");
+    let d = validate(&written_optional, &catalog());
+    assert!(codes(&d).contains(&"run-undecided"), "{d:?}");
 }
 
 // ── not-camel-case ───────────────────────────────────────────────────────────

@@ -36,7 +36,7 @@
         let project = project();
         let run_id = weft_core::new_run_id();
         let birth = vec![
-            weft_journal::RunEvent::RunStarted {
+            weft_journal::RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "a".into(),
@@ -45,7 +45,7 @@
                 binary_hash: None,
                 source_version: None,
                 run_kind: weft_core::run::RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,
@@ -113,7 +113,7 @@
             ..Default::default()
         };
         let birth = vec![
-            weft_journal::RunEvent::RunStarted {
+            weft_journal::RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "a".into(),
@@ -122,7 +122,7 @@
                 binary_hash: None,
                 source_version: None,
                 run_kind: weft_core::run::RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,
@@ -195,7 +195,7 @@
         )
         .unwrap();
         let birth = vec![
-            weft_journal::RunEvent::RunStarted {
+            weft_journal::RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "a".into(),
@@ -204,7 +204,7 @@
                 binary_hash: None,
                 source_version: None,
                 run_kind: weft_core::run::RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,
@@ -282,12 +282,13 @@
             instance_values: Default::default(),
             picks: Default::default(),
             settings: Default::default(),
+            given: startable.given.clone(),
         };
         let drive = crate::run_driver::RunDrive {
             run_id,
             journal: run,
             program: startable.program.clone(),
-            starts_from: crate::run_driver::StartsFrom::Plan { born_with, opening: startable.opening(run_id, &payload).unwrap() },
+            starts_from: crate::run_driver::StartsFrom::Plan { born_with, kicked: startable.opening(&payload) },
             cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
             exchange: None,
             hand_back: None,
@@ -331,7 +332,7 @@
         let run_id = weft_core::new_run_id();
         let durable = weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Durable, true).unwrap();
         let birth = vec![
-            weft_journal::RunEvent::RunStarted {
+            weft_journal::RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "a".into(),
@@ -340,7 +341,7 @@
                 binary_hash: None,
                 source_version: None,
                 run_kind: weft_core::run::RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,
@@ -394,7 +395,7 @@
         let drive = crate::run_driver::RunDrive {
             run_id,
             journal: run,
-            program: std::sync::Arc::new(crate::plan::ProgramTables::new(std::sync::Arc::new(project), None)),
+            program: std::sync::Arc::new(crate::plan::ProgramTables::new(std::sync::Arc::new(project))),
             starts_from: crate::run_driver::StartsFrom::Record(birth),
             cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
             exchange: Some(crate::run_driver::Exchange { conn: conn.clone(), live: Some(conn.clone()), sink }),

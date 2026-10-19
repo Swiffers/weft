@@ -56,11 +56,11 @@
     {
       "name": "user",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The full user object as Slack returns it."
     }
   ],
   "features": {
-    "catchErrors": true,
     "oneOfRequired": [
       [
         "email",

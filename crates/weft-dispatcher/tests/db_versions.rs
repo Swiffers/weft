@@ -73,11 +73,11 @@ async fn start_run(
     at: u64,
 ) -> Uuid {
     let run_id = weft_core::new_run_id();
-    let birth = RunEvent::RunStarted {
+    let birth = RunEvent::RunStarted { given: Default::default(),
         run_id, project_id: project, entry_node: "a".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()), binary_hash: Some("bin-A".into()),
-        source_version: Some(version.into()), run_kind: weft_core::run::RunKind::Project, selection: None,
-        seed: seed.map(|parent| weft_core::run_spec::Seed { parent, origins: Default::default() }),
+        source_version: Some(version.into()), run_kind: weft_core::run::RunKind::Project, cut_from: None,
+        seed: seed.map(|parent| weft_core::run_spec::Seed { parent, origins: Default::default(), answers: Default::default() }),
         instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: at,
         settings: Default::default(),
     };
@@ -85,7 +85,7 @@ async fn start_run(
     let stale = ["b".to_string(), "c".to_string()];
     let queued = Queued {
         events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
-        watch_end: false, stale: &stale, spec: spec.as_ref(), example: None,
+        watch_end: false, stale: &stale, spec: spec.as_ref(), example: None, program: None,
     };
     assert!(journal.queue_run(queued, false).await.unwrap());
     run_id

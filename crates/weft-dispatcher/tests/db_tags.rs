@@ -69,7 +69,7 @@ async fn start_run(
     run_kind: weft_core::run::RunKind,
 ) -> weft_core::RunId {
     let run_id = weft_core::new_run_id();
-    let birth = RunEvent::RunStarted {
+    let birth = RunEvent::RunStarted { given: Default::default(),
         run_id,
         project_id: project,
         entry_node: "start".into(),
@@ -78,14 +78,14 @@ async fn start_run(
         binary_hash: run_kind.is_project().then(|| "bin-A".into()),
         run_kind,
         source_version: None,
-        selection: None,
+        cut_from: None,
         seed: None,
         instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         settings: Default::default(),
     };
     let queued = Queued {
         events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
-        watch_end: false, stale: &[], spec: None, example: None,
+        watch_end: false, stale: &[], spec: None, example: None, program: None,
     };
     assert!(journal.queue_run(queued, false).await.expect("queue the run"));
     run_id
@@ -457,7 +457,6 @@ async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: P
                     frames: vec![],
                     port: "out".into(),
                     value: Arc::new(json!({ "email": value, "order": 4217 })),
-                    provided: false,
                     at_unix: 2,
                 },
             ];

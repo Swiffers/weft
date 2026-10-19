@@ -263,7 +263,7 @@ async fn missing_song_id(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let plan = json!({ "chunks": [{ "text": "[Intro]", "duration_ms": 3000, "positive_styles": ["ambient"] }] });
     for (extra, says) in [
         (json!({}), "nothing to compose from"),
@@ -280,7 +280,7 @@ async fn refused(rig: FakeRig) -> WeftResult<()> {
         (json!({ "prompt": "lo-fi", "lyrics": "x".repeat(4_001) }), "at most 4000"),
     ] {
         let err = rig.run(&ElevenLabsMusicNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");

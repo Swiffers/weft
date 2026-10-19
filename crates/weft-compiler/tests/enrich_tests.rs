@@ -23,8 +23,11 @@ out.data = greeting.value
 
     let text = project.nodes.iter().find(|n| n.id == "greeting").unwrap();
     assert_eq!(text.node_type, "Text");
-    assert_eq!(text.outputs.len(), 1);
-    assert_eq!(text.outputs[0].name, "value");
+    // Its own `value`, plus the failure output every node carries.
+    assert_eq!(
+        text.outputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["value", weft_core::node::ERROR_PORT]
+    );
 
     let debug = project.nodes.iter().find(|n| n.id == "out").unwrap();
     assert_eq!(debug.node_type, "Debug");
@@ -77,6 +80,35 @@ sink.data = hello.value
     );
 }
 
+/// A source's type variable binds against the first group port that
+/// declares a type, read with only the keys written up to that port: a
+/// key the inside reads past it (`self.x.name`) is not part of what the
+/// source sends.
+#[test]
+fn a_typevar_binds_against_the_group_port_with_the_keys_before_it() {
+    let source_out = |out: &str| format!(
+        r#"
+a = ExecPython() -> (out: {out}) {{ code: "return {{'out': {{'name': 'x'}}}}" }}
+g = Group(x: {{ name: String }}) -> (y: String) {{
+    m = Text {{ value: self.x.name }}
+    self.y = m.value
+}}
+g.x = a.out
+"#
+    );
+    let out_type = |source: &str| {
+        let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        enrich(&mut project, &catalog()).expect("enrich");
+        let a = project.nodes.iter().find(|n| n.id == "a").unwrap();
+        a.outputs.iter().find(|p| p.name == "out").unwrap().port_type.clone()
+    };
+    let named = weft_core::weft_type::WeftType::parse("{ name: String }").unwrap();
+    // `{ name: T }` against `{ name: String }`: T is String.
+    assert_eq!(out_type(&source_out("{ name: T }")), named);
+    // `T` against `{name: String}`: T is the whole record.
+    assert_eq!(out_type(&source_out("T")), named);
+}
+
 #[test]
 fn enrich_rejects_unknown_node_type() {
     let source = r#"
@@ -92,9 +124,7 @@ bad = NotARealNode
 #[test]
 fn enrich_rejects_custom_port_on_node_that_disallows_it() {
     // `Text` does not set canAddOutputPorts, so a user-declared custom
-    // output port on it must fail loud, not vanish silently. The port
-    // carries a concrete type so it reaches the can-add check (a
-    // MustOverride placeholder would trip the needs-a-type error first).
+    // output port on it must fail loud, not vanish silently.
     let source = r#"
 
 t = Text() -> (bogus: String) { value: "hi" }
@@ -108,26 +138,40 @@ t = Text() -> (bogus: String) { value: "hi" }
     );
 }
 
-/// A node that catches its failures (`features.catchErrors`) already
-/// has the `error` output the runtime fills: a source port of that name
-/// is refused, naming the fix, even on a node that accepts custom
-/// outputs. It is the ONE error that port earns: a type that disagrees
-/// with the language's own `error` port adds no mismatch on top.
+/// Every node already has the `_error` output the runtime fills: a
+/// source port of that name is refused, naming the fix, on a node that
+/// accepts custom outputs and on one that does not. It is the ONE error
+/// that port earns: a type that disagrees with the language's own
+/// `_error` adds no mismatch on top, and a node that takes no custom
+/// outputs adds no custom-port refusal. `error` is an ordinary name.
 #[test]
-fn enrich_rejects_an_error_port_on_a_catching_node() {
-    for declared in ["String", "Number"] {
-        let source = format!(
-            "\nq = PostgresExecuteQuery() -> (error: {declared}) {{ query: \"SELECT 1 AS one\" }}\n"
-        );
+fn enrich_rejects_an_error_port_declared_on_any_node() {
+    let cases = [
+        ("ExecPython", "String", "code: \"return {}\""),
+        ("ExecPython", "Number", "code: \"return {}\""),
+        ("Text", "String", "value: \"x\""),
+    ];
+    for (node, declared, config) in cases {
+        let source = format!("\nq = {node}() -> (_error: {declared}) {{ {config} }}\n");
         let mut project = compile(&source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
         let errors = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict);
-        assert_eq!(errors.len(), 1, "{declared}: {:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert_eq!(errors.len(), 1, "{node} {declared}: {:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
         assert!(
-            errors[0].message.contains("'error' is the output this node type already has for its failures"),
-            "{declared}: expected the error-port refusal, got: {}",
+            errors[0].message.contains("'_error' is the output every node already has for its failures"),
+            "{node} {declared}: expected the error-port refusal, got: {}",
             errors[0].message
         );
     }
+    let mut project = compile(
+        "\nq = ExecPython() -> (error: String) { code: \"return {}\" }\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog()).expect("`error` is a name a program may give its own port");
+    let q = project.nodes.iter().find(|n| n.id == "q").unwrap();
+    let names: Vec<&str> = q.outputs.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"error") && names.contains(&weft_core::node::ERROR_PORT), "{names:?}");
 }
 
 /// An output takes no value: a firing emits on it. On a node that
@@ -357,12 +401,13 @@ outer = Loop(items: List[String]) -> (results: List[String | Null]) {
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
-    // Group lowers to Passthrough boundary nodes.
-    assert!(
-        project.nodes.iter().any(|n| n.id == "outer.inner__in" && n.node_type == "Passthrough"),
-        "Group nested in Loop must lower to a Passthrough boundary; nodes: {:?}",
-        project.nodes.iter().map(|n| (n.id.clone(), n.node_type.clone())).collect::<Vec<_>>()
-    );
+    // A group is no node: it stays a group, inside the loop, around its
+    // member.
+    assert!(!project.nodes.iter().any(|n| n.id.starts_with("outer.inner__")), "a group lowers to no boundary node");
+    let inner = project.groups.iter().find(|g| g.id == "outer.inner").expect("the group");
+    assert_eq!(inner.parent_group_id.as_deref(), Some("outer"));
+    let p = project.nodes.iter().find(|n| n.id == "outer.inner.p").expect("its member");
+    assert_eq!(p.scope, vec!["outer".to_string(), "outer.inner".to_string()]);
 }
 
 #[test]
@@ -398,8 +443,6 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
         ("l1__out", "LoopOut"),
         ("l1.l2__in", "LoopIn"),
         ("l1.l2__out", "LoopOut"),
-        ("l1.l2.g__in", "Passthrough"),
-        ("l1.l2.g__out", "Passthrough"),
         ("l1.l2.g.l3__in", "LoopIn"),
         ("l1.l2.g.l3__out", "LoopOut"),
     ];
@@ -414,6 +457,9 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
             "missing {want_id} ({want_type}) in nested lowering; got: {ids:?}"
         );
     }
+    let g = project.groups.iter().find(|g| g.id == "l1.l2.g").expect("the group between the loops");
+    assert_eq!(g.parent_group_id.as_deref(), Some("l1.l2"));
+    assert!(!ids.iter().any(|(id, _)| id.starts_with("l1.l2.g__")), "a group lowers to no boundary node");
 }
 
 #[test]
@@ -499,7 +545,7 @@ out.data = human.testRejected
 "#;
     let mut project = compile(wrong_type, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
-    assert!(format!("{err}").contains("incompatible"), "type mismatch must error: {err}");
+    assert!(format!("{err}").contains("always gives it Boolean"), "type mismatch must error: {err}");
 
     let unknown_port = r#"
 
@@ -745,15 +791,10 @@ out = Debug { data: g.y }
             .any(|p| p.name == "_should_flow")
     };
     assert!(has_flow("out"), "a catalog node takes the flow port");
-    assert!(has_flow("g__in"), "a group takes it on its In boundary");
     assert!(
-        !has_flow("g__out"),
-        "the Out boundary forwards what reached it; a group that did not run has nothing to forward"
-    );
-    assert!(
-        project.edges.iter().any(|e| e.target == "g__in"
+        project.edges.iter().any(|e| e.target == "g" && e.via.is_empty()
             && e.target_handle.as_deref() == Some("_should_flow")),
-        "the guard wire lands on the In boundary"
+        "the guard wire lands on the group itself"
     );
 }
 
@@ -977,23 +1018,34 @@ fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
     );
 }
 
-/// An input required only once wired has its requiredness decided by its
-/// wiring, so a header line declaring it required is refused, naming the
-/// fix; declaring it optional says nothing new and stays legal.
+/// A program may make an optional input required or optional even when
+/// wired, but never a required one optional: that is refused naming the
+/// port and why.
 #[test]
-fn enrich_refuses_making_an_input_required_when_wired_always_required() {
-    let errors_for = |header: &str| {
-        let source = format!("\ns = StartInfra({header}) {{ node: \"svc\" }}\n");
+fn enrich_refuses_making_a_required_input_optional() {
+    let errors_for = |node: &str, header: &str| {
+        let source = format!("\nn = {node}({header}) {{}}\n");
         let mut project = compile(&source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
-        weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict)
+        let errors: Vec<String> = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict)
             .into_iter()
             .map(|e| e.message)
-            .collect::<Vec<_>>()
+            .collect();
+        (project, errors)
     };
-    let refused = errors_for("instance: String");
-    assert!(
-        refused.iter().any(|m| m.contains("required only when wired") && m.contains("instance?")),
-        "{refused:?}"
-    );
-    assert!(errors_for("instance?: String").is_empty(), "optional is what it already is");
+    let (_, refused) = errors_for("Debug", "data?: JsonDict");
+    assert!(refused.iter().any(|m| m.contains("'data'") && m.contains("its code needs it")), "{refused:?}");
+
+    let (project, errors) = errors_for("StartInfra", "instance: String");
+    assert!(errors.is_empty(), "{errors:?}");
+    let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
+    assert!(instance.required && !instance.optional, "written without `?`: always required");
+
+    let (project, errors) = errors_for("StartInfra", "instance?: String");
+    assert!(errors.is_empty(), "{errors:?}");
+    let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
+    assert!(!instance.required && instance.optional, "written `?`: runs without it even when wired");
+
+    let (project, _) = errors_for("StartInfra", "");
+    let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
+    assert!(!instance.required && !instance.optional, "unwritten: required once wired");
 }

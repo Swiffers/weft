@@ -138,9 +138,9 @@ async fn shared_settings(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn empty_script(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&ElevenLabsDialogueNode, inputs(&rig, json!({ "lines": [] }))).await.failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {err}");
+    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
     assert!(err.contains("`lines` is empty"), "{err}");
     assert!(rig.requests().is_empty(), "nothing is sent");
     Ok(())
@@ -166,9 +166,9 @@ async fn refused(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_caught(rig: FakeRig) -> WeftResult<()> {
     refuse(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&ElevenLabsDialogueNode, inputs(&rig, json!({}))).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("at most 10 different voices"), "{error}");
     assert!(!outcome.outputs.contains_key("file"), "a caught failure emits no audio");
     Ok(())

@@ -1,9 +1,9 @@
 # Two nodes the worker dies in the middle of. Neither may run again: in
 # a durable run the next worker fails both, because each may have partly
 # happened, and a fast run ends cancelled.
-# `caught` catches its failures and its `error` is wired, so its failure
-# goes there and `handler` receives the message; `plain` has nothing
-# wired on `error`, so its failure fails the run.
+# `caught` has its `_error` wired, so its failure goes there and `handler`
+# receives the message; `plain` has nothing wired on `_error`, so its
+# failure fails the run.
 
 plain = ExecPython -> (done: Boolean) {
   code: "import time; time.sleep(600); return {'done': True}"
@@ -15,4 +15,4 @@ caught = ExecPython -> (done: Boolean) {
   code: "import time; time.sleep(600); return {'done': True}"
 }
 handler = Debug
-handler.data = caught.error
+handler.data = caught._error

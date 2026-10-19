@@ -6,6 +6,7 @@
 //! enqueue with the same string the registry uses to look up the
 //! executor.
 
+pub mod cancel_call;
 pub mod fire_signal;
 pub mod program_call;
 pub mod register_signal;
@@ -17,6 +18,7 @@ pub mod withdraw_signal;
 // Only the executor unit structs are re-exported because main.rs
 // instantiates them when wiring the registry. Concrete payload /
 // result types are imported directly by their producers.
+pub use cancel_call::CancelCallExecutor;
 pub use fire_signal::FireSignalExecutor;
 pub use program_call::ProgramCallExecutor;
 pub use register_signal::RegisterSignalExecutor;

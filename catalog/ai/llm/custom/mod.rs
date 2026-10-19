@@ -25,6 +25,9 @@ impl Node for CustomProviderNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        provider::emit(&ctx, "custom").await
+        // The recipe's `connectionOptional` makes an unpicked connection
+        // `None` here, and the object then carries no `account`.
+        let account = ctx.inputs.access(provider::CONNECTION_INPUT)?;
+        provider::emit(&ctx, "custom", account).await
     }
 }

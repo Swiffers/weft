@@ -48,7 +48,7 @@ impl std::fmt::Display for PathError {
 pub fn walk_path(ty: &WeftType, path: &[String]) -> Result<WeftType, PathError> {
     let mut current = ty.clone();
     for (at, key) in path.iter().enumerate() {
-        let WeftType::Record(fields) = current.structural() else {
+        let WeftType::Record { fields, .. } = current.structural() else {
             return Err(PathError::NotARecord { at, ty: current.to_string() });
         };
         let Some(field) = fields.iter().find(|f| &f.name == key) else {
@@ -81,7 +81,7 @@ pub fn project_value(value: &Value, ty: &WeftType, path: &[String]) -> Result<Pr
     let mut current_value = value;
     let mut current_ty = ty.clone();
     for key in path {
-        let WeftType::Record(fields) = current_ty.structural() else {
+        let WeftType::Record { fields, .. } = current_ty.structural() else {
             return Err(format!("'{current_ty}' has no keys to read (path {})", path.join(".")));
         };
         let Some(field) = fields.iter().find(|f| &f.name == key) else {

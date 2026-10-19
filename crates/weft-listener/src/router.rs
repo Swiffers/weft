@@ -19,6 +19,8 @@
 //!                      wakes it instead of waiting, or nothing when
 //!                      its kind cannot be woken that way
 //!   POST /live         what one signal shows
+//!   POST /cancel_call  send the last call of a wait whose run was
+//!                      cancelled, to the service the run waited on
 //!   POST /rehydrate    reconcile with the durable signal table
 //!   POST /wake         the alarm calling back for a `Wakes` signal
 //!   GET  /signals      debug: list the connections this process holds
@@ -54,6 +56,7 @@ pub fn router(state: ListenerState) -> Router {
         .route("/match_push", post(match_push))
         .route("/wake_by_hand", post(wake_by_hand))
         .route("/live", post(live))
+        .route("/cancel_call", post(cancel_call))
         .route("/signals", get(list_signals))
         .route("/rehydrate", post(rehydrate_handler))
         // SYNC: the wake route <-> kinds::WAKE_PATH
@@ -161,7 +164,18 @@ async fn live(
         live.items.insert(0, weft_core::live::LiveItem::text("State", format!("down, retrying: {reason}")));
     }
     kinds::read_only_display(&sig.spec.kind, &live).map_err(|why| (StatusCode::INTERNAL_SERVER_ERROR, why))?;
-    Ok(Json(LiveResponse { live }))
+    Ok(Json(LiveResponse { live, answer: kinds::last_answer(&sig) }))
+}
+
+/// Send the last call of a wait whose run was cancelled. Answered once the
+/// service answered; anything that kept the call from going through is a
+/// 502 naming why (the dispatcher's task fails with it, and logs it).
+async fn cancel_call(
+    State(state): State<ListenerState>,
+    Json(req): Json<weft_core::signal::listener_protocol::CancelCallRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    kinds::cancel_call(&state, req).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn unregister(

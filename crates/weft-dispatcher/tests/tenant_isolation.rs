@@ -28,6 +28,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         defaults: Default::default(),
+        given: Default::default(),
     }
 }
 
@@ -256,14 +257,14 @@ async fn a_project_being_removed_says_so_and_takes_no_registration() {
 }
 
 fn started(run_id: Uuid, project_id: uuid::Uuid) -> weft_journal::RunEvent {
-    weft_journal::RunEvent::RunStarted {
+    weft_journal::RunEvent::RunStarted { given: Default::default(),
         run_id,
         project_id,
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("h".to_string()),
         binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-        selection: None,
+        cut_from: None,
         seed: None,
         instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         settings: Default::default(),

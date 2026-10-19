@@ -6,15 +6,17 @@ description: "Read when a program calls a language model and you need it to beha
 # Models: reasoning, budgets, and caching
 
 Three things decide how a model call runs, and they sit in different
-places. The provider node says WHICH model. The LLM node itself says
+places. The model node (an `OpenRouterModel`, for one, wired to its
+service's access node) says WHICH model. The LLM node itself says
 what it is given and what comes back. And [params], the node wired into
 an LLM node's `params` input, says how it thinks: everything below that
 is not about the prompt is a setting on it.
 
-If you need a real model id for the provider node, run `weft options <node>
-model --search <text>` from the project, with the provider node's name as
+If you need a real model id for the model node, run `weft options <node>
+model --search <text>` from the project, with that model node's name as
 `<node>`. It prints one `id  label` line per matching model, the same list
-the editor's search shows, read through the connection picked on that node,
+the editor's search shows, read through the connection picked on the access
+node feeding it,
 and the id is what you write in `model`. Never guess an id, and never ask the
 provider's API yourself.
 

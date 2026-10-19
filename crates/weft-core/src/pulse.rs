@@ -58,18 +58,13 @@ pub struct Pulse {
     /// The producer failed or its output was refused: which node broke
     /// and why, carried unchanged however many skips sit between that
     /// node and this wire. Stream consumers receive it at the end;
-    /// scalar consumers retain ordinary closure behavior. Neither may
-    /// replace it with a backup.
+    /// scalar consumers retain ordinary closure behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
-    /// A supplied output or a used input backup, including its stream end.
+    /// Sent by a stand-in emitted or baked for this run, or a handed
+    /// stream's item, including its stream end: not a node that ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provided: bool,
-    /// Derived from this run's input backup after the real supplier
-    /// ended without data. Kept after absorption so replay cannot select
-    /// the same backup twice.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub backup: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_from: Option<RunId>,
 }
@@ -157,7 +152,6 @@ impl Pulse {
             closed: false,
             failure: None,
             provided: false,
-            backup: false,
             inherited_from: None,
         }
     }
@@ -199,7 +193,6 @@ impl Pulse {
             closed: true,
             failure,
             provided: false,
-            backup: false,
             inherited_from: None,
         }
     }

@@ -16,9 +16,9 @@
   "inputs": [
     {
       "name": "file",
-      "type": "File",
+      "type": "T",
       "required": true,
-      "description": "Stored run file. Kept in place with `run`; copied (original untouched) with `project`."
+      "description": "Stored run file, of any kind (`File`). Kept in place with `run`; copied (original untouched) with `project`."
     },
     {
       "name": "scope",
@@ -46,11 +46,14 @@
       "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: 30 days for a run file, no expiry for a project copy."
     }
   ],
+  "typeParams": {
+    "T": "File"
+  },
   "outputs": [
     {
       "name": "file",
-      "type": "File",
-      "description": "`run`: the same reference, now kept. `project`: the NEW project copy (same name, type, size); later runs read this one."
+      "type": "T",
+      "description": "`run`: the same reference, now kept. `project`: the NEW project copy (same name, type, size); later runs read this one. The same kind that came in: a Video stays a Video."
     },
     {
       "name": "filename",

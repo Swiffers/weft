@@ -11,7 +11,10 @@
 # the test's environment. The cheapest vision-capable model keeps the run
 # nearly free.
 
-prov = OpenRouterProvider {
+openrouter = OpenRouterAccess
+
+prov = OpenRouterModel {
+  access: openrouter.access
   # A cheap Gemini: strong vision for pennies. (gpt-4.1-nano reliably
   # misnamed even a solid-color square; the relay link was verified
   # byte-identical, so the failure was the model, not the pipeline.)

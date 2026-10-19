@@ -82,7 +82,7 @@ pub fn emit(
 
     // The CATALOG node types this binary compiles in: what the project
     // references, or the whole catalog under `NodeSet::Full`. Runtime-
-    // internal built-ins (Passthrough, LoopIn, LoopOut, ...) are never
+    // internal built-ins (LoopIn, LoopOut) are never
     // among them: the engine dispatches them inline, so they don't need
     // a catalog shim and the catalog doesn't carry them.
     let referenced = node_types_for(project, catalog, node_set);
@@ -244,8 +244,8 @@ pub fn node_types_for(
 }
 
 /// The set of CATALOG node types this project references, sorted.
-/// Runtime-internal built-in node types (Passthrough, LoopIn,
-/// LoopOut, ...) are excluded: they live in the engine, not the
+/// Runtime-internal built-in node types (LoopIn, LoopOut) are
+/// excluded: they live in the engine, not the
 /// catalog, and the codegen / hash / docker passes that consume this
 /// set would otherwise fail to resolve them. Exposed so callers
 /// outside codegen (e.g. Dockerfile emission) walk the same set
@@ -1553,6 +1553,8 @@ mod tests {
         NodeDefinition {
             id: id.into(),
             node_type: node_type.into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: serde_json::Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -1582,7 +1584,7 @@ mod tests {
 
     /// Regression: codegen's `collect_node_types` used to return every
     /// node's `node_type` verbatim, including runtime-internal built-ins
-    /// (Passthrough, LoopIn, LoopOut). Downstream callers (worker-image
+    /// (LoopIn, LoopOut). Downstream callers (worker-image
     /// build, source-hash) then fed those to the catalog and the build
     /// failed with `node 'LoopIn' not found in catalog`. The filter
     /// must drop those before the catalog lookup.
@@ -1594,20 +1596,18 @@ mod tests {
                 make_node("user_node", "Text"),
                 make_node("my_loop__in", "LoopIn"),
                 make_node("my_loop__out", "LoopOut"),
-                make_node("my_group__in", "Passthrough"),
-                make_node("my_group__out", "Passthrough"),
             ],
             edges: Vec::new(),
             groups: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
         };
         let types = collect_node_types(&project);
         assert!(types.contains("Text"), "user catalog type included: {types:?}");
         assert!(!types.contains("LoopIn"), "LoopIn excluded: {types:?}");
         assert!(!types.contains("LoopOut"), "LoopOut excluded: {types:?}");
-        assert!(!types.contains("Passthrough"), "Passthrough excluded: {types:?}");
     }
 
     use super::{add_dep, merge_dep_specs};

@@ -35,6 +35,10 @@ pub use predicate::{Predicate, PredicateOp};
 pub mod limits;
 pub use limits::{EntryLimits, Limited, ResolvedLimits};
 
+// Wire-pure like `predicate`: `SignalSpec` carries it.
+pub mod cancel_call;
+pub use cancel_call::{CancelCall, CancelMethod};
+
 // The dispatcher <-> listener wire, also wire-pure, so the dispatcher
 // speaks it without linking the listener.
 pub mod listener_protocol;
@@ -194,6 +198,7 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
         consumer_kind,
         limits: crate::signal::EntryLimits::default(),
         settings: crate::run_settings::RunSettings::default(),
+        on_cancel: None,
     }
 }
 
@@ -277,6 +282,9 @@ pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
     // refused where someone is watching; per event it would be a
     // silent never-fires.
     predicate::validate(&spec.match_predicates)?;
+    if let Some(call) = &spec.on_cancel {
+        call.validate()?;
+    }
     if entry.requires_access && spec.access.is_none() {
         return Err(format!(
             "signal kind '{}' acts as a connection, but none was set; build the kind with \

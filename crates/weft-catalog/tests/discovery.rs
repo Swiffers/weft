@@ -1,7 +1,8 @@
 //! Discovery over a synthetic `nodes/` tree. Proves the two unit
 //! forms (bare node, package), arbitrary nesting depth, auto-detected
 //! package members, and the rule that a clash leaves every claimant out
-//! while the rest of the tree loads.
+//! while the rest of the tree loads. And over the standard library: the
+//! loader gives every node its `_error` output.
 
 use std::fs;
 use std::path::Path;
@@ -507,4 +508,29 @@ fn types_declarations_resolve_member_port_types() {
         let told = cat.unavailable(node_type).expect("told why");
         assert!(told.contains("declared twice"), "{told}");
     }
+}
+
+/// Every node the standard library loads has the language's `_error`
+/// output exactly once, as text, and no `metadata.json` declares it: the
+/// loader gives it to each, a trigger and a node that only shapes values
+/// alike, and none opts in.
+#[test]
+fn every_stdlib_node_has_the_error_output() {
+    let root = weft_catalog::stdlib_root().expect("stdlib root");
+    let catalog = FsCatalog::discover(&root).expect("stdlib catalog");
+    let mut nodes = 0;
+    for entry in catalog.iter() {
+        let errors: Vec<_> = entry.metadata.outputs.iter().filter(|o| o.name == weft_core::node::ERROR_PORT).collect();
+        assert_eq!(errors.len(), 1, "{}", entry.node_type);
+        assert_eq!(
+            errors[0].port_type,
+            weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::String),
+            "{}",
+            entry.node_type
+        );
+        let authored = std::fs::read_to_string(entry.source_dir.join("metadata.json")).expect("the node's metadata");
+        assert!(!authored.contains(&format!("\"{}\"", weft_core::node::ERROR_PORT)), "{} declares it", entry.node_type);
+        nodes += 1;
+    }
+    assert!(nodes > 100, "the standard library loaded: {nodes} nodes");
 }

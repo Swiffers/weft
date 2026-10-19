@@ -55,7 +55,7 @@ impl Node for ElevenLabsAgentCallNode {
         // The number is the program's own choice, so a number this node
         // cannot dial, or a Twilio setting on a number that is not
         // Twilio's, is the program's mistake: an input error, which
-        // `error` never catches.
+        // `_error` never catches.
         let Some(&(_, route, a_provider)) = PROVIDERS.iter().find(|(name, _, _)| *name == provider) else {
             return Err(WeftError::Input(format!(
                 "phone number {phone_number} has provider '{provider}', which this node does not know how to \

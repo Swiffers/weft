@@ -356,6 +356,79 @@ pub struct NodeMetadata {
     /// (`weft_core::route`), so the check reads no node's mind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claims_route: Option<ClaimsRoute>,
+    /// What each type variable this node's ports use may stand for:
+    /// variable name to its BOUND (`{"T": "File"}`), so `KeepFile`'s
+    /// `T` in and `T` out keeps a `Video` a `Video` and still refuses a
+    /// `String`. A bound only checks, never decides: the variable is
+    /// worked out from what is connected, as an unbounded one is, and
+    /// the compiler then holds that answer to the bound (the other
+    /// variables a bound names substituted first). A program writes the
+    /// same on a group or an inline node: `Group[T: Media](file: T)`.
+    // SYNC: NodeMetadata.type_params <-> packages/weft-graph/src/protocol.ts CatalogEntry.typeParams
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub type_params: std::collections::BTreeMap<String, WeftType>,
+    /// The text setting whose placeholders name this node's inputs
+    /// (a query's `$userId`, a template's `{{name}}`), and the pattern
+    /// that finds them (its group named `name` is the input). The
+    /// compiler holds the two to each other, knowing nothing of what
+    /// the text is: every placeholder the setting holds (written in the
+    /// braces or through `@file`) must be an input of the node, and
+    /// every input it adds must appear in it. So a typo in a query's
+    /// `$userid` fails the build instead of the first call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholders_are_inputs: Option<PlaceholdersAreInputs>,
+}
+
+/// Which setting holds the placeholders and how they are spelled
+/// ([`NodeMetadata::placeholders_are_inputs`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceholdersAreInputs {
+    /// The input holding the text (`"query"`, `"template"`).
+    #[serde(rename = "in")]
+    pub setting: String,
+    /// A regular expression finding one placeholder, whose group named
+    /// `name` is the input it stands for (`"\\$(?<name>[a-zA-Z_][a-zA-Z0-9_]*)"`).
+    /// Back-references are allowed (`\\k<tag>`), so a pattern can skip a
+    /// span to the closing delimiter that matches its opening one (SQL's
+    /// `$tag$ ... $tag$`). A match whose `name` group took no part is
+    /// text the pattern skips (a string literal, a comment).
+    pub pattern: String,
+}
+
+impl PlaceholdersAreInputs {
+    /// The pattern, compiled. The load refuses one that does not
+    /// compile or has no `name` group, so a caller after it holds a good one.
+    pub fn regex(&self) -> Result<fancy_regex::Regex, String> {
+        let regex = fancy_regex::Regex::new(&self.pattern)
+            .map_err(|e| format!("placeholdersAreInputs.pattern is not a regular expression: {e}"))?;
+        if !regex.capture_names().any(|name| name == Some("name")) {
+            return Err(format!(
+                "placeholdersAreInputs.pattern `{}` has no group named `name`; that group \
+                 (`(?<name>...)`) is the input a placeholder stands for",
+                self.pattern
+            ));
+        }
+        Ok(regex)
+    }
+
+    /// The input names `text`'s placeholders stand for, each once, in
+    /// the order they first appear. A pattern that gives up on the text
+    /// (fancy-regex's backtracking limit) is an error naming the setting.
+    pub fn names_in(&self, regex: &fancy_regex::Regex, text: &str) -> Result<Vec<String>, String> {
+        let mut names: Vec<String> = Vec::new();
+        for captures in regex.captures_iter(text) {
+            let captures = captures.map_err(|e| {
+                format!("the placeholders of '{}' could not be read: {e}", self.setting)
+            })?;
+            if let Some(name) = captures.name("name").map(|m| m.as_str().to_string()) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
+    }
 }
 
 /// Which config fields carry the public address a node claims. The
@@ -372,6 +445,14 @@ pub struct ClaimsRoute {
     /// one. Absent, or empty on the node in the program, means every method.
     #[serde(default, rename = "methodField", skip_serializing_if = "Option::is_none")]
     pub method_field: Option<String>,
+    /// Every output port a program adds to the node reads the path
+    /// capture of its name (`-> (id: String)` on `cards/{id}`). The
+    /// compiler then holds each added port to a capture the written
+    /// path has, typed as the text a capture is, so a port that could
+    /// never fill is refused where it is written. Needs
+    /// `features.canAddOutputPorts`.
+    #[serde(default, rename = "capturesAreOutputs", skip_serializing_if = "std::ops::Not::not")]
+    pub captures_are_outputs: bool,
 }
 
 /// The declared fire payload as ONE record type, so the whole check is
@@ -394,8 +475,8 @@ pub fn fire_payload_type(
         return Ok(None);
     }
     for (field, ty) in fires_with {
-        if crate::weft_type::WeftType::parse(ty).is_none() {
-            return Err(format!("firesWith field `{field}` is not a weft type: `{ty}`"));
+        if let Err(why) = crate::weft_type::WeftType::try_parse(ty) {
+            return Err(format!("firesWith field `{field}` is not a weft type: `{ty}` ({why})"));
         }
     }
     let fields: Vec<String> =
@@ -651,6 +732,14 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
     let Some(obj) = value.as_object() else { return Ok(()) };
     if let Some(inputs) = obj.get("inputs").and_then(|o| o.as_array()) {
         for input in inputs {
+            if input.get("requiredWhenWired").is_some() {
+                let name = input.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                return Err(format!(
+                    "input '{name}' sets `requiredWhenWired`, which no longer exists: an optional \
+                     input is required once wired already (unwired, the node runs without it). \
+                     Remove the key"
+                ));
+            }
             if let Some(exposure) = input.get("exposure") {
                 let name = input.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                 let replacement = match exposure.as_str() {
@@ -670,6 +759,19 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
                 ));
             }
         }
+    }
+    if obj.get("features").and_then(|f| f.get("catchErrors")).is_some() {
+        return Err(format!(
+            "`features.catchErrors` no longer exists: every node has the `{ERROR_PORT}` \
+             output, and a failure goes there when a program wires it. Remove the key."
+        ));
+    }
+    if obj.get("features").and_then(|f| f.get("optionalCustomInputs")).is_some() {
+        return Err(
+            "`features.optionalCustomInputs` is `features.join` now: a node whose added inputs \
+             are optional is a join (the first of several branches), and says so."
+                .into(),
+        );
     }
     if obj.get("features").and_then(|f| f.get("isOutputDefault")).is_some() {
         return Err(
@@ -847,6 +949,7 @@ pub const METADATA_PLACES: &[(&[&str], MetadataPlace, &str)] = {
         (&["accessApps"], NamesAre(Casing::Snake, "service name"), ""),
         (&["types"], NamesAre(Casing::Pascal, "declared type"), ""),
         (&["firesWith"], NamesAre(Casing::Camel, "fire payload field"), ""),
+        (&["typeParams"], NamesAre(Casing::Pascal, "type variable"), ""),
         (&["service", "events", "*", "fields"], NamesAre(Casing::Camel, "event field"), ""),
         // A topic is a value of a fixed set (the service's event kinds): a
         // trigger names it as a value (`"drive_changes"`), so it takes the
@@ -949,10 +1052,9 @@ impl NodeMetadata {
     /// ([`crate::run_settings::RunSettings::node_inputs`]). A trigger that
     /// declares one of the names it receives is refused, so each setting
     /// has exactly one spelling; a node that receives none of them may
-    /// use those names for its own inputs. A node with
-    /// `features.catchErrors` gets the [`ERROR_PORT`]
-    /// output the runtime fills with its failure, and is refused when it
-    /// declares that output itself. Run once, on the authored document,
+    /// use those names for its own inputs. Every node gets the
+    /// [`ERROR_PORT`] output the runtime fills with its failure, and is
+    /// refused when it declares that output itself. Run once, on the authored document,
     /// by both loaders (the catalog's and the derive's `parse_embedded`),
     /// so the editor, the compiler and the worker all see the same
     /// ports.
@@ -978,25 +1080,145 @@ impl NodeMetadata {
             }
         }
         self.inputs.extend(added);
-        if features.catch_errors {
-            let port = ERROR_PORT;
-            if self.outputs.iter().any(|o| o.name == port) {
-                return Err(format!(
-                    "output '{port}' is the port the language gives a node with \
-                     features.catchErrors; remove it from this node's outputs"
-                ));
-            }
-            self.outputs.push(OutputSpec {
-                name: port.to_string(),
-                port_type: WeftType::primitive(WeftPrimitive::String),
-                description: Some(
-                    "Why the node failed, when this output is wired. Unwired, a failure stops the run."
-                        .to_string(),
-                ),
-                baked: false,
-            });
+        let port = ERROR_PORT;
+        if self.outputs.iter().any(|o| o.name == port) {
+            return Err(format!(
+                "output '{port}' is the port the language gives every node for its \
+                 failures; remove it from this node's outputs"
+            ));
         }
+        self.outputs.push(error_output());
         Ok(())
+    }
+
+    /// The node's declared bounds, as the type parameters a program's
+    /// node of this type starts with.
+    pub fn type_param_list(&self) -> Vec<crate::weft_type::TypeParam> {
+        self.type_params
+            .iter()
+            .map(|(name, bound)| crate::weft_type::TypeParam::new(name.clone(), bound.clone()))
+            .collect()
+    }
+
+    /// Whether a program may declare `declared` on this node's output
+    /// `port`, whose type in the node as built is `current` (the
+    /// metadata's, or one its config derived). `Err` finishes the
+    /// sentence "the port is declared X, ...". A type variable in the
+    /// output is pinned by a declaration that fits it. A narrowable
+    /// output takes anything that fits its bound. Every other output is
+    /// the node's contract and is only ever restated as it is: the node
+    /// emits what its type says, nothing narrower. The compiler's merge
+    /// and the node-test rig both ask here.
+    // SYNC: output_declaration_fits <-> packages/weft-graph/src/webview/lib/projection/header-ports.ts declarationRule
+    pub fn output_declaration_fits(&self, port: &str, current: &WeftType, declared: &WeftType) -> Result<(), String> {
+        if current.contains_unresolved_leaf() {
+            return if WeftType::is_compatible(declared, current) {
+                Ok(())
+            } else {
+                Err(format!("which does not fit in its type {current}"))
+            };
+        }
+        match self.outputs.iter().find(|o| o.name == port).and_then(OutputSpec::narrowing_bound) {
+            Some(bound) if WeftType::fits_within(declared, bound) => Ok(()),
+            Some(bound) => Err(format!("which does not fit in {bound}, the widest type the program may declare there")),
+            None if declared == current => Ok(()),
+            None => Err(format!(
+                "but {} always gives it {current}: only an output its node marks narrowable takes \
+                 the type the program declares",
+                self.node_type
+            )),
+        }
+    }
+
+    /// The type rules of a node's ports: a narrowable output's bound is a
+    /// real type its own type fits in, and every `typeParams` entry bounds
+    /// a variable a port uses, without a cycle.
+    fn check_port_types(&self) -> Result<(), String> {
+        let mut used = std::collections::BTreeSet::new();
+        for input in &self.inputs {
+            input.input_type.collect_type_vars(&mut used);
+        }
+        if let Some(ty) = &self.features.custom_input_type {
+            ty.collect_type_vars(&mut used);
+        }
+        for output in &self.outputs {
+            output.port_type.collect_type_vars(&mut used);
+            match &output.narrowable {
+                None => {}
+                Some(narrowable) => {
+                    if output.port_type.contains_unresolved_leaf() {
+                        return Err(format!(
+                            "output '{}' is narrowable, and its type {} holds a type variable, \
+                             which the program already pins by declaring the port; drop one",
+                            output.name, output.port_type
+                        ));
+                    }
+                    if let Narrowable::Bound(bound) = narrowable {
+                        if bound.contains_unresolved_leaf() {
+                            return Err(format!(
+                                "output '{}' narrows within {bound}, which is not a concrete type",
+                                output.name
+                            ));
+                        }
+                        if !WeftType::fits_within(&output.port_type, bound) {
+                            return Err(format!(
+                                "output '{}' is typed {} but narrows within {bound}, which that \
+                                 type does not fit in",
+                                output.name, output.port_type
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for rule in &self.validate {
+            self.check_condition_ports(&rule.when)?;
+        }
+        let params = self.type_param_list();
+        crate::weft_type::TypeParam::check_declarations(&params)
+            .and_then(|()| crate::weft_type::TypeParam::check_used(&params, &used))
+            .map_err(|why| format!("typeParams: {why}"))
+    }
+
+    /// Every port a validation rule's condition names is one of this
+    /// node's (or one a program may add, on a node that takes added
+    /// ports): a misspelled port reads as never wired, and under a `not`
+    /// the rule then fires on every program.
+    fn check_condition_ports(&self, condition: &Condition) -> Result<(), String> {
+        let input = |port: &str| {
+            if self.features.can_add_input_ports || self.inputs.iter().any(|i| i.name == port) {
+                Ok(())
+            } else {
+                Err(format!("a validate rule names input '{port}', which this node does not have"))
+            }
+        };
+        let output = |port: &str| {
+            if self.features.can_add_output_ports || self.outputs.iter().any(|o| o.name == port) {
+                Ok(())
+            } else {
+                Err(format!("a validate rule names output '{port}', which this node does not have"))
+            }
+        };
+        match condition {
+            Condition::InputSatisfied { port }
+            | Condition::InputWired { port }
+            | Condition::InputSourceType { port, .. }
+            | Condition::InputNames { port, .. } => input(port),
+            Condition::OutputWired { port } | Condition::OutputTypeFits { port, .. } => output(port),
+            Condition::All { of } | Condition::Any { of } => {
+                of.iter().try_for_each(|c| self.check_condition_ports(c))
+            }
+            Condition::Not { of } => self.check_condition_ports(of),
+            Condition::ConfigPresent { .. }
+            | Condition::ConfigNonempty { .. }
+            | Condition::ConfigEquals { .. }
+            | Condition::ConfigInSet { .. }
+            | Condition::ConfigMatches { .. }
+            | Condition::CustomOutputsDeclared {}
+            | Condition::RunReaches { .. }
+            | Condition::DownstreamOf { .. }
+            | Condition::PerInstance {} => Ok(()),
+        }
     }
 
     /// Semantic metadata rules serde cannot express. One name = one
@@ -1209,26 +1431,12 @@ impl NodeMetadata {
                     input.name
                 ));
             }
-            if input.required_when_wired {
-                let problem = if input.required {
-                    Some("is also `required`; pick one (`required` skips on a closed value wired or not)")
-                } else if input.input_type.as_generator().is_some() {
-                    Some("is a stream, and a stream input is always `required`")
-                } else if !input.effective_accepts(self.is_compiler_read(&input.name)).wire {
-                    Some("takes no wire, so it could never be wired")
-                } else {
-                    None
-                };
-                if let Some(problem) = problem {
-                    return Err(format!("input '{}': `requiredWhenWired` {problem}", input.name));
-                }
-            }
             // A widget implies the SHAPE of the value it edits. On an
             // input whose type cannot hold that shape, the widget's own
             // contract (a number widget's min/max, a checkbox's bool)
             // becomes silently unenforceable downstream, so the
-            // mismatch is rejected here. Unresolved types (TypeVar,
-            // MustOverride) pass: is_compatible is permissive there and
+            // mismatch is rejected here. Unresolved types (a TypeVar) pass:
+            // is_compatible is permissive there and
             // the resolved instance re-derives its widget.
             let widget_value_type = match input.effective_widget() {
                 Widget::Number { .. } => Some(WeftType::primitive(WeftPrimitive::Number)),
@@ -1450,6 +1658,38 @@ impl NodeMetadata {
                     ));
                 }
             }
+            if claims.captures_are_outputs && !self.features.can_add_output_ports {
+                return Err(
+                    "claimsRoute.capturesAreOutputs reads the path's captures onto the output \
+                     ports a program adds, so the node needs features.canAddOutputPorts"
+                        .into(),
+                );
+            }
+        }
+        self.check_port_types()?;
+        if let Some(placeholders) = &self.placeholders_are_inputs {
+            placeholders.regex()?;
+            let Some(setting) = self.inputs.iter().find(|i| i.name == placeholders.setting) else {
+                return Err(format!(
+                    "placeholdersAreInputs reads the placeholders from input '{}', which this node \
+                     does not declare",
+                    placeholders.setting
+                ));
+            };
+            if !WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::String), &setting.input_type) {
+                return Err(format!(
+                    "placeholdersAreInputs reads the placeholders from input '{}', which holds {} \
+                     rather than text",
+                    setting.name, setting.input_type
+                ));
+            }
+            if !self.features.can_add_input_ports {
+                return Err(
+                    "placeholdersAreInputs matches placeholders against the inputs a program \
+                     adds, so the node needs features.canAddInputPorts"
+                        .into(),
+                );
+            }
         }
         if let Some(service) = &self.publishes {
             // The SAME rule an `AccessSpec.service` is held to (that is
@@ -1616,7 +1856,7 @@ impl NodeMetadata {
 /// Free-form values (a `default`'s contents, a rule's `equals`
 /// payload, a list source's `where`) keep every key name and every
 /// null they hold.
-pub const COMPACT_KEEP_TOP_LEVEL: [&str; 11] = [
+pub const COMPACT_KEEP_TOP_LEVEL: [&str; 12] = [
     "type",
     "description",
     "inputs",
@@ -1632,6 +1872,9 @@ pub const COMPACT_KEEP_TOP_LEVEL: [&str; 11] = [
     // down, and a wiring view that hides it leaves a reader guessing
     // at the one thing they have to type by hand.
     "firesWith",
+    // What each type variable of the ports may stand for: what a wire
+    // into a `T` port has to be.
+    "typeParams",
 ];
 
 /// Top-level metadata keys the compact wiring view drops by NOT being
@@ -1644,7 +1887,7 @@ pub const COMPACT_KEEP_TOP_LEVEL: [&str; 11] = [
 /// that); it exists so every top-level key has exactly one declared
 /// disposition, keep or drop, which is what the classification tests
 /// hold to account when the schema grows.
-pub const COMPACT_DROP_TOP_LEVEL: [&str; 9] = [
+pub const COMPACT_DROP_TOP_LEVEL: [&str; 10] = [
     "label",
     "tags",
     "icon",
@@ -1656,6 +1899,10 @@ pub const COMPACT_DROP_TOP_LEVEL: [&str; 9] = [
     // Which config fields hold the address this node claims. The
     // compiler's overlap check reads it; nobody writing weft does.
     "claimsRoute",
+    // The pattern the compiler holds a setting's placeholders to the
+    // inputs with. The description says the rule in words; the regex is
+    // the compiler's.
+    "placeholdersAreInputs",
 ];
 
 /// Presentation keys stripped inside the `portsFromConfig` subtree of
@@ -1985,6 +2232,14 @@ pub enum Condition {
     /// Braced (`{}`) so a stray field on it is refused like on every
     /// other kind.
     CustomOutputsDeclared {},
+    /// The node's output `port`, as the program declared it (or as the
+    /// node gives it when the program declared nothing), fits in
+    /// `within`. For a narrowable output whose sensible types follow one
+    /// of the node's settings: a route whose `dataType` is `text` takes
+    /// a body declared `String`, and a rule says so at compile time
+    /// rather than at the first call. False when the node has no such
+    /// output.
+    OutputTypeFits { port: String, within: WeftType },
     /// The run this node is part of holds a node `with` a feature, in
     /// the given direction. `downstream`: every run started from this
     /// node (a trigger's fire, or a run seeded at the node) contains
@@ -2008,8 +2263,8 @@ pub enum Condition {
     /// (the compiler's per-instance slice). For a node that cannot be
     /// copied per instance, like a trigger serving one public address.
     /// `{perInstanceReason}` in the message says why, path included
-    /// ("it reads 'blender'", "it sits inside group 'work', which
-    /// receives 'blender'").
+    /// ("it reads 'blender'", "it sits inside group 'work', whose gate
+    /// reads 'blender'").
     /// Braced (`{}`) so a stray field on it is refused.
     PerInstance {},
     /// Every name the input's written value holds is something of this
@@ -2034,8 +2289,8 @@ pub enum Condition {
 
 /// What the names of an `input_names` condition name, and what each
 /// must be: `{"node": {"role": "infra", "perInstance": true}}` or
-/// `{"field": {"instanceFilled": true}}`. Each narrowing is optional
-/// (`{"node": {}}` is any node).
+/// `{"field": {"instanceFilled": true}}`, or `{"state": {}}`. Each
+/// narrowing is optional (`{"node": {}}` is any node).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum Named {
@@ -2054,6 +2309,10 @@ pub enum Named {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance_filled: Option<bool>,
     },
+    /// A place whose state a run can tell (`GetNodeState`): a node
+    /// outside every loop, or a loop
+    /// (`crate::project::selection::state_place`).
+    State {},
 }
 
 /// What kind of node `input_names` with `{"node": {"role": ..}}` requires.
@@ -2096,6 +2355,7 @@ mod condition_tests {
                     { "kind": "config_nonempty", "field": "model" },
                     { "kind": "config_in_set", "field": "mode", "values": ["a", "b"] },
                     { "kind": "config_matches", "field": "path", "regex": "^/" },
+                    { "kind": "output_type_fits", "port": "body", "within": "JsonDict | String" },
                     { "kind": "run_reaches", "direction": "downstream", "with": { "answersCaller": true } },
                     { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["http"] } },
                     { "kind": "downstream_of", "with": { "answersCaller": ["stream"] } },
@@ -2195,10 +2455,30 @@ pub enum DisplayKind {
     Link,
 }
 
-/// The output the language gives a node with `features.catchErrors`
+/// The output the language gives every node
 /// ([`NodeMetadata::add_language_ports`]), which the runtime fills with
-/// the node's failure (`context::caught_failure`).
-pub const ERROR_PORT: &str = "error";
+/// the node's failure (`context::caught_failure`). The underscore marks
+/// it as the language's, like the gate on the other side
+/// (`run::skip::SHOULD_FLOW_PORT`), so `error` stays a name a node may
+/// give its own output.
+// SYNC: ERROR_PORT <-> packages/weft-graph/src/protocol.ts ERROR_PORT
+pub const ERROR_PORT: &str = "_error";
+
+/// The [`ERROR_PORT`] output as every node's metadata carries it.
+fn error_output() -> OutputSpec {
+    OutputSpec {
+        name: ERROR_PORT.to_string(),
+        port_type: WeftType::primitive(WeftPrimitive::String),
+        description: Some(
+            "Why the node failed, when this output is wired: the node then completes, \
+             unless it had already started a stream (a bus, a generator). Unwired, a \
+             failure stops the run."
+                .to_string(),
+        ),
+        baked: false,
+        narrowable: None,
+    }
+}
 
 // SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2224,13 +2504,16 @@ pub struct NodeFeatures {
     /// `not-camel-case` check leaves them alone.
     #[serde(default, rename = "addedPortsAreDataKeys", skip_serializing_if = "std::ops::Not::not")]
     pub added_ports_are_data_keys: bool,
-    /// The node's created input ports are OPTIONAL by default (a
-    /// closure on one does not skip the node). For node types whose
-    /// extra inputs are optional by nature, `FirstInOrder` being the
-    /// one that needs it. Without it a created port is required, like
-    /// a declared one. A `?` on the config key overrides either way.
-    #[serde(default, rename = "optionalCustomInputs", skip_serializing_if = "std::ops::Not::not")]
-    pub optional_custom_inputs: bool,
+    /// The node is a JOIN: it meets several branches and goes on with
+    /// whichever arrived (`FirstInOrder`). Its created input ports are
+    /// OPTIONAL (a closure on one does not skip it; a `?` on the config
+    /// key changes nothing), it runs when everything it waits on has
+    /// arrived or closed, and when nothing arrived it closes its output
+    /// itself. That meaning is also what exempts it from the rule that
+    /// a node whose wired inputs are all optional needs its gate wired:
+    /// "first of these branches" is already when it runs.
+    #[serde(default, rename = "join", skip_serializing_if = "std::ops::Not::not")]
+    pub join: bool,
     /// The type every CREATED input port takes (a port a config key
     /// makes on a node that accepts custom inputs). `None` means each
     /// created port gets its own type variable, so it takes whatever
@@ -2245,16 +2528,6 @@ pub struct NodeFeatures {
     /// events rather than running as part of a run).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
-    /// The node reaches outside (a service, a database, a file, a
-    /// model), so a failure of its body is an outcome the program may
-    /// want to handle. The language gives it an [`ERROR_PORT`]
-    /// output ([`NodeMetadata::add_language_ports`]) and the runtime
-    /// does the catching (`context::caught_failure`): with
-    /// `error` wired, the failure's message goes there and the firing
-    /// completes; unwired, the failure stops the run. The node's own
-    /// code writes no error handling.
-    #[serde(default, rename = "catchErrors", skip_serializing_if = "std::ops::Not::not")]
-    pub catch_errors: bool,
     /// The node's body does nothing outside the run that weft does not put
     /// on record first: no network, no connection, no wait, no `ctx.run`,
     /// no tag, no storage beyond this run's own files. It may answer its
@@ -2324,8 +2597,8 @@ pub struct NodeFeatures {
     /// catalog node type that executes but must not appear in
     /// user-facing tooling. Users cannot declare a hidden node type
     /// in source; the parser rejects them with a dedicated error.
-    /// (Group/Loop boundary lowering does NOT use this: those are
-    /// not catalog nodes, they're inline-dispatched in the engine.)
+    /// (A loop's boundaries do NOT use this: they are not catalog
+    /// nodes, the engine runs them inline.)
     #[serde(default, rename = "hidden", skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
 }
@@ -2958,16 +3231,6 @@ pub struct InputSpec {
     pub input_type: WeftType,
     #[serde(default)]
     pub required: bool,
-    /// Optional while nothing is wired here, required once something is:
-    /// an unwired input lets the node run without it (no compile error),
-    /// and a wired one that arrives closed skips the node exactly as a
-    /// required input does. For an input whose absence has a meaning of
-    /// its own (an `instance` left unwired acts on the program's own
-    /// copies) that a wire which never delivered must not fall back to.
-    /// Never together with `required`; the metadata check refuses it.
-    // SYNC: InputSpec.required_when_wired <-> packages/weft-graph/src/protocol.ts InputSpec.requiredWhenWired
-    #[serde(default, rename = "requiredWhenWired", skip_serializing_if = "std::ops::Not::not")]
-    pub required_when_wired: bool,
     /// Which drivers this input takes, when the author narrows it.
     /// Absent means both (a constant in the source, or a wire from
     /// another node); `["wire"]` refuses every written value, `["literal"]`
@@ -3075,6 +3338,73 @@ pub struct OutputSpec {
     /// its own (a status) is not baked. The infra node only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub baked: bool,
+    /// The program may declare what this output holds, for an output
+    /// whose shape only the program knows (a model's JSON answer, a
+    /// request's body, a query's rows): `-> (response: Verdict)` on the
+    /// call. `true` lets the declared type be anything that fits in
+    /// `type`; a type string is a wider bound than `type`, which stays
+    /// what the port holds when nothing is declared (a route's body is
+    /// `JsonDict` unless declared `String` or a file). The compiler
+    /// checks the declaration fits; at run time the emit check holds
+    /// every value to it, and a value that does not fit is a failure
+    /// the program can catch. An output that is not narrowable takes no
+    /// other type than its own.
+    // SYNC: OutputSpec.narrowable <-> packages/weft-graph/src/protocol.ts OutputSpec.narrowable
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrowable: Option<Narrowable>,
+}
+
+/// How far an output may be narrowed ([`OutputSpec::narrowable`]),
+/// written `true` or a type string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Narrowable {
+    /// `true`: anything that fits in the output's own type.
+    Within,
+    /// A bound wider than the output's own type.
+    Bound(WeftType),
+}
+
+impl Serialize for Narrowable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Narrowable::Within => serializer.serialize_bool(true),
+            Narrowable::Bound(bound) => bound.serialize(serializer),
+        }
+    }
+}
+
+/// `true` or a type string, anything else refused by name: a typo in
+/// the bound says which name is unknown (an untagged enum would only
+/// say that nothing matched), and `false` says to drop the key.
+impl<'de> Deserialize<'de> for Narrowable {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Bool(true) => Ok(Narrowable::Within),
+            serde_json::Value::Bool(false) => Err(D::Error::custom(
+                "`\"narrowable\": false` is what leaving the key out means; remove it",
+            )),
+            serde_json::Value::String(bound) => WeftType::try_parse(&bound)
+                .map(Narrowable::Bound)
+                .map_err(|why| D::Error::custom(format!("narrowable bound `{bound}`: {why}"))),
+            other => Err(D::Error::custom(format!(
+                "narrowable is `true` or the type a declaration must fit in, got {other}"
+            ))),
+        }
+    }
+}
+
+impl OutputSpec {
+    /// The type a declaration on this output must fit in, when it may be
+    /// narrowed at all.
+    // SYNC: narrowing_bound <-> packages/weft-graph/src/protocol.ts narrowingBound
+    pub fn narrowing_bound(&self) -> Option<&WeftType> {
+        match &self.narrowable {
+            Some(Narrowable::Within) => Some(&self.port_type),
+            Some(Narrowable::Bound(bound)) => Some(bound),
+            None => None,
+        }
+    }
 }
 
 /// The languages a code widget can highlight. Closed: a metadata file
@@ -3687,7 +4017,7 @@ mod node_output_tests {
     fn declared_ports(names: &[&str]) -> std::collections::HashMap<String, WeftType> {
         names
             .iter()
-            .map(|n| (n.to_string(), WeftType::MustOverride))
+            .map(|n| (n.to_string(), WeftType::type_var("T")))
             .collect()
     }
 
@@ -4278,7 +4608,7 @@ mod input_semantics_tests {
     #[test]
     fn only_an_infra_nodes_output_may_be_baked() {
         let mut m = metadata_with(vec![]);
-        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true });
+        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true, narrowable: None });
         assert!(m.validate_semantics().unwrap_err().contains("only an infra node's outputs are"));
         m.requires_infra = true;
         m.validate_semantics().expect("an infra node bakes");
@@ -4374,45 +4704,40 @@ mod input_semantics_tests {
         assert_eq!(limiter.inputs.len(), own.len());
     }
 
-    /// `catchErrors` gives the node the language's `error` output; a
-    /// node declaring it itself is refused, and without the flag
-    /// `error` is an ordinary name.
+    /// Every node gets the language's `_error` output, a trigger and a
+    /// node that only shapes values alike; a node declaring it itself is
+    /// refused, and `error` is an ordinary name a node may use.
     #[test]
-    fn catch_errors_adds_the_error_output() {
-        let error_output = || OutputSpec {
-            name: ERROR_PORT.into(),
+    fn every_node_gets_the_error_output() {
+        let output = |name: &str| OutputSpec {
+            name: name.into(),
             port_type: WeftType::primitive(WeftPrimitive::String),
             description: None,
             baked: false,
+            narrowable: None,
         };
-        let mut catching = metadata_with(vec![]);
-        catching.features.catch_errors = true;
-        catching.add_language_ports().unwrap();
-        assert_eq!(catching.outputs.len(), 1);
-        assert_eq!(catching.outputs[0].name, ERROR_PORT);
-        assert_eq!(catching.outputs[0].port_type, WeftType::primitive(WeftPrimitive::String));
-        catching.validate_semantics().expect("the added output passes the semantic rules");
+        let mut plain = metadata_with(vec![]);
+        plain.add_language_ports().unwrap();
+        assert_eq!(plain.outputs.len(), 1);
+        assert_eq!(plain.outputs[0].name, ERROR_PORT);
+        assert_eq!(plain.outputs[0].port_type, WeftType::primitive(WeftPrimitive::String));
+        plain.validate_semantics().expect("the added output passes the semantic rules");
+
+        let mut trigger = metadata_with(vec![]);
+        trigger.features.is_trigger = true;
+        trigger.add_language_ports().unwrap();
+        assert_eq!(trigger.outputs.iter().filter(|o| o.name == ERROR_PORT).count(), 1);
 
         let mut declares_it = metadata_with(vec![]);
-        declares_it.features.catch_errors = true;
-        declares_it.outputs.push(error_output());
+        declares_it.outputs.push(output(ERROR_PORT));
         let e = declares_it.add_language_ports().unwrap_err();
-        assert!(e.contains("catchErrors"), "{e}");
+        assert!(e.contains(ERROR_PORT) && e.contains("every node"), "{e}");
 
-        let mut plain = metadata_with(vec![]);
-        plain.outputs.push(error_output());
-        plain.add_language_ports().expect("without the flag, `error` is the node's own name");
-        assert_eq!(plain.outputs.len(), 1);
-    }
-
-    /// The flag's wire spelling.
-    #[test]
-    fn catch_errors_round_trips() {
-        let features: NodeFeatures = serde_json::from_str(r#"{ "catchErrors": true }"#).unwrap();
-        assert!(features.catch_errors);
-        assert_eq!(serde_json::to_value(&features).unwrap(), serde_json::json!({ "catchErrors": true }));
-        let none: NodeFeatures = serde_json::from_str("{}").unwrap();
-        assert!(!none.catch_errors);
+        let mut own_error = metadata_with(vec![]);
+        own_error.outputs.push(output("error"));
+        own_error.add_language_ports().expect("`error` is the node's own name");
+        let names: Vec<&str> = own_error.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["error", ERROR_PORT]);
     }
 
     /// A fire payload is a trigger's, and a type it cannot read fails the
@@ -4630,6 +4955,7 @@ mod input_semantics_tests {
             port_type: WeftType::Access,
             description: None,
             baked: false,
+            narrowable: None,
         };
 
         publishing("postgres", vec![access_out()])
@@ -4660,35 +4986,17 @@ mod input_semantics_tests {
             description: None,
             requires_scopes: None,
             requires_values: None,
-            required_when_wired: false,
         }
     }
 
-    /// `requiredWhenWired` is a third requiredness beside `required` and
-    /// optional, so it never sits with `required`, and it is refused where
-    /// it could never mean anything: a stream (always required) or an
-    /// input that takes no wire.
+    /// The key that once made an optional input required when wired is
+    /// refused, naming that an optional input is that already.
     #[test]
-    fn required_when_wired_is_refused_where_it_cannot_apply() {
-        let string = || WeftType::primitive(WeftPrimitive::String);
-        let ok = metadata_with(vec![InputSpec { required_when_wired: true, ..input("instance", string()) }]);
-        assert!(ok.validate_semantics().is_ok());
-
-        let both = metadata_with(vec![InputSpec { required: true, required_when_wired: true, ..input("instance", string()) }]);
-        assert!(both.validate_semantics().unwrap_err().contains("also `required`"));
-
-        let stream = metadata_with(vec![InputSpec {
-            required_when_wired: true,
-            ..input("rows", WeftType::Generator(Box::new(string())))
-        }]);
-        assert!(stream.validate_semantics().unwrap_err().contains("stream"));
-
-        let literal_only = metadata_with(vec![InputSpec {
-            required_when_wired: true,
-            accepts: Some(Accepts::literal_only()),
-            ..input("instance", string())
-        }]);
-        assert!(literal_only.validate_semantics().unwrap_err().contains("takes no wire"));
+    fn required_when_wired_is_refused_as_removed() {
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "inputs": [{ "name": "instance", "type": "String", "requiredWhenWired": true }] });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("requiredWhenWired") && e.contains("required once wired"), "{e}");
     }
 
     /// Every input takes both drivers unless something narrows it: the
@@ -4792,6 +5100,11 @@ mod input_semantics_tests {
             "features": { "isOutputDefault": true } });
         let e = refuse_removed_metadata_keys(&doc).unwrap_err();
         assert!(e.contains("isOutputDefault") && e.contains("--target"), "{e}");
+
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "features": { "catchErrors": true } });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("catchErrors") && e.contains(ERROR_PORT), "{e}");
 
         let doc = json!({ "type": "T", "label": "T", "description": "",
             "outputs": [{ "name": "out", "type": "String", "required": false }] });
@@ -4996,6 +5309,7 @@ mod input_semantics_tests {
                 port_type: WeftType::primitive(WeftPrimitive::Image),
                 description: None,
                 baked: false,
+                narrowable: None,
             });
             m.display = Some(d);
             m
@@ -5143,6 +5457,173 @@ mod input_semantics_tests {
         assert_eq!(again.inputs[0].accepts, resolved.inputs[0].accepts);
         assert_eq!(again.inputs[0].widget, resolved.inputs[0].widget);
     }
+
+    /// A node's metadata from its JSON, the way a `metadata.json` reads.
+    fn metadata_json(extra: serde_json::Value) -> NodeMetadata {
+        let mut doc = json!({ "type": "N", "label": "N", "description": "" });
+        doc.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(doc).expect("the metadata parses")
+    }
+
+    fn ty(s: &str) -> WeftType {
+        WeftType::parse(s).unwrap_or_else(|| panic!("{s} parses"))
+    }
+
+    #[test]
+    fn a_narrowable_output_narrows_within_its_type_or_a_wider_bound() {
+        let m = metadata_json(json!({ "outputs": [{ "name": "response", "type": "JsonDict", "narrowable": true }] }));
+        m.validate_semantics().expect("narrowable: true loads");
+
+        // A rule naming an output the node lacks is refused at load.
+        let m = metadata_json(json!({
+            "outputs": [{ "name": "body", "type": "JsonDict", "narrowable": true }],
+            "validate": [{
+                "when": { "kind": "not", "of": { "kind": "output_type_fits", "port": "bdy", "within": "String" } },
+                "then": { "message": "x" }
+            }],
+        }));
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("names output 'bdy'"), "{e}");
+        assert_eq!(m.outputs[0].narrowing_bound(), Some(&WeftType::JsonDict));
+
+        let m = metadata_json(json!({ "outputs": [
+            { "name": "body", "type": "JsonDict", "narrowable": "JsonDict | String" }
+        ] }));
+        m.validate_semantics().expect("a wider bound loads");
+        assert_eq!(m.outputs[0].narrowing_bound(), Some(&ty("JsonDict | String")));
+
+        let m = metadata_json(json!({ "outputs": [{ "name": "body", "type": "JsonDict", "narrowable": "String" }] }));
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("output 'body'") && e.contains("does not fit in"), "{e}");
+
+        let parse = |narrowable: serde_json::Value| {
+            let doc = json!({ "type": "N", "label": "N", "description": "",
+                "outputs": [{ "name": "body", "type": "JsonDict", "narrowable": narrowable }] });
+            serde_json::from_value::<NodeMetadata>(doc).unwrap_err().to_string()
+        };
+        let e = parse(json!(false));
+        assert!(e.contains("\"narrowable\": false"), "{e}");
+        // A typo in the bound names the unknown name, not "no variant matched".
+        let e = parse(json!("JsonDic | String"));
+        assert!(e.contains("narrowable bound") && e.contains("`JsonDic`"), "{e}");
+        let e = parse(json!(3));
+        assert!(e.contains("narrowable is `true` or the type"), "{e}");
+
+        let m = metadata_json(json!({
+            "inputs": [{ "name": "value", "type": "T" }],
+            "outputs": [{ "name": "value", "type": "T", "narrowable": true }],
+        }));
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("output 'value' is narrowable") && e.contains("type variable"), "{e}");
+    }
+
+    #[test]
+    fn type_params_refuse_an_unused_variable_and_a_cycle() {
+        let m = metadata_json(json!({
+            "typeParams": { "T": "Media" },
+            "inputs": [{ "name": "file", "type": "Image" }],
+        }));
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("typeParams") && e.contains("`T`") && e.contains("no port uses it"), "{e}");
+
+        let m = metadata_json(json!({
+            "typeParams": { "T1": "List[T2]", "T2": "List[T1]" },
+            "inputs": [{ "name": "a", "type": "T1" }, { "name": "b", "type": "T2" }],
+        }));
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("typeParams") && e.contains("cycle"), "{e}");
+
+        let m = metadata_json(json!({
+            "typeParams": { "T": "File" },
+            "inputs": [{ "name": "file", "type": "T" }],
+            "outputs": [{ "name": "file", "type": "T" }],
+        }));
+        m.validate_semantics().expect("a used, acyclic bound loads");
+
+        // A bound waiting on a variable nothing ever resolves checks nothing.
+        let m = metadata_json(json!({
+            "typeParams": { "T": "List[T2]" },
+            "inputs": [{ "name": "value", "type": "T" }],
+            "outputs": [{ "name": "value", "type": "T" }],
+        }));
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("typeParams") && e.contains("names `T2`, which no port uses"), "{e}");
+    }
+
+    #[test]
+    fn placeholders_are_inputs_is_held_to_the_node() {
+        let query = json!([{ "name": "query", "type": "String" }]);
+        let adds = json!({ "canAddInputPorts": true });
+        let good = json!({ "in": "query", "pattern": "\\$(?<name>[a-zA-Z_][a-zA-Z0-9_]*)" });
+        metadata_json(json!({ "inputs": query, "features": adds, "placeholdersAreInputs": good }))
+            .validate_semantics()
+            .expect("a text input, a capturing pattern and added inputs load");
+
+        let e = metadata_json(json!({
+            "inputs": query, "features": adds,
+            "placeholdersAreInputs": { "in": "sql", "pattern": "\\$(?<name>[a-z]+)" },
+        }))
+        .validate_semantics()
+        .unwrap_err();
+        assert!(e.contains("input 'sql'") && e.contains("does not declare"), "{e}");
+
+        let e = metadata_json(json!({
+            "inputs": query, "features": adds,
+            "placeholdersAreInputs": { "in": "query", "pattern": "\\$([a-z]+)" },
+        }))
+        .validate_semantics()
+        .unwrap_err();
+        assert!(e.contains("no group named `name`"), "{e}");
+
+        // A back-reference skips a span to its own closing delimiter.
+        let tagged = PlaceholdersAreInputs {
+            setting: "query".into(),
+            pattern: "\\$(?<tag>\\w*)\\$.*?\\$\\k<tag>\\$|\\$(?<name>[a-z]+)".into(),
+        };
+        let regex = tagged.regex().expect("a back-reference compiles");
+        assert_eq!(tagged.names_in(&regex, "$f$ $g$ $no $g$ $f$ $yes").unwrap(), vec!["yes".to_string()]);
+
+        let e = metadata_json(json!({ "inputs": query, "placeholdersAreInputs": good }))
+            .validate_semantics()
+            .unwrap_err();
+        assert!(e.contains("canAddInputPorts"), "{e}");
+    }
+
+    #[test]
+    fn optional_custom_inputs_is_refused_naming_join() {
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "features": { "optionalCustomInputs": true } });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("optionalCustomInputs") && e.contains("`features.join`"), "{e}");
+    }
+
+    /// What a program may declare on an output: a narrowable one takes
+    /// anything fitting its bound, a type variable takes anything it is
+    /// compatible with, every other output only its own type.
+    #[test]
+    fn output_declaration_fits_follows_the_output_kind() {
+        let m = metadata_json(json!({ "outputs": [
+            { "name": "response", "type": "JsonDict", "narrowable": true },
+            { "name": "text", "type": "String" },
+            { "name": "value", "type": "T" },
+        ], "inputs": [{ "name": "value", "type": "T" }] }));
+        let json_dict = WeftType::JsonDict;
+        m.output_declaration_fits("response", &json_dict, &ty("{ verdict: String, score: Number }"))
+            .expect("a record fits JsonDict");
+        let e = m.output_declaration_fits("response", &json_dict, &ty("String")).unwrap_err();
+        assert!(e.contains("does not fit in JsonDict"), "{e}");
+
+        let string = ty("String");
+        m.output_declaration_fits("text", &string, &string).expect("its own type is restated");
+        let e = m.output_declaration_fits("text", &string, &ty("String | Null")).unwrap_err();
+        assert!(e.contains("narrowable"), "{e}");
+
+        let t = ty("T");
+        m.output_declaration_fits("value", &t, &ty("{ a: Number }")).expect("a T output is pinned by any type");
+        m.output_declaration_fits("value", &ty("List[T]"), &ty("List[Image]")).expect("compatible with List[T]");
+        let e = m.output_declaration_fits("value", &ty("List[T]"), &ty("Number")).unwrap_err();
+        assert!(e.contains("does not fit in its type"), "{e}");
+    }
 }
 
 
@@ -5189,7 +5670,7 @@ pub fn derive_config_ports(
 }
 
 /// The metadata sentinel meaning "this port's own type variable": the
-/// materializer turns it into `T__{key}`, one variable per port, so
+/// materializer turns it into `T__in__{key}`, one variable per port, so
 /// sibling ports never unify by accident.
 // SYNC: AUTO_TYPE_VAR <-> packages/weft-graph/src/webview/lib/utils/port-specs.ts
 //       AUTO_TYPE_VAR_MARKER
@@ -5202,20 +5683,17 @@ pub const AUTO_TYPE_VAR: &str = "T_Auto";
 // SYNC: materialize_auto_type_vars <-> packages/weft-graph/src/webview/lib/utils/port-specs.ts materializeAutoTypeVars
 pub fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
     match t {
-        WeftType::TypeVar(n) if n == AUTO_TYPE_VAR => WeftType::type_var(&format!("T__{key}")),
+        WeftType::TypeVar(n) if n == AUTO_TYPE_VAR => WeftType::port_var(crate::weft_type::PortSide::Input, key),
         WeftType::List(inner) => WeftType::List(Box::new(materialize_auto_type_vars(inner, key))),
         WeftType::Generator(inner) => {
             WeftType::Generator(Box::new(materialize_auto_type_vars(inner, key)))
         }
-        WeftType::Dict(k, v) => WeftType::Dict(
-            Box::new(materialize_auto_type_vars(k, key)),
-            Box::new(materialize_auto_type_vars(v, key)),
-        ),
+        WeftType::Dict(v) => WeftType::Dict(Box::new(materialize_auto_type_vars(v, key))),
         WeftType::Union(members) => {
             WeftType::Union(members.iter().map(|m| materialize_auto_type_vars(m, key)).collect())
         }
-        WeftType::Record(fields) => WeftType::Record(
-            fields
+        WeftType::Record { fields, open } => WeftType::Record {
+            fields: fields
                 .iter()
                 .map(|f| crate::weft_type::RecordField {
                     name: f.name.clone(),
@@ -5223,7 +5701,8 @@ pub fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
                     optional: f.optional,
                 })
                 .collect(),
-        ),
+            open: *open,
+        },
         // No `Named` arm: a declared body is concrete by construction
         // (the registry and the wire parser both refuse a type
         // variable inside one), so there is never a `T_Auto` to
@@ -5377,7 +5856,7 @@ mod compact_view_tests {
             .keys()
             .map(|k| k.as_str())
             .collect();
-        const SERIALIZED_WHEN_NON_EMPTY: [&str; 10] = [
+        const SERIALIZED_WHEN_NON_EMPTY: [&str; 12] = [
             "images",
             "publishes",
             "display",
@@ -5388,6 +5867,8 @@ mod compact_view_tests {
             "types",
             "firesWith",
             "claimsRoute",
+            "typeParams",
+            "placeholdersAreInputs",
         ];
         observed.extend(SERIALIZED_WHEN_NON_EMPTY);
 

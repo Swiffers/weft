@@ -58,6 +58,7 @@
     {
       "name": "file",
       "type": "File",
+      "narrowable": true,
       "description": "The stored file."
     },
     {
@@ -76,9 +77,6 @@
       "description": "Size in bytes."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

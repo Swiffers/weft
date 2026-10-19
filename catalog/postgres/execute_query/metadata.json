@@ -1,7 +1,7 @@
 {
   "type": "PostgresExecuteQuery",
   "label": "Postgres: Query",
-  "description": "Run SQL against Postgres and get the rows back. Parameters are the node's own inline-declared input ports, read by name: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. Binding: a string as the text of the placeholder's type (so `$when::timestamptz`, a uuid column or `$amount::numeric` parse it like a quoted literal), a boolean as bool, a number to whatever numeric column it meets, null anywhere, an object or list as jsonb (`$params::jsonb->>'id'`). Where Postgres cannot infer a parameter's type (inside `jsonb_build_object(...)`, `$x IS NULL`, bare `SELECT $x`) it refuses with \"could not determine data type of parameter\": cast it (`$x::text`). A port used twice is ONE parameter with one type, so `'...' || $id` makes `id` text and a uuid or integer comparison on it then fails; use a separate port. Several statements form a script: with `$name` parameters they run in one transaction, each with the ports it names; without any, all but the last run whole (transaction control and utility statements work) and the last runs alone. The last statement's rows come back. Declare output ports (`-> (name: String)`) to read the first row's columns; a nullable column is typed `T | Null` (`List[Dict[String, JsonDict | Null]]`), since `JsonDict` alone refuses null. To fail on purpose, define once in the schema `CREATE FUNCTION fail(msg text) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION '%', msg; END $$;` and call `SELECT fail('no such publication') WHERE NOT EXISTS (...)` (a `$port` inside a `DO` body is plain text, not a parameter). A data-modifying CTE (`WITH ins AS (INSERT ... RETURNING *) SELECT ...`) is invisible to the rest of its statement: read from `ins`, not the table. Unreachable database, broken constraint, `fail(..)` or missing privilege: catchable by `error`. An SQL mistake (syntax, unknown table or column, positional `$1`): always fails the run.",
+  "description": "Run SQL against Postgres and get the rows back. Parameters are the node's own inline-declared input ports, read by name: `PostgresExecuteQuery(userId: String) { query: \"SELECT * FROM users WHERE id = $userId\" }`; the build fails on a `$name` that is no input of the node, and on an input the query never uses. Binding: a string as the text of the placeholder's type (so `$when::timestamptz`, a uuid column or `$amount::numeric` parse it like a quoted literal), a boolean as bool, a number to whatever numeric column it meets, null anywhere, an object or list as jsonb (`$params::jsonb->>'id'`). Where Postgres cannot infer a parameter's type (inside `jsonb_build_object(...)`, `$x IS NULL`, bare `SELECT $x`) it refuses with \"could not determine data type of parameter\": cast it (`$x::text`). A port used twice is ONE parameter with one type, so `'...' || $id` makes `id` text and a uuid or integer comparison on it then fails; use a separate port. Several statements form a script: with `$name` parameters they run in one transaction, each with the ports it names; without any, all but the last run whole (transaction control and utility statements work) and the last runs alone. The last statement's rows come back: all of them on `rows` (`[]` when none), the first on `row`. To have them checked, declare their shape in the program, `type User = { id: String, name: String | Null, .. }`, and on the node `-> (row: User)` or `-> (rows: List[User])`: a row that does not fit fails the node naming the field (catchable by `_error`). `..` ignores the columns the type does not name; a column that can be NULL is typed `T | Null`. With no rows `row` closes, so whatever reads it skips; declared `-> (row: User | Null)` it carries `null` instead. To fail on purpose, define once in the schema `CREATE FUNCTION fail(msg text) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION '%', msg; END $$;` and call `SELECT fail('no such publication') WHERE NOT EXISTS (...)` (a `$port` inside a `DO` body is plain text, not a parameter). A data-modifying CTE (`WITH ins AS (INSERT ... RETURNING *) SELECT ...`) is invisible to the rest of its statement: read from `ins`, not the table. Unreachable database, broken constraint, `fail(..)` or missing privilege: catchable by `_error`. So are rows weighing more than 100 KB in all, the most a wire carries: page a big result with `LIMIT` and `OFFSET`. An SQL mistake (syntax, unknown table or column, positional `$1`): always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -42,34 +42,30 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "description": "Answered rows keyed by column (the last statement's, for a script)."
+      "narrowable": true,
+      "description": "Every row the query answered (the last statement's, for a script), keyed by column; `[]` when none. Declare `-> (rows: List[User])` to have each row checked against `User`."
+    },
+    {
+      "name": "row",
+      "type": "JsonDict",
+      "narrowable": "JsonDict | Null",
+      "description": "The first row, the same as the first of `rows`. Closes when the query answered none; declared `-> (row: User | Null)` it carries `null` instead."
     },
     {
       "name": "count",
       "type": "Number",
-      "description": "Rows RETURNED (length of `rows`), not rows changed: a plain INSERT/UPDATE/DELETE gives 0; add `RETURNING id` to count them. A column named `count` cannot use this port: alias it (`count(*) as total`) and declare that port."
+      "description": "Rows RETURNED (length of `rows`), not rows changed: a plain INSERT/UPDATE/DELETE gives 0; add `RETURNING id` to count them."
     }
   ],
   "features": {
-    "catchErrors": true,
     "canAddInputPorts": true,
-    "canAddOutputPorts": true,
     "addedPortsAreDataKeys": true
   },
+  "placeholdersAreInputs": {
+    "in": "query",
+    "pattern": "(?s)--[^\\n]*|/\\*.*?\\*/|[Ee](?:'(?:[^'\\\\]|\\\\.)*')+|(?:'[^']*')+|(?:\"[^\"]*\")+|\\$(?<tag>(?:[A-Za-z_][[:word:]]*)?)\\$.*?\\$\\k<tag>\\$|[[:word:]]+(?:\\$[[:word:]]+)*\\$?|\\$(?<name>[A-Za-z_][[:word:]]*)"
+  },
   "validate": [
-    {
-      "when": {
-        "kind": "config_matches",
-        "field": "query",
-        "regex": "(?i)\\bas\\s+\"?(count|rows)\"?\\b"
-      },
-      "then": {
-        "message": "'{id}' aliases a column to `count` or `rows`, which are this node's own outputs (how many rows came back, and the rows themselves). A column of that name has nowhere to go: reading the port gives you what the node puts there. Alias it to something else in the SQL, `count(*) as total`, and declare a port for that name.",
-        "level": "structural",
-        "severity": "error",
-        "field": "query"
-      }
-    },
     {
       "when": {
         "kind": "all",

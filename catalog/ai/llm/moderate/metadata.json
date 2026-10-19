@@ -1,7 +1,7 @@
 {
   "type": "LlmModerate",
   "label": "Moderate",
-  "description": "Classify text for content safety through OpenAI's moderation endpoint (free, no usage caps); wire an OpenAIProvider. Emits whether the text flags, which categories, and per-category scores.",
+  "description": "Classify text for content safety through OpenAI's moderation endpoint (free, no usage caps); wire an OpenAI Access node. Emits whether the text flags, which categories, and per-category scores.",
   "tags": [
     "ai",
     "moderation",
@@ -11,10 +11,11 @@
   "color": "#7C3AED",
   "inputs": [
     {
-      "name": "provider",
-      "type": "LlmProvider",
+      "name": "access",
+      "type": "Access",
       "required": true,
-      "description": "Wire an OpenAIProvider; only its connection is used, so the one feeding your chat nodes works here too."
+      "accepts": ["wire"],
+      "description": "The OpenAI connection: wire an OpenAI Access node's `access` (the one feeding your OpenAI Model nodes works here too)."
     },
     {
       "name": "model",
@@ -52,8 +53,5 @@
       "name": "scores",
       "type": "JsonDict"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

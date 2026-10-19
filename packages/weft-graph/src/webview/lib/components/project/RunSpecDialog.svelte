@@ -43,8 +43,8 @@
 	let missing = $state<CrossingPort[]>([]);
 	/// Each input crossing into the run, under the start it is handed at:
 	/// the first start its value would pass (`handAt`), which for a
-	/// group inside another is that group, not the outer door the wire
-	/// lands on. One with no start on its way is listed on its own.
+	/// group inside another is that group, not the outer group the wire
+	/// enters first. One with no start on its way is listed on its own.
 	const handedAt = (port: CrossingPort) => port.handAt ?? { node: port.node, port: port.port };
 	const missingAt = (start: string) => missing.filter(port => handedAt(port).node === start);
 	const missingElsewhere = $derived(missing.filter(port => {
@@ -216,7 +216,7 @@
 				<span class="text-zinc-500">Group (a group or an include, by its id)</span>
 				<input class="border rounded px-2 py-1 font-mono" bind:value={group} oninput={changed} />
 				{#if group.trim()}
-					<span class="text-zinc-500">Group input backups (port values as JSON)</span>
+					<span class="text-zinc-500">Group input values (port values as JSON)</span>
 					<textarea class="border rounded px-2 py-1 font-mono h-16" bind:value={groupPayload} oninput={changed}></textarea>
 					{@render crossings(missingAt(group.trim()))}
 				{/if}
@@ -246,7 +246,7 @@
 		</div>
 		{#if list(from).length > 0}
 			<div class="mt-3 text-xs">
-				<div class="text-zinc-500 mb-1">Starting input backups. Real values win. Supply streams as lists of items.</div>
+				<div class="text-zinc-500 mb-1">Starting input values. A value you hand a port is its value. Supply streams as lists of items.</div>
 				{#each [...new Set(list(from))] as node (node)}
 					<label class="flex flex-col gap-1 mb-2">
 						<span class="font-mono">{node}</span>

@@ -314,7 +314,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                             if req.seeded {
                                 resolved.warnings.push("This preview has not checked the saved run. When starting, compatible saved results may supply inputs at the cut; an input something needs that no saved result supplies refuses the run then.".into());
                             } else {
-                                weft_core::run_spec::refuse_unrunnable(&definition, &resolved.selection, &spec)?;
+                                weft_core::run_spec::refuse_unrunnable(&definition, &resolved, &spec)?;
                             }
                             Ok(resolved)
                         });
@@ -629,8 +629,8 @@ fn do_validate(
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
-/// types (Passthrough) are omitted; unknown types are skipped (parse
-/// is lenient, the editor renders them as placeholders).
+/// types are omitted; unknown types are skipped (parse is lenient, the
+/// editor renders them as placeholders).
 fn collect_catalog(
     project: &ProjectDefinition,
     catalog: &FsCatalog,
@@ -697,7 +697,7 @@ mod tests {
         let original = super::resolve_source(saved, Some(&project), Some(&include), &mut catalogs, false).unwrap();
         let edited = "Group(number: Number) -> (out: Number) {\n self.out = self.number\n}\n";
         let current = super::resolve_source(edited, Some(&project), Some(&include), &mut catalogs, false).unwrap();
-        assert!(current.nodes.iter().any(|node| node.id == "batch__in" && node.inputs.iter().any(|port| port.name == "number")));
+        assert!(current.groups.iter().any(|group| group.id == "batch" && group.in_ports.iter().any(|port| port.name == "number")));
         assert_ne!(weft_compiler::hash::compute_definition_hash(&original).unwrap(), weft_compiler::hash::compute_definition_hash(&current).unwrap());
         assert_eq!(std::fs::read_to_string(&include).unwrap(), saved);
     }

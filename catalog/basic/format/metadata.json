@@ -1,7 +1,7 @@
 {
   "type": "Format",
   "label": "Format",
-  "description": "Fill a text template with values from the graph. Write it with `{{name}}` placeholders and declare one input port per placeholder: `Format(user: String, count: Number) { template: \"Hi {{user}}, you have {{count}} left\" }`. A string fills in as is, anything else as its JSON. A placeholder with no port, or a port with no placeholder, fails the node naming it. Literal braces are doubled: `{{{{json}}}}` renders as `{{json}}` and needs no port.",
+  "description": "Fill a text template with values from the graph. Write it with `{{name}}` placeholders and declare one input port per placeholder: `Format(user: String, count: Number) { template: \"Hi {{user}}, you have {{count}} left\" }`. A string fills in as is, anything else as its JSON. A placeholder with no port, or a port with no placeholder, is a compile error naming it (a template that arrives on a wire is checked when the node runs). Literal braces are doubled: `{{{{json}}}}` renders as `{{json}}` and needs no port.",
   "tags": [
     "format",
     "template",
@@ -28,6 +28,10 @@
       "description": "The template with every placeholder filled."
     }
   ],
+  "placeholdersAreInputs": {
+    "in": "template",
+    "pattern": "\\{\\{\\{\\{|\\}\\}\\}\\}|\\{\\{\\s*(?<name>[A-Za-z_][A-Za-z0-9_]*)\\s*\\}\\}"
+  },
   "features": {
     "pure": true,
     "canAddInputPorts": true

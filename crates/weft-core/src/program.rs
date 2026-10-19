@@ -88,6 +88,10 @@ pub enum ProgramCall {
     RunsCount { filter: RunFilter },
     /// Revoke instance tokens: every token of `instance`, or the one `id`.
     TokensRevoke { instance: InstanceId, id: Option<uuid::Uuid> },
+    /// Where one node of a run of this project stands ([`NodeState`]),
+    /// read from that run's record. `node` is spelled the way `--from`
+    /// takes it; a node inside a loop is refused, a loop itself is read.
+    NodeState { run: crate::RunId, node: String },
 }
 
 impl ProgramCall {
@@ -125,6 +129,7 @@ impl ProgramCall {
             ProgramCall::RunsList { .. } => "weft.runs.list",
             ProgramCall::RunsCount { .. } => "weft.runs.count",
             ProgramCall::TokensRevoke { .. } => "weft.tokens.revoke",
+            ProgramCall::NodeState { .. } => "weft.runs.node_state",
         }
     }
 }
@@ -357,6 +362,83 @@ pub struct RunFilter {
     /// Runs started at least this many seconds ago.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub older_than_secs: Option<u64>,
+}
+
+crate::wire_enum! {
+    /// Where one node of a run stands ([`NodeState::status`]).
+    // SYNC: NodeStatus <-> catalog/logic/get_node_state/metadata.json (the `state` output's description)
+    pub enum NodeStatus {
+        /// It has not fired in this run (yet).
+        Pending = "pending",
+        Running = "running",
+        /// It is waiting on a signal (`ctx.await_signal`): an outside job,
+        /// a person, a timer.
+        Waiting = "waiting",
+        Completed = "completed",
+        Failed = "failed",
+        Skipped = "skipped",
+        /// The run was cancelled while it had not finished.
+        Cancelled = "cancelled",
+    }
+}
+
+/// Where one node of a run stands, as `ProgramCall::NodeState` answers
+/// it, read from the run's record, so it stays readable for as long as
+/// the run is kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "NodeStateWire", into = "NodeStateWire")]
+pub struct NodeState {
+    pub status: NodeStatus,
+    /// While it waits: what its wait kept of the last answer it saw (a
+    /// poll of an outside job's status); `None` before the first one, and
+    /// for a wait whose kind has no answer to keep. On the wire as `live`
+    /// (the raw answer, unparsed) or `liveTooLarge` (its size in bytes,
+    /// past what a wait keeps), never both.
+    pub live: Option<crate::signal::listener_protocol::LastAnswer>,
+    /// When it failed: the error, as raw text.
+    pub error: Option<String>,
+}
+
+/// [`NodeState`] as the program reads it: `live` and `liveTooLarge` are
+/// two keys of one answer, so a shape holding both, or either of the
+/// wrong type, is refused rather than read as no answer.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NodeStateWire {
+    status: NodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_too_large: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl TryFrom<NodeStateWire> for NodeState {
+    type Error = String;
+
+    fn try_from(wire: NodeStateWire) -> Result<Self, String> {
+        use crate::signal::listener_protocol::LastAnswer;
+        let live = match (wire.live, wire.live_too_large) {
+            (Some(text), None) => Some(LastAnswer::Kept(text)),
+            (None, Some(bytes)) => Some(LastAnswer::TooLarge(bytes)),
+            (None, None) => None,
+            (Some(_), Some(_)) => return Err("a node's state holds both `live` and `liveTooLarge`".into()),
+        };
+        Ok(Self { status: wire.status, live, error: wire.error })
+    }
+}
+
+impl From<NodeState> for NodeStateWire {
+    fn from(state: NodeState) -> Self {
+        use crate::signal::listener_protocol::LastAnswer;
+        let (live, live_too_large) = match state.live {
+            Some(LastAnswer::Kept(text)) => (Some(text), None),
+            Some(LastAnswer::TooLarge(bytes)) => (None, Some(bytes)),
+            None => (None, None),
+        };
+        Self { status: state.status, live, live_too_large, error: state.error }
+    }
 }
 
 /// The most runs one listing answers (`ctx.runs().list(..)`, the
@@ -613,6 +695,39 @@ mod tests {
     use crate::running_policy::DeactivationMode;
 
     crate::wire_enum_roundtrip_tests!(RunStatus);
+    crate::wire_enum_roundtrip_tests!(NodeStatus);
+    use crate::signal::listener_protocol::LastAnswer;
+
+    /// A node's state reaches the program in the shape `GetNodeState`
+    /// hands on: its status word, and the raw answer or error only when
+    /// there is one.
+    #[test]
+    fn a_node_state_reaches_the_program_in_its_wire_shape() {
+        let waiting = NodeState { status: NodeStatus::Waiting, live: Some(LastAnswer::Kept("{\"status\":\"IN_QUEUE\"}".into())), error: None };
+        assert_eq!(
+            serde_json::to_value(&waiting).unwrap(),
+            serde_json::json!({ "status": "waiting", "live": "{\"status\":\"IN_QUEUE\"}" })
+        );
+        let large = NodeState { status: NodeStatus::Waiting, live: Some(LastAnswer::TooLarge(70_000)), error: None };
+        let wire = serde_json::to_value(&large).unwrap();
+        assert_eq!(wire, serde_json::json!({ "status": "waiting", "liveTooLarge": 70_000 }));
+        assert_eq!(serde_json::from_value::<NodeState>(wire).unwrap(), large);
+        for refused in [
+            serde_json::json!({ "status": "waiting", "live": "a", "liveTooLarge": 3 }),
+            serde_json::json!({ "status": "waiting", "live": 5 }),
+            serde_json::json!({ "status": "waiting", "liveTooLarge": "x" }),
+        ] {
+            assert!(serde_json::from_value::<NodeState>(refused.clone()).is_err(), "{refused}");
+        }
+        let failed = NodeState { status: NodeStatus::Failed, live: None, error: Some("boom".into()) };
+        let wire = serde_json::to_value(&failed).unwrap();
+        assert_eq!(wire, serde_json::json!({ "status": "failed", "error": "boom" }));
+        assert_eq!(serde_json::from_value::<NodeState>(wire).unwrap(), failed);
+        let call = ProgramCall::NodeState { run: crate::RunId::from_u128(4), node: "one.render".into() };
+        let wire = serde_json::to_value(&call).unwrap();
+        assert_eq!(wire["call"], "node_state");
+        assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), call);
+    }
 
     #[test]
     fn running_reaches_a_run_parked_on_a_wait_and_waiting_only_that() {

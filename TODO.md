@@ -297,13 +297,13 @@ Not now: it is a real piece of infrastructure, not an afternoon.
 
 ## Type rules in metadata: an output typed from the node's other ports
 
-Two nodes want an output whose type the metadata cannot write down as a
-single type, and today each fakes it: `FirstInOrder` emits whichever
-branch survived, so its output is really the UNION of what its created
-inputs carry, and `LlmInference.response` is a `String` without
-`parseJson` and a record or `JsonDict` with it. Both are `MustOverride`
-or a type variable now, and the author restates the type in the
-signature every time.
+A node can want an output whose type the metadata cannot write down as
+a single type: `FirstInOrder` emits whichever branch survived, so its
+output is really the UNION of what its created inputs carry. It uses a
+type variable shared by every created input now, so two branches of
+different types need the type declared on the node. (`LlmInference`
+was the other case; it is two nodes now, `LlmInference` answering text
+and `LlmInferenceJson` with a narrowable `response`.)
 
 The feature is a small rule language in `metadata.json` (an output typed
 as "the union of these inputs", "this type when that input is true"),

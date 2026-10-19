@@ -77,7 +77,7 @@ pub fn fill_picks(node: &NodeDefinition, literals: &mut serde_json::Map<String, 
 
 /// Every place of a node with a field picked on the install, spelled.
 pub fn picked_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
-    crate::project::selection::every_place(project)
+    crate::project::places::every_place(project)
         .into_iter()
         .filter_map(|place| {
             let node = project.nodes.iter().find(|n| n.id == place.id)?;
@@ -105,19 +105,17 @@ fn optional(node: &NodeDefinition, field: &str) -> bool {
     )
 }
 
-/// What a run over `selection` carries of the install's `stored` picks:
-/// the ones at its places, or the refusal naming every required
-/// connection nobody picked on this install, with the command that
-/// picks it.
-pub fn run_picks(
-    project: &ProjectDefinition,
-    selection: &crate::project::selection::RunSelection,
-    stored: &Picks,
-) -> Result<Picks, Refusal> {
+/// What a run of `program` (the program it runs: a cut, or the whole
+/// one) carries of the install's `stored` picks: the ones at its places,
+/// or the refusal naming every required connection nobody picked on this
+/// install, with the command that picks it.
+pub fn run_picks(program: &ProjectDefinition, stored: &Picks) -> Result<Picks, Refusal> {
+    let project = program;
     let mut picks = Picks::new();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut seen = BTreeSet::new();
-    for place in &selection.nodes {
+    // Only what runs opens a connection: a stand-in never does.
+    for place in &crate::project::places::running_places(program) {
         let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else { continue };
         if picked_fields(node).next().is_none() {
             continue;
@@ -193,7 +191,7 @@ pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) ->
     let known: BTreeMap<String, &NodeDefinition> = project
         .into_iter()
         .flat_map(|project| {
-            crate::project::selection::every_place(project).into_iter().filter_map(move |place| {
+            crate::project::places::every_place(project).into_iter().filter_map(move |place| {
                 let node = project.nodes.iter().find(|n| n.id == place.id)?;
                 Some((crate::project::address_of(project, &place.id, &place.path), node))
             })
@@ -270,7 +268,7 @@ impl Stranded {
 
 /// Every place of `project`, spelled, with its node.
 fn places_of(project: &ProjectDefinition) -> BTreeMap<String, &NodeDefinition> {
-    crate::project::selection::every_place(project)
+    crate::project::places::every_place(project)
         .into_iter()
         .filter_map(|place| {
             let node = project.nodes.iter().find(|n| n.id == place.id)?;
@@ -334,7 +332,7 @@ pub fn stranded(project: &ProjectDefinition, stored: &[StoredField]) -> Vec<Stra
 /// and nothing is stored under a place the program moved away from. The
 /// refusal names every gap, each with its fix.
 pub fn activation_picks(project: &ProjectDefinition, picks: &Picks, stored: &[StoredField]) -> Result<(), Refusal> {
-    let mut refusal = match run_picks(project, &crate::project::selection::RunSelection::whole(project), picks) {
+    let mut refusal = match run_picks(project, picks) {
         Ok(_) => Refusal { errors: Vec::new() },
         Err(refusal) => refusal,
     };
@@ -435,11 +433,10 @@ mod tests {
     #[test]
     fn a_run_carries_its_picks_and_is_refused_a_required_one_missing() {
         let p = project(vec![access_node("slack", false), access_node("maybe", true)]);
-        let all = crate::project::selection::RunSelection::whole(&p);
         let handle = json!({ "id": uuid::Uuid::nil(), "identity": "me" });
         let stored: Picks = BTreeMap::from([("slack".into(), BTreeMap::from([("access".into(), handle.clone())]))]);
-        assert_eq!(run_picks(&p, &all, &stored).unwrap()["slack"]["access"], handle);
-        let refused = run_picks(&p, &all, &Picks::new()).unwrap_err();
+        assert_eq!(run_picks(&p, &stored).unwrap()["slack"]["access"], handle);
+        let refused = run_picks(&p, &Picks::new()).unwrap_err();
         assert_eq!(refused.errors.len(), 1, "the optional one is not required: {refused:?}");
         assert!(refused.errors[0].contains("weft connect --node slack"), "{refused:?}");
     }

@@ -1,14 +1,20 @@
 //! GoogleSheetsLookup: find the rows where a column holds a value.
 //! The read-side workhorse: resolve an order id to its row, check
 //! whether an email is already logged, fetch a record by key.
+//!
+//! The matches come out a page at a time, like GoogleSheetsRead's rows:
+//! from `offset` matches in, at most `maxRows`, and only as many as the
+//! 100 KB a wire carries.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
+use weft::storage::wire_page;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::sheets::{read_cells, row_object, tab_title};
+use super::api::page_size;
+use super::sheets::{heavy_row, read_cells, row_object, tab_title};
 
 #[derive(NodeManifest)]
 pub struct GoogleSheetsLookupNode;
@@ -29,6 +35,8 @@ impl Node for GoogleSheetsLookupNode {
         let gid: Option<String> = ctx.inputs.opt("tab")?;
         let column: String = ctx.inputs.get("column")?;
         let value: String = ctx.inputs.get("value")?;
+        let offset = ctx.inputs.get::<f64>("offset")? as usize;
+        let max_rows = page_size(&ctx.inputs, "maxRows")?;
 
         let http = ctx.client(&account).await?;
         let title = tab_title(&http, &id, gid.as_deref()).await?;
@@ -53,11 +61,15 @@ impl Node for GoogleSheetsLookupNode {
         }
 
         let found = !rows.is_empty();
+        let page = wire_page(&rows, offset, max_rows).map_err(|i| heavy_row(&rows[i], &row_numbers[i]))?;
+        let next = page.end;
         ctx.pulse_downstream(
             NodeOutput::new()
-                .set("rows", json!(rows))
-                .set("rowNumbers", json!(row_numbers))
-                .set("found", found),
+                .set("rows", json!(rows[page.clone()]))
+                .set("rowNumbers", json!(row_numbers[page]))
+                .set("found", found)
+                .set("nextOffset", next as f64)
+                .set("hasMore", next < rows.len()),
         )
         .await
     }

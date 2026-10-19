@@ -37,7 +37,7 @@ fn worker(replica: &str) -> DoorWorker<'_> {
 /// A run driven by `owner`: queued, then claimed by it.
 async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
     let run_id = weft_core::new_run_id();
-    let birth = RunEvent::RunStarted {
+    let birth = RunEvent::RunStarted { given: Default::default(),
         run_id,
         project_id: PROJECT,
         entry_node: "route".into(),
@@ -46,7 +46,7 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
         binary_hash: Some("bin-1".into()),
         source_version: None,
         run_kind: weft_core::run::RunKind::Project,
-        selection: None,
+        cut_from: None,
         seed: None,
         instance: None,
         stand_in: None,
@@ -65,6 +65,7 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
         stale: &[],
         spec: None,
         example: None,
+        program: None,
     };
     assert!(journal.queue_run(queued, false).await.expect("queue the run"));
     let mut conn = pool.acquire().await.unwrap();
@@ -104,6 +105,36 @@ async fn a_run_parked_waits_with_no_owner(pool: PgPool) {
     let run_id = driven_by(&pool, "w1").await;
     assert!(let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap());
     assert_eq!(standing(&pool, run_id).await, ("parked".into(), None));
+}
+
+/// A run that parks is announced to every dispatcher, for whoever follows
+/// it (`weft wait --waiting-for-input`); a run handed back is not parked,
+/// nor one that parks with an answer already handed to it (it is queued
+/// to carry on at once), and neither says anything of the kind.
+#[sqlx::test]
+async fn a_run_that_parks_is_announced(pool: PgPool) {
+    schema(&pool).await;
+    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    heard.listen(weft_task_store::runs::EVENTS_CHANNEL).await.unwrap();
+    let handed = driven_by(&pool, "w1").await;
+    assert!(let_go(&pool, worker("w1"), handed, LetGo::HandedBack).await.unwrap());
+    let answered = driven_by(&pool, "w1").await;
+    let mut tx = pool.begin().await.unwrap();
+    weft_task_store::parked_fires::hand_answer_in(&mut tx, "form", answered, &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") })
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(let_go(&pool, worker("w1"), answered, LetGo::Parked).await.unwrap());
+    assert_eq!(standing(&pool, answered).await, ("queued".into(), None), "it carries on with its answer");
+    let parked = driven_by(&pool, "w1").await;
+    assert!(let_go(&pool, worker("w1"), parked, LetGo::Parked).await.unwrap());
+    let told = tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv()).await.expect("announced").unwrap();
+    let event: weft_core::live_event::LiveEvent = serde_json::from_str(told.payload()).unwrap();
+    assert!(
+        matches!(event.event, weft_core::live_event::DispatcherEvent::RunParked { run_id, project_id } if run_id == parked && project_id == PROJECT),
+        "{event:?}"
+    );
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(300), heard.recv()).await.is_err(), "one announcement, the park's");
 }
 
 /// A run that ended is nobody's to let go of.

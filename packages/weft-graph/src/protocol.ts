@@ -74,6 +74,11 @@ export const ALL_PRIMITIVE_TYPES: WeftPrimitive[] = [
   'Image', 'Video', 'Audio', 'Blob', 'Empty',
 ];
 
+/** The type names that are not primitives but still mean something to
+ *  the type language: no declared type may take one. */
+// SYNC: CONTAINER_AND_SPECIAL_TYPES <-> crates/weft-core/src/weft_type.rs CONTAINER_AND_SPECIAL_TYPES
+const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'Infra', 'Generator'];
+
 // SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::UNION_ALIASES
 /** Named union aliases. The ONE table both name resolution (parse) and
  *  rendering read, so an alias round-trips to its NAME instead of
@@ -101,7 +106,10 @@ export const FILE_PRIMITIVES: WeftPrimitive[] = (() => {
 export type WeftType =
   | { kind: 'primitive'; value: WeftPrimitive }
   | { kind: 'list'; inner: WeftType }
-  | { kind: 'dict'; key: WeftType; value: WeftType }
+  // `Dict[String, V]`, holding only the value type: a dict's keys are
+  // always text, so the key is not part of the type (the spelling keeps
+  // it, and the parser refuses any other key).
+  | { kind: 'dict'; value: WeftType }
   | { kind: 'json_dict' }
   // A message-bus handle: an in-process channel between co-alive nodes.
   // A Bus output connects only to a Bus input; the payloads are not
@@ -123,21 +131,33 @@ export type WeftType =
   | { kind: 'generator'; inner: WeftType }
   | { kind: 'union'; types: WeftType[] }
   // Dict with KNOWN field names: `{ role: String, name?: String }`.
+  // `open` (written `..` as the last item, `{ role: String, .. }`) takes
+  // keys it does not declare; a closed record refuses them.
   // SYNC: record/named <-> crates/weft-core/src/weft_type.rs WeftType::Record/Named
-  | { kind: 'record'; fields: { name: string; ty: WeftType; optional: boolean }[] }
+  | { kind: 'record'; fields: RecordField[]; open: boolean }
   // A user-declared NOMINAL type: compatibility is by name. The backend
   // serializes it self-contained (`Name=Body`), so the parser here never
   // needs a registry; display renders the bare name.
   | { kind: 'named'; name: string; body: WeftType }
-  | { kind: 'typevar'; name: string }
-  | { kind: 'must_override' };
+  // A port written with no type (`(x)`), or with one that does not
+  // parse, holds its own variable `T__in__x` (`T__out__x` on an output):
+  // what is wired decides it.
+  | { kind: 'typevar'; name: string };
+
+/** One declared field of a record type. */
+export interface RecordField {
+  name: string;
+  ty: WeftType;
+  optional: boolean;
+}
 
 /** Type variable names users can write: T, T1, T2, ... T99.
  *
  *  Also accepted (catalog-internal only, not user-facing):
  *    - `T_Auto`: sentinel used by form-field port specs to request a
- *      per-port-instance TypeVar. Replaced with `T__{key}` at enrichment time.
- *    - `T__scope` (e.g. `T__hook`): materialized form of a `T_Auto` marker.
+ *      per-port-instance TypeVar. Replaced with `T__in__{key}` at enrichment time.
+ *    - `T__scope` (e.g. `T__in__hook`): materialized form of a `T_Auto` marker,
+ *      and the type of a header port written with no type (`portVar`).
  *      Must parse because port types round-trip through strings in the frontend.
  *
  *  These internal forms exist so catalog authors can express "this port
@@ -155,6 +175,16 @@ function isTypeVarName(s: string): boolean {
     return scope.length > 0 && /^[A-Za-z0-9_]+$/.test(scope);
   }
   return false;
+}
+
+/** The type variable of one port and no other: the type of a header
+ *  port written with no type (`(photo)`), and of an input a key or a
+ *  wire creates, taken from what is wired to it. An input's is
+ *  `T__in__photo`, an output's `T__out__photo`: the side leads, so no
+ *  two ports share one whatever their names. */
+// SYNC: portVar <-> crates/weft-core/src/weft_type.rs WeftType::port_var
+export function portVar(side: 'input' | 'output', port: string): string {
+  return side === 'input' ? `T__in__${port}` : `T__out__${port}`;
 }
 
 /** Split string on delimiter, but only at top level (not inside [] or {}) */
@@ -175,6 +205,24 @@ function splitTopLevel(s: string, delimiter: string): string[] {
 }
 
 /** Index of the first top-level (outside []/{}) occurrence of `delimiter`. */
+/** Whether the bracket opening `s` is the one its last character
+ *  closes (`(A | B)` yes, `(A) | (B)`, `(A)(B)` and a mismatched `(A]`
+ *  no). */
+// SYNC: openingBracketClosesLast <-> crates/weft-core/src/weft_type.rs opening_bracket_closes_last
+function openingBracketClosesLast(s: string): boolean {
+  const pairs: Record<string, string> = { ']': '[', '}': '{', ')': '(' };
+  const open: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '[' || c === '{' || c === '(') open.push(c);
+    else if (c in pairs) {
+      if (open.pop() !== pairs[c]) return false;
+      if (open.length === 0) return i === s.length - 1;
+    }
+  }
+  return false;
+}
+
 function findTopLevel(s: string, delimiter: string): number {
   let depth = 0;
   for (let i = 0; i < s.length; i++) {
@@ -193,7 +241,7 @@ function anyLeaf(t: WeftType, leaf: (kind: WeftType['kind']) => boolean): boolea
     case 'generator':
       return anyLeaf(t.inner, leaf);
     case 'dict':
-      return anyLeaf(t.key, leaf) || anyLeaf(t.value, leaf);
+      return anyLeaf(t.value, leaf);
     case 'union':
       return t.types.some(u => anyLeaf(u, leaf));
     case 'record':
@@ -205,31 +253,59 @@ function anyLeaf(t: WeftType, leaf: (kind: WeftType['kind']) => boolean): boolea
   }
 }
 
-/** Any unresolved leaf (`typevar`, `must_override`) anywhere in the type. */
+/** Whether a type still holds a type variable anywhere (`T`,
+ *  `List[T]`, `Dict[String, T]`, a header port's own `T__in__x`), meaning
+ *  inference resolves it per instance and its spelling is not what a
+ *  reparse renders. */
 // SYNC: containsUnresolvedLeaf <-> crates/weft-core/src/weft_type.rs contains_unresolved_leaf
-function containsUnresolvedLeaf(t: WeftType): boolean {
-  return anyLeaf(t, kind => kind === 'typevar' || kind === 'must_override');
-}
-
-/** Whether a type still holds a TYPEVAR anywhere (`T`, `List[T]`,
- *  `Dict[String, T]`), meaning inference resolves it per instance and
- *  its spelling is not what a reparse renders. Deliberately EXCLUDES
- *  `must_override`, unlike `containsUnresolvedLeaf`: a wired
- *  MustOverride port is an error, never resolved, so its rendered type
- *  stays MustOverride and the spelling is honest. */
-export function containsTypevar(t: WeftType): boolean {
+export function containsUnresolvedLeaf(t: WeftType): boolean {
   return anyLeaf(t, kind => kind === 'typevar');
 }
 
-function parseSingleType(s: string): WeftType | null {
+/** A type string that is not a type, carrying why (the backend's
+ *  `try_parse` message). Thrown inside the parser only; the exported
+ *  entry points turn it into a result or a null. */
+class TypeParseError extends Error {}
+
+function refuse(message: string): never {
+  throw new TypeParseError(message);
+}
+
+/** Why `name` cannot name a declared type, or null when it can: an
+ *  identifier starting with an uppercase letter that is not something
+ *  the type language already means. */
+// SYNC: declarableNameProblem <-> crates/weft-core/src/weft_type.rs TypeRegistry::check_declarable_name
+function declarableNameProblem(name: string): string | null {
+  if (!/^[A-Z][A-Za-z0-9_]*$/.test(name)) {
+    return 'a type name starts with an uppercase letter and contains only letters, digits, and underscores';
+  }
+  const reserved = (ALL_PRIMITIVE_TYPES as string[]).includes(name)
+    || CONTAINER_AND_SPECIAL_TYPES.includes(name)
+    || NAMED_UNIONS.has(name)
+    || isTypeVarName(name);
+  return reserved ? `\`${name}\` is reserved by the type language` : null;
+}
+
+/** The declarable names one `tryParseWeftType` call met and could not
+ *  resolve, in the order it met them. The editor holds no registry of
+ *  the project's declared types, so such a name parses as a stand-in
+ *  and the parse goes on: a definite refusal later in the string is
+ *  still the one reported, and only a string whose every refusal is
+ *  such a name is left to the compiler. Set for the length of one
+ *  parse (the parser is synchronous and never re-entered). */
+let unresolvedNames: string[] = [];
+
+// SYNC: parseSingleType <-> crates/weft-core/src/weft_type.rs parse_single_type
+function parseSingleType(s: string): WeftType {
   s = s.trim();
+  if (!s) refuse('an empty type');
   // Parenthesized group: `(A | B)` is the type inside. Exists so a
   // named type's union body has an unambiguous wire form
   // (`Kind=(A | B)` vs the union `Kind=A | B`). Only strip when the
-  // opening paren closes at the very end.
+  // opening paren closes at the very end: `(A)(B)` is not one group.
   // SYNC: paren group <-> crates/weft-core/src/weft_type.rs parse_single_type
-  if (s.startsWith('(') && s.endsWith(')') && findTopLevel(s.slice(1, -1), ')') === -1) {
-    return parseWeftType(s.slice(1, -1));
+  if (s.startsWith('(') && openingBracketClosesLast(s)) {
+    return parseTypeOrThrow(s.slice(1, -1));
   }
   // Named union aliases (Media, File) resolve through the one table,
   // never a per-name branch.
@@ -245,75 +321,81 @@ function parseSingleType(s: string): WeftType | null {
   const eq = findTopLevel(s, '=');
   if (eq !== -1) {
     const name = s.slice(0, eq).trim();
-    // Same rule as the backend's check_declarable_name: an
-    // uppercase-starting identifier that is not something the type
-    // language already means (a primitive, a container keyword, a
-    // special type, an alias, a TypeVar shape).
-    // SYNC: named-name rule <-> crates/weft-core/src/weft_type.rs TypeRegistry::check_declarable_name
-    if (!/^[A-Z][A-Za-z0-9_]*$/.test(name)) return null;
-    if (
-      (ALL_PRIMITIVE_TYPES as string[]).includes(name)
-      || ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'Infra', 'Generator', 'MustOverride'].includes(name)
-      || NAMED_UNIONS.has(name)
-      || isTypeVarName(name)
-    ) return null;
-    const body = parseWeftType(s.slice(eq + 1));
+    const why = declarableNameProblem(name);
+    if (why !== null) refuse(`\`${s}\`: \`${name}\` is not a type name: ${why}`);
+    const body = parseTypeOrThrow(s.slice(eq + 1));
     // A declared body must be CONCRETE, mirroring the backend's
     // wire-parser gate: a type variable under an alias would let
     // two same-named types carry different bodies, which name-only
     // nominal compatibility must never see.
     // SYNC: named-body concreteness <-> crates/weft-core/src/weft_type.rs parse_single_type (Name=Body arm)
-    if (!body || containsUnresolvedLeaf(body)) return null;
+    if (containsUnresolvedLeaf(body)) {
+      refuse(`\`${name}\` is a declared type, so its body cannot hold a type variable`);
+    }
     return { kind: 'named', name, body };
   }
-  // Record: `{ field: Type, field?: Type }` (at least one field).
+  // Record: `{ field: Type, field?: Type }`, closed, or with `..` as its
+  // last item, open. At least one field (neither `{}` nor `{ .. }` is a
+  // type: `JsonDict` is "some object").
   if (s.startsWith('{') && s.endsWith('}')) {
     const inner = s.slice(1, -1);
-    const fields: { name: string; ty: WeftType; optional: boolean }[] = [];
-    for (const part of splitTopLevel(inner, ',')) {
+    const noField = `\`${s}\` declares no field; \`JsonDict\` is the type for any object`;
+    if (!inner.trim()) refuse(noField);
+    const fields: RecordField[] = [];
+    let open = false;
+    const parts = splitTopLevel(inner, ',');
+    parts.forEach((part, i) => {
       const p = part.trim();
-      if (!p) return null;
+      if (p === '..') {
+        if (i !== parts.length - 1) refuse(`\`${s}\`: \`..\` opens a record, so it comes last`);
+        open = true;
+        return;
+      }
+      if (!p) refuse(`\`${s}\`: an empty field`);
       const colon = findTopLevel(p, ':');
-      if (colon === -1) return null;
+      if (colon === -1) refuse(`\`${s}\`: the field \`${p}\` has no type (\`name: Type\`)`);
       let name = p.slice(0, colon).trim();
       const optional = name.endsWith('?');
       if (optional) name = name.slice(0, -1).trimEnd();
-      if (!/^[A-Za-z0-9_]+$/.test(name) || fields.some(f => f.name === name)) return null;
-      const ty = parseWeftType(p.slice(colon + 1));
-      if (!ty) return null;
-      fields.push({ name, ty, optional });
-    }
-    return fields.length > 0 ? { kind: 'record', fields } : null;
+      if (!/^[A-Za-z0-9_]+$/.test(name)) refuse(`\`${s}\`: \`${name}\` is not a field name`);
+      if (fields.some(f => f.name === name)) refuse(`\`${s}\`: the field \`${name}\` is declared twice`);
+      fields.push({ name, ty: parseTypeOrThrow(p.slice(colon + 1)), optional });
+    });
+    if (fields.length === 0) refuse(noField);
+    return { kind: 'record', fields, open };
   }
   if (s === 'JsonDict') return { kind: 'json_dict' };
   if (s === 'Bus') return { kind: 'bus' };
   if (s === 'Access') return { kind: 'access' };
   if (s === 'Infra') return { kind: 'infra' };
-  if (s === 'MustOverride') return { kind: 'must_override' };
 
-  // Parameterized: List[...], Dict[...]
+  // Parameterized: List[T], Generator[T], Dict[String, V]
   const bracketPos = s.indexOf('[');
   if (bracketPos !== -1) {
-    if (!s.endsWith(']')) return null;
+    if (!s.endsWith(']')) refuse(`\`${s}\` opens a \`[\` it never closes at its end`);
     const name = s.slice(0, bracketPos).trim();
     const inner = s.slice(bracketPos + 1, -1);
 
-    if (name === 'List') {
-      const innerType = parseWeftType(inner);
-      return innerType ? { kind: 'list', inner: innerType } : null;
-    }
-    if (name === 'Generator') {
-      const innerType = parseWeftType(inner);
-      return innerType ? { kind: 'generator', inner: innerType } : null;
-    }
+    if (name === 'List') return { kind: 'list', inner: parseTypeOrThrow(inner) };
+    if (name === 'Generator') return { kind: 'generator', inner: parseTypeOrThrow(inner) };
     if (name === 'Dict') {
       const parts = splitTopLevel(inner, ',');
-      if (parts.length !== 2) return null;
-      const key = parseWeftType(parts[0].trim());
-      const val = parseWeftType(parts[1].trim());
-      return key && val ? { kind: 'dict', key, value: val } : null;
+      if (parts.length !== 2) refuse(`\`${s}\`: a dict takes two types, \`Dict[String, V]\``);
+      const key = parseTypeOrThrow(parts[0].trim());
+      const value = parseTypeOrThrow(parts[1].trim());
+      // A JSON object's keys are text, so no value has any other key
+      // type: `Dict[Number, String]` would compile and then match nothing.
+      // SYNC: dict-key rule <-> crates/weft-core/src/weft_type.rs parse_single_type (Dict arm)
+      if (!weftTypesEqual(key, { kind: 'primitive', value: 'String' })) {
+        const k = weftTypeToString(key);
+        refuse(
+          `\`${s}\`: a dict's keys are always text, so its key type is \`String\`. `
+          + `To key by a ${k}, use \`List[{key: ${k}, value: ${weftTypeToString(value)}}]\``,
+        );
+      }
+      return { kind: 'dict', value };
     }
-    return null;
+    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator and Dict`);
   }
 
   // Primitive
@@ -326,46 +408,80 @@ function parseSingleType(s: string): WeftType | null {
     return { kind: 'typevar', name: s };
   }
 
-  return null;
+  // A user-declared type name lands here too: the editor holds no
+  // registry, so it cannot tell `Verdict` from a typo. A name no
+  // project can declare is refused outright; a declarable one stands in
+  // as a named type until the parse ends (see `unresolvedNames`).
+  if (declarableNameProblem(s) !== null) refuse(`\`${s}\` is not a type`);
+  unresolvedNames.push(s);
+  return { kind: 'named', name: s, body: { kind: 'primitive', value: 'Empty' } };
 }
 
-/** Parse a port type string into a structured representation. */
-// SYNC: parseWeftType <-> crates/weft-core/src/weft_type.rs WeftType::parse
-export function parseWeftType(s: string): WeftType | null {
+/** The union of `types`, normalized like the backend's union builder:
+ *  nested unions flattened, members deduped by structural equality,
+ *  `Empty` dropped whenever another member remains (`Number | Empty` IS
+ *  `Number`; the bottom type adds nothing), a single survivor collapsed. */
+// SYNC: unionOf <-> crates/weft-core/src/weft_type.rs WeftType::union
+export function unionOf(types: WeftType[]): WeftType {
+  const flat: WeftType[] = [];
+  for (const t of types) {
+    if (t.kind === 'union') flat.push(...t.types);
+    else flat.push(t);
+  }
+  const deduped: WeftType[] = [];
+  for (const t of flat) {
+    if (!deduped.some(u => weftTypesEqual(u, t))) deduped.push(t);
+  }
+  const nonEmpty = deduped.length > 1
+    ? deduped.filter(t => !(t.kind === 'primitive' && t.value === 'Empty'))
+    : deduped;
+  return nonEmpty.length === 1 ? nonEmpty[0] : { kind: 'union', types: nonEmpty };
+}
+
+function parseTypeOrThrow(s: string): WeftType {
   const trimmed = s.trim();
-  if (!trimmed) return null;
+  if (!trimmed) refuse('an empty type');
 
   // Split on top-level | for unions
   const parts = splitTopLevel(trimmed, '|');
   if (parts.length > 1) {
-    const types: WeftType[] = [];
-    for (const part of parts) {
-      const parsed = parseSingleType(part.trim());
-      if (!parsed) return null;
-      types.push(parsed);
-    }
-    // Flatten nested unions, then normalize like the backend's
-    // union builder: dedup by structural equality, drop `Empty`
-    // whenever another member remains (`Number | Empty` IS
-    // `Number`; the bottom type adds nothing), collapse a single
-    // survivor.
-    // SYNC: union normalization <-> crates/weft-core/src/weft_type.rs WeftType::union
-    const flat: WeftType[] = [];
-    for (const t of types) {
-      if (t.kind === 'union') flat.push(...t.types);
-      else flat.push(t);
-    }
-    const deduped: WeftType[] = [];
-    for (const t of flat) {
-      if (!deduped.some(u => weftTypesEqual(u, t))) deduped.push(t);
-    }
-    const nonEmpty = deduped.length > 1
-      ? deduped.filter(t => !(t.kind === 'primitive' && t.value === 'Empty'))
-      : deduped;
-    return nonEmpty.length === 1 ? nonEmpty[0] : { kind: 'union', types: nonEmpty };
+    return unionOf(parts.map(part => parseSingleType(part.trim())));
   }
 
   return parseSingleType(trimmed);
+}
+
+/** Parse a port type string, or say why it is not one (the backend's
+ *  message, so the editor shows what the compiler would). `unknownName`
+ *  marks a refusal whose only cause is names this parser does not know
+ *  but a project could declare (the editor holds no registry): the
+ *  compiler is the one to settle it. Any other refusal in the string
+ *  wins over such a name, whichever comes first. */
+// SYNC: tryParseWeftType <-> crates/weft-core/src/weft_type.rs WeftType::try_parse
+export function tryParseWeftType(
+  s: string,
+): { ok: true; type: WeftType } | { ok: false; error: string; unknownName: boolean } {
+  unresolvedNames = [];
+  try {
+    const type = parseTypeOrThrow(s);
+    if (unresolvedNames.length > 0) {
+      return { ok: false, error: `\`${unresolvedNames[0]}\` is not a type`, unknownName: true };
+    }
+    return { ok: true, type };
+  } catch (e) {
+    if (e instanceof TypeParseError) return { ok: false, error: e.message, unknownName: false };
+    throw e;
+  } finally {
+    unresolvedNames = [];
+  }
+}
+
+/** Parse a port type string into a structured representation, null
+ *  when it is not a type (`tryParseWeftType` says why). */
+// SYNC: parseWeftType <-> crates/weft-core/src/weft_type.rs WeftType::parse
+export function parseWeftType(s: string): WeftType | null {
+  const parsed = tryParseWeftType(s);
+  return parsed.ok ? parsed.type : null;
 }
 
 
@@ -386,12 +502,12 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
     case 'list':
       return b.kind === 'list' && weftTypesEqual(a.inner, b.inner);
     case 'dict':
-      return b.kind === 'dict' && weftTypesEqual(a.key, b.key) && weftTypesEqual(a.value, b.value);
+      return b.kind === 'dict' && weftTypesEqual(a.value, b.value);
     case 'union':
       return b.kind === 'union' && a.types.length === b.types.length
         && a.types.every(at => (b as Extract<WeftType, { kind: 'union' }>).types.some(bt => weftTypesEqual(at, bt)));
     case 'record':
-      return b.kind === 'record' && a.fields.length === b.fields.length
+      return b.kind === 'record' && a.open === b.open && a.fields.length === b.fields.length
         && a.fields.every(af => (b as Extract<WeftType, { kind: 'record' }>).fields.some(
           bf => bf.name === af.name && bf.optional === af.optional && weftTypesEqual(af.ty, bf.ty)));
     case 'generator':
@@ -401,8 +517,72 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
     case 'typevar':
       return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
     default:
-      // json_dict / bus / access / infra / must_override carry no payload.
+      // json_dict / bus / access / infra carry no payload.
       return true;
+  }
+}
+
+
+/** The alias NAME of a structural union, if its members are exactly one
+ *  alias's primitive set (order-insensitive). The rendering half of the
+ *  alias round-trip; the type itself stays structural. */
+function unionAliasName(types: WeftType[]): string | null {
+  const prims: WeftPrimitive[] = [];
+  for (const t of types) {
+    if (t.kind !== 'primitive') return null;
+    prims.push(t.value);
+  }
+  for (const [name, members] of NAMED_UNIONS) {
+    if (members.length === prims.length && members.every((m) => prims.includes(m))) {
+      return name;
+    }
+  }
+  return null;
+}
+
+/** The AUTHORED rendering of a parsed type: a named type prints its
+ *  bare name (what humans read/write; edit ops re-resolve it against
+ *  the project registry backend-side), and an alias's member set
+ *  renders under its NAME (`File`/`Media` survive a parse -> string
+ *  round trip), matching the backend. NOT re-parseable frontend-side
+ *  when a named type is present; a string that will be parsed again
+ *  must use `weftTypeToWireString`.
+ *  SYNC: weftTypeToString/weftTypeToWireString <-> crates/weft-core/src/weft_type.rs WeftType::fmt_with, wire_string */
+export function weftTypeToString(t: WeftType): string {
+  return renderType(t, false);
+}
+
+/** The SELF-CONTAINED rendering: a named type prints `Name=Body`, so
+ *  the result re-parses without any registry. Use for every string that
+ *  flows back into `parseWeftType`. */
+export function weftTypeToWireString(t: WeftType): string {
+  return renderType(t, true);
+}
+
+function renderType(t: WeftType, wire: boolean): string {
+  switch (t.kind) {
+    case 'primitive': return t.value;
+    case 'list': return `List[${renderType(t.inner, wire)}]`;
+    case 'dict': return `Dict[String, ${renderType(t.value, wire)}]`;
+    case 'json_dict': return 'JsonDict';
+    case 'bus': return 'Bus';
+    case 'access': return 'Access';
+    case 'infra': return 'Infra';
+    case 'generator': return `Generator[${renderType(t.inner, wire)}]`;
+    case 'union': return unionAliasName(t.types) ?? t.types.map(m => renderType(m, wire)).join(' | ');
+    case 'record': {
+      const fields = t.fields.map(f => `${f.name}${f.optional ? '?' : ''}: ${renderType(f.ty, wire)}`);
+      return `{${[...fields, ...(t.open ? ['..'] : [])].join(', ')}}`;
+    }
+    case 'named': {
+      if (!wire) return t.name;
+      // A union body is parenthesized so the rendered string is
+      // unambiguous: `Kind=(A | B)` is one named type, `Kind=A | B`
+      // re-parses as a union with a named member.
+      const body = renderType(t.body, wire);
+      return t.body.kind === 'union' ? `${t.name}=(${body})` : `${t.name}=${body}`;
+    }
+    case 'typevar': return t.name;
   }
 }
 
@@ -410,13 +590,11 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
 /// Does a ref's declared type make it a stored-file ref (its value is a
 /// stored file, not text content)? Answered structurally over the
 /// parsed type, so composite types (`List[Image]`, `Image | Null`)
-/// count and non-value positions (a dict KEY, a generator element)
-/// do not.
+/// count and a generator element does not.
 /// SYNC: typeReferencesFile <-> crates/weft-core/src/weft_type.rs references_file
 export function typeReferencesFile(type: string): boolean {
   // STRUCTURAL, arm for arm with the Rust match (a token regex could
-  // not say "a dict's KEY doesn't count" or "a generator's element
-  // never counts"). A string that does not parse is not provably a
+  // not say "a generator's element never counts"). A string that does not parse is not provably a
   // file ref, so it answers false, the same conservative answer the
   // Rust side gives every non-file arm.
   const parsed = parseWeftType(type);
@@ -429,8 +607,6 @@ function weftTypeReferencesFile(t: WeftType): boolean {
       return FILE_PRIMITIVES.includes(t.value);
     case 'list':
       return weftTypeReferencesFile(t.inner);
-    // A dict's KEY is an index, never a stored value; only the value
-    // side can make the type file-referencing (mirrors Rust).
     case 'dict':
       return weftTypeReferencesFile(t.value);
     case 'union':
@@ -498,6 +674,12 @@ export interface NodeDefinition {
   inputs: InputDefinition[];
   outputs: PortDefinition[];
   features: NodeFeaturesWire;
+  /// The bounds on this node's type variables: its node type's
+  /// `typeParams` and the ones the program wrote after the type name
+  /// (`ExecPython[T: Media](...)`, or on the group a boundary halves),
+  /// each with what it resolved to once the compiler ran.
+  // SYNC: typeParams <-> crates/weft-core/src/project.rs NodeDefinition.type_params
+  typeParams?: TypeParamWire[];
   requiresInfra?: boolean;
   /// Set on a node that exists once per instance of the program.
   // SYNC: perInstance <-> crates/weft-core/src/project.rs NodeDefinition.per_instance
@@ -525,12 +707,28 @@ export interface NodeDefinition {
   /// project's only trigger (or only infra node) is inside an include.
   // SYNC: includeContents <-> crates/weft-core/src/project.rs NodeDefinition.include_contents
   includeContents?: IncludedContents;
+  /// Set only on a node inside an included file compiled for a build,
+  /// whose types differ per place the file is included at: one entry per
+  /// place. The editor's interface parse never produces it; carried as is.
+  // SYNC: NodeDefinition.placeTypes <-> crates/weft-core/src/project.rs NodeDefinition.place_types
+  placeTypes?: PlaceTypes[];
   /// The file this node was written in; absent = the compiled source.
   /// The editor never edits by span (every EditOp addresses by id/key,
   /// and the Rust engine resolves the decl in the buffer it is editing,
   /// failing loudly on an id it cannot find), so this is not consumed
   /// by the editor; the Problems panel routes diagnostics by it.
   sourceFile?: string;
+}
+
+/// The types one node holds at one place its included file is included
+/// at: `place` names that place, and each port's type and each type
+/// variable's resolution are wire type strings.
+// SYNC: PlaceTypes <-> crates/weft-core/src/project.rs PlaceTypes
+export interface PlaceTypes {
+  place: string[];
+  inputs: Record<string, string>;
+  outputs: Record<string, string>;
+  typeParams: TypeParamWire[];
 }
 
 /// What an opaque `@include` node stands for: the roles its file plays,
@@ -560,6 +758,15 @@ export interface IncludedContents {
   nodeTypes?: string[];
 }
 
+/// One wire, end to end: from the node that makes a value to the node
+/// that reads it, however many group ports it passes (`via`). Either end
+/// can be a group: a wire landing on a group's `_should_flow` /
+/// `_should_not_flow` is its gate; a wire whose source is a group starts
+/// at one of that group's own ports (`via[0]` is its crossing: a literal
+/// or nothing, sent when the group opens); a wire whose target is a group
+/// on any other port stops at that group's own port (the last crossing),
+/// which nobody on the far side reads. The editor draws each leg between
+/// two stops (`host-bridge.ts legsOf`).
 // SYNC: Edge <-> crates/weft-core/src/project.rs Edge
 export interface Edge {
   id: string;
@@ -568,22 +775,44 @@ export interface Edge {
   sourceHandle: string | null;
   targetHandle: string | null;
   /// The keys read off the source value before it lands
-  /// (`w.seconds = x.profile.wpm` carries `["wpm"]`). Absent or empty
-  /// for a plain wire. The graph draws such a wire dotted with the
-  /// path at its target end.
+  /// (`w.seconds = x.profile.wpm` carries `["wpm"]`), every leg's in
+  /// order. Absent for a plain wire. The graph draws such a wire dotted
+  /// with the path at its target end.
   path?: string[];
+  /// The group ports the wire passes, source to target. Absent for a
+  /// wire between two nodes of one scope.
+  via?: Crossing[];
+  /// The last leg's line.
   span?: Span;
   /// The file the span lives in; absent = the compiled source.
   sourceFile?: string;
 }
+
+/// One group port a wire passes. `path`, `span` and `sourceFile` belong
+/// to the leg that ENDS at this port (the line `g.x = a.out` for the leg
+/// into `g.x`).
+// SYNC: Crossing <-> crates/weft-core/src/project.rs Crossing
+export interface Crossing {
+  group: string;
+  port: string;
+  side: CrossingSide;
+  path?: string[];
+  span?: Span;
+  sourceFile?: string;
+}
+
+/// Into a group through one of its inputs, or out through one of its
+/// outputs.
+// SYNC: CrossingSide <-> crates/weft-core/src/project.rs CrossingSide
+export type CrossingSide = 'in' | 'out';
 
 // SYNC: GroupDefinition <-> crates/weft-core/src/project.rs GroupDefinition
 // SYNC: GroupDefinition (kind + loopConfig) <-> crates/weft-core/src/project.rs GroupKind
 export interface GroupDefinition {
   id: string;
   /// `group` or `loop`. The visual editor renders a loop differently
-  /// (distinct color/glyph + carry-port double rendering) even
-  /// though both flatten through the same boundary-pair shape.
+  /// (distinct color/glyph + carry-port double rendering). A loop runs
+  /// through its two boundary nodes; every other kind has none.
   /// On the Rust side `kind` + `loopConfig` are ONE flattened tagged
   /// enum (GroupKind), so a loop always carries its config and a
   /// payload missing `kind` fails Rust deserialization.
@@ -594,6 +823,10 @@ export interface GroupDefinition {
   /// For a `call`: the id of the shared `body` group (the included
   /// file, compiled once) this site calls. Never for the others.
   body?: string;
+  /// For a `call` in a run's cut program: the places under the site that
+  /// run (`locatedKey`s relative to the site); every place when absent.
+  // SYNC: GroupDefinition.runs <-> crates/weft-core/src/project.rs GroupKind::Call.runs
+  runs?: string[];
   /// Always null today: no group-like decl carries a user label in the
   /// language; the editor derives the display name from the id's local
   /// segment. The slot exists so a future label syntax needs no wire
@@ -620,6 +853,19 @@ export interface GroupDefinition {
   /// Where each `portLiterals` entry was written, and in which form, so an
   /// edit rewrites the value where it already lives.
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
+  /// File-backed `portLiterals` entries, keyed by port: the same record a
+  /// node keeps for a `@file` / `@asset` field (`NodeDefinition.fileRefs`).
+  // SYNC: fileRefs <-> crates/weft-core/src/project.rs GroupDefinition.file_refs
+  fileRefs?: Record<string, FileRef>;
+  /// `[T: Media]` written after `Group`: bounds on the type variables its
+  /// ports use (a loop's sit on its two boundary nodes instead).
+  // SYNC: GroupDefinition.typeParams <-> crates/weft-core/src/project.rs GroupDefinition.type_params
+  typeParams?: TypeParamWire[];
+  /// Set only on a group inside an included file compiled for a build,
+  /// whose port types differ per place the file is included at, the way a
+  /// node's do (`NodeDefinition.placeTypes`). Carried as is.
+  // SYNC: GroupDefinition.placeTypes <-> crates/weft-core/src/project.rs GroupDefinition.place_types
+  placeTypes?: PlaceTypes[];
   /// The file the group's spans live in; absent = the compiled source.
   sourceFile?: string;
 }
@@ -632,6 +878,18 @@ export interface ProjectDefinition {
   nodes: NodeDefinition[];
   edges: Edge[];
   groups: GroupDefinition[];
+  /// Where a run of a cut is given what it does not compute (the values
+  /// are the run's own, never the program's). Absent in a program as
+  /// written, which is every program the editor parses.
+  given?: GivenPlaces;
+}
+
+/// See `ProjectDefinition.given`: per place (`locatedKey`), the input
+/// ports handed a value, and the places that stand in for their node.
+// SYNC: GivenPlaces <-> crates/weft-core/src/project.rs GivenPlaces
+export interface GivenPlaces {
+  inputs?: Record<string, string[]>;
+  outputs?: string[];
 }
 
 export type Severity = 'error' | 'warning' | 'info' | 'hint';
@@ -671,9 +929,6 @@ export interface InputSpec {
   name: string;
   type: string;
   required?: boolean;
-  /// Optional while unwired, required once wired; never with `required`.
-  // SYNC: InputSpec.requiredWhenWired <-> crates/weft-core/src/node.rs InputSpec.required_when_wired
-  requiredWhenWired?: boolean;
   // SYNC: InputSpec.accepts <-> crates/weft-core/src/node.rs InputSpec.accepts
   accepts?: Accepts;
   widget?: Widget;
@@ -700,6 +955,44 @@ export interface OutputSpec {
   /// An infra node's output made once when its infra is applied, and
   /// read saved by every fire.
   baked?: boolean;
+  /// The program may declare what this output holds (`-> (response:
+  /// Verdict)` on the call): `true` takes anything that fits in `type`,
+  /// a type string is a wider bound (`type` stays what the port holds
+  /// when nothing is declared). Absent: the output takes no other type
+  /// than its own.
+  // SYNC: OutputSpec.narrowable <-> crates/weft-core/src/node.rs OutputSpec.narrowable
+  narrowable?: true | string;
+}
+
+/// The type a program's declaration on this output must fit in, or null
+/// when the output takes no other type than its own.
+// SYNC: narrowingBound <-> crates/weft-core/src/node.rs OutputSpec::narrowing_bound
+export function narrowingBound(output: Pick<OutputSpec, 'type' | 'narrowable'>): string | null {
+  if (output.narrowable === true) return output.type;
+  if (typeof output.narrowable === 'string') return output.narrowable;
+  return null;
+}
+
+/// Whether a closed value on this input skips the node, given whether a
+/// wire feeds it: always for a required input, never for an optional one
+/// (the program wrote `x?:`), and for one that is neither (the node's
+/// metadata calls it optional and the program wrote nothing) only while
+/// a wire feeds it.
+// SYNC: inputIsRequired <-> crates/weft-core/src/project.rs InputDefinition::is_required
+export function inputIsRequired(input: Pick<InputDefinition, 'required' | 'optional'>, wired: boolean): boolean {
+  return input.required || (wired && !input.optional);
+}
+
+/// One type variable a node or a group bounds: `T` in `Group[T: Media]`,
+/// or a node type's `typeParams` entry. `bound` and `resolved` are wire
+/// type strings; `resolved` is what the compiler worked the variable out
+/// to be from what is connected, absent until then. The bound arrives
+/// with the node's other resolved variables already substituted in.
+// SYNC: TypeParamWire <-> crates/weft-core/src/weft_type.rs TypeParam
+export interface TypeParamWire {
+  name: string;
+  bound: string;
+  resolved?: string;
 }
 
 // SYNC: CatalogEntry/InputSpec/Widget/OutputSpec <-> crates/weft-core/src/node.rs
@@ -736,6 +1029,10 @@ export interface CatalogEntry {
    *  is the app's credentials. Empty in the shipped catalog. */
   // SYNC: accessApps <-> crates/weft-core/src/node.rs NodeMetadata.access_apps
   accessApps?: Record<string, AppRegistration>;
+  /** The bound on each type variable the node's ports use, keyed by
+   *  the variable (`{ "T": "Media" }`): what the variable may resolve to. */
+  // SYNC: CatalogEntry.typeParams <-> crates/weft-core/src/node.rs NodeMetadata.type_params
+  typeParams?: Record<string, string>;
 }
 
 // The connection vocabulary (recipes, connections, doors) lives in the
@@ -859,6 +1156,7 @@ export type SkipReason =
   | { kind: 'did_flow' }
   | { kind: 'watched_node_failed'; failure: Failure }
   | { kind: 'required_input_closed'; port: string; failure?: Failure }
+  | { kind: 'nothing_joined'; failure?: Failure }
   | { kind: 'every_input_closed'; failure?: Failure }
   | { kind: 'one_of_group_closed'; ports: string[]; failure?: Failure }
   | { kind: 'scope_skipped'; scope: string }
@@ -904,6 +1202,21 @@ export const SHOULD_NOT_FLOW_PORT = '_should_not_flow';
 /// Is this port name the language's gate, either way round?
 export function isGatePort(name: string): boolean {
   return name === SHOULD_FLOW_PORT || name === SHOULD_NOT_FLOW_PORT;
+}
+
+/// The output the language gives every catalog node, which the runtime
+/// fills with why the node failed. Wired, a failure completes the node
+/// through it; unwired, a failure stops the run. It is the gate's mirror
+/// on the output side, so the editor draws it as a marker on the right
+/// edge, never as an output row. Group and loop boundaries have none.
+// SYNC: ERROR_PORT <-> crates/weft-core/src/node.rs ERROR_PORT
+export const ERROR_PORT = '_error';
+
+/// Is this port one the language gives a node (the gate, either way
+/// round, or the failure output)? Such a port is never written into a
+/// node's header and never removed with it.
+export function isLanguagePort(name: string): boolean {
+  return isGatePort(name) || name === ERROR_PORT;
 }
 
 // SYNC: NodeFiringStatus <-> crates/weft-core/src/run/firing.rs NodeFiringStatus
@@ -954,7 +1267,7 @@ export function frameText(frame: Frame): string {
 
 /// The key of one place of a run: a node under the call sites that
 /// reach it, `one/Clean.strip`, or the bare id at the top. What a run's
-/// scope, a seed's origins and a run selection are keyed by.
+/// scope and a seed's origins are keyed by.
 // SYNC: locatedKey <-> crates/weft-core/src/frames.rs Located
 export function locatedKey(id: string, callPath: readonly string[]): string {
   return callPath.length === 0 ? id : `${callPath.join('/')}/${id}`;
@@ -1093,6 +1406,9 @@ export interface InstanceInfraEntry {
 export interface Seed {
   parent: string;
   origins: Record<string, string>;
+  /// The places this run runs again that replay the answers their waits
+  /// got in `parent`.
+  answers?: string[];
 }
 
 import type { RunSpec, ResolveSpecResponse } from './run-spec';
@@ -1137,15 +1453,38 @@ export interface NodeFiringEvent {
   /// own firings.
   // SYNC: inheritedFrom <-> crates/weft-core/src/live_event.rs DispatcherEvent inherited_from
   inheritedFrom?: string;
-  /// Input ports whose value a person provided (a scoped run's
-  /// `--from node='{"port":value}'`), on `running`. The inspector paints
-  /// them as provided by hand.
-  // SYNC: providedPorts <-> crates/weft-core/src/live_event.rs DispatcherEvent provided_ports
-  providedPorts?: string[];
+  /// Input ports whose value the run was given rather than a node of it
+  /// making it: a value a person handed in (a scoped run's
+  /// `--from node='{"port":value}'`), or an output a node stood in with
+  /// (`--emit`, a baked infra value), on `running`. `inheritedPorts`
+  /// names the ports a seed's saved result sent, with the run that made
+  /// it.
   // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
-  backupPorts?: string[];
+  providedPorts?: string[];
   inheritedPorts?: Record<string, string>;
 }
+
+/// One copy of a scope (a group, an include's call site, an included
+/// file's body, a loop's iteration): the scope's id and the frames its
+/// direct members fire at. A body's copy ends with the call frame of the
+/// site that called it; a loop's with the iteration's.
+// SYNC: ScopeCopy <-> crates/weft-core/src/project/scopes.rs ScopeCopy
+export interface ScopeCopy {
+  scope: string;
+  frames: Frame[];
+}
+
+/// How a copy of a scope was decided: it opened, or it did not run and why.
+// SYNC: ScopeState <-> crates/weft-core/src/run/scope.rs ScopeState
+export type ScopeState = { state: 'open' } | { state: 'skipped'; reason: SkipReason };
+
+/// The engine decided one copy of a scope. A group is no node, so this
+/// is what the graph paints a group (and an include box) from, per copy;
+/// a copy inside one that did not run is decided skipped with it
+/// (`scope_skipped`, naming the outermost). `inheritedFrom` as on a
+/// firing.
+// SYNC: ScopeDecidedEvent <-> crates/weft-core/src/live_event.rs DispatcherEvent::ScopeDecided, extension-vscode/src/runFollower.ts DispatcherEvent
+export type ScopeDecidedEvent = ScopeCopy & ScopeState & { inheritedFrom?: string; atUnix: number };
 
 /// Live loop event surfaced through the dispatcher SSE stream. Mirrors
 /// the four `LoopInstantiated` / `LoopIterationLaunched` / `LoopOutFired`
@@ -1197,7 +1536,7 @@ export type LoopInspectorEvent =
 /// renders as `from: <payload-pretty>` (or a byte count for a binary
 /// payload); `window` renders an ephemeral window's rollup ("N frames,
 /// M bytes"); `closed` renders an explicit `* the bus closed here`
-/// marker. `busId` groups lines by channel so a node attached to
+/// marker, or `* the bus failed here: <error>` when it failed. `busId` groups lines by channel so a node attached to
 /// multiple buses gets one scrollable section per bus. Replay orders
 /// lines by arrival from the SSE stream (the dispatcher already orders
 /// them by their place in the run's record).
@@ -1245,7 +1584,15 @@ export type BusInspectorEvent =
       totals: Array<{ from: string; msgKind: string; count: number; bytes: number }>;
       atUnix: number;
     }
-  | { kind: 'closed'; busId: string; offset: number; atUnix: number };
+  // SYNC: BusInspectorEvent 'closed' <-> crates/weft-journal/src/events.rs BusClosed, crates/weft-core/src/live_event.rs BusClosed, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_closed'
+  | { kind: 'closed'; busId: string; offset: number; end: StreamEnd; atUnix: number };
+
+/// How a stream (a bus) ended: cleanly, or failed with the producer's
+/// error.
+// SYNC: StreamEnd <-> crates/weft-core/src/primitive.rs StreamEnd
+export type StreamEnd =
+  | { kind: 'finished' }
+  | { kind: 'failed'; error: string };
 
 /// One live-caller-connection event the inspector replays. One caller
 /// per run (no busId; the run id is the identity).
@@ -1309,6 +1656,9 @@ export type CorruptionSite =
   | 'LoopIterationLaunched'
   | 'LoopOutFired'
   | 'LoopTerminated'
+  /// The run's birth gives values where its program says nothing is
+  /// given, or misses one it says.
+  | 'RunGiven'
   | 'UndecodableRow'
   /// Not one row: the whole run. The code it ran is no longer
   /// recorded, so no value can be worked out from the journal. Shown
@@ -1328,8 +1678,8 @@ export type LiveDataType = (typeof LIVE_DATA_TYPES)[number];
 /// One line of a node's display: what it shows about itself while it
 /// runs. Two things produce one, and both serve it on `GET /live` in
 /// this shape: an infra node's own container, and the listener kind
-/// holding a trigger's signal. One channel (`nodeDisplay`) carries
-/// both, keyed by node id.
+/// holding a signal (a trigger's, or a wait's in a run). One channel
+/// (`nodeDisplay`) carries all of them, keyed by node id.
 // SYNC: LiveDataItem <-> crates/weft-core/src/live.rs LiveItem, crates/weft-e2e/src/display.rs
 export interface LiveDataItem {
   /// - `text`: plain copyable string in a code-style box.
@@ -1908,10 +2258,11 @@ export type HostMessage =
   /// The run tagged itself (`ctx.tag_run`). `tags` is one call's
   /// list; the webview accumulates the run's set.
   | { kind: 'runTags'; runId: string; tags: string[] }
-  /// The run's scope, off its birth row: the places it is held to
-  /// (`locatedKey`s; `null` = the whole graph), so every other node
-  /// paints as not in this run, and the run it was seeded from with
-  /// what it re-ran.
+  /// The run's scope, off its birth row: every place its program runs
+  /// (`locatedKey`s; a place that stands in for itself is not among
+  /// them; `null` when the run's program could not be read), so every
+  /// other node paints as not in this run, and the run it was seeded
+  /// from with what it re-ran.
   // SYNC: runScope <-> crates/weft-core/src/live_event.rs DispatcherEvent::RunStarted (subgraph, seed)
   | { kind: 'runScope'; runId: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
@@ -1939,6 +2290,8 @@ export type HostMessage =
   /// names a loaded node spells off the weft way.
   | { kind: 'catalogError'; error?: string; warnings?: CatalogWarning[] }
   | { kind: 'firingEvent'; event: NodeFiringEvent }
+  /// One copy of a scope decided (live or replay); see `ScopeDecidedEvent`.
+  | { kind: 'scopeDecided'; event: ScopeDecidedEvent }
   /// One metered call's cost record for a firing (a provider meter's
   /// figure). `costId` is the record's stable identity: the same record can
   /// arrive via both the replay and the live stream, so the reducer dedups
@@ -1987,8 +2340,9 @@ export type HostMessage =
   /// behind a collapsed disclosure.
   | { kind: 'journalCorruption'; site: CorruptionSite; reason: string }
   /// What one node is showing, off its `/live`: the container's for an
-  /// infra node, the listener kind's for a trigger. Routed to that
-  /// node's body panel.
+  /// infra node, the listener kind's for a trigger, and for any other
+  /// node the listener kind's holding its wait in the followed run.
+  /// Routed to that node's body panel.
   | ({ kind: 'nodeDisplay'; nodeId: string } & NodeFeedState)
   | { kind: 'followStatus'; status: FollowStatus }
   /// The live run SSE stream ended or broke before the

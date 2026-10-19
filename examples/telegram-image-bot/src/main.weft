@@ -13,6 +13,9 @@
 
 telegram = TelegramAccess
 fal = FalAccess
+openrouter = OpenRouterAccess
+
+writer = OpenRouterModel { access: openrouter.access, model: "anthropic/claude-sonnet-4.5" }
 
 pg = PostgresDatabase { database: "imagebot" }
 
@@ -45,16 +48,17 @@ sorry = TelegramSendMessage {
   text: credit.refusal
 }
 
-brief = Group(request: String) -> (prompt: String) {
+brief = Group(request: String, provider: LlmProvider) -> (prompt: String) {
   # Turn what they typed into an image prompt
   write = LlmInference -> (response: String) {
     prompt: self.request
-    provider: OpenRouterProvider { model: "anthropic/claude-sonnet-4.5" }.provider
+    provider: self.provider
     params: LlmParams { systemPrompt: @file("assets/prompts/image_brief.md") }.params
   }
   self.prompt = write.response
 }
 brief.request = ask.text
+brief.provider = writer.provider
 brief._should_flow = credit.paid
 
 picture = FalGenerateImage {

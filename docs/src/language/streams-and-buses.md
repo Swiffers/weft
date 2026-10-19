@@ -88,6 +88,29 @@ who joined and who left, so nothing a reader needs can disappear into a gap.
 The record exists so you can read the conversation in the inspector afterwards.
 It is not what rebuilds a bus, because nothing rebuilds a bus.
 
+### How a bus ends
+
+Picture a reader at the end of a model's answer. Did the model finish, or did
+it stop halfway through a sentence? A bus says which. It ends when the node
+that made it is done, or when a node that joined it is, and it ends one of two
+ways:
+
+- **finished**, when that node's work completed, or when the node closed the
+  bus early on purpose;
+- **failed**, with the reason, when that node failed, was cancelled, or paused
+  on a wait before it was done. weft also ends a bus failed when the run got
+  stuck, or ended while the bus was still open.
+
+Each reader decides what a failed end means for it. `Stream` fails the answer
+to its caller ([what the caller
+sees](triggers-and-routes.md#when-a-run-ends-before-it-answers)), `Debug` logs
+a warning naming the reason, and the bus's panel in the inspector ends with
+`* the bus failed here: <reason>` instead of `* the bus closed here`.
+
+If a producer fails before its first piece, it may not have opened its bus
+yet. For what the program can do then, go and read [when a node
+fails](how-a-program-runs.md#when-a-node-fails).
+
 ### A bus lives exactly as long as its worker
 
 It is memory in a process. If that worker goes away, the bus goes with it, and

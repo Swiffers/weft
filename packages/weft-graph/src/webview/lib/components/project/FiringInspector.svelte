@@ -3,7 +3,7 @@
 	import type { RunTerminal, NodeFiring } from '../../types';
 	import { frameText, type FileEditWire, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
-	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
+	import { busClosedLine, formatClockTime, formatStreamBody } from '../../utils/stream-log';
 	import PayloadCards from './PayloadCards.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
 	import * as Dialog from '../ui/dialog';
@@ -104,7 +104,7 @@
 				const ts = formatBusTime(e.atUnix);
 				if (e.kind === 'joined') return `${ts}  * ${e.name} joined`;
 				if (e.kind === 'left') return `${ts}  * ${e.name} left`;
-				if (e.kind === 'closed') return `${ts}  * the bus closed here`;
+				if (e.kind === 'closed') return `${ts}  ${busClosedLine(e.end).text}`;
 				if (e.kind === 'window') return `${ts}  * ${formatWindowBody(e)}`;
 				return `${ts}  ${e.from}: ${formatMessageBody(e)}`;
 			});
@@ -168,29 +168,26 @@
 			.join('\n\n');
 	}
 
-	/// How an input port got its value when it did not travel a wire in
-	/// this run: a backup the run was started with, an output someone
-	/// supplied in place of the node upstream, or a value reused from
-	/// the seed run. `null` for an ordinary wired value. `short` cuts
-	/// the origin run's id to what the banner shows; the copy text
-	/// keeps the whole id.
+	/// How an input port got its value when no node of this run made
+	/// it: a value the run was given (handed to this input, or sent by a
+	/// node upstream standing in for itself), or a value reused from the
+	/// seed run. `null` for an ordinary wired value. `short` cuts the
+	/// origin run's id to what the banner shows; the copy text keeps the
+	/// whole id.
 	function portOrigin(
 		firing: {
 			providedPorts?: string[];
-			backupPorts?: string[];
 			inheritedPorts?: Record<string, string>;
 		},
 		port: string,
 		short: boolean,
 	): string | null {
 		const origin = firing.inheritedPorts?.[port];
-		const how = firing.backupPorts?.includes(port)
-			? 'backup used'
-			: firing.providedPorts?.includes(port)
-				? 'supplied output'
-				: origin
-					? 'reused input'
-					: null;
+		const how = firing.providedPorts?.includes(port)
+			? 'given to the run'
+			: origin
+				? 'reused input'
+				: null;
 		if (!how) return null;
 		return origin ? `${how} from run ${short ? origin.slice(0, 8) : origin}` : how;
 	}
@@ -498,7 +495,8 @@
 											{:else if e.kind === 'left'}
 												<span class="text-zinc-400">* {e.name} left</span>
 											{:else if e.kind === 'closed'}
-												<span class="text-zinc-400 italic">* the bus closed here</span>
+												{@const closedLine = busClosedLine(e.end)}
+												<span class="{closedLine.failed ? 'text-red-600 break-words' : 'text-zinc-400'} italic">{closedLine.text}</span>
 											{:else if e.kind === 'window'}
 												<span class="text-zinc-500 italic">* {formatWindowBody(e)}</span>
 											{:else}

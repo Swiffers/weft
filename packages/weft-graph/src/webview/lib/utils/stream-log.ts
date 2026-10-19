@@ -6,7 +6,7 @@
 /// rules that make a line HONEST (a message whose content was cut says
 /// so and says its real size, and raw bytes say they were never written
 /// down) and a second copy of those is a second chance to drop one.
-import type { WirePayload } from '../../../protocol';
+import type { StreamEnd, WirePayload } from '../../../protocol';
 
 /// Wall-clock time of a line, as a reader scanning a log wants it.
 export function formatClockTime(atUnix: number): string {
@@ -39,4 +39,16 @@ export function formatStreamBody(
   }
   const body = prettyPayload(payload.data);
   return trimmed ? `${body}\n(${byteSize} bytes in all, shown trimmed)` : body;
+}
+
+/// The line a bus's close reads as: where it closed, or where it failed
+/// and why. `failed` tells the panel to draw it as an error. One
+/// definition for the panel and its copy text, so the two say the same.
+export function busClosedLine(end: StreamEnd): { text: string; failed: boolean } {
+  switch (end.kind) {
+    case 'finished':
+      return { text: '* the bus closed here', failed: false };
+    case 'failed':
+      return { text: `* the bus failed here: ${end.error}`, failed: true };
+  }
 }

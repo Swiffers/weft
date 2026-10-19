@@ -65,20 +65,22 @@ it writes, the container it needs, the person it asks: each are fast to produce 
 ## Your first weft program
 
 ```weft
+type Draft = { answer: String, sensitivity: String, .. }
+
 whatsapp = BaileyBridge
+openrouter = OpenRouterAccess
 
 ask = BaileyReceive { bridge: whatsapp.bridge }
 
-draft = LlmInference -> (answer: String, sensitivity: String) {
-  parseJson: true
+draft = LlmInferenceJson -> (response: Draft) {
   prompt: ask.content
-  provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider
-  params: LlmParams { systemPrompt: @file("prompts/support.md"), temperature: 0.75 }.params
+  provider: OpenRouterModel { access: openrouter.access, model: "z-ai/glm-5.3" }.provider
+  params: LlmParams { systemPrompt: @file("assets/prompts/support.md"), temperature: 0.75 }.params
 }
 
 # Exactly one of these two says yes, the other stays quiet
 route = Switch {
-  value: draft.sensitivity
+  value: draft.response.sensitivity
   cases: [
     { "kind": "equals", "value": "high", "port": "needsAPerson" },
     { "kind": "otherwise", "port": "goAhead" }
@@ -96,7 +98,7 @@ review = HumanQuery {
   ]
   from: ask.pushName
   question: ask.content
-  answer: draft.answer
+  answer: draft.response.answer
 }
 
 allowed = FirstInOrder {
@@ -108,7 +110,7 @@ reply = BaileySend {
   _should_flow: allowed.value
   bridge: whatsapp.bridge
   to: ask.chatId
-  message: draft.answer
+  message: draft.response.answer
 }
 ```
 
@@ -127,9 +129,9 @@ This is a complete runnable program: a support bot on WhatsApp. A customer messa
 The first line is the WhatsApp integration. **It is only one line** because `BaileyBridge` is an infrastructure node: it ships with its own container and manages its own lifecycle. After you start the infrastructure, the bridge shows a QR code in the graph view. Scan it with whatsapp to connect the bridge. You can check the source code of `BaileyBridge` in the [`catalog/`](catalog/bailey/bridge/) if you want to see how it works.
 
 
-Then `ask` is a trigger: when a message arrives, it starts a run with the payload. `draft` then calls an LLM and drafts a reply. The system prompt asks for JSON. `parseJson: true` parses the reply, attempts to repair malformed JSON, and pulls out the declared outputs: the answer and the sensitivity rating. The prompt lives in its own file, and the model is pinned in the source, here `z-ai/glm-5.3`.
+Then `ask` is a trigger: when a message arrives, it starts a run with the payload. `draft` then calls an LLM and drafts a reply. The system prompt asks for JSON, and `LlmInferenceJson` repairs malformed JSON, parses it, and checks it against `Draft`, the type declared on its `response`: an answer and a sensitivity rating, read as `draft.response.answer` and `draft.response.sensitivity`. The prompt lives in its own file, and the model is pinned in the source, here `z-ai/glm-5.3`.
 
-After that there is a `Switch`. It looks at `draft.sensitivity` and opens exactly one of its two ports: `needsAPerson` if the rating is `"high"`, `goAhead` otherwise. `review` reads that port through `_should_flow`, so the person is only asked when the answer was sensitive.
+After that there is a `Switch`. It looks at `draft.response.sensitivity` and opens exactly one of its two ports: `needsAPerson` if the rating is `"high"`, `goAhead` otherwise. `review` reads that port through `_should_flow`, so the person is only asked when the answer was sensitive.
 
 When the `review` fires, this run waits for a human to review the answer through the integrated [Weft browser extension](extension-browser/). The question and the run's state are saved. Once the worker has no other work, it exits; the waiting run needs no process of its own. When the human replies, the runtime restores the recorded state and continues. The WhatsApp bridge and shared runtime services stay up. For what survives a restart, read [the journal](https://weavemindai.github.io/weft/running/the-journal.html).
 

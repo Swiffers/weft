@@ -60,11 +60,12 @@ impl ListenerClient {
         Ok(Self::ok(self.post("/prepare", req).await?, "/prepare").await?.json().await?)
     }
 
-    /// What the trigger's kind is showing, or `None` when the listener
-    /// holds no such signal. `address` is where an outside caller
-    /// reaches this signal, which the listener cannot work out on its own
-    /// (see `LiveRequest::address`).
-    pub async fn live(&self, token: &str, address: Option<&str>) -> Result<Option<weft_core::live::LiveFeed>> {
+    /// What the signal's kind is showing (and, for a run's wait, the raw
+    /// last answer it saw), or `None` when the listener holds no such
+    /// signal. `address` is where an outside caller reaches this signal,
+    /// which the listener cannot work out on its own (see
+    /// `LiveRequest::address`).
+    pub async fn live(&self, token: &str, address: Option<&str>) -> Result<Option<weft_core::signal::listener_protocol::LiveResponse>> {
         let resp = self
             .post(
                 "/live",
@@ -77,8 +78,7 @@ impl ListenerClient {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let body: weft_core::signal::listener_protocol::LiveResponse = Self::ok(resp, "/live").await?.json().await?;
-        Ok(Some(body.live))
+        Ok(Some(Self::ok(resp, "/live").await?.json().await?))
     }
 
     pub async fn process(&self, token: &str, payload: &Value) -> Result<weft_core::signal::listener_protocol::ProcessOutcome> {
@@ -140,6 +140,15 @@ impl ListenerClient {
         };
         let req = weft_core::signal::listener_protocol::StartRequest { token: token.to_string(), mode, replaced };
         Self::ok(self.post("/start", &req).await?, "/start").await?;
+        Ok(())
+    }
+
+    /// Have the listener send the last call of a wait whose run was
+    /// cancelled (`weft_core::signal::cancel_call`). Answers once the
+    /// outside service answered it; a refusal or a call that could not
+    /// reach the service is an error naming why.
+    pub async fn cancel_call(&self, call: &weft_core::signal::listener_protocol::CancelCallRequest) -> Result<()> {
+        Self::ok(self.post("/cancel_call", call).await?, "/cancel_call").await?;
         Ok(())
     }
 

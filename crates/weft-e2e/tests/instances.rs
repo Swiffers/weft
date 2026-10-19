@@ -131,10 +131,10 @@ async fn one_trigger_is_turned_on_and_off_alone() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let project = Project::prepare("instances", disp.clone()).await?;
     project.set_main(
-        "a = Route -> (text: String) { path: \"__E2E_PATH__/a\", method: \"POST\" }\n\
-         ra = Reply\nra.body = a.text\n\
-         b = Route -> (text: String) { path: \"__E2E_PATH__/b\", method: \"POST\" }\n\
-         rb = Reply\nrb.body = b.text\n",
+        "a = Route -> (body: { text: String }) { path: \"__E2E_PATH__/a\", method: \"POST\" }\n\
+         ra = Reply\nra.body = a.body.text\n\
+         b = Route -> (body: { text: String }) { path: \"__E2E_PATH__/b\", method: \"POST\" }\n\
+         rb = Reply\nrb.body = b.body.text\n",
     )?;
     let base = project.unique_live_path()?;
     let call = |route: &'static str| {
@@ -296,27 +296,27 @@ async fn a_program_manages_its_instances_through_the_instance_nodes() -> anyhow:
 out = Debug
 out.data = svc.status
 
-up = Route -> (instance: String) { path: "__E2E_PATH__/up", method: "POST" }
+up = Route -> (body: { instance: String }) { path: "__E2E_PATH__/up", method: "POST" }
 start = StartInfra { node: "svc" }
-start.instance = up.instance
+start.instance = up.body.instance
 upReply = Reply
 upReply.body = start.done
 
-look = Route -> (instance: String) { path: "__E2E_PATH__/look", method: "POST" }
+look = Route -> (body: { instance: String }) { path: "__E2E_PATH__/look", method: "POST" }
 state = InstanceInfraStatus { node: "svc" }
-state.instance = look.instance
+state.instance = look.body.instance
 lookReply = Reply
 lookReply.body = state.status
 
-mint = Route -> (instance: String) { path: "__E2E_PATH__/mint", method: "POST" }
+mint = Route -> (body: { instance: String }) { path: "__E2E_PATH__/mint", method: "POST" }
 token = MintInstanceToken { expiresInHours: 1 }
-token.instance = mint.instance
+token.instance = mint.body.instance
 mintReply = Reply
 mintReply.body = token.token
 
-wipe = Route -> (instance: String) { path: "__E2E_PATH__/wipe", method: "POST" }
+wipe = Route -> (body: { instance: String }) { path: "__E2E_PATH__/wipe", method: "POST" }
 gone = WipeInstance { infra: ["svc"] }
-gone.instance = wipe.instance
+gone.instance = wipe.body.instance
 wipeReply = Reply
 wipeReply.body = gone.done
 "#,

@@ -11,8 +11,10 @@
 //! it recorded, and the journal is supposed to be the truth about what
 //! happened.
 //!
-//! Nothing arrives on a branch that was cut, so a firing where every
-//! input closed emits nothing and the closure carries on downstream.
+//! Nothing arrives on a branch that was cut. The node is a join
+//! (`features.join`), so when every branch closed it does not run at
+//! all: the skip closes its output, carrying the failure of a branch
+//! that broke. When it runs, at least one branch delivered.
 
 use async_trait::async_trait;
 
@@ -33,18 +35,25 @@ impl Node for FirstInOrderNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        if ctx.declared_inputs().is_empty() {
+            return Err(weft::node_error(
+                "this FirstInOrder joins no branches: wire one input per branch, in the order \
+                 they take precedence",
+            ));
+        }
         // `in_order` walks the node's ports in the order they were
         // written and yields only the ones that DELIVERED: a branch
-        // that closed is absent, so the first pair is the winner.
-        let first = ctx.inputs.in_order()?.next().map(|(_, value)| value.clone());
-
-        let output = match first {
-            Some(value) => NodeOutput::new().set("value", value),
-            // Every branch stayed quiet: emit nothing, and the engine's
-            // closure tells everything downstream that nothing is
-            // coming.
-            None => NodeOutput::new(),
+        // that closed is absent, so the first pair is the winner. A join
+        // none of whose branches delivered is skipped before it runs (its
+        // skip closes `value`, carrying a branch's failure), so a run
+        // that finds none here is the engine breaking that promise, and
+        // says so rather than closing `value` with the failure dropped.
+        let Some((_, first)) = ctx.inputs.in_order()?.next() else {
+            return Err(weft::node_error(
+                "this FirstInOrder ran with no branch delivered, which the engine skips before \
+                 running; this is a weft bug",
+            ));
         };
-        ctx.pulse_downstream(output).await
+        ctx.pulse_downstream(NodeOutput::new().set("value", first.clone())).await
     }
 }

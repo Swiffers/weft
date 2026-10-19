@@ -85,11 +85,11 @@ async fn seed_project(
 /// The birth of run `run_id` of `project_id`, in `phase`, on image
 /// `binary_hash`.
 fn birth(run_id: weft_core::RunId, project_id: Uuid, phase: weft_core::context::Phase, binary_hash: &str) -> RunEvent {
-    RunEvent::RunStarted {
+    RunEvent::RunStarted { given: Default::default(),
         run_id, project_id, entry_node: "entry".into(), phase,
         definition_hash: Some("def-1".into()), binary_hash: Some(binary_hash.into()),
         source_version: (phase == weft_core::context::Phase::TriggerSetup).then(|| "source".into()),
-        run_kind: weft_core::run::RunKind::Project, selection: None, seed: None, instance: None, stand_in: None,
+        run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None,
         fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         settings: Default::default(),
     }
@@ -100,7 +100,7 @@ fn birth(run_id: weft_core::RunId, project_id: Uuid, phase: weft_core::context::
 async fn queue(journal: &PostgresJournal, events: &[RunEvent], for_activation: bool) -> anyhow::Result<bool> {
     journal.queue_run(Queued {
         events, tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT, watch_end: false,
-        stale: &[], spec: None, example: None,
+        stale: &[], spec: None, example: None, program: None,
     }, for_activation).await
 }
 
@@ -725,6 +725,56 @@ async fn queueing_a_run_is_atomic_and_happens_once(pool: PgPool) {
     assert_eq!(journal.events_log(run_id).await.unwrap().len(), 2);
     assert!(!queue(&journal, &[start, kick], false).await.unwrap(), "a retried start finds its run");
     assert_eq!(rows_of(&pool, "run_log", run_id).await, 1, "and writes nothing twice");
+
+    // A run of a cut is queued with the cut, kept with the project's
+    // programs under the hash its birth names, marked with what it was cut
+    // from; a start refused keeps nothing, and a birth naming another
+    // program than the one it is started with is refused.
+    let cut_of = |project: Uuid| {
+        let cut: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": project, "nodes": [], "edges": [], "groups": [],
+        })).unwrap();
+        weft_journal::record::RunsProgram::of("def-1", project, &cut).unwrap()
+    };
+    let cut_birth = |run_id, project, program: &weft_journal::record::RunsProgram| {
+        let mut born = birth(run_id, project, weft_core::context::Phase::Fire, "bin-A");
+        if let RunEvent::RunStarted { definition_hash, cut_from, .. } = &mut born {
+            *definition_hash = Some(program.definition_hash().to_string());
+            *cut_from = program.cut_from().map(str::to_string);
+        }
+        born
+    };
+    let queue_cut = |events: Vec<RunEvent>, program: weft_journal::record::RunsProgram| {
+        let journal = &journal;
+        async move {
+            journal.queue_run(Queued {
+                events: &events, tenant: TENANT,
+                keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT, watch_end: false,
+                stale: &[], spec: None, example: None, program: Some(&program),
+            }, false).await
+        }
+    };
+    let kept = |project: Uuid, hash: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>,)>("SELECT cut_from FROM project_definition WHERE project_id = $1 AND definition_hash = $2")
+                .bind(project).bind(hash).fetch_all(&pool).await.unwrap()
+        }
+    };
+    let program = cut_of(id);
+    let cut_run = weft_core::new_run_id();
+    assert!(queue_cut(vec![cut_birth(cut_run, id, &program)], program.clone()).await.unwrap());
+    assert_eq!(kept(id, program.definition_hash().to_string()).await, [(Some("def-1".to_string()),)], "the cut is kept with the run, as a cut");
+
+    let refused = cut_of(missing);
+    let lost_cut = weft_core::new_run_id();
+    assert!(queue_cut(vec![cut_birth(lost_cut, missing, &refused)], refused.clone()).await.is_err());
+    assert!(kept(missing, refused.definition_hash().to_string()).await.is_empty(), "a refused start keeps no cut");
+
+    let mismatched = weft_core::new_run_id();
+    let err = queue_cut(vec![birth(mismatched, id, weft_core::context::Phase::Fire, "bin-A")], cut_of(id)).await.unwrap_err();
+    assert!(format!("{err:#}").contains("is started with program"), "{err:?}");
+    assert_eq!(rows_of(&pool, "run", mismatched).await, 0, "a birth that names another program is not started");
 }
 
 /// Seed a live worker of `project_id` on image `binary_hash`, driving
@@ -800,7 +850,7 @@ async fn the_drain_counts_what_workers_drive_and_the_runs_queued_or_driven(pool:
 /// within the grace its claim gave it, before its worker's lease is
 /// written.
 #[sqlx::test]
-async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast(pool: PgPool) {
+async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast_or_asked_to_stop(pool: PgPool) {
     use weft_dispatcher::journal::Lost;
     use weft_core::run_settings::{Keeping, RunSettings};
     let (journal, projects) = setup(&pool).await;
@@ -837,6 +887,20 @@ async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast(pool: PgPoo
     assert_eq!(run_column::<String>(&pool, "state", fast).await.as_deref(), Some("ended"));
     assert!(matches!(journal.events_log(fast).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
     assert_eq!(journal.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::NotLost, "an ended run is not lost");
+
+    // A durable run asked to stop while its worker drove it ends when that
+    // worker goes away, for what asked: queued again, it would only start a
+    // worker to read the cancel off its claim.
+    let (stopped, started) = start(Keeping::Durable);
+    queue(&journal, &[started], false).await.unwrap();
+    claim(&pool, stopped, id, "worker-a").await;
+    journal.cancel_run(stopped, None, &weft_core::run::CancelCause::User).await.unwrap();
+    assert_eq!(journal.let_go_of_lost(stopped, past_grace, None).await.unwrap(), Lost::Ended);
+    assert_eq!(run_column::<String>(&pool, "state", stopped).await.as_deref(), Some("ended"));
+    assert!(matches!(
+        journal.events_log(stopped).await.unwrap().last(),
+        Some(RunEvent::RunCancelled { cause: Some(weft_core::run::CancelCause::User), .. })
+    ));
 }
 
 /// A worker whose runs only wait vouched for itself until their waits
@@ -955,6 +1019,104 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool)
     assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
 }
 
+/// A cancel queues the last call of each wait that carries one, in its own
+/// commit: one `cancel_call` task per wait, carrying the call and the
+/// connection it is sent as, deduplicated on the wait, and none for a wait
+/// that carries no call.
+#[sqlx::test]
+async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let run = queued_run(&journal, id).await;
+    sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(run).execute(&pool).await.unwrap();
+    seed_wait(&journal, "tok-plain", id, run).await;
+    let mut calling = entry_signal("tok-calling", id);
+    calling.node_id = "render".into();
+    calling.is_resume = true;
+    calling.run_id = Some(run);
+    let mut spec = weft_core::primitive::SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://queue.example/requests/7/status" }));
+    spec.on_cancel = Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel"));
+    calling.spec_json = serde_json::to_string(&spec).unwrap();
+    journal.signal_insert(&calling).await.expect("seed the wait with a last call");
+
+    let written = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    assert_eq!((written.removed.len(), written.cancel_calls), (2, 1));
+    let tasks: Vec<(String, Option<String>, Option<Uuid>, serde_json::Value)> =
+        sqlx::query_as("SELECT kind, dedup_key, run_id, payload FROM task WHERE kind = 'cancel_call'").fetch_all(&pool).await.unwrap();
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    let (_, dedup, task_run, payload) = &tasks[0];
+    assert_eq!(dedup.as_deref(), Some(weft_task_store::kinds::cancel_call_key("tok-calling").as_str()));
+    assert_eq!(*task_run, Some(run));
+    let call: weft_core::signal::listener_protocol::CancelCallRequest = serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(call.token, "tok-calling");
+    assert_eq!(call.spec.on_cancel, Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel")));
+
+    let again = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    assert_eq!((again.removed.len(), again.cancel_calls), (0, 0), "the waits went with the first cancel");
+
+    // A run a worker drives, asked to cancel while one of its nodes was
+    // still registering its wait: the wait lands after the cancel, and
+    // the removal at the run's ending sends its call all the same.
+    let driven = queued_run(&journal, id).await;
+    claim(&pool, driven, id, "worker-a").await;
+    assert!(journal.cancel_run(driven, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    let mut late = calling.clone();
+    late.token = "tok-late".into();
+    late.run_id = Some(driven);
+    journal.signal_insert(&late).await.expect("a wait registered after the cancel");
+    // Its worker saw the cancel and ended the run so.
+    sqlx::query("UPDATE run SET state = 'ended', outcome = 'cancelled', owner = NULL WHERE run_id = $1").bind(driven).execute(&pool).await.unwrap();
+    // As `run_ends` calls it: holding the run's row in a transaction of its
+    // own, so the removal must not wait on that row.
+    let mut holding = pool.begin().await.unwrap();
+    weft_journal::record::lock_in(&mut holding, driven).await.unwrap();
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(10), journal.signal_remove_for_run_id(driven))
+        .await
+        .expect("the removal never waits on the run's row")
+        .unwrap();
+    holding.commit().await.unwrap();
+    assert_eq!(removed.len(), 1);
+    let queued: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT dedup_key FROM task WHERE kind = 'cancel_call' AND run_id = $1").bind(driven).fetch_all(&pool).await.unwrap();
+    assert_eq!(queued, vec![Some(weft_task_store::kinds::cancel_call_key("tok-late"))]);
+
+    // A run that ended any other way takes its waits down without a call,
+    // even one asked to cancel that finished before its worker saw it.
+    let finished = queued_run(&journal, id).await;
+    let mut kept = calling.clone();
+    kept.token = "tok-kept".into();
+    kept.run_id = Some(finished);
+    journal.signal_insert(&kept).await.expect("a wait of a run that ends on its own");
+    sqlx::query("UPDATE run SET state = 'ended', outcome = 'completed', cancel_requested = '\"user\"'::jsonb WHERE run_id = $1")
+        .bind(finished)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(journal.signal_remove_for_run_id(finished).await.unwrap().len(), 1);
+    let none: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE kind = 'cancel_call' AND run_id = $1").bind(finished).fetch_one(&pool).await.unwrap();
+    assert_eq!(none, 0);
+
+    // Removing the project cuts short a run whose worker never wrote the
+    // cancel: its wait goes with the project, and its call is queued and
+    // kept with it.
+    let cut = queued_run(&journal, id).await;
+    claim(&pool, cut, id, "worker-b").await;
+    assert!(journal.cancel_run(cut, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    let mut stranded = calling.clone();
+    stranded.token = "tok-stranded".into();
+    stranded.run_id = Some(cut);
+    journal.signal_insert(&stranded).await.expect("a wait registered after the cancel");
+    projects.remove(id).await.unwrap().expect("the project was there");
+    let kept: Vec<Option<String>> = sqlx::query_scalar("SELECT dedup_key FROM task WHERE kind = 'cancel_call' ORDER BY dedup_key")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(kept.contains(&Some(weft_task_store::kinds::cancel_call_key("tok-stranded"))), "{kept:?}");
+    assert!(kept.contains(&Some(weft_task_store::kinds::cancel_call_key("tok-calling"))), "a queued call outlives the project: {kept:?}");
+    assert!(!kept.contains(&Some(weft_task_store::kinds::cancel_call_key("tok-kept"))), "{kept:?}");
+}
+
 /// A charge an earlier drive opened and no response priced is booked
 /// unknown when the dispatcher cancels the parked run: one `CostReported`
 /// closing it, before the ending, in the same write.
@@ -1006,7 +1168,7 @@ async fn an_ending_with_work_left_is_found_without_its_announcement(pool: PgPool
     let started = birth(run_id, id, weft_core::context::Phase::Fire, "bin-A");
     assert!(journal.queue_run(Queued {
         events: std::slice::from_ref(&started), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
-        watch_end: true, stale: &[], spec: None, example: None,
+        watch_end: true, stale: &[], spec: None, example: None, program: None,
     }, false).await.unwrap());
     let quiet = queued_run(&journal, id).await;
     complete(&journal, run_id).await;
@@ -1906,7 +2068,7 @@ async fn a_project_being_removed_has_no_run_born(pool: PgPool) {
                     written: Written::of(&events),
                     wrote_files: false,
                 }],
-                selections: Vec::new(),
+                programs: Vec::new(),
             };
             let batch = Batch { head, rows: vec![row.as_slice()] };
             let mut conn = pool.acquire().await.unwrap();

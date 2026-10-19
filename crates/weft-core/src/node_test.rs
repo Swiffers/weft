@@ -405,7 +405,6 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         description: Some(description.to_string()),
         requires_scopes: None,
         requires_values: None,
-        required_when_wired: false,
     }
 }
 
@@ -521,6 +520,10 @@ pub struct RigOutcome {
     /// The declared infrastructure, on a `run_provision_infra`
     /// outcome. `None` on the ctx-driven verbs (run / setup_trigger).
     pub infra_spec: Option<crate::infra::InfraSpec>,
+    /// The run id the body's ctx carried (`ctx.run_id`), minted fresh for
+    /// each run; `None` when no body ran with a ctx (`run_provision_infra`,
+    /// or inputs refused before the body).
+    pub run_id: Option<crate::RunId>,
 }
 
 impl RigOutcome {
@@ -794,8 +797,8 @@ struct FakeState {
     /// real granted set can also be unknowable); a declared set is
     /// checked against the access's required permissions.
     connection_permissions: Mutex<BTreeMap<String, Vec<String>>>,
-    /// Declared-output-type overrides: what the compiler resolves for
-    /// a `MustOverride` output port in a real graph.
+    /// Declared output types: what a program declares on a narrowable
+    /// output (or an added one) in a real graph.
     output_types: Mutex<HashMap<String, WeftType>>,
     /// Output ports the case wires downstream (`FakeRig::wire_output`),
     /// what the compiled graph supplies in production.
@@ -1212,18 +1215,19 @@ impl FakeRig {
         Access::new("fake-connection", service, None).to_value()
     }
 
-    /// Declare the resolved type of an output port, what the compiler
-    /// supplies for a `MustOverride` declaration in a real graph
-    /// (`ctx.output_type` reads it). Ports with a concrete metadata
-    /// type need no declaration.
+    /// Declare the type of an output port, what a program declares on a
+    /// narrowable output (`-> (response: Verdict)`) or an added one in a
+    /// real graph (`ctx.output_type` reads it). Held to the same rule the
+    /// compiler applies, so an output that is not narrowable takes only
+    /// its own type.
     pub fn output_type(&self, port: &str, ty: WeftType) {
         self.state.output_types.lock().unwrap().insert(port.to_string(), ty);
     }
 
     /// Wire output `port` downstream, what a wire out of it in the
     /// graph does in production (`ctx.is_output_wired` reads it). A
-    /// rig run wires nothing by default, so a node that catches its
-    /// failure into `error` fails loudly until the case wires it.
+    /// rig run wires nothing by default, so a case testing a failure
+    /// caught on `_error` wires that port first.
     pub fn wire_output(&self, port: &str) {
         self.state.wired_outputs.lock().unwrap().insert(port.to_string());
     }
@@ -1455,11 +1459,12 @@ impl FakeRig {
         let (handle, ctx, _feeds_alive) = match self.build_ctx(node, RUN_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
+        let run_id = ctx.run_id;
         let result = node.run(ctx).await;
-        handle.into_outcome(result)
+        RigOutcome { run_id: Some(run_id), ..handle.into_outcome(result) }
     }
 
     /// Run an infra node's `provision_infra` body with throwaway
@@ -1471,6 +1476,7 @@ impl FakeRig {
             outputs: Default::default(),
             closed_ports: Vec::new(),
             infra_spec: None,
+            run_id: None,
         };
         // Keeps the run's generator feeds registered (see `run`).
         let (bag, _feeds_alive) = match manifest_input_bag(node.manifest(), &self.state.input_types.lock().unwrap(), inputs) {
@@ -1495,11 +1501,12 @@ impl FakeRig {
         let (handle, ctx, _feeds_alive) = match self.build_ctx(node, SETUP_TRIGGER_BODY, inputs) {
             Ok(triple) => triple,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
+        let run_id = ctx.run_id;
         let result = node.setup_trigger(ctx).await;
-        handle.into_outcome(result)
+        RigOutcome { run_id: Some(run_id), ..handle.into_outcome(result) }
     }
 
     /// The journal a body of `node` replays and records: what
@@ -1519,13 +1526,7 @@ impl FakeRig {
     ) -> WeftResult<(CaptureBox, RunContext, RegisteredFeeds)> {
         let manifest = node.manifest();
         let custom = self.state.input_types.lock().unwrap().clone();
-        let (mut bag, feeds) = manifest_input_bag(manifest, &custom, inputs)?;
-        // A case's declared created ports are part of what the node
-        // declares, whether or not the case delivered on them. The
-        // compiler supplies both halves in production; here the case does.
-        for (port, _) in &custom {
-            bag.declare_port(port.clone());
-        }
+        let (bag, feeds) = manifest_input_bag(manifest, &custom, inputs)?;
         let wake = self.state.wake.lock().unwrap().take();
         // The same gate production applies before a trigger's body
         // runs: a firing payload has to be exactly what the node
@@ -1540,17 +1541,15 @@ impl FakeRig {
                     .map_err(WeftError::NodeFailed)?;
             }
         }
-        // Declared overrides play the compiler's role for MustOverride
-        // ports; concrete metadata types stand as-is. The output map is
+        // Declared types play the program's role for narrowable and
+        // added ports; the metadata's types stand otherwise. The output map is
         // derived from the BAG (defaults applied), never the raw case
         // inputs: the node reads the bag, so a `portsFromConfig` field
         // with a manifest default must shape the outputs the same way
         // it shapes the run.
         let config = Value::Object(bag.object()?.clone());
         let mut outputs = declared_output_map(manifest, &config);
-        for (port, ty) in self.state.output_types.lock().unwrap().iter() {
-            outputs.insert(port.clone(), ty.clone());
-        }
+        declare_output_types(manifest, &config, &mut outputs, &self.state.output_types.lock().unwrap())?;
         // A resume loads the body's journal, exactly as the run
         // driver seeds a firing's awaited sequence from the fold: in
         // call-index order, whatever order the records landed in (two
@@ -1565,7 +1564,6 @@ impl FakeRig {
             capture: Capture::new(
                 outputs,
                 self.state.wired_outputs.lock().unwrap().clone(),
-                manifest.features.catch_errors,
             ),
             declared_inputs: declared_input_map(manifest, &custom),
             wake,
@@ -1896,6 +1894,48 @@ fn declared_input_map(manifest: &NodeMetadata, custom: &[(String, WeftType)]) ->
     declared
 }
 
+/// Lay the output types a case declared over the node's own, each held
+/// to what the compiler would let a program declare there
+/// ([`NodeMetadata::output_declaration_fits`]; an added output needs a
+/// node that takes them, and on a node whose added outputs read its
+/// path's captures, a capture of the case's path typed as text), so a
+/// case cannot test a type no program could give the port. Both rigs go
+/// through it.
+fn declare_output_types(
+    manifest: &NodeMetadata,
+    config: &Value,
+    outputs: &mut HashMap<String, WeftType>,
+    declared: &HashMap<String, WeftType>,
+) -> WeftResult<()> {
+    for (port, ty) in declared {
+        let fits = match outputs.get(port) {
+            Some(current) => manifest.output_declaration_fits(port, current, ty),
+            None if manifest.features.can_add_output_ports => added_output_fits(manifest, config, port, ty),
+            None => Err("but the node has no such output and takes no added ones".to_string()),
+        };
+        fits.map_err(|why| WeftError::NodeFailed(format!("the case declares output '{port}' as {ty}, {why}")))?;
+        outputs.insert(port.clone(), ty.clone());
+    }
+    Ok(())
+}
+
+/// An added output, held to the node's rule for its added ports: on a
+/// node whose added outputs read its path's captures, the case's path
+/// (the `claimsRoute.pathField` input) has to capture it as text.
+fn added_output_fits(manifest: &NodeMetadata, config: &Value, port: &str, ty: &WeftType) -> Result<(), String> {
+    let Some(claims) = manifest.claims_route.as_ref().filter(|c| c.captures_are_outputs) else {
+        return Ok(());
+    };
+    let raw = config.get(&claims.path_field).and_then(Value::as_str).ok_or_else(|| {
+        format!("but its added ports read the captures of '{}', which the case does not set", claims.path_field)
+    })?;
+    let pattern = crate::route::RoutePattern::parse(raw)?;
+    match pattern.capture_port_problem(port, ty) {
+        Some(problem) => Err(format!("which its path refuses: the case {problem}")),
+        None => Ok(()),
+    }
+}
+
 /// Every output port a run may emit on: the manifest's own, plus the
 /// ones this node DERIVES from its config (a form's fields, a switch's
 /// cases). `config` is the case's inputs, which is where a rig run
@@ -1946,9 +1986,9 @@ struct Capture {
     declared: HashMap<String, WeftType>,
     /// The output ports the case wired downstream.
     wired: HashSet<String>,
-    /// The node declares `features.catchErrors`: a failed body goes to
-    /// `error` when it is wired, decided as the engine decides it.
-    catch_errors: bool,
+    /// The buses the body creates or joins, ended with how it returned
+    /// as the engine ends them.
+    buses: crate::bus::FiringBuses,
     outputs: Mutex<serde_json::Map<String, Value>>,
     /// Items emitted on `Generator[T]` ports, in order. Folded into
     /// `outputs` as one JSON array per port at outcome time, so a test
@@ -1959,11 +1999,11 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(declared: HashMap<String, WeftType>, wired: HashSet<String>, catch_errors: bool) -> Self {
+    fn new(declared: HashMap<String, WeftType>, wired: HashSet<String>) -> Self {
         Self {
             declared,
             wired,
-            catch_errors,
+            buses: crate::bus::FiringBuses::default(),
             outputs: Mutex::new(Default::default()),
             stream_outputs: Mutex::new(HashMap::new()),
             closed_ports: Mutex::new(Vec::new()),
@@ -1978,7 +2018,8 @@ impl Capture {
         let mut streams = self.stream_outputs.lock().unwrap();
         let closed = self.closed_ports.lock().unwrap();
         // Gate order mirrors production's `pulse_downstream`: all
-        // ports declared, then the runtime output-type check, then the
+        // ports declared, then the wire cap and the runtime output-type
+        // check, then the
         // one-emission-per-port claim (generator ports accept repeats,
         // but never past a close), so a multi-fault emission errors on
         // the same gate here and there.
@@ -1996,17 +2037,25 @@ impl Capture {
         // error can try the port again with something else, and
         // whatever the firing already sent stays sent. Generator ports
         // check each ITEM against the element type, again as
-        // production does.
-        for (port, value) in &output.outputs {
-            let declared = self.declared[port].port_value_type();
-            if !declared.accepts_runtime_value(value) {
-                return Err(WeftError::NodeFailed(format!(
+        // production does. Before the type, per port, the wire's own
+        // limit, with the very refusal the engine gives, so a node test
+        // catches a value no wire would carry.
+        // An open record drops the keys it does not declare, as there.
+        let mut conformed = NodeOutput::new();
+        for (port, value) in output.outputs {
+            crate::storage::check_wire_value(NODE_UNDER_TEST_ID, &port, &value)
+                .map_err(WeftError::NodeFailed)?;
+            let declared = self.declared[&port].port_value_type();
+            let value = declared.conform_value(value).map_err(|why| {
+                WeftError::NodeFailed(format!(
                     "the node emitted a value on port '{port}' that its declared type \
-                     '{declared}' does not accept; nothing was sent and the port is still \
-                     open, so this emission can be retried with a value that fits"
-                )));
-            }
+                     '{declared}' does not accept ({why}); nothing was sent and the port is \
+                     still open, so this emission can be retried with a value that fits"
+                ))
+            })?;
+            conformed.outputs.insert(port, value);
         }
+        let output = conformed;
         for port in output.outputs.keys() {
             let is_generator = self.declared[port].as_generator().is_some();
             if closed.iter().any(|p| p == port) {
@@ -2100,14 +2149,27 @@ impl Capture {
     }
 
     fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
+        // The body is done: its buses end with how it returned, as the
+        // engine ends them, so a reader under test reads the same end.
+        self.buses.end(crate::bus::body_end(&result));
         let mut outputs = self.outputs.into_inner().unwrap();
+        let mut streams = self.stream_outputs.into_inner().unwrap();
+        let closed_ports = self.closed_ports.into_inner().unwrap();
+        // A stream is open once something went out on it (a bus's marker,
+        // a generator's first item) and it was not closed since, as the
+        // engine reads it off the firing's record.
+        let opened_a_stream = self.declared.iter().any(|(port, ty)| {
+            ty.opens_a_stream()
+                && (outputs.contains_key(port) || streams.get(port).is_some_and(|items| !items.is_empty()))
+                && !closed_ports.contains(port)
+        });
         // The runtime's catch, decided by the same function the engine
-        // reads: a caught failure lands on `error` and the firing ends
+        // reads: a caught failure lands on `_error` and the firing ends
         // well, so a node's test of its caught path tests what runs.
         let result = match result {
             Err(error) => match crate::context::caught_failure(
-                self.catch_errors,
                 crate::context::catchable_message(&error),
+                opened_a_stream,
                 self.wired.contains(crate::context::ERROR_PORT),
             ) {
                 Some(message) => {
@@ -2118,7 +2180,6 @@ impl Capture {
             },
             ok => ok,
         };
-        let mut streams = self.stream_outputs.into_inner().unwrap();
         // EVERY declared generator output lands in the outcome as one
         // array, a stream that yielded nothing included: a test asserts
         // the whole yielded sequence, and "no entry" would make an
@@ -2131,8 +2192,9 @@ impl Capture {
         RigOutcome {
             result,
             outputs,
-            closed_ports: self.closed_ports.into_inner().unwrap(),
+            closed_ports,
             infra_spec: None,
+            run_id: None,
         }
     }
 }
@@ -2568,8 +2630,8 @@ impl ContextHandle for TestHandle {
         &self.capture.wired
     }
 
-    fn catches_errors(&self) -> bool {
-        self.capture.catch_errors
+    fn firing_buses(&self) -> &crate::bus::FiringBuses {
+        &self.capture.buses
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
@@ -3082,8 +3144,8 @@ impl LiveRig {
     }
 
     /// Declare an output port's type for the runs that follow, as
-    /// [`FakeRig::output_type`] does on the fake tier: a created output
-    /// port, or the resolved type of a `MustOverride` one.
+    /// [`FakeRig::output_type`] does on the fake tier: an added output
+    /// port, or what a program declares on a narrowable one.
     pub fn output_type(&self, port: &str, ty: WeftType) {
         self.output_types.lock().unwrap().insert(port.to_string(), ty);
     }
@@ -3222,7 +3284,7 @@ impl LiveRig {
         let (bag, _feeds_alive) = match manifest_input_bag(manifest, &custom, inputs) {
             Ok(pair) => pair,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
         let has_generator_input = manifest.has_generator_input();
@@ -3232,12 +3294,12 @@ impl LiveRig {
         let config = match bag.object() {
             Ok(obj) => Value::Object(obj.clone()),
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
         let mut outputs_by_name = declared_output_map(manifest, &config);
-        for (port, ty) in self.output_types.lock().unwrap().iter() {
-            outputs_by_name.insert(port.clone(), ty.clone());
+        if let Err(e) = declare_output_types(manifest, &config, &mut outputs_by_name, &self.output_types.lock().unwrap()) {
+            return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None };
         }
         let inner = match (self.factory)(
             HandleRole::NodeUnderTest { node_type: &manifest.node_type },
@@ -3246,7 +3308,7 @@ impl LiveRig {
         ) {
             Ok(handle) => handle,
             Err(e) => {
-                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+                return RigOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None, run_id: None }
             }
         };
         let handle = Arc::new(CapturingHandle {
@@ -3254,13 +3316,13 @@ impl LiveRig {
             capture: Capture::new(
                 outputs_by_name,
                 self.wired_outputs.lock().unwrap().clone(),
-                manifest.features.catch_errors,
             ),
             declared_inputs: declared_input_map(manifest, &custom),
         });
         let ctx = test_context(manifest, bag, None, handle.clone());
+        let run_id = ctx.run_id;
         let result = node.run(ctx).await;
-        CaptureBox::Live(handle).into_outcome(result)
+        RigOutcome { run_id: Some(run_id), ..CaptureBox::Live(handle).into_outcome(result) }
     }
 }
 
@@ -3396,8 +3458,8 @@ impl ContextHandle for CapturingHandle {
         &self.capture.wired
     }
 
-    fn catches_errors(&self) -> bool {
-        self.capture.catch_errors
+    fn firing_buses(&self) -> &crate::bus::FiringBuses {
+        &self.capture.buses
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {

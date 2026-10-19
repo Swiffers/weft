@@ -907,12 +907,13 @@ impl BusCoordinator {
         self.registry.live_bus_arcs().iter().any(|b| !b.is_closed())
     }
 
-    /// Close every live bus (appends a `Closed` log entry to each).
-    /// Does NOT release the registry's `Arc<BusInner>` refs: the pump
-    /// still needs to journal the `Closed` entries.
-    pub fn close_all(&self) {
+    /// Close every live bus still open as `end` (appends a `Closed` log
+    /// entry to each; a bus already ended keeps its end). Does NOT
+    /// release the registry's `Arc<BusInner>` refs: the pump still
+    /// needs to journal the `Closed` entries.
+    pub fn close_all(&self, end: weft_core::bus::StreamEnd) {
         for b in self.registry.live_bus_arcs() {
-            b.close();
+            b.close(end.clone());
         }
         self.journal_pump_notify.notify_waiters();
     }
@@ -952,7 +953,7 @@ impl BusCoordinator {
             self.pump_should_exit.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
-        self.close_all();
+        self.close_all(run_ended_with_bus_open());
         let drain = self.drain_complete_notify.clone();
         loop {
             // Arm the wake BEFORE the predicate check so a drain pass
@@ -988,6 +989,13 @@ impl BusCoordinator {
     }
 }
 
+/// The end of a bus still open when its run ends. Every bus a body holds
+/// ends with that body, so one left open here outlived whoever held it
+/// (a body that never ended, a cancel): its stream did not complete.
+fn run_ended_with_bus_open() -> weft_core::bus::StreamEnd {
+    weft_core::bus::StreamEnd::Failed { error: "the run ended before this bus did".into() }
+}
+
 impl Drop for BusCoordinator {
     /// Backstop for the case where the coordinator is dropped without
     /// `shutdown()` being called first (a panic unwind, a test that
@@ -1005,7 +1013,7 @@ impl Drop for BusCoordinator {
     /// extra `close()` calls are idempotent no-ops.
     fn drop(&mut self) {
         for b in self.registry.live_bus_arcs() {
-            b.close();
+            b.close(run_ended_with_bus_open());
         }
         self.pump_should_exit
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1193,7 +1201,7 @@ async fn drain_buses(
                 // stream never reorders against the bus log.
                 BusEntryKind::Joined { .. }
                 | BusEntryKind::Left { .. }
-                | BusEntryKind::Closed => {
+                | BusEntryKind::Closed { .. } => {
                     if let Some(state) = windows.get_mut(&bus_id) {
                         if matches!(
                             write_open_window(&inner, run_id, &bus_id_str, journal, replica, state)
@@ -1333,10 +1341,11 @@ fn membership_event(run_id: RunId, bus_id: &str, entry: &BusEntry) -> RunEvent {
             name: name.clone(),
             at_unix,
         },
-        BusEntryKind::Closed => RunEvent::BusClosed {
+        BusEntryKind::Closed { end } => RunEvent::BusClosed {
             run_id,
             bus_id: bus_id.to_string(),
             offset,
+            end: end.clone(),
             at_unix,
         },
         BusEntryKind::Message { .. } => {
@@ -1414,7 +1423,7 @@ pub enum NodeTaskOutcome {
     /// has any: each one the body emitted nothing on carries it.
     Completed { saved: std::collections::BTreeMap<String, serde_json::Value> },
     /// The firing failed. `message` is what the run's failure reads;
-    /// `catchable` is what the node's `error` output carries if the
+    /// `catchable` is what the node's `_error` output carries if the
     /// failure is caught (`weft_core::context::catchable_message`),
     /// `None` for a failure that never is. `gave_up_wait`: the firing
     /// failed on a wait it gave up (`WeftError::WaitGaveUp`), a time
@@ -1451,15 +1460,6 @@ pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// can take minutes, or hours behind a slow pull); this only paces how
 /// often a still-running one says so.
 const INFRA_APPLY_REPORT_EVERY: Duration = Duration::from_secs(30);
-
-/// The runtime output-type gate: a node may only emit on a port a value
-/// its declared type accepts (`WeftType::accepts_runtime_value`: a
-/// declared named/record shape validates the value against its
-/// contract, everything else infers and compares structurally; an
-/// unresolved declared type accepts anything).
-fn type_accepts(declared: &WeftType, value: &Value) -> bool {
-    declared.accepts_runtime_value(value)
-}
 
 /// Journal write for teardown paths that cannot propagate errors: a
 /// failure is logged. Through a `DriveJournal` the write is only handed
@@ -1518,9 +1518,9 @@ pub struct RunnerHandle {
     /// Which copies of its infra the run's program declares: an `Infra`
     /// handle another node shared resolves only to one of these.
     declared_infra: Arc<weft_core::project::DeclaredInfra>,
-    /// The node declares `features.catchErrors`, so its `error` output
-    /// is the runtime's to fill (`ContextHandle::catches_errors`).
-    catch_errors: bool,
+    /// The buses this firing ends when its body does
+    /// (`weft_core::bus::FiringBuses`, ended by [`Self::end_body`]).
+    buses: weft_core::bus::FiringBuses,
     /// The node's baked outputs (`weft_core::infra::bake`), and what the
     /// body emitted on them this firing: what an infra setup saves.
     baked_outputs: std::collections::BTreeSet<String>,
@@ -1725,7 +1725,7 @@ impl RunnerHandle {
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
-            catch_errors: false,
+            buses: Default::default(),
             baked_outputs: Default::default(),
             baked_emitted: Default::default(),
             infra_made: Default::default(),
@@ -1900,13 +1900,6 @@ impl RunnerHandle {
         self
     }
 
-    /// Whether this node declares `features.catchErrors` (from its
-    /// definition).
-    pub fn with_catch_errors(mut self, catch_errors: bool) -> Self {
-        self.catch_errors = catch_errors;
-        self
-    }
-
     pub fn with_baked_outputs(mut self, baked_outputs: std::collections::BTreeSet<String>) -> Self {
         self.baked_outputs = baked_outputs;
         self
@@ -1996,9 +1989,11 @@ impl RunnerHandle {
     /// with a clone of its ctx) is refused, because the firing it would
     /// belong to is no longer running. Taken under the claims lock every
     /// emission sends under, so an emission is either on the channel
-    /// before the firing's terminal or refused.
-    pub fn end_body(&self) {
+    /// before the firing's terminal or refused. The buses the body held
+    /// end with `end`, how it returned (`weft_core::bus::body_end`).
+    pub fn end_body(&self, end: weft_core::bus::StreamEnd) {
         self.lock_port_claims().body_returned = true;
+        self.buses.end(end);
     }
 
     /// The refusal for anything done through this handle after its body
@@ -2436,7 +2431,6 @@ pub async fn ship_port_emissions(
                 frames: frames.clone(),
                 port: port.clone(),
                 value: value.clone(),
-                provided: false,
                 at_unix: now_unix(),
             },
             replica,
@@ -2462,7 +2456,6 @@ pub async fn ship_port_closed(
         node_id: node_id.to_string(),
         frames: frames.clone(),
         port: port.to_string(),
-        provided: false,
         at_unix: now_unix(),
     };
     record_from_replica(journal, event, replica).await;
@@ -3339,8 +3332,8 @@ impl ContextHandle for RunnerHandle {
         &self.wired_outputs
     }
 
-    fn catches_errors(&self) -> bool {
-        self.catch_errors
+    fn firing_buses(&self) -> &weft_core::bus::FiringBuses {
+        &self.buses
     }
 
     /// Fire downstream. Each output port the node mentions in
@@ -3384,31 +3377,26 @@ impl ContextHandle for RunnerHandle {
             // fails the call outright, naming where the bytes belong.
             weft_core::storage::check_wire_value(&self.place, &port, &value)
                 .map_err(WeftError::NodeFailed)?;
-            match self.declared_outputs.get(&port).map(|d| (d, d.as_generator())) {
-                Some((_, Some(element))) if !type_accepts(element, &value) => {
-                    return Err(WeftError::NodeFailed(format!(
-                        "node '{}' yielded a value on stream port '{}' that the element \
-                         type '{}' does not accept (got {})",
-                        self.place,
-                        port,
-                        element,
-                        WeftType::infer(&value),
-                    )));
-                }
-                Some((declared, None)) if !type_accepts(declared, &value) => {
-                    return Err(WeftError::NodeFailed(format!(
-                        "node '{}' emitted a value on port '{}' that its declared type '{}' \
-                         does not accept (got {})",
-                        self.place,
-                        port,
-                        declared,
-                        WeftType::infer(&value),
-                    )));
-                }
-                _ => {
+            let (declared, what) = match self.declared_outputs.get(&port) {
+                Some(declared) => match declared.as_generator() {
+                    Some(element) => (element, "yielded a value on stream port"),
+                    None => (declared, "emitted a value on port"),
+                },
+                None => {
                     kept.outputs.insert(port, value);
+                    continue;
                 }
-            }
+            };
+            // An open record drops the keys it does not declare here, so
+            // what flows on carries only what the port says it holds.
+            let value = declared.conform_value(value).map_err(|why| {
+                WeftError::NodeFailed(format!(
+                    "node '{}' {what} '{port}' that its declared type '{declared}' does not \
+                     accept: {why}",
+                    self.place,
+                ))
+            })?;
+            kept.outputs.insert(port, value);
         }
 
         // The call is now known to proceed: claim every touched port
@@ -3716,7 +3704,7 @@ fn http_client() -> &'static reqwest::Client {
 
 #[cfg(test)]
 mod type_check_tests {
-    use super::type_accepts;
+    use serde_json::Value;
     use weft_core::storage::StoredFile;
     use weft_core::weft_type::{FileKind, WeftType};
 
@@ -3742,34 +3730,53 @@ mod type_check_tests {
         .to_value()
     }
 
+    fn accepts(declared: &WeftType, value: Value) -> bool {
+        declared.conform_value(value).is_ok()
+    }
+
     #[test]
     fn declared_file_accepts_any_stored_file() {
         let file = WeftType::file();
-        assert!(type_accepts(&file, &image_value()));
-        assert!(type_accepts(&file, &video_value()));
+        assert!(accepts(&file, image_value()));
+        assert!(accepts(&file, video_value()));
     }
 
     #[test]
     fn narrowed_image_accepts_image_rejects_video() {
         // The File port narrowed to Image: an image flows, a video does not.
         let image = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Image);
-        assert!(type_accepts(&image, &image_value()));
-        assert!(!type_accepts(&image, &video_value()), "a video on an Image port is refused");
+        assert!(accepts(&image, image_value()));
+        assert!(!accepts(&image, video_value()), "a video on an Image port is refused");
     }
 
     #[test]
     fn primitive_mismatch_is_rejected() {
         let number = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number);
-        assert!(type_accepts(&number, &serde_json::json!(42)));
-        assert!(!type_accepts(&number, &serde_json::json!("not a number")));
+        assert!(accepts(&number, serde_json::json!(42)));
+        assert!(!accepts(&number, serde_json::json!("not a number")));
     }
 
     #[test]
     fn unresolved_declared_accepts_anything() {
-        // A TypeVar / MustOverride port has no concrete contract yet, so the
-        // gate must not reject (is_compatible short-circuits on unresolved).
-        assert!(type_accepts(&WeftType::MustOverride, &video_value()));
-        assert!(type_accepts(&WeftType::type_var("T"), &serde_json::json!("anything")));
+        // A TypeVar port has no concrete contract yet, so the gate must
+        // not reject (is_compatible short-circuits on unresolved).
+        assert!(accepts(&WeftType::type_var("T"), video_value()));
+        assert!(accepts(&WeftType::type_var("T"), serde_json::json!("anything")));
+    }
+
+    /// A narrowed output holds the value to the declared shape: a
+    /// missing field fails naming it, an open record's extra key is
+    /// dropped on the way out.
+    #[test]
+    fn a_declared_record_names_the_missing_field_and_an_open_one_drops_extras() {
+        let verdict = WeftType::parse("{ label: String, score: Number }").expect("type");
+        let why = verdict.conform_value(serde_json::json!({ "label": "ok" })).unwrap_err();
+        assert!(why.contains("missing required field \"score\""), "{why}");
+        let open = WeftType::parse("{ label: String, .. }").expect("type");
+        assert_eq!(
+            open.conform_value(serde_json::json!({ "label": "ok", "extra": 1 })),
+            Ok(serde_json::json!({ "label": "ok" })),
+        );
     }
 
     // Touch FileKind so the import is used even if the helpers change.
@@ -5292,7 +5299,7 @@ mod bus_pump_tests {
         let (waits, coord) = coord_with_tracker();
         let mut bus = new_bus_for(&coord, "a");
         bus.register("a").unwrap();
-        coord.close_all();
+        coord.close_all(weft_core::bus::StreamEnd::Finished);
         // No liveness entry was ever created (the node never entered a
         // wait), and dropping the registered handle on a closed bus must
         // not panic.

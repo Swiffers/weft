@@ -14,7 +14,7 @@
 	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
-	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort } from "../../../../protocol";
+	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort, portVar } from "../../../../protocol";
 	import FieldStrip from './FieldStrip.svelte';
 	import { LOOP_CONFIG_FIELDS, fieldForInput, gateField, nextPortLiterals } from '../../utils/input-field';
 
@@ -418,7 +418,12 @@
 			return buildPortMenuItems({
 				port,
 				...(side === 'input'
-					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					? {
+						side,
+						// A container port is always written: `x:` or `x?:`.
+						requiredness: port.required ? 'required' : 'optional',
+						onSetRequired: (required: boolean) => setInputPortRequired(portName, required),
+					}
 					: { side }),
 				deleteAction: 'remove',
 				onSetType: (newType) => setPortType(portName, side, newType),
@@ -487,13 +492,15 @@
 				}
 				return;
 			}
-			currentInputs.push({ name: trimmed, portType: 'MustOverride', required: false });
+			// No type chosen yet: the port holds its own variable, which the
+			// signature writes as the bare name.
+			currentInputs.push({ name: trimmed, portType: portVar('input', trimmed), required: false });
 		} else {
 			if (currentOutputs.some(p => p.name === trimmed)) {
 				toast.error(`Output port "${trimmed}" already exists.`);
 				return;
 			}
-			currentOutputs.push({ name: trimmed, portType: 'MustOverride', required: true });
+			currentOutputs.push({ name: trimmed, portType: portVar('output', trimmed), required: true });
 		}
 		// Send the port change alone. If the extra port grows the group past its
 		// current height, the min-height `$effect` above fires right after this

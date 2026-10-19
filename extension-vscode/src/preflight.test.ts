@@ -9,7 +9,7 @@ function diag(over: Partial<WeftDiagnostic>): WeftDiagnostic {
     endLine: 0,
     endColumn: 0,
     severity: 'error',
-    message: "OpenRouterProvider 'llm' has no OpenRouter connection picked; connect one on the node.",
+    message: "OpenRouterAccess 'openrouter' has no OpenRouter connection picked; connect one on the node.",
     code: 'rule-runtime',
     ...over,
   };

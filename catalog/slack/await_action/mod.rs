@@ -215,7 +215,7 @@ impl Node for SlackAwaitActionNode {
 }
 
 /// A button list the program wrote wrong: an input error, which
-/// `error` never catches (the fix is editing the program).
+/// `_error` never catches (the fix is editing the program).
 fn bad_buttons(what: &str) -> weft::WeftError {
     weft::WeftError::Input(what.to_string())
 }

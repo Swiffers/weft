@@ -35,7 +35,7 @@
       "type": "LlmProvider",
       "required": true,
       "accepts": ["wire"],
-      "description": "Which service, model, and credential: wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output. Never build this value by hand or pass it through a port typed JsonDict (a group that carries it declares the port as LlmProvider)."
+      "description": "Which service, model, and credential: wire an OpenRouter Model, Anthropic Model, OpenAI Model, or Custom Provider node's output. Never build this value by hand or pass it through a port typed JsonDict (a group that carries it declares the port as LlmProvider)."
     },
     {
       "name": "params",
@@ -61,13 +61,6 @@
       "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one."
     },
     {
-      "name": "parseJson",
-      "type": "Boolean",
-      "default": false,
-      "label": "Parse JSON",
-      "description": "Parse and repair JSON from the reply (output becomes a Dict). Declare output ports named after the JSON's keys (`-> (verdict: String, score: Number)`) and each key comes out on its own port."
-    },
-    {
       "name": "autoCache",
       "type": "Boolean",
       "default": true,
@@ -78,8 +71,8 @@
   "outputs": [
     {
       "name": "response",
-      "type": "MustOverride",
-      "description": "The reply. Declare its type: `String` without parseJson; with parseJson read it only when something needs the whole object (`JsonDict` or a record type), and prefer one port per key."
+      "type": "String",
+      "description": "The reply's text, as the model wrote it (never parsed: for an answer read as JSON, use the LLM (JSON) node). Empty on a turn that only called tools."
     },
     {
       "name": "historyFile",
@@ -92,26 +85,7 @@
       "description": "Pulses only when the model called tools. Append each result with a Chat Message (role tool) and wire its `historyFile` into the next call. A call left unanswered (the run stopped before its result was appended) is answered `cancelled` by the next call."
     }
   ],
-  "validate": [
-    {
-      "when": {
-        "kind": "all",
-        "of": [
-          { "kind": "custom_outputs_declared" },
-          { "kind": "not", "of": { "kind": "config_equals", "field": "parseJson", "equals": true } }
-        ]
-      },
-      "then": {
-        "message": "'{id}' declares output ports ({customOutputs}) that only fire with parseJson: true; turn it on, or drop the ports and read `response`",
-        "level": "structural",
-        "severity": "error",
-        "field": "parseJson"
-      }
-    }
-  ],
   "features": {
-    "catchErrors": true,
-    "canAddOutputPorts": true,
     "oneOfRequired": [["prompt", "historyFile", "media"]]
   }
 }

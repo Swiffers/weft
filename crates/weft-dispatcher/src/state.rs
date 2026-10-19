@@ -164,10 +164,8 @@ impl DispatcherState {
         Ok(Some(program))
     }
 
-    /// The program identity of the run whose rows are `events`: read
-    /// from the project's stored code for the binary its birth names. A
-    /// run never copies the implementation fingerprints, so this is the
-    /// way back to them.
+    /// The program identity of the run whose rows are `events`
+    /// ([`Self::registered_identity`] of what its birth names).
     pub async fn run_program_identity(
         &self,
         events: &[weft_journal::RunEvent],
@@ -176,14 +174,35 @@ impl DispatcherState {
             run_id,
             project_id,
             definition_hash: Some(definition_hash),
+            cut_from,
             binary_hash: Some(binary_hash),
             ..
         }) = events.first()
         else {
             anyhow::bail!("the run's history does not start with a birth naming its program");
         };
+        self.registered_identity(*run_id, *project_id, definition_hash, cut_from.as_deref(), binary_hash).await
+    }
+
+    /// The identity of the registered program run `run_id` of `project_id`
+    /// ran against, its birth naming its program `definition_hash` (cut
+    /// from `cut_from`, for a run of a cut) on worker `binary_hash`: read
+    /// from the project's stored code for that binary. A run never copies
+    /// the implementation fingerprints, so this is the way back to them.
+    /// A run of a cut answers with the registered program it was cut
+    /// from: what its bakes are for and what a seed holds its results
+    /// against.
+    pub async fn registered_identity(
+        &self,
+        run_id: weft_core::RunId,
+        project_id: uuid::Uuid,
+        definition_hash: &str,
+        cut_from: Option<&str>,
+        binary_hash: &str,
+    ) -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
+        let registered = cut_from.unwrap_or(definition_hash);
         self.projects
-            .program_identity(*project_id, definition_hash, binary_hash)
+            .program_identity(project_id, registered, binary_hash)
             .await?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} ran on worker {binary_hash}, which its project no longer records"))
     }

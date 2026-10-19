@@ -32,7 +32,8 @@
   "outputs": [
     {
       "name": "value",
-      "type": "MustOverride",
+      "type": "String | Number | Boolean | JsonDict",
+      "narrowable": true,
       "description": "The event's `value` field. The feed decides its type, so declare it where the node is used: `-> (value: String)`."
     }
   ],

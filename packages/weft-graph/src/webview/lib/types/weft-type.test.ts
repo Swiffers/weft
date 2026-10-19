@@ -8,8 +8,12 @@ import {
 	weftTypesEqual,
 	extractPrimitives,
 	inferTypeFromValue,
+	fitsWithin,
+	tryParseWeftType,
+	typeVarBoundRefuses,
 	type WeftType,
 } from '../types';
+import { portVar } from '../../../protocol';
 
 describe('parseWeftType', () => {
 	it('parses primitives', () => {
@@ -62,8 +66,13 @@ describe('parseWeftType', () => {
 		expect(parseWeftType('T42')?.kind).toBe('typevar');
 	});
 
-	it('parses MustOverride', () => {
-		expect(parseWeftType('MustOverride')?.kind).toBe('must_override');
+	it("parses a port's own variable", () => {
+		expect(parseWeftType(portVar('input', 'photo'))).toEqual({ kind: 'typevar', name: 'T__in__photo' });
+		expect(parseWeftType(portVar('output', 'photo'))).toEqual({ kind: 'typevar', name: 'T__out__photo' });
+	});
+
+	it('reads `MustOverride` as an unknown name like any other', () => {
+		expect(tryParseWeftType('MustOverride')).toEqual({ ok: false, error: '`MustOverride` is not a type', unknownName: true });
 	});
 
 	it('parses Access', () => {
@@ -86,6 +95,7 @@ describe('parseWeftType', () => {
 				{ name: 'age', ty: { kind: 'primitive', value: 'Number' }, optional: false },
 				{ name: 'nickname', ty: { kind: 'primitive', value: 'String' }, optional: true },
 			],
+			open: false,
 		});
 	});
 
@@ -97,6 +107,7 @@ describe('parseWeftType', () => {
 			body: {
 				kind: 'record',
 				fields: [{ name: 'name', ty: { kind: 'primitive', value: 'String' }, optional: false }],
+				open: false,
 			},
 		});
 	});
@@ -128,7 +139,7 @@ describe('parseWeftType', () => {
 		// Mirrors the backend's wire-parser gate: a declared body must
 		// be concrete, or two same-named types could carry different
 		// bodies under name-only nominal compatibility.
-		for (const s of ['MyBox=List[T]', 'MyBox=T_Auto', 'MyBox={a: T}', 'MyBox=MustOverride']) {
+		for (const s of ['MyBox=List[T]', 'MyBox=T_Auto', 'MyBox={a: T}', 'MyBox=T__photo']) {
 			expect(parseWeftType(s), s).toBeNull();
 		}
 	});
@@ -196,7 +207,6 @@ describe('complex type parsing', () => {
 		const t = parseWeftType('Dict[String, List[String]]');
 		expect(t?.kind).toBe('dict');
 		if (t?.kind === 'dict') {
-			expect(t.key.kind).toBe('primitive');
 			expect(t.value.kind).toBe('list');
 			if (t.value.kind === 'list') {
 				expect(t.value.inner.kind).toBe('primitive');
@@ -552,7 +562,7 @@ describe('weftTypeToString roundtrip', () => {
 		'T',
 		'T1',
 		'List[T]',
-		'MustOverride',
+		'T__photo',
 		'Access',
 		'{ name: String, nickname?: String }',
 	];
@@ -622,15 +632,15 @@ describe('isWeftTypeCompatible', () => {
 		expect(isWeftTypeCompatible('Dict[String, String]', 'Dict[String, Number]')).toBe(false);
 	});
 
-	// TypeVar/MustOverride always compatible (unresolved)
+	// A type variable is always compatible (unresolved)
 	it('TypeVar compatible with anything', () => {
 		expect(isWeftTypeCompatible('T', 'String')).toBe(true);
 		expect(isWeftTypeCompatible('String', 'T')).toBe(true);
 	});
 
-	it('MustOverride compatible with anything', () => {
-		expect(isWeftTypeCompatible('MustOverride', 'String')).toBe(true);
-		expect(isWeftTypeCompatible('String', 'MustOverride')).toBe(true);
+	it("a port's own variable compatible with anything", () => {
+		expect(isWeftTypeCompatible('T__photo', 'String')).toBe(true);
+		expect(isWeftTypeCompatible('String', 'T__photo')).toBe(true);
 	});
 
 	// List compatibility. ('List into matching List' and 'element into
@@ -774,8 +784,8 @@ describe('extractPrimitives', () => {
 		expect(extractPrimitives(parseWeftType('T')!)).toEqual([]);
 	});
 
-	it('returns empty for MustOverride', () => {
-		expect(extractPrimitives(parseWeftType('MustOverride')!)).toEqual([]);
+	it("returns empty for a port's own variable", () => {
+		expect(extractPrimitives(parseWeftType('T__photo')!)).toEqual([]);
 	});
 });
 
@@ -825,7 +835,6 @@ describe('inferTypeFromValue', () => {
 		const t = inferTypeFromValue({});
 		expect(t.kind).toBe('dict');
 		if (t.kind === 'dict') {
-			expect(t.key).toEqual({ kind: 'primitive', value: 'String' });
 			expect(t.value).toEqual({ kind: 'primitive', value: 'Empty' });
 		}
 	});
@@ -930,8 +939,8 @@ describe('mock type compatibility', () => {
 		expect(mockPortCompatible([1, 2], 'T')).toBe(true);
 	});
 
-	it('any value matches MustOverride', () => {
-		expect(mockPortCompatible('anything', 'MustOverride')).toBe(true);
+	it("any value matches a port's own variable", () => {
+		expect(mockPortCompatible('anything', 'T__photo')).toBe(true);
 	});
 
 	it('nested dict matches Dict[String, Number]', () => {
@@ -952,7 +961,7 @@ describe('mock type compatibility', () => {
 		expect(mockPortCompatible([], 'List[Number]')).toBe(true);
 	});
 
-	// Regression: frontend was missing typevar/MustOverride guards,
+	// Regression: frontend was missing typevar guards,
 	// causing false-positive validation errors
 	it('any value matches TypeVar T (regression)', () => {
 		expect(mockPortCompatible('hello', 'T')).toBe(true);
@@ -962,10 +971,10 @@ describe('mock type compatibility', () => {
 		expect(mockPortCompatible(null, 'T')).toBe(true);
 	});
 
-	it('any value matches MustOverride (regression)', () => {
-		expect(mockPortCompatible('anything', 'MustOverride')).toBe(true);
-		expect(mockPortCompatible(42, 'MustOverride')).toBe(true);
-		expect(mockPortCompatible([1], 'MustOverride')).toBe(true);
+	it("any value matches a port's own variable (regression)", () => {
+		expect(mockPortCompatible('anything', 'T__photo')).toBe(true);
+		expect(mockPortCompatible(42, 'T__photo')).toBe(true);
+		expect(mockPortCompatible([1], 'T__photo')).toBe(true);
 	});
 
 	// Regression: Null at top level was type-checked instead of skipped,
@@ -1151,5 +1160,166 @@ describe('inferTypeFromValue no typevars', () => {
 		const s = weftTypeToString(t);
 		expect(s).not.toContain(' T');
 		expect(s).not.toMatch(/T\]/);
+	});
+});
+
+// ── Dict keys are text ──────────────────────────────────────────────────────
+// SYNC assertions with crates/weft-core/src/weft_type.rs parse_single_type (Dict arm)
+
+describe('dict keys', () => {
+	it('holds only the value type and still spells Dict[String, V]', () => {
+		const t = parseWeftType('Dict[String, Number]');
+		expect(t).toEqual({ kind: 'dict', value: { kind: 'primitive', value: 'Number' } });
+		expect(weftTypeToString(t!)).toBe('Dict[String, Number]');
+		expect(weftTypeToWireString(parseWeftType('Dict[String, List[Media]]')!)).toBe('Dict[String, List[Media]]');
+	});
+
+	it('refuses any key but String, pointing at a list of key/value records', () => {
+		const parsed = tryParseWeftType('Dict[Number, String]');
+		expect(parsed.ok).toBe(false);
+		if (!parsed.ok) {
+			expect(parsed.error).toContain("a dict's keys are always text");
+			expect(parsed.error).toContain('List[{key: Number, value: String}]');
+			expect(parsed.unknownName).toBe(false);
+		}
+		expect(parseWeftType('Dict[Number, String]')).toBeNull();
+		expect(parseWeftType('Dict[String | Number, String]')).toBeNull();
+		expect(parseWeftType('Dict[T, String]')).toBeNull();
+	});
+
+	it('compares values only, and JsonDict meets every dict both ways', () => {
+		expect(isWeftTypeCompatible('Dict[String, Image]', 'Dict[String, Media]')).toBe(true);
+		expect(isWeftTypeCompatible('Dict[String, Media]', 'Dict[String, Image]')).toBe(false);
+		expect(isWeftTypeCompatible('JsonDict', 'Dict[String, Number]')).toBe(true);
+		expect(isWeftTypeCompatible('Dict[String, Number]', 'JsonDict')).toBe(true);
+	});
+
+	it('an unknown name is marked as one the compiler settles', () => {
+		const parsed = tryParseWeftType('List[Verdict]');
+		expect(parsed.ok).toBe(false);
+		if (!parsed.ok) expect(parsed.unknownName).toBe(true);
+	});
+});
+
+// ── Open records ────────────────────────────────────────────────────────────
+
+describe('open records', () => {
+	it('parses a last `..` as an open record and displays it', () => {
+		const t = parseWeftType('{ email: String, age?: Number, .. }');
+		expect(t).toEqual({
+			kind: 'record',
+			fields: [
+				{ name: 'email', ty: { kind: 'primitive', value: 'String' }, optional: false },
+				{ name: 'age', ty: { kind: 'primitive', value: 'Number' }, optional: true },
+			],
+			open: true,
+		});
+		expect(weftTypeToString(t!)).toBe('{email: String, age?: Number, ..}');
+		expect(parseWeftType(weftTypeToWireString(t!))).toEqual(t);
+		expect(weftTypeToString(parseWeftType('{ email: String }')!)).toBe('{email: String}');
+	});
+
+	it('refuses `..` anywhere but last, and a record with no field', () => {
+		const notLast = tryParseWeftType('{ .., email: String }');
+		expect(notLast.ok).toBe(false);
+		if (!notLast.ok) expect(notLast.error).toContain('comes last');
+		expect(parseWeftType('{ .. }')).toBeNull();
+		expect(parseWeftType('{}')).toBeNull();
+		expect(parseWeftType('{ email: String, .., .. }')).toBeNull();
+	});
+
+	it('equality includes openness', () => {
+		const open = parseWeftType('{ a: String, .. }')!;
+		const closed = parseWeftType('{ a: String }')!;
+		expect(weftTypesEqual(open, closed)).toBe(false);
+		expect(weftTypesEqual(open, parseWeftType('{a: String, ..}')!)).toBe(true);
+	});
+
+	it('an open target takes undeclared fields, a closed one refuses them', () => {
+		expect(isWeftTypeCompatible('{ email: String, extra: Number }', '{ email: String }')).toBe(false);
+		expect(isWeftTypeCompatible('{ email: String, extra: Number }', '{ email: String, .. }')).toBe(true);
+	});
+
+	it('a missing required field is refused either way', () => {
+		expect(isWeftTypeCompatible('{ extra: Number }', '{ email: String }')).toBe(false);
+		expect(isWeftTypeCompatible('{ extra: Number }', '{ email: String, .. }')).toBe(false);
+		expect(isWeftTypeCompatible('{ email?: String }', '{ email: String, .. }')).toBe(false);
+	});
+
+	it("the source's openness says nothing", () => {
+		expect(isWeftTypeCompatible('{ email: String, .. }', '{ email: String }')).toBe(true);
+	});
+});
+
+// ── fitsWithin ──────────────────────────────────────────────────────────────
+// SYNC assertions with crates/weft-core/src/weft_type.rs fits_within
+
+describe('fitsWithin', () => {
+	const t = (s: string) => parseWeftType(s)!;
+
+	it('is compatibility for an ordinary type', () => {
+		expect(fitsWithin(t('Image'), t('Media'))).toBe(true);
+		expect(fitsWithin(t('Blob'), t('Media'))).toBe(false);
+		expect(fitsWithin(t('Signup={ email: String }'), t('JsonDict'))).toBe(true);
+	});
+
+	it('narrows a stream item-wise, where wiring stays invariant', () => {
+		expect(fitsWithin(t('Generator[Image]'), t('Generator[Media]'))).toBe(true);
+		expect(isCompatible(t('Generator[Image]'), t('Generator[Media]'))).toBe(false);
+		expect(fitsWithin(t('Generator[Blob]'), t('Generator[Media]'))).toBe(false);
+		expect(fitsWithin(t('Generator[Generator[Image]]'), t('Generator[Generator[Media]]'))).toBe(true);
+		expect(fitsWithin(t('Rows=Generator[{ id: Number }]'), t('Generator[JsonDict]'))).toBe(true);
+		expect(fitsWithin(t('Image'), t('Generator[Media]'))).toBe(false);
+	});
+
+	it('keeps a named bound nominal', () => {
+		expect(fitsWithin(t('Generator[Number]'), t('Rows=Generator[Number]'))).toBe(false);
+		expect(fitsWithin(t('Other=Generator[Number]'), t('Rows=Generator[Number]'))).toBe(false);
+		expect(fitsWithin(t('Rows=Generator[Number]'), t('Rows=Generator[Number]'))).toBe(true);
+	});
+});
+
+describe('record into a dict', () => {
+	it('an optional field needs the value type to take null', () => {
+		expect(isWeftTypeCompatible('{ a?: Number }', 'Dict[String, Number]')).toBe(false);
+		expect(isWeftTypeCompatible('{ a?: Number }', 'Dict[String, Number | Null]')).toBe(true);
+		expect(isWeftTypeCompatible('{ a: Number }', 'Dict[String, Number]')).toBe(true);
+	});
+});
+
+describe('a paren group', () => {
+	it('is stripped only when it wraps the whole type', () => {
+		expect(parseWeftType('(String | Number)')).toEqual(parseWeftType('String | Number'));
+		const twoGroups = tryParseWeftType('(String)(Number)');
+		expect(twoGroups.ok).toBe(false);
+		if (!twoGroups.ok) expect(twoGroups.error).toContain('`(String)(Number)`');
+		expect(tryParseWeftType('(String]').ok).toBe(false);
+	});
+});
+
+// ── Bounded type parameters on a wire ───────────────────────────────────────
+
+describe('typeVarBoundRefuses', () => {
+	const media = [{ name: 'T', bound: 'Media' }];
+
+	it('refuses a source outside the bound of a bare variable target', () => {
+		expect(typeVarBoundRefuses('String', 'T', media)).toBe(true);
+		expect(typeVarBoundRefuses('Blob', 'T', media)).toBe(true);
+		expect(typeVarBoundRefuses('Video', 'T', media)).toBe(false);
+	});
+
+	it('checks nothing on a target that is not a bare bounded variable', () => {
+		expect(typeVarBoundRefuses('String', 'T', undefined)).toBe(false);
+		expect(typeVarBoundRefuses('String', 'T1', media)).toBe(false);
+		expect(typeVarBoundRefuses('String', 'List[T]', media)).toBe(false);
+		expect(typeVarBoundRefuses('String', 'String', media)).toBe(false);
+	});
+
+	it('substitutes resolved variables into the bound, and skips one still unresolved', () => {
+		const params = [{ name: 'T', bound: 'Media' }, { name: 'T2', bound: 'List[T]' }];
+		expect(typeVarBoundRefuses('List[Image]', 'T2', params)).toBe(false);
+		const resolved = [{ name: 'T', bound: 'Media', resolved: 'Video' }, { name: 'T2', bound: 'List[T]' }];
+		expect(typeVarBoundRefuses('List[Image]', 'T2', resolved)).toBe(true);
+		expect(typeVarBoundRefuses('List[Video]', 'T2', resolved)).toBe(false);
 	});
 });

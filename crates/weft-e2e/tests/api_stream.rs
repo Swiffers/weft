@@ -1,14 +1,31 @@
 //! Streaming with zero custom Rust: a bus behind a route, framed as
 //! server-sent events and as ndjson, read whole by the rig. Plus the
 //! lifetime of a streaming run: a caller who hangs up on a feed that has
-//! gone quiet still ends it.
+//! gone quiet still ends it. And a producer failing: before its first
+//! piece unhandled (a plain failure naming the run), before it with a
+//! backup branch on `_error`, and halfway (the stream's error marker).
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
+use weft_e2e::run::SettledRun;
 use weft_e2e::{ensure, live, project::Project};
 
 fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The run an answer names in its `Weft-Run-Id` header, which every
+/// answer of a route's run carries.
+fn run_of(headers: &reqwest::header::HeaderMap) -> anyhow::Result<uuid::Uuid> {
+    let value = header(headers, weft_core::caller::RUN_ID_HEADER)
+        .ok_or_else(|| anyhow::anyhow!("the answer names no run: {headers:?}"))?;
+    Ok(value.parse()?)
+}
+
+/// The run `run_id` once it settled. A route's run reaches its record a
+/// moment after its answer; the wait covers that.
+async fn settled(disp: &weft_e2e::client::Dispatcher, run_id: uuid::Uuid) -> anyhow::Result<SettledRun> {
+    SettledRun::observe_within(disp, run_id, std::time::Duration::from_secs(120)).await
 }
 
 #[tokio::test]
@@ -17,12 +34,13 @@ async fn a_bus_streams_as_sse_and_ndjson() -> anyhow::Result<()> {
     let mut project = Project::prepare("api_stream", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-
     let (status, headers, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/sse"), &[], None).await?;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
     assert_eq!(String::from_utf8_lossy(&body), "data: t1\n\ndata: t2\n\ndata: t3\n\n");
+    let streamed = run_of(&headers)?;
+    settled(&disp, streamed).await?.completed()?;
 
     let (status, headers, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/lines"), &[], None).await?;
@@ -175,6 +193,74 @@ async fn abandoned_streams_do_not_pile_up() -> anyhow::Result<()> {
             settled.cancel_reason()
         );
     }
+
+    project.finish().await
+}
+
+/// A producer that fails before its first piece, with nothing handling it:
+/// the run fails without answering, and its caller is told only that it
+/// failed and which run it was, as JSON under a `500`. The whole message
+/// stays on the run, where its owner reads it.
+#[tokio::test]
+async fn a_run_that_fails_unanswered_tells_its_caller_plainly() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_stream", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+    let (status, headers, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/refused"), &[], None).await?;
+    assert_eq!(status, 500, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(header(&headers, "content-type"), Some("application/json"));
+    let run_id = run_of(&headers)?;
+    let told: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(told, serde_json::json!({ "error": "Something went wrong", "runId": run_id.to_string() }));
+    settled(&disp, run_id).await?.failed_with("the stand-in model went away after 0 tick(s)")?;
+
+    project.finish().await
+}
+
+/// The same failure with a backup branch gated on the producer's
+/// `_error`: no bus opened, so the stream never starts, and the backup
+/// answers the caller. The run completes.
+#[tokio::test]
+async fn a_producer_failing_before_its_first_piece_is_answered_by_a_backup() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_stream", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+    let (status, headers, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/backup"), &[], None).await?;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&body)?, serde_json::json!("the backup answered"));
+    let run = settled(&disp, run_of(&headers)?).await?;
+    run.completed()?;
+    run.assert_completed("fallback")?;
+
+    project.finish().await
+}
+
+/// A producer that breaks off after two pieces: the caller gets what
+/// went out, then the format's error marker (an SSE `error` event with
+/// the plain failure and the run's id), never a short stream passed off
+/// as whole.
+#[tokio::test]
+async fn a_stream_that_breaks_off_ends_with_its_error_marker() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_stream", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+    let (status, headers, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/broken"), &[], None).await?;
+    assert_eq!(status, 200, "the head went out with the first piece");
+    assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+    let run_id = run_of(&headers)?;
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        format!(
+            "data: t1\n\ndata: t2\n\n\nevent: error\ndata: {{\"error\":\"Something went wrong\",\"runId\":\"{run_id}\"}}\n\n"
+        )
+    );
+    settled(&disp, run_id).await?.failed_with("the stand-in model went away after 2 tick(s)")?;
 
     project.finish().await
 }

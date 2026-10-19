@@ -77,7 +77,7 @@ impl Node for ElevenLabsRunTemplateNode {
                 Ok((name.clone(), ty.clone()))
             })
             .collect::<WeftResult<_>>()?;
-        let outputs: BTreeMap<String, WeftType> = ctx.data_outputs().into_iter().collect();
+        let outputs: BTreeMap<String, WeftType> = ctx.declared_outputs().into_iter().collect();
 
         let http = ctx.client(&account).await?;
         let refs = References::new(&ctx, &http);

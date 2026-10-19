@@ -34,8 +34,5 @@
       "name": "messageId",
       "type": "String"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

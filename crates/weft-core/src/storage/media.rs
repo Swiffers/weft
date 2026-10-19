@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::weft_type::{FileKind, WeftType};
+use crate::weft_type::{FileKind, WeftPrimitive, WeftType};
 
 /// What external form a stored media slot takes: a presigned URL
 /// (cheap: nothing is downloaded, the consumer fetches the bytes
@@ -137,12 +137,61 @@ pub fn classify_media_slot(value: &Value) -> Result<MediaSlotContent, String> {
 pub fn media_slots(value: &Value, ty: &WeftType) -> Vec<Value> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    walk(value, ty, &mut |slot| {
+    walk(value, ty, &mut |slot, _| {
         if seen.insert(slot.to_string()) {
             out.push(slot.clone());
         }
         None
     });
+    out
+}
+
+/// [`media_slots`] with the type each slot is declared as (`Image`, or
+/// the union `Image | Null` it sits in) and where the slot sits in the
+/// value (`photo`, `pages[2].scan`; empty when the value itself is the
+/// slot), for a caller that holds what arrives in a slot to what the
+/// slot says it takes and names the place that did not. One entry per
+/// distinct (value, type) pair, at its first place, in traversal order.
+pub fn typed_media_slots(value: &Value, ty: &WeftType) -> Vec<TypedSlot> {
+    let mut out: Vec<TypedSlot> = Vec::new();
+    walk_at(value, ty, &mut Vec::new(), &mut |at, slot, slot_ty| {
+        if !out.iter().any(|s| s.value == *slot && s.ty == *slot_ty) {
+            out.push(TypedSlot { at: place_name(at), value: slot.clone(), ty: slot_ty.clone() });
+        }
+        None
+    });
+    out
+}
+
+/// One media slot [`typed_media_slots`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedSlot {
+    /// Where it sits: record fields and dict keys joined by `.`, list
+    /// items as `[i]`. Empty when the whole value is the slot.
+    pub at: String,
+    pub value: Value,
+    pub ty: WeftType,
+}
+
+/// One step into a value on the way to a slot.
+enum Step<'v> {
+    Key(&'v str),
+    Item(usize),
+}
+
+fn place_name(at: &[Step<'_>]) -> String {
+    let mut out = String::new();
+    for step in at {
+        match step {
+            Step::Key(key) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(key);
+            }
+            Step::Item(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
     out
 }
 
@@ -155,7 +204,7 @@ pub fn substitute_media(
     ty: &WeftType,
     replacements: &HashMap<String, Value>,
 ) -> Value {
-    walk(value, ty, &mut |slot| replacements.get(&slot.to_string()).cloned())
+    walk(value, ty, &mut |slot, _| replacements.get(&slot.to_string()).cloned())
         .unwrap_or_else(|| value.clone())
 }
 
@@ -166,7 +215,7 @@ pub fn substitute_media(
 /// body that only speaks URLs (Python, a provider) reads the link. The
 /// inverse is [`strip_links`].
 pub fn with_links(value: &Value, ty: &WeftType, links: &HashMap<String, String>) -> Value {
-    walk(value, ty, &mut |slot| {
+    walk(value, ty, &mut |slot, _| {
         let url = links.get(&slot.to_string())?;
         let mut linked = slot.clone();
         let obj = linked.as_object_mut()?;
@@ -206,55 +255,108 @@ pub fn strip_links(value: &Value) -> Value {
     }
 }
 
+/// Whether a stored-file value sits anywhere in `value`. Type-free, like
+/// [`strip_links`]: it finds markers by their sentinel.
+pub fn holds_file_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => FileKind::from_marker_obj(map).is_some() || map.values().any(holds_file_marker),
+        Value::Array(items) => items.iter().any(holds_file_marker),
+        _ => false,
+    }
+}
+
 /// The one traversal both verbs share. `f` sees every media slot's
-/// value and answers an optional replacement; the walk answers a
-/// rebuilt value when anything changed underneath (None = subtree
-/// unchanged, caller keeps the original).
+/// value and the type the slot is declared as, and answers an optional
+/// replacement; the walk answers a rebuilt value when anything changed
+/// underneath (None = subtree unchanged, caller keeps the original).
 fn walk(
     value: &Value,
     ty: &WeftType,
-    f: &mut impl FnMut(&Value) -> Option<Value>,
+    f: &mut impl FnMut(&Value, &WeftType) -> Option<Value>,
+) -> Option<Value> {
+    walk_at(value, ty, &mut Vec::new(), &mut |_, slot, slot_ty| f(slot, slot_ty))
+}
+
+/// [`walk`], telling `f` where each slot sits. The steps are borrowed
+/// from the value and pushed and popped as the walk descends, so a
+/// caller that never reads them pays no allocation per slot.
+fn walk_at<'v>(
+    value: &'v Value,
+    ty: &WeftType,
+    at: &mut Vec<Step<'v>>,
+    f: &mut impl FnMut(&[Step<'v>], &Value, &WeftType) -> Option<Value>,
 ) -> Option<Value> {
     match ty {
-        WeftType::Primitive(p) if FileKind::from_primitive(*p).is_some() => f(value),
+        WeftType::Primitive(p) if FileKind::from_primitive(*p).is_some() => f(at, value, ty),
         WeftType::List(inner) => {
             let items = value.as_array()?;
-            rebuild_seq(items, |item| walk(item, inner, f))
+            rebuild_seq(items, |i, item| {
+                at.push(Step::Item(i));
+                let out = walk_at(item, inner, at, f);
+                at.pop();
+                out
+            })
         }
-        WeftType::Dict(_, v_ty) => {
+        WeftType::Dict(v_ty) => {
             let map = value.as_object()?;
-            rebuild_map(map, |_, v| walk(v, v_ty, f))
+            rebuild_map(map, |k, v| {
+                at.push(Step::Key(k));
+                let out = walk_at(v, v_ty, at, f);
+                at.pop();
+                out
+            })
         }
-        WeftType::Record(fields) => {
+        WeftType::Record { fields, .. } => {
             let map = value.as_object()?;
             rebuild_map(map, |k, v| {
                 let field = fields.iter().find(|fld| fld.name == *k)?;
-                walk(v, &field.ty, f)
+                at.push(Step::Key(k));
+                let out = walk_at(v, &field.ty, at, f);
+                at.pop();
+                out
             })
         }
-        WeftType::Named { body, .. } => walk(value, body, f),
+        WeftType::Named { body, .. } => walk_at(value, body, at, f),
         WeftType::Union(members) => {
-            // A union slot is a media slot exactly when a member is
-            // ITSELF a media type (`Image | Null`, `Media`) and the
-            // value holds media material. Members that merely CONTAIN
-            // media deeper (`String | List[Part]`) don't make the slot
-            // one: a plain string there is text, even when it looks
-            // like a URL; the walk descends instead.
-            if members.iter().any(|m| m.is_file_valued()) && classify_media_slot(value).is_ok() {
-                return f(value);
+            // A union with a member that is ITSELF a file (`Image |
+            // Null`, `Media`) makes the slot a media slot when the value
+            // is a stored-file object (well formed or not: a broken one
+            // reaches `f`, which says so), or a string the union can only
+            // read as a file. With a `String` member a string is text,
+            // whatever it looks like (a URL, a `data:` URL), and is never
+            // fetched or decoded. Members that merely CONTAIN files
+            // deeper (`String | List[Part]`) don't make the slot one: the
+            // walk descends into them instead, never into the file
+            // members.
+            if members.iter().any(|m| m.is_file_valued()) {
+                let takes_text = members.iter().any(takes_text);
+                let is_file_object = value.as_object().and_then(FileKind::from_marker_obj).is_some();
+                if is_file_object || (value.is_string() && !takes_text) {
+                    return f(at, value, ty);
+                }
             }
-            members.iter().find_map(|m| walk(value, m, f))
+            members.iter().filter(|m| !m.is_file_valued()).find_map(|m| walk_at(value, m, at, f))
         }
         _ => None,
     }
 }
 
+/// Whether a value of `ty` may be text: `String`, through any declared
+/// name and nested union (`type Text = String | Number`).
+fn takes_text(ty: &WeftType) -> bool {
+    match ty.structural() {
+        WeftType::Primitive(WeftPrimitive::String) => true,
+        WeftType::Union(members) => members.iter().any(takes_text),
+        _ => false,
+    }
+}
+
 /// Rebuild an array from per-item results; None when nothing changed.
-fn rebuild_seq(
-    items: &[Value],
-    mut per_item: impl FnMut(&Value) -> Option<Value>,
+fn rebuild_seq<'v>(
+    items: &'v [Value],
+    mut per_item: impl FnMut(usize, &'v Value) -> Option<Value>,
 ) -> Option<Value> {
-    let results: Vec<Option<Value>> = items.iter().map(&mut per_item).collect();
+    let results: Vec<Option<Value>> = items.iter().enumerate().map(|(i, item)| per_item(i, item)).collect();
     if results.iter().all(Option::is_none) {
         return None;
     }
@@ -268,9 +370,9 @@ fn rebuild_seq(
 }
 
 /// Rebuild an object from per-entry results; None when nothing changed.
-fn rebuild_map(
-    map: &serde_json::Map<String, Value>,
-    mut per_entry: impl FnMut(&String, &Value) -> Option<Value>,
+fn rebuild_map<'v>(
+    map: &'v serde_json::Map<String, Value>,
+    mut per_entry: impl FnMut(&'v String, &'v Value) -> Option<Value>,
 ) -> Option<Value> {
     let results: Vec<Option<Value>> = map.iter().map(|(k, v)| per_entry(k, v)).collect();
     if results.iter().all(Option::is_none) {
@@ -358,6 +460,20 @@ mod tests {
         ]);
         let slots = media_slots(&value, &history_ty());
         assert_eq!(slots, vec![marker("a"), marker("b")], "deduped, in order");
+    }
+
+    #[test]
+    fn a_typed_slot_names_where_it_sits() {
+        let value = json!([
+            { "role": "user", "content": [
+                { "type": "image", "image": marker("a") },
+                { "type": "image", "image": marker("b") },
+            ]},
+        ]);
+        let at: Vec<String> = typed_media_slots(&value, &history_ty()).into_iter().map(|s| s.at).collect();
+        assert_eq!(at, vec!["[0].content[0].image", "[0].content[1].image"]);
+        let whole = typed_media_slots(&marker("a"), &WeftType::parse("Image").unwrap());
+        assert_eq!(whole[0].at, "", "the value itself is the slot");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "type": "GoogleCalendarListEvents",
   "label": "Google Calendar: List Events",
-  "description": "Lists a calendar's events in a time window, recurring events expanded to instances and ordered by start, optionally filtered by a search term.",
+  "description": "Lists a calendar's events in a time window, recurring events expanded to instances and ordered by start, optionally filtered by a search term. One call reads one Google page of at most `maxResults` events; to read them all, wire `nextPageToken` into the next call's `pageToken` while `hasMore` is true. A page over the 100 KB a wire carries fails the node, catchable by `_error`: lower `maxResults`.",
   "tags": [
     "google",
     "calendar"
@@ -53,20 +53,47 @@
       "name": "query",
       "type": "String",
       "label": "Search"
+    },
+    {
+      "name": "maxResults",
+      "type": "Number",
+      "default": 25,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 2500,
+        "step": 1
+      },
+      "label": "Page size",
+      "description": "The most events one page holds (Google may send fewer). A page that weighs more than the 100 KB a wire carries fails the node: lower this."
+    },
+    {
+      "name": "pageToken",
+      "type": "String",
+      "label": "Page token",
+      "description": "Where this page starts: empty for the first page, else the `nextPageToken` the previous call handed out (Google's own token for its next page)."
     }
   ],
   "outputs": [
     {
       "name": "events",
-      "type": "List[JsonDict]",
-      "description": "Each event: id, summary, start, end, location, description, link."
+      "type": "List[{ id: String, summary: String | Null, start: String | Null, end: String | Null, location: String | Null, description: String | Null, link: String }]",
+      "description": "This page's events, ordered by start. Each event: id, summary, start, end, location, description, link."
     },
     {
       "name": "count",
-      "type": "Number"
+      "type": "Number",
+      "description": "How many events this page holds."
+    },
+    {
+      "name": "nextPageToken",
+      "type": "String",
+      "description": "Google's token for the next page, to wire into the next call's `pageToken`; empty after the last page."
+    },
+    {
+      "name": "hasMore",
+      "type": "Boolean",
+      "description": "True when Google has a page after this one."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

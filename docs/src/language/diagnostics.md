@@ -39,7 +39,6 @@ a slug per cause.
 | `scope-reachability` | A wire crosses a group or loop boundary without going through its ports | Route it through the group's own ports |
 | `deref-path` | The dotted path on a wire cannot be read off the source's type | Fix the path, or change the source type |
 | `type-mismatch` | The source's type does not fit the target's | Change one side, or cast. The message suggests a cast where one exists |
-| `must-override-unmet` | A connected port is still `MustOverride` | Declare a real type in the source |
 | `unresolved-typevar` | A connected port still has a type variable nothing pinned down | Connect it to something concrete, or declare the type |
 | `cast-not-allowed` | A cast node's two ports are a pair the conversion table does not allow | Pick types the table allows |
 | `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus |
@@ -68,7 +67,7 @@ a slug per cause.
 | `duplicate-port` | A node has two ports of the same name on one side | Rename one |
 | `reserved-name` | A node or group is named after a node type, so `name.port` would read as an inline node | Rename it |
 | `two-gates` | A node carries both `_should_flow` and `_should_not_flow` | Keep the one that says what you mean |
-| `no-required-skip` (warning) | A node has inputs but none is required, so it runs even when everything upstream is null | Mark one required, or add `@require_one_of` |
+| `run-undecided` | Every input wired into a node is declared with `?`, so nothing says when it runs | Gate it with `_should_flow`, drop the `?` from the input it cannot do without, or add `@require_one_of` |
 | `level-too-large` (warning) | One level of the graph holds more than fifteen items | Group the nodes that cooperate on one job. Nesting a group costs nothing at run time |
 | `not-camel-case` (warning) | A name you chose in the program is not camelCase | Rename it to camelCase. The message gives the spelling when it can work one out. For which names are checked, go and read [Spelling a name](syntax.md#spelling-a-name) |
 
@@ -136,6 +135,8 @@ or a switch's cases.
 | `route-path-missing` | A node claiming a public address has none, or an empty one | Give it a path, like `hooks/stripe` or `chat/{room}` |
 | `route-path-invalid` | The path is not a servable pattern | The message says what is wrong |
 | `route-method-unknown` | That is not an HTTP method | Fix it |
+| `route-capture-shadows-output` | A path captures a name that is also one of the node's own outputs (`cards/{body}` on a `Route`), so the capture could never be read | Rename the capture |
+| `route-output-not-a-capture` | An output added to a `Route` names no capture of its path, or is not typed `String` | Add `{name}` to the path or remove the port, and type every capture `String` |
 | `route-overlap` | Two nodes claim addresses one call could reach, and neither is more specific | Make one spell out what the other captures, or change a path or a method |
 
 ## Instances
@@ -144,6 +145,7 @@ or a switch's cases.
 |---|---|---|
 | `per-instance-ineligible` | `@per_instance` on a node that runs no container of its own. Only an infra node can carry it | Remove it; for a value each instance gets (its connection included), write `@instance_filled` on the field |
 | `instance-filled-wired` | An `@instance_filled` field also has a wire into it | Remove the wire, or the marker |
+| `instance-filled-place-types` | An `@instance_filled` field of a node in an included file takes a different type at each place the file is included, and one instance's value cannot be both | Declare the field's type on the node |
 | `instance-filled-boundary` | `@instance_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
 | `instance-filled-not-an-input` | `@instance_filled` on a key that is not one of the node's inputs | Put it on an input |
 

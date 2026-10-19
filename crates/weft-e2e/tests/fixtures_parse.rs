@@ -90,50 +90,7 @@ const FILLED_IN_BY_THE_RIG: [&str; 7] = [
 #[test]
 fn every_fixture_graph_compiles() -> anyhow::Result<()> {
     let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("stdlib root: {e}"))?;
-    // One fixture's errors, or `None` when it has no program or its
-    // catalog does not load. Every fixture compiles on its own thread:
-    // they share nothing, and one after another this is among the
-    // slowest tests in the workspace.
-    let errors_of = |fixture: &std::path::Path| -> anyhow::Result<Option<Vec<String>>> {
-        let main = fixture.join("src").join("main.weft");
-        if !main.is_file() {
-            return Ok(None);
-        }
-        let source = std::fs::read_to_string(&main)?;
-        // The project's own node roots (`nodes/` AND `src/`, since a node
-        // may sit beside the file that includes it) plus the stdlib. The
-        // rig copies the stdlib into each project at deploy time; here
-        // every root is read where it already is, so this stays a plain
-        // cargo test with no copying and no install.
-        let mut roots = weft_compiler::project::node_roots(fixture).to_vec();
-        roots.push(stdlib.clone());
-        let catalog = match weft_catalog::FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>()) {
-            Ok(c) if c.problems().is_empty() => c,
-            // The catalog's own failure is the other test's finding; not
-            // repeating it here keeps one mistake to one report.
-            _ => return Ok(None),
-        };
-        // The two anchors the CLI gives a program, and they differ:
-        // `@file("assets/...")` resolves from the PROJECT ROOT, while
-        // `@include("lib/x.weft")` resolves from the including file's
-        // OWN directory, which for the program is `src/`.
-        let src = fixture.join("src");
-        let (_, diagnostics) = weft_compiler::compile_strict(
-            &source,
-            uuid::Uuid::new_v4(),
-            weft_compiler::CompileFs::disk(fixture).anchored_at(Some(&src)),
-            &catalog,
-            weft_compiler::validate::ValidationMode::Structural,
-            None,
-        );
-        Ok(Some(
-            diagnostics
-                .into_iter()
-                .filter(|d| d.severity == weft_compiler::Severity::Error)
-                .map(|d| format!("{}: {}", d.code.clone().unwrap_or_default(), d.message))
-                .collect(),
-        ))
-    };
+    let errors_of = |fixture: &std::path::Path| graph_errors(fixture, &stdlib);
     let fixtures = fixtures()?;
     let results: Vec<(String, anyhow::Result<Option<Vec<String>>>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = fixtures
@@ -178,6 +135,73 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
         "these fixtures compile on their own now; drop them from \
          FILLED_IN_BY_THE_RIG: {never_needed:?}"
     );
+    Ok(())
+}
+
+/// The errors one project's program compiles with, structurally, or
+/// `None` when it has no program or its catalog does not load.
+fn graph_errors(project: &std::path::Path, stdlib: &std::path::Path) -> anyhow::Result<Option<Vec<String>>> {
+    let main = project.join("src").join("main.weft");
+    if !main.is_file() {
+        return Ok(None);
+    }
+    let source = std::fs::read_to_string(&main)?;
+    // The project's own node roots (`nodes/` AND `src/`, since a node
+    // may sit beside the file that includes it) plus the stdlib. The
+    // rig copies the stdlib into each project at deploy time; here
+    // every root is read where it already is, so this stays a plain
+    // cargo test with no copying and no install.
+    let mut roots = weft_compiler::project::node_roots(project).to_vec();
+    roots.push(stdlib.to_path_buf());
+    let catalog = match weft_catalog::FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>()) {
+        Ok(c) if c.problems().is_empty() => c,
+        // The catalog's own failure is the other test's finding; not
+        // repeating it here keeps one mistake to one report.
+        _ => return Ok(None),
+    };
+    // The two anchors the CLI gives a program, and they differ:
+    // `@file("assets/...")` resolves from the PROJECT ROOT, while
+    // `@include("lib/x.weft")` resolves from the including file's
+    // OWN directory, which for the program is `src/`.
+    let src = project.join("src");
+    let (_, diagnostics) = weft_compiler::compile_strict(
+        &source,
+        uuid::Uuid::new_v4(),
+        weft_compiler::CompileFs::disk(project).anchored_at(Some(&src)),
+        &catalog,
+        weft_compiler::validate::ValidationMode::Structural,
+        None,
+    );
+    Ok(Some(
+        diagnostics
+            .into_iter()
+            .filter(|d| d.severity == weft_compiler::Severity::Error)
+            .map(|d| format!("{}: {}", d.code.clone().unwrap_or_default(), d.message))
+            .collect(),
+    ))
+}
+
+/// The example programs the repo ships compile against the stdlib, the
+/// same structural check as the fixtures': an example that stopped
+/// compiling when the language moved is the first program a newcomer
+/// runs into.
+#[test]
+fn every_example_graph_compiles() -> anyhow::Result<()> {
+    let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("stdlib root: {e}"))?;
+    let examples = weft_e2e::project::fixtures_root().join("../../../examples");
+    let mut broken: Vec<String> = Vec::new();
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&examples)? {
+        let example = entry?.path();
+        let Some(errors) = graph_errors(&example, &stdlib)? else { continue };
+        seen += 1;
+        if !errors.is_empty() {
+            let name = example.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            broken.push(format!("{name}:\n    {}", errors.join("\n    ")));
+        }
+    }
+    anyhow::ensure!(seen > 0, "no example program under {}", examples.display());
+    anyhow::ensure!(broken.is_empty(), "example programs that do not compile:\n{}", broken.join("\n"));
     Ok(())
 }
 

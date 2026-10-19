@@ -69,13 +69,13 @@
         // The port half of `node.port`.
         { className: 'symbol', begin: '(?<=\\.)' + IDENT },
 
-        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|Passthrough|self|type)\\b' },
+        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|self|type)\\b' },
 
         {
           className: 'type',
           begin:
             '\\b(String|Number|Boolean|Null|Image|Video|Audio|Blob|Empty|Media|File' +
-            '|List|Dict|JsonDict|Bus|Access|Infra|Generator|MustOverride)\\b',
+            '|List|Dict|JsonDict|Bus|Access|Infra|Generator)\\b',
         },
 
         { className: 'literal', begin: '\\b(true|false)\\b' },

@@ -82,8 +82,5 @@
       "name": "link",
       "type": "String"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

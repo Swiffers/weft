@@ -435,12 +435,11 @@ pub async fn outputs(
     let sources = crate::projection::reconstruct_run(&state, run_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
     let project = sources[&run_id].project();
-    // A forwarding boundary is the compiler's: what entered a group is
-    // the wire of the node that fed it, what left is the wire of the
-    // node that filled it, so its wire says nothing a person's wire
-    // does not, and its name (the group's) would collide with theirs.
-    // A loop's Out is different: the list it gathers over the
-    // iterations exists nowhere else, so it stays, as the loop's own
+    // A loop's `LoopIn` is the compiler's: what it hands the body is the
+    // wire of the node that fed the loop, so its wire says nothing a
+    // person's wire does not, and its name (the loop's) would collide
+    // with theirs. Its `LoopOut` is different: the list it gathers over
+    // the iterations exists nowhere else, so it stays, as the loop's own
     // output (`doubler.results`).
     let boundary = |id: &str| project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some()
         && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
@@ -450,14 +449,29 @@ pub async fn outputs(
         .map(|wire| weft_core::run_spec::ExpectedWire::spell(project, wire)).collect();
     // Every place of the run, spelled the way the wires are: a node in
     // an included file once per site that reaches it, a group once.
-    let nodes = weft_core::project::selection::every_place(project).iter()
+    let nodes = weft_core::project::places::every_place(project).iter()
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))
 }
 
+/// Where one node of a run stands (`weft_core::program::NodeState`), the
+/// same answer a program's `GetNodeState` reads. The node is spelled the
+/// way `--from` takes it (`one.render`).
+pub async fn node_state(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((run_id_str, node)): Path<(String, String)>,
+) -> Result<Json<weft_core::program::NodeState>, (StatusCode, String)> {
+    let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id")))?;
+    let project_id = authorize_run(&*state.journal, &caller.0, run_id).await?.project_id;
+    Ok(Json(crate::node_state::read(&state, project_id, run_id, &node).await?))
+}
+
 /// Replay journaled history through the same projection as live events.
-/// Terminals come from the journal, never a synthesized second completion.
+/// Terminals come from the journal, never a synthesized second completion;
+/// a run parked now ends its replay with `RunParked`, the one event about
+/// where it stands rather than what it did.
 pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -532,6 +546,16 @@ pub async fn replay(
             crate::events::IdentifiedEvent { event_id: record.event_id, event: () }
                 .project(|()| projected),
         );
+    }
+    // A run parked now says so after its history: parking writes no
+    // record row, and a reader that takes the history before the live
+    // events (`weft wait --waiting-for-input`) learns here that it waits.
+    let summary = state.journal.run_summary(run_id).await.map_err(|e| {
+        tracing::error!(target: "weft_dispatcher::api", %run_id, error = %e, "replay: reading the run's status failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if summary.is_some_and(|summary| summary.status == weft_core::program::RunStatus::WaitingForInput) {
+        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::RunParked { run_id, project_id }));
     }
     // A row the fold could not apply is painted as its corruption, at
     // the row, by the projector; the rows that never decoded follow.

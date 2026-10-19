@@ -7,9 +7,10 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{FakeRig, NodeManifest, NodeTest, WeftResult};
 
-use super::{cadence, changed, watched, PostgresWatchQueryNode};
+use super::super::postgres_execute_query::PostgresExecuteQueryNode;
+use super::{cadence, changed, first_row, watched, PostgresWatchQueryNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -19,28 +20,36 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_script_refuses_before_dialing", script_refused),
         NodeTest::fake("a_placeholder_without_a_port_refuses_before_dialing", missing_port),
         NodeTest::fake("a_bad_cadence_refuses_before_dialing", bad_cadence),
-        NodeTest::basic("a_declared_column_carries_that_column_of_the_first_row", first_row_split),
+        NodeTest::basic("row_carries_the_first_row_or_null", first_row_or_null),
+        NodeTest::basic("the_placeholder_pattern_is_postgres_query_s", same_pattern),
     ]
 }
 
-/// The live-counter shape: an output port named after a column carries
-/// that column's VALUE, so a consumer reads `7` instead of unwrapping
-/// `[{"count": 7}]`. A tick with no rows says nothing on those ports
-/// rather than closing them, because the next tick may answer one and a
-/// closed port would end the feed.
-fn first_row_split() -> WeftResult<()> {
+/// `row` is the first row, and `null` once the query answers none: the
+/// bus stays open for the next run, and a reader is told the row is
+/// gone instead of being left on it.
+fn first_row_or_null() -> WeftResult<()> {
     let rows = vec![json!({ "count": 7, "name": "ada" }), json!({ "count": 9, "name": "bo" })];
-    let cols = ["count".to_string(), "name".to_string()];
+    assert_eq!(first_row(&rows), json!({ "count": 7, "name": "ada" }), "the FIRST row, not the last");
+    assert_eq!(first_row(&[]), json!(null), "no rows, null");
+
+    // `row` moves only when the first row does: a change further down
+    // the list sends on `rows` alone.
+    let more = vec![json!({ "count": 7, "name": "ada" }), json!({ "count": 10, "name": "bo" })];
+    assert!(changed(Some(rows.as_slice()), more.as_slice()));
+    assert!(!changed(Some(&first_row(&rows)), &first_row(&more)));
+    assert!(changed(Some(&first_row(&rows)), &first_row(&[])), "the row going away is news");
+    Ok(())
+}
+
+/// The compiler finds this node's placeholders with the same pattern
+/// as Postgres: Query's, which its own test holds to `placeholders()`.
+fn same_pattern() -> WeftResult<()> {
     assert_eq!(
-        super::first_row_columns(&rows, &cols),
-        vec![("count".to_string(), json!(7)), ("name".to_string(), json!("ada"))],
-        "the FIRST row, not the last and not all of them"
+        PostgresWatchQueryNode.manifest().placeholders_are_inputs,
+        PostgresExecuteQueryNode.manifest().placeholders_are_inputs,
     );
-
-    assert!(super::first_row_columns(&[], &cols).is_empty(), "no rows, nothing to say");
-
-    // Declaring nothing is the ordinary case, and it costs nothing.
-    assert!(super::first_row_columns(&rows, &[]).is_empty());
+    assert!(PostgresWatchQueryNode.manifest().placeholders_are_inputs.is_some());
     Ok(())
 }
 
@@ -64,10 +73,12 @@ fn cadence_floor() -> WeftResult<()> {
 
 fn changes() -> WeftResult<()> {
     let rows = vec![json!({ "id": 1 })];
-    assert!(changed(None, &rows), "the feed opens with what is there");
-    assert!(changed(None, &[]), "an empty first result is still the first message");
-    assert!(!changed(Some(&rows), &rows));
-    assert!(changed(Some(&rows), &[json!({ "id": 1 }), json!({ "id": 2 })]));
+    let empty: Vec<serde_json::Value> = Vec::new();
+    assert!(changed(None, rows.as_slice()), "the feed opens with what is there");
+    assert!(changed(None, empty.as_slice()), "an empty first result is still the first message");
+    assert!(!changed(Some(rows.as_slice()), rows.as_slice()));
+    let grown = vec![json!({ "id": 1 }), json!({ "id": 2 })];
+    assert!(changed(Some(rows.as_slice()), grown.as_slice()));
     Ok(())
 }
 

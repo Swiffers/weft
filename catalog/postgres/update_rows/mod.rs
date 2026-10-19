@@ -1,10 +1,12 @@
 //! PostgresUpdateRows: update matching rows, SET columns from a JSON
 //! object, WHERE from a SQL condition whose `$name` placeholders read
 //! the node's own input ports (as in PostgresExecuteQuery), and emit
-//! the changed rows (RETURNING *).
+//! the changed rows (RETURNING *): how many changed, and as many of
+//! them as fit the 100 KB a wire carries, never failing once the update
+//! has committed.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
@@ -100,8 +102,30 @@ impl Node for PostgresUpdateRowsNode {
 
         let client = connect(&ctx, &account).await?;
         let rows = query_json(&client, &sql, &names, &params).await?;
+        // The update has committed by now, so nothing past this point
+        // may fail it: `count` is every changed row, and `rows` the
+        // leading ones that fit the 100 KB a wire carries, with
+        // `truncated` saying when some were left out.
         let count = rows.len() as f64;
-        ctx.pulse_downstream(NodeOutput::new().set("rows", json!(rows)).set("count", count))
-            .await
+        let (kept, truncated) = capped_rows(rows);
+        ctx.pulse_downstream(
+            NodeOutput::new()
+                .set("rows", Value::Array(kept))
+                .set("count", count)
+                .set("truncated", truncated),
+        )
+        .await
     }
+}
+
+/// The leading `rows` that one wire carries, and whether any were left
+/// out. A first row heavier than a wire on its own leaves none.
+pub fn capped_rows(mut rows: Vec<Value>) -> (Vec<Value>, bool) {
+    let end = match weft::storage::wire_page(&rows, 0, usize::MAX) {
+        Ok(fits) => fits.end,
+        Err(_) => 0,
+    };
+    let truncated = end < rows.len();
+    rows.truncate(end);
+    (rows, truncated)
 }

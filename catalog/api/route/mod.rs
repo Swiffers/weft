@@ -8,29 +8,26 @@
 //!   - `setup_trigger`: build a `Route` signal from the node's fields
 //!     and register it. The dispatcher mounts the public route.
 //!   - `run`: the caller is attached for this run. The opening request
-//!     (`ctx.wake`) fans onto the fixed ports; the body, read off the
-//!     caller handle, fans onto the ports the author declared: a JSON
-//!     body's top-level keys each on their port, never the whole object
-//!     (a route declares what it receives, and a picture the body
-//!     carries must land on a file port, where it is stored instead of
-//!     riding a wire as bytes), a text or byte body whole on the one
-//!     declared port. A
-//!     declared port named like a path capture (`-> (id: String)` on
-//!     `cards/{id}`) reads the capture, over a body key of that name,
-//!     and is never where a text or bytes body lands: that is the one
-//!     declared port left once the captures are set aside. A
-//!     picture on a file-kind port is stored on the way in
-//!     (`wire::inline_files`). Nothing here answers the caller; Reply,
-//!     Stream and Close do, or a custom node through `ctx.http_caller()`.
+//!     (`ctx.wake`) fans onto the fixed ports, and the body, read off
+//!     the caller handle, lands whole on `body`, held to the type the
+//!     program declared there (`-> (body: Signup)`, `JsonDict` when it
+//!     declared none): a picture it carries in a file-typed place is
+//!     stored on the way in, an open record drops the keys it does not
+//!     declare, and a body that does not fit is answered `400` naming
+//!     what is wrong, before anything downstream runs. A port the
+//!     program adds reads the path capture of its name (`-> (id:
+//!     String)` on `cards/{id}`). Nothing else here answers the caller;
+//!     Reply, Stream and Close do, or a custom node through
+//!     `ctx.http_caller()`.
 
 use async_trait::async_trait;
 use serde_json::Value;
-use weft::caller::InboundMessage;
+use weft::caller::{InboundMessage, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
 use weft::signal::{DataType, LiveConnectionConfig, Route};
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
-use super::wire::{self, REQUEST_PORTS};
+use super::wire;
 
 #[derive(NodeManifest)]
 pub struct RouteNode;
@@ -73,102 +70,74 @@ impl Node for RouteNode {
             other => other.clone(),
         };
         let data_type = ctx.caller_data_type().unwrap_or_default();
-        let body_ports = declared_body_ports(&ctx, &request.params);
-        let output = match (data_type, body) {
-            (DataType::Json, InboundMessage::Json(body)) => {
-                // A json route fans the body's top-level KEYS onto ports of
-                // the same name, so a body that has no keys has nothing to
-                // fan: a bare list or string would leave every declared port
-                // silent, the branches behind them closed, and the caller
-                // with no answer and nothing anywhere saying why. Refused by
-                // name instead.
-                //
-                // NULL is not that. It is how a request with no body at all
-                // arrives, which is every GET, and a GET is an ordinary way
-                // to call a route: the request ports below still fire, the
-                // body ports simply stay silent because there was no body
-                // to fill them from. Refusing it would break every route
-                // somebody reads rather than writes to.
-                if !body.is_null() && !body.is_object() {
-                    weft::node_bail!(
-                        "this route's body lands key by key on its declared ports, so it has \
-                         to be a json object; the caller sent {}. Either send an object, or \
-                         set the body shape to `text` and read it whole",
-                        wire::kind_of(&body)
-                    );
-                }
-                // Top-level keys onto same-named declared ports. The fixed
-                // request ports are set after, so they win over a body key.
-                ctx.fan_declared(&body)
+        let declared = ctx.output_type("body")?;
+        let body = match (data_type, body) {
+            // A request with no body at all, which is every GET, leaves
+            // `body` closed: the request ports below still fire, and a
+            // GET is an ordinary way to call a route.
+            (DataType::Json, InboundMessage::Json(Value::Null)) => None,
+            // A json body is ONE object, the shape a declared record (or
+            // `JsonDict`) holds: anything else is the caller's mistake.
+            (DataType::Json, InboundMessage::Json(other)) if !other.is_object() => {
+                let why = format!(
+                    "the body has to be a json object, and the request sent {}",
+                    wire::kind_of(&other)
+                );
+                return refuse(&http, data_type, why).await;
             }
-            (DataType::Json, other) => weft::node_bail!(
-                "the trigger declares a json body but the connection delivered {}",
-                shape_of(&other)
-            ),
-            (data_type, message) => {
-                // `text` and `bytes`: the whole body on the ONE declared
-                // port; none declared means the body is ignored. The port
-                // names the stored file and is what the bytes are held
-                // to, so an `Image` port refuses a zip here rather than
-                // deeper in, where the caller's own words no longer are.
-                let (name, declared) = match body_ports.as_slice() {
-                    [port] => (
-                        port.as_str(),
-                        ctx.declared_outputs().get(port).cloned(),
-                    ),
-                    _ => ("body", None),
-                };
-                let value = wire::value_of(
-                    &ctx,
-                    message,
-                    request.header("content-type"),
-                    name,
-                    declared.as_ref(),
-                )
-                .await?;
-                match body_ports.as_slice() {
-                    [] => NodeOutput::new(),
-                    [port] => NodeOutput::new().set(port.clone(), value),
-                    many => weft::node_bail!(
-                        "a {} route delivers its whole body on one declared port, but {} are \
-                         declared ({}); keep one",
-                        data_type.as_wire_str(),
-                        many.len(),
-                        many.join(", ")
-                    ),
+            (DataType::Json, message @ InboundMessage::Json(_))
+            | (DataType::Text, message @ InboundMessage::Text(_))
+            | (DataType::Bytes, message @ InboundMessage::Bytes(_)) => {
+                let content_type = request.header("content-type");
+                match wire::take_message(&ctx, message, content_type, "body", &declared).await? {
+                    Ok(body) => Some(body),
+                    Err(why) => return refuse(&http, data_type, why).await,
                 }
+            }
+            // The other shapes: a fired run whose body is text on a
+            // json route or an object on a text one (a live connection
+            // reads the body as the route's dataType already).
+            (data_type, other) => {
+                let why = format!(
+                    "this route takes a {} body, and the request sent {}",
+                    data_type.as_wire_str(),
+                    shape_of(&other)
+                );
+                return refuse(&http, data_type, why).await;
             }
         };
-        // A capture read through a declared port of its name: part of
-        // the fixed request, so it wins over a body key, and the fixed
-        // ports still win over it.
-        let declared = ctx.declared_outputs();
+        let output = match body {
+            Some(body) => NodeOutput::new().set("body", body),
+            None => NodeOutput::new(),
+        };
+        // A port the program added reads the path capture of its name
+        // (the compiler holds every added port to a capture of the
+        // path, `claimsRoute.capturesAreOutputs`). The fixed request
+        // ports are set after it.
+        let declared_ports = ctx.declared_outputs();
         let output = request
             .params
             .iter()
-            .filter(|(name, _)| declared.contains_key(*name))
+            .filter(|(name, _)| declared_ports.contains_key(*name))
             .fold(output, |out, (name, value)| out.set(name.clone(), Value::String(value.clone())));
-        let output = wire::inline_files(&ctx, output).await?;
-        let output = wire::request_ports(&request)
+        let output = wire::request_ports(self.manifest(), &request)
             .into_iter()
             .fold(output, |out, (port, value)| out.set(port, value));
         ctx.pulse_downstream(output).await
     }
 }
 
-/// The ports the author declared beyond the fixed request ports and the
-/// path's captures: where the body lands. A port named like a capture
-/// reads the capture, so a `GET preview/{view}` on a bytes route can
-/// read `view` and still answer bytes.
-fn declared_body_ports(ctx: &RunContext, captures: &std::collections::BTreeMap<String, String>) -> Vec<String> {
-    let mut ports: Vec<String> = ctx
-        .declared_outputs()
-        .keys()
-        .filter(|name| !REQUEST_PORTS.contains(&name.as_str()) && !captures.contains_key(*name))
-        .cloned()
-        .collect();
-    ports.sort();
-    ports
+/// Answer the caller `400` with `why`, the request it sent not being what
+/// the program declared, and end the firing without starting anything
+/// downstream: the request never became a run's input, so nothing past
+/// the route has anything to act on, and the caller already has its
+/// answer. A json route answers `{"error": why}`, the others the text.
+async fn refuse(http: &weft::caller::HttpCaller, data_type: DataType, why: String) -> WeftResult<()> {
+    let body = match data_type {
+        DataType::Json => OutboundChunk::Json(serde_json::json!({ "error": why })),
+        DataType::Text | DataType::Bytes => OutboundChunk::Text(why),
+    };
+    http.respond_with(ResponseHead::new(400), body).await
 }
 
 /// The body a FIRED run carries, off this trigger's own wake payload.

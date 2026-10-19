@@ -1785,11 +1785,15 @@ fi
 # into it, so a refused run has touched nothing installed. Only the
 # default install gets the extensions: a branch's editor is
 # scripts/dev-editor.sh, and every editor keeps the default install's.
+# A branch's run that would have built the editor prepares its sources
+# instead, for the checks (see "the editor's sources" below).
+prepare_editor_sources=0
 if [[ $on_default_install -eq 0 ]]; then
   if [[ $do_bump -eq 1 ]]; then
     fail "--bump builds the extensions to release them, and install ${install_env} (picked by ${install_picked_by}) builds no extension; bump in the package folder instead: ${C_BOLD}pnpm version patch --no-git-tag-version${C_RESET}"
     exit 1
   fi
+  prepare_editor_sources=$build_vscode
   if [[ $build_vscode -eq 1 || $build_browser -eq 1 ]]; then
     hint "install ${install_env} (picked by ${install_picked_by}) gets no VS Code or browser extension (your editor keeps the default install's); to try this checkout's editor, run ${C_BOLD}scripts/dev-editor.sh${C_RESET}"
     build_vscode=0
@@ -2126,6 +2130,30 @@ fi
 if [[ -n "${public_url}" && ( $is_full_install -eq 0 || $on_default_install -eq 0 ) ]]; then
   # Only a full install on main prints the summary block, so say it here.
   hint "public surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes, signal fire links, file share links, OAuth callback)"
+fi
+
+# ---- the editor's sources, on a branch --------------------------------
+#
+# A branch's install gets no editor (scripts/dev-editor.sh runs one from
+# source when you want to try it), but the checks every change to the
+# editor or the graph runs (`pnpm run compile`, `svelte-check`, the
+# packages' tests) need the extension's dependencies installed and the
+# shared packages borrowing them: the same wiring CI does
+# (`borrow-packages`) and dev-editor.sh does. Without it every check in a
+# fresh worktree fails on missing modules in files nobody touched.
+if [[ $prepare_editor_sources -eq 1 ]]; then
+  section "Editor sources"
+  ext_dir="${here}/extension-vscode"
+  if ! command -v pnpm >/dev/null 2>&1; then
+    warn "pnpm is not on PATH, so the editor's checks (pnpm run compile, svelte-check) cannot run in this checkout; install it with ${C_BOLD}npm i -g pnpm${C_RESET} and run ./setup.sh again"
+  else
+    weft_vscode_link_borrowers "${ext_dir}"
+    if [[ ! -d "${ext_dir}/node_modules" || "${ext_dir}/package.json" -nt "${ext_dir}/node_modules" || "${ext_dir}/pnpm-lock.yaml" -nt "${ext_dir}/node_modules" ]]; then
+      spin_passthrough "pnpm install (extension-vscode)" pnpm -C "${ext_dir}" install --prefer-offline \
+        || { fail "the editor's dependencies did not install; see above, then run ./setup.sh again"; exit 1; }
+    fi
+    ok "the editor's sources are ready for their checks"
+  fi
 fi
 
 # ---- VS Code extension -----------------------------------------------

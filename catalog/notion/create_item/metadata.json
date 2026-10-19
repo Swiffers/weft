@@ -73,8 +73,5 @@
       "type": "String",
       "description": "The new row's link."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

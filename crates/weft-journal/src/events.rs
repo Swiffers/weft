@@ -656,11 +656,15 @@ pub enum RunEvent {
         at_unix: u64,
     },
 
+    /// The bus closed, and how it ended: the inspector draws where it
+    /// closed, or where it failed and why.
+    // SYNC: BusClosed <-> crates/weft-core/src/live_event.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_closed'
     BusClosed {
         #[serde(skip)]
         run_id: RunId,
         bus_id: String,
         offset: u64,
+        end: weft_core::bus::StreamEnd,
         at_unix: u64,
     },
 
@@ -1358,7 +1362,14 @@ mod wire_tests {
                 totals: Default::default(),
                 at_unix: 1,
             },
-            RunEvent::BusClosed { run_id: run_id(), bus_id: "b".into(), offset: 2, at_unix: 1 },
+            RunEvent::BusClosed { run_id: run_id(), bus_id: "b".into(), offset: 2, end: weft_core::bus::StreamEnd::Finished, at_unix: 1 },
+            RunEvent::BusClosed {
+                run_id: run_id(),
+                bus_id: "c".into(),
+                offset: 3,
+                end: weft_core::bus::StreamEnd::Failed { error: "the model went away".into() },
+                at_unix: 1,
+            },
             RunEvent::CallerConnected { run_id: run_id(), offset: 0, protocol: "websocket".into(), at_unix: 7 },
             RunEvent::CallerWindow {
                 run_id: run_id(),

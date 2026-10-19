@@ -88,6 +88,16 @@ impl Node for PostgresExecuteQueryNode {
                 steps_json(&mut client, &bound).await?
             }
         };
+        // A wire carries at most 100 KB, and the SQL is where the bound
+        // goes: said here, before the emission, with the fix.
+        if let Some(weight) = weft::storage::over_wire(&rows) {
+            weft::node_bail!(
+                "the query answered {} rows weighing {weight}. Add a `LIMIT` and read the rest a page \
+                 at a time (`OFFSET`, or `WHERE id > $after` with the last id of the page before), \
+                 or select only the columns you need. Anything the statement wrote stays written",
+                rows.len()
+            );
+        }
         emit(&ctx, rows).await
     }
 }

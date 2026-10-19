@@ -44,8 +44,5 @@
       "type": "String",
       "description": "The stored object's ETag."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

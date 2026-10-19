@@ -271,9 +271,9 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_send(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&GmailSendNode, a_mail()).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("Daily sending quota exceeded"), "{error}");
     for port in ["id", "threadId"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
@@ -282,7 +282,7 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn mistake_not_caught(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &GmailSendNode,

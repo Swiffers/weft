@@ -9,7 +9,10 @@
 //! output Bus as raw bytes (base64 exists only at this
 //! provider-protocol boundary). When the text bus closes, the tail is
 //! flushed, the session drains, and the full audio is also stored and
-//! emitted as a file.
+//! emitted as a file. A text bus that ended failed (its producer broke
+//! off) fails the node rather than speak a cut text as whole. The audio
+//! bus opens on the first audio frame, so a session refused before it
+//! speaks is a failure `_error` can catch.
 //!
 //! The session's settings ride two places, as the protocol has them:
 //! the URL's query string (model, format, language, seed, ...) and the
@@ -36,14 +39,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use weft::access::socket::SocketMessage;
-use weft::bus::{BusEntryKind, BusHandle, BusOptions, BusPayloadKind, WirePayload};
+use weft::bus::{BusEntryKind, BusOptions, BusPayloadKind, WirePayload};
+use weft::context::PendingBus;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
 use weft::{
     node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, ValueBag, WeftError, WeftResult,
 };
 
-use super::elevenlabs::{audio_file_type, WS_API};
+use super::elevenlabs::{audio_file_type, refuse_broken_input, WS_API};
 use super::flows::set_some;
 use super::speech::voice_settings;
 
@@ -325,28 +329,42 @@ fn placed(characters: &[Character], offset: f64) -> Value {
     )
 }
 
-/// One session frame relayed: its characters, placed on the whole
-/// speech, onto the `alignment` bus when `timing` (that bus and the
-/// audio's bytes per second) is given, then its audio onto the `audio`
-/// bus and into the full-copy buffer. `true` when the frame said the
-/// session is complete.
-fn relay_frame(
-    payload: &str,
-    audio_bus: &BusHandle,
-    timing: Option<(&BusHandle, f64)>,
-    full: &mut Vec<u8>,
-) -> WeftResult<bool> {
-    let frame = classify_session_frame(payload, timing.is_some())?;
+/// One session frame, read for relaying ([`read_frame`]).
+struct Relayed {
+    /// Its characters placed on the whole speech, when the session was
+    /// opened for timing and the frame carries any.
+    alignment: Option<Value>,
+    /// Its audio, already added to the full copy; `None` when it had none.
+    audio: Option<Vec<u8>>,
+    /// The frame said the session is complete.
+    is_final: bool,
+}
+
+/// Read one session frame: its characters, placed on the whole speech
+/// when `rate` (the audio's bytes per second) is given, and its audio,
+/// added to the full-copy buffer.
+fn read_frame(payload: &str, rate: Option<f64>, full: &mut Vec<u8>) -> WeftResult<Relayed> {
+    let frame = classify_session_frame(payload, rate.is_some())?;
     let characters = frame.characters.as_ref().filter(|c| !c.is_empty());
-    if let (Some((bus, rate)), Some(characters)) = (timing, characters) {
-        // The frame's times count from its own first byte, which comes
-        // after every byte relayed so far.
-        let offset = full.len() as f64 / rate;
-        bus.send("alignment", placed(characters, offset)).node_err("relaying the character timing")?;
-    }
-    if !frame.audio.is_empty() {
+    // The frame's times count from its own first byte, which comes after
+    // every byte relayed so far.
+    let alignment = rate.zip(characters).map(|(rate, characters)| placed(characters, full.len() as f64 / rate));
+    let audio = (!frame.audio.is_empty()).then(|| {
         full.extend_from_slice(&frame.audio);
-        audio_bus.send_bytes("audio", frame.audio).node_err("relaying an audio chunk")?;
+        frame.audio
+    });
+    Ok(Relayed { alignment, audio, is_final: frame.is_final })
+}
+
+/// Relay a read frame: its timing onto the `alignment` bus when that is
+/// wired, its audio onto the `audio` bus, each bus opening with the first
+/// piece it carries. `true` when the frame said the session is complete.
+async fn relay_frame(frame: Relayed, audio_bus: &mut PendingBus<'_>, alignment_bus: Option<&mut PendingBus<'_>>) -> WeftResult<bool> {
+    if let (Some(bus), Some(alignment)) = (alignment_bus, frame.alignment) {
+        bus.open().await?.send("alignment", alignment).node_err("relaying the character timing")?;
+    }
+    if let Some(audio) = frame.audio {
+        audio_bus.open().await?.send_bytes("audio", audio).node_err("relaying an audio chunk")?;
     }
     Ok(frame.is_final)
 }
@@ -388,32 +406,25 @@ impl Node for ElevenLabsSpeakNode {
         let mut socket = conn.socket(&session.url(&voice)).await?;
         socket.send(SocketMessage::Text(session.opener().to_string())).await?;
 
-        // The live audio bus: marker emitted before any synthesis (a
-        // downstream consumer reads while chunks land), closed on
-        // EVERY exit by the guard. Ephemeral: the frames are transient
-        // by nature; the stored file below is the durable copy.
-        let audio_bus = ctx
-            .open_bus(
-                "audio",
-                BusOptions {
-                    ephemeral: true,
-                    payload: BusPayloadKind::Bytes,
-                    meta: bus_meta(&session.output_format),
-                    ..Default::default()
-                },
-                "speaker",
-            )
-            .await?;
+        // The live audio bus, opened with the first audio frame (a
+        // downstream consumer reads while chunks land) and ended the way
+        // the body ends. Ephemeral: the frames are transient by nature;
+        // the stored file below is the durable copy.
+        let mut audio_bus = ctx.pending_bus(
+            "audio",
+            BusOptions {
+                ephemeral: true,
+                payload: BusPayloadKind::Bytes,
+                meta: bus_meta(&session.output_format),
+                ..Default::default()
+            },
+            "speaker",
+        );
         // The character timing, only when something reads it, and as
         // transient as the frames it describes.
-        let alignment_bus = match session.timing {
-            Some(_) => Some(
-                ctx.open_bus("alignment", BusOptions { ephemeral: true, ..Default::default() }, "speaker")
-                    .await?,
-            ),
-            None => None,
-        };
-        let timing = alignment_bus.as_deref().zip(session.timing);
+        let mut alignment_bus = session
+            .timing
+            .map(|_| ctx.pending_bus("alignment", BusOptions { ephemeral: true, ..Default::default() }, "speaker"));
 
         let mut full: Vec<u8> = Vec::new();
         // Whether any chunk carried a pronounceable character.
@@ -473,7 +484,8 @@ impl Node for ElevenLabsSpeakNode {
                         // goodbye below; one arriving here means the
                         // session ended its generation while text was
                         // still coming, so the tail would go unspoken.
-                        if relay_frame(&msg.into_text()?, &audio_bus, timing, &mut full)? {
+                        let frame = read_frame(&msg.into_text()?, session.timing, &mut full)?;
+                        if relay_frame(frame, &mut audio_bus, alignment_bus.as_mut()).await? {
                             return Err(node_error(
                                 "the session finished before the text ended; the tail would go \
                                  unspoken",
@@ -487,6 +499,8 @@ impl Node for ElevenLabsSpeakNode {
             }
         }
 
+        // A text that broke off is not a text to finish speaking.
+        refuse_broken_input("text", text.end())?;
         // The text ended: close the generation (the protocol's
         // empty-text goodbye flushes whatever is buffered), then
         // drain the session's queued audio until its final frame.
@@ -495,7 +509,8 @@ impl Node for ElevenLabsSpeakNode {
             .await?;
         let mut finished = false;
         while let Some(msg) = socket.recv().await? {
-            if relay_frame(&msg.into_text()?, &audio_bus, timing, &mut full)? {
+            let frame = read_frame(&msg.into_text()?, session.timing, &mut full)?;
+            if relay_frame(frame, &mut audio_bus, alignment_bus.as_mut()).await? {
                 finished = true;
                 break;
             }
@@ -509,9 +524,6 @@ impl Node for ElevenLabsSpeakNode {
             ));
         }
         socket.close().await?;
-        drop(alignment_bus);
-        drop(audio_bus);
-
         // A zero-byte file would look like a success and only fail
         // downstream, silently; name the actual cause instead.
         if !spoke {
@@ -522,6 +534,16 @@ impl Node for ElevenLabsSpeakNode {
         }
         if full.is_empty() {
             return Err(node_error("the session finished without producing any audio"));
+        }
+
+        // The speech is whole (the checks above passed): readers end now, not after the file is
+        // stored. A timing bus no frame carried characters for opens here,
+        // so its readers read an empty stream rather than none at all.
+        if let Some(alignment_bus) = &mut alignment_bus {
+            alignment_bus.open().await?.close();
+        }
+        if let Some(audio_bus) = audio_bus.opened() {
+            audio_bus.close();
         }
 
         let stored = ctx

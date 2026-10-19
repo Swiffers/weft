@@ -1143,6 +1143,21 @@ export function isGatePort(name: string): boolean {
   return name === SHOULD_FLOW_PORT || name === SHOULD_NOT_FLOW_PORT;
 }
 
+/// The output the language gives every catalog node, which the runtime
+/// fills with why the node failed. Wired, a failure completes the node
+/// through it; unwired, a failure stops the run. It is the gate's mirror
+/// on the output side, so the editor draws it as a marker on the right
+/// edge, never as an output row. Group and loop boundaries have none.
+// SYNC: ERROR_PORT <-> crates/weft-core/src/node.rs ERROR_PORT
+export const ERROR_PORT = '_error';
+
+/// Is this port one the language gives a node (the gate, either way
+/// round, or the failure output)? Such a port is never written into a
+/// node's header and never removed with it.
+export function isLanguagePort(name: string): boolean {
+  return isGatePort(name) || name === ERROR_PORT;
+}
+
 // SYNC: NodeFiringStatus <-> crates/weft-core/src/run/firing.rs NodeFiringStatus
 /// Adding a state requires adding it on both sides; the UI lookup
 /// tables in `webview/lib/utils/status.ts` exhaust this union so
@@ -1434,7 +1449,7 @@ export type LoopInspectorEvent =
 /// renders as `from: <payload-pretty>` (or a byte count for a binary
 /// payload); `window` renders an ephemeral window's rollup ("N frames,
 /// M bytes"); `closed` renders an explicit `* the bus closed here`
-/// marker. `busId` groups lines by channel so a node attached to
+/// marker, or `* the bus failed here: <error>` when it failed. `busId` groups lines by channel so a node attached to
 /// multiple buses gets one scrollable section per bus. Replay orders
 /// lines by arrival from the SSE stream (the dispatcher already orders
 /// them by their place in the run's record).
@@ -1482,7 +1497,15 @@ export type BusInspectorEvent =
       totals: Array<{ from: string; msgKind: string; count: number; bytes: number }>;
       atUnix: number;
     }
-  | { kind: 'closed'; busId: string; offset: number; atUnix: number };
+  // SYNC: BusInspectorEvent 'closed' <-> crates/weft-journal/src/events.rs BusClosed, crates/weft-core/src/live_event.rs BusClosed, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_closed'
+  | { kind: 'closed'; busId: string; offset: number; end: StreamEnd; atUnix: number };
+
+/// How a stream (a bus) ended: cleanly, or failed with the producer's
+/// error.
+// SYNC: StreamEnd <-> crates/weft-core/src/primitive.rs StreamEnd
+export type StreamEnd =
+  | { kind: 'finished' }
+  | { kind: 'failed'; error: string };
 
 /// One live-caller-connection event the inspector replays. One caller
 /// per run (no busId; the run id is the identity).

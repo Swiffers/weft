@@ -243,17 +243,17 @@ impl ResponseHead {
         self.header("content-type").map(|v| v.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
     }
 
-    /// The bytes that tell a reader of this body the program failed,
-    /// once the status line is already out: in the body's own framing,
-    /// so a reader parsing it gets the error as an item it can read.
-    /// JSON lines get one line `{"error": "...", "status": 504}`, the
-    /// status being the one the answer would have had, had it not started
-    /// (`500` the program failed, `504` a time limit, `503` stopped);
-    /// server-sent events an `error` event, anything else a text line
-    /// `[error] ...`. Each starts on a fresh line, since the last item may
-    /// not have ended one (a blank line is skipped by a JSON-lines or SSE
-    /// reader).
-    pub fn in_band_error(&self, message: &str, status: u16) -> Vec<u8> {
+    /// The bytes that tell a reader of this body the run failed, once
+    /// the status line is already out: in the body's own framing, so a
+    /// reader parsing it gets the error as an item it can read. JSON
+    /// lines get one line `{"error": "...", "runId": "...", "status":
+    /// 504}`, the status being the one the answer would have had, had it
+    /// not started (`500` the program failed, `504` a time limit, `503`
+    /// stopped); server-sent events an `error` event whose data is the
+    /// failure as JSON; anything else a text line `[error] ...`. Each
+    /// starts on a fresh line, since the last item may not have ended
+    /// one (a blank line is skipped by a JSON-lines or SSE reader).
+    pub fn in_band_error(&self, failure: &PlainFailure, status: u16) -> Vec<u8> {
         const JSON_LINES: &[&str] = &[
             "application/x-ndjson",
             "application/ndjson",
@@ -265,19 +265,15 @@ impl ResponseHead {
         let essence = self.content_type_essence();
         match essence.as_deref() {
             Some(ct) if JSON_LINES.contains(&ct) => {
-                format!("\n{}\n", serde_json::json!({ "error": message, "status": status })).into_bytes()
+                let mut line = serde_json::to_value(failure).expect("a plain failure serializes");
+                line["status"] = serde_json::json!(status);
+                format!("\n{line}\n").into_bytes()
             }
             Some("text/event-stream") => {
-                let mut out = String::from("\nevent: error\n");
-                for line in message.split('\n') {
-                    out.push_str("data: ");
-                    out.push_str(line);
-                    out.push('\n');
-                }
-                out.push('\n');
-                out.into_bytes()
+                let data = serde_json::to_string(failure).expect("a plain failure serializes");
+                format!("\nevent: error\ndata: {data}\n\n").into_bytes()
             }
-            _ => format!("\n[error] {message}").into_bytes(),
+            _ => format!("\n[error] {}", failure.line()).into_bytes(),
         }
     }
 
@@ -521,8 +517,50 @@ pub fn try_send_head(wire_started: bool) -> Result<(), CallerError> {
     }
 }
 
+/// What a run's caller is told when the run failed without answering
+/// it: that it failed, and the run's id. Never the failure itself: its
+/// node paths, file names and a provider's words are the run owner's to
+/// read, and the id is how the owner opens it (`weft logs <id>`, the
+/// graph); opening a run needs the owner's credential, so the id is safe
+/// to hand out. The run's record keeps the whole message.
+// SYNC: PlainFailure <-> packages/weft-connect/src/server/passthrough.ts PlainFailure
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlainFailure {
+    pub error: &'static str,
+    pub run_id: crate::RunId,
+}
+
+/// The words of every [`PlainFailure`], and what the per-instance runs
+/// list shows for a failed run.
+pub const PLAIN_FAILURE: &str = "Something went wrong";
+
+impl PlainFailure {
+    pub fn of(run_id: crate::RunId) -> Self {
+        Self { error: PLAIN_FAILURE, run_id }
+    }
+
+    /// The failure as a JSON body, what a caller gets before the first
+    /// byte.
+    pub fn body(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a plain failure serializes")
+    }
+
+    /// The failure as one line of text: a text stream's error line, a
+    /// socket's close reason.
+    pub fn line(&self) -> String {
+        format!("{} (run {})", self.error, self.run_id)
+    }
+}
+
+/// The header every answer of a route's run carries, success or failure:
+/// the run's id, so a caller can name the run it got.
+// SYNC: RUN_ID_HEADER <-> packages/weft-connect/src/server/passthrough.ts RUN_ID_HEADER
+pub const RUN_ID_HEADER: &str = "Weft-Run-Id";
+
 /// Why a run whose HTTP caller never heard a word ended badly: every path
-/// to its answer closed. Said to the caller and recorded on the run.
+/// to its answer closed. Recorded on the run; the caller hears the plain
+/// failure ([`PlainFailure`]).
 pub const NO_ANSWER: &str = "the run ended without answering: every path to its Reply (or Stream, or Close) \
      was skipped, usually because a value it waited on never arrived";
 
@@ -635,6 +673,14 @@ pub trait CallerConnection: Send + Sync {
         final_chunk: Option<OutboundChunk>,
         close: Option<CloseReason>,
     ) -> Result<(), CallerError>;
+
+    /// End the exchange as failed, `message` saying why: a real error
+    /// status (`500`) while nothing went out yet, the body framing's
+    /// error marker after ([`ResponseHead::in_band_error`]), a `1011`
+    /// close on a socket. The caller reads the plain failure and the
+    /// run's id ([`PlainFailure`]); `message` goes on the run's record,
+    /// where its owner reads it. Terminal; first terminal wins.
+    async fn fail(&self, message: &str) -> Result<(), CallerError>;
 
     /// WebSocket only: await the next inbound message at `cursor` (the
     /// reader's next absolute offset to read over the windowed inbound log),
@@ -853,6 +899,13 @@ impl HttpCaller {
     pub async fn close_with(&self, head: ResponseHead) -> WeftResult<()> {
         self.conn.terminate(Some(head), None, None).await.map_err(Into::into)
     }
+
+    /// End the response as failed ([`CallerConnection::fail`]): what a
+    /// node answering from something that broke off says, instead of
+    /// ending a cut answer as if it were whole. Terminal.
+    pub async fn fail(&self, message: &str) -> WeftResult<()> {
+        self.conn.fail(message).await.map_err(Into::into)
+    }
 }
 
 /// WebSocket talk surface: full duplex. Holds a built-in FORWARD cursor
@@ -944,6 +997,12 @@ impl WsCaller {
     /// Terminal; first terminal wins.
     pub async fn close_with(&self, close: CloseReason) -> WeftResult<()> {
         self.conn.terminate(None, None, Some(close)).await.map_err(Into::into)
+    }
+
+    /// Close the session as failed ([`CallerConnection::fail`]): a `1011`
+    /// close. Terminal.
+    pub async fn fail(&self, message: &str) -> WeftResult<()> {
+        self.conn.fail(message).await.map_err(Into::into)
     }
 
     // ----- cursor positioning (mirrors the bus) -------------------------
@@ -1072,6 +1131,7 @@ pub enum CallerCall {
     Receive,
     Request(OutboundChunk),
     HttpRequest,
+    Fail { message: String },
 }
 
 /// Hand-rolled fake `CallerConnection` for contract tests. Records every
@@ -1281,6 +1341,15 @@ impl CallerConnection for FakeCallerConnection {
         Ok(())
     }
 
+    async fn fail(&self, message: &str) -> Result<(), CallerError> {
+        let mut g = self.inner.lock().expect("fake caller poisoned");
+        g.calls.push(CallerCall::Fail { message: message.to_string() });
+        try_terminate(g.terminated)?;
+        g.terminated = true;
+        g.wire_started = true;
+        Ok(())
+    }
+
     async fn receive(
         &self,
         cursor: &std::sync::atomic::AtomicU64,
@@ -1415,22 +1484,37 @@ mod tests {
 
     #[test]
     fn in_band_error_speaks_the_body_framing() {
+        let run_id = uuid::Uuid::from_u128(7);
+        let failure = PlainFailure::of(run_id);
         let head = |ct: &str| ResponseHead::new(200).with_header("Content-Type", ct);
-        let line = head("application/x-ndjson; charset=utf-8").in_band_error("the model \"failed\"", 500);
+        let line = head("application/x-ndjson; charset=utf-8").in_band_error(&failure, 500);
         let text = String::from_utf8(line).unwrap();
         assert!(text.starts_with('\n') && text.ends_with('\n'), "{text:?}");
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(parsed, serde_json::json!({ "error": "the model \"failed\"", "status": 500 }));
+        assert_eq!(parsed, serde_json::json!({ "error": PLAIN_FAILURE, "runId": run_id, "status": 500 }));
         for ct in ["application/ndjson", "application/jsonl", "APPLICATION/X-JSONLINES"] {
-            let text = String::from_utf8(head(ct).in_band_error("boom", 504)).unwrap();
-            assert_eq!(text, "\n{\"error\":\"boom\",\"status\":504}\n", "{ct}");
+            let text = String::from_utf8(head(ct).in_band_error(&failure, 504)).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(parsed["status"], 504, "{ct}");
         }
         assert_eq!(
-            String::from_utf8(head("text/event-stream").in_band_error("a\nb", 503)).unwrap(),
-            "\nevent: error\ndata: a\ndata: b\n\n",
+            String::from_utf8(head("text/event-stream").in_band_error(&failure, 503)).unwrap(),
+            format!("\nevent: error\ndata: {{\"error\":\"{PLAIN_FAILURE}\",\"runId\":\"{run_id}\"}}\n\n"),
         );
-        assert_eq!(head("text/plain; charset=utf-8").in_band_error("boom", 500), b"\n[error] boom");
-        assert_eq!(ResponseHead::new(200).in_band_error("boom", 500), b"\n[error] boom", "no content type is text");
+        let text_line = format!("\n[error] {PLAIN_FAILURE} (run {run_id})").into_bytes();
+        assert_eq!(head("text/plain; charset=utf-8").in_band_error(&failure, 500), text_line);
+        assert_eq!(ResponseHead::new(200).in_band_error(&failure, 500), text_line, "no content type is text");
+    }
+
+    /// The plain failure's wire shape: the words and the run's id,
+    /// nothing else.
+    #[test]
+    fn a_plain_failure_carries_the_words_and_the_run_id() {
+        let run_id = uuid::Uuid::from_u128(9);
+        let body: serde_json::Value = serde_json::from_slice(&PlainFailure::of(run_id).body()).unwrap();
+        assert_eq!(body, serde_json::json!({ "error": "Something went wrong", "runId": run_id.to_string() }));
+        assert_eq!(PlainFailure::of(run_id).line(), format!("Something went wrong (run {run_id})"));
+        assert_eq!(RUN_ID_HEADER, "Weft-Run-Id");
     }
 
     #[test]

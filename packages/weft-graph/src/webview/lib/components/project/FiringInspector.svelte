@@ -3,7 +3,7 @@
 	import type { RunTerminal, NodeFiring } from '../../types';
 	import { frameText, type FileEditWire, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
-	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
+	import { busClosedLine, formatClockTime, formatStreamBody } from '../../utils/stream-log';
 	import PayloadCards from './PayloadCards.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
 	import * as Dialog from '../ui/dialog';
@@ -104,7 +104,7 @@
 				const ts = formatBusTime(e.atUnix);
 				if (e.kind === 'joined') return `${ts}  * ${e.name} joined`;
 				if (e.kind === 'left') return `${ts}  * ${e.name} left`;
-				if (e.kind === 'closed') return `${ts}  * the bus closed here`;
+				if (e.kind === 'closed') return `${ts}  ${busClosedLine(e.end).text}`;
 				if (e.kind === 'window') return `${ts}  * ${formatWindowBody(e)}`;
 				return `${ts}  ${e.from}: ${formatMessageBody(e)}`;
 			});
@@ -498,7 +498,8 @@
 											{:else if e.kind === 'left'}
 												<span class="text-zinc-400">* {e.name} left</span>
 											{:else if e.kind === 'closed'}
-												<span class="text-zinc-400 italic">* the bus closed here</span>
+												{@const closedLine = busClosedLine(e.end)}
+												<span class="{closedLine.failed ? 'text-red-600 break-words' : 'text-zinc-400'} italic">{closedLine.text}</span>
 											{:else if e.kind === 'window'}
 												<span class="text-zinc-500 italic">* {formatWindowBody(e)}</span>
 											{:else}

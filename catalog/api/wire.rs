@@ -173,7 +173,12 @@ pub async fn take_inbound(
         )));
     }
     let mut stored = std::collections::HashMap::new();
-    for (slot, slot_ty) in weft::storage::media::typed_media_slots(&value, declared) {
+    for weft::storage::media::TypedSlot { at, value: slot, ty: slot_ty } in
+        weft::storage::media::typed_media_slots(&value, declared)
+    {
+        // The place inside the value, so a body with two pictures says
+        // which one was wrong.
+        let place = if at.is_empty() { name.to_string() } else { format!("{name}.{at}") };
         let text = match &slot {
             Value::String(text) => text,
             // Anything else in a file place (a null, a number) is held
@@ -184,7 +189,7 @@ pub async fn take_inbound(
             Ok(decoded) => decoded,
             Err(why) => {
                 return Ok(Err(format!(
-                    "{name}: a place declared {slot_ty} takes a picture as a data: URL or base64; {why}"
+                    "{place}: a place declared {slot_ty} takes a picture as a data: URL or base64; {why}"
                 )))
             }
         };
@@ -192,7 +197,7 @@ pub async fn take_inbound(
             Ok((mime, _)) => mime,
             Err(why) => {
                 return Ok(Err(format!(
-                    "{name}: the bytes sent for a place declared {slot_ty} are not what it takes: {why}"
+                    "{place}: the bytes sent for a place declared {slot_ty} are not what it takes: {why}"
                 )))
             }
         };

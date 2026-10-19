@@ -53,19 +53,22 @@ bridge = BaileyBridge {
 }
 receive = BaileyReceive { bridge: bridge.bridge }
 
-openrouter = OpenRouterProvider {
-  connection: @instance_filled
+openrouter = OpenRouterAccess {
+  account: @instance_filled
+}
+model = OpenRouterModel {
+  access: openrouter.access
   model: @instance_filled("deepseek/deepseek-v4-flash-0731")
 }
 digest = Cron { cron: @instance_filled("0 0 8 * * *") }
 ```
 
-On a connection field, what you write decides whose key pays for an
-instance's calls, so ask the user which they want before writing it:
+On an access node's `account` field, what you write decides whose key pays
+for an instance's calls, so ask the user which they want before writing it:
 
 - nothing written: every instance runs on the connection the user picked on
   the install;
-- `connection: @instance_filled`: each instance connects its own and pays,
+- `account: @instance_filled`: each instance connects its own and pays,
   and an instance with none is refused, naming the field. It takes no
   fallback: a connection id written in the source is refused.
 
@@ -149,13 +152,13 @@ live = Group(keys: Access) {
     @per_instance
   }
 
-  say = Route -> (text: String) { path: "sessions/{id}/messages", method: "POST", auth: self.keys }
+  say = Route -> (body: { text: String }) { path: "sessions/{id}/messages", method: "POST", auth: self.keys }
   look = Route -> (view: String) { path: "sessions/{id}/preview/{view}", method: "GET", auth: self.keys }
   shoot = Route -> (id: String) { path: "sessions/{id}/render", method: "POST", auth: self.keys }
 
   agent = @include("live/agent.weft")
   agent.workstation = blender.workstation
-  agent.text = say.text
+  agent.text = say.body.text
 
   viewport = Group(workstation: Infra, view: String) {
     frame = BlenderPreview { workstation: self.workstation, view: self.view }

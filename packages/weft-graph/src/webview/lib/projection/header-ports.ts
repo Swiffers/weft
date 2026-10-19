@@ -18,7 +18,7 @@
 // override and freeze it into source.
 
 import type { EditPortSig, RevertedPortSig, OutputSpec, TypeParamWire, WeftType } from '../../../protocol';
-import { isGatePort, containsUnresolvedLeaf, inputIsRequired, narrowingBound, parseWeftType, tryParseWeftType } from '../../../protocol';
+import { isLanguagePort, containsUnresolvedLeaf, inputIsRequired, narrowingBound, parseWeftType, tryParseWeftType } from '../../../protocol';
 import { collectTypeVarBindings, fitsWithin, isCompatible, typeParamBound, typeParamViolation, weftTypesEqual, weftTypeToString } from '../types';
 
 export interface HeaderPortLike {
@@ -121,7 +121,8 @@ const requirednessState = (p: HeaderPortLike): string =>
  *     a genuine override read as a revert. The projection needs the
  *     list to apply the revert's rendered effect; the server does not
  *     (its header rewrite already omits them).
- *  Everything else (catalog-provided, inference-typed, `_should_flow`)
+ *  Everything else (catalog-provided, inference-typed, the language's
+ *  own `_should_flow` and `_error`)
  *  appears in neither list. */
 export function headerPortSigs(
 	previous: HeaderPortLike[],
@@ -134,7 +135,7 @@ export function headerPortSigs(
 	const sigs: EditPortSig[] = [];
 	const reverted: RevertedPortSig[] = [];
 	for (const p of next) {
-		if (isGatePort(p.name)) continue;
+		if (isLanguagePort(p.name)) continue;
 		const prev = prevByName.get(p.name);
 		const d = defByName.get(p.name);
 		const isWired = wired.has(p.name);
@@ -258,12 +259,13 @@ export function removedPortNames(
 	next: { name: string }[],
 ): string[] {
 	const kept = new Set(next.map((p) => p.name));
-	// A gate, either spelling, is language machinery and not a removable
-	// port: a producer rendering a filtered list must never make Rust
-	// sweep a real `n._should_flow = ...` wire (same guard headerPortSigs
-	// has).
+	// A language port (the gate, either spelling, or `_error`) is not a
+	// removable port: a producer rendering a filtered list (the card's
+	// output rows leave `_error` out) must never make Rust sweep a real
+	// `n._should_flow = ...` or `y.x = n._error` wire (same guard
+	// headerPortSigs has).
 	return previous
-		.filter((p) => !isGatePort(p.name) && !kept.has(p.name))
+		.filter((p) => !isLanguagePort(p.name) && !kept.has(p.name))
 		.map((p) => p.name);
 }
 

@@ -4643,6 +4643,23 @@ fn a_group_input_a_required_node_needs_must_be_connected() {
     assert!(unmet_is_empty(&entry_program(&wired, dir.path())));
 }
 
+/// A default fills only an unwired input. Inside, `req.method` is wired
+/// from `g.verb`, so when that port closes the request skips, default or
+/// not, and the port is required.
+#[test]
+fn a_group_input_feeding_a_defaulted_input_must_be_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "g = Group(verb: String) -> (out: Number) {\n\
+          req = HttpRequest { url: \"http://x\", method: self.verb }\n\
+          self.out = req.status\n\
+        }\n\
+        d = Debug { data: g.out }\n";
+    let d = entry_program(src, dir.path());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains("'g.verb'") && unmet[0].contains("'g.req.method'"), "{}", unmet[0]);
+}
+
 fn unmet_is_empty(d: &[Diagnostic]) -> bool {
     unmet(d).is_empty()
 }

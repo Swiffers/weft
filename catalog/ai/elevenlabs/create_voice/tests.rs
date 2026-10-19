@@ -85,12 +85,12 @@ async fn no_preview(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     for (description, says) in
         [("calm narrator".to_string(), "`description` is 13 characters"), ("x".repeat(1001), "`description` is 1001 characters")]
     {
         let err = rig.run(&ElevenLabsCreateVoiceNode, inputs(&rig, json!({ "description": description }))).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
         assert!(err.contains(says), "{err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent, so no voice is minted");

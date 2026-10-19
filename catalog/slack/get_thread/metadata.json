@@ -70,8 +70,5 @@
       "type": "Number",
       "description": "Messages in the thread, parent included."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

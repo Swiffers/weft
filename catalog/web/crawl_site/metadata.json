@@ -1,7 +1,7 @@
 {
   "type": "CrawlSite",
   "label": "Crawl Site",
-  "description": "Crawl a site from a starting URL and emit every reached page as clean markdown, using Firecrawl. Runs as long as the crawl takes; `limit` bounds the per-page cost.",
+  "description": "Crawl a site from a starting URL and emit every reached page as clean markdown, using Firecrawl. Runs as long as the crawl takes; `limit` bounds the per-page cost. The pages weigh more than the 100 KB a wire carries, so they come out as one stored file, a JSON line per page (url, title, markdown), with the page count beside it.",
   "tags": [
     "web",
     "scrape",
@@ -39,17 +39,14 @@
   "outputs": [
     {
       "name": "pages",
-      "type": "List[{ url: String | Null, title: String | Null, markdown: String }]",
-      "description": "Each page: url, title, markdown."
+      "type": "Blob",
+      "description": "A JSON lines file (`application/jsonl`), one line per crawled page: `{ url, title, markdown }`, url and title null when Firecrawl gave none."
     },
     {
       "name": "count",
       "type": "Number"
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

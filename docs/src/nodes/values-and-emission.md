@@ -82,10 +82,25 @@ node 'reply' tried to emit on undeclared output port 'txet'. Declare it in
 metadata.json's outputs list, or correct the port name in the node body.
 ```
 
-**A value over 100 KB fails the call**, naming the port. The check is on what
-you emit, so a node one hop later cannot trim it for you: bound it yourself (a
-cap input, a `LIMIT`), or put bytes in [storage](storage.md) and send the
-marker.
+**A value over 100 KB fails the call**, naming the port. The weight is the
+value written as JSON, checked on what you emit, so a node one hop later
+cannot trim it for you. There are two ways out, and the refusal names both:
+put the data in [storage](storage.md) and send the stored file, whose value
+weighs a few hundred bytes whatever the file holds, or send less. Sending less
+means sending one page of it along with where the next page starts, or cutting
+it short and saying so in another output.
+
+If you want to bound a value yourself, `weft::storage` measures it the way the
+wire does, against `MAX_WIRE_VALUE_BYTES`:
+
+| You want | Call |
+|---|---|
+| What a value weighs on a wire | `wire_weight(&value)` |
+| The longest start of a text that weighs at most `budget`, never splitting a character | `cut_to_weight(text, budget)` |
+| A text cut to `max_chars` characters, then to what one port carries, and whether anything was cut | `cap_text(text, max_chars)` |
+
+`FetchPage` uses `cap_text` this way: a `maxChars` input, and a `truncated`
+output that tells the program the page was cut.
 
 ## Waiting for the value to be taken
 
@@ -127,41 +142,30 @@ as: `file`, `filename`, `mimeType` and `sizeBytes`.
 
 Those, plus `?` on anything the ctx returns, cover every failure except a
 mistake in the program itself, which you return as `Err(WeftError::Input(..))`
-(see [Letting the program handle a failure](#letting-the-program-handle-a-failure)).
+(see [which failures a program can handle](#which-failures-a-program-can-handle)).
 
 Write the message as an instruction to whoever is building the program, because
 that is who reads it. "pick a destination: a channel or a user" beats "invalid
 configuration".
 
-## Letting the program handle a failure
+## Which failures a program can handle
 
-If your node reaches outside, it can fail for reasons the program might want
-to deal with: a model refusing a prompt, a host that does not answer, a
-database rejecting a row. If you want a
-program to be able to handle those, set this in the node's metadata:
+Every node has an `_error` output, which weft adds when it loads the node. If
+a program wires it, your node's failure comes out there and the node counts as
+done; if nobody wired it, the failure fails the run. For what that looks like
+from the program, go and read [when a node
+fails](../language/how-a-program-runs.md#when-a-node-fails). Your body writes
+no handling for it: it returns its errors with `?` as usual.
 
-```json
-"features": { "catchErrors": true }
-```
+`_error` is weft's, so a body that emits on it or closes it fails. `error`,
+without the underscore, is yours to use like any other name.
 
-weft then gives the node an `error` output, and your body just returns its
-errors with `?` as usual. If the program wires `error`, the failure's message comes out there,
-the node counts as done, and every output the body had not sent yet closes. If
-nobody wired it, the failure fails the run.
-
-In a durable run, a node that failed because its worker went away goes to `error`
-too (go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-run)).
-
-weft owns `error`: your node cannot declare it, and a body that emits on it
-fails. If your node only shapes values (a cast, a switch, a template), leave
-the flag off: it has nothing outside to fail on.
-
-Only failures of the call itself are caught: what `node_err`, `node_bail!` and
-outside errors produce. A bad setting, a bad input or a bad type always fails
-the run, wired or not, because the fix for those is in the program. The ctx
-sorts its own refusals the same way: `ctx.output_type` on a port your node does
-not declare fails the run, so just use `?` on it. A cancel, or a node pausing to
-wait for an answer, never becomes an `error` value.
+What your node does decide is which kind of failure it returns. Only a failure
+of the work itself reaches `_error`: what `node_err`, `node_bail!` and outside
+errors produce. A bad setting, a bad input or a bad type always fails the run,
+wired or not, because the fix for those is in the program. The ctx sorts its
+own refusals the same way: `ctx.output_type` on a port your node does not
+declare fails the run, so just use `?` on it.
 
 So when your node spots a mistake in the program itself (SQL it cannot run, a
 value of the wrong shape, an empty field it needs), fail with
@@ -169,7 +173,14 @@ value of the wrong shape, an empty field it needs), fail with
 the failure while it runs, use `node_bail!` instead. If your node talks to a
 server, decide the same way for each kind of refusal: the Postgres nodes fail
 the run on a syntax error or a missing table, and put a broken constraint on
-`error`.
+`_error`.
 
-In a test, `rig.wire_output("error")` wires `error` the way a program would.
-Without it the rig wires nothing, so the same node fails loudly.
+If your node produces a stream, its failure stops reaching `_error` once
+something went out on a `Bus` or `Generator` output. So do the work that can
+fail before you send the first piece. For a bus, `ctx.pending_bus` waits to
+open it until you have the first piece (go and read [streams and buses in
+Rust](streams-and-buses.md#hosting-a-bus)).
+
+In a test, `rig.wire_output("_error")` wires `_error` the way a program would,
+and `outcome.output("_error")` reads what came out. Without it the rig wires
+nothing, so the same node fails loudly.

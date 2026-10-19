@@ -90,8 +90,5 @@
       "name": "count",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

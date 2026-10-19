@@ -94,8 +94,5 @@
       "type": "String",
       "description": "The posted message's ts."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

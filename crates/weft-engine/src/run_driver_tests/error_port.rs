@@ -1,7 +1,9 @@
-    //! Layer 3: a node with `features.catchErrors` has its failure put on
-    //! its `error` output by the runtime when that output is wired, and a
-    //! firing a dead worker left running is failed, never run again, with
-    //! the same catch applying to that failure.
+    //! Layer 3: a node's failure is put on its `_error` output by the
+    //! runtime when that output is wired and the node has no stream open
+    //! (a bus, a generator that yielded); a
+    //! bus the node opened ends the way its body returned; and a firing a
+    //! dead worker left running is failed, never run again, with the same
+    //! catch applying to that failure.
 
     use super::*;
     use super::engine_test_rig::{catalog, drive, drive_journal, test_manifest};
@@ -11,6 +13,7 @@
     use weft_core::node::Node;
     use weft_core::{RunContext, ProjectDefinition};
     use weft_journal::RunEvent;
+    use std::sync::Mutex as StdMutex;
 
     /// Fails as an outcome of the node (a provider refusing, say).
     struct Refused;
@@ -95,8 +98,8 @@
         ])
     }
 
-    /// `node` (of `node_type`, catching its failures) feeds `after` on
-    /// `out`, and, when `error_wired`, `handler` on `error`.
+    /// `node` (of `node_type`) feeds `after` on `out`, and, when
+    /// `error_wired`, `handler` on `_error`.
     fn project(node_type: &str, error_wired: bool) -> ProjectDefinition {
         let sink = |id: &str, x: f64| json!({
             "id": id, "nodeType": "Sink", "label": null, "config": null, "position": {"x": x, "y": 0.0},
@@ -110,22 +113,22 @@
                 "inputs": [],
                 "outputs": [
                     {"name": "out", "portType": "String", "required": false},
-                    {"name": "error", "portType": "String", "required": false}
+                    {"name": "_error", "portType": "String", "required": false}
                 ],
-                "features": {"catchErrors": true}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
             }),
             sink("after", 1.0),
         ];
         if error_wired {
             nodes.push(sink("handler", 2.0));
-            edges.push(json!({"id": "e", "source": "node", "target": "handler", "sourceHandle": "error", "targetHandle": "in"}));
+            edges.push(json!({"id": "e", "source": "node", "target": "handler", "sourceHandle": "_error", "targetHandle": "in"}));
         }
         serde_json::from_value(json!({ "id": uuid::Uuid::new_v4(), "nodes": nodes, "edges": edges, "groups": [] })).unwrap()
     }
 
     fn error_value(events: &[RunEvent]) -> Option<String> {
         events.iter().find_map(|e| match e {
-            RunEvent::PortEmitted { node_id, port, value, .. } if node_id == "node" && port == "error" => {
+            RunEvent::PortEmitted { node_id, port, value, .. } if node_id == "node" && port == "_error" => {
                 value.as_str().map(str::to_string)
             }
             _ => None,
@@ -143,8 +146,8 @@
         })
     }
 
-    /// Wired, the failure is a value on `error`: the node completes,
-    /// the branch reading `error` runs, the one reading `out` is
+    /// Wired, the failure is a value on `_error`: the node completes,
+    /// the branch reading `_error` runs, the one reading `out` is
     /// skipped (the port closed), and the run completes.
     #[tokio::test]
     async fn a_failure_goes_to_a_wired_error_and_the_branch_carries_on() {
@@ -157,7 +160,7 @@
         // The node's log says where the failure went.
         assert!(
             events.iter().any(|e| matches!(e, RunEvent::LogLine { node_id, message, .. }
-                if node_id == "node" && message.contains("handed to the 'error' output") && message.contains("the service refused"))),
+                if node_id == "node" && message.contains("handed to the '_error' output") && message.contains("the service refused"))),
             "{events:?}"
         );
     }
@@ -256,7 +259,7 @@
         assert!(failed(&events, "node").is_some_and(|e| e.contains("the service refused")), "{events:?}");
     }
 
-    /// The crash failure is an outcome of the node too: with `error`
+    /// The crash failure is an outcome of the node too: with `_error`
     /// wired it goes there and the branch carries on.
     #[tokio::test]
     async fn a_node_the_worker_died_in_goes_to_a_wired_error() {
@@ -270,9 +273,9 @@
         assert!(completed(&events, "handler"), "{events:?}");
     }
 
-    /// A worker that died between putting a caught failure on `error`
+    /// A worker that died between putting a caught failure on `_error`
     /// and completing the firing: the next one completes it as
-    /// caught, with no second value on `error`, and the branch reading
+    /// caught, with no second value on `_error`, and the branch reading
     /// it carries on.
     #[tokio::test]
     async fn a_catch_the_worker_died_in_completes_as_caught() {
@@ -281,7 +284,7 @@
         let mut rows = crashed_rows(&project, run_id);
         rows.push(RunEvent::PortEmitted {
             run_id, emission_id: uuid::Uuid::new_v4(), node_id: "node".into(), frames: vec![],
-            port: "error".into(), value: Arc::new(json!("the service refused")), provided: false, at_unix: 0,
+            port: "_error".into(), value: Arc::new(json!("the service refused")), provided: false, at_unix: 0,
         });
         let (outcome, events) = drive_journal(project, nodes(), run_id, rows, CancellationFlag::new_arc()).await;
         let outcome = outcome.expect("the drive runs");
@@ -289,7 +292,7 @@
         assert!(completed(&events, "node") && failed(&events, "node").is_none(), "{events:?}");
         let error_rows = events
             .iter()
-            .filter(|e| matches!(e, RunEvent::PortEmitted { node_id, port, .. } if node_id == "node" && port == "error"))
+            .filter(|e| matches!(e, RunEvent::PortEmitted { node_id, port, .. } if node_id == "node" && port == "_error"))
             .count();
         assert_eq!(error_rows, 1, "only the dead worker's emission: {events:?}");
         assert_eq!(error_value(&events).as_deref(), Some("the service refused"));
@@ -354,4 +357,220 @@
         let error = failed(&events, "node").expect("the node fails");
         assert!(error.contains("features.pure") && error.contains("tag its run"), "{error}");
         assert!(error_value(&events).is_none(), "a wrong declaration is never caught");
+    }
+
+    /// Streams on `stream`: fails at `fail_at` pieces, before it opened
+    /// its bus when that is 0 (a provider refusing the call), halfway
+    /// otherwise, or finishes after `pieces` when it never fails.
+    struct Streamer {
+        pieces: usize,
+        fail_at: Option<usize>,
+    }
+    test_manifest!(Streamer, "Streamer");
+    #[async_trait]
+    impl Node for Streamer {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            if self.fail_at == Some(0) {
+                return Err(WeftError::NodeFailed("the model refused the call".into()));
+            }
+            let bus = ctx.open_bus("stream", Default::default(), "streamer").await?;
+            for piece in 0..self.pieces {
+                if self.fail_at == Some(piece) {
+                    return Err(WeftError::NodeFailed("the model went away mid-answer".into()));
+                }
+                bus.send("delta", json!(piece)).map_err(|e| WeftError::NodeFailed(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// What a [`Reader`] read off its bus, and how the bus ended.
+    type ReadBack = Arc<StdMutex<Option<(Vec<serde_json::Value>, Option<weft_core::bus::StreamEnd>)>>>;
+
+    /// Reads the bus on `bus` from the start, as a stream to a caller
+    /// does, and keeps what it read and how the bus ended.
+    struct Reader {
+        read: ReadBack,
+    }
+    test_manifest!(Reader, "Reader");
+    #[async_trait]
+    impl Node for Reader {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let bus = ctx.bus_from_input("bus")?;
+            let mut cursor = bus.cursor_from_start();
+            let mut pieces = Vec::new();
+            while let Some(entry) = cursor.next().await {
+                if let weft_core::bus::BusEntryKind::Message { payload: Some(payload), .. } = entry.kind {
+                    pieces.push(payload.into_json().expect("a json bus"));
+                }
+            }
+            *self.read.lock().unwrap() = Some((pieces, bus.end()));
+            Ok(())
+        }
+    }
+
+    /// `node` (a [`Streamer`]) feeds `reader` on its bus and `handler` on
+    /// `_error`.
+    fn streaming(streamer: Streamer) -> (ProjectDefinition, Arc<dyn weft_core::NodeCatalog>, ReadBack) {
+        let read: ReadBack = Default::default();
+        let nodes = catalog(vec![
+            ("Streamer", Box::new(streamer)),
+            ("Reader", Box::new(Reader { read: read.clone() })),
+            ("Sink", Box::new(Sink)),
+        ]);
+        let project = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                {
+                    "id": "node", "nodeType": "Streamer", "label": null, "config": null, "position": {"x": 0.0, "y": 0.0},
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "stream", "portType": "Bus", "required": false},
+                        {"name": "_error", "portType": "String", "required": false}
+                    ],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "reader", "nodeType": "Reader", "label": null, "config": null, "position": {"x": 1.0, "y": 0.0},
+                    "inputs": [{"name": "bus", "portType": "Bus", "required": true}], "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "handler", "nodeType": "Sink", "label": null, "config": null, "position": {"x": 2.0, "y": 0.0},
+                    "inputs": [{"name": "in", "portType": "String", "required": true}], "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                {"id": "s", "source": "node", "target": "reader", "sourceHandle": "stream", "targetHandle": "bus"},
+                {"id": "e", "source": "node", "target": "handler", "sourceHandle": "_error", "targetHandle": "in"}
+            ],
+            "groups": []
+        }))
+        .unwrap();
+        (project, nodes, read)
+    }
+
+    fn skipped(events: &[RunEvent], node: &str) -> bool {
+        events.iter().any(|e| matches!(e, RunEvent::NodeSkipped { node_id, .. } if node_id == node))
+    }
+
+    /// A failure before the bus opened is caught on the wired `_error`:
+    /// the bus output closes as absence, so its reader never starts, and
+    /// the branch gated on the failure answers instead.
+    #[tokio::test]
+    async fn a_failure_before_the_bus_opens_is_caught_and_its_readers_never_start() {
+        let (project, nodes, read) = streaming(Streamer { pieces: 2, fail_at: Some(0) });
+        let (outcome, events) = drive(project, nodes, &["node"]).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        assert_eq!(error_value(&events).as_deref(), Some("the model refused the call"));
+        assert!(completed(&events, "handler"), "{events:?}");
+        assert!(skipped(&events, "reader"), "{events:?}");
+        assert!(read.lock().unwrap().is_none(), "the reader never ran");
+    }
+
+    /// Once the bus is open, a failure is not caught, even with `_error`
+    /// wired: the node fails, the bus ends failed with its error, and the
+    /// reader reads what was sent, then that end.
+    #[tokio::test]
+    async fn a_failure_after_the_first_piece_fails_the_node_and_ends_the_bus_failed() {
+        let (project, nodes, read) = streaming(Streamer { pieces: 3, fail_at: Some(1) });
+        let (outcome, events) = drive(project, nodes, &["node"]).await;
+        assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
+        assert!(failed(&events, "node").is_some_and(|e| e.contains("mid-answer")), "{events:?}");
+        assert!(error_value(&events).is_none(), "nothing caught once the bus opened");
+        assert!(skipped(&events, "handler"), "{events:?}");
+        let (pieces, end) = read.lock().unwrap().clone().expect("the reader ran");
+        assert_eq!(pieces, vec![json!(0)]);
+        assert!(
+            matches!(&end, Some(weft_core::bus::StreamEnd::Failed { error }) if error.contains("mid-answer")),
+            "{end:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, RunEvent::BusClosed { end: weft_core::bus::StreamEnd::Failed { .. }, .. })),
+            "the record says how the bus ended: {events:?}"
+        );
+    }
+
+    /// A body that returns normally ends its bus finished.
+    #[tokio::test]
+    async fn a_body_that_returns_ends_its_bus_finished() {
+        let (project, nodes, read) = streaming(Streamer { pieces: 2, fail_at: None });
+        let (outcome, _events) = drive(project, nodes, &["node"]).await;
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        let (pieces, end) = read.lock().unwrap().clone().expect("the reader ran");
+        assert_eq!(pieces, vec![json!(0), json!(1)]);
+        assert_eq!(end, Some(weft_core::bus::StreamEnd::Finished));
+    }
+
+    /// Yields one item on its `Generator` output `rows`, then fails.
+    struct YieldThenFail;
+    test_manifest!(YieldThenFail, "YieldThenFail");
+    #[async_trait]
+    impl Node for YieldThenFail {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.pulse_downstream(weft_core::node::NodeOutput::new().set("rows", 1)).await?;
+            Err(WeftError::NodeFailed("the source went away mid-stream".into()))
+        }
+    }
+
+    /// Pulls every item of `rows`; what it saw ends up in its own
+    /// failure or completion.
+    struct Puller;
+    test_manifest!(Puller, "Puller");
+    #[async_trait]
+    impl Node for Puller {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let rows = ctx.inputs.get::<weft_core::Generator<i64>>("rows")?;
+            while rows.next().await?.is_some() {}
+            Ok(())
+        }
+    }
+
+    /// A generator that already yielded is a stream its reader holds part
+    /// of: a failure after it is not caught, even with `_error` wired, and
+    /// the reader's pull sees the failure instead of a clean end.
+    #[tokio::test]
+    async fn a_failure_after_a_generator_yielded_is_not_caught() {
+        let nodes = catalog(vec![
+            ("YieldThenFail", Box::new(YieldThenFail)),
+            ("Puller", Box::new(Puller)),
+            ("Sink", Box::new(Sink)),
+        ]);
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                {
+                    "id": "node", "nodeType": "YieldThenFail", "label": null, "config": null, "position": {"x": 0.0, "y": 0.0},
+                    "inputs": [],
+                    "outputs": [
+                        {"name": "rows", "portType": "Generator[Number]", "required": false},
+                        {"name": "_error", "portType": "String", "required": false}
+                    ],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "puller", "nodeType": "Puller", "label": null, "config": null, "position": {"x": 1.0, "y": 0.0},
+                    "inputs": [{"name": "rows", "portType": "Generator[Number]", "required": true}], "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "handler", "nodeType": "Sink", "label": null, "config": null, "position": {"x": 2.0, "y": 0.0},
+                    "inputs": [{"name": "in", "portType": "String", "required": true}], "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                {"id": "s", "source": "node", "target": "puller", "sourceHandle": "rows", "targetHandle": "rows"},
+                {"id": "e", "source": "node", "target": "handler", "sourceHandle": "_error", "targetHandle": "in"}
+            ],
+            "groups": []
+        }))
+        .unwrap();
+        let (outcome, events) = drive(project, nodes, &["node"]).await;
+        assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
+        assert!(failed(&events, "node").is_some_and(|e| e.contains("mid-stream")), "{events:?}");
+        assert!(error_value(&events).is_none(), "nothing caught once the stream opened");
+        assert!(failed(&events, "puller").is_some(), "the reader's pull saw the failure: {events:?}");
+        assert!(skipped(&events, "handler"), "{events:?}");
     }

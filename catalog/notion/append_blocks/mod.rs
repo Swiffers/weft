@@ -31,7 +31,7 @@ impl Node for NotionAppendBlocksNode {
 
         let children = children_of(content.as_deref(), blocks.as_ref())?;
         // Appending nothing is a mistake in the program, never a value
-        // for `error`.
+        // for `_error`.
         if children.is_empty() {
             return Err(weft::WeftError::Input(
                 "nothing to write: set content (plain text) or blocks".to_string(),

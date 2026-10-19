@@ -91,8 +91,8 @@ the table, or a page calls a route with that instance's token in
 
 ## Connections per person
 
-Each person connects their own accounts when the field is written
-`connection: @instance_filled`: that person's calls then run on their key and
+Each person connects their own accounts when the access node's field is
+written `account: @instance_filled`: that person's calls then run on their key and
 their bill. A field left unmarked runs every person on the connection the
 user picked on the install, on the user's bill. Ask the user which they want
 for each paid service before you write it.

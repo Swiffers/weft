@@ -1,18 +1,18 @@
 //! ElevenLabsSpeak self-tests. The fake rig has no provider WebSocket,
 //! so the session is tested through its parts: the URL and the opener
-//! a run's inputs make, the refusals, the frame vocabulary, and the
-//! relay that turns frames into bus messages. The live test drives the
-//! whole socket.
+//! a run's inputs make, the refusals, the frame vocabulary, the read
+//! that turns frames into bus messages, and the refusal of a text that
+//! broke off. The live test drives the whole socket.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use weft::bus::{BusHandle, BusOptions, BusPayloadKind};
+use weft::bus::{BusOptions, StreamEnd};
 use weft::{FakeRig, LiveRig, NodeManifest, NodeTest, ValueBag, WeftResult, Widget};
 
-use super::super::elevenlabs::audio_file_type;
+use super::super::elevenlabs::{audio_file_type, refuse_broken_input};
 use super::{
-    bus_meta, byte_rate, classify_session_frame, placed, refusal, relay_frame, text_of, Character,
+    bus_meta, byte_rate, classify_session_frame, placed, read_frame, refusal, text_of, Character,
     ElevenLabsSpeakNode, Session,
 };
 
@@ -27,7 +27,8 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("a_voice_id_can_only_ever_name_a_voice", voice_id_encoded),
         NodeTest::basic("the_streaming_settings_that_cannot_go_together", pairs),
         NodeTest::basic("characters_land_on_the_whole_speech", characters_placed),
-        NodeTest::fake("each_frames_timing_reaches_the_alignment_bus_on_one_clock", timing_relay),
+        NodeTest::basic("a_live_input_that_broke_off_is_refused", broken_input),
+        NodeTest::basic("each_frames_timing_lands_on_one_clock", timing_relay),
         NodeTest::fake("settings_the_socket_would_refuse_are_refused_before_it_opens", refused),
         NodeTest::fake("accepted_settings_pass_every_refusal", accepted),
         NodeTest::live("one_real_streamed_speech", "elevenlabs", live_stream),
@@ -280,14 +281,9 @@ fn characters_placed() -> WeftResult<()> {
     Ok(())
 }
 
-/// Two timed frames relayed through the real buses: the second frame's
-/// characters count from where the first frame's audio ends.
-async fn timing_relay(_rig: FakeRig) -> WeftResult<()> {
-    let mut audio = BusHandle::create_with_options(BusOptions { payload: BusPayloadKind::Bytes, ..Default::default() })
-        .expect("a bytes bus opens");
-    audio.register("speaker").expect("a fresh bus accepts its first name");
-    let mut timing = BusHandle::create();
-    timing.register("speaker").expect("a fresh bus accepts its first name");
+/// Two timed frames read for relaying: the second frame's characters
+/// count from where the first frame's audio ends.
+fn timing_relay() -> WeftResult<()> {
     let frame = |bytes: usize, chars: Value, starts: Value, durations: Value| {
         json!({
             "audio": base64::engine::general_purpose::STANDARD.encode(vec![0u8; bytes]),
@@ -297,31 +293,33 @@ async fn timing_relay(_rig: FakeRig) -> WeftResult<()> {
     };
     // pcm_16000 is 32 000 bytes a second: the first frame is half a
     // second of audio.
-    let clock = Some((&timing, 32_000.0));
+    let clock = Some(32_000.0);
     let mut full = Vec::new();
-    assert!(!relay_frame(&frame(16_000, json!(["H", "i"]), json!([0, 125]), json!([125, 375])), &audio, clock, &mut full)?);
-    assert!(!relay_frame(&frame(3_200, json!(["!"]), json!([0]), json!([250])), &audio, clock, &mut full)?);
-    assert!(relay_frame(r#"{"audio":null,"isFinal":true}"#, &audio, clock, &mut full)?);
+    let first = read_frame(&frame(16_000, json!(["H", "i"]), json!([0, 125]), json!([125, 375])), clock, &mut full)?;
+    assert!(!first.is_final);
+    assert_eq!(first.audio.as_ref().map(Vec::len), Some(16_000));
+    assert_eq!(first.alignment, Some(json!([{ "text": "H", "start": 0.0, "end": 0.125 }, { "text": "i", "start": 0.125, "end": 0.5 }])));
+    let second = read_frame(&frame(3_200, json!(["!"]), json!([0]), json!([250])), clock, &mut full)?;
+    assert_eq!(second.alignment, Some(json!([{ "text": "!", "start": 0.5, "end": 0.75 }])), "placed after every byte before it");
+    let last = read_frame(r#"{"audio":null,"isFinal":true}"#, clock, &mut full)?;
+    assert!(last.is_final);
+    assert!(last.audio.is_none() && last.alignment.is_none(), "the final frame carries no audio and no timing");
     assert_eq!(full.len(), 19_200, "every frame's audio is in the full copy");
+    // Without the clock (timing not asked for), no frame carries timing.
+    let untimed = read_frame(&frame(10, json!(["x"]), json!([0]), json!([1])), None, &mut Vec::new())?;
+    assert!(untimed.alignment.is_none());
+    Ok(())
+}
 
-    timing.close();
-    let mut cursor = timing.cursor_from_start();
-    let (_, first) = cursor
-        .next_json("alignment")
-        .await
-        .expect("the timing bus carries json")
-        .expect("the first frame's timing");
-    assert_eq!(first, json!([{ "text": "H", "start": 0.0, "end": 0.125 }, { "text": "i", "start": 0.125, "end": 0.5 }]));
-    let (_, second) = cursor
-        .next_json("alignment")
-        .await
-        .expect("the timing bus carries json")
-        .expect("the second frame's timing");
-    assert_eq!(second, json!([{ "text": "!", "start": 0.5, "end": 0.75 }]));
-    assert!(
-        cursor.next_json("alignment").await.expect("the timing bus carries json").is_none(),
-        "the final frame carries no timing"
-    );
+/// A live input that broke off is refused naming its port and why; one
+/// that finished passes, and one still open is the reader's bug.
+fn broken_input() -> WeftResult<()> {
+    let err = refuse_broken_input("text", Some(StreamEnd::Failed { error: "the model went away".into() }))
+        .expect_err("a broken input is refused")
+        .to_string();
+    assert!(err.contains("'text' broke off") && err.contains("the model went away"), "{err}");
+    refuse_broken_input("text", Some(StreamEnd::Finished))?;
+    assert!(refuse_broken_input("text", None).is_err(), "an input read to its end is closed");
     Ok(())
 }
 

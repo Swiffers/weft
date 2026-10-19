@@ -95,9 +95,6 @@
       "description": "The generated video, kept for 30 days after it was last read."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "video"

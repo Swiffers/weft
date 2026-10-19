@@ -30,7 +30,7 @@ fn bridge_call(
     participants: &[String],
 ) -> WeftResult<(&'static str, serde_json::Value)> {
     // Every refusal here is the program's own settings missing a value
-    // its action needs, so none is catchable on `error`.
+    // its action needs, so none is catchable on `_error`.
     let mistake = WeftError::Input;
     let need_group =
         || group_id.map(str::to_string).ok_or_else(|| mistake(format!("'{action}' needs groupId")));

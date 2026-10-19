@@ -7,14 +7,19 @@
 //! a Socket is refused loud, the format is ignored).
 //!
 //! The bus is read from the earliest message still buffered, so a
-//! producer that started before this node attached loses nothing. The
-//! framing is the package's pure `framing.rs`; a raw payload rides per
-//! the trigger's data type through `wire::chunk_for`.
+//! producer that started before this node attached loses nothing. A bus
+//! that ended failed (its producer broke off) is never ended as a whole
+//! answer: the exchange fails instead (`fail`), a real error status when
+//! nothing went out yet, the format's error marker after (an SSE `error`
+//! event, a last ndjson line, an `[error]` line), a `1011` close on a
+//! socket, and `done` stays absent. The framing is the package's pure
+//! `framing.rs`; a raw payload rides per the trigger's data type through
+//! `wire::chunk_for`.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::bus::{BusEntryKind, WirePayload};
+use weft::bus::{BusEntryKind, BusHandle, StreamEnd, WirePayload};
 use weft::caller::{CallerHandle, HttpCaller, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
 use weft::{RunContext, Node, NodeManifest, WeftResult};
@@ -76,6 +81,9 @@ impl Node for StreamNode {
                     let chunk = framed(&ctx, format, data_type, payload).await?;
                     write_chunk(&http, &mut head, chunk).await?;
                 }
+                if let Some(why) = broke_off(&bus) {
+                    return http.fail(&why).await;
+                }
                 // The bus closed: end the response. A stream that never
                 // carried a message still answers, with the head alone.
                 match head.take() {
@@ -95,9 +103,21 @@ impl Node for StreamNode {
                     let chunk = framed(&ctx, Format::Raw, data_type, payload).await?;
                     ws.send(chunk).await?;
                 }
+                if let Some(why) = broke_off(&bus) {
+                    return ws.fail(&why).await;
+                }
             }
         }
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+    }
+}
+
+/// Why the stream did not complete, when its bus ended failed: what the
+/// exchange's failure says on the run's record.
+fn broke_off(bus: &BusHandle) -> Option<String> {
+    match bus.end() {
+        Some(StreamEnd::Failed { error }) => Some(format!("the stream broke off: {error}")),
+        Some(StreamEnd::Finished) | None => None,
     }
 }
 

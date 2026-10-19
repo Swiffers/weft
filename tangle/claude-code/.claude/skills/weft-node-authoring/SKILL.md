@@ -118,7 +118,7 @@ Unknown keys are a loud parse error. Top level:
 | `inputs` | one list for wired data and design-time config |
 | `outputs` | output ports |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `catchErrors` (the node reaches outside; weft adds the `error` output and catches the body's failures onto it), `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `addedPortsAreDataKeys` (under Spelling) |
+| `features` | flags: `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `join` (the node meets several branches and goes on with whichever arrived, like `FirstInOrder`: its added inputs are optional, and it closes its output itself when nothing arrived), `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `addedPortsAreDataKeys` (under Spelling) |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
 | `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name. On a node without `features.isTrigger`, or with a type weft cannot parse, the node fails to load |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
@@ -172,8 +172,8 @@ graph view lists it as "node spelling warning". Clear every one on a node you
 write.
 
 If the ports a program adds to your node are named after data from outside
-weft (a request body's fields, a query's parameters, a table's columns, a
-template's ids), set `features.addedPortsAreDataKeys`. The compiler's
+weft (a path's captures, a query's parameters, a template's ids, the keys
+of a JSON object it builds), set `features.addedPortsAreDataKeys`. The compiler's
 `not-camel-case` warning then leaves the ports a program adds alone, and still
 checks the name the program gives the node.
 
@@ -315,25 +315,25 @@ failure is recorded in the journal where the user reads it. If you catch
 yourself writing a fallback value, a `.ok()`, or a retry, stop and write:
 "Wait. Fail loudly." Then bail with the cause.
 
-A node that reaches outside (a service, a database, a file, a model) can fail
-in a way a program wants to handle, so it lets the program choose: it sets
-`"features": { "catchErrors": true }` in its metadata and writes no error
-handling at all. Weft gives it an `error` output and does the catching:
-
-```json
-"features": { "catchErrors": true }
-```
-
-With `error` wired, a failure of the body becomes its message on `error` and
-every output the body had not emitted closes; unwired, the failure fails the
-run. A bad setting, input or type always fails the run. The body stays loud:
-it returns its errors with `?` and `node_bail!` exactly as any node does.
-Weft owns `error`: declaring it in the metadata is refused, and so is a body
-emitting on it. A node that only shapes values (a cast, a switch, a
-template) has nothing outside to fail on and does not set the flag.
-`ctx.is_output_wired(port)` tells a body whether anything reads a port. A
-`fake` test of the caught path calls `rig.wire_output("error")` first; a rig
-wires nothing by default, so without it the failure fails the test run.
+A program that wants to handle a node's failure wires its `_error` output,
+which every node has (weft adds it, a `String`), so your node writes no error
+handling at all. With `_error` wired, a failure of the body becomes its
+message on `_error`, the node completes, and every output the body had not
+emitted closes; unwired, the failure fails the run. What is caught is a
+failure of the call itself (`node_bail!`, an outside error through `?`, a
+wait that gave up, the worker going away). A bad setting, input or type, a
+suspension or a cancel always fails the run, and so does any failure once
+the node has sent something on a `Bus` or generator output: that stream
+ends failed instead. The body stays loud: it returns its errors with `?` and
+`node_bail!` exactly as any node does. Weft owns `_error`: declaring it in
+the metadata is refused, and so is a body emitting on it. No feature turns
+it on: the loader refuses a `metadata.json` whose `features` still names the
+old flag. A plain `error` is a free name for an output of your own. `ctx.is_output_wired(port)` tells a body whether anything reads a port.
+A `fake` test of the caught path calls `rig.wire_output("_error")` first and
+reads the message with `outcome.output("_error")?`; a rig wires nothing by
+default, so without it the failure fails the test run
+(`nodes/base_catalog/ai/elevenlabs/clone_voice/tests.rs` has both, and shows
+an input error failing even with `_error` wired).
 
 **Calling a service.** `weft::access::client` already holds what every API
 node repeats, so you never write it again: `get_json` / `post_json` (send,
@@ -383,7 +383,7 @@ user-added output ports use `ctx.fan_declared(...)`.
 
 **Share what is slow to build**: a client pool, a process. `ctx.shared(&access, |opened| async move { .. })` builds it the first time a run asks and hands every later run on that worker the same one; it is built again when the connection's values change, or after nobody used it for the project's idle window (300 seconds by default, `weft workers set --shared-idle-seconds`). The closure returns a `WeftResult` of the thing and you get a handle you use as the thing. `ctx.shared("name", |()| async { .. })` is the same when nothing is built from a connection, and `.with_limit(n)` before the `.await` lets at most `n` runs of a worker hold it at once (a pool kept under a database's connection limit). A database client opened on every run pays the connection each time; for a worked pool, go and read `nodes/base_catalog/postgres/postgres.rs`.
 
-If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the node: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `catchErrors` and `error` wired, that failure goes to `error` like any other. A node marked `pure` is the exception: a firing of it that had sent nothing on and read no stream runs again, since it did nothing anyone could see. The one other body weft starts again on purpose is one parked on `ctx.await_signal`, which replays from the top when its answer comes, so the work before the wait goes through `ctx.run(...)`, which
+If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the node: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `_error` wired, that failure goes to `_error` like any other. A node marked `pure` is the exception: a firing of it that had sent nothing on and read no stream runs again, since it did nothing anyone could see. The one other body weft starts again on purpose is one parked on `ctx.await_signal`, which replays from the top when its answer comes, so the work before the wait goes through `ctx.run(...)`, which
 gives back the recorded result. An emit on a port already sent before the wait does nothing on the replay, so a node can send `stats` at once, wait, then send `image`; what it cannot do is wait after yielding on or closing a stream output, which is refused. In a run that cannot pause (a route's caller on the line, `recorded: false`, a bus open), `ctx.await_signal` holds in your call instead and returns the answer without a replay; if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp`, which your node may match and handle (test it with `rig.signal_given_up()`).
 
 **Stopping is cooperative, and a node that ignores it cannot be stopped.**
@@ -808,17 +808,23 @@ typed in) and say why in the report.
 A trigger's display is NOT yours to write: the signal KIND serves it, inside
 weft. "The display" below says what that means for you.
 
-**The wire limit**: a value emitted on a port is at most 100 KB, checked on
-every emission (and on every yielded item of a stream), and a bigger one
-fails the node right there: `port 'results' of 'search' carries 107 KB; a
-wire carries at most 100 KB`. Nothing downstream can trim it, because the
-check is on what YOU emit, so the node bounds its own output: a cap input
-where the size comes from the outside world (`WebSearch`'s `maxTextChars`
-cuts each page's text at the provider), and storage for anything that is
-bytes rather than a value: `ctx.storage(scope).put(..)` and emit the file
-value, which weighs a few hundred bytes whatever the file does. A node
-whose output CAN exceed the limit on a bad day (a long article, a big
-listing) and does neither is a node that fails on that day.
+**The wire limit**: a value emitted on a port weighs at most 100 KB as JSON,
+checked on every emission (and on every yielded item of a stream), and a
+bigger one fails the node right there: `port 'results' of 'search' carries 107 KB, and a wire carries at most 100 KB. Return less: one page of it with where the next one starts, or a part that says it was cut. Or store the data and send the stored file instead, whose value weighs a few hundred bytes whatever the file holds`. Nothing downstream can trim it, because the check is on what YOU emit,
+so an output that can grow is bounded when the node is written, one of three
+ways. Page it: an offset or cursor in, where the next page starts plus
+`hasMore` out (`GoogleSheetsRead` takes `offset` and `maxRows` and answers
+`nextOffset`; `S3ListObjects` takes `startAfter` and `maxKeys` and answers
+`lastKey`). Cap it: a size setting with a default and an output saying it
+was cut (`FetchPage`'s `maxChars` and `truncated`). Or store it, for
+anything that is bytes rather than a value: `ctx.storage(scope).put(..)` and
+emit the file value, which weighs a few hundred bytes whatever the file
+does. `weft::storage::wire_weight(&value)` is the same measure the refusal
+uses, `cut_to_weight(text, budget)` cuts a text to a weight, and
+`cap_text(text, max_chars)` cuts to a `maxChars` and then to the limit,
+answering `(text, cut)` for your `truncated` output. A node whose output CAN
+exceed the limit on a bad day (a long article, a big listing) and is
+bounded none of these ways is a node that fails on that day.
 
 Every `put` makes a new stored file. A value that grows with use (a
 conversation, a log, a document the node keeps adding to) passes 100 KB one
@@ -833,7 +839,8 @@ keeps its key, so every reference already handed out reads the new content,
 and every edit is recorded on the run as a readable diff the graph shows
 under "Files edited". `ctx.storage(scope).replace(&file, bytes)` overwrites
 whatever is there without reading it. A one-shot answer (a reply, a fetched
-page, a query's rows) stays a value: it does not grow through use.
+page, a query's rows) is still a value, since it does not grow through use,
+but it is still paged or capped as above.
 
 **A file input**: the value on an `Image` / `Audio` / `Video` / `Blob` port
 is the stored-file marker (`__weft_image__`, `__weft_video__`,
@@ -862,22 +869,33 @@ has to move while the run is still going (rows kept live, a model's deltas,
 audio frames). A `Bus` port is wire-only, and what travels it is a marker,
 not the data.
 
-If you want to produce one, `ctx.open_bus(port, BusOptions::default(), "watch")`
-is the whole ritual in one call: it creates the bus, pulses its marker on that
-output port, and registers you on it under that name. Then
-`bus.send("<kind>", json!(value))`, or `send_bytes` on a `Bytes` bus. The
+If you want to produce one, open it on your FIRST piece, never before the
+call that can fail: `let mut bus = ctx.pending_bus(port, opts, "watch");`,
+then, with the first piece in hand, `bus.open().await?.send("<kind>",
+json!(value))` (or `send_bytes` on a `Bytes` bus), and
+`bus.open().await?.close()` at the end
+(`nodes/base_catalog/ai/llm/stream/mod.rs` is the model). Until the marker
+goes out your node has opened no stream, so a failure before then is still
+caught on `_error` and the port closes as an absence (its readers never
+start, and a branch gated on `_error` can answer); a producer that never
+opens it leaves the port closed. `ctx.open_bus(port, opts, name)` creates the
+bus, pulses its marker and registers you under that name in one call (it is
+what `open()` calls); use it straight only when nothing can fail before the
+first piece. The
 options, all declared at creation and read back by every consumer: `payload`
 (`Json` by default, `Bytes` for media frames, wrong shape refused loud), `meta`
 for facts a reader needs about the stream (sample rate, model name),
 `ephemeral` to keep payloads out of the journal, `window` for how far a slow
 reader may fall behind (64 frames).
 
-A bus must be closed, because a reader parked on one that never closes waits
-for ever. The handle `open_bus` gives you closes it when it drops, on every
-exit path including the failing one, so what you have to get right is not
-holding it past the work: a node that runs until the run ends waits on
-`ctx.cancellation()` and returns, and that drop is what the reader downstream
-sees as the end of the feed.
+A bus ends when the body of the firing that created or joined it returns:
+finished if the body returned `Ok`, failed with its error if it failed (a
+body that paused on a wait ends its buses failed too). Dropping a handle
+closes nothing. `bus.close()` ends it early, as finished ("no more
+messages"); a failed end is never yours to write. So what you have to get
+right is returning when the work is done: a node that runs until the run
+ends waits on `ctx.cancellation()` and returns, and that return is what the
+reader downstream sees as the end of the feed.
 
 If you want to read a bus the graph handed you, the choice is what you must not
 miss:
@@ -887,11 +905,16 @@ miss:
 | `ctx.join_bus(port, name)?`, then `bus.cursor()` | you take part in the exchange and want what is sent from now on |
 | `ctx.bus_from_input(port)?`, then `bus.cursor_from_start()` | you must not miss what was sent before you attached, or the producer may already have finished |
 
-`join_bus` closes on drop like `open_bus`; `bus_from_input` never closes, which
-is what an observer wants, because ending a feed the producer still owns is a
-bug. Read with `cursor.next().await` for every entry, or
-`cursor.next_json("<kind>").await` for one kind's payloads. `None` means the
-bus closed.
+A bus you joined is held by your firing like one you created, so if your
+body fails the bus ends failed. `bus_from_input` never ends it, which is
+what an observer wants (a debug tap, a reader streaming it out), because
+ending a feed the producer still owns is a bug. Read with
+`cursor.next().await` for every entry, or `cursor.next_json("<kind>").await`
+for one kind's payloads. `None` means the bus ended: then ask `bus.end()`,
+and on `Some(StreamEnd::Failed { error })` the stream did not complete, so
+say so in your own protocol rather than presenting it as whole
+(`nodes/base_catalog/api/stream/mod.rs` calls `http.fail(&why)` or
+`ws.fail(&why)`).
 
 Do every bus read and wait on your own task, and never move a handle or a
 cursor into a `tokio::spawn`. The engine works out "everyone is stuck, close

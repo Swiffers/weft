@@ -76,9 +76,6 @@
       "description": "The edited image."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "image"

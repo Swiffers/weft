@@ -581,23 +581,21 @@ pub fn enrich_collecting(
             PortDirection::Input,
             &mut errors,
         );
-        // A node that catches its failures has an `error` output the
-        // language gave it and the runtime fills; a source port of that
-        // name would read as the author's own value on it. The declared
-        // port is dropped before the merge so this is the one error it
-        // earns, not this plus a type mismatch against the catalog's.
+        // Every node has an `_error` output the language gave it and
+        // the runtime fills; a source port of that name would read as
+        // the author's own value on it. The declared port is dropped
+        // before the merge so this is the one error it earns, not this
+        // plus a type mismatch against the catalog's.
         let mut weft_outputs = weft_outputs;
-        if meta.features.catch_errors {
-            let port = weft_core::node::ERROR_PORT;
-            if weft_outputs.iter().any(|p| p.name == port) {
-                weft_outputs.retain(|p| p.name != port);
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
-                    "node '{}': '{port}' is the output this node type already has for its \
-                     failures (wire it to handle them); remove '{port}' from the node's \
-                     outputs, or give your own port another name",
-                    node.id,
-                )});
-            }
+        let port = weft_core::node::ERROR_PORT;
+        if weft_outputs.iter().any(|p| p.name == port) {
+            weft_outputs.retain(|p| p.name != port);
+            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                "node '{}': '{port}' is the output every node already has for its failures \
+                 (wire it to handle them); remove '{port}' from the node's outputs, or give \
+                 your own port another name",
+                node.id,
+            )});
         }
         let output_fits = |catalog: &PortDefinition, declared: &WeftType| {
             meta.output_declaration_fits(&catalog.name, &catalog.port_type, declared)

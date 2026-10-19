@@ -42,17 +42,111 @@ pub const MAX_WIRE_VALUE_BYTES: usize = 100 * 1024;
 /// apart from a conflict that will not resolve on its own.
 pub const COMPLETING_HEADER: &str = "x-weft-completing";
 
-/// Whether `value` may travel a wire from port `port` of node `node`:
-/// the refusal names the port, the weight and where bytes belong.
-pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX);
-    if bytes <= MAX_WIRE_VALUE_BYTES {
-        return Ok(());
+/// What `value` weighs on a wire: its compact JSON, in bytes. The one
+/// measure [`check_wire_value`] holds to [`MAX_WIRE_VALUE_BYTES`], so a
+/// node that bounds its own output with it can never disagree with the
+/// refusal. A value that does not serialize weighs `usize::MAX`.
+pub fn wire_weight<T: Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |v| v.len())
+}
+
+/// The longest start of `text`, cut between two characters, that
+/// weighs at most `budget` on a wire as a JSON string ([`wire_weight`]:
+/// its UTF-8 bytes, the two quotes, and every escape JSON writes, so a
+/// newline counts two). For a node that keeps a text under the limit
+/// itself and says it cut it. A budget below 2, the weight of the empty
+/// string, has no answer and is the caller's bug: it panics.
+pub fn cut_to_weight(text: &str, budget: usize) -> &str {
+    assert!(budget >= 2, "cut_to_weight: a budget of {budget} bytes holds not even the empty string's two quotes");
+    if wire_weight(text) <= budget {
+        return text;
     }
+    // Every place `text` can be cut, the empty start included.
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let fits = |i: usize| wire_weight(&text[..ends[i]]) <= budget;
+    // The weight only grows with the length, so a binary search finds
+    // the last cut that fits: `lo` fits (or is the empty start), `hi`
+    // does not.
+    let (mut lo, mut hi) = (0, ends.len() - 1);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    &text[..ends[lo]]
+}
+
+/// `text` cut to at most `max_chars` characters, and further, with
+/// [`cut_to_weight`], to what one port carries when even that weighs
+/// more than a wire takes, with whether anything was cut. The shape of
+/// a node's text setting like `maxChars` paired with a `truncated`
+/// output.
+pub fn cap_text(text: &str, max_chars: usize) -> (&str, bool) {
+    let by_chars = match text.char_indices().nth(max_chars) {
+        Some((i, _)) => &text[..i],
+        None => text,
+    };
+    let cut = cut_to_weight(by_chars, MAX_WIRE_VALUE_BYTES);
+    (cut, cut.len() < text.len())
+}
+
+/// A weight said the way every refusal over the limit says it: "117
+/// KB, and a wire carries at most 100 KB". A refusal puts it after its
+/// own subject ("port 'x' of 'y' carries ...", "the rows weigh ...")
+/// and adds its own fix.
+pub fn wire_weight_said(bytes: usize) -> String {
+    format!("{} KB, and a wire carries at most {} KB", bytes.div_ceil(1024), MAX_WIRE_VALUE_BYTES / 1024)
+}
+
+/// When `value` weighs more than a wire carries, its weight said
+/// ([`wire_weight_said`]); `None` when it fits.
+pub fn over_wire<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    let bytes = wire_weight(value);
+    (bytes > MAX_WIRE_VALUE_BYTES).then(|| wire_weight_said(bytes))
+}
+
+/// Where a page of a list ends: the items from `offset` (past the end
+/// is an empty page at the end) that one wire carries as a list, at
+/// most `max` of them. `Err(index)` when the page's first item, at
+/// `index`, weighs more than a wire on its own: no page can hold it,
+/// so the caller decides, once, whether to refuse it or cut it. `max`
+/// is at least 1: an empty page would never move a cursor on, so a
+/// page size of 0 is the caller's bug and panics (a node refuses such a
+/// setting where it reads it).
+pub fn wire_page(items: &[Value], offset: usize, max: usize) -> Result<std::ops::Range<usize>, usize> {
+    assert!(max >= 1, "wire_page: a page of at most 0 items never moves on");
+    let start = offset.min(items.len());
+    // The list's own brackets, then each item and the comma before it.
+    let mut total = 2;
+    let mut end = start;
+    for item in items[start..].iter().take(max) {
+        let added = wire_weight(item) + usize::from(end > start);
+        if total + added > MAX_WIRE_VALUE_BYTES {
+            break;
+        }
+        total += added;
+        end += 1;
+    }
+    if end == start && start < items.len() {
+        return Err(start);
+    }
+    Ok(start..end)
+}
+
+/// Whether `value` may travel a wire from port `port` of node `node`:
+/// the refusal names the port, the weight, the limit, and the two ways
+/// out, since what fits depends on what the value is.
+pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
+    let Some(weight) = over_wire(value) else {
+        return Ok(());
+    };
     Err(format!(
-        "port '{port}' of '{node}' carries {} KB; a wire carries at most {} KB. Bytes belong in a stored file: put the data in storage and send the file value",
-        bytes.div_ceil(1024),
-        MAX_WIRE_VALUE_BYTES / 1024
+        "port '{port}' of '{node}' carries {weight}. Return less: one page of it with where the next \
+         one starts, or a part that says it was cut. Or store the data and send the stored file \
+         instead, whose value weighs a few hundred bytes whatever the file holds"
     ))
 }
 
@@ -1494,8 +1588,85 @@ mod tests {
         assert!(check_wire_value("n", "out", &at_cap).is_ok(), "the cap itself passes");
         let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
         let refusal = check_wire_value("pic", "bytes", &over).unwrap_err();
-        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB; a wire carries at most 100 KB"), "{refusal}");
-        assert!(refusal.contains("stored file"), "{refusal}");
+        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB, and a wire carries at most 100 KB"), "{refusal}");
+        let less = refusal.find("Return less: one page of it").expect("the way out any node or script has");
+        let stored = refusal.find("send the stored file").expect("the way out for bytes");
+        assert!(less < stored, "returning less comes first: {refusal}");
+    }
+
+    #[test]
+    fn wire_weight_is_the_measure_the_refusal_uses() {
+        // `"x...x"` weighs its length and the two quotes.
+        let fits = "x".repeat(MAX_WIRE_VALUE_BYTES - 2);
+        assert_eq!(wire_weight(fits.as_str()), MAX_WIRE_VALUE_BYTES);
+        assert!(check_wire_value("n", "out", &json!(fits)).is_ok());
+        let over = "x".repeat(MAX_WIRE_VALUE_BYTES - 1);
+        assert_eq!(wire_weight(&json!(over)), MAX_WIRE_VALUE_BYTES + 1);
+        assert!(check_wire_value("n", "out", &json!(over)).is_err());
+        // A newline is two bytes of JSON, a slice weighs as a list.
+        assert_eq!(wire_weight("a\nb"), 6);
+        assert_eq!(wire_weight(&[json!(1), json!(2)][..]), 5);
+    }
+
+    #[test]
+    fn a_cut_lands_between_characters_and_fits_its_budget() {
+        // "é" is two bytes: a budget of 5 holds the quotes and one "é",
+        // and never half of the next.
+        assert_eq!(cut_to_weight("ééé", 5), "é");
+        assert_eq!(cut_to_weight("ééé", 6), "éé");
+        assert_eq!(cut_to_weight("abc", 100), "abc", "what fits stays whole");
+        assert_eq!(cut_to_weight("abc", 2), "", "only the quotes fit");
+        assert_eq!(cut_to_weight("a\nb", 5), "a\n", "an escape counts what it weighs");
+        let long = "x".repeat(MAX_WIRE_VALUE_BYTES * 2);
+        assert_eq!(wire_weight(cut_to_weight(&long, MAX_WIRE_VALUE_BYTES)), MAX_WIRE_VALUE_BYTES);
+    }
+
+    #[test]
+    fn a_wire_page_stops_at_its_size_and_at_what_a_wire_carries() {
+        let small: Vec<Value> = (0..5).map(|i| json!({ "n": i })).collect();
+        assert_eq!(wire_page(&small, 0, 2), Ok(0..2), "at most the page size");
+        assert_eq!(wire_page(&small, 4, 2), Ok(4..5), "the last page holds what is left");
+        assert_eq!(wire_page(&small, 9, 2), Ok(5..5), "past the end is an empty page");
+        // Three items of 40 KB: two fit a wire, whatever the page size.
+        let heavy: Vec<Value> = (0..3).map(|_| json!({ "a": "x".repeat(40 * 1024) })).collect();
+        assert_eq!(wire_page(&heavy, 0, 500), Ok(0..2));
+        assert!(wire_weight(&heavy[0..2]) <= MAX_WIRE_VALUE_BYTES);
+        assert_eq!(wire_page(&heavy, 2, 500), Ok(2..3));
+        // An item no page can hold is named, wherever the page starts.
+        let huge = vec![json!(1), json!({ "a": "x".repeat(MAX_WIRE_VALUE_BYTES) })];
+        assert_eq!(wire_page(&huge, 1, 500), Err(1));
+        assert_eq!(wire_page(&huge, 0, 500), Ok(0..1), "a page before it stops short of it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not even the empty string")]
+    fn a_budget_below_the_empty_string_is_a_caller_bug() {
+        cut_to_weight("abc", 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "never moves on")]
+    fn a_page_of_zero_items_is_a_caller_bug() {
+        let _ = wire_page(&[json!(1)], 0, 0);
+    }
+
+    #[test]
+    fn over_wire_says_the_weight_and_the_limit() {
+        assert_eq!(over_wire(&json!({ "a": 1 })), None);
+        let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
+        assert_eq!(over_wire(&over).as_deref(), Some("101 KB, and a wire carries at most 100 KB"));
+    }
+
+    #[test]
+    fn cap_text_counts_characters_then_the_wire_and_says_whether_it_cut() {
+        assert_eq!(cap_text("hello", 10), ("hello", false));
+        assert_eq!(cap_text("héllo", 3), ("hél", true), "characters, not bytes");
+        // Fifty thousand characters of three bytes each: the character
+        // cap keeps them all, and the wire is what cuts.
+        let heavy = "日".repeat(50_000);
+        let (cut, was_cut) = cap_text(&heavy, 50_000);
+        assert!(was_cut);
+        assert!(wire_weight(cut) <= MAX_WIRE_VALUE_BYTES && wire_weight(cut) + 3 > MAX_WIRE_VALUE_BYTES);
     }
 
     #[test]

@@ -51,6 +51,13 @@ Three things will refuse the drop, and each tells you which:
   `'<port>' is driven by a config assignment; unset it first to drive it with an edge.`
   Clear the field, then draw the arrow.
 
+Near the top of each node's right edge, set apart from its output ports, there
+is a small red circle with a `!` in it. That is `_error`, where the node's
+failure comes out, and you drag a wire out of it as you would from any output. While nothing is wired
+to it, it is an outline and a failure stops the run. Once a wire leaves it, it
+fills in red, and a failure goes down that wire instead. For which failures go
+there, go and read [when a node fails](../language/how-a-program-runs.md#when-a-node-fails).
+
 To remove an arrow, grab it near one end and drop it on empty canvas.
 
 To take one field out of a value instead of the whole thing, right-click the
@@ -148,7 +155,10 @@ Click the magnifying glass in a box's header, **Inspect run**, for what
 went in, what came out, how long it took and what it cost. A failed box shows
 its error there. A skipped box says why in words, such as
 `its _should_flow said no` or `the required input 'x' closed`, and you follow
-the arrows backwards from there to find the node that decided. If a node
+the arrows backwards from there to find the node that decided. A bus's
+messages end with `* the bus closed here`, or with `* the bus failed here:`
+and the reason when it broke off (go and read [how a bus
+ends](../language/streams-and-buses.md#how-a-bus-ends)). If a node
 changed a stored file in place (added a turn to a conversation, say), its panel
 lists each change under **Files edited**: the file, the versions it moved
 between, and the lines added and removed.

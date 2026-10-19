@@ -7,8 +7,8 @@ import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
 import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, acceptsLiteral } from './types';
 import { CONFIG_STRIP_BAR_PX, configStripOpenPx, containerPaddingPx, expandedContainerMinPx } from './constants/container-layout';
-import { LOOP_CONFIG_FIELDS } from './utils/input-field';
-import { SHOULD_FLOW_PORT } from '../../protocol';
+import { LOOP_CONFIG_FIELDS, outputRows } from './utils/input-field';
+import { ERROR_PORT, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, isGatePort } from '../../protocol';
 
 export interface AutoOrganizeResult {
 	positions: Map<string, { x: number; y: number }>;
@@ -363,13 +363,15 @@ export async function autoOrganize(
 		return isGroup ? groupPortY(nodeId, portIndex) : nodePortY(portIndex);
 	}
 
-	/** The flow dock's Y on a node's header (the yellow triangle). */
+	/** The flow dock's Y on a node's header (the yellow triangle), and
+	 *  the error dock's (the "!" circle) on the other side. */
 	const FLOW_PORT_Y = 16;
 
 	/** The ELK ports for one box: the implicit `_should_flow` dock (not in
 	 *  any declared `inputs`, but a wire into it is a real dependency edge;
 	 *  without it those wires get dropped and the gated chains come out
-	 *  sideways) plus every declared port an edge actually anchors on,
+	 *  sideways), its mirror the `_error` dock on the east side, plus every
+	 *  declared port an edge actually anchors on,
 	 *  inputs west, outputs east. Ports no edge touches are NOT declared,
 	 *  and every Y is clamped inside the box: a node can declare far more
 	 *  inputs than it renders, and the row-index fallback would otherwise
@@ -385,21 +387,35 @@ export async function autoOrganize(
 	) {
 		const clamp = (y: number) => Math.max(4, Math.min(y, height - 4));
 		const ports: any[] = [];
-		if (usedPortIds.has(`${nodeId}__in__${SHOULD_FLOW_PORT}`)) {
+		// Either spelling of the gate lands on the same dock on the header.
+		for (const gate of [SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT]) {
+			if (!usedPortIds.has(`${nodeId}__in__${gate}`)) continue;
 			ports.push({
-				id: `${nodeId}__in__${SHOULD_FLOW_PORT}`,
+				id: `${nodeId}__in__${gate}`,
 				x: 0,
-				y: clamp(portPositions?.get(nodeId)?.get(SHOULD_FLOW_PORT) ?? FLOW_PORT_Y),
+				y: clamp(portPositions?.get(nodeId)?.get(gate) ?? FLOW_PORT_Y),
 				width: 1, height: 1,
 				// Above every declared port (the dock sits on the header).
 				properties: { 'port.side': 'WEST', 'port.index': '-1' },
 			});
 		}
-		inputs.forEach((name, i) => {
-			// The dock is declared once, above. A node's declared inputs
-			// carry `_should_flow` too (the parser lists it on every node),
-			// which used to declare the same port id twice.
-			if (name === SHOULD_FLOW_PORT) return;
+		// The error dock mirrors the flow dock on the east side: `_error`
+		// is not an output row, so it gets no row index, and a wire out
+		// of it anchors on the header like a gate wire does.
+		if (usedPortIds.has(`${nodeId}__out__${ERROR_PORT}`)) {
+			ports.push({
+				id: `${nodeId}__out__${ERROR_PORT}`,
+				x: width - 1,
+				y: clamp(portPositions?.get(nodeId)?.get(ERROR_PORT) ?? FLOW_PORT_Y),
+				width: 1, height: 1,
+				properties: { 'port.side': 'EAST', 'port.index': '-1' },
+			});
+		}
+		// The docks are declared once, above, and are no rows: a node's
+		// declared ports carry both gate spellings and `_error` too (every
+		// node has them, drawn on the header), and counting them would put
+		// every row after them too low.
+		inputs.filter((name) => !isGatePort(name)).forEach((name, i) => {
 			const id = `${nodeId}__in__${name}`;
 			if (!usedPortIds.has(id)) return;
 			ports.push({
@@ -410,7 +426,7 @@ export async function autoOrganize(
 				properties: { 'port.side': 'WEST', 'port.index': String(i) },
 			});
 		});
-		outputs.forEach((name, i) => {
+		outputs.filter((name) => name !== ERROR_PORT).forEach((name, i) => {
 			const id = `${nodeId}__out__${name}`;
 			if (!usedPortIds.has(id)) return;
 			ports.push({
@@ -585,7 +601,7 @@ export async function autoOrganize(
 			return groupSizes.get(node.id) ?? { width: 400, height: 300 };
 		}
 		const cfg = node.config as Record<string, unknown>;
-		const portCount = Math.max((node.inputs || []).length, (node.outputs || []).length, 1);
+		const portCount = Math.max((node.inputs || []).length, outputRows(node.outputs || []).length, 1);
 		return {
 			width: override?.width ?? (cfg?.width as number | undefined) ?? NODE_WIDTH,
 			height: override?.height

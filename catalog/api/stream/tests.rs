@@ -1,10 +1,11 @@
 //! Stream self-tests: every bus message reaches the caller in order under
 //! the format's framing, the head rides the first chunk, the bus closing
-//! ends the HTTP response, a socket stays open, and the pure framing.
+//! ends the HTTP response, a socket stays open, a bus that ended failed
+//! fails the exchange instead, and the pure framing.
 
 use serde_json::json;
 
-use weft::bus::BusOptions;
+use weft::bus::{BusOptions, StreamEnd};
 use weft::caller::{CallerCall, InboundMessage, LiveRequest, OutboundChunk, ResponseHead};
 use weft::signal::DataType;
 use weft::{FakeRig, NodeTest, WeftResult};
@@ -21,6 +22,9 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_socket_gets_one_message_per_bus_message_and_stays_open", socket_stream),
         NodeTest::basic("formats_parse_and_name_their_content_type", formats),
         NodeTest::fake("first_goes_out_ahead_of_the_bus", first_then_bus),
+        NodeTest::fake("a_bus_that_broke_off_fails_the_answer_after_what_went_out", failed_mid_stream),
+        NodeTest::fake("a_bus_that_broke_off_before_a_message_fails_with_nothing_sent", failed_before_a_message),
+        NodeTest::fake("a_bus_that_broke_off_closes_a_socket_as_failed", failed_on_a_socket),
         NodeTest::basic("sse_frames_text_per_line_and_json_whole", sse_framing),
         NodeTest::basic("ndjson_is_one_json_value_per_line", ndjson_framing),
     ]
@@ -37,6 +41,63 @@ fn closed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde
     }
     bus.close();
     Ok(marker)
+}
+
+/// A bus carrying `messages` whose producer then failed: weft ended it
+/// failed, as it does a producer's bus when its body returns an error.
+fn failed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde_json::Value> {
+    let (mut bus, marker) = rig.seed_bus(BusOptions::default())?;
+    bus.register("llm").expect("a fresh bus accepts its first name");
+    for m in messages {
+        bus.send("delta", m.clone()).expect("an open bus accepts a send");
+    }
+    bus.inner_arc().close(StreamEnd::Failed { error: "the model went away".into() });
+    Ok(marker)
+}
+
+/// The deltas that went out stay sent; then the exchange FAILS, which the
+/// connection writes as the format's error marker, and `done` stays
+/// absent: a cut answer never reads as a whole one.
+async fn failed_mid_stream(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(conn.clone());
+    let bus = failed_bus(&rig, &[json!("hel")])?;
+    let outcome = rig.run(&StreamNode, json!({ "bus": bus, "format": "sse" })).await.ok()?;
+    assert!(outcome.outputs.get("done").is_none(), "{:?}", outcome.outputs);
+    let calls = conn.calls();
+    assert!(matches!(calls.last(), Some(CallerCall::Fail { message }) if message.contains("the model went away")), "{calls:?}");
+    assert_eq!(conn.chunks(), vec![OutboundChunk::Text("data: hel\n\n".into())]);
+    assert!(!calls.iter().any(|c| matches!(c, CallerCall::Terminate { .. })), "never ended as whole: {calls:?}");
+    Ok(())
+}
+
+/// Nothing went out yet: the failure is the whole answer (a real error
+/// status, written by the connection), and no head or chunk precedes it.
+async fn failed_before_a_message(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(conn.clone());
+    let bus = failed_bus(&rig, &[])?;
+    rig.run(&StreamNode, json!({ "bus": bus, "format": "ndjson" })).await.ok()?;
+    assert_eq!(
+        conn.calls(),
+        vec![
+            CallerCall::EnsureConnected,
+            CallerCall::Fail { message: "the stream broke off: the model went away".into() },
+        ]
+    );
+    Ok(())
+}
+
+/// Behind a socket, the frames that went out stay sent and the socket
+/// closes as failed.
+async fn failed_on_a_socket(rig: FakeRig) -> WeftResult<()> {
+    let conn = ws_caller(DataType::Json, LiveRequest::default(), vec![]);
+    rig.attach_caller(conn.clone());
+    let bus = failed_bus(&rig, &[json!("a")])?;
+    rig.run(&StreamNode, json!({ "bus": bus })).await.ok()?;
+    assert_eq!(conn.chunks(), vec![OutboundChunk::Json(json!("a"))]);
+    assert!(matches!(conn.calls().last(), Some(CallerCall::Fail { .. })), "{:?}", conn.calls());
+    Ok(())
 }
 
 async fn sse_stream(rig: FakeRig) -> WeftResult<()> {

@@ -306,11 +306,21 @@ async fn forward_socket(
         .and_then(|v| v.to_str().ok())
         .map(|p| vec![p.to_string()])
         .unwrap_or_default();
+    // And the run the socket opened, which the worker names on its answer.
+    let run_id = answer
+        .headers()
+        .get(weft_core::caller::RUN_ID_HEADER)
+        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
     let hold = upstream.hold;
-    upgrade.protocols(chosen).on_upgrade(move |caller| async move {
+    let mut opened = upgrade.protocols(chosen).on_upgrade(move |caller| async move {
         pump(caller, worker).await;
         drop(hold);
-    })
+    });
+    if let Some(run_id) = run_id {
+        let name = HeaderName::from_bytes(weft_core::caller::RUN_ID_HEADER.as_bytes()).expect("a valid header name");
+        opened.headers_mut().insert(name, run_id);
+    }
+    opened
 }
 
 /// Pass messages both ways until either side ends, then end the other.

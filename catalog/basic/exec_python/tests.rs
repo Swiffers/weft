@@ -133,6 +133,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_key_that_is_no_output_fails_the_run_even_with_error_wired", undeclared_key_wired),
         NodeTest::fake("returning_error_fails_the_run_even_with_error_wired", returned_error_wired),
         NodeTest::fake("a_value_of_the_wrong_type_fails_the_run_even_with_error_wired", wrong_type_wired),
+        NodeTest::fake("a_value_heavier_than_a_wire_comes_out_on_error_naming_the_port", heavy_value_wired),
     ]
 }
 
@@ -248,14 +249,14 @@ async fn string_on_file_port(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A script that calls out and fails, the case `error` exists for.
+/// A script that calls out and fails, the case `_error` exists for.
 const FAILING_CALL: &str = "raise ConnectionError('the weather service is down')";
 
 async fn raise_wired(rig: FakeRig) -> WeftResult<()> {
     rig.output_type("weather", WeftType::parse("String").expect("String parses"));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&ExecPythonNode, json!({ "code": FAILING_CALL })).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("ConnectionError: the weather service is down"), "{error}");
     assert!(error.contains("Traceback"), "the traceback rides along: {error}");
     assert!(!outcome.outputs.contains_key("weather"), "a caught failure emits nothing else");
@@ -271,7 +272,7 @@ async fn raise_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn syntax_error_wired(rig: FakeRig) -> WeftResult<()> {
     rig.output_type("weather", WeftType::parse("String").expect("String parses"));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&ExecPythonNode, json!({ "code": "return {'weather': 'sun'" })).await.failure()?;
     assert!(err.starts_with("input error") && err.contains("does not compile"), "{err}");
     Ok(())
@@ -279,7 +280,7 @@ async fn syntax_error_wired(rig: FakeRig) -> WeftResult<()> {
 
 async fn undeclared_key_wired(rig: FakeRig) -> WeftResult<()> {
     rig.output_type("weather", WeftType::parse("String").expect("String parses"));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&ExecPythonNode, json!({ "code": "return {'wether': 'sun'}" })).await.failure()?;
     assert!(err.starts_with("type error") && err.contains("'wether'") && err.contains("weather"), "{err}");
     Ok(())
@@ -287,15 +288,29 @@ async fn undeclared_key_wired(rig: FakeRig) -> WeftResult<()> {
 
 async fn returned_error_wired(rig: FakeRig) -> WeftResult<()> {
     rig.output_type("weather", WeftType::parse("String").expect("String parses"));
-    rig.wire_output("error");
-    let err = rig.run(&ExecPythonNode, json!({ "code": "return {'error': 'no weather today'}" })).await.failure()?;
+    rig.wire_output("_error");
+    let err = rig.run(&ExecPythonNode, json!({ "code": "return {'_error': 'no weather today'}" })).await.failure()?;
     assert!(err.starts_with("type error") && err.contains("raise an exception"), "{err}");
+    Ok(())
+}
+
+/// Two hundred thousand characters weigh 196 KB, past the 100 KB a
+/// wire carries: the emission is refused as a failure of this run's
+/// data, so `_error` catches it, and it says which port and what to do.
+async fn heavy_value_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("report", WeftType::parse("String").expect("String parses"));
+    rig.wire_output("_error");
+    let outcome = rig.run(&ExecPythonNode, json!({ "code": "return {'report': 'x' * 200000}" })).await.ok()?;
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("port 'report'") && error.contains("carries 196 KB"), "{error}");
+    assert!(error.contains("Return less"), "it names first the fix a script can make: {error}");
+    assert!(!outcome.outputs.contains_key("report"), "nothing heavy went out");
     Ok(())
 }
 
 async fn wrong_type_wired(rig: FakeRig) -> WeftResult<()> {
     rig.output_type("degrees", WeftType::parse("Number").expect("Number parses"));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&ExecPythonNode, json!({ "code": "return {'degrees': 'warm'}" })).await.failure()?;
     assert!(err.starts_with("type error") && err.contains("'degrees'"), "{err}");
     Ok(())

@@ -308,13 +308,16 @@ pub enum DispatcherEvent {
         totals: Vec<crate::bus::BusWindowTotal>,
         at_unix: u64,
     },
-    /// The bus was closed. Inspector renders an explicit
-    /// `* the bus closed here` marker; replay cursors stop here.
+    /// The bus was closed, and how it ended. Inspector renders an
+    /// explicit `* the bus closed here` marker, or where it failed and
+    /// why; replay cursors stop here.
+    // SYNC: BusClosed <-> crates/weft-journal/src/events.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_closed'
     BusClosed {
         run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
+        end: crate::bus::StreamEnd,
         at_unix: u64,
     },
     /// A live caller attached to this run. First event in the

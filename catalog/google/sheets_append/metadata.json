@@ -115,8 +115,5 @@
       "name": "done",
       "type": "Boolean"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

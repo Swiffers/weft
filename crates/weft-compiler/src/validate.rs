@@ -3401,8 +3401,9 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 ///   `ExecPython`), unless the node type already has it (a catalog port
 ///   the header only narrows, which the catalog's own check owns) or
 ///   names its added ports after outside data
-///   (`features.addedPortsAreDataKeys`: a body's fields, a table's
-///   columns, spelled however that data spells them).
+///   (`features.addedPortsAreDataKeys`: a path's captures, a query's
+///   parameters, the keys of a JSON object it builds, spelled however
+///   that data spells them).
 /// - a port a group's or loop's header declares. A call site's ports
 ///   are its file's, checked once on that file's own header; a loop's
 ///   carry ghost mirrors a port checked where it was declared.

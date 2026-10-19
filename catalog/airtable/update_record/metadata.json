@@ -111,8 +111,5 @@
       "narrowable": true,
       "description": "The updated record."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

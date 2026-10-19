@@ -414,12 +414,13 @@ impl RunProjector {
                     at_unix,
                 }]
             }
-            RunEvent::BusClosed { bus_id, offset, .. } => {
+            RunEvent::BusClosed { bus_id, offset, end, .. } => {
                 vec![DispatcherEvent::BusClosed {
                     run_id,
                     project_id,
                     bus_id: bus_id.clone(),
                     offset: *offset,
+                    end: end.clone(),
                     at_unix,
                 }]
             }

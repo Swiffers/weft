@@ -54,7 +54,6 @@
     }
   ],
   "features": {
-    "catchErrors": true,
     "oneOfRequired": [
       [
         "content",

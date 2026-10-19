@@ -540,7 +540,9 @@ The shape, unless the user asks for another:
   forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
   own routes (`/connect/<tenant>/<project id>/<path>`) and the picture links in their answers
   (`/public/files/<token>`), carries the caller's token and body, and keeps the
-  site's cookies and the `Weft-Instance` header back. A page fetches
+  site's cookies and the `Weft-Instance` header back. On the way back it
+passes the `Weft-Run-Id` header, so a page can log or show the run id
+beside a `Something went wrong`. A page fetches
   `/weft/signal-token/displays` with the instance token as bearer, calls a
   program route as `/weft/connect/<tenant>/<project id>/<path>` with the instance token in
   `Weft-Instance-Token`, and `new InstanceDoor(instanceToken)` already calls

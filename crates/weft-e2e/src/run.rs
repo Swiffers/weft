@@ -399,7 +399,15 @@ async fn wait_for_terminal_within(
             let disp = disp.clone();
             let path = path.clone();
             async move {
-                let v: Value = disp.get_json(&path).await?;
+                // A run reaches its record a moment after it starts (a
+                // route's run after its answer): not found yet is not
+                // terminal yet.
+                let (code, body) = disp.get_raw(&path).await?;
+                if code == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                anyhow::ensure!(code.is_success(), "GET {path} -> HTTP {code}: {body}");
+                let v: Value = serde_json::from_str(&body).with_context(|| format!("GET {path}: decode body: {body}"))?;
                 let status = v
                     .get("status")
                     .and_then(Value::as_str)

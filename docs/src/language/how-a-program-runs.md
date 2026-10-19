@@ -36,26 +36,15 @@ For an ordinary node:
 
 | What happened | What the node does |
 |---|---|
-| An input it needs closed (the table below says which) | Skips |
+| An input it needs closed | Skips |
 | An input you declared `x?: T` closed | Nothing. It runs without that input |
 | Every `@require_one_of` input closed | Skips |
 | `_should_flow` is `false`, or closed | Skips |
 | It was waiting on a person, who skipped the question | Skips |
 
-Which inputs a node needs comes from its metadata and from what your program
-writes on the port:
-
-| What the node's metadata says | What the program writes | Result |
-|---|---|---|
-| required | nothing | always required |
-| required | `x?: T` | compile error naming the port: the node's code needs it |
-| optional | nothing | unwired: runs without it. Wired: waits for it, and skips if the wire closes |
-| optional | `x: T` (no `?`) | always required |
-| optional | `x?: T` | runs without it even when wired and the wire closed, whether nothing arrived or the source failed |
-
-So by default a node skips when a wired input closes, and writing `?` on that
-input lets it run without it. For an example of each, go and read
-[optional and required inputs](syntax.md#optional-and-required-inputs).
+By default a node needs every input that is wired, and writing `?` on one lets
+it run without it. For which inputs a node needs, with an example of each, go
+and read [optional and required inputs](syntax.md#optional-and-required-inputs).
 
 If every input wired into a node is written with `?`, nothing says when it
 should run, and the compiler stops with `run-undecided`: gate it with
@@ -77,7 +66,8 @@ than a skip, so a reader whose stream carried nothing still runs and sees that
 nothing came.
 
 A failed node closes whatever it had not already sent. Anything it did send is
-not taken back.
+not taken back. For how a program carries on past a failure, go and read
+[when a node fails](#when-a-node-fails).
 
 ## Choosing a branch, and joining back up
 
@@ -114,12 +104,12 @@ value arriving means the node stays off, and a closure, the structural "nothing
 is coming", is what runs it.
 
 ```weft
-route = Route -> (photo: File) { path: "cards", method: "POST" }
+route = Route -> (body: { title: String, photo?: File }) { path: "cards", method: "POST" }
 
-# A card sent with no picture: `photo` closes, so this runs.
+# A card sent with no picture: the wire reading `photo` closes, so this runs.
 defaultArt = FetchToStorage {
   url: "https://example.com/blank.png"
-  _should_not_flow: route.photo
+  _should_not_flow: route.body.photo
 }
 ```
 
@@ -142,9 +132,58 @@ skip: a node that skipped because its input closed on a failure did not decline
 either, so its own ports close with that same failure on them (its skip reason
 ends in `because 'query' failed: ...`), and a watcher two nodes down still
 reads a failure, not an absence, and still sees `query` named as the node that
-broke rather than the node that skipped.
+broke rather than the node that skipped. The one exception is a node whose
+`_error` is wired: it handled its failure, so it counts as finished and its
+ports close as plain absences ([below](#when-a-node-fails)).
 
 A node has one gate. Wiring both spellings is the `two-gates` error.
+
+## When a node fails
+
+Left alone, a node that fails fails the whole run. If you want the program to
+carry on instead, wire the node's `_error` output. Every node has one, given by
+weft. When it is wired and the node fails, the reason comes out on `_error` as
+text, the node counts as finished, and every output it had not sent closes.
+
+So to run a backup only when something broke, gate the backup on `_error`:
+
+```weft
+fetch = HttpRequest { url: "https://example.com/prices", method: "GET" }
+
+backup = HttpRequest { url: "https://mirror.example.com/prices", method: "GET" }
+backup._should_flow = fetch._error
+```
+
+When `fetch` works, its `_error` closes and `backup` skips. When the host does
+not answer, the reason arrives on `_error` and `backup` runs. The failure still
+shows in the node's log, as `failed, handed to the '_error' output: ...`, so
+`weft logs` and the inspector tell you it happened.
+
+Only a failure of the node's own work goes to `_error`: a service refusing or
+not answering, a script raising, a wait that gave up, a node whose worker died
+in the middle of a durable run. A mistake in the program fails the run even
+with `_error` wired, because the fix is in the program: a bad setting, an input
+of the wrong shape, a value of the wrong type. A cancel, or a node pausing to
+wait for an answer, is not a failure, so it never comes out on `_error` either.
+
+**Once a node has started a stream, its failure fails the run.** As soon as
+anything went out on a `Bus` or `Generator` output, the readers already hold
+part of the answer, and a backup gated on `_error` would send a second answer
+on top of it.
+The stream ends failed instead, and its readers are told (go and read [how a
+bus ends](streams-and-buses.md#how-a-bus-ends)). A producer can open its bus
+on the first piece, the way `LlmStream` does. So if a model refuses a prompt
+before writing a word, the refusal still comes out on `_error`. The node's bus
+port then closes like any output it never sent: a reader that needs the bus
+skips, and the backup can answer.
+
+A group, a loop or an included file has no `_error` of its own. If you want to
+handle a failure from inside one, take the failing node's `_error` out through
+one of the group's outputs, like any other value.
+
+`_error` belongs to weft. A program that declares an output called `_error` on
+a node is refused, while `error`, without the underscore, is a name like any
+other.
 
 ## One node, several firings at once
 
@@ -206,8 +245,9 @@ go and read [versions, seeds and frozen examples](../running/versions.md).
 `--group` runs the group's own nodes and nothing that feeds it, so a group
 port wired from outside gets only what you hand it. If a cut leaves an input
 with nothing, weft looks at who needs it. When a node would skip without it
-(it is a required input, or the only member of a `@require_one_of` set that
-could get a value; the node's own, or one inside the group it enters, followed
+(it is an input written without `?`, default or not, other than an input of
+a join node such as `FirstInOrder`, which is optional anyway; or the only member
+of a `@require_one_of` set that could get a value; the node's own, or one inside the group it enters, followed
 through every group, loop and included file on the way), the run is refused
 before it starts, naming the input and what it feeds:
 
@@ -225,7 +265,7 @@ lands, and the way to hand it a value is to start there.
 The input is named at the start you gave, even when the missing value would
 cross more doors on the way (a group inside an included file), and a value you
 hand there feeds everything behind it. A trigger's own inputs never count: a
-run that does not fire it never reads them. An input that only feeds optional inputs
+run that does not fire it never reads them. An input that only feeds inputs written with `?`
 just closes, with a warning.
 
 A start is where the walk upstream stops, for `--from` and `--group` alike, so
@@ -280,8 +320,9 @@ run starts, go and read
 ## How a run ends
 
 A run is finished when there is no work left and nothing still in flight. It
-does not need an end node. It can also fail, when a node failed or weft could
-get no further, or be cancelled by a person or by another run.
+does not need an end node. It can also fail, when a node failed and nothing was
+wired to its `_error`, or when weft could get no further. A person or another
+run can also cancel it.
 
 A run can pause without ending. **Waiting for input** means a node is parked
 on an answer from outside, and the run carries on when that answer comes.

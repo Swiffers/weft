@@ -105,6 +105,22 @@ describe('run history and live follow', () => {
     follower.stop();
   });
 
+  it('passes a bus close through with how it ended, a failure and its error included', async () => {
+    const { client, follower, posted } = rig();
+    const following = follower.replay('a');
+    client.subscriptions[0].handlers.onOpen?.();
+    await Promise.resolve();
+    const closed = (eventId: string, end: Extract<DispatcherEvent, { kind: 'bus_closed' }>['end']): DispatcherEvent =>
+      ({ eventId, kind: 'bus_closed', runId: 'a', projectId: 'p', busId: 'b', offset: 3, end, atUnix: 1 });
+    client.reads[0].resolve([closed('done', { kind: 'finished' }), closed('broke', { kind: 'failed', error: 'producer crashed' })]);
+    await following;
+    expect(posted.filter((e) => e.kind === 'busEvent')).toEqual([
+      { kind: 'busEvent', event: { kind: 'closed', busId: 'b', offset: 3, end: { kind: 'finished' }, atUnix: 1 } },
+      { kind: 'busEvent', event: { kind: 'closed', busId: 'b', offset: 3, end: { kind: 'failed', error: 'producer crashed' }, atUnix: 1 } },
+    ]);
+    follower.stop();
+  });
+
   it('settles a failed connection without fetching incomplete history', async () => {
     const { client, follower, posted } = rig();
     const following = follower.replay('a');

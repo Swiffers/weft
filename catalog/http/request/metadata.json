@@ -1,7 +1,7 @@
 {
   "type": "HttpRequest",
   "label": "HTTP Request",
-  "description": "Make an outbound HTTP request (GET/POST/PUT/PATCH/DELETE, JSON body, custom headers). Only no answer (unreachable host, dropped connection, unreadable body) is a failure; an error status (404, 500) succeeds with `status` and `ok` carrying it. A text response comes out on `body`: a JSON object as a dict, anything else (array, scalar, non-JSON text) as its raw text. A response whose type is not text (an image, a PDF, a zip) comes out whole on `file` instead. For an API key, pick a `connection` rather than writing it in `headers`.",
+  "description": "Make an outbound HTTP request (GET/POST/PUT/PATCH/DELETE, JSON body, custom headers). Only no answer (unreachable host, dropped connection, unreadable body) is a failure; an error status (404, 500) succeeds with `status` and `ok` carrying it. A text response comes out on `body`: a JSON object as a dict, anything else (array, scalar, non-JSON text) as its raw text. A response whose type is not text (an image, a PDF, a zip), or a text one over 100 KB (the most a wire carries), comes out whole on `file` instead: wire `file` when a response can be that big. For an API key, pick a `connection` rather than writing it in `headers`.",
   "tags": [
     "http",
     "api",
@@ -101,22 +101,19 @@
       "name": "body",
       "type": "JsonDict | String",
       "narrowable": true,
-      "description": "A text response: a JSON object as a dict, anything else as its raw text. Absent when the response came out on `file`."
+      "description": "A text response up to 100 KB: a JSON object as a dict, anything else as its raw text. Absent when the response came out on `file`; with `file` unwired, a bigger text response fails the node instead."
     },
     {
       "name": "file",
       "type": "File",
       "narrowable": true,
-      "description": "A response whose type is not text (or that names no type and does not read as text), stored whole. Absent for a text response."
+      "description": "A response whose type is not text (or that names no type and does not read as text), or a text one over 100 KB, stored whole. Absent for a text response that fits `body`."
     },
     {
       "name": "ok",
       "type": "Boolean"
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

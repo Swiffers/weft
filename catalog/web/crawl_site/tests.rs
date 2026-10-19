@@ -1,15 +1,29 @@
 //! CrawlSite self-tests: submit, park until the crawl ends, accumulate
-//! pages across `next` links, and the loud failed-crawl path.
+//! pages across `next` links into one stored JSON lines file, and the
+//! loud failed-crawl path.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
-use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
+use weft::storage::StorageScope;
+use weft::{FakeRig, LiveRig, NodeTest, StoredFile, WeftResult};
 
 use super::CrawlSiteNode;
+
+/// The pages a stored JSON lines file holds, one per line.
+fn lines(bytes: &[u8]) -> Vec<Value> {
+    std::str::from_utf8(bytes)
+        .expect("utf-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON page a line"))
+        .collect()
+}
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("crawls_and_accumulates_pages_across_links", crawl_accumulates),
+        NodeTest::fake("a_crawl_heavier_than_a_wire_is_stored_whole", heavy_crawl),
+        NodeTest::fake("a_next_link_that_brings_no_pages_ends_the_reading", empty_next),
+        NodeTest::fake("a_read_failing_mid_crawl_fails_and_keeps_no_half_file", failed_mid_read),
         NodeTest::fake("a_failed_crawl_fails_loud", failed_crawl),
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
         NodeTest::fake("a_failed_crawl_comes_out_on_error_when_it_is_wired", failed_crawl_wired),
@@ -33,7 +47,7 @@ async fn live_crawl(rig: LiveRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.output("count")?.as_f64(), Some(1.0));
-    let pages = outcome.output("pages")?;
+    let pages = lines(&rig.stored_bytes(outcome.output("pages")?).await?);
     assert!(
         pages[0]["markdown"].as_str().unwrap_or_default().contains("Example Domain"),
         "the crawled page carries the real content: {}",
@@ -84,11 +98,15 @@ async fn crawl_accumulates(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["count"], json!(2.0), "pages accumulate, never replace");
+    let file = StoredFile::from_value(outcome.output("pages")?)?;
+    assert_eq!(file.mime_type, "application/jsonl");
     assert_eq!(
-        outcome.outputs["pages"][0]["url"],
-        json!("https://ex.com/1"),
+        lines(&rig.stored_bytes(&file.key)?),
+        vec![
+            json!({ "url": "https://ex.com/1", "title": "One", "markdown": "page one" }),
+            json!({ "url": "https://ex.com/2", "title": "Two", "markdown": "page two" }),
+        ]
     );
-    assert_eq!(outcome.outputs["pages"][1]["markdown"], json!("page two"));
 
     let submit = &rig.requests()[0];
     assert_eq!(
@@ -136,7 +154,7 @@ async fn failed_crawl(rig: FakeRig) -> WeftResult<()> {
 async fn failed_crawl_wired(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-4" }));
     rig.signal(json!({ "status": "failed", "error": "robots.txt forbids crawling" }));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig
         .run(
             &CrawlSiteNode,
@@ -148,7 +166,7 @@ async fn failed_crawl_wired(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("robots.txt forbids crawling"), "{error}");
     for port in ["pages", "count"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
@@ -173,5 +191,70 @@ async fn unknown_status(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("an unknown status is loud").to_string();
     assert!(err.contains("unexpected status 'paused'"), "{err}");
+    Ok(())
+}
+
+/// Three pages of 40 KB weigh more than a wire: the file holds them all,
+/// uncut.
+async fn heavy_crawl(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-5" }));
+    rig.signal(json!({ "status": "completed" }));
+    let data: Vec<_> = (0..3).map(|i| json!({ "markdown": "m".repeat(40 * 1024), "metadata": { "sourceURL": format!("https://ex.com/{i}") } })).collect();
+    rig.respond("GET", "/v2/crawl/job-5", json!({ "status": "completed", "data": data }));
+    let outcome = rig
+        .run(&CrawlSiteNode, json!({ "account": rig.access("firecrawl"), "url": "https://ex.com" }))
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["count"], json!(3.0));
+    let file = StoredFile::from_value(outcome.output("pages")?)?;
+    let pages = lines(&rig.stored_bytes(&file.key)?);
+    assert_eq!(pages.len(), 3);
+    assert!(pages.iter().all(|p| p["markdown"].as_str().map(str::len) == Some(40 * 1024)), "every page whole");
+    Ok(())
+}
+
+/// Firecrawl's rule for reading a finished crawl: stop when there is no
+/// `next`, or when a page of the answer brings no new pages.
+async fn empty_next(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-6" }));
+    rig.signal(json!({ "status": "completed" }));
+    rig.respond(
+        "GET",
+        "/v2/crawl/job-6",
+        json!({ "status": "completed", "data": [{ "markdown": "one", "metadata": {} }], "next": "https://api.firecrawl.dev/v2/crawl/job-6?page=2" }),
+    );
+    rig.respond(
+        "GET",
+        "/v2/crawl/job-6?page=2",
+        json!({ "status": "completed", "data": [], "next": "https://api.firecrawl.dev/v2/crawl/job-6?page=3" }),
+    );
+    let outcome = rig
+        .run(&CrawlSiteNode, json!({ "account": rig.access("firecrawl"), "url": "https://ex.com" }))
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["count"], json!(1.0));
+    let reads = rig.requests().iter().filter(|r| r.method == "GET").count();
+    assert_eq!(reads, 2, "the empty answer ends it, its `next` is never followed");
+    Ok(())
+}
+
+/// The pages stream into storage as they are read: a page that breaks
+/// on the second answer fails the node with its own error, and the
+/// first answer's pages, already streamed, leave no file behind.
+async fn failed_mid_read(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-7" }));
+    rig.signal(json!({ "status": "completed" }));
+    rig.respond(
+        "GET",
+        "/v2/crawl/job-7",
+        json!({ "status": "completed", "data": [{ "markdown": "one", "metadata": {} }], "next": "https://api.firecrawl.dev/v2/crawl/job-7?page=2" }),
+    );
+    rig.respond("GET", "/v2/crawl/job-7?page=2", json!({ "status": "completed", "data": [{ "metadata": {} }] }));
+    let err = rig
+        .run(&CrawlSiteNode, json!({ "account": rig.access("firecrawl"), "url": "https://ex.com" }))
+        .await
+        .failure()?;
+    assert!(err.contains("carries no markdown"), "the read's own error, not the upload's: {err}");
+    assert!(rig.stored_files(&StorageScope::Run)?.is_empty(), "no half file is kept");
     Ok(())
 }

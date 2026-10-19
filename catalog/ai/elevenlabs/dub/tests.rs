@@ -270,9 +270,9 @@ async fn failed_project(rig: FakeRig) -> WeftResult<()> {
 
 async fn failed_caught(rig: FakeRig) -> WeftResult<()> {
     fails(&rig, json!({ "code": "translation_failed", "message": "The transcript could not be translated." }));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({}))).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("translation_failed"), "{error}");
     assert!(!outcome.outputs.contains_key("file"), "a caught failure emits no file");
     Ok(())
@@ -293,9 +293,9 @@ fn refuse_the_language(rig: &FakeRig) -> Value {
 }
 
 async fn cloning_needs_v2(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig.run(&ElevenLabsDubNode, inputs(&rig, json!({ "cloningStrength": 5 }))).await.failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {err}");
+    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
     assert!(err.contains("dubbing_v2 setting") && err.contains("dubbing_v1"), "{err}");
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
     Ok(())

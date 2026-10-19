@@ -4,10 +4,11 @@
 
 use serde_json::{json, Value};
 
+use weft::bus::StreamEnd;
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope, StoredFile};
-use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
+use weft::{node_error, RunContext, NodeErrExt, WeftError, WeftResult};
 
 pub const API: &str = "https://api.elevenlabs.io/v1";
 /// The same API over a websocket, for the live (streaming) nodes.
@@ -114,6 +115,22 @@ pub fn input_file_format(ctx: &RunContext, file_mime: &str) -> WeftResult<Option
              only for raw 16-bit PCM at 16 kHz, mono, little-endian. Set `fileFormat` to `other`, or pass the raw PCM"
         ))),
         other => weft::node_bail!("'{other}' is not a `fileFormat` ElevenLabs takes (`other` or `pcm_s16le_16`)"),
+    }
+}
+
+/// A live input the node read to its end, refused when its bus ended
+/// failed: its producer broke off, so what came in is not the whole
+/// input, and speaking or transcribing it as whole would pass a cut
+/// input off as complete.
+pub fn refuse_broken_input(port: &str, end: Option<StreamEnd>) -> WeftResult<()> {
+    match end {
+        Some(StreamEnd::Failed { error }) => {
+            Err(node_error(format!("the input on '{port}' broke off before it ended: {error}")))
+        }
+        Some(StreamEnd::Finished) => Ok(()),
+        // A cursor runs out only on a closed bus, and every close says
+        // how it ended: an input still open here is a bug in the reader.
+        None => Err(node_error(format!("the input on '{port}' was read to its end while still open"))),
     }
 }
 

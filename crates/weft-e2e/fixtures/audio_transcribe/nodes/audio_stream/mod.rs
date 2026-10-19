@@ -14,9 +14,9 @@
 //! { "sample_rate": 16000, "encoding": "pcm_s16le" }
 //! ```
 //!
-//! The bus closes when the file ends (or on any error: the handle from
-//! `ctx.open_bus` closes on every exit), and that close IS the
-//! end-of-stream signal a reader waits on.
+//! The bus closes when the file ends (or on any error: a bus from
+//! `ctx.open_bus` ends with the body, failed then), and that close IS
+//! the end-of-stream signal a reader waits on.
 
 use std::time::Duration;
 
@@ -155,7 +155,7 @@ impl Node for AudioStreamNode {
             pace.tick().await;
             bus.send_bytes("audio", chunk.to_vec()).node_err("stream an audio frame")?;
         }
-        drop(bus); // the close IS the end-of-stream signal
+        bus.close(); // the close IS the end-of-stream signal
 
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())

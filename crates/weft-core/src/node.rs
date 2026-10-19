@@ -760,6 +760,12 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
             }
         }
     }
+    if obj.get("features").and_then(|f| f.get("catchErrors")).is_some() {
+        return Err(format!(
+            "`features.catchErrors` no longer exists: every node has the `{ERROR_PORT}` \
+             output, and a failure goes there when a program wires it. Remove the key."
+        ));
+    }
     if obj.get("features").and_then(|f| f.get("optionalCustomInputs")).is_some() {
         return Err(
             "`features.optionalCustomInputs` is `features.join` now: a node whose added inputs \
@@ -1046,10 +1052,9 @@ impl NodeMetadata {
     /// ([`crate::run_settings::RunSettings::node_inputs`]). A trigger that
     /// declares one of the names it receives is refused, so each setting
     /// has exactly one spelling; a node that receives none of them may
-    /// use those names for its own inputs. A node with
-    /// `features.catchErrors` gets the [`ERROR_PORT`]
-    /// output the runtime fills with its failure, and is refused when it
-    /// declares that output itself. Run once, on the authored document,
+    /// use those names for its own inputs. Every node gets the
+    /// [`ERROR_PORT`] output the runtime fills with its failure, and is
+    /// refused when it declares that output itself. Run once, on the authored document,
     /// by both loaders (the catalog's and the derive's `parse_embedded`),
     /// so the editor, the compiler and the worker all see the same
     /// ports.
@@ -1075,25 +1080,14 @@ impl NodeMetadata {
             }
         }
         self.inputs.extend(added);
-        if features.catch_errors {
-            let port = ERROR_PORT;
-            if self.outputs.iter().any(|o| o.name == port) {
-                return Err(format!(
-                    "output '{port}' is the port the language gives a node with \
-                     features.catchErrors; remove it from this node's outputs"
-                ));
-            }
-            self.outputs.push(OutputSpec {
-                name: port.to_string(),
-                port_type: WeftType::primitive(WeftPrimitive::String),
-                description: Some(
-                    "Why the node failed, when this output is wired. Unwired, a failure stops the run."
-                        .to_string(),
-                ),
-                baked: false,
-                narrowable: None,
-            });
+        let port = ERROR_PORT;
+        if self.outputs.iter().any(|o| o.name == port) {
+            return Err(format!(
+                "output '{port}' is the port the language gives every node for its \
+                 failures; remove it from this node's outputs"
+            ));
         }
+        self.outputs.push(error_output());
         Ok(())
     }
 
@@ -2461,10 +2455,30 @@ pub enum DisplayKind {
     Link,
 }
 
-/// The output the language gives a node with `features.catchErrors`
+/// The output the language gives every node
 /// ([`NodeMetadata::add_language_ports`]), which the runtime fills with
-/// the node's failure (`context::caught_failure`).
-pub const ERROR_PORT: &str = "error";
+/// the node's failure (`context::caught_failure`). The underscore marks
+/// it as the language's, like the gate on the other side
+/// (`run::skip::SHOULD_FLOW_PORT`), so `error` stays a name a node may
+/// give its own output.
+// SYNC: ERROR_PORT <-> packages/weft-graph/src/protocol.ts ERROR_PORT
+pub const ERROR_PORT: &str = "_error";
+
+/// The [`ERROR_PORT`] output as every node's metadata carries it.
+fn error_output() -> OutputSpec {
+    OutputSpec {
+        name: ERROR_PORT.to_string(),
+        port_type: WeftType::primitive(WeftPrimitive::String),
+        description: Some(
+            "Why the node failed, when this output is wired: the node then completes, \
+             unless it had already started a stream (a bus, a generator). Unwired, a \
+             failure stops the run."
+                .to_string(),
+        ),
+        baked: false,
+        narrowable: None,
+    }
+}
 
 // SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2514,16 +2528,6 @@ pub struct NodeFeatures {
     /// events rather than running as part of a run).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
-    /// The node reaches outside (a service, a database, a file, a
-    /// model), so a failure of its body is an outcome the program may
-    /// want to handle. The language gives it an [`ERROR_PORT`]
-    /// output ([`NodeMetadata::add_language_ports`]) and the runtime
-    /// does the catching (`context::caught_failure`): with
-    /// `error` wired, the failure's message goes there and the firing
-    /// completes; unwired, the failure stops the run. The node's own
-    /// code writes no error handling.
-    #[serde(default, rename = "catchErrors", skip_serializing_if = "std::ops::Not::not")]
-    pub catch_errors: bool,
     /// The node's body does nothing outside the run that weft does not put
     /// on record first: no network, no connection, no wait, no `ctx.run`,
     /// no tag, no storage beyond this run's own files. It may answer its
@@ -4700,46 +4704,40 @@ mod input_semantics_tests {
         assert_eq!(limiter.inputs.len(), own.len());
     }
 
-    /// `catchErrors` gives the node the language's `error` output; a
-    /// node declaring it itself is refused, and without the flag
-    /// `error` is an ordinary name.
+    /// Every node gets the language's `_error` output, a trigger and a
+    /// node that only shapes values alike; a node declaring it itself is
+    /// refused, and `error` is an ordinary name a node may use.
     #[test]
-    fn catch_errors_adds_the_error_output() {
-        let error_output = || OutputSpec {
-            name: ERROR_PORT.into(),
+    fn every_node_gets_the_error_output() {
+        let output = |name: &str| OutputSpec {
+            name: name.into(),
             port_type: WeftType::primitive(WeftPrimitive::String),
             description: None,
             baked: false,
             narrowable: None,
         };
-        let mut catching = metadata_with(vec![]);
-        catching.features.catch_errors = true;
-        catching.add_language_ports().unwrap();
-        assert_eq!(catching.outputs.len(), 1);
-        assert_eq!(catching.outputs[0].name, ERROR_PORT);
-        assert_eq!(catching.outputs[0].port_type, WeftType::primitive(WeftPrimitive::String));
-        catching.validate_semantics().expect("the added output passes the semantic rules");
+        let mut plain = metadata_with(vec![]);
+        plain.add_language_ports().unwrap();
+        assert_eq!(plain.outputs.len(), 1);
+        assert_eq!(plain.outputs[0].name, ERROR_PORT);
+        assert_eq!(plain.outputs[0].port_type, WeftType::primitive(WeftPrimitive::String));
+        plain.validate_semantics().expect("the added output passes the semantic rules");
+
+        let mut trigger = metadata_with(vec![]);
+        trigger.features.is_trigger = true;
+        trigger.add_language_ports().unwrap();
+        assert_eq!(trigger.outputs.iter().filter(|o| o.name == ERROR_PORT).count(), 1);
 
         let mut declares_it = metadata_with(vec![]);
-        declares_it.features.catch_errors = true;
-        declares_it.outputs.push(error_output());
+        declares_it.outputs.push(output(ERROR_PORT));
         let e = declares_it.add_language_ports().unwrap_err();
-        assert!(e.contains("catchErrors"), "{e}");
+        assert!(e.contains(ERROR_PORT) && e.contains("every node"), "{e}");
 
-        let mut plain = metadata_with(vec![]);
-        plain.outputs.push(error_output());
-        plain.add_language_ports().expect("without the flag, `error` is the node's own name");
-        assert_eq!(plain.outputs.len(), 1);
-    }
-
-    /// The flag's wire spelling.
-    #[test]
-    fn catch_errors_round_trips() {
-        let features: NodeFeatures = serde_json::from_str(r#"{ "catchErrors": true }"#).unwrap();
-        assert!(features.catch_errors);
-        assert_eq!(serde_json::to_value(&features).unwrap(), serde_json::json!({ "catchErrors": true }));
-        let none: NodeFeatures = serde_json::from_str("{}").unwrap();
-        assert!(!none.catch_errors);
+        let mut own_error = metadata_with(vec![]);
+        own_error.outputs.push(output("error"));
+        own_error.add_language_ports().expect("`error` is the node's own name");
+        let names: Vec<&str> = own_error.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["error", ERROR_PORT]);
     }
 
     /// A fire payload is a trigger's, and a type it cannot read fails the
@@ -5102,6 +5100,11 @@ mod input_semantics_tests {
             "features": { "isOutputDefault": true } });
         let e = refuse_removed_metadata_keys(&doc).unwrap_err();
         assert!(e.contains("isOutputDefault") && e.contains("--target"), "{e}");
+
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "features": { "catchErrors": true } });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("catchErrors") && e.contains(ERROR_PORT), "{e}");
 
         let doc = json!({ "type": "T", "label": "T", "description": "",
             "outputs": [{ "name": "out", "type": "String", "required": false }] });

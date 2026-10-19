@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { fieldForInput, clampToRange, gateField, hasUnpickedAccess, inputRendersField, nextPortLiterals } from './input-field';
-import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from '../../../protocol';
+import { fieldForInput, clampToRange, errorMarker, gateField, hasUnpickedAccess, inputRendersField, nextPortLiterals, outputRows } from './input-field';
+import { ERROR_PORT, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from '../../../protocol';
 import { acceptsLiteral, acceptsWire } from '../types';
 import type { PortDefinition } from '../types';
 
@@ -249,5 +249,35 @@ describe('hasUnpickedAccess', () => {
 		// The invariant the predicate's read leans on: a port's constant
 		// has one home, so the handle can only ever live there.
 		expect(fieldForInput(access()).portDriven).toBe(true);
+	});
+});
+
+/** `_error` is the language's failure output on every catalog node. The
+ *  card draws it as a marker on the right edge, so it must never come
+ *  back as an output row, and the marker's look follows the wires. */
+describe('outputRows', () => {
+	it('drops _error and keeps every other output in order', () => {
+		const outs = [{ name: 'value' }, { name: 'error' }, { name: ERROR_PORT }];
+		expect(outputRows(outs).map((p) => p.name)).toEqual(['value', 'error']);
+	});
+});
+
+describe('errorMarker', () => {
+	const outs = [{ name: 'value' }, { name: ERROR_PORT }];
+
+	it('shows nothing for a node without _error (a group or loop boundary)', () => {
+		expect(errorMarker('g', [{ name: 'value' }], [])).toBeNull();
+	});
+
+	it('is an outline while no wire leaves _error', () => {
+		const edges = [
+			{ source: 'n', sourceHandle: 'value' },
+			{ source: 'other', sourceHandle: ERROR_PORT },
+		];
+		expect(errorMarker('n', outs, edges)).toEqual({ wired: false });
+	});
+
+	it('fills once a wire leaves this node\'s _error', () => {
+		expect(errorMarker('n', outs, [{ source: 'n', sourceHandle: ERROR_PORT }])).toEqual({ wired: true });
 	});
 });

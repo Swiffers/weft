@@ -1061,6 +1061,15 @@ impl WeftType {
     /// Every structural pattern-match on a possibly-aliased type goes
     /// through this so an alias behaves identically to the spelled-out
     /// type.
+    /// Whether a value going out on a port of this type opens a stream
+    /// whose readers start reading at once: a `Bus` (its marker) or a
+    /// `Generator[T]` (its first item). Once one is open, the readers
+    /// already hold part of the output, which decides what a failure of
+    /// the producer may still become (`context::caught_failure`).
+    pub fn opens_a_stream(&self) -> bool {
+        matches!(self.structural(), WeftType::Bus | WeftType::Generator(_))
+    }
+
     // SYNC: structural <-> packages/weft-graph/src/webview/lib/types/index.ts structural
     pub fn structural(&self) -> &WeftType {
         match self {

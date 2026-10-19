@@ -42,8 +42,5 @@
       "type": "Number",
       "description": "ElevenLabs's average alignment loss over every character of the transcript."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

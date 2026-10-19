@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsRead",
   "label": "Google Sheets: Read",
-  "description": "Reads a Google Sheets tab's rows, signed in or (account left unconnected) from the share link of a sheet shared with 'anyone with the link'.",
+  "description": "Reads a Google Sheets tab's rows, signed in or (account left unconnected) from the share link of a sheet shared with 'anyone with the link'. One call reads one page: at most `maxRows` rows from `offset`, and no more than fit the 100 KB a wire carries; `nextOffset` is where the next page starts, and `hasMore` says whether there is one.",
   "tags": [
     "google",
     "sheets",
@@ -93,6 +93,31 @@
       "type": "Boolean",
       "default": true,
       "label": "First row is a header"
+    },
+    {
+      "name": "offset",
+      "type": "Number",
+      "default": 0,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "label": "Skip rows",
+      "description": "How many data rows (below the header) to skip before this page starts. To read the next page, wire the previous call's `nextOffset` here."
+    },
+    {
+      "name": "maxRows",
+      "type": "Number",
+      "default": 500,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 10000,
+        "step": 1
+      },
+      "label": "Max rows",
+      "description": "The most rows one page holds. A page also stops early when more rows would weigh more than the 100 KB a wire carries."
     }
   ],
   "outputs": [
@@ -100,10 +125,17 @@
       "name": "rows",
       "type": "List[JsonDict]",
       "narrowable": true,
-      "description": "With a header, {column: value} each; without, {c0, c1, ...}."
+      "description": "This page's rows. With a header, {column: value} each; without, {c0, c1, ...}."
+    },
+    {
+      "name": "nextOffset",
+      "type": "Number",
+      "description": "Where the next page starts: wire it into the next call's `offset`."
+    },
+    {
+      "name": "hasMore",
+      "type": "Boolean",
+      "description": "True when the tab has rows past this page."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

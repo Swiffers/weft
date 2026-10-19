@@ -90,12 +90,13 @@ attaches, a signal nobody answers.
 | An infra endpoint | `rig.declare_endpoint(name, url)`, `rig.answer_endpoint(...)`, `rig.refuse_endpoint(...)` |
 | What it asked for | `rig.registered_signals()`, `rig.awaited_signals()`, `rig.logs()`, `rig.run_tags()`, `rig.stops()` |
 | A port's type, for a node that takes added ports | `rig.output_type(port, ty)`, `rig.input_type(port, ty)` |
-| An output something downstream reads | `rig.wire_output(port)`. Nothing is wired unless you say so. On a node with `catchErrors`, `rig.wire_output("error")` makes a failure come out on `error`, as it would in a run |
+| An output something downstream reads | `rig.wire_output(port)`. Nothing is wired unless you say so. `rig.wire_output("_error")` makes a failure come out on `_error`, as it would in a run, and `outcome.output("_error")` reads it |
 | A server that is there and will not talk, for a node that opens its own socket | `rig.hang_up_server()`, a local port that hangs up on every connection. It is for raw socket clients (a database driver, a mail client): web calls in a fake test never reach the network, so for those use `rig.fail_connection`. If you want a refused connection, use this rather than a closed port: on some machines a closed port hangs until a timeout |
 
 The outcome gives you `.ok()` for the happy path, `.failure()` for the error
 string, `.output(port)` for one port, `.infra_spec()` for an infra run, and
-`.outputs` for the map.
+`.outputs` for the map. The rig refuses a value over 100 KB with the same error
+a run gives, so a test catches an output no wire would carry.
 
 Note the last group: in a fake test nothing is really stopped and nothing is
 really tagged. The rig records what your node **asked for**, and that is what

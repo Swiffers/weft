@@ -97,6 +97,18 @@ pub struct NodeFiring {
     pub inherited_from: Option<RunId>,
 }
 
+impl NodeFiring {
+    /// Whether this firing has a stream open: something went out (a bus's
+    /// marker, a generator's first item) on one of `stream_ports`, its
+    /// node's outputs that open one (`WeftType::opens_a_stream`), and it
+    /// was not closed since. Read off the record, so the worker and the
+    /// fold agree, and it decides whether a failure may still be caught
+    /// (`context::caught_failure`).
+    pub fn opened_a_stream<'a>(&self, mut stream_ports: impl Iterator<Item = &'a str>) -> bool {
+        stream_ports.any(|port| self.mentioned_ports.contains(port) && !self.closed_output_ports.contains(port))
+    }
+}
+
 /// One entry per node, growing as each dispatch records its lifecycle.
 pub type NodeFiringTable = BTreeMap<String, Vec<NodeFiring>>;
 

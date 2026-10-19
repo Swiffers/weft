@@ -65,19 +65,37 @@ downstream.
 
 ```rust
 let bus = ctx.open_bus("channel", BusOptions::default(), "host").await?;
-bus.send(MessageKind::Json, json!({ "text": "hello" }))?;
+bus.send("text", json!({ "text": "hello" })).node_err("sending the greeting")?;
 ```
 
 `open_bus` does the whole producer move: makes the bus, emits the marker on
-that port, and registers your name. The guard closes the bus when it drops, so
-every way out of your function, including a panic, ends the channel instead of
-leaving readers parked forever.
+that port, and registers your name.
+
+If the work that makes your pieces can fail (a provider's call, a handshake, a
+first query), open the bus on the first piece instead of before the work.
+Until the marker goes out, your node has opened no stream. If it fails then, a
+program that wired your `_error` still gets the failure there, and the port
+closes as if nothing was coming, so the readers never start. `ctx.pending_bus` holds the
+options until then:
+
+```rust
+let mut bus = ctx.pending_bus("stream", BusOptions::default(), "llm");
+let mut chunks = client.stream(&prompt).await.node_err("starting the stream")?;
+while let Some(chunk) = chunks.next().await {
+    bus.open().await?.send("delta", json!(chunk)).node_err("sending a delta")?;
+}
+```
+
+The first `open()` makes the bus and emits its marker, and every later one
+hands back the same bus. If you never call it, the port closes like any port
+you never mentioned. `bus.opened()` tells you whether it is open yet without
+opening it. `LlmStream` works this way.
 
 ## Joining one
 
 ```rust
 let bus = ctx.join_bus("channel", "translator")?;
-bus.wait_for("host")?;
+bus.wait_for("host").await.node_err("waiting for the host")?;
 
 let mut cursor = bus.cursor();
 while let Some(msg) = cursor.next().await {
@@ -85,11 +103,13 @@ while let Some(msg) = cursor.next().await {
 }
 ```
 
-`join_bus` resolves the bus on that input and registers your name, with the
-same close-on-drop guard.
+`join_bus` resolves the bus on that input and registers your name. A bus you
+joined ends with your body, as one you made does, so a reader that dies
+mid-conversation never leaves the producer waiting on it.
 
-For an observer that must **not** close the bus, a debug tap that comes and
-goes, use `ctx.bus_from_input("channel")` instead.
+For an observer that must **not** end the bus when it is done (a debug tap, or
+a node streaming the bus out to a caller), use `ctx.bus_from_input("channel")`
+instead.
 
 Registering is the "I am here and ready" moment. A node with a slow warmup
 should hold the bus and register when it is genuinely ready, because that is
@@ -100,8 +120,37 @@ see everything.
 
 `wait_for(name)` parks until that name is live, or returns an error if the bus
 closed first. You never have to decide whether a name will ever turn up: the
-engine watches the run, and when a wait can no longer be satisfied it closes
-the bus and every waiting cursor wakes.
+engine watches the run, and when a wait can no longer be satisfied it ends the
+bus, failed and saying the run was stuck, and every waiting cursor wakes.
+
+## How a bus ends
+
+weft ends every bus your firing made or joined when your body returns, and
+says how: **finished** if the body returned `Ok`, **failed** with the error if
+it returned one, panicked, or was cancelled. Pausing on `ctx.await_signal`
+ends it failed too, because the body that resumes opens a new bus and never
+finishes this one. A task you spawned does not keep a bus open: the bus ends
+with the body, whoever still holds a handle.
+
+Dropping a handle ends nothing. If you are done sending before your body is
+done working, `bus.close()` ends the bus now, and always as finished. To end
+it failed, return the error from your body.
+
+A reader finds out once its cursor runs out. `next()` returns `None` at the
+end either way, so ask `bus.end()`:
+
+```rust
+while let Some(msg) = cursor.next().await {
+    // ...
+}
+if let Some(StreamEnd::Failed { error }) = bus.end() {
+    weft::node_bail!("the stream broke off: {error}");
+}
+```
+
+`end()` is `None` while the bus is open. What a failed end means is up to your
+node. If it answers a caller from a bus, end the answer with `fail` (go and
+read [talking to a live caller](live-callers.md)).
 
 ## Choosing options
 

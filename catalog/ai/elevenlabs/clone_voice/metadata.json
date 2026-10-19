@@ -62,8 +62,5 @@
       "type": "Boolean",
       "description": "Whether ElevenLabs says the new voice requires verification."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

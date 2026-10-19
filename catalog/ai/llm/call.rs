@@ -66,12 +66,19 @@ pub struct LlmCall {
 }
 
 impl LlmCall {
+    /// Whether `response` is a whole reply ([`ensure_reply_substance`]):
+    /// what [`finish`] checks first, and what a streaming call checks
+    /// before telling its readers the stream finished.
+    pub fn ensure_whole(&self, response: &minillmlib::CompletionResponse) -> WeftResult<()> {
+        ensure_reply_substance(response, self.announces_finish)
+    }
+
     /// The error a failed call surfaces. With reasoning set off, a provider
     /// REFUSING the request (a client error: 4xx other than 408 and 429,
     /// which are transient) whose message is about reasoning is told in
     /// the author's terms: the model always reasons, so the switch has to
     /// go on. That is a settings mistake (`Config`), which fails the run
-    /// even with `error` wired: retrying cannot help, the params must
+    /// even with `_error` wired: retrying cannot help, the params must
     /// change. Every other failure (a timeout, an overload, a 5xx whose
     /// text happens to say "reason") stays a catchable node failure.
     pub fn call_error(&self, err: MiniLLMError) -> WeftError {
@@ -376,7 +383,7 @@ pub async fn finish(
     response: &CompletionResponse,
     answer: impl FnOnce(&CompletionResponse) -> WeftResult<Option<Value>>,
 ) -> WeftResult<NodeOutput> {
-    ensure_reply_substance(response, llm.announces_finish)?;
+    llm.ensure_whole(response)?;
     let mut output = NodeOutput::new();
     if let Some(value) = answer(response)? {
         output = output.set("response", value);

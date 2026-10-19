@@ -1,7 +1,7 @@
 {
   "type": "PostgresUpdateRows",
   "label": "Postgres: Update Rows",
-  "description": "Update the rows matching a SQL condition, setting columns from a JSON object, and emit the changed rows. The condition's parameters are the node's own inline-declared input ports, read by name, as in Postgres: Query: `PostgresUpdateRows(email: String) { where: \"email = $email\" }`. Unreachable database or a broken constraint: catchable by `error`. A syntax error in `where`, an unknown column, or a `$name` with no port of that name: always fails the run.",
+  "description": "Update the rows matching a SQL condition, setting columns from a JSON object, and emit the changed rows. The condition's parameters are the node's own inline-declared input ports, read by name, as in Postgres: Query: `PostgresUpdateRows(email: String) { where: \"email = $email\" }`. Unreachable database or a broken constraint: catchable by `_error`. `count` is every changed row; `rows` holds as many of them as fit the 100 KB a wire carries, and `truncated` says when some were left out. A syntax error in `where`, an unknown column, or a `$name` with no port of that name: always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -48,15 +48,20 @@
       "name": "rows",
       "type": "List[JsonDict]",
       "narrowable": true,
-      "description": "Changed rows as stored."
+      "description": "Changed rows as stored, as many as fit the 100 KB a wire carries."
     },
     {
       "name": "count",
-      "type": "Number"
+      "type": "Number",
+      "description": "How many rows the update changed, all of them, whether or not `rows` holds them all."
+    },
+    {
+      "name": "truncated",
+      "type": "Boolean",
+      "description": "True when the changed rows weighed more than a wire carries, so `rows` holds only the first ones. The update itself changed every row either way."
     }
   ],
   "features": {
-    "catchErrors": true,
     "canAddInputPorts": true,
     "addedPortsAreDataKeys": true
   }

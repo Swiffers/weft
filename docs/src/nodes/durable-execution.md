@@ -175,9 +175,9 @@ stream` instead: the items it had read are gone from the stream, so the
 message tells you to run the whole run again to start the stream over.
 
 If you want to run that node again once you have checked, `weft run --from
-<node>=<json>` starts a run there with the inputs you hand it. If the node
-sets `catchErrors` and you wired its `error` output, this failure goes there
-like any other, and that branch carries on; otherwise the run fails.
+<node>=<json>` starts a run there with the inputs you hand it. If you wired
+the node's `_error` output, this failure goes there like any other, and that
+branch carries on; otherwise the run fails.
 
 If the node that was running is a pure one that does not read a
 stream, and had not passed a value on yet, the next worker runs it again instead of failing it. A

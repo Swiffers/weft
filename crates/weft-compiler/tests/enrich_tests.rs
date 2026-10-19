@@ -23,8 +23,11 @@ out.data = greeting.value
 
     let text = project.nodes.iter().find(|n| n.id == "greeting").unwrap();
     assert_eq!(text.node_type, "Text");
-    assert_eq!(text.outputs.len(), 1);
-    assert_eq!(text.outputs[0].name, "value");
+    // Its own `value`, plus the failure output every node carries.
+    assert_eq!(
+        text.outputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["value", weft_core::node::ERROR_PORT]
+    );
 
     let debug = project.nodes.iter().find(|n| n.id == "out").unwrap();
     assert_eq!(debug.node_type, "Debug");
@@ -106,26 +109,40 @@ t = Text() -> (bogus: String) { value: "hi" }
     );
 }
 
-/// A node that catches its failures (`features.catchErrors`) already
-/// has the `error` output the runtime fills: a source port of that name
-/// is refused, naming the fix, even on a node that accepts custom
-/// outputs. It is the ONE error that port earns: a type that disagrees
-/// with the language's own `error` port adds no mismatch on top.
+/// Every node already has the `_error` output the runtime fills: a
+/// source port of that name is refused, naming the fix, on a node that
+/// accepts custom outputs and on one that does not. It is the ONE error
+/// that port earns: a type that disagrees with the language's own
+/// `_error` adds no mismatch on top, and a node that takes no custom
+/// outputs adds no custom-port refusal. `error` is an ordinary name.
 #[test]
-fn enrich_rejects_an_error_port_on_a_catching_node() {
-    for declared in ["String", "Number"] {
-        let source = format!(
-            "\nq = PostgresExecuteQuery() -> (error: {declared}) {{ query: \"SELECT 1 AS one\" }}\n"
-        );
+fn enrich_rejects_an_error_port_declared_on_any_node() {
+    let cases = [
+        ("ExecPython", "String", "code: \"return {}\""),
+        ("ExecPython", "Number", "code: \"return {}\""),
+        ("Text", "String", "value: \"x\""),
+    ];
+    for (node, declared, config) in cases {
+        let source = format!("\nq = {node}() -> (_error: {declared}) {{ {config} }}\n");
         let mut project = compile(&source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
         let errors = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict);
-        assert_eq!(errors.len(), 1, "{declared}: {:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert_eq!(errors.len(), 1, "{node} {declared}: {:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
         assert!(
-            errors[0].message.contains("'error' is the output this node type already has for its failures"),
-            "{declared}: expected the error-port refusal, got: {}",
+            errors[0].message.contains("'_error' is the output every node already has for its failures"),
+            "{node} {declared}: expected the error-port refusal, got: {}",
             errors[0].message
         );
     }
+    let mut project = compile(
+        "\nq = ExecPython() -> (error: String) { code: \"return {}\" }\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog()).expect("`error` is a name a program may give its own port");
+    let q = project.nodes.iter().find(|n| n.id == "q").unwrap();
+    let names: Vec<&str> = q.outputs.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"error") && names.contains(&weft_core::node::ERROR_PORT), "{names:?}");
 }
 
 /// An output takes no value: a firing emits on it. On a node that

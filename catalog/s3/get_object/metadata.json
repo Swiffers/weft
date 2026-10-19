@@ -47,8 +47,5 @@
       "name": "sizeBytes",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

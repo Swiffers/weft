@@ -9,15 +9,24 @@
 //! browser's cookie endpoint and answers 404 for a private sheet). So
 //! the body branches on whether an account is connected, and both
 //! branches feed one pure cells-to-rows step.
+//!
+//! A tab can hold far more than the 100 KB a wire carries, so one call
+//! emits one page of it: the data rows from `offset` on, at most
+//! `maxRows` of them and only as many as a wire carries, with
+//! `nextOffset` where the next page starts and `hasMore` whether there
+//! is one.
 
 use async_trait::async_trait;
+use serde_json::Value;
 
 use weft::access::client::checked_send;
 use weft::node::NodeOutput;
 use weft::reqwest_middleware::ClientWithMiddleware;
+use weft::storage::wire_page;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::sheets::{read_cells, rows_from_cells, tab_title};
+use super::api::page_size;
+use super::sheets::{heavy_row, read_cells, rows_from_cells, tab_title};
 
 #[derive(NodeManifest)]
 pub struct GoogleSheetsReadNode;
@@ -37,14 +46,26 @@ impl Node for GoogleSheetsReadNode {
         // `hasHeader` declares a metadata default, so the bag holds it.
         let tab: Option<String> = ctx.inputs.opt("tab")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
+        let offset = ctx.inputs.get::<f64>("offset")? as usize;
+        let max_rows = page_size(&ctx.inputs, "maxRows")?;
 
         let http = ctx.client(account.as_ref()).await?;
         let cells = match &account {
             Some(_) => read_via_sheets_api(&http, &id, tab.as_deref()).await?,
             None => read_via_public_export(&http, &id, tab.as_deref()).await?,
         };
-        ctx.pulse_downstream(NodeOutput::new().set("rows", rows_from_cells(cells, has_header)))
-            .await
+        let rows = rows_from_cells(cells, has_header);
+        let rows = rows.as_array().map(Vec::as_slice).unwrap_or_default();
+        let page = wire_page(rows, offset, max_rows)
+            .map_err(|i| heavy_row(&rows[i], i + 1 + usize::from(has_header)))?;
+        let next = page.end;
+        ctx.pulse_downstream(
+            NodeOutput::new()
+                .set("rows", Value::Array(rows[page].to_vec()))
+                .set("nextOffset", next as f64)
+                .set("hasMore", next < rows.len()),
+        )
+        .await
     }
 }
 

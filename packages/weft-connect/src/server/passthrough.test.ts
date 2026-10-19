@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { weftPassThrough } from './passthrough';
+import { RUN_ID_HEADER, weftPassThrough, type PlainFailure } from './passthrough';
 
 /** A dispatcher that records what reached it and echoes the body back. */
 function fakeDispatcher(answer: (req: Request) => Response | Promise<Response> = () => new Response('ok')) {
@@ -114,6 +114,24 @@ describe('the pass-through', () => {
 		expect(init?.redirect).toBe('manual');
 		expect(await new Response(init?.body as ReadableStream).text()).toBe('{"text":"hello"}');
 		expect(new Headers(init?.headers).get('weft-instance-token')).toBe('wft-m');
+	});
+
+	it("hands back which run answered, on a failure and on a success", async () => {
+		const runId = '7f3c0d2e-0000-4000-8000-000000000001';
+		const failure: PlainFailure = { error: 'Something went wrong', runId };
+		for (const [status, body] of [
+			[500, JSON.stringify(failure)],
+			[200, '{"reply":"hi"}'],
+		] as const) {
+			const { fetcher } = fakeDispatcher(
+				() => new Response(body, { status, headers: { 'content-type': 'application/json', [RUN_ID_HEADER]: runId } }),
+			);
+			const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+			const res = await pass(new Request(`${site}/connect/local/p/bot/ask`, { method: 'POST', body: '{}' }), 'connect/local/p/bot/ask');
+			expect(res.status).toBe(status);
+			expect(res.headers.get(RUN_ID_HEADER)).toBe(runId);
+			expect(await res.text()).toBe(body);
+		}
 	});
 
 	it('reaches the display doors, keeping each segment one segment', async () => {

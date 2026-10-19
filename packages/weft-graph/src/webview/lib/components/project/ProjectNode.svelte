@@ -22,7 +22,7 @@
 	import { isScopeKey } from "../../utils/storage-key";
 	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { declarationRule, nodeInputRequiredness, portDeleteAction } from "../../projection/header-ports";
-	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
+	import { errorMarker, fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputRows, outputsOf } from "../../utils/input-field";
 	import FiringInspector from './FiringInspector.svelte';
 	import PayloadCards from './PayloadCards.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
@@ -35,6 +35,7 @@
 	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import FlowDock from './FlowDock.svelte';
+	import ErrorDock from './ErrorDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
 	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
 
@@ -492,12 +493,17 @@
 		(p: PortDefinition) => acceptsWire(p) && !isGatePort(p.name)
 	));
 	const outputs = $derived(outputsOf(data.outputs));
+	/** Outputs that render a ROW: all but `_error`, which docks on the
+	 *  right edge as a marker (`errorDock`). `outputs` stays the
+	 *  COMPLETE list (edits round-trip the full set). */
+	const rowOutputs = $derived(outputRows(outputs));
+	const errorDockState = $derived(errorMarker(id, outputs, edgesState.current));
 
 	// Dynamic min resize height: header + ports + fixed buffer for at least one config line
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
 	const PORT_ROW_HEIGHT = 25;
 	const minResizeHeight = $derived(
-		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, outputs.length) * PORT_ROW_HEIGHT + 80
+		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, rowOutputs.length) * PORT_ROW_HEIGHT + 80
 	);
 	
 	// Check if node allows adding ports based on its features
@@ -1674,6 +1680,15 @@
 	/>
 {/snippet}
 
+<!-- Error dock: `_error` carries why this node failed, so it sits apart
+     from the node's own outputs, as a "!" circle on the right edge level
+     with the flow dock. Filled means a wire handles the failure. -->
+{#snippet errorDock()}
+	{#if errorDockState}
+		<ErrorDock top={18} wired={errorDockState.wired} />
+	{/if}
+{/snippet}
+
 {#if data.simplified}
 	<!-- Simplified view. A bare node is a square: icon, type, editable label, one
 	     in/out dot. A node with LIVE DISPLAY content (infra feed, debug preview,
@@ -1993,7 +2008,7 @@
 			
 			<!-- Output Ports -->
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
-				{#each outputs as output}
+				{#each rowOutputs as output}
 				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
 				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, canAddOutputPorts)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2454,6 +2469,7 @@
 </div>
 
 {@render flowDock()}
+{@render errorDock()}
 
 {/if}
 

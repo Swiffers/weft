@@ -1226,8 +1226,8 @@ impl FakeRig {
 
     /// Wire output `port` downstream, what a wire out of it in the
     /// graph does in production (`ctx.is_output_wired` reads it). A
-    /// rig run wires nothing by default, so a node that catches its
-    /// failure into `error` fails loudly until the case wires it.
+    /// rig run wires nothing by default, so a case testing a failure
+    /// caught on `_error` wires that port first.
     pub fn wire_output(&self, port: &str) {
         self.state.wired_outputs.lock().unwrap().insert(port.to_string());
     }
@@ -1564,7 +1564,6 @@ impl FakeRig {
             capture: Capture::new(
                 outputs,
                 self.state.wired_outputs.lock().unwrap().clone(),
-                manifest.features.catch_errors,
             ),
             declared_inputs: declared_input_map(manifest, &custom),
             wake,
@@ -1987,9 +1986,9 @@ struct Capture {
     declared: HashMap<String, WeftType>,
     /// The output ports the case wired downstream.
     wired: HashSet<String>,
-    /// The node declares `features.catchErrors`: a failed body goes to
-    /// `error` when it is wired, decided as the engine decides it.
-    catch_errors: bool,
+    /// The buses the body creates or joins, ended with how it returned
+    /// as the engine ends them.
+    buses: crate::bus::FiringBuses,
     outputs: Mutex<serde_json::Map<String, Value>>,
     /// Items emitted on `Generator[T]` ports, in order. Folded into
     /// `outputs` as one JSON array per port at outcome time, so a test
@@ -2000,11 +1999,11 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(declared: HashMap<String, WeftType>, wired: HashSet<String>, catch_errors: bool) -> Self {
+    fn new(declared: HashMap<String, WeftType>, wired: HashSet<String>) -> Self {
         Self {
             declared,
             wired,
-            catch_errors,
+            buses: crate::bus::FiringBuses::default(),
             outputs: Mutex::new(Default::default()),
             stream_outputs: Mutex::new(HashMap::new()),
             closed_ports: Mutex::new(Vec::new()),
@@ -2038,11 +2037,13 @@ impl Capture {
         // error can try the port again with something else, and
         // whatever the firing already sent stays sent. Generator ports
         // check each ITEM against the element type, again as
-        // production does.
+        // production does. Before the type, per port, the wire's own
+        // limit, with the very refusal the engine gives, so a node test
+        // catches a value no wire would carry.
         // An open record drops the keys it does not declare, as there.
         let mut conformed = NodeOutput::new();
         for (port, value) in output.outputs {
-            crate::storage::check_wire_value("the node under test", &port, &value)
+            crate::storage::check_wire_value(NODE_UNDER_TEST_ID, &port, &value)
                 .map_err(WeftError::NodeFailed)?;
             let declared = self.declared[&port].port_value_type();
             let value = declared.conform_value(value).map_err(|why| {
@@ -2148,14 +2149,27 @@ impl Capture {
     }
 
     fn into_outcome(self, result: WeftResult<()>) -> RigOutcome {
+        // The body is done: its buses end with how it returned, as the
+        // engine ends them, so a reader under test reads the same end.
+        self.buses.end(crate::bus::body_end(&result));
         let mut outputs = self.outputs.into_inner().unwrap();
+        let mut streams = self.stream_outputs.into_inner().unwrap();
+        let closed_ports = self.closed_ports.into_inner().unwrap();
+        // A stream is open once something went out on it (a bus's marker,
+        // a generator's first item) and it was not closed since, as the
+        // engine reads it off the firing's record.
+        let opened_a_stream = self.declared.iter().any(|(port, ty)| {
+            ty.opens_a_stream()
+                && (outputs.contains_key(port) || streams.get(port).is_some_and(|items| !items.is_empty()))
+                && !closed_ports.contains(port)
+        });
         // The runtime's catch, decided by the same function the engine
-        // reads: a caught failure lands on `error` and the firing ends
+        // reads: a caught failure lands on `_error` and the firing ends
         // well, so a node's test of its caught path tests what runs.
         let result = match result {
             Err(error) => match crate::context::caught_failure(
-                self.catch_errors,
                 crate::context::catchable_message(&error),
+                opened_a_stream,
                 self.wired.contains(crate::context::ERROR_PORT),
             ) {
                 Some(message) => {
@@ -2166,7 +2180,6 @@ impl Capture {
             },
             ok => ok,
         };
-        let mut streams = self.stream_outputs.into_inner().unwrap();
         // EVERY declared generator output lands in the outcome as one
         // array, a stream that yielded nothing included: a test asserts
         // the whole yielded sequence, and "no entry" would make an
@@ -2179,7 +2192,7 @@ impl Capture {
         RigOutcome {
             result,
             outputs,
-            closed_ports: self.closed_ports.into_inner().unwrap(),
+            closed_ports,
             infra_spec: None,
             run_id: None,
         }
@@ -2617,8 +2630,8 @@ impl ContextHandle for TestHandle {
         &self.capture.wired
     }
 
-    fn catches_errors(&self) -> bool {
-        self.capture.catch_errors
+    fn firing_buses(&self) -> &crate::bus::FiringBuses {
+        &self.capture.buses
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
@@ -3303,7 +3316,6 @@ impl LiveRig {
             capture: Capture::new(
                 outputs_by_name,
                 self.wired_outputs.lock().unwrap().clone(),
-                manifest.features.catch_errors,
             ),
             declared_inputs: declared_input_map(manifest, &custom),
         });
@@ -3446,8 +3458,8 @@ impl ContextHandle for CapturingHandle {
         &self.capture.wired
     }
 
-    fn catches_errors(&self) -> bool {
-        self.capture.catch_errors
+    fn firing_buses(&self) -> &crate::bus::FiringBuses {
+        &self.capture.buses
     }
 
     async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {

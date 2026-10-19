@@ -130,7 +130,6 @@
     }
   ],
   "features": {
-    "catchErrors": true,
     "oneOfRequired": [
       [
         "rowNumber",

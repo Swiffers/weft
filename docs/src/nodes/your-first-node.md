@@ -136,7 +136,8 @@ downstream to stop waiting.
 
 **Keep values small.** A value over 100 KB fails the emit, naming the port.
 Bytes go in [storage](storage.md), and what travels the wire is the marker
-saying where they are.
+saying where they are. If a big answer is not a file, go and read
+[emitting](values-and-emission.md#emitting) for how to send less of it.
 
 ## Failing well
 

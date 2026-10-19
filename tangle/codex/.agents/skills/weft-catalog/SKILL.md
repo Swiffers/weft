@@ -54,7 +54,7 @@ An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `lab
 `remote_select`. Several carry their own settings inside that object, a
 select's `options` (the accepted literals) among them.
 
-`features`: `isTrigger` (starts runs from outside), `canAddInputPorts` / `canAddOutputPorts` (the source may add ports of its own, in that direction; a node carries either, both or neither, and this is where you read which), `optionalCustomInputs`, `customInputType`, `oneOfRequired` (skip the node when every port in a group arrives closed), `castPorts`, `liveEndpoint`, `showDebugPreview`, `addedPortsAreDataKeys` (the ports you add are named after outside data, such as a query's parameters or a request body's fields, and keep that data's spelling: the compiler's `not-camel-case` warning skips them).
+`features`: `isTrigger` (starts runs from outside), `canAddInputPorts` / `canAddOutputPorts` (the source may add ports of its own, in that direction; a node carries either, both or neither, and this is where you read which), `join` (a node where several branches meet and the one that arrived carries on, `FirstInOrder` being one: its added inputs are optional, it waits until each has arrived or closed, closes its own output when none arrived, and runs with no `_should_flow` wired), `customInputType`, `oneOfRequired` (skip the node when every port in a group arrives closed), `castPorts`, `liveEndpoint`, `showDebugPreview`, `addedPortsAreDataKeys` (the ports you add are named after outside data, such as a query's parameters or a path's captures, and keep that data's spelling: the compiler's `not-camel-case` warning skips them).
 
 `portsFromConfig`: ports generated at compile time from a config list. The metadata names the field and what an entry may be, so a node carrying the key tells you which of its ports you get by filling that list (a node that branches on cases derives one port per case this way).
 
@@ -73,9 +73,9 @@ from memory.
 
 ## Wiring patterns that recur
 
-**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into every consumer's `account` input. Consumers check at run time that the connection is picked and has the required scopes or values.
+**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into each consumer's `account` input (`access` on a model node and `LlmModerate`, and `auth` on a `Route` or `Socket` for an auth node such as `JwtAuth`). Consumers check at run time that the connection is picked and has the required scopes or values.
 
-**A provider node**: `provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider` inline, or declared long and shared across several LLM nodes.
+**A model**: two nodes, an access node that holds the connection (`router = OpenRouterAccess`) and a model node fed by it that names the model and gives the `provider`: `provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider` inline, or the model node declared long and shared across several LLM nodes. Every model of one service hangs off the same access node.
 
 **Shared sampling**: `params: LlmParams { systemPrompt: @file("assets/prompts/x.md"), temperature: 0.75 }.params` into any LLM node's `params`.
 
@@ -97,14 +97,19 @@ names that field and the kinds an entry may be; the compact view shows the
 ports a given list produced. A form is the case you meet most, each field of
 it an entry that becomes a port.
 
-**Ports you declare on the arrow** (`canAddOutputPorts` in its metadata): a
-node that answers with an opaque blob lets you name the pieces you want, and
-each arrives typed on a port of its own. Reach for this whenever the next
-node needs ONE field rather than the whole answer, because an opaque value
-has no keys to read: without a declared port you would be writing out a
-record type by hand just to pull one thing out of it. The node's metadata
-says what the names mean to it (a column of the answer, a key of a parsed
-reply), and the type you declare is what judges the value at run time.
+**Ports you declare on the arrow** (`canAddOutputPorts` in its metadata):
+a handful of nodes let you name outputs of your own, and the metadata says
+what each name means: `ExecPython` reads the name off what its script
+returns, `ElevenLabsRunTemplate` matches it to an id in the template, and
+`Route` takes one per capture in its path.
+
+**One field out of an opaque answer**: if the next node needs ONE field of
+a query's row or of a model's JSON reply, declare a record on the output
+that carries it (marked `narrowable` in the metadata) and read the field
+with a dot: `look = PostgresExecuteQuery(id: String) -> (row: Card) {...}`
+then `look.row.title`, or `mark = LlmInferenceJson -> (response: Verdict)
+{...}` then `mark.response.label`. A bare `JsonDict` has no keys to read,
+and the type you declare is what judges the value at run time.
 
 ## When the catalog is missing something
 

@@ -36,6 +36,7 @@ import type {
   NodeFiringEvent,
   Seed,
   SkipReason,
+  StreamEnd,
 } from '../../packages/weft-graph/src/protocol';
 
 // A replay may stall while live updates keep arriving. Bound the waiting
@@ -131,7 +132,8 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'bus_left'; runId: string; projectId: string; busId: string; offset: number; name: string; atUnix: number }
   // SYNC: DispatcherEvent 'bus_window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window'
   | { kind: 'bus_window'; runId: string; projectId: string; busId: string; firstOffset: number; lastOffset: number; messages: Array<{ offset: number; from: string; msgKind: string; payload?: WirePayload; payloadByteSize: number; trimmed?: boolean; atUnix: number }>; totals: Array<{ from: string; msgKind: string; count: number; bytes: number }>; atUnix: number }
-  | { kind: 'bus_closed'; runId: string; projectId: string; busId: string; offset: number; atUnix: number }
+  // SYNC: DispatcherEvent 'bus_closed' <-> crates/weft-journal/src/events.rs BusClosed, crates/weft-core/src/live_event.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed'
+  | { kind: 'bus_closed'; runId: string; projectId: string; busId: string; offset: number; end: StreamEnd; atUnix: number }
   // Live caller connection events. One caller per run (keyed by
   // run, no busId). The webview replays the caller exchange the same
   // way it replays a bus; `payload` is the same tagged WirePayload a
@@ -596,7 +598,7 @@ export class RunFollower implements vscode.Disposable {
       case 'bus_closed':
         this.post({
           kind: 'busEvent',
-          event: { kind: 'closed', busId: e.busId, offset: e.offset, atUnix: e.atUnix },
+          event: { kind: 'closed', busId: e.busId, offset: e.offset, end: e.end, atUnix: e.atUnix },
         });
         break;
       case 'bus_participant':

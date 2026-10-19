@@ -85,7 +85,7 @@ async fn fitting_record(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// The answer is checked before the turn is written: a rejected one
-/// fails on `error` naming the field, and the conversation file keeps
+/// fails on `_error` naming the field, and the conversation file keeps
 /// the content and version it came in with (no user message, no
 /// answer), so a retry sends the model the same conversation.
 async fn missing_field(rig: FakeRig) -> WeftResult<()> {
@@ -93,13 +93,13 @@ async fn missing_field(rig: FakeRig) -> WeftResult<()> {
     rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&[r#"{"label": "spam"}"#], Some("stop")));
     let history = json!([{ "role": "user", "content": "q1" }, { "role": "assistant", "content": "a1" }]);
     let file = conversation_file(&rig, history.clone());
-    rig.wire_output("error");
+    rig.wire_output("_error");
     rig.wire_output("historyFile");
     let outcome = rig
         .run(&LlmInferenceJsonNode, json!({ "provider": provider(&rig), "prompt": "grade it", "historyFile": file.clone() }))
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains(r#"the model's answer does not fit Verdict: value: missing required field "score""#), "{error}");
     for port in ["response", "historyFile", "toolCalls"] {
         assert!(!outcome.outputs.contains_key(port), "a rejected answer emits nothing on {port}");

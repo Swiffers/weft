@@ -172,7 +172,7 @@ running to finish, and only a node still running after that is failed. A run
 that cannot pause ([below](#when-a-run-cannot-pause)) keeps running on the
 stopping worker for as long as the platform lets it, and if the worker goes
 before the run ends, that is the same as the worker dying. If you want to know
-what `catchErrors` does with that failure, or what happens to a node that was
+what a wired `_error` does with that failure, or what happens to a node that was
 waiting on an answer or reading a stream, go and read [surviving a
 restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
@@ -194,8 +194,10 @@ is quiet, meaning every node still running is waiting, on an answer or on a
 bus. Anything that moves (a bus message, a node finishing) starts it over. If
 the run stays quiet for `holdSecs` (60 seconds unless the trigger says
 otherwise), the call that was waiting fails, saying it gave up, and the wait is
-withdrawn, so a form is no longer offered. The node can handle that error like
-any other, or send it to `error` with `catchErrors`. With `holdSecs: 0`, such a
+withdrawn, so a form is no longer offered. The node's code can handle that
+error like any other, and if it does not, the program can: it comes out on the
+node's `_error` when that is wired ([when a node
+fails](how-a-program-runs.md#when-a-node-fails)). With `holdSecs: 0`, such a
 wait fails at once.
 
 If the run becomes able to pause while a wait holds (the last bus between its
@@ -241,8 +243,17 @@ from the run's record, so the compiler refuses `outlivesCaller: true` with
 `recorded: false`. A run with a bus open cannot move, since a bus lives in its worker's memory
 alone, so it keeps running on that worker for as long as the worker stays up.
 
+### When a run ends before it answers
+
+Every answer a route's run gives, good or bad, carries a `Weft-Run-Id` header
+holding the run's id.
+
 If a run ends before it has finished answering its caller, the caller gets
-one of these statuses instead, with the reason in the body:
+one of these statuses instead, and this JSON body:
+
+```json
+{"error": "Something went wrong", "runId": "9b81d0a2-..."}
+```
 
 | Status | When |
 |---|---|
@@ -258,13 +269,33 @@ may last, when it runs out while every run on that worker only waits (for
 why, go and read
 [the broker](../running/architecture.md#the-broker-and-who-may-talk-to-what)).
 
+The caller never sees why the run ended: the reason can name your nodes, your
+files and a provider's words, and those are yours to read. The whole reason
+stays on the run's record, and you open it with `weft logs <run id>` or in the
+graph. The id is safe to hand out, because opening a run takes your own
+credential. If you want a caller to get a message of your own instead, wire
+`_error` on the nodes that may fail and gate a `Reply` of yours on it; the run
+then no longer fails ([when a node
+fails](how-a-program-runs.md#when-a-node-fails)).
+
 A `503` here carries no `Retry-After`, because calling again would start a
 second run beside the one that may still be going. If the answer had already
 started, its status was already sent, so the error comes at the end of the
-body instead: a JSON-lines answer ends with `{"error": "...", "status": 504}`,
-a server-sent-events answer with an `error` event, and any other answer with
-a line `[error] ...`. A socket closes with `1011` where a call would get `500`
-or `504`, and with `1013` where it would get `503`.
+body instead, in the answer's own format:
+
+| The answer is | It ends with |
+|---|---|
+| JSON lines | one more line, `{"error": "Something went wrong", "runId": "...", "status": 504}`, where `status` is the one the call would have got |
+| Server-sent events | an `error` event whose data is `{"error": "Something went wrong", "runId": "..."}` |
+| Anything else | a line `[error] Something went wrong (run <id>)` |
+
+A socket closes with `1011` where a call would get `500` or `504`, and with
+`1013` where it would get `503`, and the close reason is that same
+`Something went wrong (run <id>)`.
+
+A `Stream` answers this way too when the bus it reads ended failed: a `500` if
+nothing was sent yet, the marker above if it was, `1011` on a socket. Its
+`done` output then stays absent.
 
 ## Answering on a socket
 

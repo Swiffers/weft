@@ -16,6 +16,7 @@ fn path(url: &str) -> String {
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("finds_matching_rows_with_their_numbers", finds_rows),
+        NodeTest::fake("matches_come_a_page_at_a_time", paged_matches),
         NodeTest::fake("an_unknown_column_fails_loud", unknown_column),
         NodeTest::live("one_real_lookup_of_a_read_back_value", "google", live_lookup)
             .with_fixture(
@@ -63,10 +64,40 @@ async fn finds_rows(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     assert_eq!(outcome.outputs["found"], json!(true));
     assert_eq!(outcome.outputs["rowNumbers"], json!([2, 3]), "1-based, past the header");
+    assert_eq!(outcome.outputs["hasMore"], json!(false));
     assert_eq!(
         outcome.outputs["rows"][0],
         json!({ "name": "ada", "city": "london" })
     );
+    Ok(())
+}
+
+async fn paged_matches(rig: FakeRig) -> WeftResult<()> {
+    canned_tab(&rig);
+    let lookup = |offset: u64| {
+        rig.run(
+            &GoogleSheetsLookupNode,
+            json!({
+                "account": rig.access("google"),
+                "spreadsheet": "s1",
+                "column": "city",
+                "value": "london",
+                "offset": offset,
+                "maxRows": 1,
+            }),
+        )
+    };
+    let first = lookup(0).await.ok()?;
+    assert_eq!(first.outputs["rows"], json!([{ "name": "ada", "city": "london" }]));
+    assert_eq!(first.outputs["rowNumbers"], json!([2]));
+    assert_eq!(first.outputs["nextOffset"], json!(1.0));
+    assert_eq!(first.outputs["hasMore"], json!(true));
+
+    let second = lookup(1).await.ok()?;
+    assert_eq!(second.outputs["rows"], json!([{ "name": "alan", "city": "london" }]));
+    assert_eq!(second.outputs["rowNumbers"], json!([3]), "the sheet row, not the place among the matches");
+    assert_eq!(second.outputs["hasMore"], json!(false));
+    assert_eq!(second.outputs["found"], json!(true));
     Ok(())
 }
 

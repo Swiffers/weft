@@ -188,7 +188,7 @@ fn graph_errors(project: &std::path::Path, stdlib: &std::path::Path) -> anyhow::
 #[test]
 fn every_example_graph_compiles() -> anyhow::Result<()> {
     let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("stdlib root: {e}"))?;
-    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let examples = weft_e2e::project::fixtures_root().join("../../../examples");
     let mut broken: Vec<String> = Vec::new();
     let mut seen = 0;
     for entry in std::fs::read_dir(&examples)? {

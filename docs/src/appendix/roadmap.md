@@ -19,13 +19,12 @@ That needs a replay story for a partially-consumed stream, which items were
 delivered and which pulls answered, so it comes after the rest of the durable
 work.
 
-**Type rules in metadata.** Two nodes want an output whose type metadata cannot
-write down as one type: `FirstInOrder` emits the union of its created inputs, and
-`LlmInference.response` is a `String` without `parseJson` and a record or
-`JsonDict` with it. Both make the author restate the type in the signature every
-time. The plan is a small rule language in `metadata.json`, read the way
-`portsFromConfig` is, for "the union of these inputs" or "this type when that
-input is true". It is the whole feature or nothing, because a half rule would
+**Type rules in metadata.** `FirstInOrder` wants an output whose type metadata
+cannot write down as one type: the union of its created inputs. Today every
+input it creates shares one type variable, so it cannot join a `String` branch
+with a `Number` one. The plan is a
+small rule language in `metadata.json`, read the way `portsFromConfig` is, for
+"the union of these inputs". It is the whole feature or nothing, because a half rule would
 send the editor, the validator and the runtime three different answers about one
 port.
 

@@ -57,5 +57,6 @@ async fn fire_reads(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["id"], json!("m7"));
     assert_eq!(outcome.outputs["subject"], json!("fresh mail"));
     assert_eq!(outcome.outputs["body"], json!("the new message"));
+    assert_eq!(outcome.outputs["bodyTruncated"], json!(false), "the trigger caps bodies the way GmailGet does");
     Ok(())
 }

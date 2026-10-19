@@ -7,16 +7,16 @@
 //! ## No envelope, close is the goodbye signal
 //!
 //! The bus is a durable log: closing it is itself a journaled `Closed`
-//! entry every cursor reads. `ctx.open_bus` hands back a guard that
-//! closes on EVERY exit path (success or error), so a half-broken host
-//! can never leave the guest's cursor parked forever; the guest's
+//! entry every cursor reads. A bus from `ctx.open_bus` ends with the
+//! host's body on EVERY exit path (success or error), so a half-broken
+//! host can never leave the guest's cursor parked forever; the guest's
 //! cursor returns `None` when it reaches the close entry.
 //!
 //! Flow:
-//!   1. host: open_bus (create + emit marker + register, close-on-drop)
+//!   1. host: open_bus (create + emit marker + register, ends with the body)
 //!   2. host: wait_for("guest")
 //!   3. host: for each line: send "msg", read the guest's next reply
-//!   4. host: drop the bus (the close), pulse_downstream(done=true)
+//!   4. host: close the bus (the goodbye), pulse_downstream(done=true)
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -63,7 +63,7 @@ impl Node for BusChatHostNode {
                     turn + 1
                 ))?;
         }
-        drop(bus); // the goodbye: every cursor reads the Closed entry
+        bus.close(); // the goodbye: every cursor reads the Closed entry
 
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())

@@ -1,7 +1,7 @@
 {
   "type": "TickBus",
   "label": "Tick Bus",
-  "description": "Demo node standing in for a streaming producer (an LLM stream): opens a bus, sends three text deltas, closes it. Starts when `start` arrives.",
+  "description": "Demo node standing in for a streaming producer (an LLM stream): sends three text deltas on a bus it opens with the first, or fails at `failAt`. Starts when `start` arrives.",
   "tags": [
     "bus",
     "demo",
@@ -15,6 +15,11 @@
       "type": "String",
       "required": true,
       "description": "Any value; what starts the producer (a route's path)."
+    },
+    {
+      "name": "failAt",
+      "type": "Number",
+      "description": "Fail on reaching this tick instead of sending it: 0 before the bus opens, 1 or 2 halfway through."
     }
   ],
   "outputs": [

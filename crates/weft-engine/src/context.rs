@@ -907,12 +907,13 @@ impl BusCoordinator {
         self.registry.live_bus_arcs().iter().any(|b| !b.is_closed())
     }
 
-    /// Close every live bus (appends a `Closed` log entry to each).
-    /// Does NOT release the registry's `Arc<BusInner>` refs: the pump
-    /// still needs to journal the `Closed` entries.
-    pub fn close_all(&self) {
+    /// Close every live bus still open as `end` (appends a `Closed` log
+    /// entry to each; a bus already ended keeps its end). Does NOT
+    /// release the registry's `Arc<BusInner>` refs: the pump still
+    /// needs to journal the `Closed` entries.
+    pub fn close_all(&self, end: weft_core::bus::StreamEnd) {
         for b in self.registry.live_bus_arcs() {
-            b.close();
+            b.close(end.clone());
         }
         self.journal_pump_notify.notify_waiters();
     }
@@ -952,7 +953,7 @@ impl BusCoordinator {
             self.pump_should_exit.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
-        self.close_all();
+        self.close_all(run_ended_with_bus_open());
         let drain = self.drain_complete_notify.clone();
         loop {
             // Arm the wake BEFORE the predicate check so a drain pass
@@ -988,6 +989,13 @@ impl BusCoordinator {
     }
 }
 
+/// The end of a bus still open when its run ends. Every bus a body holds
+/// ends with that body, so one left open here outlived whoever held it
+/// (a body that never ended, a cancel): its stream did not complete.
+fn run_ended_with_bus_open() -> weft_core::bus::StreamEnd {
+    weft_core::bus::StreamEnd::Failed { error: "the run ended before this bus did".into() }
+}
+
 impl Drop for BusCoordinator {
     /// Backstop for the case where the coordinator is dropped without
     /// `shutdown()` being called first (a panic unwind, a test that
@@ -1005,7 +1013,7 @@ impl Drop for BusCoordinator {
     /// extra `close()` calls are idempotent no-ops.
     fn drop(&mut self) {
         for b in self.registry.live_bus_arcs() {
-            b.close();
+            b.close(run_ended_with_bus_open());
         }
         self.pump_should_exit
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1193,7 +1201,7 @@ async fn drain_buses(
                 // stream never reorders against the bus log.
                 BusEntryKind::Joined { .. }
                 | BusEntryKind::Left { .. }
-                | BusEntryKind::Closed => {
+                | BusEntryKind::Closed { .. } => {
                     if let Some(state) = windows.get_mut(&bus_id) {
                         if matches!(
                             write_open_window(&inner, run_id, &bus_id_str, journal, replica, state)
@@ -1333,10 +1341,11 @@ fn membership_event(run_id: RunId, bus_id: &str, entry: &BusEntry) -> RunEvent {
             name: name.clone(),
             at_unix,
         },
-        BusEntryKind::Closed => RunEvent::BusClosed {
+        BusEntryKind::Closed { end } => RunEvent::BusClosed {
             run_id,
             bus_id: bus_id.to_string(),
             offset,
+            end: end.clone(),
             at_unix,
         },
         BusEntryKind::Message { .. } => {
@@ -1414,7 +1423,7 @@ pub enum NodeTaskOutcome {
     /// has any: each one the body emitted nothing on carries it.
     Completed { saved: std::collections::BTreeMap<String, serde_json::Value> },
     /// The firing failed. `message` is what the run's failure reads;
-    /// `catchable` is what the node's `error` output carries if the
+    /// `catchable` is what the node's `_error` output carries if the
     /// failure is caught (`weft_core::context::catchable_message`),
     /// `None` for a failure that never is. `gave_up_wait`: the firing
     /// failed on a wait it gave up (`WeftError::WaitGaveUp`), a time
@@ -1509,9 +1518,9 @@ pub struct RunnerHandle {
     /// Which copies of its infra the run's program declares: an `Infra`
     /// handle another node shared resolves only to one of these.
     declared_infra: Arc<weft_core::project::DeclaredInfra>,
-    /// The node declares `features.catchErrors`, so its `error` output
-    /// is the runtime's to fill (`ContextHandle::catches_errors`).
-    catch_errors: bool,
+    /// The buses this firing ends when its body does
+    /// (`weft_core::bus::FiringBuses`, ended by [`Self::end_body`]).
+    buses: weft_core::bus::FiringBuses,
     /// The node's baked outputs (`weft_core::infra::bake`), and what the
     /// body emitted on them this firing: what an infra setup saves.
     baked_outputs: std::collections::BTreeSet<String>,
@@ -1716,7 +1725,7 @@ impl RunnerHandle {
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
-            catch_errors: false,
+            buses: Default::default(),
             baked_outputs: Default::default(),
             baked_emitted: Default::default(),
             infra_made: Default::default(),
@@ -1891,13 +1900,6 @@ impl RunnerHandle {
         self
     }
 
-    /// Whether this node declares `features.catchErrors` (from its
-    /// definition).
-    pub fn with_catch_errors(mut self, catch_errors: bool) -> Self {
-        self.catch_errors = catch_errors;
-        self
-    }
-
     pub fn with_baked_outputs(mut self, baked_outputs: std::collections::BTreeSet<String>) -> Self {
         self.baked_outputs = baked_outputs;
         self
@@ -1987,9 +1989,11 @@ impl RunnerHandle {
     /// with a clone of its ctx) is refused, because the firing it would
     /// belong to is no longer running. Taken under the claims lock every
     /// emission sends under, so an emission is either on the channel
-    /// before the firing's terminal or refused.
-    pub fn end_body(&self) {
+    /// before the firing's terminal or refused. The buses the body held
+    /// end with `end`, how it returned (`weft_core::bus::body_end`).
+    pub fn end_body(&self, end: weft_core::bus::StreamEnd) {
         self.lock_port_claims().body_returned = true;
+        self.buses.end(end);
     }
 
     /// The refusal for anything done through this handle after its body
@@ -3330,8 +3334,8 @@ impl ContextHandle for RunnerHandle {
         &self.wired_outputs
     }
 
-    fn catches_errors(&self) -> bool {
-        self.catch_errors
+    fn firing_buses(&self) -> &weft_core::bus::FiringBuses {
+        &self.buses
     }
 
     /// Fire downstream. Each output port the node mentions in
@@ -5297,7 +5301,7 @@ mod bus_pump_tests {
         let (waits, coord) = coord_with_tracker();
         let mut bus = new_bus_for(&coord, "a");
         bus.register("a").unwrap();
-        coord.close_all();
+        coord.close_all(weft_core::bus::StreamEnd::Finished);
         // No liveness entry was ever created (the node never entered a
         // wait), and dropping the registered handle on a closed bus must
         // not panic.

@@ -177,7 +177,7 @@ async fn unset_sends_nothing(rig: FakeRig) -> WeftResult<()> {
 
 /// Only a client refusal over reasoning is the settings mistake: a
 /// server failure whose text mentions reasoning is transient, so it
-/// goes to a wired `error` like any other provider failure.
+/// goes to a wired `_error` like any other provider failure.
 async fn reasoning_transient(rig: FakeRig) -> WeftResult<()> {
     rig.respond_raw(
         "POST",
@@ -186,7 +186,7 @@ async fn reasoning_transient(rig: FakeRig) -> WeftResult<()> {
         "application/json",
         br#"{"error":{"message":"reasoning backend overloaded, reason: capacity"}}"#.to_vec(),
     );
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig
         .run(
             &LlmInferenceNode,
@@ -194,7 +194,7 @@ async fn reasoning_transient(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("overloaded") && !error.contains("always reasons"), "{error}");
     Ok(())
 }
@@ -207,8 +207,8 @@ async fn reasoning_refused(rig: FakeRig) -> WeftResult<()> {
         "application/json",
         br#"{"error":{"message":"reasoning cannot be disabled for this model"}}"#.to_vec(),
     );
-    // A settings mistake: it fails the run even with `error` wired.
-    rig.wire_output("error");
+    // A settings mistake: it fails the run even with `_error` wired.
+    rig.wire_output("_error");
     let err = rig
         .run(
             &LlmInferenceNode,
@@ -679,7 +679,7 @@ async fn live_completion(rig: LiveRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// The provider refusing the call, the failure both `error` tests read.
+/// The provider refusing the call, the failure both `_error` tests read.
 fn refuse_the_call(rig: &FakeRig) {
     rig.respond_raw(
         "POST",
@@ -702,12 +702,12 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_call(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig
         .run(&LlmInferenceNode, json!({ "provider": provider(&rig), "prompt": "hi" }))
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("the prompt was refused"), "{error}");
     for port in ["response", "historyFile", "toolCalls"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
@@ -716,7 +716,7 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let no_connection = json!({ "kind": "openrouter", "model": "openai/gpt-test" });
     let err = rig
         .run(&LlmInferenceNode, json!({ "provider": no_connection, "prompt": "hi" }))

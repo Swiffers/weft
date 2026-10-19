@@ -440,7 +440,8 @@ pub struct RunsQuery {
 }
 
 /// `GET /instance/runs`: the instance's own runs in the token's project,
-/// newest first.
+/// newest first, each failed one with the plain failure in place of why
+/// it failed ([`plain_failures`]).
 pub async fn runs(
     State(state): State<DispatcherState>,
     headers: HeaderMap,
@@ -459,11 +460,59 @@ pub async fn runs(
         .journal
         .list_runs(&caller.tenant, &query)
         .await
-        .map(Json)
+        .map(|page| Json(plain_failures(page)))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("runs: {e:#}")))
+}
+
+/// An instance token is a visitor of the program, never its owner: a
+/// failed run reads as the plain failure (`weft_core::caller::PLAIN_FAILURE`),
+/// its node paths and a provider's words left to the owner, who opens it
+/// by the run id the summary already carries.
+fn plain_failures(mut page: weft_core::program::RunPage) -> weft_core::program::RunPage {
+    for run in &mut page.runs {
+        if run.error.is_some() {
+            run.error = Some(weft_core::caller::PLAIN_FAILURE.to_string());
+        }
+    }
+    page
 }
 
 fn access_err(e: anyhow::Error) -> ApiError {
     let (status, message) = weft_access_store::client_error(e);
     (StatusCode::from_u16(status).expect("store status codes are valid"), message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_failures;
+    use weft_core::program::{RunPage, RunStatus, RunSummary};
+
+    fn run(status: RunStatus, error: Option<&str>) -> RunSummary {
+        RunSummary {
+            run_id: uuid::Uuid::new_v4(),
+            project_id: uuid::Uuid::nil(),
+            entry_node: "route".into(),
+            status,
+            phase: weft_core::primitive::Phase::Fire,
+            started_at: 1,
+            completed_at: Some(2),
+            tags: Vec::new(),
+            cancel_cause: None,
+            error: error.map(str::to_string),
+            skipped_nodes: 0,
+            instance: None,
+        }
+    }
+
+    /// A failed run reads as the plain failure, keeping its id; a run
+    /// that did not fail keeps no error.
+    #[test]
+    fn an_instance_reads_failures_plain() {
+        let failed = run(RunStatus::Failed, Some("route.work.ingest: ffprobe failed probing /data/src.mp4"));
+        let id = failed.run_id;
+        let page = plain_failures(RunPage { runs: vec![failed, run(RunStatus::Completed, None)], total: 2 });
+        assert_eq!(page.runs[0].error.as_deref(), Some("Something went wrong"));
+        assert_eq!(page.runs[0].run_id, id);
+        assert_eq!(page.runs[1].error, None);
+    }
 }

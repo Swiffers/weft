@@ -58,13 +58,26 @@ It passes on the instance door (`/instance/...`), the signal doors
 (`/public/files/<token>`) and a field's file chooser
 (`/access/picker/<state>` and the result it posts back), and answers 404 for
 anything else. It carries the caller's `Authorization`, `Weft-Instance-Token`,
-body and content type, and hands back the dispatcher's status. It also tells
-the dispatcher which address the browser used (your site's host and the
-`/weft` mount), so a link the dispatcher hands back, like a chooser page,
-points at your site and not at the address your server reaches weft on.
+body and content type, and hands back the dispatcher's status and the
+`Weft-Run-Id` header a route's answer carries. It also tells the dispatcher
+which address the browser used (your site's host and the `/weft` mount), so a
+link the dispatcher hands back, like a chooser page, points at your site and
+not at the address your server reaches weft on.
 
 Every door streams its body through as it arrives, and hands a redirect
 back to the browser as it is.
+
+When a route's run fails, your page gets this, and never the reason, which is
+yours to read:
+
+```json
+{"error": "Something went wrong", "runId": "..."}
+```
+
+If you want to show a visitor which run it was, or log it, read the `runId`,
+or the `Weft-Run-Id` header that every answer carries, failed or not.
+`@weft/connect/server` exports that header's name as `RUN_ID_HEADER` and the body's shape as
+`PlainFailure`, and you open the run itself with `weft logs <run id>`.
 
 ## A socket that comes back
 

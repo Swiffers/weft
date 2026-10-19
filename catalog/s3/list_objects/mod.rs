@@ -1,14 +1,19 @@
-//! S3ListObjects: list a bucket's keys under a prefix, paging
-//! (list-type=2) until exhausted. The store answers XML; the tiny
-//! tag-scan below pulls exactly the fields the node emits, so the
-//! package carries no XML dependency for three tag names.
+//! S3ListObjects: list one page of a bucket's keys under a prefix
+//! (list-type=2). A bucket can hold far more keys than the 100 KB a
+//! wire carries, so a call lists at most `maxKeys` of them after
+//! `startAfter`, and only as many as fit a wire, and says where the
+//! next page starts (`lastKey`, S3's own `start-after`) and whether
+//! there is one. The store answers XML; the tiny tag-scan below pulls
+//! exactly the fields the node emits, so the package carries no XML
+//! dependency for a few tag names.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::access::client::checked_send;
 use weft::node::NodeOutput;
-use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::storage::wire_page;
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct S3ListObjectsNode;
@@ -24,56 +29,77 @@ impl Node for S3ListObjectsNode {
         let access: Access = ctx.inputs.get("account")?;
         let bucket: String = ctx.inputs.get("bucket")?;
         let prefix: String = ctx.inputs.get_or("prefix", String::new())?;
+        let start_after: String = ctx.inputs.get_or("startAfter", String::new())?;
+        // `maxKeys` declares a metadata default, so the bag holds it. A
+        // wired or written value skips the widget's minimum, and a page
+        // of 0 keys would never move `startAfter` on.
+        let max_keys: f64 = ctx.inputs.get("maxKeys")?;
+        if max_keys < 1.0 {
+            return Err(WeftError::Config(format!("`maxKeys` is {max_keys}; a page holds at least 1 key")));
+        }
+        let max_keys = (max_keys as u64).to_string();
 
         let s3 = ctx.client(&access).await?;
-        let mut objects: Vec<Value> = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut query: Vec<(&str, &str)> =
-                vec![("list-type", "2"), ("max-keys", "1000")];
-            if !prefix.is_empty() {
-                query.push(("prefix", prefix.as_str()));
-            }
-            if let Some(t) = &token {
-                query.push(("continuation-token", t.as_str()));
-            }
-            let url = super::s3::bucket_url(&bucket, &query)?;
-            let body = checked_send(s3.get(&url), "list the bucket's objects")
-                .await?
-                .text()
-                .await
-                .node_err("s3: read list response")?;
-            // S3 always sends Key, Size, and LastModified on a
-            // Contents element; an absence means the response is not
-            // the listing shape we think it is, and a silently-zero
-            // size would make a downstream "skip empty objects" filter
-            // drop real files.
-            for content in tag_bodies(&body, "Contents") {
-                let key = first_tag(&content, "Key")
-                    .node_err("s3: a listing entry carries no Key")?;
-                let size: f64 = first_tag(&content, "Size")
-                    .and_then(|s| s.parse().ok())
-                    .node_err("s3: a listing entry carries no numeric Size")?;
-                let modified = first_tag(&content, "LastModified")
-                    .node_err("s3: a listing entry carries no LastModified")?;
-                objects.push(json!({ "key": key, "sizeBytes": size, "lastModified": modified }));
-            }
-            token = first_tag(&body, "NextContinuationToken").filter(|t| !t.is_empty());
-            if token.is_none() {
-                break;
-            }
+        let mut query: Vec<(&str, &str)> = vec![("list-type", "2"), ("max-keys", max_keys.as_str())];
+        if !prefix.is_empty() {
+            query.push(("prefix", prefix.as_str()));
         }
+        if !start_after.is_empty() {
+            query.push(("start-after", start_after.as_str()));
+        }
+        let url = super::s3::bucket_url(&bucket, &query)?;
+        let body = checked_send(s3.get(&url), "list the bucket's objects")
+            .await?
+            .text()
+            .await
+            .node_err("s3: read list response")?;
+        let listed = listing_objects(&body)?;
+        let truncated = first_tag(&body, "IsTruncated").as_deref() == Some("true");
 
+        // `keys` holds less of each object, so what fits `objects` fits
+        // `keys` too. A key is at most 1024 bytes, which JSON escapes can
+        // swell to about 6 KB, so no entry outweighs a wire on its own.
+        let page = wire_page(&listed, 0, usize::MAX).map_err(|i| {
+            weft::node_error(format!("s3: listing entry {i} weighs more than a wire carries on its own"))
+        })?;
+        let has_more = truncated || page.end < listed.len();
+        let objects = &listed[page];
+        // With nothing listed, the next page still starts where this
+        // one was asked to.
+        let last_key =
+            objects.last().and_then(|o| o["key"].as_str()).unwrap_or(start_after.as_str()).to_string();
         let count = objects.len() as f64;
         let keys: Vec<Value> = objects.iter().map(|o| o["key"].clone()).collect();
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("objects", json!(objects))
                 .set("keys", json!(keys))
-                .set("count", count),
+                .set("count", count)
+                .set("lastKey", last_key)
+                .set("hasMore", has_more),
         )
         .await
     }
+}
+
+/// The objects of one listing answer, in key order.
+fn listing_objects(body: &str) -> WeftResult<Vec<Value>> {
+    // S3 always sends Key, Size, and LastModified on a Contents
+    // element; an absence means the response is not the listing shape
+    // we think it is, and a silently-zero size would make a downstream
+    // "skip empty objects" filter drop real files.
+    tag_bodies(body, "Contents")
+        .iter()
+        .map(|content| {
+            let key = first_tag(content, "Key").node_err("s3: a listing entry carries no Key")?;
+            let size: f64 = first_tag(content, "Size")
+                .and_then(|s| s.parse().ok())
+                .node_err("s3: a listing entry carries no numeric Size")?;
+            let modified =
+                first_tag(content, "LastModified").node_err("s3: a listing entry carries no LastModified")?;
+            Ok(json!({ "key": key, "sizeBytes": size, "lastModified": modified }))
+        })
+        .collect()
 }
 
 /// Every `<tag>...</tag>` body in `xml`, in order. A plain scan is

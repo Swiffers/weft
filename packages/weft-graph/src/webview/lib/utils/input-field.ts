@@ -7,7 +7,7 @@ import type { FieldDefinition, PortDefinition } from '../types';
 import type { Widget } from '../../../protocol';
 import type { SpecField } from './port-specs';
 import { acceptsLiteral, ownValue } from '../types';
-import { SHOULD_NOT_FLOW_PORT, isGatePort } from '../../../protocol';
+import { ERROR_PORT, SHOULD_NOT_FLOW_PORT, isGatePort } from '../../../protocol';
 
 /// A node's rendered input list, read off its data. Every parse and
 /// every projection path fills the list (the wire type is a required
@@ -23,6 +23,28 @@ export function inputsOf(inputs: unknown): PortDefinition[] {
 /// The output twin of [`inputsOf`]: same contract, same loud refusal.
 export function outputsOf(outputs: unknown): PortDefinition[] {
 	return portList(outputs, 'output');
+}
+
+/// The outputs a node draws as ROWS: every output but `_error`, which the
+/// language gives every catalog node and the card draws as a marker on
+/// its right edge instead. `outputs` itself stays the complete list, so
+/// edits round-trip the full set. Every surface that lists a node's
+/// outputs to a person (the card, its sizing, a palette preview, the
+/// output a new node offers a dragged wire) reads this one.
+export function outputRows<P extends { name: string }>(outputs: P[]): P[] {
+	return outputs.filter((p) => p.name !== ERROR_PORT);
+}
+
+/// What the `_error` marker on a node's right edge shows: nothing for a
+/// node without that output (a group or loop boundary), otherwise
+/// whether a wire leaves it (filled) or not (outline).
+export function errorMarker(
+	nodeId: string,
+	outputs: { name: string }[],
+	edges: { source: string; sourceHandle?: string | null }[],
+): { wired: boolean } | null {
+	if (!outputs.some((p) => p.name === ERROR_PORT)) return null;
+	return { wired: edges.some((e) => e.source === nodeId && e.sourceHandle === ERROR_PORT) };
 }
 
 function portList(list: unknown, which: 'input' | 'output'): PortDefinition[] {

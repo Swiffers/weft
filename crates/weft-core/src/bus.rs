@@ -118,6 +118,17 @@
 //! run and, when it concludes a wait can never be satisfied,
 //! closes the bus. Every waiting cursor wakes; `next()` returns `None`.
 //!
+//! ## How a bus ends
+//!
+//! The close carries an end ([`StreamEnd`]): `Finished`, or `Failed`
+//! with an error. Every bus a firing creates or joins is held by that
+//! firing ([`FiringBuses`]) and ended by weft when the body does, with
+//! how the body returned: a reader of a producer that failed halfway
+//! learns the stream is incomplete instead of reading a short one as
+//! whole. A body may end a bus early with [`BusHandle::close`], which
+//! only ever says finished. The engine's own closes (a stuck run, the
+//! run's end) say failed, naming why.
+//!
 //! ## "wait" vs "park" vocabulary
 //!
 //! The word "park" in this codebase already names `ctx.await_signal`:
@@ -334,7 +345,7 @@ pub struct BusEntry {
 pub enum BusEntryKind {
     /// A handle registered `name`.
     Joined { name: String },
-    /// A registered handle dropped, or the bus closed for it.
+    /// A registered handle dropped while the bus was open.
     Left { name: String },
     /// A successful `send` landed. `from` is the sender's registered
     /// name (the bus stamps it). For journaled buses, `payload` is
@@ -349,12 +360,21 @@ pub enum BusEntryKind {
         payload: Option<WirePayload>,
         payload_byte_size: u64,
     },
-    /// Appended once at `close()`. Cursors never surface it as a
-    /// regular `Some(entry)`; `next()` returns `None` when it reaches
-    /// this marker. Journaled so the inspector renders "* the bus
-    /// closed here" instead of the panel just ending.
-    Closed,
+    /// Appended once at the close, saying how the bus ended. Cursors
+    /// never surface it as a regular `Some(entry)`; `next()` returns
+    /// `None` when it reaches this marker, and a reader asks the handle
+    /// how it ended ([`BusHandle::end`]). Journaled so the inspector
+    /// renders where the bus closed, or failed, instead of the panel
+    /// just ending.
+    Closed { end: StreamEnd },
 }
+
+/// How a bus ended: the same vocabulary a generator's stream ends with.
+/// `Finished` when the body of the firing that held it returned
+/// normally (or the bus was closed on purpose), `Failed` with the
+/// firing's error otherwise. Weft writes it ([`FiringBuses::end`]); a
+/// node can only end a bus as finished ([`BusHandle::close`]).
+pub use crate::primitive::StreamEnd;
 
 /// One message inside a journal window row: who sent it, when, and
 /// what it said as far as the journal keeps it. Only the ROW
@@ -743,6 +763,8 @@ pub struct BusInner {
     /// Set once when the bus is closed. Cursors return `None` after
     /// reaching the `Closed` entry; further sends error.
     closed: AtomicBool,
+    /// How the bus ended, set under the log lock just before `closed`.
+    end: std::sync::OnceLock<StreamEnd>,
     /// Set once when the journal pump has failed to write this bus's
     /// tail. Cleared by the pump's next successful batch
     /// (`acknowledge_journaled_through`). The next `send` while this
@@ -928,17 +950,27 @@ impl BusInner {
         });
     }
 
-    /// Close this bus. Appends a `Closed` entry (idempotent), sets the
-    /// closed flag, wakes every cursor waiting on the log and the
-    /// engine's liveness hook. Public so the engine's `BusCoordinator` can
-    /// fire stuck-detection close via a raw `Arc<BusInner>` it pins
-    /// for the pump's lifetime.
-    pub fn close(&self) {
+    /// Close this bus as `end`. Appends a `Closed` entry carrying it
+    /// (idempotent: the first close's end stands), sets the closed
+    /// flag, wakes every cursor waiting on the log and the engine's
+    /// liveness hook. Public so the engine can end a firing's buses
+    /// with how its body returned, and fire the stuck-detection close
+    /// via a raw `Arc<BusInner>` it pins for the pump's lifetime.
+    pub fn close(&self, end: StreamEnd) {
         let mut log = self.lock_log();
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        self.push_entry(&mut log, BusEntryKind::Closed);
+        // Under the log lock, before the flag: whoever reads `closed`
+        // also reads the end.
+        let _ = self.end.set(end.clone());
+        self.closed.store(true, Ordering::Release);
+        self.push_entry(&mut log, BusEntryKind::Closed { end });
+    }
+
+    /// How the bus ended, `None` while it is open.
+    pub fn end(&self) -> Option<StreamEnd> {
+        self.end.get().cloned()
     }
 
     /// Read whether the journal pump previously failed for this bus.
@@ -1149,6 +1181,7 @@ impl BusHandle {
             ever_joined: Mutex::new(HashSet::new()),
             journaled_through: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            end: std::sync::OnceLock::new(),
             journal_degraded: AtomicBool::new(false),
             degraded_reason: Mutex::new(String::new()),
             log_notify: Notify::new(),
@@ -1505,12 +1538,22 @@ impl BusHandle {
 
     // ----- lifecycle ---------------------------------------------
 
+    /// End the bus now, as finished: "no more messages". A failed end is
+    /// never a node's to write; weft writes it from how the body of the
+    /// firing holding the bus returned ([`FiringBuses`]).
     pub fn close(&self) {
-        self.inner.close();
+        self.inner.close(StreamEnd::Finished);
     }
 
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// How the bus ended, `None` while it is open. What a reader asks
+    /// once its cursor has run out: a `Failed` end is a stream that did
+    /// not complete, and the reader says so in its own protocol.
+    pub fn end(&self) -> Option<StreamEnd> {
+        self.inner.end()
     }
 
     /// JSON marker for THIS bus. The marker is what a producer puts
@@ -1521,40 +1564,69 @@ impl BusHandle {
     }
 }
 
-/// A bus handle that CLOSES the bus when dropped: the shape every
-/// producer (and every consumer whose exit must not leave peers parked)
-/// wants, made unforgettable. Every exit path of the owning node body
-/// (success, error, panic-unwind) runs the close; peers' cursors read
-/// the `Closed` entry and end instead of parking forever. Derefs to
-/// [`BusHandle`], so the whole surface is available. Produced by
-/// `ctx.open_bus` / `ctx.join_bus`; a deliberate non-closing observer
-/// uses `ctx.bus_from_input` instead.
-pub struct ClosingBus {
-    handle: BusHandle,
+/// The buses one firing ends when its body does: every bus it created
+/// (`ctx.create_bus`, `ctx.open_bus`) and every bus it joined
+/// (`ctx.join_bus`). Weft ends them with how the body returned
+/// ([`Self::end`]): finished when it returned normally, failed with its
+/// error otherwise, so a reader learns whether the stream it read is
+/// complete and no node writes that itself. A bus the body closed
+/// earlier keeps the end it was closed with. One per firing, held by
+/// its ctx handle.
+#[derive(Default)]
+pub struct FiringBuses {
+    held: Mutex<HeldBuses>,
 }
 
-impl ClosingBus {
-    pub fn new(handle: BusHandle) -> Self {
-        Self { handle }
+#[derive(Default)]
+struct HeldBuses {
+    buses: Vec<Weak<BusInner>>,
+    /// The body's end, once it came: a bus taken after it (by a task
+    /// the body left running) ends at once the same way.
+    ended: Option<StreamEnd>,
+}
+
+/// How a body's return ends the buses it holds (it created them, or
+/// joined them as a party to the conversation): `Finished` only when it
+/// returned, `Failed` otherwise. A body that paused on a wait has left the
+/// conversation too: a bus lives in this process, and the body that
+/// resumes opens or joins one afresh, so a reader of this one must not
+/// take what it read as whole.
+pub fn body_end(result: &crate::error::WeftResult<()>) -> StreamEnd {
+    use crate::error::WeftError;
+    match result {
+        Ok(()) => StreamEnd::Finished,
+        Err(WeftError::Suspended { .. }) => {
+            StreamEnd::Failed { error: "the node holding this bus paused on a wait".into() }
+        }
+        Err(error) => StreamEnd::Failed { error: error.to_string() },
     }
 }
 
-impl std::ops::Deref for ClosingBus {
-    type Target = BusHandle;
-    fn deref(&self) -> &BusHandle {
-        &self.handle
+impl FiringBuses {
+    /// Hold `bus` until the body ends.
+    pub fn hold(&self, bus: &BusHandle) {
+        let mut held = self.held.lock().expect("firing buses poisoned");
+        match &held.ended {
+            Some(end) => bus.inner.close(end.clone()),
+            None => held.buses.push(Arc::downgrade(&bus.inner)),
+        }
     }
-}
 
-impl std::ops::DerefMut for ClosingBus {
-    fn deref_mut(&mut self) -> &mut BusHandle {
-        &mut self.handle
-    }
-}
-
-impl Drop for ClosingBus {
-    fn drop(&mut self) {
-        self.handle.close();
+    /// End every bus still open as `end`. The first end stands: a
+    /// later call (the engine's failure path after the body's own end)
+    /// changes nothing.
+    pub fn end(&self, end: StreamEnd) {
+        let buses = {
+            let mut held = self.held.lock().expect("firing buses poisoned");
+            if held.ended.is_some() {
+                return;
+            }
+            held.ended = Some(end.clone());
+            std::mem::take(&mut held.buses)
+        };
+        for bus in buses.iter().filter_map(Weak::upgrade) {
+            bus.close(end.clone());
+        }
     }
 }
 
@@ -1746,7 +1818,7 @@ impl BusCursor {
             let len = log.len();
             while idx < len {
                 let entry = &log[idx];
-                if matches!(entry.kind, BusEntryKind::Closed) {
+                if matches!(entry.kind, BusEntryKind::Closed { .. }) {
                     *next_offset = entry.offset;
                     return Some(None);
                 }
@@ -2102,19 +2174,61 @@ mod tests {
         );
     }
 
-    /// The close-on-drop guard: dropping a `ClosingBus` (any exit path
-    /// of the owning body) closes the bus, so a parked reader ends
-    /// instead of waiting forever.
+    /// A firing's buses end with its body: a reader drains what was sent,
+    /// then reads how the bus ended. Dropping the handle ends nothing
+    /// on its own; the body's end does.
     #[tokio::test]
-    async fn the_closing_guard_ends_readers_on_drop() {
+    async fn a_firings_buses_end_with_its_body() {
+        let firing = FiringBuses::default();
         let bus = BusHandle::create();
         let mut cursor = bus.cursor();
-        let guard = ClosingBus::new(registered(&bus, "host"));
-        guard.send("hi", json!(1)).unwrap();
-        drop(guard);
+        let host = registered(&bus, "host");
+        firing.hold(&host);
+        host.send("hi", json!(1)).unwrap();
+        drop(host);
+        assert!(!bus.is_closed(), "a dropped handle leaves the bus to the body's end");
+        firing.end(StreamEnd::Failed { error: "the model went away".into() });
         assert!(matches!(cursor.next_json("hi").await, Ok(Some((_, v))) if v == json!(1)));
-        assert!(cursor.next_json("hi").await.unwrap().is_none(), "closed on drop");
-        assert!(bus.is_closed());
+        assert!(cursor.next_json("hi").await.unwrap().is_none(), "ended by the body");
+        assert_eq!(bus.end(), Some(StreamEnd::Failed { error: "the model went away".into() }));
+    }
+
+    /// The first end stands: a bus closed on purpose stays finished when
+    /// the body then fails, a second end changes nothing, and a bus taken
+    /// after the body ended ends at once the same way.
+    #[test]
+    fn the_first_end_stands() {
+        let firing = FiringBuses::default();
+        let done_early = BusHandle::create();
+        let open = BusHandle::create();
+        firing.hold(&done_early);
+        firing.hold(&open);
+        done_early.close();
+        firing.end(StreamEnd::Failed { error: "boom".into() });
+        firing.end(StreamEnd::Finished);
+        assert_eq!(done_early.end(), Some(StreamEnd::Finished));
+        assert_eq!(open.end(), Some(StreamEnd::Failed { error: "boom".into() }));
+        let late = BusHandle::create();
+        firing.hold(&late);
+        assert_eq!(late.end(), Some(StreamEnd::Failed { error: "boom".into() }));
+        assert_eq!(BusHandle::create().end(), None, "an open bus has no end yet");
+    }
+
+    /// Only a body that returned ends its buses finished; a pause, a
+    /// skip or any failure ends them failed.
+    #[test]
+    fn a_body_end_follows_how_it_returned() {
+        use crate::error::WeftError;
+        assert_eq!(body_end(&Ok(())), StreamEnd::Finished);
+        assert!(
+            matches!(body_end(&Err(WeftError::Suspended { token: "t".into() })), StreamEnd::Failed { error } if error.contains("paused")),
+        );
+        assert!(matches!(body_end(&Err(WeftError::WaitSkipped("w".into()))), StreamEnd::Failed { .. }));
+        assert_eq!(
+            body_end(&Err(WeftError::NodeFailed("the model went away".into()))),
+            StreamEnd::Failed { error: WeftError::NodeFailed("the model went away".into()).to_string() }
+        );
+        assert!(matches!(body_end(&Err(WeftError::Cancelled)), StreamEnd::Failed { .. }));
     }
 
     /// Drive `cursor` until its next Message entry; skips Joined/Left.

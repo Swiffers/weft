@@ -270,7 +270,7 @@ async fn bare_base64(rig: FakeRig) -> WeftResult<()> {
     rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     let (status, error) = refusal(&conn);
     assert_eq!(status, 400);
-    assert!(error.contains("not what it takes"), "{error}");
+    assert!(error.contains("not what it takes") && error.starts_with("body.photo:"), "names the field: {error}");
 
     // Not base64 at all: the string is named for what it is.
     let conn = call(&rig, DataType::Json, InboundMessage::Json(json!({ "photo": "not base64!!" })));

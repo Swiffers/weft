@@ -53,9 +53,16 @@ caller.respond(OutboundChunk::json(json!({ "answer": text }))).await?;
 | `write(chunk)` | Send a piece, keeping the connection open |
 | `write_with(head, chunk)` | The first piece, setting the head |
 | `close()` / `close_with(head)` | Finish |
+| `fail(message)` | Finish as failed: a `500` if nothing went out yet, the answer format's error marker if it did |
 
 Streaming is `write` repeatedly, then `close`. That is how an answer appears in
 somebody's browser a word at a time while your model is still writing it.
+
+If what you are streaming broke off halfway, end with `fail` rather than
+`close`, so the caller does not take a cut answer for a whole one. The caller
+is told only that the run failed, with its id; your `message` goes on the run's
+record for you. For exactly what the caller receives, go and read [when a run
+ends before it answers](../language/triggers-and-routes.md#when-a-run-ends-before-it-answers).
 
 The head can only be sent once, and sending a body after the exchange ended is
 an error rather than a silent nothing.
@@ -78,6 +85,7 @@ while let Some(msg) = ws.recv_next().await? {
 | `recv_next()` | The same, with `None` when the caller has gone |
 | `request(msg)` | Send, and wait for the reply to that |
 | `close()` / `close_with(reason)` | End it |
+| `fail(message)` | End it as failed, with a `1011` close |
 
 There is also a cursor, so a node joining late can read from a chosen point
 rather than only from now: `cursor()`, `cursor_from_start()`,

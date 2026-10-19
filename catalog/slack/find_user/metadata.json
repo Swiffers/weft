@@ -61,7 +61,6 @@
     }
   ],
   "features": {
-    "catchErrors": true,
     "oneOfRequired": [
       [
         "email",

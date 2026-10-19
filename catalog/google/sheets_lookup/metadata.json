@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsLookup",
   "label": "Google Sheets: Lookup Rows",
-  "description": "Finds the rows of a Google Sheets tab whose given header column holds an exact value (resolve an id to its record, check a key is already logged); emits the rows, their row numbers, and whether any matched.",
+  "description": "Finds the rows of a Google Sheets tab whose given header column holds an exact value (resolve an id to its record, check a key is already logged); emits the rows, their row numbers, and whether any matched. The matches come a page at a time: at most `maxRows` from `offset`, and no more than fit the 100 KB a wire carries; `nextOffset` is where the next page starts, and `hasMore` says whether there is one.",
   "tags": [
     "google",
     "sheets",
@@ -105,6 +105,31 @@
       "required": true,
       "label": "Value",
       "description": "Exact cell value to match."
+    },
+    {
+      "name": "offset",
+      "type": "Number",
+      "default": 0,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "label": "Skip matches",
+      "description": "How many matching rows to skip before this page starts. To read the next page, wire the previous call's `nextOffset` here."
+    },
+    {
+      "name": "maxRows",
+      "type": "Number",
+      "default": 500,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 10000,
+        "step": 1
+      },
+      "label": "Max rows",
+      "description": "The most matching rows one page holds. A page also stops early when more rows would weigh more than the 100 KB a wire carries."
     }
   ],
   "outputs": [
@@ -112,20 +137,27 @@
       "name": "rows",
       "type": "List[JsonDict]",
       "narrowable": true,
-      "description": "Matching rows, keyed by the header."
+      "description": "This page's matching rows, keyed by the header."
     },
     {
       "name": "rowNumbers",
       "type": "List[Number]",
-      "description": "Each match's 1-based sheet row number."
+      "description": "Each of this page's matches' 1-based sheet row number."
     },
     {
       "name": "found",
       "type": "Boolean",
-      "description": "Whether at least one row matched."
+      "description": "Whether at least one row of the tab matched, on this page or any other."
+    },
+    {
+      "name": "nextOffset",
+      "type": "Number",
+      "description": "Where the next page of matches starts: wire it into the next call's `offset`."
+    },
+    {
+      "name": "hasMore",
+      "type": "Boolean",
+      "description": "True when more rows matched than this page holds."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

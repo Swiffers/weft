@@ -8,7 +8,7 @@
 //!
 //! The answer is checked BEFORE the turn is written to the
 //! conversation file: an answer that is not JSON, or does not fit the
-//! declared type, fails the node (catchable on `error`) with the reason
+//! declared type, fails the node (catchable on `_error`) with the reason
 //! and leaves `historyFile` exactly as it came in, so a retry sends the
 //! model the same conversation rather than one ending in the answer it
 //! just got wrong.

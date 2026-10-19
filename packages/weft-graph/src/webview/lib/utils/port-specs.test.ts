@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildSpecMap, entryForSource, entryPortCollisions, hasValue, isEmptyChoiceSet, port, type PortEntryDef, type PortSpec, type SpecField } from './port-specs';
 import { isValidFieldKey } from './port-specs';
+import { ERROR_PORT } from '../../../protocol';
 
 // A field key becomes a weft PORT NAME (`{key}Approved`, ...), and the parser
 // only accepts port names matching `[A-Za-z_][A-Za-z0-9_]*`. This guards the
@@ -79,6 +80,19 @@ describe('entryPortCollisions', () => {
 		const map = buildSpecMap([flow]);
 		const bad: PortEntryDef = { kind: 'flow', key: '_should_flow' };
 		expect(entryPortCollisions(bad, [], map, noReserved)).toEqual(['_should_flow']);
+	});
+
+	it('_error is reserved on the output side of every node', () => {
+		const out: PortSpec = {
+			kind: 'out',
+			keyField: 'key',
+			label: 'Out',
+			addsInputs: [],
+			addsOutputs: [port('{key}', 'String')],
+		};
+		const map = buildSpecMap([out]);
+		const bad: PortEntryDef = { kind: 'out', key: ERROR_PORT };
+		expect(entryPortCollisions(bad, [], map, noReserved)).toEqual([ERROR_PORT]);
 	});
 });
 

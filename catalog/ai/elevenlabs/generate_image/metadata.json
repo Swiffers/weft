@@ -166,9 +166,6 @@
       "description": "The generated image, kept for 30 days after it was last read."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

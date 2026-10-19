@@ -25,7 +25,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::bus::{BusOptions, ClosingBus};
+use weft::bus::BusOptions;
+use weft::context::PendingBus;
 use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -94,10 +95,11 @@ impl Node for PostgresWatchQueryNode {
             None => (connect_alone(&ctx, &conn).await?, None),
         };
 
-        // Opened before the first query, so a consumer parked on either
-        // is attached for the opening result.
-        let rows_bus = open_if_read(&ctx, "rows").await?;
-        let row_bus = open_if_read(&ctx, "row").await?;
+        // Both open with the first result, so a query that fails before
+        // it answers is a failure `_error` can catch, and a consumer of
+        // either is attached for the opening result.
+        let mut rows_bus = read_bus(&ctx, "rows");
+        let mut row_bus = read_bus(&ctx, "row");
         let cancel = ctx.cancellation();
         let mut last_rows: Option<Vec<Value>> = None;
         let mut last_row: Option<Value> = None;
@@ -105,14 +107,14 @@ impl Node for PostgresWatchQueryNode {
             let rows = query_json(&client, &sql, &names, &values).await?;
             let row = first_row(&rows);
             if changed(last_rows.as_deref(), rows.as_slice()) {
-                if let Some(bus) = &rows_bus {
-                    bus.send("rows", json!(rows)).node_err("sending the rows on the bus")?;
+                if let Some(bus) = &mut rows_bus {
+                    bus.open().await?.send("rows", json!(rows)).node_err("sending the rows on the bus")?;
                 }
                 last_rows = Some(rows);
             }
             if changed(last_row.as_ref(), &row) {
-                if let Some(bus) = &row_bus {
-                    bus.send("row", row.clone()).node_err("sending the first row on the bus")?;
+                if let Some(bus) = &mut row_bus {
+                    bus.open().await?.send("row", row.clone()).node_err("sending the first row on the bus")?;
                 }
                 last_row = Some(row);
             }
@@ -146,14 +148,11 @@ pub fn first_row(rows: &[Value]) -> Value {
     rows.first().cloned().unwrap_or(Value::Null)
 }
 
-/// The bus on `port`, opened only when something reads it: a journaled
-/// bus records every message, so one nobody reads would be written on
-/// every change for nothing.
-async fn open_if_read(ctx: &RunContext, port: &str) -> WeftResult<Option<ClosingBus>> {
-    if !ctx.is_output_wired(port) {
-        return Ok(None);
-    }
-    Ok(Some(ctx.open_bus(port, BusOptions::default(), "watch").await?))
+/// The bus on `port`, only when something reads it (a journaled bus
+/// records every message, so one nobody reads would be written on every
+/// change for nothing), opening with the first piece it carries.
+fn read_bus<'c>(ctx: &'c RunContext, port: &str) -> Option<PendingBus<'c>> {
+    ctx.is_output_wired(port).then(|| ctx.pending_bus(port, BusOptions::default(), "watch"))
 }
 
 /// Whether a bus's value moved since its last message. The first one

@@ -1,9 +1,12 @@
 //! LlmStream self-tests: deltas land on the bus as they arrive, the
-//! close ends the stream, and the whole reply still pulses.
+//! close ends the stream (failed when the reply broke off), the whole
+//! reply still pulses, and a call refused before its first chunk opens
+//! no bus and is caught on a wired `_error`.
 
 use serde_json::json;
 
-use weft::bus::BusEntryKind;
+use weft::bus::{BusEntryKind, StreamEnd};
+use weft::context::ERROR_PORT;
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::super::testing::sse;
@@ -13,6 +16,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("deltas_ride_the_bus_then_the_reply_pulses", streams),
         NodeTest::fake("a_dropped_stream_fails_loud_after_partial_deltas", truncated),
+        NodeTest::fake("a_call_refused_before_its_first_chunk_opens_no_bus", refused),
         NodeTest::live("one_real_streamed_completion", "openrouter", live_stream),
     ]
 }
@@ -72,15 +76,53 @@ async fn truncated(rig: FakeRig) -> WeftResult<()> {
     let err = outcome.result.expect_err("a dropped stream must refuse").to_string();
     assert!(err.contains("truncated"), "{err}");
 
-    // The guard closes the bus on EVERY exit, the failure path
-    // included: the marker pulsed before the error, so a reader may be
-    // parked on it, and only the close releases it. Draining to the
-    // end proves termination (an unclosed bus would park this cursor
-    // forever); the metadata names the model, as on the happy path.
+    // The bus ends with the body, the failure path included, and says
+    // so: the marker pulsed before the error, so a reader may be parked
+    // on it, and the failed end both releases it and tells it the reply
+    // is cut. Draining to the end proves termination; the metadata names
+    // the model, as on the happy path.
     let bus = rig.bus(&outcome.outputs["stream"])?;
     assert_eq!(bus.meta()["model"], json!("test/model"));
     let mut cursor = bus.cursor_from_start();
     while cursor.next().await.is_some() {}
+    assert!(
+        matches!(bus.end(), Some(StreamEnd::Failed { error }) if error.contains("truncated")),
+        "{:?}",
+        bus.end()
+    );
+    Ok(())
+}
+
+/// A call the provider refuses answers before any chunk: the bus never
+/// opened, so no reader ever started, and the failure is the node's
+/// outcome to catch on a wired `_error`, where a backup branch can
+/// answer instead.
+async fn refused(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw(
+        "POST",
+        "/api/v1/chat/completions",
+        401,
+        "application/json",
+        json!({ "error": { "message": "no such key", "code": 401 } }).to_string().into_bytes(),
+    );
+    rig.wire_output(ERROR_PORT);
+    let outcome = rig
+        .run(
+            &LlmStreamNode,
+            json!({
+                "provider": {
+                    "kind": "openrouter",
+                    "model": "test/model",
+                    "account": rig.access("openrouter"),
+                },
+                "prompt": "say hello",
+            }),
+        )
+        .await
+        .ok()?;
+    assert!(outcome.outputs.get("stream").is_none(), "no bus opened: {:?}", outcome.outputs);
+    let caught = outcome.outputs[ERROR_PORT].as_str().expect("the caught failure is text");
+    assert!(caught.contains("401") || caught.contains("no such key"), "{caught}");
     Ok(())
 }
 
@@ -121,5 +163,6 @@ async fn streams(rig: FakeRig) -> WeftResult<()> {
         }
     }
     assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);
+    assert_eq!(bus.end(), Some(StreamEnd::Finished));
     Ok(())
 }

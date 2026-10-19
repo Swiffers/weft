@@ -1,7 +1,7 @@
 {
   "type": "MistralParseDocument",
   "label": "Parse Document",
-  "description": "Turn a PDF, scan, or image into clean markdown through Mistral's OCR (tables, layout, 100+ languages). Emits the whole document's markdown and a per-page breakdown.",
+  "description": "Turn a PDF, scan, or image into clean markdown through Mistral's OCR (tables, layout, 100+ languages). Emits the whole document's markdown and a per-page breakdown as stored files, since a long document weighs more than the 100 KB a wire carries: wire `markdown` into a File to Text node to read a short one as text.",
   "tags": [
     "ai",
     "document",
@@ -26,19 +26,17 @@
   "outputs": [
     {
       "name": "markdown",
-      "type": "String"
+      "type": "Blob",
+      "description": "A markdown file (`text/markdown`) holding the whole document, its pages one after another."
     },
     {
       "name": "pages",
-      "type": "List[{ index: Number, markdown: String }]",
-      "description": "Each page: index and markdown."
+      "type": "Blob",
+      "description": "A JSON file holding a list with one entry per page: `index` (from 0) and `markdown`."
     },
     {
       "name": "pageCount",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

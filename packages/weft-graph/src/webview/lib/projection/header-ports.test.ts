@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { copiedPortSigs, declarationProblem, declarationRule, headerPortSigs, headerWorthy, nodeInputRequiredness, partitionRemovals, portDeleteAction, removedPortNames } from './header-ports';
-import { SHOULD_FLOW_PORT } from '../../../protocol';
+import { ERROR_PORT, SHOULD_FLOW_PORT } from '../../../protocol';
 
 // The bug this pins: adding one custom output through the editor once
 // wrote the node type's ENTIRE resolved signature into source,
@@ -184,6 +184,12 @@ describe('headerPortSigs', () => {
 		});
 	});
 
+	it('_error is never written into the header, even when the previous list lacked it', () => {
+		const err = { name: ERROR_PORT, required: false, portType: 'String' };
+		expect(headerPortSigs([], [err], [...defaults, err], unwired)).toEqual(none);
+		expect(headerPortSigs([], [err], defaults, unwired)).toEqual(none);
+	});
+
 	it('a declared custom port whose generic got inference-resolved round-trips the authored generic', () => {
 		const p = [{ name: 'x', required: true, portType: 'String', declaredType: 'T' }];
 		expect(headerPortSigs(p, p, defaults, wired('x'))).toEqual({
@@ -336,6 +342,11 @@ describe('removedPortNames', () => {
 	it('_should_flow is never removable, even off a filtered list', () => {
 		const prev = [{ name: SHOULD_FLOW_PORT }, { name: 'a' }];
 		expect(removedPortNames(prev, [])).toEqual(['a']);
+	});
+
+	it('_error is never removable, even off the card\'s output rows (which leave it out)', () => {
+		const prev = [{ name: 'a' }, { name: ERROR_PORT }];
+		expect(removedPortNames(prev, [{ name: 'a' }])).toEqual([]);
 	});
 });
 

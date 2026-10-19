@@ -1032,7 +1032,7 @@ impl Bodies {
 /// a turn with work (the scan that ran before the reap held the location,
 /// and nothing else wakes the loop to rescan it). A body that panicked
 /// never sent its terminal, so the panic is turned into a Failed terminal
-/// for its firing, catchable on its `error` output like a failure the body
+/// for its firing, catchable on its `_error` output like a failure the body
 /// returned (a panic is the node failing, not the program's shape);
 /// otherwise its record stays Running and the run never learns the node
 /// ended. A body that returned already reported through the task channel.
@@ -1208,7 +1208,7 @@ fn apply_snapshot(
     // sent, a row written, a paid call) may have partly happened, and
     // nothing in the journal says how far it got, so the node is never
     // run again by itself: the caller fails it (`fail_crashed_firings`),
-    // catchable on its `error` output like any failure. A retry is
+    // catchable on its `_error` output like any failure. A retry is
     // only ever something the program asks for.
     //
     // Except a pure node (`features.pure`) that had not emitted yet: it
@@ -1288,8 +1288,8 @@ fn crashed_firing_message(firing: &CrashedFiring) -> String {
 
 /// Fail each firing `apply_snapshot` found a dead worker left running:
 /// a loud `NodeFailed` with the cause, downstream closures included,
-/// through the one failure door, so with `catchErrors` and `error`
-/// wired the message goes there and the branch carries on.
+/// through the one failure door, so with `_error` wired the message
+/// goes there and the branch carries on.
 #[allow(clippy::too_many_arguments)]
 async fn fail_crashed_firings(
     crashed: Vec<CrashedFiring>,
@@ -2241,7 +2241,6 @@ async fn drive(
             .with_per_instance(node_def.per_instance)
             .with_run_instance(instance.cloned())
             .with_declared_infra(declared_infra.clone())
-            .with_catch_errors(node_def.features.catch_errors)
             .with_baked_outputs(node_def.baked_outputs.clone())
             .with_settings(settings);
             // What a trigger wakes with is a declared contract
@@ -2474,6 +2473,7 @@ async fn drive(
                 // ABORTED mid-body (a cancel), where no code after the
                 // body ever runs. Runtime plumbing, not the node's job.
                 let access_guard = AccessCloseGuard(Some(runner_for_close));
+                let body_end = BodyEnd(Some(runner_for_bake.clone()));
                 let runs_body = matches!(body, NodeBody::Run);
                 let result = match body {
                     NodeBody::Run => node_impl.run(ctx).await,
@@ -2486,8 +2486,9 @@ async fn drive(
                 // The firing ends here (or pauses): anything a task the
                 // body spawned does through its ctx from now on is
                 // refused, so what goes out ahead of the terminal below
-                // is all the firing's own.
-                runner_for_bake.end_body();
+                // is all the firing's own, and its buses end the way it
+                // returned.
+                body_end.returned(&result);
                 access_guard.close_now().await;
                 // A body that returned leaves its baked outputs to what its
                 // copy saved, wherever it emitted nothing; an infra setup
@@ -2947,7 +2948,11 @@ fn unwind(
             parked_nodes = waits.parked_nodes_count(),
             "every in-flight task is parked with no unconsumed activity; closing all buses to unwind"
         );
-        bus_coordinator.close_all();
+        bus_coordinator.close_all(weft_core::bus::StreamEnd::Failed {
+            error: "the run was stuck: every node on this bus waited on another, and nothing could \
+                    end the wait"
+                .into(),
+        });
     } else {
         tracing::warn!(
             target: "weft_engine::run_driver",
@@ -3511,12 +3516,12 @@ async fn handle_loop_boundary_failure(
 /// closed. "Stuff already sent stays sent" (the principle that drives
 /// the closure semantics).
 ///
-/// `catchable` is what the node's `error` output carries if the
+/// `catchable` is what the node's `_error` output carries if the
 /// failure is caught (`None` for a failure that never is). Caught
-/// (`weft_core::context::caught_failure`: the node declares
-/// `features.catchErrors` and `error` is wired), the node instead puts
-/// the message on `error` and completes, its other unmentioned ports
-/// closing as at any completion. `gave_up_wait`: the firing failed on a
+/// (`weft_core::context::caught_failure`: `_error` is wired and the
+/// firing has no stream open), the node instead puts the message on `_error`
+/// and completes, its other unmentioned ports closing as at any
+/// completion. `gave_up_wait`: the firing failed on a
 /// wait it gave up at a time limit, which an uncaught failure's record
 /// and its `NodeFailed` row carry (`NodeFiring::gave_up_wait`).
 #[allow(clippy::too_many_arguments)]
@@ -3535,12 +3540,20 @@ async fn handle_node_failure(
     journal: &dyn JournalClient,
     replica: &str,
 ) {
-    let catch_errors = project.nodes.iter().any(|n| n.id == node_id && n.features.catch_errors);
     let error_wired = program_idx
         .get_outgoing(project, node_id, frames)
         .iter()
         .any(|edge| edge.source_handle.as_deref() == Some(weft_core::context::ERROR_PORT));
-    if let Some(message) = weft_core::context::caught_failure(catch_errors, catchable, error_wired) {
+    let opened_a_stream = firing_at(firings, node_id, run_id, frames).is_some_and(|record| {
+        let node = project.nodes.iter().find(|n| n.id == node_id);
+        record.opened_a_stream(
+            node.into_iter()
+                .flat_map(|n| n.outputs.iter())
+                .filter(|p| p.port_type.opens_a_stream())
+                .map(|p| p.name.as_str()),
+        )
+    });
+    if let Some(message) = weft_core::context::caught_failure(catchable, opened_a_stream, error_wired) {
         if catch_into_error_port(
             node_id, mentioned, run_id, frames, err, message, project, program_idx, pulses,
             firings, journal, replica,
@@ -3562,15 +3575,15 @@ async fn handle_node_failure(
 }
 
 /// The caught half of [`handle_node_failure`]: put `message` on the
-/// node's `error` output, then complete its firing exactly as a body
+/// node's `_error` output, then complete its firing exactly as a body
 /// that returned would (the `PortEmitted` row, then `NodeCompleted`,
 /// every other unmentioned port closing). Answers false, having changed
 /// nothing, when the value cannot go out (the record is gone, or the
 /// emission is refused), so the caller fails the firing as it would have.
 ///
-/// `error` already mentioned means this catch already ran and its
+/// `_error` already mentioned means this catch already ran and its
 /// worker died between the `PortEmitted` row and `NodeCompleted` (the
-/// body never touches `error` on a catching node: the ctx refuses it).
+/// body never touches `_error`: the ctx refuses it).
 /// The refold rebuilt the emission, so the firing only completes, with
 /// no second value on the port.
 #[allow(clippy::too_many_arguments)]
@@ -3850,6 +3863,31 @@ impl Drop for AccessCloseGuard {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move { runner.close_opened_accesses().await });
             }
+        }
+    }
+}
+
+/// Ends a firing's body on every exit of the node task
+/// (`RunnerHandle::end_body`): with the body's own result when it returns
+/// ([`Self::returned`]); failed when the guard drops mid-body instead (a
+/// panic, or an abort on a cancel), so a bus the body held never reads
+/// as a stream that finished.
+struct BodyEnd(Option<Arc<crate::context::RunnerHandle>>);
+
+impl BodyEnd {
+    fn returned(mut self, result: &weft_core::error::WeftResult<()>) {
+        if let Some(runner) = self.0.take() {
+            runner.end_body(weft_core::bus::body_end(result));
+        }
+    }
+}
+
+impl Drop for BodyEnd {
+    fn drop(&mut self) {
+        if let Some(runner) = self.0.take() {
+            runner.end_body(weft_core::bus::StreamEnd::Failed {
+                error: "the node stopped before its body returned (it panicked, or its run was cancelled)".into(),
+            });
         }
     }
 }
@@ -5478,11 +5516,12 @@ mod bus_comm_tests;
 #[path = "run_driver_tests/branching.rs"]
 mod branching_tests;
 
-// Layer 3: a catching node's failure goes to its wired `error`, and a
-// firing a dead worker left running is failed, never run again.
+// Layer 3: a node's failure goes to its wired `_error` until it opened a
+// bus, a bus ends the way its body returned, and a firing a dead worker
+// left running is failed, never run again.
 #[cfg(test)]
-#[path = "run_driver_tests/catch_errors.rs"]
-mod catch_errors_tests;
+#[path = "run_driver_tests/error_port.rs"]
+mod error_port_tests;
 
 // Layer 3: a baked output falls back on what its copy saved.
 #[cfg(test)]

@@ -50,13 +50,14 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
     .await?;
     assert_eq!(failed["status"], "failed", "{failed}");
 
-    // A route whose only answer was skipped tells its caller so, and its
-    // run counts as failed: written down, with the reason on it.
+    // A route whose only answer was skipped tells its caller it failed,
+    // plainly, and its run counts as failed: written down, with the
+    // reason on it for its owner.
     let (status, _, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/silent"), &[], None).await?;
     let said = String::from_utf8_lossy(&body).to_string();
     assert_eq!(status.as_u16(), 500, "{said}");
-    assert!(said.contains("the run ended without answering"), "{said}");
+    assert_eq!(serde_json::from_slice::<Value>(&body)?["error"], "Something went wrong", "{said}");
     let silent = poll_until("the unanswered run to list", Duration::from_secs(60), Duration::from_millis(250), || {
         let disp = disp.clone();
         async move {
@@ -66,6 +67,10 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
     })
     .await?;
     assert_eq!(silent["status"], "failed", "{silent}");
+    assert!(
+        silent["error"].as_str().is_some_and(|e| e.contains("the run ended without answering")),
+        "the reason is on the run: {silent}"
+    );
 
     // The successful calls left nothing, whatever time has passed.
     let rows = listed(&disp, pid).await?;

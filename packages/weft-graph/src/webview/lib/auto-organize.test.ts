@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { autoOrganize } from './auto-organize';
 import { expandedContainerMinPx } from './constants/container-layout';
+import { ERROR_PORT } from '../../protocol';
 
 const node = (id: string, extra: Record<string, unknown> = {}) => ({
   id,
@@ -26,6 +27,18 @@ describe('autoOrganize', () => {
     // Right of the gate's whole box, not beside or above it (the default
     // node width is 280): the wire was fed to ELK, so it layered them.
     expect(gated.x).toBeGreaterThan(gate.x + 280);
+  });
+
+  it('an _error wire is a real dependency: the handler lands downstream', async () => {
+    const withError = (id: string) => node(id, {
+      outputs: [{ name: 'value', type: 'String' }, { name: ERROR_PORT, type: 'String' }],
+    });
+    const nodes = [withError('risky'), withError('handler')] as any;
+    const edges = [
+      { id: 'e1', source: 'risky', target: 'handler', sourceHandle: ERROR_PORT, targetHandle: '_should_flow' },
+    ] as any;
+    const { positions } = await autoOrganize(nodes, edges);
+    expect(positions.get('handler')!.x).toBeGreaterThan(positions.get('risky')!.x + 280);
   });
 
   it('without the wire the two nodes are unrelated components, stacked in bands', async () => {

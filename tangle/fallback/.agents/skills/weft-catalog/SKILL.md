@@ -54,7 +54,7 @@ An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `lab
 `remote_select`. Several carry their own settings inside that object, a
 select's `options` (the accepted literals) among them.
 
-`features`: `isTrigger` (starts runs from outside), `canAddInputPorts` / `canAddOutputPorts` (the source may add ports of its own, in that direction; a node carries either, both or neither, and this is where you read which), `optionalCustomInputs`, `customInputType`, `oneOfRequired` (skip the node when every port in a group arrives closed), `castPorts`, `liveEndpoint`, `showDebugPreview`, `addedPortsAreDataKeys` (the ports you add are named after outside data, such as a query's parameters or a request body's fields, and keep that data's spelling: the compiler's `not-camel-case` warning skips them).
+`features`: `isTrigger` (starts runs from outside), `canAddInputPorts` / `canAddOutputPorts` (the source may add ports of its own, in that direction; a node carries either, both or neither, and this is where you read which), `join` (the node merges several branches and goes on with whichever arrived, like `FirstInOrder`; its added inputs are optional and it needs no `_should_flow`), `customInputType`, `oneOfRequired` (skip the node when every port in a group arrives closed), `castPorts`, `liveEndpoint`, `showDebugPreview`, `addedPortsAreDataKeys` (the ports you add are named after outside data, such as a query's parameters or a route path's captures, and keep that data's spelling: the compiler's `not-camel-case` warning skips them).
 
 `portsFromConfig`: ports generated at compile time from a config list. The metadata names the field and what an entry may be, so a node carrying the key tells you which of its ports you get by filling that list (a node that branches on cases derives one port per case this way).
 
@@ -73,9 +73,9 @@ from memory.
 
 ## Wiring patterns that recur
 
-**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into every consumer's `account` input. Consumers check at run time that the connection is picked and has the required scopes or values.
+**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into each consumer's `account` input (`access` on a model node and `LlmModerate`, and `auth` on a `Route` or `Socket` for an auth node such as `JwtAuth`). Consumers check at run time that the connection is picked and has the required scopes or values.
 
-**A provider node**: `provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider` inline, or declared long and shared across several LLM nodes.
+**A provider node**: a model node fed by its service's [access node], `router = OpenRouterAccess` then `provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider` inline, or the model declared long and shared across several LLM nodes. One access node serves every model of that service, and the connection is picked on it, never on the model node.
 
 **Shared sampling**: `params: LlmParams { systemPrompt: @file("assets/prompts/x.md"), temperature: 0.75 }.params` into any LLM node's `params`.
 
@@ -97,14 +97,18 @@ names that field and the kinds an entry may be; the compact view shows the
 ports a given list produced. A form is the case you meet most, each field of
 it an entry that becomes a port.
 
-**Ports you declare on the arrow** (`canAddOutputPorts` in its metadata): a
-node that answers with an opaque blob lets you name the pieces you want, and
-each arrives typed on a port of its own. Reach for this whenever the next
-node needs ONE field rather than the whole answer, because an opaque value
-has no keys to read: without a declared port you would be writing out a
-record type by hand just to pull one thing out of it. The node's metadata
-says what the names mean to it (a column of the answer, a key of a parsed
-reply), and the type you declare is what judges the value at run time.
+**Ports you declare on the arrow** (`canAddOutputPorts` in its metadata): only
+a few nodes take outputs of your own, and the metadata says what the names
+mean to each: `ExecPython` (the keys its script returns),
+`ElevenLabsRunTemplate` (an output's id in the template) and `Route` (the captures of its
+path). The type you declare is what judges the value at run time.
+
+**One field out of an opaque answer**: if the next node needs ONE field of a
+`JsonDict` answer, declare a record on that output (an output its metadata
+marks `narrowable`) and read the field with dots: `-> (row: Card)` on a
+query and `look.row.title`, or `-> (response: Verdict)` on `LlmInferenceJson`
+and `mark.response.label`. An opaque value has no keys to read until you name
+its shape.
 
 ## When the catalog is missing something
 

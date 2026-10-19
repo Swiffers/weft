@@ -18,8 +18,8 @@ An [access node] is any node whose metadata carries a `service` block: that
 block is what makes it the place a [connection] is picked (`TelegramAccess`
 is one). `--compact` strips the block, so you read it in the node's
 `metadata.json`. Do not go by the `access` tag in the listing, which several
-access nodes do not carry: a model provider holds a connection exactly the
-same way and is tagged by its service instead. One with
+access nodes do not carry: a connection is picked on `CustomProvider` and
+`HttpRequest` exactly the same way, and neither has an `access` tag. One with
 a required, unpicked [connection] pins open in the graph (expanded,
 collapse disabled, "Pick a connection first") until one is picked; a
 `connectionOptional` node never pins. A [door] is one way of adding a

@@ -1,7 +1,7 @@
 {
   "type": "S3ListObjects",
   "label": "S3: List Objects",
-  "description": "List an S3-compatible bucket's objects under a prefix (all pages): keys, sizes, last-modified times.",
+  "description": "List an S3-compatible bucket's objects under a prefix, one page at a time: keys, sizes, last-modified times. A page holds at most `maxKeys` objects after `startAfter`, and no more than fit the 100 KB a wire carries; to read the next page, wire `lastKey` into the next call's `startAfter`, while `hasMore` is true.",
   "tags": [
     "s3",
     "storage",
@@ -27,13 +27,32 @@
       "type": "String",
       "label": "Prefix",
       "description": "Only keys starting with this; empty lists the whole bucket."
+    },
+    {
+      "name": "startAfter",
+      "type": "String",
+      "label": "Start after",
+      "description": "List only the keys that come after this one. Empty starts at the first key. To read the next page, wire the previous call's `lastKey` here."
+    },
+    {
+      "name": "maxKeys",
+      "type": "Number",
+      "default": 500,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 1000,
+        "step": 1
+      },
+      "label": "Max keys",
+      "description": "The most objects one page holds (S3 lists at most 1000 at once). A page also stops early when more objects would weigh more than the 100 KB a wire carries."
     }
   ],
   "outputs": [
     {
       "name": "objects",
       "type": "List[{ key: String, sizeBytes: Number, lastModified: String }]",
-      "description": "Each object: key, sizeBytes, lastModified."
+      "description": "This page's objects, in key order. Each object: key, sizeBytes, lastModified."
     },
     {
       "name": "keys",
@@ -41,10 +60,18 @@
     },
     {
       "name": "count",
-      "type": "Number"
+      "type": "Number",
+      "description": "How many objects this page holds."
+    },
+    {
+      "name": "lastKey",
+      "type": "String",
+      "description": "The last key of this page (the `startAfter` it was given when the page is empty): wire it into the next call's `startAfter`."
+    },
+    {
+      "name": "hasMore",
+      "type": "Boolean",
+      "description": "True when keys past this page match the prefix."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

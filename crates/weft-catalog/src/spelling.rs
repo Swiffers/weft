@@ -28,6 +28,7 @@ use weft_core::weft_type::WeftType;
 const RESERVED_PORTS: &[(&str, &str)] = &[
     (weft_core::run::skip::SHOULD_FLOW_PORT, "the gate every node takes, owned by the language"),
     (weft_core::run::skip::SHOULD_NOT_FLOW_PORT, "the inverted gate, owned by the language"),
+    (weft_core::node::ERROR_PORT, "the failure output every node has, owned by the language"),
     (weft_core::tag::TAGS_CONFIG_KEY, "the tags key the language reads off every node"),
 ];
 

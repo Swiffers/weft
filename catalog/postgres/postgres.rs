@@ -20,11 +20,11 @@ use serde_json::{json, Map, Value};
 
 /// Fail the node now for a mistake in the program itself: the SQL it
 /// wrote, a setting, a value of the wrong shape. Such a failure is an
-/// input error, so it fails the run even when the node's `error`
+/// input error, so it fails the run even when the node's `_error`
 /// output is wired: the fix is editing the program, and nothing a
 /// program does at run time can route around it. A refusal that
 /// depends on the database's data or state stays `node_bail!`, which
-/// `error` catches.
+/// `_error` catches.
 macro_rules! mistake {
     ($($arg:tt)*) => {
         return Err(weft::WeftError::Input(format!($($arg)*)))
@@ -36,7 +36,7 @@ pub(crate) use mistake;
 /// server cannot even plan (SQLSTATE class 42: a syntax error, a
 /// table, column or function that does not exist, a parameter whose
 /// type it cannot infer) is a mistake in the program's SQL, so it is
-/// an input error that fails the run even with `error` wired. Anything
+/// an input error that fails the run even with `_error` wired. Anything
 /// else (a broken constraint, a `fail(..)` the SQL raised, a missing
 /// privilege, a dropped connection) is the database's answer to this
 /// run, which a program can handle.

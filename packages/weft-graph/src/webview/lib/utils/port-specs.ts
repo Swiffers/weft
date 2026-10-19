@@ -1,5 +1,5 @@
 import type { PortDefinition, PortType } from '../types';
-import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
+import { ERROR_PORT, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
 import { parseWeftType, substituteTypeVars, weftTypeToWireString, type WeftType } from '../types';
 
 // The wire types ARE the webview's types: `PortType` is a plain string,
@@ -202,9 +202,9 @@ export function entryPortCollisions(
 	// Names the node type itself already owns on each side (its catalog
 	// ports): a derived port shadowing one would write a header the
 	// build rejects, so it is refused at the door like an entry-vs-entry
-	// collision. `_should_flow` is reserved on the input side of every
-	// node (the enricher synthesizes it), so it is seeded here rather
-	// than left to each caller.
+	// collision. The language's own ports are reserved on every node
+	// (the gate on the input side, `_error` on the output side), so they
+	// are seeded here rather than left to each caller.
 	reserved: { inputs: string[]; outputs: string[] },
 ): string[] {
 	const collide = (
@@ -224,7 +224,7 @@ export function entryPortCollisions(
 		...collide(
 			deriveOutputsFromEntries([entry], specMap),
 			deriveOutputsFromEntries(others, specMap),
-			reserved.outputs,
+			[...reserved.outputs, ERROR_PORT],
 		),
 	];
 }

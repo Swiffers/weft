@@ -17,7 +17,7 @@
 	import { derefKeys, derefType } from '../../utils/deref-menu';
 	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
-	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
+	import { hasUnpickedAccess, inputsOf, outputRows, outputsOf } from "../../utils/input-field";
 	import { effectiveAccessValue, installPicksVersion, loadInstallPicks } from "./install-picks.svelte";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
@@ -1243,7 +1243,7 @@
 		const font = nodeLabelFont(10);
 
 		const inputNames = (inputs || []).map(p => p.name + (p.required ? '*' : ''));
-		const outputNames = (outputs || []).map(p => p.name);
+		const outputNames = outputRows(outputs || []).map(p => p.name);
 
 		let maxRowWidth = 0;
 		const rowCount = Math.max(inputNames.length, outputNames.length);
@@ -2010,7 +2010,9 @@
 					// the node type.
 					let debugData: unknown = undefined;
 					if (nodeTypeConfig?.features?.showDebugPreview) {
-						const hasOutputs = (nodeTypeConfig.defaultOutputs?.length ?? 0) > 0;
+						// `_error` is on every catalog node, so it says
+						// nothing about whether the node has a value to show.
+						const hasOutputs = outputRows(nodeTypeConfig.defaultOutputs ?? []).length > 0;
 						if (hasOutputs) {
 							debugData = nodeOutputs[firingKey(n.id)];
 						} else {
@@ -3391,7 +3393,9 @@
 					}
 				} else if (!vetoLiteralDrivenTarget(wire.nodeId, wire.handle)) {
 					// Dragged backwards from an input: the new node drives it.
-					const output = (template?.defaultOutputs ?? []).find(
+					// Never `_error`: a failure is not what a dragged
+					// input asks to be driven by.
+					const output = outputRows(template?.defaultOutputs ?? []).find(
 						p => wireTypesFit(p.portType, originType, nodeTypeParams(wire.nodeId)),
 					);
 					if (output) {

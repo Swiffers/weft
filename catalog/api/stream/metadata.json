@@ -1,7 +1,7 @@
 {
   "type": "Stream",
   "label": "Stream",
-  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes: an LLM's reply as it is generated, a watched query keeping a page live. Behind a Route the response body streams; behind a Socket each message is one frame and the socket stays open. Stored files inside messages go out as `{ url, mimeType, filename, sizeBytes }`.",
+  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes: an LLM's reply as it is generated, a watched query keeping a page live. Behind a Route the response body streams; behind a Socket each message is one frame and the socket stays open. Stored files inside messages go out as `{ url, mimeType, filename, sizeBytes }`. A bus that ended failed ends the answer as a failure: an error status before anything was sent, the format's error marker after, a 1011 close on a socket.",
   "tags": [
     "api",
     "http",
@@ -79,7 +79,7 @@
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the bus closed and the last chunk was handed over."
+      "description": "True once the bus closed and the last chunk was handed over. Absent when the bus ended failed: the caller was told the run failed instead."
     }
   ],
   "features": {

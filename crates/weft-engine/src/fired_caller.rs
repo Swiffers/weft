@@ -162,6 +162,20 @@ impl CallerConnection for FiredCaller {
         self.record(head, final_chunk, true)
     }
 
+    /// The exchange's failure, as its record keeps it: there is no wire,
+    /// and the one reading this is the run's owner, who reads `message`
+    /// whole.
+    async fn fail(&self, message: &str) -> Result<(), CallerError> {
+        if *self.terminated.borrow() {
+            return Err(CallerError::AlreadyTerminated);
+        }
+        self.started.store(true, Ordering::SeqCst);
+        self.terminated.send_replace(true);
+        self.record.errored(message);
+        self.record.disconnected("the fired run answered with a failure");
+        Ok(())
+    }
+
     async fn receive(
         &self,
         _cursor: &AtomicU64,
@@ -279,6 +293,25 @@ mod tests {
         assert!(rows[1].contains("outbound") && rows[1].contains("terminal=true"), "{rows:#?}");
         assert!(rows[2].contains("disconnected"), "{rows:#?}");
         assert!(!caller.is_connected(), "the exchange is over");
+    }
+
+    /// A failed exchange keeps its whole message: the one reading a
+    /// fired run's exchange is its owner. It ends the exchange like any
+    /// terminal, and a second terminal is refused.
+    #[tokio::test]
+    async fn a_failure_is_recorded_whole() {
+        let rows = Arc::new(Rows::default());
+        let caller = caller(&rows);
+        caller.fail("the stream broke off: the model went away").await.expect("the first terminal");
+        let recorded = rows.0.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|r| r.contains("errored the stream broke off: the model went away")),
+            "{recorded:#?}"
+        );
+        assert!(recorded.last().is_some_and(|r| r.contains("disconnected")), "{recorded:#?}");
+        assert!(!caller.is_connected(), "the exchange is over");
+        assert!(matches!(caller.fail("again").await, Err(CallerError::AlreadyTerminated)));
+        assert!(matches!(caller.terminate(None, None, None).await, Err(CallerError::AlreadyTerminated)));
     }
 
     /// The node asks for the request through the same call a real

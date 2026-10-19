@@ -1,8 +1,11 @@
 //! PostgresUpdateRows self-tests: the built SQL (layer 1).
 
+use serde_json::json;
+
+use weft::storage::{wire_weight, MAX_WIRE_VALUE_BYTES};
 use weft::{NodeTest, WeftResult};
 
-use super::update_sql;
+use super::{capped_rows, update_sql};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -12,6 +15,7 @@ pub fn tests() -> Vec<NodeTest> {
             "a_trailing_comment_cannot_eat_the_returning",
             a_trailing_comment_cannot_eat_the_returning,
         ),
+        NodeTest::basic("changed_rows_past_a_wire_are_capped_and_say_so", capped),
     ]
 }
 
@@ -73,5 +77,22 @@ fn only_real_placeholders() -> WeftResult<()> {
         assert!(sql.contains(kept), "{condition:?} became {sql}");
         assert_eq!(names, vec!["id".to_string()], "{condition:?}");
     }
+    Ok(())
+}
+
+/// The update has committed by the time rows come back, so a heavy
+/// result is cut, never refused.
+fn capped() -> WeftResult<()> {
+    let light = vec![json!({ "id": 1 }), json!({ "id": 2 })];
+    assert_eq!(capped_rows(light.clone()), (light, false), "rows that fit come back whole");
+
+    let heavy: Vec<_> = (0..3).map(|i| json!({ "id": i, "note": "x".repeat(40 * 1024) })).collect();
+    let (kept, truncated) = capped_rows(heavy);
+    assert_eq!(kept.len(), 2, "two 40 KB rows fill a wire");
+    assert!(truncated);
+    assert!(wire_weight(&kept) <= MAX_WIRE_VALUE_BYTES);
+
+    let huge = vec![json!({ "note": "x".repeat(MAX_WIRE_VALUE_BYTES) })];
+    assert_eq!(capped_rows(huge), (Vec::new(), true), "a row no wire carries is left out, and said so");
     Ok(())
 }

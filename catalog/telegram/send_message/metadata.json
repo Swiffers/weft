@@ -68,8 +68,5 @@
       "type": "Number",
       "description": "The sent message's id."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

@@ -47,35 +47,38 @@ name people see; read weft-deploying before you offer one.
 
 ## The shape
 
-The run ends when it has sent its [answer]. You declare the body keys you
-want on the trigger's arrow, never a body blob, and each arrives on its own
-port.
+The run ends when it has sent its [answer]. The body arrives whole on the
+[route]'s `body` port, and you declare on the arrow the shape you expect,
+then read its keys with dots.
 
 ```weft
-hello = Route -> (name: String) { path: "hello", method: "POST" }
-answer = Reply { status: 201, body: hello.name }
+hello = Route -> (body: { name: String }) { path: "hello", method: "POST" }
+answer = Reply { status: 201, body: hello.body.name }
 ```
 
 A [route]'s fixed output ports carry the request as the gateway saw it: the
-method, the path as called, the query, the headers, and who the [gate] let
-in. Its metadata lists them. A path capture has no fixed port: you declare an
-output of its name (below).
+method, the path as called, the query, the headers, who the [gate] let in,
+and the body. Its metadata lists them. A path capture has no fixed port: you
+declare an output of its name (below).
 
-What you DECLARE on the arrow is how the body reaches the graph, and the
-rule depends on the body shape the [route] is set to (`dataType` in the
-source, "Body shape" in the editor):
+The type you declare on `body` decides how the body reaches the graph, and
+it goes with the body shape the [route] is set to (`dataType` in the source,
+"Body shape" in the editor):
 
-- an object body: each declared name is a top-level key of it. There is no
-  port for the whole object, so you declare every key you read, and a key
-  that is itself an object arrives as one value (`meta: JsonDict`). An
-  undeclared key is dropped. If the caller's body spells a key in
-  snake_case, name the port the same way (`-> (user_id: String)`): a `Route`
-  keeps a body key's spelling without a warning. If your own frontend sends
-  the body, name its keys camelCase, like every field weft writes.
-- a text body: the whole body arrives as a `String` on the ONE port you
-  declare.
-- a binary body: it is stored, and the [stored-file value] arrives on the
-  one port you declare.
+- an object body (`json`): declare a record, named or inline, or leave it
+  `JsonDict` to take any object. A record is checked as the request arrives:
+  a body that does not fit is answered `400` naming the field, and nothing
+  downstream runs. A record refuses keys it does not declare, unless you end
+  it with `..` (`{ email: String, .. }`), which drops them. A field written
+  `?` may be missing, and a wire reading a missing one closes
+  (`hello.body.nick` with `nick?: String`). Record fields keep any spelling,
+  so if the caller sends `user_id`, declare `user_id`; if your own frontend
+  sends the body, name its keys camelCase, like every field weft writes.
+- a text body (`text`): declare `-> (body: String)` and the whole body
+  arrives as that `String`.
+- a binary body (`bytes`): it is stored, and the [stored-file value] arrives
+  on `body`, declared `File`, or `Image` to have the bytes checked as a
+  picture.
 
 Declare the capture as an output, and read it as `card.id`:
 
@@ -95,15 +98,18 @@ branch with `status: 404` works. A `Reply` or a second `Stream` after a
 `Stream` is a compile error, because the head already went out: end a
 streamed answer with a `Close`. A
 program that never sends anything holds the caller while it runs. When that
-run ends, it is recorded as failed, and the caller gets `500` with the body
-`run failed: the run ended without answering: every path to its Reply
-(or Stream, or Close) was skipped, usually because a value it waited on never
-arrived`. If you
+run ends, it is recorded as failed with `run failed: the run ended without
+answering: every path to its Reply (or Stream, or Close) was skipped, usually
+because a value it waited on never arrived`, and the caller gets `500`. If you
 catch yourself wiring a branch that reaches no [answer], stop and write:
 "Wait. Every branch answers." Then end that branch on a `Reply` or `Close`.
 
-Whenever a run ends before it answers, the status tells the caller which
-kind of end it was:
+Whenever a run ends before it answers, the caller never sees the failure's
+own message: the body is `{"error": "Something went wrong", "runId": "<run
+id>"}`, and the status tells it which kind of end it was. Every answer of a
+route's run, good or failed, also carries a `Weft-Run-Id: <run id>` header.
+The full message is on the run (`weft logs <run id>`), and opening a run
+needs the owner's credential, so the id is safe to hand out.
 
 | Status | When |
 |---|---|
@@ -115,9 +121,14 @@ This `503` has no `Retry-After`: calling again would start a second run
 beside the one that may still be going. The `503` a parked route answers
 does carry `Retry-After: 5`, because no run started. If the answer had
 already started streaming, its status line is gone, so the error comes in
-the body: a JSON-lines answer ends with `{"error": "...", "status": 504}`. A
-socket closes with `1011` for a failure or a time limit, and `1013` when
-the run was stopped or carries on without this caller.
+the body, in the answer's own framing: a JSON-lines answer ends with
+`{"error": "Something went wrong", "runId": "...", "status": 504}` (the
+status it would have had), server-sent events get an `event: error` whose
+data is `{"error":"Something went wrong","runId":"..."}`, and anything else
+gets a text line `[error] Something went wrong (run <id>)`. A socket closes
+with `1011` for a failure or a time limit, and `1013` when the run was
+stopped or carries on without this caller, with the reason `Something went
+wrong (run <id>)`.
 
 Two routes of one account can share a call as long as one of them spells out
 what the other captures: `chat/general` beside `chat/{room}` is fine, and the
@@ -143,7 +154,7 @@ found = Reply { body: lookup.body, status: lookup.status }
 ```
 
 A `GET` route has no body: declare nothing on the arrow and read the fixed
-ports. A `text` route: `say = Route -> (line: String) { path: "say", dataType:
+ports. A `text` route: `say = Route -> (body: String) { path: "say", dataType:
 "text" }`, and the `Reply` body must be a `String`.
 
 If the answer has a different shape from what came in, the [answer] node says
@@ -221,17 +232,17 @@ A route also has `durable`, off by default, and it cannot be combined with `reco
 
 ## Pictures in and out
 
-A value a node emits is at most 100 KB; above that the node fails, naming
-the port. A picture a caller sends inside a JSON body lands on a port
-declared as its kind, and the [route] stores it on the way in:
+A value a node emits weighs at most 100 KB as JSON; above that the node
+fails, naming the port. A picture a caller sends inside a JSON body lands on a
+body field declared as its kind, and the [route] stores it on the way in:
 
 ```weft
-upload = Route -> (photo: Image, caption: String) { path: "cards", method: "POST" }
+upload = Route -> (body: { photo: Image, caption: String }) { path: "cards", method: "POST" }
 ```
 
 The body key `photo` holds a `data:image/png;base64,...` URL (the media type
 comes from it) or bare base64 (the media type comes from the bytes' own
-signature); bytes that are not what the port declares fail the run by name.
+signature); bytes that are not what the field declares are answered `400`, naming the field, and nothing past the route runs.
 Multipart bodies are not read: the caller sends JSON with a data URL. The
 file lands at run scope, walled to that run and swept when it ends: a
 later request cannot read it even if it was kept. If you want to serve a picture from a
@@ -279,12 +290,12 @@ program's `PostgresDatabase`:
 
 ```weft
 preview = Route -> (view: String) { path: "session/preview/{view}", method: "GET" }
-latest = PostgresExecuteQuery(view: String) -> (picture: JsonDict) {
+latest = PostgresExecuteQuery(view: String) -> (row: { picture: JsonDict }) {
   account: db.access
   view: preview.view
   query: "SELECT picture FROM preview WHERE view = $view"
 }
-show = Reply { answerAs: "bytes", body: latest.picture }
+show = Reply { answerAs: "bytes", body: latest.row.picture }
 ```
 
 An `<img>` can point straight at that route. A json answer works for a
@@ -302,9 +313,10 @@ own ports say which output is a `Bus`; a model streaming its answer is the
 one you will reach for most:
 
 ```weft
-ask = Route -> (prompt: String) { path: "chat", method: "POST" }
-prov = OpenRouterProvider { model: "openai/gpt-4.1-nano" }
-live = LlmStream { provider: prov.provider, prompt: ask.prompt }
+ask = Route -> (body: { prompt: String }) { path: "chat", method: "POST" }
+router = OpenRouterAccess
+prov = OpenRouterModel { access: router.access, model: "openai/gpt-4.1-nano" }
+live = LlmStream { provider: prov.provider, prompt: ask.body.prompt }
 out = Stream { format: "sse", bus: live.stream }
 ```
 
@@ -333,10 +345,11 @@ behind it: the id, the row just created, the session token, then the feed.
 closes; a bus that closed before the `Stream` node ran still streams whole.
 
 The status line went out with the first chunk, so a failure after that
-cannot change it. It arrives in the body's own framing, as the last thing the
-reader gets: a final `{"error":"..."}` line on `ndjson`, an `event: error` on
-`sse`, a `[error] ...` line on anything else. Tell the frontend's reader to
-look for it.
+cannot change it, and neither can a bus that ended failed. It arrives in the
+body's own framing, as the last thing the reader gets, the plain
+`Something went wrong` with the run id: a final `{"error":"...","runId":"..."}`
+line on `ndjson`, an `event: error` on `sse`, a `[error] ...` line on anything
+else. Tell the frontend's reader to look for it.
 
 A run behind a `Route` lives as long as its caller: when they hang up, the
 run is cancelled and whatever it was still doing stops. That is
@@ -384,10 +397,10 @@ answer's `done`, and set `outlivesCaller: true` so the caller leaving does not
 kill the work you promised to do.
 
 ```weft
-door = Route -> (text: String) { path: "ingest", method: "POST", outlivesCaller: true }
-ack = Reply { status: 202, body: door.text }
+door = Route -> (body: { text: String }) { path: "ingest", method: "POST", outlivesCaller: true }
+ack = Reply { status: 202, body: door.body.text }
 slow = ExecPython(text: String) -> (done: Boolean) {
-  text: door.text
+  text: door.body.text
   _should_flow: ack.done
   code: "return {'done': True}"
 }
@@ -457,16 +470,17 @@ calling. A route like `live/count` with no captures has none: the path is the
 same literal for everybody, so tagging on it makes every new viewer stop all
 the others, and you have broken the feature you were protecting. If nothing on
 the route names one caller apart from another, that route wants no tagging at
-all.
+all. A `Socket` hands its captures only on `params`, a `Dict` with no keys to
+read on a wire, so the tag below comes from a route's capture:
 
 ```weft
-sock = Socket -> (room: String, inbound: Generator[JsonDict]) { path: "chat/{room}" }
+feed = Route -> (room: String) { path: "live/{room}", method: "GET" }
 
-claim = TagRun { room: sock.room }
+claim = TagRun { room: feed.room }
 
 stop = StopTagged {
   _should_flow: claim.done
-  room: sock.room
+  room: feed.room
 }
 ```
 
@@ -517,7 +531,24 @@ and only the closing node ends it. Each says so in its own metadata, and
 what a [route] accepts but a socket refuses (a status line, headers) is
 refused loudly rather than ignored.
 
-**One connection is one run, so a socket is not finished until it carries a `TagRun` and a `StopTagged`; the wiring is under Streaming above.** A bus lives inside one run, so a message
+**One connection is one run, so a socket whose gate names the person is not finished until it carries a `TagRun` and a `StopTagged`, wired as under Streaming above.** What a socket can tag on is who the [gate] let in. A path capture like `{room}` names a room shared by everyone in it, not one person, so it is the wrong tag here. The `caller` port takes the type you declare: declare it on the arrow as an open record holding the claim that names the person, and wire that claim into both nodes.
+
+```weft
+gate = JwtAuth
+sock = Socket -> (inbound: Generator[Said], caller: { sub: String, .. }) {
+  path: "chat/{room}"
+  auth: gate.access
+}
+claim = TagRun { person: sock.caller.sub }
+stop = StopTagged {
+  _should_flow: claim.done
+  person: sock.caller.sub
+}
+```
+
+The `..` matters: a token carries more claims than `sub`, and a record without it refuses every claim it does not declare. A socket with no gate has nothing that tells one caller from another, and wants no tagging.
+
+A bus lives inside one run, so a message
 on one socket cannot reach another socket through a bus. A chat room today:
 each run writes to a table in the project's Postgres, and a trigger reads it.
 Two callers seeing each other live is not expressible yet: you say so and
@@ -644,7 +675,8 @@ Firing one fails saying so; use `weft activate` for a real client.
 node's own body, still exists for supplying values without running code,
 but firing is now the faster way to watch a route work end to end.
 
-A request answered `500 run failed: the run ended without answering`
-is a failed run that reached no [answer], with that error, in `weft follow`
-and in `weft runs`, even on a `recorded: false` route (a failed run
+A request answered `500` with `Something went wrong` is a failed run; if it
+reached no [answer], `weft logs` on the id in its body (or its `Weft-Run-Id`
+header) says `run failed: the run ended without answering`, as do `weft
+follow` and `weft runs`, even on a `recorded: false` route (a failed run
 always leaves its failure on record). The fix is in the graph, never in a retry.

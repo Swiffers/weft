@@ -182,7 +182,7 @@ async fn no_line(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let reference = rig.store_file("reference.mp3", "audio/mpeg", b"reference-take".to_vec());
     for (extra, says) in [
         (json!({ "description": "too short" }), "`description` is 9 characters"),
@@ -193,7 +193,7 @@ async fn refused(rig: FakeRig) -> WeftResult<()> {
         (json!({ "model": "eleven_ttv_v3", "promptStrength": 0.5 }), "no `referenceAudio` is given"),
     ] {
         let err = rig.run(&ElevenLabsDesignVoiceNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");

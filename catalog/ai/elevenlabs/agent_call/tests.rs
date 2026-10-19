@@ -319,7 +319,7 @@ async fn number_id_encoded(rig: FakeRig) -> WeftResult<()> {
 /// number ElevenLabs ignores them, so the node refuses them once the
 /// number's provider is known, before anything is dialed.
 async fn twilio_only(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     rig.respond("GET", "/v1/convai/phone-numbers/pn-exotel", json!({ "provider": "exotel" }));
     rig.respond("GET", "/v1/convai/phone-numbers/pn-sip", json!({ "provider": "sip_trunk" }));
     for (extra, says) in [
@@ -330,7 +330,7 @@ async fn twilio_only(rig: FakeRig) -> WeftResult<()> {
         ),
     ] {
         let err = rig.run(&ElevenLabsAgentCallNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().iter().all(|r| r.method == "GET"), "only the numbers were read; nothing was dialed");
@@ -338,7 +338,7 @@ async fn twilio_only(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn unknown_provider(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     number(&rig, "carrier_pigeon");
     let err = rig.run(&ElevenLabsAgentCallNode, inputs(&rig, json!({}))).await.failure()?;
     assert!(err.starts_with("input error"), "{err}");

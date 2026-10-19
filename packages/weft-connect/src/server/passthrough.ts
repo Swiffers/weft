@@ -30,10 +30,34 @@ export const PASSED_DOORS = ['instance', 'signal', 'signal-token', 'connect', 'a
 // SYNC: 'weft-instance-token' <-> src/core/transport.ts INSTANCE_TOKEN_HEADER
 const PASSED_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'weft-instance-token'];
 
+/** The header every answer of a route's run carries, success or failure:
+ *  the run's id, which the site can log or show beside a failure so the
+ *  program's owner can open the run.
+ *  SYNC: RUN_ID_HEADER <-> crates/weft-core/src/caller.rs RUN_ID_HEADER */
+export const RUN_ID_HEADER = 'Weft-Run-Id';
+
+/** What a route answers when its run failed without answering: the plain
+ *  words and the run's id, never the failure itself (the owner reads that
+ *  on the run). The body before anything was sent, and the item of a
+ *  stream's error marker after.
+ *  SYNC: PlainFailure <-> crates/weft-core/src/caller.rs PlainFailure */
+export interface PlainFailure {
+	error: string;
+	runId: string;
+}
+
 // The response headers that travel back: what the body is, how long it may
-// be kept, and where a redirect points (the dispatcher builds that address
-// from the forwarded headers below, so it is the site's own).
-const PASSED_RESPONSE_HEADERS = ['content-type', 'content-length', 'cache-control', 'content-disposition', 'location'];
+// be kept, where a redirect points (the dispatcher builds that address
+// from the forwarded headers below, so it is the site's own), and which
+// run answered.
+const PASSED_RESPONSE_HEADERS = [
+	'content-type',
+	'content-length',
+	'cache-control',
+	'content-disposition',
+	'location',
+	RUN_ID_HEADER.toLowerCase(),
+];
 
 // The headers that tell the dispatcher which address the BROWSER used, so a
 // link it hands back (an instance's file chooser page) points at the site, not

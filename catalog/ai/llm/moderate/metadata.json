@@ -53,8 +53,5 @@
       "name": "scores",
       "type": "JsonDict"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

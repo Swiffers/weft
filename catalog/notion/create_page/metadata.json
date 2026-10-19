@@ -62,8 +62,5 @@
       "type": "String",
       "description": "The new page's link."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

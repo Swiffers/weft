@@ -626,7 +626,9 @@ pub struct LoopInstanceKey {
 /// runtime (`crate::generator` re-exports it), the journal's loop
 /// snapshots, and the fold. `Finished` is the clean end; `Failed`
 /// carries the producer's error so a consumer's pull surfaces it
-/// through `?` instead of reading a truncated stream as complete.
+/// through `?` instead of reading a truncated stream as complete. A
+/// bus's close carries it too (`crate::bus::FiringBuses`).
+// SYNC: StreamEnd <-> packages/weft-graph/src/protocol.ts StreamEnd
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEnd {

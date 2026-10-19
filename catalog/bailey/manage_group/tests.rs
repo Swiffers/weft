@@ -23,7 +23,7 @@ pub fn tests() -> Vec<NodeTest> {
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
     rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig
         .run(
             &BaileyManageGroupNode,
@@ -36,7 +36,7 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("WhatsApp not connected"), "{error}");
     assert!(!outcome.outputs.contains_key("groupId"), "a caught failure emits nothing on groupId");
     Ok(())
@@ -44,7 +44,7 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 
 async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
     let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &BaileyManageGroupNode,

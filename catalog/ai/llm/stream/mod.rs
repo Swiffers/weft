@@ -1,7 +1,8 @@
 //! LlmStream: one language-model call whose reply STREAMS. The node
-//! opens a Bus on its `stream` output and sends each text delta the
-//! moment the model produces it; the bus close is the end-of-stream
-//! signal, and the whole reply then pulses on the normal ports
+//! opens a Bus on its `stream` output with the model's first chunk and
+//! sends each text delta the moment the model produces it; the bus close
+//! is the end-of-stream signal (a failed end when the call broke off),
+//! and the whole reply then pulses on the normal ports
 //! (`response`, `historyFile`, `toolCalls`) exactly like LlmInference,
 //! the turn added in place to the conversation file on `historyFile`. A
 //! consumer that wants the live text joins the bus; one that only
@@ -37,12 +38,13 @@ impl Node for LlmStreamNode {
         let leaf = call::to_wire(&ctx, &llm).await?;
 
         // The delta channel: the model name rides the bus metadata so a
-        // consumer knows the source before the first delta; the guard
-        // closes on EVERY exit, so a failed call still ends the stream
-        // for readers.
+        // consumer knows the source before the first delta. It opens on
+        // the model's first chunk, so a call refused before it answers
+        // is a failure `_error` can catch while nothing has been read;
+        // past that, the bus ends the way the body does, failed included.
         let model = llm.generator.model.clone();
         let opts = BusOptions { meta: json!({ "model": model }), ..BusOptions::default() };
-        let bus = ctx.open_bus("stream", opts, "llm").await?;
+        let mut bus = ctx.pending_bus("stream", opts, "llm");
 
         let mut stream = leaf
             .complete_streaming(&llm.generator, Some(&llm.params))
@@ -56,13 +58,17 @@ impl Node for LlmStreamNode {
             };
             let Some(chunk) = chunk else { break };
             let chunk = chunk.map_err(|e| llm.call_error(e))?;
+            let bus = bus.open().await?;
             if !chunk.delta.is_empty() {
                 bus.send("delta", json!(chunk.delta)).node_err("sending a delta on the bus")?;
             }
         }
-        drop(bus); // the close IS the end-of-stream signal
-
         let response = stream.collect().await.map_err(|e| llm.call_error(e))?;
+        // A whole reply ends the stream for its readers now, not after
+        // the conversation file is written; a cut one fails the node
+        // here, and the bus ends failed with it.
+        llm.ensure_whole(&response)?;
+        bus.open().await?.close();
         let output = call::finish(&ctx, llm, &response, call::reply_text).await?;
         ctx.pulse_downstream(output).await
     }

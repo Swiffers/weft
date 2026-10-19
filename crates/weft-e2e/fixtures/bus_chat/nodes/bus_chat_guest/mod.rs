@@ -4,16 +4,16 @@
 //!
 //! There is no envelope. The bus's `Closed` entry IS the end-of-
 //! conversation signal: the guest's cursor returns `None` when it
-//! reaches it. `ctx.join_bus` hands back a guard that closes on EVERY
-//! exit path (happy, error, or early-return), so a half-broken guest
-//! can never leave the host parked forever on its reply cursor.
+//! reaches it. A bus from `ctx.join_bus` ends with the guest's body on
+//! EVERY exit path (happy, error, or early-return), so a half-broken
+//! guest can never leave the host parked forever on its reply cursor.
 //!
 //! Flow:
-//!   1. join_bus (resolve marker + register "guest", close-on-drop)
+//!   1. join_bus (resolve marker + register "guest", ends with the body)
 //!   2. wait_for("host")
 //!   3. loop: pull the next host message; reply with the next scripted
 //!      line. Exits when the cursor returns None (host closed).
-//!   4. drop the bus, pulse_downstream(done=true)
+//!   4. close the bus, pulse_downstream(done=true)
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -56,7 +56,7 @@ impl Node for BusChatGuestNode {
             bus.send("msg", json!(reply)).node_err(format!("guest send '{reply}'"))?;
             reply_idx += 1;
         }
-        drop(bus);
+        bus.close();
 
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())

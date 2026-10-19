@@ -59,7 +59,7 @@ pub fn pulse_id(
 
 /// The emission of a node body's values and closes on its ordinary
 /// output ports, and of what the engine puts on them for the firing (a
-/// caught failure on `error`, a baked value): one id per firing. Each
+/// caught failure on `_error`, a baked value): one id per firing. Each
 /// such port goes out at most once per firing, and the pulse id carries
 /// the port, so one id serves every one of them, and a replay of the
 /// body after a pause that emits a port again lands on the pulse

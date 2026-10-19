@@ -224,8 +224,5 @@
         "port": "text"
       }
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

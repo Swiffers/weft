@@ -54,14 +54,21 @@
 //! - Failures come in two kinds. An exception the script raises while
 //!   it runs (a network call it makes failing, a `raise` of its own)
 //!   carries its type, message and traceback; with the optional
-//!   `error` output wired that message comes out there and every
+//!   `_error` output wired that message comes out there and every
 //!   other output closes, unwired it fails the run. A mistake in the
 //!   program itself fails the run either way: code that does not
 //!   compile (an input error), and an answer that is not a dict of
 //!   declared outputs holding values their types accept (a type
-//!   error: no return, a key that is no output, `error` among the
-//!   keys, a string on a number port). `error` is weft's, so a script
+//!   error: no return, a key that is no output, `_error` among the
+//!   keys, a string on a number port). `_error` is weft's, so a script
 //!   that wants to fail on purpose raises.
+//!
+//! - A value the script returns on one port weighs at most the 100 KB
+//!   a wire carries, as JSON. The runtime refuses a heavier one at the
+//!   emission, naming the port and its weight, a failure `_error`
+//!   catches like any other that depends on what the script was given.
+//!   The refusal's first way out is the one a script has (it cannot
+//!   store a file): return less, or split it across outputs.
 //!
 //! - A cancelled run stops its script at once: its process is killed
 //!   (a script inside one long C call, a `time.sleep`, a blocking read,
@@ -103,11 +110,11 @@ impl Node for ExecPythonNode {
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // An exception the script raises fails this firing, and the
-        // runtime puts it on `error` when it is wired. A mistake
+        // runtime puts it on `_error` when it is wired. A mistake
         // in the program itself (the code does not compile, the answer
         // is not a dict of declared outputs of the right types) is an
         // input or type error, which fails the run whether or not
-        // `error` is wired.
+        // `_error` is wired.
         let code: String = ctx.inputs.get("code")?;
 
         // Bind every input port the program created under its name in
@@ -131,9 +138,9 @@ impl Node for ExecPythonNode {
 
         // Check the whole answer before anything goes out, so a wrong
         // key or type refuses the firing as the program mistake it is
-        // (the engine's own refusal of an emission is a failure `error`
+        // (the engine's own refusal of an emission is a failure `_error`
         // would catch).
-        ctx.pulse_downstream(answer_output(&ctx.data_outputs(), result)?).await
+        ctx.pulse_downstream(answer_output(&ctx.declared_outputs(), result)?).await
     }
 }
 
@@ -141,9 +148,11 @@ impl Node for ExecPythonNode {
 /// no pulse; `None` is a null on a port whose type takes `Null` and no
 /// pulse on any other, so `{"x": None}` skips a plain port x. A file handed back on a file-typed port
 /// goes out as the marker the wire expects. A key that is not a declared
-/// data output, `error` included (weft fills it with the script's
+/// data output, `_error` included (weft fills it with the script's
 /// failure; a script fails on purpose by raising), and a value its port
-/// does not accept are type errors naming the port.
+/// does not accept are type errors naming the port. A value heavier
+/// than a wire carries is left to the runtime, which refuses the
+/// emission naming the port, its weight, and returning less.
 fn answer_output(outputs: &HashMap<String, WeftType>, result: Vec<(String, Value)>) -> WeftResult<NodeOutput> {
     let mut out = NodeOutput::new();
     for (port, value) in result {
@@ -376,7 +385,7 @@ impl Interpreters {
 /// its own kind: code that does not compile is an input error, an
 /// answer that is not a dict of plain values is a type error (both are
 /// the program's own mistakes), and an exception the script raises while
-/// it runs is a node failure, the one kind `error` catches. A cancel
+/// it runs is a node failure, the one kind `_error` catches. A cancel
 /// kills the script's process.
 pub(crate) async fn run_python(
     interpreters: &Interpreters,

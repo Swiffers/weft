@@ -367,7 +367,7 @@ fn spelled_parameters() -> WeftResult<()> {
 }
 
 /// A database that hangs up on every connection, so the failure is the
-/// connection's, an outcome of this run, which is what both `error`
+/// connection's, an outcome of this run, which is what both `_error`
 /// tests read.
 async fn refused_query(rig: &FakeRig) -> weft::RigOutcome {
     connection(rig);
@@ -384,19 +384,19 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = refused_query(&rig).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("postgres: connect"), "{error}");
     assert!(!outcome.outputs.contains_key("rows") && !outcome.outputs.contains_key("count"));
     Ok(())
 }
 
 /// A mistake in the program's own SQL (a positional `$1`) is fixed by
-/// editing the program, so it fails the run even with `error` wired.
+/// editing the program, so it fails the run even with `_error` wired.
 async fn sql_mistake_wired(rig: FakeRig) -> WeftResult<()> {
     connection(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &PostgresExecuteQueryNode,
@@ -409,11 +409,11 @@ async fn sql_mistake_wired(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// A connection set up wrong is the program's own shape, never an
-/// outcome to route around: it fails the run even with `error` wired.
+/// outcome to route around: it fails the run even with `_error` wired.
 async fn bad_setting_wired(rig: FakeRig) -> WeftResult<()> {
     connection(&rig);
     rig.connection_value("postgres", "sslmode", "sometimes");
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = run_query(&rig).await.failure()?;
     assert!(err.contains("TLS setting"), "{err}");
     Ok(())

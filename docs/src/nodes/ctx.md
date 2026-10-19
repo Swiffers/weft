@@ -80,13 +80,13 @@ honestly.
 
 | Call | What it does | It fails when |
 |---|---|---|
-| `pulse_downstream(output).await` | Sends values on | A port is mentioned twice, is not declared, gets a value its type does not allow, or is `error` on a node with `catchErrors` |
+| `pulse_downstream(output).await` | Sends values on | A port is mentioned twice, is not declared, gets a value its type does not allow or one over 100 KB, or is `_error` |
 | `yield_downstream(output).await` | The same, but waits until the value was taken | Same, plus a delivery that can never happen, and an empty output |
-| `close_port("port").await` | Closes one output. On a stream port this is the end of the stream | The port was already mentioned this firing, or is `error` on a node with `catchErrors` |
+| `close_port("port").await` | Closes one output. On a stream port this is the end of the stream | The port was already mentioned this firing, or is `_error` |
 | `set_max_buffered_items("port", n)` | Raises the un-taken cap on a stream port above 4096 | The port is not a stream output, or `n` is 0 |
-| `fan_declared(&value)` | Builds an output by matching an object's keys to your declared ports, skipping the rest. On a node with `catchErrors` it never fills `error`: a key called `error` in the data is data | never |
-| `data_outputs()` | Your declared ports, minus `error` on a node with `catchErrors`: the ones a node fills from data (a row's columns, a response's fields) | never |
-| `output_type("port")?` | The resolved type of one output | The node does not declare that output: a type error, so it fails the run even with `error` wired |
+| `fan_declared(&value)` | Builds an output by matching an object's keys to your declared ports, skipping the rest. It never fills `_error`: a key called `_error` in the data is data | never |
+| `data_outputs()` | Your declared ports minus `_error`: the ones a node fills from data (a row's columns, a response's fields) | never |
+| `output_type("port")?` | The resolved type of one output | The node does not declare that output: a type error, so it fails the run even with `_error` wired |
 | `declared_outputs()` / `declared_inputs()` | Every port this node declares in the program, with its type | never |
 | `is_output_wired("port")` | Whether anything downstream reads that output in this run | never |
 
@@ -253,11 +253,15 @@ links expire. Hand it to whoever asked and do not store it.
 
 | Call | What it does | It fails when |
 |---|---|---|
-| `create_bus(opts)` | Makes a bus and gives you a handle and a marker to emit | The options do not make sense |
+| `create_bus(opts)` | Makes a bus and gives you a handle and a marker to emit. The bus ends when your body does | The options do not make sense |
 | `bus(&marker)` | Turns a marker value back into a live handle | The bus is gone, or that is not a marker |
-| `open_bus("port", opts, "name").await` | The whole producer move: make it, emit the marker, register your name. Closes on drop | Emitting or registering fails |
-| `join_bus("port", "name")` | The consumer twin, also closing on drop | The input is not a live bus |
-| `bus_from_input("port")` | A handle that does **not** close the bus. For an observer | Same |
+| `open_bus("port", opts, "name").await` | The whole producer move: make it, emit the marker, register your name. The bus ends when your body does | Emitting or registering fails |
+| `pending_bus("port", opts, "name")` | A bus that opens only on your first `open().await`, so the work that can fail runs first and its failure can still reach `_error` | never; `open()` fails as `open_bus` does |
+| `join_bus("port", "name")` | The consumer twin: registers your name, and the bus ends when your body does | The input is not a live bus |
+| `bus_from_input("port")` | A handle whose bus does **not** end with your body. For an observer | Same |
+
+For how a bus ends and what a reader does about it, go and read [streams and
+buses in Rust](streams-and-buses.md#how-a-bus-ends).
 
 Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("rows")?`.
 

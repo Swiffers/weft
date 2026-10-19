@@ -77,8 +77,5 @@
       "type": "Boolean",
       "description": "True once the change landed."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

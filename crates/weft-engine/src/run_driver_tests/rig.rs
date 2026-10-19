@@ -415,7 +415,7 @@
             fired: firing.map(weft_core::frames::Located::top),
             ..Default::default()
         };
-        let program = weft_core::project::cut::cut(project, &walk, &mut Default::default());
+        let program = weft_core::project::cut::cut(project, &walk, &mut Default::default()).expect("a cut");
         (program, Some(weft_core::project::hash::compute_definition_hash(project).unwrap()))
     }
 

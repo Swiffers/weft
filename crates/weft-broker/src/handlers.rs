@@ -1031,7 +1031,7 @@ pub async fn supervisor_gone_copies(
                     .collect();
             req.copies
                 .iter()
-                .filter(|c| !rows.contains(&c.copy_id) && !declared.declares_copy(c))
+                .filter(|c| !rows.contains(&c.copy_id) && declared.gone_copy(c))
                 .map(|c| c.copy_id.clone())
                 .collect()
         }

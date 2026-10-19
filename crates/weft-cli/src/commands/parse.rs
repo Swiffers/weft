@@ -1,11 +1,12 @@
 //! `weft parse` / `weft validate`: editor feedback surface.
 //!
 //! Both read weft source from stdin and run the compiler against the
-//! project's `nodes/` catalog (the same catalog the build uses), then
-//! print JSON to stdout. This is where the editor's live graph and
+//! project's node catalog (the same catalog the build uses), then print
+//! JSON to stdout. This is where the editor's live graph and
 //! Problems-panel feedback comes from. It runs locally, on the CLI,
-//! because the catalog lives in the project's `nodes/` folder: the
-//! dispatcher (a remote process) has no access to it.
+//! because the catalog lives in the project's folders (`nodes/`, and the
+//! nodes beside the code under `src/`): the dispatcher (a remote process)
+//! has no access to them.
 //!
 //! `parse` is lenient (unknown node types become placeholders so the
 //! graph keeps rendering mid-edit); `validate` is the full strict
@@ -112,15 +113,16 @@ fn do_parse(
 // A long-lived process the VS Code extension spawns once and keeps warm. It
 // reads one JSON request per line on stdin and writes one JSON response per
 // line on stdout. Holding the per-project node catalog in memory makes each
-// request ~parse-cost instead of paying catalog-discovery (a full `nodes/`
-// walk) on every keystroke as the one-shot `weft parse` would. This is the
+// request ~parse-cost instead of paying catalog-discovery (a full walk of
+// both node roots) on every keystroke as the one-shot `weft parse` would. This is the
 // editor's hot path; the one-shot commands stay for tests and other callers.
 
 /// One editor request. `kind` selects the pipeline; `source` is the buffer
 /// text (NOT read from disk, so an unsaved buffer parses); `file` gives the
 /// `@file`/`@include` base + the project to resolve. `reload_catalog` drops
 /// the warm catalog for this project first (the host sends it when its
-/// `nodes/` watcher fired, so the server never needs its own watcher).
+/// node watcher fired, over `nodes/` and `src/` alike, so the server never
+/// needs its own watcher).
 // SYNC: ServerRequest <-> extension-vscode/src/parseServer.ts ParseServerRequest
 #[derive(Debug, Deserialize)]
 struct ServerRequest {
@@ -219,7 +221,7 @@ pub async fn serve(ctx: Ctx) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     // Per-project-root warm catalog. The catalog is immutable during an
-    // editing session except when the user edits `nodes/`, which the host
+    // editing session except when the user edits a node, which the host
     // signals via `reload_catalog`.
     let mut catalogs: HashMap<PathBuf, FsCatalog> = HashMap::new();
 

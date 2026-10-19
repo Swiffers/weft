@@ -336,11 +336,12 @@ fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<Targ
             // declare tests (the catalog's own predicate, shared with
             // every other consumer): building a test binary for a
             // test-less package would be wasted compilation.
-            let mut names: Vec<String> = catalog
-                .packages()
-                .filter(|p| catalog.package_declares_tests(p))
-                .map(|p| p.name.clone())
-                .collect();
+            let mut names: Vec<String> = Vec::new();
+            for package in catalog.packages() {
+                if catalog.package_declares_tests(package)? {
+                    names.push(package.name.clone());
+                }
+            }
             names.sort();
             Ok(names
                 .into_iter()

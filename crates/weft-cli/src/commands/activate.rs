@@ -129,6 +129,7 @@ async fn run_inner(
         }
         None => format!("activated {name} ({id})"),
     };
+    super::ensure::warn_broken(progress, &answer.broken);
     progress.complete_with(&summary, serde_json::json!({ "perInstanceLeftOut": left_out, "address": answer.address }));
     Ok(())
 }

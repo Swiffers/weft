@@ -2066,15 +2066,50 @@ fn two_files_landing_on_one_body_id_are_refused_however_they_are_reached() {
     assert!(errs.iter().any(|e| e.message.contains("takes the id `@a_b`") && e.message.contains("rename one of them")), "{errs:?}");
 }
 
-/// A file whose own include is broken is not registered as a body: a
-/// second site of it reports the errors again rather than finding an
-/// id with nothing behind it.
+/// A file whose own include is broken is still registered as a body,
+/// around the placeholder the broken include leaves inside it: every site
+/// calls that one body, and the error is reported once, pinned to the
+/// placeholder.
 #[test]
-fn a_file_that_fails_to_compile_is_not_registered_for_its_next_site() {
+fn a_file_whose_own_include_is_broken_is_one_body_around_a_placeholder() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("broken.weft"), "Group() {\n  x = @include(\"missing.weft\")\n}\n").unwrap();
-    let errs = compile("a = @include(\"broken.weft\")\nb = @include(\"broken.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
-    assert!(errs.iter().filter(|e| e.message.contains("missing.weft")).count() >= 2, "{errs:?}");
+    let (project, errs) = compile_lenient(
+        "a = @include(\"broken.weft\")\nb = @include(\"broken.weft\")\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Full,
+        None,
+    );
+    let missing: Vec<_> = errs.iter().filter(|e| e.message.contains("missing.weft")).collect();
+    assert_eq!(missing.len(), 1, "{errs:?}");
+    assert_eq!(missing[0].subjects, ["@broken.x"], "{errs:?}");
+    assert!(project.nodes.iter().any(|n| n.id == "@broken.x" && n.include_path.as_deref() == Some("missing.weft")));
+    for site in ["a", "b"] {
+        assert!(matches!(&project.groups.iter().find(|g| g.id == site).unwrap().kind, weft_core::GroupKind::Call { body, .. } if body == "@broken"));
+    }
+}
+
+/// A file that does not parse leaves a placeholder node at each site
+/// that includes it, the errors pinned to that site, and nothing else.
+#[test]
+fn a_file_that_does_not_parse_is_a_placeholder_at_each_site() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.weft"), "Group() {\n  x = Text {\n").unwrap();
+    let (project, errs) = compile_lenient(
+        "a = @include(\"draft.weft\")\nb = @include(\"draft.weft\")\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Full,
+        None,
+    );
+    for site in ["a", "b"] {
+        let node = project.nodes.iter().find(|n| n.id == site).unwrap_or_else(|| panic!("a placeholder at {site}"));
+        assert_eq!(node.node_type, INCLUDE_NODE_TYPE);
+        assert!(errs.iter().any(|e| e.subjects == [site] && e.file.as_deref().is_some_and(|f| f.ends_with("draft.weft"))), "{errs:?}");
+    }
+    assert!(errs.iter().all(|e| !e.subjects.is_empty()), "nothing is the program's as a whole: {errs:?}");
+    assert!(project.groups.is_empty(), "no body for a file that does not parse");
 }
 
 /// Every spliced node, edge, and per-field span names the FILE it was

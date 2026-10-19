@@ -208,7 +208,10 @@ mod fs_hashes {
     ) -> Result<SourceHash> {
         let project_root = project.root.as_path();
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-binary-v2\n");
+        // v3: the image keeps the record of the node packages its build
+        // left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`); an image
+        // from before has none to read.
+        hasher.update(b"weft-binary-v3\n");
         hash_image_recipe(&mut hasher, project)?;
 
         // SET of referenced node TYPES: the dispatch table in registry.rs
@@ -684,34 +687,49 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// Load + enrich a project to a `ProjectDefinition` AND return the
-    /// catalog it was enriched against, without running cargo / docker.
-    /// Returns both because every caller (drift hashes, infra build) needs
-    /// the same catalog the definition was built from; returning it here is
-    /// one discovery per command instead of each caller re-walking `nodes/`.
-    pub fn load_enriched_project(project: &Project) -> Result<(ProjectDefinition, FsCatalog)> {
-        load_enriched_project_with_diagnostics(project).map_err(|e| anyhow::anyhow!("{e}"))
+    /// The project's program as every command compiles it
+    /// ([`crate::compile_program`]: what does not compile is left in as
+    /// broken parts) AND the catalog it was compiled against, read from
+    /// disk, without running cargo / docker. Returns both because every
+    /// caller (drift hashes, infra build) needs the same catalog the
+    /// definition was built from; returning it here is one discovery per
+    /// command instead of each caller re-walking the node roots.
+    pub fn load_program(project: &Project) -> Result<(ProjectDefinition, FsCatalog)> {
+        load_program_with_diagnostics(project).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Same as `load_enriched_project` but on compile failure the Err
-    /// carries the structured `Vec<Diagnostic>` so callers that surface
-    /// errors to the editor (the CLI's run path emitting structured
-    /// progress events) can render them one-per-line rather than as a
-    /// single flattened string.
-    pub fn load_enriched_project_with_diagnostics(
+    /// Same as `load_program` but on a failure of the program as a whole
+    /// the Err carries the structured `Vec<Diagnostic>` so callers that
+    /// surface errors to the editor (the CLI's run path emitting
+    /// structured progress events) can render them one-per-line rather
+    /// than as a single flattened string.
+    pub fn load_program_with_diagnostics(
         project: &Project,
     ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
-        use crate::build::build_project_catalog;
-        use crate::compile_enriched_with_diagnostics;
-        let source = project
-            .read_main_weft()
-            .map_err(|e| CompileLoadError::Read(format!("read {}: {e}", project.main_weft().display())))?;
-        let catalog = build_project_catalog(&project.root)
+        load_program_in(project, std::sync::Arc::new(weft_catalog::DiskTree))
+    }
+
+    /// [`load_program_with_diagnostics`] with every file read from `tree`:
+    /// the entry file, the files it includes and reads, and both node
+    /// roots. A command reads its project once into a snapshot and
+    /// compiles from that, so nothing written to disk meanwhile reaches
+    /// it.
+    pub fn load_program_in(
+        project: &Project,
+        tree: std::sync::Arc<dyn weft_catalog::SourceTree>,
+    ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
+        let main_weft = project.main_weft();
+        let source = tree
+            .read_to_string(&main_weft)
+            .map_err(|e| CompileLoadError::Read(format!("read {}: {e}", main_weft.display())))?;
+        let roots = crate::project::node_roots(&project.root);
+        let catalog = FsCatalog::discover_roots_in(tree.clone(), &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>())
             .map_err(|e| CompileLoadError::Read(format!("catalog: {e}")))?;
         let src_dir = project.src_dir();
-        let fs = crate::CompileFs::disk(&project.root).anchored_at(Some(&src_dir));
-        let mut definition = compile_enriched_with_diagnostics(&source, project.id(), fs, &catalog)
-            .map_err(CompileLoadError::Diagnostics)?;
+        let reader = crate::file_reader::TreeFileReader::new(tree.as_ref());
+        let fs = crate::CompileFs::with_reader(&reader, Some(&project.root)).anchored_at(Some(&src_dir));
+        let mut definition =
+            crate::compile_program(&source, project.id(), fs, &catalog).map_err(CompileLoadError::Diagnostics)?;
         // What weft.toml says for every run and trigger rides in the
         // program, so a version reads the defaults it was built with.
         definition.defaults = project.manifest.defaults();

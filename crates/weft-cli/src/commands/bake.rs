@@ -3,6 +3,8 @@
 //! replaced on the way, and `--running-policy` says what happens to
 //! its running runs, exactly as on `weft activate`.
 
+use anyhow::Context;
+
 use super::ensure::{parse_running_choice, running_choice};
 use super::Ctx;
 use crate::progress::ActionVerb;
@@ -34,6 +36,13 @@ pub async fn run(
         progress.dispatcher_call_start(&path);
         let result: serde_json::Value = client.post_json(&path, &serde_json::to_value(&body)?).await?;
         progress.dispatcher_call_done(serde_json::json!({"projectId": id}));
+        // The install's own reading of the version it baked, whichever way
+        // it was named.
+        let broken: Vec<weft_core::project::Broken> = match result.get("broken") {
+            Some(broken) => serde_json::from_value(broken.clone()).context("read the parts of the bake that do not compile")?,
+            None => Vec::new(),
+        };
+        super::ensure::warn_broken(&progress, &broken);
         progress.complete_with("trigger settings saved", result);
         Ok(())
     }).await

@@ -31,11 +31,11 @@ pub struct AssetResolutions {
 /// plane lacks is uploaded; without, it is an error naming `weft bake`.
 pub async fn asset_resolutions(
     client: &DispatcherClient,
-    project_root: &std::path::Path,
+    files: &dyn weft_assets::AssetSource,
     definition: &weft_core::project::ProjectDefinition,
     publish: bool,
 ) -> Result<AssetResolutions> {
-    let (map, key_refs, text_refs) = resolve_asset_map(client, project_root, definition, publish).await?;
+    let (map, key_refs, text_refs) = resolve_asset_map(client, files, definition, publish).await?;
     let source_refs = key_refs
         .into_iter()
         .chain(text_refs.into_iter().filter(weft_compiler::file_ref::is_runtime_key_ref))
@@ -81,15 +81,18 @@ pub async fn publish_references(
 /// the value its declared type stands for. An uploaded file is not added
 /// to the project's published assets, so it lives on the store's own
 /// countdown, which every read of it pushes back.
+///
+/// `files` is the command's snapshot, then the disk: a value naming a
+/// project file gets the bytes the run's version holds.
 pub async fn resolve_run_values(
     client: &DispatcherClient,
-    project_root: &std::path::Path,
+    files: &super::snapshot::SnapshotFirst<'_>,
     spec: &mut weft_core::run_spec::RunSpec,
 ) -> Result<()> {
-    let fs = weft_compiler::CompileFs::disk(project_root);
+    let fs = weft_compiler::CompileFs::with_reader(files, Some(files.root()));
     weft_compiler::file_ref::resolve_file_markers(spec, &fs)
         .map_err(|errs| anyhow::anyhow!("a run value cannot be read:\n  {}", errs.join("\n  ")))?;
-    let (map, _, _) = resolve_asset_map(client, project_root, &*spec, true).await?;
+    let (map, _, _) = resolve_asset_map(client, files, &*spec, true).await?;
     weft_compiler::file_ref::apply_asset_resolutions(spec, &map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
     Ok(())
@@ -99,9 +102,12 @@ pub async fn resolve_run_values(
 /// disk, look up the stored-key ones, fetch and cast the text ones. Hands
 /// back every resolved value by resolution key, and the stored-key and
 /// text refs, which a build's publish names.
+///
+/// `files` is where a path a ref names is read: project-relative, or
+/// anywhere on the machine when absolute.
 async fn resolve_asset_map(
     client: &DispatcherClient,
-    project_root: &std::path::Path,
+    files: &dyn weft_assets::AssetSource,
     target: &impl weft_compiler::file_ref::MarkedValues,
     publish: bool,
 ) -> Result<(BTreeMap<String, serde_json::Value>, Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
@@ -109,10 +115,9 @@ async fn resolve_asset_map(
     let mut map = if refs.is_empty() {
         BTreeMap::new()
     } else {
-        let source = DiskSource::new(project_root.to_path_buf());
         let mut store = DispatcherStore::new(client);
         store.publish = publish;
-        weft_assets::sync_assets(&refs, &source, &store).await.context("sync project assets")?
+        weft_assets::sync_assets(&refs, files, &store).await.context("sync project assets")?
     };
     // Refs whose source is a RUNTIME STORAGE KEY (a stored file picked in the
     // editor): nothing to sync, resolve them against the tenant's file
@@ -142,9 +147,11 @@ async fn resolve_asset_map(
             } else if weft_compiler::file_ref::is_runtime_key_ref(r) {
                 crate::commands::files::download_bytes(client, &r.path).await
             } else {
-                let path = std::path::Path::new(&r.path);
-                let full = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
-                std::fs::read(&full).with_context(|| format!("read {}", full.display()))
+                files.open(&r.path).and_then(|mut file| {
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).with_context(|| format!("read {}", r.path))?;
+                    Ok(bytes)
+                })
             };
             match fetched.and_then(|bytes| {
                 weft_compiler::file_ref::resolve_text_bytes(r, &bytes).map_err(anyhow::Error::msg)
@@ -172,7 +179,7 @@ pub async fn resolve_project_assets(
     definition: &mut weft_core::project::ProjectDefinition,
     publish: bool,
 ) -> Result<Vec<String>> {
-    let resolutions = asset_resolutions(client, project_root, definition, publish).await?;
+    let resolutions = asset_resolutions(client, &DiskSource::new(project_root.to_path_buf()), definition, publish).await?;
     weft_compiler::file_ref::apply_asset_resolutions(definition, &resolutions.map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
     if !publish {

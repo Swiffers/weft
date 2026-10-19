@@ -837,7 +837,7 @@ export function isLoopNodeType(nodeType: unknown): boolean {
 /** The opaque `@include` block: a node carrying only the included file's
  *  interface ports, whose body lives in that file. No catalog entry by
  *  design. */
-// SYNC: INCLUDE_NODE_TYPE <-> crates/weft-compiler/src/weft_compiler.rs INCLUDE_NODE_TYPE
+// SYNC: INCLUDE_NODE_TYPE <-> crates/weft-core/src/project.rs INCLUDED_GROUP_TYPE
 export const INCLUDE_NODE_TYPE = 'IncludedGroup';
 
 export function isIncludeNodeType(nodeType: unknown): boolean {

@@ -280,6 +280,12 @@ pub struct ActivateResponse {
     /// the install gives it one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<crate::projects::ProjectAddress>,
+    /// The parts of the activated version that do not compile
+    /// (`ProjectDefinition::broken`): no trigger whose cut needs one came
+    /// on, and the CLI tells whoever activated about every one, by id or
+    /// not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broken: Vec<crate::project::Broken>,
 }
 
 /// One address a listener answers on, for the trigger at `node_id`.

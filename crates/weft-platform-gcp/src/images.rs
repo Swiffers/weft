@@ -96,20 +96,75 @@ fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str, mac
     // keeps (`weft_compiler::worker_image`'s build step).
     args.extend(["--build-arg".into(), format!("{COMPILE_CACHE_ARG}=none")]);
     args.push(".".into());
+    let mut steps = vec![json!({
+        "name": "gcr.io/cloud-builders/docker",
+        // The worker's Dockerfile uses BuildKit's cache mounts.
+        "env": ["DOCKER_BUILDKIT=1"],
+        "args": args,
+    })];
+    if let Some(path) = &req.result_file {
+        steps.push(result_step(&req.image_ref, path));
+    }
     json!({
         "source": { "storageSource": { "bucket": bucket, "object": object } },
-        "steps": [{
-            "name": "gcr.io/cloud-builders/docker",
-            // The worker's Dockerfile uses BuildKit's cache mounts.
-            "env": ["DOCKER_BUILDKIT=1"],
-            "args": args,
-        }],
+        "steps": steps,
         "images": [req.image_ref],
         "timeout": BUILD_TIMEOUT,
         "serviceAccount": account,
         "options": options(machine),
         "tags": ["weft", format!("weft-project-{}", req.project_id.simple())],
     })
+}
+
+/// The `id` of the step that reads a build's result file, which is how a
+/// poll finds that step's output from the build alone.
+const RESULT_STEP_ID: &str = "weft-result";
+
+/// The step that reads `path` out of the image the build step just made,
+/// without running it, into Cloud Build's step output (`$BUILDER_OUTPUT/
+/// output`, handed back base64-encoded in `results.buildStepOutputs` at
+/// the step's index; the command given to `docker create` is never run,
+/// it lets an image that names none be created). The steps share one Docker daemon, so the image is
+/// there before `images` pushes it. A file the image lacks fails the step,
+/// and with it the build. Every `$` is doubled: Cloud Build substitutes a
+/// single one itself and refuses a name it does not know.
+const RESULT_SCRIPT: &str = r#"set -e
+id=$$(docker create "$$1" weft-never-run)
+status=0
+docker cp "$$id:$$2" "$$BUILDER_OUTPUT/output" || status=$$?
+docker rm --force "$$id" >/dev/null || echo "could not remove the container $$id" >&2
+exit $$status"#;
+
+fn result_step(image_ref: &str, path: &str) -> Value {
+    json!({
+        "id": RESULT_STEP_ID,
+        "name": "gcr.io/cloud-builders/docker",
+        "entrypoint": "bash",
+        // `bash -c <script> <$0> <$1> <$2>`: the image and the path go in
+        // as arguments, never spliced into the script.
+        "args": ["-c", RESULT_SCRIPT, RESULT_STEP_ID, image_ref, path],
+    })
+}
+
+/// A succeeded build's result: the output of its [`RESULT_STEP_ID`] step,
+/// decoded, when it has one. That step's output missing, empty or not
+/// base64 is a failed build: the step exists because the request asked for
+/// the file.
+fn result_of(build: &Value) -> Result<Option<Vec<u8>>, String> {
+    let steps = build.get("steps").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let Some(index) = steps.iter().position(|step| step.get("id").and_then(Value::as_str) == Some(RESULT_STEP_ID)) else {
+        return Ok(None);
+    };
+    let output = build.pointer("/results/buildStepOutputs").and_then(Value::as_array).and_then(|outputs| outputs.get(index)).and_then(Value::as_str);
+    let encoded = match output {
+        Some(encoded) if !encoded.is_empty() => encoded,
+        _ => return Err(format!("the build succeeded but its result step (step {index}) handed back no output")),
+    };
+    use base64::Engine as _;
+    match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) => Err(format!("the build succeeded but its result step (step {index}) handed back an output that is not base64: {e}")),
+    }
 }
 
 /// A build's options: its log goes to Cloud Logging only (Cloud Build
@@ -134,7 +189,10 @@ fn status_of(build: &Value) -> BuildStatus {
         }
     };
     match status {
-        "SUCCESS" => BuildStatus::Succeeded,
+        "SUCCESS" => match result_of(build) {
+            Ok(result) => BuildStatus::Succeeded { result },
+            Err(why) => BuildStatus::Failed { reason: why },
+        },
         // Cancelled (by weft's own release, after the end was recorded, or
         // by somebody in the console) and expired (queued too long) are
         // ends Cloud Build knows and words: its words are the reason.
@@ -276,6 +334,7 @@ mod tests {
             image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
             build_args: vec![("WEFT_COMPILE_LANE".into(), "0".into())],
             uses: Default::default(),
+            result_file: None,
         };
         let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
         assert_eq!(body["images"][0], req.image_ref);
@@ -284,14 +343,73 @@ mod tests {
         assert_eq!(body["serviceAccount"], "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com");
         assert_eq!(body["options"]["logging"], "CLOUD_LOGGING_ONLY", "a build with its own account logs to Cloud Logging");
         assert!(body["options"].get("machineType").is_none(), "Cloud Build's own default machine, the free one");
+        assert_eq!(body["steps"].as_array().unwrap().len(), 1, "no result step when no result file is asked");
         let bigger = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", Some("E2_HIGHCPU_8"));
         assert_eq!(bigger["options"]["machineType"], "E2_HIGHCPU_8");
+    }
+
+    /// A build asked for a result file reads it in a step of its own after
+    /// the build step, the image and the path passed as arguments.
+    #[test]
+    fn a_result_file_adds_a_step_reading_it_out_of_the_image() {
+        let req = BuildRequest {
+            name: "b1".into(),
+            project_id: uuid::Uuid::from_u128(1),
+            tenant: "local".into(),
+            context_dir: "/ctx".into(),
+            staging: weft_platform_traits::Staging::new(()),
+            image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
+            build_args: Vec::new(),
+            uses: Default::default(),
+            result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()),
+        };
+        let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
+        let steps = body["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["args"][0], "build");
+        let step = &steps[1];
+        assert_eq!(step["id"], RESULT_STEP_ID);
+        assert_eq!(step["name"], "gcr.io/cloud-builders/docker");
+        assert_eq!(step["entrypoint"], "bash");
+        let args: Vec<&str> = step["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+        assert_eq!(args, ["-c", RESULT_SCRIPT, RESULT_STEP_ID, req.image_ref.as_str(), "/weft-left-out.json"]);
+        assert!(RESULT_SCRIPT.starts_with("set -e\n"));
+        assert!(RESULT_SCRIPT.contains(r#"docker cp "$$id:$$2" "$$BUILDER_OUTPUT/output""#));
+        assert!(
+            !RESULT_SCRIPT.replace("$$", "").contains('$'),
+            "every `$` is doubled, or Cloud Build substitutes it"
+        );
+    }
+
+    /// A succeeded build answers its result step's output, decoded; that
+    /// output missing, empty or not base64 fails it.
+    #[test]
+    fn a_succeeded_build_answers_its_result_steps_output() {
+        let steps = json!([{ "args": ["build"] }, { "id": RESULT_STEP_ID }]);
+        let ok = json!({ "status": "SUCCESS", "steps": steps, "results": { "buildStepOutputs": ["", "eyJwYWNrYWdlcyI6W119"] } });
+        assert_eq!(status_of(&ok), BuildStatus::Succeeded { result: Some(br#"{"packages":[]}"#.to_vec()) });
+        for (results, why) in [
+            (json!({}), "no output"),
+            (json!({ "buildStepOutputs": [""] }), "no output"),
+            (json!({ "buildStepOutputs": ["", ""] }), "no output"),
+            (json!({ "buildStepOutputs": ["", "not base64!"] }), "not base64"),
+        ] {
+            let BuildStatus::Failed { reason } = status_of(&json!({ "status": "SUCCESS", "steps": steps, "results": results })) else {
+                panic!("a build without its result succeeded: {results}")
+            };
+            assert!(reason.contains("result step (step 1)") && reason.contains(why), "{reason}");
+        }
+        let no_result_step = json!({ "status": "SUCCESS", "steps": [{ "args": ["build"] }], "results": { "buildStepOutputs": [""] } });
+        assert_eq!(status_of(&no_result_step), BuildStatus::Succeeded { result: None });
+        let failed = json!({ "status": "FAILURE", "statusDetail": "step 1 failed", "steps": steps });
+        assert!(matches!(status_of(&failed), BuildStatus::Failed { reason } if reason.contains("step 1 failed")));
+        assert_eq!(status_of(&json!({ "status": "WORKING", "steps": steps })), BuildStatus::Pending);
     }
 
     #[test]
     fn a_build_status_is_read_as_weft_reads_builds() {
         assert_eq!(status_of(&json!({ "status": "WORKING" })), BuildStatus::Pending);
-        assert_eq!(status_of(&json!({ "status": "SUCCESS" })), BuildStatus::Succeeded);
+        assert_eq!(status_of(&json!({ "status": "SUCCESS" })), BuildStatus::Succeeded { result: None });
         assert_eq!(status_of(&json!({ "status": "CANCELLED" })), BuildStatus::Failed { reason: "CANCELLED".into() }, "an end Cloud Build words itself");
         let BuildStatus::Failed { reason } = status_of(&json!({ "status": "FAILURE", "statusDetail": "step 0 failed", "logUrl": "https://log" })) else {
             panic!()

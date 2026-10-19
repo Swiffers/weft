@@ -627,7 +627,7 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["node", "compact"])]
         list: bool,
         /// Describe the bundled stdlib catalog instead of a project's
-        /// `nodes/`. Needs no project on disk; used to produce the browser
+        /// nodes. Needs no project on disk; used to produce the browser
         /// parser's catalog asset.
         #[arg(long)]
         stdlib: bool,
@@ -645,7 +645,7 @@ enum Cmd {
         compact: bool,
     },
     /// Parse weft source (read from stdin) against the project's
-    /// `nodes/` catalog and print the project + referenced catalog +
+    /// node catalog and print the project + referenced catalog +
     /// diagnostics as JSON. The editor's live graph feedback. Lenient:
     /// unknown node types become placeholders rather than errors.
     Parse {
@@ -657,7 +657,7 @@ enum Cmd {
         file: Option<std::path::PathBuf>,
     },
     /// Validate weft source (read from stdin) against the project's
-    /// `nodes/` catalog and print diagnostics as JSON. The full check
+    /// node catalog and print diagnostics as JSON. The full check
     /// before a project ships: the strict compile + enrich + validate
     /// pipeline, runtime rules included (the editor runs the same
     /// before Run, Activate and Resync).

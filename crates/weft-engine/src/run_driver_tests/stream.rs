@@ -210,7 +210,7 @@
                     inputs: [(consumer, [("in".to_string(), json!([8, 9]))].into())].into(),
                     outputs: Default::default(),
                 };
-                let project = weft_core::project::cut::cut(&whole, &walk, &mut given);
+                let project = weft_core::project::cut::cut(&whole, &walk, &mut given).expect("a cut");
                 // The roots the cut's run kicks: with its stream handed,
                 // the consumer is one, as no wire lands on that port.
                 let kicks = weft_core::run_spec::KickPlan::for_program(&project, None, None);

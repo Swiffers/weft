@@ -39,6 +39,7 @@ pub mod options;
 pub mod files;
 // The version tree and its verbs.
 pub mod versions;
+pub mod snapshot;
 pub mod checkpoint;
 pub mod branch;
 pub mod running_source;
@@ -403,7 +404,7 @@ pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
     // refused there, naming the run or the project). So the spelling
     // goes as it is, and it is the top-level node it names.
     let Some(project) = ctx.project_here()? else { return Ok(spelled.to_string()) };
-    let (definition, _) = weft_compiler::hash::load_enriched_project(project)?;
+    let (definition, _) = weft_compiler::hash::load_program(project)?;
     let (id, call_path) = resolve_node(project, &definition, spelled)?;
     Ok(weft_core::project::address_of(&definition, &id, &call_path))
 }

@@ -338,7 +338,11 @@ impl Joiner<'_, '_> {
                      there would go round for ever. Remove one of the lines that join the group's ports",
                     weft_core::project::plain_id(group)
                 ),
-            ).in_file(line.and_then(|crossing| crossing.source_file.as_deref())));
+            ).in_file(line.and_then(|crossing| crossing.source_file.as_deref()))
+            // The loop is the group's ports' business: it breaks the group
+            // (and a cut that runs nothing of it never notices), never the
+            // program around it.
+            .about(group));
             return false;
         }
         seen.push(here);

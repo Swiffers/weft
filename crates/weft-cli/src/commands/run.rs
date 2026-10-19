@@ -48,10 +48,12 @@ pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<std::process::ExitCo
 
 /// Load saved parameters, apply explicit edits, and omit accepted output
 /// evidence from the run request. Graph validation sees the final edit.
-fn spec_for(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<Option<RunSpec>> {
+/// A saved example is read from the command's snapshot (`files`), so the
+/// run uses the example its version holds.
+fn spec_for(ctx: &Ctx, args: &RunArgs, files: &super::snapshot::SnapshotFirst<'_>) -> anyhow::Result<Option<RunSpec>> {
     match (&args.spec, args.flags.is_empty()) {
         (Some(name), _) => {
-            let spec = super::versions::read_spec(ctx.project()?, name)?;
+            let spec = super::versions::read_spec_from(ctx.project()?, name, &|path| files.read_to_string(path))?;
             Ok(Some(super::versions::apply_run_flags(&spec.without_expected(), &args.flags)?))
         }
         (None, true) => Ok(args.save.as_ref().map(RunSpec::whole)),
@@ -70,28 +72,33 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
         Some(run) if !run.is_empty() => Some(super::resolve_run_id(ctx, run).await?.parse().context("a resolved run id")?),
         _ => None,
     };
-    let mut spec = spec_for(ctx, &args)?;
+    // The snapshot comes first: the example this run reads, and the one it
+    // saves, are the version's.
+    let mut snapshot = super::snapshot::Snapshot::take(&ctx.project()?.root)?;
+    let mut spec = spec_for(ctx, &args, &snapshot.then_disk())?;
     if let (Some(name), Some(spec)) = (&args.save, &mut spec) {
         spec.name = name.clone();
     }
     if let Some(name) = &args.save {
         let spec = spec.as_ref().expect("saving constructs a run spec");
+        // Asked of the disk, which is what the write below would replace.
         if super::versions::read_spec_if_present(ctx.project()?, name)?.is_some_and(|existing| existing.is_frozen()) {
             bail!("example '{name}' contains accepted results; save parameters under another name, or freeze an accepted new run to replace it");
         }
-        let path = super::versions::write_spec(ctx.project()?, &RunSpec { name: name.clone(), ..spec.clone() })?;
+        let (path, text) = super::versions::write_spec(ctx.project()?, &RunSpec { name: name.clone(), ..spec.clone() })?;
+        snapshot.record(&path, text.into_bytes())?;
         if !ctx.json() {
             println!("saved {}", path.display());
         }
     }
-    let compiled = super::ensure::compile_project(ctx, progress)?;
+    let compiled = super::ensure::compile_snapshot(progress, snapshot)?;
     // A `@file(...)` / `@asset(...)` in a handed value becomes the value
     // it stands for before anything checks it, so the port-type check
     // below judges the file, never the marker text. What was saved above
     // keeps the markers, so an example reads its file afresh every run.
     if let Some(spec) = &mut spec {
         let (client, _, _) = super::resolve_project(ctx)?;
-        super::assets::resolve_run_values(&client, &ctx.project()?.root, spec).await?;
+        super::assets::resolve_run_values(&client, &compiled.files(), spec).await?;
     }
     validate_run(&compiled.definition, spec.as_ref(), &args)?;
     let node_set = args.node_set.unwrap_or(weft_core::builds::NodeSet::Full);
@@ -129,6 +136,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     for w in &started.warnings {
         progress.warn(w);
     }
+    handle.warn_broken(progress);
     // The summary is the completion's own line: `Progress` prints it in
     // human mode, so printing it above as well said it twice.
     progress.complete(&summary);

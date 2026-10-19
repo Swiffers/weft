@@ -216,7 +216,8 @@ pub struct ProjectStatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<ProjectAddress>,
     /// True when live `infra_node` rows exist whose node is NOT in the
-    /// current source (the node was deleted while deployed). Never gates
+    /// current source (the node was deleted while deployed, or it sits
+    /// behind a part that does not compile). Never gates
     /// run/activate; clients OR it into their infra-controls check so the
     /// controls for live infra never vanish.
     pub orphaned_infra: bool,

@@ -187,7 +187,7 @@ async fn a_queued_run_keeps_the_image_it_was_born_on(pool: PgPool) {
 async fn registered_sources_belong_to_the_exact_program(pool: PgPool) {
     let (_, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
-    let implementations = std::collections::BTreeMap::new();
+    let implementations = weft_dispatcher::project_store::ProgramCode::default();
     let source = std::collections::BTreeMap::from([("main.weft".into(), "original-file".into())]);
     projects.register_with_hashes(empty_project(id), "sources", "", TENANT,
         Some("binary"), Some("graph"), None, None, Some(&implementations), Some(&source), None).await.unwrap();

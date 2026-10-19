@@ -988,6 +988,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
             }
         }
     });
+    let left_out = catalog.left_out();
     Worker {
         holds,
         under_way_changed,
@@ -998,7 +999,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         replica: config.replica.clone(),
         tenant_id: config.tenant_id.clone(),
         cancels,
-        plans: Arc::new(crate::plan::Plans::new(config.project_id)),
+        plans: Arc::new(crate::plan::Plans::new(config.project_id, left_out)),
         background: weft_core::in_flight::InFlight::new("worker run"),
         stopping,
         stopping_overdue: tokio_util::sync::CancellationToken::new(),

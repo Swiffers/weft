@@ -19,7 +19,7 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
     // against before the first checkpoint or run.
     if !discard {
         if let Some(head) = tree.head.head_version.as_deref().and_then(|h| tree.versions.iter().find(|v| v.id == h)) {
-            let local = local_manifest(project)?;
+            let local = local_manifest(&project.root)?;
             let dirty = dirty_files(&head.manifest, &local);
             if !dirty.is_empty() {
                 bail!(
@@ -118,7 +118,7 @@ pub fn dirty_files(head: &Manifest, local: &Manifest) -> Vec<String> {
 /// Make the disk match `manifest`: download every blob whose bytes
 /// differ, remove every covered file the manifest does not name.
 async fn restore(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project, manifest: &Manifest) -> anyhow::Result<()> {
-    let local = local_manifest(project)?;
+    let local = local_manifest(&project.root)?;
     // Every path is checked BEFORE anything is written, so a bad entry
     // halfway down the manifest cannot leave the tree half restored.
     //

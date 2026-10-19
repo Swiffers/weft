@@ -565,9 +565,9 @@ pub(crate) async fn coherent_definition(
     state: &DispatcherState,
     id: uuid::Uuid,
 ) -> Result<(weft_core::project::hash::ProgramIdentity, std::sync::Arc<ProjectDefinition>), (StatusCode, String)> {
-    let program = state
+    let running = state
         .projects
-        .running_program_identity(id)
+        .running_program(id)
         .await
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("running program identity: {e}"))
@@ -581,7 +581,7 @@ pub(crate) async fn coherent_definition(
                 ),
             )
         })?;
-    let hash = &program.definition_hash;
+    let hash = &running.identity.definition_hash;
     let project = state
         .program(id, hash)
         .await
@@ -595,7 +595,29 @@ pub(crate) async fn coherent_definition(
                 ),
             )
         })?;
-    Ok((program, project))
+    let project = with_left_out(project, &running.left_out, running.worker_log.as_deref());
+    Ok((running.identity, project))
+}
+
+/// `project` as its worker can run it: the node packages the worker's
+/// build left out because they did not compile (`left_out`, recorded with
+/// the registered worker, `project_store::ProgramCode`) added to its
+/// broken parts, so a run, fire or setup whose cut uses one of their node
+/// types is refused up front, naming the package, and every other cut
+/// runs. Kept beside the definition rather than in it: the definition is
+/// stored and cached under its hash, and a fixed node changes the worker,
+/// never that hash.
+fn with_left_out(
+    project: std::sync::Arc<ProjectDefinition>,
+    left_out: &[weft_core::builds::LeftOutPackage],
+    log: Option<&str>,
+) -> std::sync::Arc<ProjectDefinition> {
+    if left_out.is_empty() {
+        return project;
+    }
+    let mut runnable = (*project).clone();
+    runnable.broken.extend(weft_core::builds::LeftOut::broken_parts(left_out, &project, log));
+    std::sync::Arc::new(runnable)
 }
 
 
@@ -1828,14 +1850,17 @@ pub(crate) async fn gather_action_snapshot(
             .filter(|spelled| source_infra.contains(spelled))
             .collect();
     let trigger_infra_ready = trigger_infra_ready(&shared_trigger_infra, infra_rows);
-    // Orphans: live rows whose node the user deleted from source.
-    // They count into the rollup (below) and raise the project-level
-    // signal, so a FULLY-orphaned live infra set never collapses the
-    // rollup to `none` and never makes the infra controls vanish
-    // (Model 1's never-lose-track guarantee).
-    let is_orphan = |r: &crate::infra_node::InfraNodeRow| !declared.declares(&r.node_id, r.instance.is_some());
-    let orphan_count = infra_rows.iter().filter(|r| is_orphan(r)).count();
-    let orphaned_infra = orphan_count > 0;
+    // Live rows the source does not declare: the user deleted the node
+    // from source, or it sits behind a part that does not compile
+    // (`DeclaredInfra::gone` tells the two apart, for what takes copies
+    // down on its own). Either way they count into the rollup (below) and
+    // raise the project-level signal, so live infra the source does not
+    // show never collapses the rollup to `none` and never makes the infra
+    // controls vanish (Model 1's never-lose-track guarantee): what to do
+    // with them is the person's call.
+    let is_undeclared = |r: &crate::infra_node::InfraNodeRow| !declared.declares(&r.node_id, r.instance.is_some());
+    let undeclared_count = infra_rows.iter().filter(|r| is_undeclared(r)).count();
+    let orphaned_infra = undeclared_count > 0;
 
     // Aggregate infra state across SOURCE nodes + orphan rows:
     //   - none:    no source infra node and no live row.
@@ -1847,7 +1872,7 @@ pub(crate) async fn gather_action_snapshot(
     // Transient states take precedence (terminating > stopping >
     // provisioning) so the action bar shows the in-flight state and
     // offers only its cancel.
-    let total = source_infra.len() + orphan_count;
+    let total = source_infra.len() + undeclared_count;
     let infra_rollup = if total == 0 {
         "none".to_string()
     } else {
@@ -1860,8 +1885,8 @@ pub(crate) async fn gather_action_snapshot(
         let mut stopping = 0usize;
         let mut terminating = 0usize;
         let mut provisioning = 0usize;
-        // One slot per source node (absent counted) + one per orphan
-        // row (an orphan always HAS a row, by definition).
+        // One slot per source node (absent counted) + one per undeclared
+        // row (it always HAS a row, by definition).
         let mut count_status = |status: InfraNodeStatus| match status {
             InfraNodeStatus::Running => running += 1,
             InfraNodeStatus::Failed => failed += 1,
@@ -1880,7 +1905,7 @@ pub(crate) async fn gather_action_snapshot(
                 None => absent += 1,
             }
         }
-        for r in infra_rows.iter().filter(|r| is_orphan(r)) {
+        for r in infra_rows.iter().filter(|r| is_undeclared(r)) {
             count_status(r.status);
         }
         if terminating > 0 {
@@ -2179,7 +2204,8 @@ pub(crate) struct ActionInputs<'a> {
     /// part of the graph waits on that part's infra alone.
     pub run_infra_ready: bool,
     /// Live `infra_node` rows exist whose node is NOT in the current
-    /// source (the user deleted the node while it was deployed). Does
+    /// source (the user deleted the node while it was deployed, or it sits
+    /// behind a part that does not compile). Does
     /// NOT gate run/activate; DOES keep the infra controls offered so
     /// the user never loses track of live infra.
     pub orphaned_infra: bool,
@@ -2403,6 +2429,34 @@ fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
 /// The activations `scope` names in `project`, refusing a mismatch (a
 /// per-instance trigger without an instance, a shared one with one, an
 /// address that is not a trigger) and a scope that names nothing.
+/// Refuse to turn on a trigger whose fire could never run: its setup may
+/// need nothing broken (a route needs nothing to register), while every
+/// fire runs the trigger's cut (`run_spec::compute_trigger_fire`), and one
+/// that needs a part that does not compile is refused at each call. The
+/// person is told now, naming the part, rather than every caller later.
+/// Asked of the triggers an activate switches on, whoever asks, and of the
+/// ones a resync puts back (before it takes any down); never of a
+/// re-arm, whose triggers are on and whose change has nothing to do with
+/// it.
+async fn refuse_unfireable(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    project: &ProjectDefinition,
+    keys: &[weft_core::activation::ActivationKey],
+) -> Result<(), (StatusCode, String)> {
+    let mut refused = Vec::new();
+    for key in keys {
+        let saved = saved_for_run(state, id, project, key.instance()).await?;
+        if let Err(why) = weft_core::run_spec::compute_trigger_fire(project, &key.trigger, &serde_json::Value::Null, None, &saved) {
+            refused.push(why);
+        }
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err((StatusCode::UNPROCESSABLE_ENTITY, refused.join("\n")))
+}
+
 pub(crate) fn resolve_scope(
     project: &ProjectDefinition,
     scope: &weft_core::activation::ActivationScope,
@@ -2486,14 +2540,27 @@ pub async fn bake(
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     body: Option<Json<BakeRequest>>,
-) -> Result<Json<crate::journal::TriggerBake>, (StatusCode, String)> {
+) -> Result<Json<BakeAnswer>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
     let (program, project) = coherent_definition(&state, id).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let (running_policy, drain_timeout_secs) = body.running.resolve(None);
     let keys = resolve_scope(&project, &body.scope)?;
     prepare_trigger_setup(&state, id, &project, &keys, StaleWorkerChoice::Replace(running_policy, drain_timeout_secs)).await?;
-    Ok(Json(run_trigger_setup(&state, id, &project, &keys, &program, None, None).await?))
+    let bake = run_trigger_setup(&state, id, &project, &keys, &program, None, None).await?;
+    Ok(Json(BakeAnswer { bake, broken: project.broken.clone() }))
+}
+
+/// What a bake answers: the settings it saved, and the parts of the baked
+/// version that do not compile (`ProjectDefinition::broken`), which no
+/// setup that needs one ran, so whoever baked is told about every one
+/// however they asked (`weft bake`, by id or not).
+#[derive(Debug, serde::Serialize)]
+pub struct BakeAnswer {
+    #[serde(flatten)]
+    bake: crate::journal::TriggerBake,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    broken: Vec<weft_core::project::Broken>,
 }
 
 /// Refuse unless every infra copy the named activations' triggers read
@@ -3027,6 +3094,11 @@ pub(crate) async fn activate_with(
     } = request;
     // No picker on an activate: the body's answer, or the default.
     let (running_policy, drain_timeout_secs) = running.resolve(None);
+    // Every trigger an activate switches on is checked for a fire that
+    // could never run, whoever asks (a person, a program's run, an infra
+    // brought back); a re-arm's triggers are on already, and a resync
+    // checked its own before taking any down.
+    let checks_fires = !matches!(asker, ActivateAsker::Rearm(_) | ActivateAsker::Resync(_));
     let (stale, rearm, resync) = match asker {
         ActivateAsker::Outside => (StaleWorkerChoice::Replace(running_policy, drain_timeout_secs), None, None),
         ActivateAsker::Resync(driver) => (StaleWorkerChoice::Replace(running_policy, drain_timeout_secs), None, Some(driver)),
@@ -3087,6 +3159,9 @@ pub(crate) async fn activate_with(
             off
         }
     };
+    if checks_fires {
+        refuse_unfireable(state, id, &project, &keys).await?;
+    }
     // Every connection the program needs picked on this install, before
     // any trigger moves: a run born without one is refused at its first
     // call, long after the activation said yes. A re-arm skips it: its
@@ -3234,7 +3309,13 @@ pub(crate) async fn activate_with(
     // The program the project now runs answers its callers at the
     // project's own address, straight (`crate::front`).
     let address = crate::front::serve_or_log(state, id, port).await;
-    Ok(Json(ActivateResponse { urls, infra_not_running, per_instance_left_out: scope.per_instance_left_out(&project), address }))
+    Ok(Json(ActivateResponse {
+        urls,
+        infra_not_running,
+        per_instance_left_out: scope.per_instance_left_out(&project),
+        address,
+        broken: project.broken.clone(),
+    }))
 }
 
 /// The project's own address, as its front last answered it.
@@ -3249,13 +3330,19 @@ async fn project_address(state: &DispatcherState, id: uuid::Uuid) -> Option<weft
 /// in the source. Called after TriggerSetup so any trigger the user
 /// removed while it was down has its leftover signal row dropped.
 /// Resume rows (per-suspension) skip this: the corresponding suspended
-/// run is the source of truth for them.
+/// run is the source of truth for them. None while a part that does not
+/// compile may hide triggers (`ProjectDefinition::hides_nodes`): a row
+/// missing from such a program may be a trigger inside it, and dropping
+/// it would kill an address the person still has.
 async fn orphan_entry_tokens(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     project: &ProjectDefinition,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> anyhow::Result<Vec<String>> {
+    if project.hides_nodes() {
+        return Ok(Vec::new());
+    }
     let triggers: HashSet<String> = weft_core::project::trigger_places(project)
         .iter()
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
@@ -3676,8 +3763,12 @@ pub async fn resync(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))?;
+    // The fires are judged on the program as its worker runs it, what it
+    // left out included.
+    let (_, runnable) = coherent_definition(&state, id).await?;
     for owner in &owners {
         require_trigger_infra(&state, id, &built, &owner.keys(&owner.on)).await?;
+        refuse_unfireable(&state, id, &runnable, &owner.keys(&owner.on)).await?;
     }
     crate::install_picks::require_activation_picks(&state, id, &built).await?;
 

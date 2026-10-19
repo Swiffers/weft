@@ -100,7 +100,14 @@ async fn advance_build(pool: &PgPool, images: &dyn ImageBuilder, build: &ledger:
             "the build {builder_id} is gone: its builder knows nothing of it any more (it was deleted, or the \
              process that ran it ended). Build again"
         )),
-        BuildStatus::Succeeded => ledger::Outcome::Succeeded,
+        // A worker's record of what it left out is read here, once: one that
+        // does not read fails the build rather than registering a worker
+        // whose missing packages nobody would refuse.
+        BuildStatus::Succeeded { result: None } => ledger::Outcome::Succeeded(None),
+        BuildStatus::Succeeded { result: Some(record) } => match weft_core::builds::LeftOut::parse(&record) {
+            Ok(left_out) => ledger::Outcome::Succeeded(Some(left_out)),
+            Err(why) => ledger::Outcome::Failed(why),
+        },
         BuildStatus::Failed { reason } => ledger::Outcome::Failed(reason),
     };
     // Whoever recorded the end frees the build, once.

@@ -42,7 +42,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // order (its infra first, then its triggers).
     let mut declares_infra = false;
     let (desired_binary_hash, desired_full_binary_hash, desired_definition_hash, desired_infra_hash) =
-        match weft_compiler::hash::load_enriched_project(project) {
+        match weft_compiler::hash::load_program(project) {
             Ok((mut def, catalog)) => {
                 declares_infra = weft_core::project::has_infra(&def);
                 let resolved = crate::commands::assets::resolve_project_assets(
@@ -157,8 +157,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // Orphaned live infra: never silent (the never-lose-track rule).
     if data.orphaned_infra {
         println!(
-            "  WARNING: live infra exists whose node was removed from the source; \
-             it keeps running (and consuming resources) until stopped/terminated via the infra verbs"
+            "  WARNING: live infra exists whose node the source does not declare (removed from it, \
+             or inside a part that does not compile); it keeps running (and consuming resources) \
+             until stopped/terminated via the infra verbs"
         );
     }
 

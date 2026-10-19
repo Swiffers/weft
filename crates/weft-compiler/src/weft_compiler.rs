@@ -43,12 +43,35 @@ pub struct CompileError {
     /// a parse error inside an `@include`d file keeps its own
     /// coordinates and names its file here. None = the compiled source.
     pub file: Option<String>,
+    /// The nodes and groups the error breaks, by id
+    /// (`weft_core::node::Diagnostic::subjects`): set on what an included
+    /// file that does not compile leaves behind, so the program around it
+    /// still compiles. Empty for an error in the entry file, which is
+    /// about the program as a whole.
+    pub subjects: Vec<String>,
 }
 
 impl CompileError {
     /// An error anchored to a span (the normal case: the offending token/node).
     pub fn at(span: Span, message: impl Into<String>) -> Self {
-        Self { span, message: message.into(), file: None }
+        Self { span, message: message.into(), file: None, subjects: Vec::new() }
+    }
+
+    /// The parts this error breaks ([`Self::subjects`]). Fills only when
+    /// unset, like [`Self::in_file`]: an error a deeper include already
+    /// pinned to its own placeholder keeps it.
+    pub fn about(mut self, subject: &str) -> Self {
+        if self.subjects.is_empty() {
+            self.subjects.push(subject.to_string());
+        }
+        self
+    }
+
+    /// The finding this error is, for a caller that reports diagnostics.
+    pub fn diagnostic(&self, code: &str) -> weft_core::node::Diagnostic {
+        weft_core::node::Diagnostic::at(self.span, weft_core::node::Severity::Error, code, self.message.clone())
+            .in_file(self.file.as_deref())
+            .about(self.subjects.iter().cloned())
     }
 
     /// Stamp the file the span lives in. Fills only when unset, so an
@@ -483,9 +506,11 @@ fn parse_checked(
 
 // ─── Include resolution ───────────────────────────────────────────────────────
 
-/// Internal node type for an opaque `@include` block in Interface mode. The
-/// editor renders it as an expandable group that navigates into the file.
-pub const INCLUDE_NODE_TYPE: &str = "IncludedGroup";
+/// Internal node type for an opaque `@include` block: in Interface mode the
+/// block the editor renders as an expandable group that navigates into the
+/// file, in Full mode the placeholder an included file that does not
+/// compile leaves ([`broken_include`]).
+pub const INCLUDE_NODE_TYPE: &str = weft_core::project::INCLUDED_GROUP_TYPE;
 
 
 /// The display label for one of a loop's two boundaries. Single definition
@@ -527,25 +552,11 @@ fn resolve_includes(
     bodies: &mut Bodies,
     errors: &mut Vec<CompileError>,
 ) {
-    let includes = std::mem::take(&mut state.includes);
-    for inc in includes {
-        if fs.base.is_none() {
-            errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
-            continue;
-        }
-        match resolve_one_include(&inc, fs, mode, in_progress, bodies) {
-            Ok(IncludeResult::Site(mut site)) => {
-                // Root-level fills need no stamping: an unstamped span
-                // already means "the compiled source", which is exactly
-                // where these are written.
-                apply_pending_literals(&inc, &mut site, errors);
-                state.groups.push(*site);
-            }
-            Ok(IncludeResult::Node(mut node)) => {
-                apply_pending_literals_to_node(&inc, &mut node, errors);
-                state.nodes.push(*node);
-            }
-            Err(errs) => errors.extend(errs),
+    for inc in std::mem::take(&mut state.includes) {
+        match place_include(&inc, None, fs, mode, in_progress, bodies, errors) {
+            Some(IncludeResult::Site(site)) => state.groups.push(*site),
+            Some(IncludeResult::Node(node)) => state.nodes.push(*node),
+            None => {}
         }
     }
     // Resolve includes nested inside group bodies, anywhere in the tree.
@@ -565,55 +576,101 @@ fn resolve_group_includes(
     bodies: &mut Bodies,
     errors: &mut Vec<CompileError>,
 ) {
-    let includes = std::mem::take(&mut group.includes);
-    for inc in includes {
-        if fs.base.is_none() {
-            errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
-            continue;
-        }
-        match resolve_one_include(&inc, fs, mode, in_progress, bodies) {
-            Ok(IncludeResult::Site(mut g)) => {
-                apply_pending_literals(&inc, &mut g, errors);
-                // The site is written in THIS group's file (the body it
-                // calls carries its own): a diagnostic on the `@include`
-                // line names the file the line is in.
-                if g.source_file.is_none() {
-                    g.source_file = group.source_file.clone();
-                }
-                // The fills just landed with the INCLUDING file's spans
-                // (this group's file); the included group's own spans were
-                // already stamped with its file, so only the fresh
-                // (file-less) entries take this one.
-                if let Some(pf) = &group.source_file {
-                    for s in g.port_literal_spans.values_mut() {
-                        if s.source_file.is_none() {
-                            s.source_file = Some(pf.clone());
-                        }
-                    }
-                }
-                group.child_groups.push(*g);
-            }
-            Ok(IncludeResult::Node(mut n)) => {
-                apply_pending_literals_to_node(&inc, &mut n, errors);
-                // The opaque interface node is a member of this group (its id
-                // is already scoped `group.child`); set parent_id so flatten
-                // assigns it the group's scope, like any other child node.
-                // Without this its scope is empty and edges from siblings trip
-                // the scope-reachability check.
-                n.parent_id = Some(group.id.clone());
-                // An interface-mode opaque node's span is the `@include`
-                // line, which is written in THIS group's file.
-                if n.source_file.is_none() {
-                    n.source_file = group.source_file.clone();
-                }
-                group.nodes.push(*n);
-            }
-            Err(errs) => errors.extend(errs),
+    for inc in std::mem::take(&mut group.includes) {
+        let within = Within { group: &group.id, file: group.source_file.as_deref() };
+        match place_include(&inc, Some(within), fs, mode, in_progress, bodies, errors) {
+            Some(IncludeResult::Site(site)) => group.child_groups.push(*site),
+            Some(IncludeResult::Node(node)) => group.nodes.push(*node),
+            None => {}
         }
     }
     for child in &mut group.child_groups {
         resolve_group_includes(child, fs, mode, in_progress, bodies, errors);
     }
+}
+
+/// The group an `@include` is written in, and that group's file (`None`
+/// for the compiled source itself).
+#[derive(Clone, Copy)]
+struct Within<'a> {
+    group: &'a str,
+    file: Option<&'a str>,
+}
+
+/// Resolve one `@include` written at the top level (`within` is `None`) or
+/// inside a group, and hand back what goes where it was written: the call
+/// site, the opaque node, or, for a full-mode include whose file does not
+/// compile, the placeholder [`broken_include`] leaves. Every error the
+/// include itself raises lands in `errors`, naming the file it is written
+/// in; a value written on a port the site does not have breaks only the
+/// site. `None` when nothing goes there (an interface-mode include that
+/// did not resolve, an include outside any project).
+fn place_include(
+    inc: &ParsedInclude,
+    within: Option<Within<'_>>,
+    fs: &CompileFs,
+    mode: IncludeMode,
+    in_progress: &mut Vec<std::path::PathBuf>,
+    bodies: &mut Bodies,
+    errors: &mut Vec<CompileError>,
+) -> Option<IncludeResult> {
+    if fs.base.is_none() {
+        errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
+        return None;
+    }
+    let file = within.and_then(|w| w.file);
+    match resolve_one_include(inc, fs, mode, in_progress, bodies, errors) {
+        Ok(IncludeResult::Site(mut site)) => {
+            let mut fills = Vec::new();
+            apply_pending_literals(inc, &mut site, &mut fills);
+            errors.extend(fills.into_iter().map(|e| e.in_file(file).about(&site.id)));
+            // The site is written in the including file (the body it calls
+            // carries its own): a diagnostic on the `@include` line names
+            // the file the line is in. The fills just landed with that
+            // file's spans; the included group's own spans were already
+            // stamped with its file, so only the fresh (file-less) entries
+            // take this one. At the top level nothing is stamped: an
+            // unstamped span already means "the compiled source".
+            if let Some(file) = file {
+                site.source_file.get_or_insert_with(|| file.to_string());
+                for span in site.port_literal_spans.values_mut() {
+                    span.source_file.get_or_insert_with(|| file.to_string());
+                }
+            }
+            Some(IncludeResult::Site(site))
+        }
+        Ok(IncludeResult::Node(mut node)) => {
+            apply_pending_literals_to_node(inc, &mut node, errors);
+            Some(IncludeResult::Node(Box::new(member_of(*node, within))))
+        }
+        Err(errs) => match mode {
+            IncludeMode::Full => {
+                let (node, errs) = broken_include(inc, errs);
+                errors.extend(errs.into_iter().map(|e| e.in_file(file)));
+                Some(IncludeResult::Node(Box::new(member_of(node, within))))
+            }
+            IncludeMode::Interface => {
+                errors.extend(errs);
+                None
+            }
+        },
+    }
+}
+
+/// An include's node (the opaque interface node, or the placeholder of one
+/// that does not compile) as a member of the group it is written in: its
+/// id is already scoped `group.child`, and `parent_id` gives it the group's
+/// scope at flatten, like any other child node (without it, edges from
+/// siblings trip the scope-reachability check). Its span is the `@include`
+/// line, which is written in that group's file.
+fn member_of(mut node: ParsedNode, within: Option<Within<'_>>) -> ParsedNode {
+    if let Some(within) = within {
+        node.parent_id = Some(within.group.to_string());
+        if node.source_file.is_none() {
+            node.source_file = within.file.map(str::to_string);
+        }
+    }
+    node
 }
 
 /// Land an alias's pending port values on the group the include resolved
@@ -649,6 +706,38 @@ fn apply_pending_literals_to_node(
             node.config_spans.insert(k, ConfigFieldSpan::connection(fill.span));
         }
     }
+}
+
+/// What a full-mode `@include` whose file does not compile leaves in the
+/// program: a placeholder node at the site's id, of the opaque include type
+/// the editor's interface parse uses, with the file's path and no port, and
+/// the file's errors pinned to it. The program around it compiles; a cut
+/// that keeps the placeholder is refused with those errors
+/// (`weft_core::project::Broken`), and one that does not never notices. A
+/// line written against one of the site's ports finds no such port on the
+/// placeholder, which breaks the line's two ends the same way.
+fn broken_include(inc: &ParsedInclude, errs: Vec<CompileError>) -> (ParsedNode, Vec<CompileError>) {
+    let node = ParsedNode {
+        id: inc.alias.clone(),
+        node_type: INCLUDE_NODE_TYPE.to_string(),
+        label: None,
+        config: serde_json::Map::new(),
+        parent_id: None,
+        in_ports: Vec::new(),
+        out_ports: Vec::new(),
+        type_params: Vec::new(),
+        one_of_required: Vec::new(),
+        per_instance: false,
+        span: Some(inc.span),
+        header_span: Some(inc.span),
+        config_spans: Default::default(),
+        optional_ports: Default::default(),
+        include_path: Some(inc.path.clone()),
+        include_contents: None,
+        source_file: None,
+    };
+    let errs = errs.into_iter().map(|e| e.about(&inc.alias)).collect();
+    (node, errs)
 }
 
 enum IncludeResult {
@@ -711,12 +800,16 @@ fn is_one_anonymous_group(sub: &ParseState) -> bool {
         && sub.groups[0].anonymous
 }
 
+/// `errors` takes what the file's OWN includes leave behind when they do
+/// not compile (each pinned to the placeholder it leaves in the body, see
+/// [`broken_include`]); the `Err` is this include's own failure.
 fn resolve_one_include(
     inc: &ParsedInclude,
     fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
     bodies: &mut Bodies,
+    errors: &mut Vec<CompileError>,
 ) -> Result<IncludeResult, Vec<CompileError>> {
     // A problem with the INCLUDE ITSELF (unresolvable path, cycle, wrong
     // file shape) anchors on the `@include` line here; an error INSIDE
@@ -848,19 +941,13 @@ fn resolve_one_include(
                 let mut errs = Vec::new();
                 resolve_group_includes(&mut group, &included_fs, mode, in_progress, bodies, &mut errs);
                 in_progress.pop();
-                if !errs.is_empty() {
-                    // The file did not compile, so it is not registered: a
-                    // later site of it reports the same errors instead of
-                    // finding an id with no body behind it.
-                    bodies.paths.remove(&body_id);
-                    // Nested include errors already stamped with their own
-                    // file keep it; an unstamped one is about THIS file's
-                    // compiled source, which is the included file.
-                    return Err(errs
-                        .into_iter()
-                        .map(|e| e.in_file(Some(&canonical.to_string_lossy())))
-                        .collect());
-                }
+                // What a nested include left behind is pinned to the
+                // placeholder it left in this body (and a value on one of
+                // its sites' ports to that site): the body compiles around
+                // it, and only the places that need it are broken. An error
+                // already stamped with its own file keeps it; an unstamped
+                // one is about this body's file.
+                errors.extend(errs.into_iter().map(|e| e.in_file(Some(&canonical.to_string_lossy()))));
                 // A body is a shared definition, not the root of a
                 // standalone component: clear the flag so it cannot trip
                 // the component-validation rule (which treats a top-level
@@ -1586,8 +1673,12 @@ pub const RESERVED_CONFIG_KEYS: &[&str] = &[
 // SYNC: RESERVED_TYPE_KEYWORDS <-> packages/weft-syntax/weft.tmLanguage.json,
 // packages/weft-syntax/highlight-weft.js,
 // crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
-pub const RESERVED_TYPE_KEYWORDS: &[&str] =
-    &["Group", "Loop", weft_core::project::boundary_types::LOOP_IN, weft_core::project::boundary_types::LOOP_OUT];
+pub const RESERVED_TYPE_KEYWORDS: &[&str] = &[
+    weft_core::project::own_types::GROUP,
+    weft_core::project::own_types::LOOP,
+    weft_core::project::boundary_types::LOOP_IN,
+    weft_core::project::boundary_types::LOOP_OUT,
+];
 
 /// True iff `name` is one of the language's reserved type keywords.
 pub fn is_reserved_type_keyword(name: &str) -> bool {
@@ -3632,6 +3723,7 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid, errors: &mut Vec
         updated_at: now,
         defaults: Default::default(),
         given: Default::default(),
+        broken: Vec::new(),
     }
 }
 

@@ -24,7 +24,7 @@ async fn skipped_places(ctx: &Ctx, run_id: &str) -> anyhow::Result<Vec<Skipped>>
     use weft_core::run::scope::ScopeState;
     use weft_core::run::skip::SkipReason;
     let definition = ctx.project().ok()
-        .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
+        .and_then(|project| weft_compiler::hash::load_program(project).ok())
         .map(|(definition, _)| definition);
     let rows = super::versions::replay_rows(&ctx.client()?, run_id).await?;
     let mut skipped = Vec::new();

@@ -1697,10 +1697,13 @@ async fn reap_orphans(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
     // A copy the source no longer declares: the node is gone, or it
     // changed sides (a node no longer per instance leaves its instances'
-    // copies behind, a node now per instance leaves its shared one).
+    // copies behind, a node now per instance leaves its shared one). One
+    // a part that does not compile may be hiding is left alone
+    // (`DeclaredInfra::gone`): a typo in an included file must never cost
+    // the database inside it.
     let orphans: Vec<(String, Option<weft_core::instance::InstanceId>)> = rows
         .into_iter()
-        .filter(|r| !declared.declares(&r.node_id, r.instance.is_some()))
+        .filter(|r| declared.gone(&r.node_id, r.instance.is_some()))
         .map(|r| (r.node_id, r.instance))
         .collect();
     if orphans.is_empty() {

@@ -130,7 +130,7 @@ fn check_per_instance(project: &ProjectDefinition, catalog: &dyn MetadataCatalog
                      value, and a field each instance provides is written `@instance_filled`"
                 .to_string(),
         };
-        push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, "per-instance-ineligible",
+        push(d, &[node.part()], node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, "per-instance-ineligible",
             format!(
                 "'{name}' is marked `@per_instance`, but only an infra node exists once per instance (one \
                  container each); a {} runs nothing of its own to copy. {instead}",
@@ -158,7 +158,7 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         for (field, value) in &group.port_literals {
             if weft_core::instance::as_instance_filled(value).is_none() { continue; }
             let (span, file) = group_literal_anchor(group, field);
-            push(d, file, span, Severity::Error, "instance-filled-boundary",
+            push(d, &[group.id.as_str()], file, span, Severity::Error, "instance-filled-boundary",
                 boundary_message(&weft_core::project::plain_id(&group.id), field));
         }
     }
@@ -168,7 +168,7 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             for (key, value) in config {
                 if weft_core::instance::as_instance_filled(value).is_some() {
                     let (file, span) = cfg_anchor(node, key);
-                    push(d, file, span, Severity::Error, "instance-filled-not-an-input",
+                    push(d, &[node.part()], file, span, Severity::Error, "instance-filled-not-an-input",
                         format!("'{name}.{key}' is not an input of '{name}', so no instance's value can reach it; \
                                  only an input can be `@instance_filled`"));
                 }
@@ -177,11 +177,11 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         for (field, _) in weft_core::instance::instance_filled_fields(node) {
             let (file, span) = cfg_anchor(node, field);
             if node.group_boundary.is_some() {
-                push(d, file, span, Severity::Error, "instance-filled-boundary", boundary_message(name, field));
+                push(d, &[node.part()], file, span, Severity::Error, "instance-filled-boundary", boundary_message(name, field));
                 continue;
             }
             if has_incoming_edge(node, project, field) {
-                push(d, file, span, Severity::Error, "instance-filled-wired",
+                push(d, &[node.part()], file, span, Severity::Error, "instance-filled-wired",
                     format!("'{name}.{field}' is `@instance_filled` and also wired: each instance provides this \
                              value, so nothing else can drive it. Remove the wire, or the marker"));
             }
@@ -190,7 +190,7 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             let mut types = node.place_types.iter().filter_map(|place| place.inputs.get(field));
             if let Some(first) = types.next() {
                 if let Some(other) = types.find(|ty| *ty != first) {
-                    push(d, file, span, Severity::Error, "instance-filled-place-types",
+                    push(d, &[node.part()], file, span, Severity::Error, "instance-filled-place-types",
                         format!("'{name}.{field}' is `@instance_filled`, and the file it is in is included where \
                                  it takes {first} and where it takes {other}: one instance's value cannot be both. \
                                  Declare the field's type on the node"));
@@ -394,8 +394,11 @@ fn check_route_claims(
             .iter()
             .find(|group| group.id == second[parted])
             .expect("every site on a place's path is a call site group");
+        // Wrong only where both places run: the node and the two sites its
+        // places part at.
         push(
             d,
+            &[claim.node.part(), first[parted].as_str(), second[parted].as_str()],
             site.source_file.as_deref(),
             site.header_span.or(site.span).unwrap_or_default(),
             Severity::Error,
@@ -417,10 +420,13 @@ fn check_route_claims(
     claims.sort_by(|a, b| a.places[0].order.cmp(&b.places[0].order));
     for (index, claim) in claims.iter().enumerate() {
         for earlier in claims[..index].iter().filter(|earlier| collide(claim, earlier)) {
-            cfg_push(
+            // Wrong only in a program serving both.
+            let (file, span) = cfg_anchor(claim.node, claim.field);
+            push(
                 d,
-                claim.node,
-                claim.field,
+                &[earlier.node.part(), claim.node.part()],
+                file,
+                span,
                 Severity::Error,
                 "route-overlap",
                 format!(
@@ -570,7 +576,10 @@ fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnosti
     }
 
     let registry = weft_core::weft_type::TypeRegistry::current();
-    let mut seen: std::collections::HashMap<&str, (&WeftType, String)> =
+    // Per name, its first body, where it was written, and the node there:
+    // two bodies clash only in a program holding both nodes, so a cut
+    // keeping one of them sees one body.
+    let mut seen: std::collections::HashMap<&str, (&WeftType, String, &str)> =
         std::collections::HashMap::new();
     for node in &project.nodes {
         let span = node.header_span_or_default();
@@ -589,7 +598,7 @@ fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnosti
                     registry.lookup(name)
                 {
                     if declared.as_ref() != body {
-                        push(d, file, span, Severity::Error, "named-type-conflict",
+                        push(d, &[node.part()], file, span, Severity::Error, "named-type-conflict",
                             format!(
                                 "port '{site}' restates type `{name}` as `{body}`, but \
                                  it is declared as `{declared}`; a named type has one \
@@ -600,10 +609,10 @@ fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnosti
                 }
                 match seen.get(name) {
                     None => {
-                        seen.insert(name, (body, site));
+                        seen.insert(name, (body, site, node.part()));
                     }
-                    Some((first_body, first_site)) if *first_body != body => {
-                        push(d, file, span, Severity::Error, "named-type-conflict",
+                    Some((first_body, first_site, first_node)) if *first_body != body => {
+                        push(d, &[*first_node, node.part()], file, span, Severity::Error, "named-type-conflict",
                             format!(
                                 "type `{name}` appears with two different bodies: \
                                  `{first_body}` at '{first_site}' and `{body}` at \
@@ -668,7 +677,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         let file = node.source_file.as_deref();
         for port in &node.inputs {
             if generator_below_root(&port.port_type) {
-                push(d, file, span, Severity::Error, "generator-in-container",
+                push(d, &[node.part()], file, span, Severity::Error, "generator-in-container",
                     format!(
                         "input '{}.{}: {}': Generator[T] is a port type; a stream cannot \
                          sit inside a list, dict, record, or union",
@@ -687,7 +696,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
             if port.port_type.as_generator().is_some()
                 && (!port.required || port.default.is_some())
             {
-                push(d, file, span, Severity::Error, "generator-input-must-be-required",
+                push(d, &[node.part()], file, span, Severity::Error, "generator-input-must-be-required",
                     format!(
                         "input '{}.{}': a Generator input must be required and cannot \
                          have a default; a stream has no zero value, so an unwired \
@@ -698,7 +707,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         }
         for port in &node.outputs {
             if generator_below_root(&port.port_type) {
-                push(d, file, span, Severity::Error, "generator-in-container",
+                push(d, &[node.part()], file, span, Severity::Error, "generator-in-container",
                     format!(
                         "output '{}.{}: {}': Generator[T] is a port type; a stream cannot \
                          sit inside a list, dict, record, or union",
@@ -714,7 +723,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                     })
                     .count();
                 if consumers > 1 {
-                    push(d, file, span, Severity::Error, "generator-multiple-consumers",
+                    push(d, &[node.part()], file, span, Severity::Error, "generator-multiple-consumers",
                         format!(
                             "stream '{}.{}' feeds {consumers} inputs; a Generator output \
                              connects to exactly ONE consumer (a stream has one taker). \
@@ -745,14 +754,14 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
             for port in ports.iter().filter(|p| p.port_type.as_generator().is_some()) {
                 let port_name = &port.name;
                 if root_group_ids.contains(group.id.as_str()) {
-                    push(d, file, span, Severity::Error, "generator-through-group",
+                    push(d, &[group.id.as_str()], file, span, Severity::Error, "generator-through-group",
                         format!(
                             "'{port_name}' declares a stream on the project's {side} boundary; a \
                              run's inputs and outputs are values, not live edges. \
                              Produce (or consume) the stream inside the project instead",
                         ));
                 } else {
-                    push(d, file, span, Severity::Error, "generator-through-group",
+                    push(d, &[group.id.as_str()], file, span, Severity::Error, "generator-through-group",
                         format!(
                             "'{port_name}' carries a stream across the boundary of group \
                              '{}'; a stream is a live edge between two running nodes. Put the \
@@ -786,6 +795,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         }
         let span = edge.span.unwrap_or_default();
         let file = edge.source_file.as_deref();
+        let wire = [src.part(), tgt.part()];
         // A stream flowing into a generic `T` port would instantiate
         // the variable with a live handle nobody pulls (the consumer
         // receives the raw marker and hangs the producer at its buffer
@@ -805,7 +815,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
             let tgt_generic =
                 tgt_port.is_some_and(|p| p.port_type.contains_unresolved_leaf());
             if tgt_generic {
-                push(d, file, span, Severity::Error, "generator-into-generic-port",
+                push(d, &wire, file, span, Severity::Error, "generator-into-generic-port",
                     format!(
                         "edge '{}.{} -> {}.{}': the source is a stream, and the target \
                          declares '{}', a generic type that cannot consume one. A stream \
@@ -832,7 +842,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
             let src_generic =
                 src_port.is_some_and(|p| p.port_type.contains_unresolved_leaf());
             if src_generic {
-                push(d, file, span, Severity::Error, "generator-into-generic-port",
+                push(d, &wire, file, span, Severity::Error, "generator-into-generic-port",
                     format!(
                         "edge '{}.{} -> {}.{}': the target is a stream port, and the \
                          source declares '{}', a generic type that cannot produce one. \
@@ -859,7 +869,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         let banned_endpoint =
             tgt.node_type == weft_core::project::boundary_types::LOOP_OUT || (src.node_type == weft_core::project::boundary_types::LOOP_OUT && src_generator);
         if banned_endpoint {
-            push(d, file, span, Severity::Error, "generator-through-group",
+            push(d, &wire, file, span, Severity::Error, "generator-through-group",
                 format!(
                     "edge '{}.{} -> {}.{}' carries a stream across a loop boundary; a \
                      stream is a live edge between two running nodes. Put the producer \
@@ -954,7 +964,13 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                             let through = spell(&child);
                             if reported.insert(through.clone()) {
                                 let (file, span) = anchor(&child);
-                                push(d, file, span, Severity::Error, "graph-cycle",
+                                // The cycle is wrong only with every part on
+                                // it kept: the stack from the place the back
+                                // edge returns to up to the one it leaves.
+                                let from = stack.iter().position(|(on, _)| *on == child)
+                                    .expect("an in-stack place is on the stack");
+                                let on_cycle: Vec<&str> = stack[from..].iter().map(|(on, _)| part_by_id(project, &on.id)).collect();
+                                push(d, &on_cycle, file, span, Severity::Error, "graph-cycle",
                                     format!(
                                         "the wires form a cycle through '{through}'; a wire graph \
                                          must be acyclic (iterate with a Loop, exchange feedback \
@@ -1011,7 +1027,7 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             ),
             None => format!("{what} '{}' is inside a Loop; {why}", author_name(node)),
         };
-        push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, code, message);
+        push(d, &[node.part()], node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, code, message);
     }
 
     // trigger-into-trigger / trigger-into-infra: walk downstream from each
@@ -1029,8 +1045,11 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             }
             let (file, span) = anchor(&place);
             let (from, to) = (spell(trigger), spell(&place));
+            // The two ends: the wires between them are only in a cut that
+            // keeps both, and naming those too would need the path.
+            let ends = [part_by_id(project, &trigger.id), part_by_id(project, &place.id)];
             if is_trigger(&place) && flagged.insert((from.clone(), to.clone(), "trigger")) {
-                push(d, file, span, Severity::Error, "trigger-into-trigger",
+                push(d, &ends, file, span, Severity::Error, "trigger-into-trigger",
                     format!(
                         "trigger '{from}' is wired into trigger '{to}'; a trigger's \
                          inputs snapshot at setup, so another trigger's output can never \
@@ -1038,7 +1057,7 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     ));
             }
             if is_infra(&place) && flagged.insert((from.clone(), to.clone(), "infra")) {
-                push(d, file, span, Severity::Error, "trigger-into-infra",
+                push(d, &ends, file, span, Severity::Error, "trigger-into-infra",
                     format!(
                         "trigger '{from}' is wired into infra node '{to}'; \
                          provisioning happens before any fire exists, so the value can \
@@ -1070,6 +1089,7 @@ fn check_reserved_names(
         if catalog.lookup(local).is_some() {
             push(
                 out,
+                &[id],
                 file,
                 span.unwrap_or_default(),
                 Severity::Error,
@@ -1210,11 +1230,17 @@ fn emit_rule_diagnostic(
         ValidationLevel::Structural => "rule-structural",
         ValidationLevel::Runtime => "rule-runtime",
     };
-    out.push(Diagnostic::at(span, severity, code, message).in_file(node.source_file.as_deref()));
+    push(out, &[node.part()], node.source_file.as_deref(), span, severity, code, message);
 }
 
+/// `about` is what the finding is about (`Diagnostic::subjects`), by part
+/// id (`NodeDefinition::part`, [`part_by_id`]): the node, the group, or a wire's two
+/// ends, every one of which a cut has to keep to hit the problem. Passed
+/// at every call, so no finding can forget it; empty only where no part is
+/// there to name, which stops every command.
 fn push(
     d: &mut Vec<Diagnostic>,
+    about: &[&str],
     file: Option<&str>,
     span: Span,
     severity: Severity,
@@ -1226,8 +1252,21 @@ fn push(
     // validate diagnostics get the same ranged underlines the parse layer does.
     // `file` is the anchor's `source_file` (set when an @include spliced it
     // out of another file), so the finding names the file its coordinates
-    // live in.
-    d.push(Diagnostic::at(span, severity, code, message).in_file(file));
+    // live in. A part named twice (a wire between a loop's two boundaries)
+    // is one subject.
+    let mut subjects: Vec<&str> = Vec::with_capacity(about.len());
+    for id in about {
+        if !subjects.contains(id) {
+            subjects.push(id);
+        }
+    }
+    d.push(Diagnostic::at(span, severity, code, message).in_file(file).about(subjects));
+}
+
+/// `NodeDefinition::part` for an id a wire names: a node's part, or the id
+/// as it is (a group's, for a wire at its port or gate).
+pub(crate) fn part_by_id<'a>(project: &'a ProjectDefinition, id: &'a str) -> &'a str {
+    project.nodes.iter().find(|n| n.id == id).map(NodeDefinition::part).unwrap_or(id)
 }
 
 /// The anchor for a finding about one CONFIG entry: the entry's own
@@ -1254,7 +1293,7 @@ fn cfg_push(
     message: impl Into<String>,
 ) {
     let (file, span) = cfg_anchor(node, key);
-    push(d, file, span, severity, code, message);
+    push(d, &[node.part()], file, span, severity, code, message);
 }
 
 // ─── group 1: structural integrity ──────────────────────────────────────────
@@ -1274,6 +1313,7 @@ fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         match seen.get(node.id.as_str()) {
             Some(first_line) => push(
                 d,
+                &[node.id.as_str()],
                 file,
                 span,
                 Severity::Error,
@@ -1321,6 +1361,7 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
                 };
                 push(
                     d,
+                    &[node.part()],
                     file,
                     span,
                     Severity::Error,
@@ -1356,6 +1397,7 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
             let (span, file) = group_literal_anchor(group, name);
             push(
                 d,
+                &[group.id.as_str()],
                 file,
                 span,
                 Severity::Error,
@@ -1402,6 +1444,7 @@ fn check_two_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if driven(SHOULD_FLOW_PORT) && driven(SHOULD_NOT_FLOW_PORT) {
             push(
                 d,
+                &[node.part()],
                 node.source_file.as_deref(),
                 node.header_span_or_default(),
                 Severity::Error,
@@ -1422,6 +1465,7 @@ fn check_two_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if driven(SHOULD_FLOW_PORT) && driven(SHOULD_NOT_FLOW_PORT) {
             push(
                 d,
+                &[group.id.as_str()],
                 group.source_file.as_deref(),
                 group.header_span.or(group.span).unwrap_or_default(),
                 Severity::Error,
@@ -1514,6 +1558,25 @@ fn lines(project: &ProjectDefinition) -> Vec<Line> {
     out
 }
 
+impl LineEnd {
+    /// The part this end is on ([`part_by_id`]): a node's, or the group's
+    /// whose port or gate it is.
+    fn part<'a>(&'a self, project: &'a ProjectDefinition) -> &'a str {
+        match self {
+            LineEnd::Node { id, .. } => part_by_id(project, id),
+            LineEnd::Port { group, .. } | LineEnd::Gate { group, .. } => group,
+        }
+    }
+}
+
+impl Line {
+    /// The parts of both ends: a cut carries the line only when it keeps
+    /// both.
+    fn parts<'a>(&'a self, project: &'a ProjectDefinition) -> [&'a str; 2] {
+        [self.from.part(project), self.to.part(project)]
+    }
+}
+
 /// The scope a line's end is in: a node's innermost group (a loop's own
 /// boundaries sit in the scope around their loop), a group port seen from
 /// outside the group's parent's, from inside the group itself, and a gate
@@ -1549,9 +1612,18 @@ fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     for edge in &project.edges {
         let span = edge.span.unwrap_or_default();
         let file = edge.source_file.as_deref();
+        // About the end that exists, whose wire leads nowhere: an id no part
+        // carries is in no cut. A wire with neither end is about no part,
+        // so the whole program answers for it.
+        let known: Vec<&str> = [edge.source.as_str(), edge.target.as_str()]
+            .into_iter()
+            .filter(|id| ids.contains(id))
+            .map(|id| part_by_id(project, id))
+            .collect();
         if !ids.contains(edge.source.as_str()) {
             push(
                 d,
+                &known,
                 file,
                 span,
                 Severity::Error,
@@ -1562,6 +1634,7 @@ fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if !ids.contains(edge.target.as_str()) {
             push(
                 d,
+                &known,
                 file,
                 span,
                 Severity::Error,
@@ -1593,6 +1666,7 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
         }
         push(
             d,
+            &line.parts(project),
             line.file.as_deref(),
             line.span,
             Severity::Error,
@@ -1677,7 +1751,7 @@ fn holds_a_marker(value: &serde_json::Value) -> bool {
 /// node the loop's, since the boundary's own id (`my__in`, `my__out`)
 /// appears nowhere in the source.
 fn author_name(node: &weft_core::project::NodeDefinition) -> &str {
-    node.group_boundary.as_ref().map(|b| b.group_id.as_str()).unwrap_or(&node.id)
+    node.part()
 }
 
 /// `author_name` for a node an edge names by id. An id no node carries
@@ -1734,7 +1808,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                         Some(s) => format!("node '{}' has no output port '{port}'. Did you mean '{s}'?", author_name(src)),
                         None => format!("node '{}' has no output port '{port}'. Available: [{}]", author_name(src), names.join(", ")),
                     });
-                    push(d, file, span, Severity::Error, "unknown-source-port", msg);
+                    push(d, &line.parts(project), file, span, Severity::Error, "unknown-source-port", msg);
                 }
             }
             LineEnd::Port { group, port, side, inner } => {
@@ -1744,7 +1818,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     // read outside: the group's output.
                     let hint = inner.then(|| enclosing_scope_hint(project, group, port)).flatten();
                     let msg = hint.unwrap_or_else(|| unknown_group_port(group, *side, port, &names));
-                    push(d, file, span, Severity::Error, "unknown-source-port", msg);
+                    push(d, &line.parts(project), file, span, Severity::Error, "unknown-source-port", msg);
                 }
             }
             LineEnd::Gate { .. } => {}
@@ -1758,13 +1832,13 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                         Some(s) => format!("node '{}' has no input port '{port}'. Did you mean '{s}'?", author_name(tgt)),
                         None => format!("node '{}' has no input port '{port}'. Available: [{}]", author_name(tgt), names.join(", ")),
                     };
-                    push(d, file, span, Severity::Error, "unknown-target-port", msg);
+                    push(d, &line.parts(project), file, span, Severity::Error, "unknown-target-port", msg);
                 }
             }
             LineEnd::Port { group, port, side, .. } => {
                 let Some(names) = group_ports(group, *side) else { continue };
                 if !names.contains(&port.as_str()) {
-                    push(d, file, span, Severity::Error, "unknown-target-port", unknown_group_port(group, *side, port, &names));
+                    push(d, &line.parts(project), file, span, Severity::Error, "unknown-target-port", unknown_group_port(group, *side, port, &names));
                 }
             }
             LineEnd::Gate { .. } => {}
@@ -1776,6 +1850,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if let Some(first) = seen.get(&line.to) {
             push(
                 d,
+                &[line.to.part(project)],
                 line.file.as_deref(),
                 line.span,
                 Severity::Error,
@@ -1837,18 +1912,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// unresolved-typevar: a connected port still has a TypeVar after
 ///   enrichment (couldn't be resolved from context).
 fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    /// A typed point a wire's type is held to: the type, how a message
+    /// names it, and the part it is on.
+    type Stop<'p> = (WeftType, String, &'p str);
     let by_id: std::collections::HashMap<&str, &weft_core::project::NodeDefinition> =
         project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let graph = weft_core::project::graph::ProjectGraph::new(project);
     // The concrete type a group port declares where a wire crosses it (a
     // group inside an included file has the types the site gave it), and
-    // how a message names the port. `None` for an open type.
-    let declared = |crossing: &weft_core::project::Crossing, at: &weft_core::frames::Located| -> Option<(WeftType, String)> {
+    // how a message names the port, and the group (a stretch's end). `None`
+    // for an open type.
+    let declared = |crossing: &weft_core::project::Crossing, at: &weft_core::frames::Located| -> Option<Stop> {
         let g = project.groups.iter().find(|g| g.id == crossing.group)?;
         let types = g.types_at(&at.path);
         let port_type = if crossing.side == weft_core::project::CrossingSide::In { types.input(&crossing.port) } else { types.output(&crossing.port) }?;
         (!port_type.contains_unresolved_leaf())
-            .then(|| (port_type.clone(), format!("{}.{}", weft_core::project::plain_id(&g.id), crossing.port)))
+            .then(|| (port_type.clone(), format!("{}.{}", weft_core::project::plain_id(&g.id), crossing.port), g.id.as_str()))
     };
 
     // Every wire at every place it runs: a wire inside an included file
@@ -1859,9 +1938,10 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         let Some(src) = by_id.get(edge.source.as_str()) else { continue };
         let Some(tgt) = by_id.get(edge.target.as_str()) else { continue };
         let (file, span) = (edge.source_file.as_deref(), edge.span.unwrap_or_default());
+        let wire = [src.part(), tgt.part()];
         let mut push = |code: &str, message: String| {
             if reported.insert((edge.id.clone(), message.clone())) {
-                push(d, file, span, Severity::Error, code, message);
+                push(d, &wire, file, span, Severity::Error, code, message);
             }
         };
         let Some(src_port) = src
@@ -1981,16 +2061,17 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // target's), each stretch on the line that lands at its end. A group
     // port of an open type (a type variable the group passes through)
     // declares nothing, so a stretch runs on past it. A line several wires
-    // carry is reported once.
+    // carry is reported once, about the two parts the stretch runs between.
     let mut reported: std::collections::HashSet<(Option<String>, usize, usize, String, String)> = Default::default();
-    let mut check = |from: &(WeftType, String), path: &[String], to: &(WeftType, String), span: Span, file: Option<&str>| {
+    let mut check = |from: &Stop, path: &[String], to: &Stop, span: Span, file: Option<&str>| {
+        let stretch = [from.2, to.2];
         if !reported.insert((file.map(str::to_string), span.start_line, span.start_column, from.1.clone(), to.1.clone())) {
             return;
         }
         let from_type = match weft_core::deref::walk_path(&from.0, path) {
             Ok(t) => t,
             Err(e) => {
-                push(d, file, span, Severity::Error, "deref-path",
+                push(d, &stretch, file, span, Severity::Error, "deref-path",
                     format!("cannot read '{}.{}': {e}", from.1, path.join(".")));
                 return;
             }
@@ -1999,7 +2080,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             return;
         }
         if !weft_core::weft_type::WeftType::is_compatible(&from_type, &to.0) {
-            push(d, file, span, Severity::Error, "type-mismatch",
+            push(d, &stretch, file, span, Severity::Error, "type-mismatch",
                 format!("cannot connect '{}: {from_type}' to '{}: {}'", from.1, to.1, to.0));
         }
     };
@@ -2007,18 +2088,18 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // it; a wire that stops at a group port nobody reads too.
     for (edge, source, target) in weft_core::project::places::wires_at_places(project) {
         let crossed = weft_core::project::places::crossing_places(&graph, edge, &source);
-        let stops: Vec<(usize, (WeftType, String))> = edge.via.iter().zip(&crossed).enumerate()
+        let stops: Vec<(usize, Stop)> = edge.via.iter().zip(&crossed).enumerate()
             .filter_map(|(k, (crossing, at))| declared(crossing, at).map(|typed| (k, typed))).collect();
         // With none, the wire is checked end to end above.
         let Some(&(last, _)) = stops.last() else { continue };
         // Where the stretch being checked starts: the source node's port
         // (`None`), then each declared crossing in turn.
-        let mut from: Option<(Option<usize>, (WeftType, String))> = if edge.from_group_port() {
+        let mut from: Option<(Option<usize>, Stop)> = if edge.from_group_port() {
             None
         } else {
             by_id.get(edge.source.as_str()).and_then(|src| {
                 let port_type = src.types_at(&source.path).output(edge.source_port())?;
-                Some((None, (port_type.clone(), format!("{}.{}", author_name(src), edge.source_port()))))
+                Some((None, (port_type.clone(), format!("{}.{}", author_name(src), edge.source_port()), src.part())))
             })
         };
         for (k, typed) in &stops {
@@ -2037,7 +2118,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // A port that takes no wire: input-accepts owns that.
         if !p.accepts.wire { continue; }
         let Some(port_type) = tgt.types_at(&target.path).input(&p.name) else { continue };
-        let to = (port_type.clone(), format!("{}.{}", author_name(tgt), p.name));
+        let to = (port_type.clone(), format!("{}.{}", author_name(tgt), p.name), tgt.part());
         check(start, &edge.path_after(last), &to, edge.span.unwrap_or_default(), edge.source_file.as_deref());
     }
 
@@ -2054,7 +2135,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             if !weft_core::weft_type::WeftType::is_compatible(&inferred, &input.port_type) {
                 if let Err(why) = input.port_type.cast_value(value) {
                     let (span, file) = group_literal_anchor(group, key);
-                    push(d, file, span, Severity::Error, "config-type-mismatch",
+                    push(d, &[group.id.as_str()], file, span, Severity::Error, "config-type-mismatch",
                         format!(
                             "'{}.{key}: {inferred}' incompatible with input type '{}': {why}",
                             weft_core::project::plain_id(&group.id), input.port_type,
@@ -2080,7 +2161,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             &input.port_type,
             &output.port_type,
         ) {
-            push(d, node.source_file.as_deref(), node.header_span_or_default(),
+            push(d, &[node.part()], node.source_file.as_deref(), node.header_span_or_default(),
                 Severity::Error, "cast-not-allowed", e);
         }
     }
@@ -2143,7 +2224,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 )
             {
                 if let Err(why) = input.widget.as_ref().expect("matched above").check_handle_shape(value) {
-                    push(d, file, span, Severity::Error, "config-type-mismatch",
+                    push(d, &[node.part()], file, span, Severity::Error, "config-type-mismatch",
                         format!("config '{}.{}': {why}", author_name(node), key));
                 }
                 continue;
@@ -2157,7 +2238,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             // compile pass will cast it), so no diagnostic fires.
             if !weft_core::weft_type::WeftType::is_compatible(&inferred, &input.port_type) {
                 if let Err(why) = input.port_type.cast_value(value) {
-                    push(d, file, span, Severity::Error, "config-type-mismatch",
+                    push(d, &[node.part()], file, span, Severity::Error, "config-type-mismatch",
                         format!(
                             "config '{}.{}: {}' incompatible with input type '{}': {}",
                             author_name(node), key, inferred, input.port_type, why,
@@ -2182,7 +2263,9 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// there (`root` is `component_root`).
 fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &mut Vec<Diagnostic>) {
     let fed = |at: &weft_core::frames::Located, port: &str| gets_value(project, &at.id, port);
-    let report = |d: &mut Vec<Diagnostic>, group: &str, name: &str, need: weft_core::project::places::Need, file: Option<&str>, span: Span| {
+    // `container` is the group's id, which the finding is about (a loop's
+    // too, whose `LoopIn` holds the ports); `group` is how it is named.
+    let report = |d: &mut Vec<Diagnostic>, container: &str, group: &str, name: &str, need: weft_core::project::places::Need, file: Option<&str>, span: Span| {
         let (needer, port) = need.needer;
         let why = match &need.one_of {
             None => "a required input".to_string(),
@@ -2190,6 +2273,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
         };
         push(
             d,
+            &[container],
             file,
             span,
             Severity::Error,
@@ -2214,7 +2298,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
                 .find_map(|e| weft_core::project::places::required_consumer(
                     project, &weft_core::frames::Located::top(&e.target), e.target_port(), &|_, _| true, &|_| false, &fed));
             if let Some(need) = need {
-                report(d, &weft_core::project::plain_id(&group.id), &input.name, need, group.source_file.as_deref(),
+                report(d, &group.id, &weft_core::project::plain_id(&group.id), &input.name, need, group.source_file.as_deref(),
                     group.header_span.or(group.span).unwrap_or_default());
             }
         }
@@ -2237,7 +2321,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
             }
             let at = weft_core::frames::Located::top(&node.id);
             if let Some(need) = weft_core::project::places::required_consumer(project, &at, &input.name, &|_, _| true, &|_| false, &fed) {
-                report(d, author_name(node), &input.name, need, node.source_file.as_deref(), node.header_span_or_default());
+                report(d, node.part(), author_name(node), &input.name, need, node.source_file.as_deref(), node.header_span_or_default());
             }
         }
     }
@@ -2254,6 +2338,7 @@ fn check_group_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             let (span, file) = group_literal_anchor(group, key);
             push(
                 d,
+                &[group.id.as_str()],
                 file,
                 span,
                 Severity::Error,
@@ -2355,18 +2440,22 @@ fn check_port_coverage(
                     None => (file, span),
                 }
             };
-            let edge_anchor = || -> (Option<&str>, Span) {
+            let edge_anchor = || -> (Vec<&str>, Option<&str>, Span) {
                 // Anchor on the offending EDGE where it has a span, and
                 // take the edge's own file with it: the wire may be
                 // written in a different file than the node it lands on.
-                let culprit = project
+                // The finding is about the wire, so it names both ends.
+                let wire = project
                     .edges
                     .iter()
-                    .find(|e| e.target == node.id && e.target_handle.as_deref() == Some(&input.name))
-                    .filter(|e| e.span.is_some());
-                match culprit {
-                    Some(e) => (e.source_file.as_deref(), e.span.unwrap()),
-                    None => (file, span),
+                    .find(|e| e.target == node.id && e.target_handle.as_deref() == Some(&input.name));
+                let ends = match wire {
+                    Some(e) => vec![part_by_id(project, &e.source), node.part()],
+                    None => vec![node.part()],
+                };
+                match wire.filter(|e| e.span.is_some()) {
+                    Some(e) => (ends, e.source_file.as_deref(), e.span.unwrap()),
+                    None => (ends, file, span),
                 }
             };
 
@@ -2384,15 +2473,15 @@ fn check_port_coverage(
                     author_name(node), input.name
                 );
                 if has_edge {
-                    let (edge_file, edge_span) = edge_anchor();
-                    push(d, edge_file, edge_span, Severity::Error, "input-accepts", fix.clone());
+                    let (ends, edge_file, edge_span) = edge_anchor();
+                    push(d, &ends, edge_file, edge_span, Severity::Error, "input-accepts", fix.clone());
                 }
                 // A text marker was already read into its value by the
                 // compile; the field's file-ref record is what remains of
                 // it, so the record counts as the marker it came from.
                 if literal.is_some_and(holds_a_marker) || node.file_refs.contains_key(&input.name) {
                     let (lit_file, lit_span) = literal_anchor();
-                    push(d, lit_file, lit_span, Severity::Error, "input-accepts", fix);
+                    push(d, &[node.part()], lit_file, lit_span, Severity::Error, "input-accepts", fix);
                 }
             }
 
@@ -2401,9 +2490,10 @@ fn check_port_coverage(
             // double-driven-port owns it ("remove one driver" is the
             // accurate advice), so the family check stays silent then.
             if has_edge && !has_literal && !accepts.wire {
-                let (edge_file, edge_span) = edge_anchor();
+                let (ends, edge_file, edge_span) = edge_anchor();
                 push(
                     d,
+                    &ends,
                     edge_file,
                     edge_span,
                     Severity::Error,
@@ -2418,6 +2508,7 @@ fn check_port_coverage(
                 let (lit_file, lit_span) = literal_anchor();
                 push(
                     d,
+                    &[node.part()],
                     lit_file,
                     lit_span,
                     Severity::Error,
@@ -2439,6 +2530,7 @@ fn check_port_coverage(
                     let (lit_file, lit_span) = literal_anchor();
                     push(
                         d,
+                        &[node.part()],
                         lit_file,
                         lit_span,
                         Severity::Error,
@@ -2457,6 +2549,7 @@ fn check_port_coverage(
             if input.required && !has_edge && !has_literal && input.default.is_none() {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     span,
                     Severity::Error,
@@ -2496,6 +2589,7 @@ fn check_port_coverage(
                     let (lit_file, lit_span) = literal_span();
                     push(
                         d,
+                        &[node.part()],
                         lit_file,
                         lit_span,
                         Severity::Error,
@@ -2539,6 +2633,7 @@ fn check_port_coverage(
                     .collect();
                 push(
                     d,
+                    &[node.part()],
                     file,
                     span,
                     Severity::Error,
@@ -2560,6 +2655,7 @@ fn check_port_coverage(
             if !any_met {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     span,
                     Severity::Error,
@@ -2617,6 +2713,7 @@ fn check_port_coverage(
                 if known_outputs.contains(key.as_str()) {
                     push(
                         d,
+                        &[node.part()],
                         key_file,
                         key_span,
                         Severity::Error,
@@ -2631,6 +2728,7 @@ fn check_port_coverage(
                 }
                 push(
                     d,
+                    &[node.part()],
                     key_file,
                     key_span,
                     Severity::Error,
@@ -2662,6 +2760,7 @@ fn check_port_coverage(
                 if !seen.insert(name) {
                     push(
                         d,
+                        &[node.part()],
                         file,
                         span,
                         Severity::Error,
@@ -2710,6 +2809,7 @@ fn check_config_derived_ports(
         let Some(entries) = raw.as_array() else {
             push(
                 d,
+                &[node.part()],
                 file,
                 key_span,
                 Severity::Error,
@@ -2729,6 +2829,7 @@ fn check_config_derived_ports(
             let Some(obj) = entry.as_object() else {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     key_span,
                     Severity::Error,
@@ -2746,6 +2847,7 @@ fn check_config_derived_ports(
             let Some(spec) = ports_from_config.spec_for(kind) else {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     key_span,
                     Severity::Error,
@@ -2767,6 +2869,7 @@ fn check_config_derived_ports(
             if port_name.is_empty() {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     key_span,
                     Severity::Error,
@@ -2793,6 +2896,7 @@ fn check_config_derived_ports(
             for key in &unknown {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     key_span,
                     Severity::Error,
@@ -2843,6 +2947,7 @@ fn check_config_derived_ports(
                         if empty_choice_set {
                             push(
                                 d,
+                                &[node.part()],
                                 file,
                                 key_span,
                                 Severity::Error,
@@ -2862,6 +2967,7 @@ fn check_config_derived_ports(
                         {
                             push(
                                 d,
+                                &[node.part()],
                                 file,
                                 key_span,
                                 Severity::Error,
@@ -2879,6 +2985,7 @@ fn check_config_derived_ports(
                     }
                     None if field.required => push(
                         d,
+                        &[node.part()],
                         file,
                         key_span,
                         Severity::Error,
@@ -2901,6 +3008,7 @@ fn check_config_derived_ports(
                 match catch_all_at {
                     Some(first) => push(
                         d,
+                        &[node.part()],
                         file,
                         key_span,
                         Severity::Error,
@@ -2922,6 +3030,7 @@ fn check_config_derived_ports(
             if at + 1 != entries.len() {
                 push(
                     d,
+                    &[node.part()],
                     file,
                     key_span,
                     Severity::Error,
@@ -3072,14 +3181,14 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     }
     for (gid, in_node) in &ins {
         if !outs.contains_key(gid) {
-            push(d, in_node.source_file.as_deref(), in_node.header_span_or_default(),
+            push(d, &[*gid], in_node.source_file.as_deref(), in_node.header_span_or_default(),
                 Severity::Error, "loop-boundary-unpaired",
                 format!("loop '{gid}' has LoopIn but no matching LoopOut"));
         }
     }
     for (gid, out_node) in &outs {
         if !ins.contains_key(gid) {
-            push(d, out_node.source_file.as_deref(), out_node.header_span_or_default(),
+            push(d, &[*gid], out_node.source_file.as_deref(), out_node.header_span_or_default(),
                 Severity::Error, "loop-boundary-unpaired",
                 format!("loop '{gid}' has LoopOut but no matching LoopIn"));
         }
@@ -3193,7 +3302,7 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // parallel-with-done: in parallel mode, any `self.done` write
         // inside THIS loop's body is rejected.
         if parallel && done_wired {
-            push(d, file, span, Severity::Error, "parallel-with-done",
+            push(d, &[*gid], file, span, Severity::Error, "parallel-with-done",
                 format!("loop '{gid}': parallel: true forbids `self.done = ...` connections in the body"));
         }
 
@@ -3203,7 +3312,7 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // Reject at compile time. A loop that has ANY of the three is
         // the user's own program: trusted, unbounded by the runtime.
         if lists_ok && !parallel && over.is_empty() && cfg.get("maxIters").is_none() && !done_wired {
-            push(d, file, span, Severity::Error, "loop-unbounded-no-termination",
+            push(d, &[*gid], file, span, Severity::Error, "loop-unbounded-no-termination",
                 format!(
                     "loop '{gid}': sequential loop declares no 'over', no 'maxIters', and \
                      never writes `self.done`; it can never terminate. Iterate a list with \
@@ -3224,13 +3333,13 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // Reserved port names: 'index' as user input, 'done' as user output.
         for port in &in_node.inputs {
             if port.name == "index" {
-                push(d, file, span, Severity::Error, "reserved-port-name",
+                push(d, &[*gid], file, span, Severity::Error, "reserved-port-name",
                     format!("loop '{gid}': 'index' is reserved (the implicit per-iteration index port)"));
             }
         }
         for port in &out_node.outputs {
             if port.name == "done" {
-                push(d, file, span, Severity::Error, "reserved-port-name",
+                push(d, &[*gid], file, span, Severity::Error, "reserved-port-name",
                     format!("loop '{gid}': 'done' is reserved (the implicit done-vote port)"));
             }
         }
@@ -3245,7 +3354,7 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 continue;
             }
             if !is_list_of_nullable(&port.port_type) {
-                push(d, file, span, Severity::Error, "gather-output-must-be-nullable",
+                push(d, &[*gid], file, span, Severity::Error, "gather-output-must-be-nullable",
                     format!(
                         "loop '{gid}': gather output '{}' must be declared as List[T | Null] (was {}); per-iteration body failures produce null slots",
                         port.name, port.port_type,
@@ -3293,7 +3402,7 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // iteration (it is a live edge with one taker).
         for port in &in_node.inputs {
             if port.port_type.as_generator().is_some() && !over.contains(&port.name) {
-                push(d, file, span, Severity::Error, "generator-not-iterated",
+                push(d, &[*gid], file, span, Severity::Error, "generator-not-iterated",
                     format!(
                         "loop '{gid}': Generator input '{}' must be iterated (`over: \
                          [\"{}\"]`); a stream cannot broadcast into the loop body",
@@ -3423,6 +3532,7 @@ fn check_run_decided(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         let name = author_name(node);
         push(
             d,
+            &[node.part()],
             node.source_file.as_deref(),
             node.header_span_or_default(),
             Severity::Error,
@@ -3513,6 +3623,7 @@ fn check_type_bounds(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             if let Some(why) = param.violation().filter(|why| reported.insert(why.clone())) {
                 push(
                     d,
+                    &[node.part()],
                     node.source_file.as_deref(),
                     node.header_span_or_default(),
                     Severity::Error,
@@ -3531,6 +3642,7 @@ fn check_type_bounds(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             if let Some(why) = param.violation().filter(|why| reported.insert(why.clone())) {
                 push(
                     d,
+                    &[group.id.as_str()],
                     group.source_file.as_deref(),
                     group.header_span.or(group.span).unwrap_or_default(),
                     Severity::Error,
@@ -3645,6 +3757,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     let (key_file, key_span) = cfg_anchor(node, key);
                     push(
                         d,
+                        &[node.part()],
                         key_file,
                         key_span,
                         Severity::Warning,
@@ -3695,13 +3808,13 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
     }
     // One finding per name on one owner, so a port declared on both
     // sides of a header (`(text) -> (text)`) warns once.
-    let warn = |d: &mut Vec<Diagnostic>, file: Option<&str>, span: Span, seen: &mut Vec<String>, what: &str, name: &str| {
+    let warn = |d: &mut Vec<Diagnostic>, about: &str, file: Option<&str>, span: Span, seen: &mut Vec<String>, what: &str, name: &str| {
         if seen.iter().any(|s| s == name) {
             return;
         }
         if let Err(message) = Casing::Camel.check(what, name) {
             seen.push(name.to_string());
-            push(d, file, span, Severity::Warning, "not-camel-case", message);
+            push(d, &[about], file, span, Severity::Warning, "not-camel-case", message);
         }
     };
 
@@ -3715,7 +3828,7 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         let name = local(&node.id);
         if !name.contains("__") {
             let what = if node.include_path.is_some() { "include" } else { "node" };
-            warn(d, file, span, &mut seen, what, name);
+            warn(d, node.part(), file, span, &mut seen, what, name);
         }
         let meta = catalog.lookup(&node.node_type);
         if meta.is_some_and(|m| m.features.added_ports_are_data_keys) {
@@ -3741,7 +3854,7 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         let mut seen_ports = Vec::new();
         for port in ports {
             if !is_gate_port(&port.name) {
-                warn(d, file, span, &mut seen_ports, "port", &port.name);
+                warn(d, node.part(), file, span, &mut seen_ports, "port", &port.name);
             }
         }
     }
@@ -3757,7 +3870,7 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         };
         let mut seen = Vec::new();
         if !group.anonymous && !matches!(group.kind, weft_core::project::GroupKind::Body) {
-            warn(d, file, span, &mut seen, what, local(&group.id));
+            warn(d, &group.id, file, span, &mut seen, what, local(&group.id));
         }
         if matches!(group.kind, weft_core::project::GroupKind::Call { .. }) {
             continue;
@@ -3765,7 +3878,7 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         let mut seen_ports = Vec::new();
         for port in group.in_ports.iter().chain(&group.out_ports) {
             if !port.synthesized_from_carry && !is_gate_port(&port.name) {
-                warn(d, file, span, &mut seen_ports, "port", &port.name);
+                warn(d, &group.id, file, span, &mut seen_ports, "port", &port.name);
             }
         }
     }
@@ -3902,11 +4015,13 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             if count <= LEVEL_WARN_AT {
                 continue;
             }
-            let (name, anchor) = if is_top {
+            // About the group whose inside it is, or for the top level every
+            // item of the crowded part.
+            let (name, anchor, about) = if is_top {
                 // The top level has no header of its own; the part's
                 // first item carries the warning.
                 let first = unit.first().expect("a crowded branch has a first item");
-                ("one connected part of the top level".to_string(), anchor_of[first])
+                ("one connected part of the top level".to_string(), anchor_of[first], unit.clone())
             } else {
                 // A sub level is a group's inside, and the group is an
                 // item of its parent level: its header carries the warning.
@@ -3916,15 +4031,16 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 let gid = scope.last().expect("a sub level is a group's scope");
                 let body = groups_by_id.get(gid.as_str()).is_some_and(|g| matches!(g.kind, weft_core::project::GroupKind::Body));
                 match anchor_of.get(gid.as_str()).filter(|_| !body) {
-                    Some(group) => (format!("the inside of '{}'", weft_core::project::plain_id(gid)), *group),
+                    Some(group) => (format!("the inside of '{}'", weft_core::project::plain_id(gid)), *group, vec![gid.as_str()]),
                     None => {
                         let first = unit.first().expect("a crowded level has a first item");
-                        ("this included file".to_string(), anchor_of[first])
+                        ("this included file".to_string(), anchor_of[first], vec![gid.as_str()])
                     }
                 }
             };
             push(
                 d,
+                &about,
                 anchor.0,
                 anchor.1.unwrap_or_default(),
                 Severity::Warning,

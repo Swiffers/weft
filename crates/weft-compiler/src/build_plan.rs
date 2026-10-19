@@ -54,6 +54,12 @@ pub struct PlannedImage {
     /// runs it (the worker's builder base and compile cache; nothing for an
     /// infra image).
     pub uses: weft_core::images::BuildUses,
+    /// The file the built image keeps for the install to read after the
+    /// build: the worker's record of the node packages it left out
+    /// (`weft_core::builds::LEFT_OUT_RECORD_PATH`) when its Dockerfile
+    /// writes one, `None` for a custom worker template and every infra
+    /// image.
+    pub result_file: Option<String>,
 }
 
 /// The full set of artifacts a compiled project version needs, plus the three
@@ -94,9 +100,10 @@ pub trait TagPolicy {
 ///
 /// Resolution MUST happen before this: `build_project` validates + codegens the
 /// definition as given and does not recompile source, so a raw (unresolved)
-/// `@asset` marker would fail validation against its file-typed port. The
-/// project MUST already contain its own `nodes/` (including the seeded
-/// `base_catalog/`); nothing is injected from outside the folder.
+/// `@asset` marker would reach the build instead of the stored file it
+/// stands for. The project MUST already contain its own nodes (the seeded
+/// `nodes/base_catalog/` included); nothing is injected from outside the
+/// folder.
 ///
 /// Pure + blocking (filesystem); run it on a blocking thread from async
 /// callers. The returned worker `context_dir` lives under a temp dir the caller
@@ -135,6 +142,7 @@ pub fn plan_build_from(
         node_id: None,
         image_name: None,
         uses: staged.uses,
+        result_file: staged.result_file,
     }];
 
     // Every infra image, via the shared enumerator (same set, same content hashes as
@@ -150,6 +158,7 @@ pub fn plan_build_from(
             node_id: Some(node_id),
             image_name: Some(image_name),
             uses: Default::default(),
+            result_file: None,
         });
     }
 

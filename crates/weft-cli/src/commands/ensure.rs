@@ -4,10 +4,21 @@
 //! so users don't have to remember `weft build` as a prerequisite.
 //!
 //! Semantics:
-//!   - Compile here first: a mistake in the program is reported at once,
-//!     with every diagnostic, before anything is uploaded.
-//!   - Snapshot: every covered file the tenant's assets lack is uploaded
-//!     straight to the bucket; the manifest names the version.
+//!   - Snapshot first (`snapshot::Snapshot`): every covered file is read
+//!     once, and everything after compiles, publishes and builds those
+//!     bytes, so files other people or agents edit meanwhile never reach
+//!     this command. It ends naming the files that moved on disk after the
+//!     snapshot, as a warning: the build is the snapshot.
+//!   - Compile here first, from the snapshot: a mistake in the program as
+//!     a whole is reported at once, with every diagnostic, before anything
+//!     is uploaded. A mistake in some part of it (an included file that
+//!     does not parse, a node that did not load) only breaks that part
+//!     (`weft_compiler::compile_program`): the command goes on, a run that
+//!     needs the part is refused when it is cut, and once the command did
+//!     what it came for, every broken part is printed as a warning
+//!     ([`ProjectHandle::warn_broken`]).
+//!   - Publish: every file of the snapshot the tenant's assets lack is
+//!     uploaded straight to the bucket; the manifest names the version.
 //!   - Resolve the `@asset` refs only this machine can read (a file outside
 //!     the project, a URL) and send them with the version.
 //!   - `POST /projects/{id}/builds`: the install fetches the version back,
@@ -84,7 +95,7 @@ pub struct ProjectHandle {
     pub id: String,
     pub name: String,
     pub client: DispatcherClient,
-    /// Published sources verified against the files used to compile this build.
+    /// The version's files: the snapshot this command compiled and built.
     pub manifest: super::versions::Manifest,
     /// What the install built and registered: the compiled program and its
     /// three authoritative hashes (binary = worker image identity,
@@ -121,6 +132,39 @@ impl ProjectHandle {
     pub fn activation_target(&self) -> weft_core::activation::ActivationTarget {
         weft_core::activation::ActivationTarget { build: self.built.named(), reactivate_choice: None }
     }
+
+    /// Say every part of the build that does not compile, once the command
+    /// did what it came for: whatever it ran did not need them (a cut that
+    /// needs one is refused, naming it), and they are never hidden. An
+    /// included file that does not parse may hold a trigger nobody can see
+    /// until it does, so the line never claims the command missed nothing.
+    /// The parts are the install's own reading of the version, not this
+    /// machine's.
+    pub fn warn_broken(&self, progress: &Progress) {
+        warn_broken(progress, &self.built.definition.broken);
+        for package in &self.built.left_out {
+            progress.warn(&format!(
+                "the worker was built without it, so nothing that uses its nodes runs: {}",
+                package.reason(self.built.worker_log.as_deref())
+            ));
+        }
+    }
+}
+
+/// [`ProjectHandle::warn_broken`] for a verb that kept only the parts.
+pub fn warn_broken(progress: &Progress, broken: &[weft_core::project::Broken]) {
+    for line in broken_warnings(broken) {
+        progress.warn(&line);
+    }
+}
+
+/// The warning lines for `broken`, the parts of a build that do not
+/// compile: one per part, its reason's own lines kept under it.
+fn broken_warnings(broken: &[weft_core::project::Broken]) -> Vec<String> {
+    broken
+        .iter()
+        .map(|part| format!("does not compile, so nothing that needs it runs: {}", part.why.replace('\n', "\n  ")))
+        .collect()
 }
 
 /// How often a version build being followed is asked where it is, and
@@ -406,45 +450,47 @@ pub async fn ensure_registered(
 
 pub struct CompiledProject {
     pub definition: weft_core::ProjectDefinition,
-    sources: super::versions::Manifest,
+    /// The project as the snapshot reads it (its `weft.toml`): the build
+    /// is asked for under its name and id, never the disk's.
+    project: weft_compiler::project::Project,
+    /// The files it was compiled from, which the build publishes.
+    snapshot: std::sync::Arc<super::snapshot::Snapshot>,
 }
 
-/// Compile without publishing files or building an image. Commands validate
-/// their requested operation against this same definition before registration.
-pub fn compile_project(ctx: &Ctx, progress: &Progress) -> Result<CompiledProject> {
-    let project = ctx.project()?;
-    let sources = super::versions::local_manifest(project)?;
+impl CompiledProject {
+    /// Where a command resolves the markers in what it sends beside the
+    /// program (a run's handed values): this compile's snapshot, then the
+    /// disk.
+    pub fn files(&self) -> super::snapshot::SnapshotFirst<'_> {
+        self.snapshot.then_disk()
+    }
+}
 
-    // Compile + enrich once; both hashes are scoped to the referenced
-    // / infra-closure nodes, so they need the definition + catalog.
-    // Cheap, and downstream code after ensure_registered needs these
-    // anyway. Use the diagnostic-bearing loader so a compile failure
-    // can fire a structured progress error (the editor's action-bar
-    // modal renders per-diagnostic info) instead of a single
-    // flattened string.
-    let (definition, catalog) = match weft_compiler::hash::load_enriched_project_with_diagnostics(project) {
-        Ok(pair) => pair,
-        Err(weft_compiler::hash::CompileLoadError::Read(msg)) => {
-            anyhow::bail!("{msg}");
-        }
+/// Snapshot the project and compile it, without publishing files or
+/// building an image. Commands check their requested operation against this
+/// same definition before registration. Fails only on a mistake in the
+/// program as a whole; a part that does not compile is in
+/// `definition.broken`.
+pub fn compile_project(ctx: &Ctx, progress: &Progress) -> Result<CompiledProject> {
+    compile_snapshot(progress, super::snapshot::Snapshot::take(&ctx.project()?.root)?)
+}
+
+/// [`compile_project`] from a snapshot the command already took (`weft run`
+/// reads its example from it first).
+pub fn compile_snapshot(progress: &Progress, snapshot: super::snapshot::Snapshot) -> Result<CompiledProject> {
+    let snapshot = std::sync::Arc::new(snapshot);
+    let project = snapshot.project()?;
+    // Use the diagnostic-bearing loader so a compile failure can fire a
+    // structured progress error (the editor's action-bar modal renders
+    // per-diagnostic info) instead of a single flattened string.
+    let definition = match weft_compiler::hash::load_program_in(&project, snapshot.clone()) {
+        Ok((definition, _)) => definition,
+        Err(weft_compiler::hash::CompileLoadError::Read(msg)) => anyhow::bail!("{msg}"),
         Err(weft_compiler::hash::CompileLoadError::Diagnostics(diags)) => {
-            return Err(compile_failure(project, progress, &diags));
+            return Err(compile_failure(&project, progress, &diags));
         }
     };
-    // The program's own rules (a trigger inside a loop, a wire into a
-    // trigger, ...) are checked here, before any verb looks at its cut or
-    // spec: the diagnostic that names the node and says why is what the
-    // user reads, never a later refusal about a cut it caused. The build
-    // validates again on its own path; this is the same check, earlier.
-    let diags = weft_compiler::validate::validate_with_mode(
-        &definition,
-        &catalog,
-        weft_compiler::validate::ValidationMode::Structural,
-    );
-    if diags.iter().any(|d| matches!(d.severity, weft_compiler::Severity::Error)) {
-        return Err(compile_failure(project, progress, &diags));
-    }
-    Ok(CompiledProject { definition, sources })
+    Ok(CompiledProject { definition, project, snapshot })
 }
 
 /// Report compile diagnostics both ways at once and hand back the error
@@ -511,18 +557,15 @@ pub async fn build_compiled(
     node_set: weft_core::builds::NodeSet,
     compiled: CompiledProject,
 ) -> Result<ProjectHandle> {
-    let CompiledProject { definition, sources } = compiled;
-    let project = ctx.project()?;
+    let CompiledProject { definition, project, snapshot } = compiled;
     let client = ctx.client()?;
-    let manifest = super::versions::snapshot(&client, project, !progress.json).await?;
-    anyhow::ensure!(manifest == sources,
-        "project files changed after compilation; rerun the command to build and record the same sources");
+    let manifest = snapshot.publish(&client, !progress.json).await?;
 
     // The `@asset` refs only this machine can read, resolved here and sent
     // with the version (a referenced file the tenant's assets lack is
     // uploaded on the way).
     let resolutions =
-        crate::commands::assets::asset_resolutions(&client, &project.root, &definition, true).await?;
+        crate::commands::assets::asset_resolutions(&client, &snapshot.then_disk(), &definition, true).await?;
 
     let id = project.id().to_string();
     let path = format!("/projects/{id}/builds");
@@ -556,15 +599,19 @@ pub async fn build_compiled(
     for warning in crate::commands::assets::publish_references(&client, &built.definition, &resolutions, Some(&manifest)).await? {
         progress.warn(&warning);
     }
-    // The install built the files as they were when this command read
-    // them; if the disk moved meanwhile, the build registered is already
-    // behind it, and the next edit would look already live.
-    anyhow::ensure!(
-        super::versions::local_manifest(project)? == manifest,
-        "project files changed while building, so the version this built is already \
-         behind your disk. Run the command again (it rebuilds only what moved). If several \
-         people or agents edit at once, wait for them to finish first"
-    );
+    // The install built the files as the snapshot read them; whatever moved
+    // on disk since is not in this build, and the next edit would look
+    // live already if nobody said so.
+    // The build already registered, so a look at the disk that fails is
+    // said rather than failing the command after its work.
+    match snapshot.changed_on_disk() {
+        Ok(moved) => {
+            if let Some(note) = moved_since_note(&snapshot.taken_at(), &moved) {
+                progress.warn(&note);
+            }
+        }
+        Err(e) => progress.warn(&format!("could not check which of your files changed during this command: {e:#}")),
+    }
 
     Ok(ProjectHandle {
         id,
@@ -573,6 +620,20 @@ pub async fn build_compiled(
         manifest,
         built,
     })
+}
+
+/// What a person is told when files moved on disk after the command's
+/// snapshot (`taken`): the build is the snapshot, and these are not in it.
+fn moved_since_note(taken: &chrono::DateTime<chrono::Local>, moved: &[String]) -> Option<String> {
+    if moved.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "built from your files as they were at {}; these changed after that and are not in this build \
+         (run the command again to take them): {}",
+        taken.format("%H:%M:%S"),
+        moved.join(", ")
+    ))
 }
 
 #[cfg(test)]

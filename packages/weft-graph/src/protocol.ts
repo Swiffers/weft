@@ -882,6 +882,22 @@ export interface ProjectDefinition {
   /// are the run's own, never the program's). Absent in a program as
   /// written, which is every program the editor parses.
   given?: GivenPlaces;
+  /// The parts of the program that do not compile; a cut that needs one is
+  /// refused. Absent in a program that compiles whole, which is every
+  /// program the editor parses (its own parse reports diagnostics instead).
+  broken?: Broken[];
+}
+
+/// See `ProjectDefinition.broken`.
+// SYNC: Broken <-> crates/weft-core/src/project.rs Broken
+export interface Broken {
+  /// The node and group ids the problem is about; a cut keeping all of
+  /// them needs it.
+  parts: string[];
+  why: string;
+  /// The part may stand for nodes the program cannot see (an included
+  /// file that does not compile, a node whose type did not load).
+  hides?: boolean;
 }
 
 /// See `ProjectDefinition.given`: per place (`locatedKey`), the input
@@ -911,6 +927,10 @@ export interface Diagnostic {
   // was compiled (an @include splices other files' nodes in with their
   // own line numbers). Absent = the compiled source itself.
   file?: string;
+  // The node and group ids the finding is about (one for a node or a
+  // group, the two ends for a wire); absent when it is about the program
+  // as a whole.
+  subjects?: string[];
 }
 
 /// Derived from the Widget union (never a second hand-kept list).

@@ -1,8 +1,8 @@
 //! `weft describe-nodes`: print the project's node catalog as JSON
-//! (every node under `nodes/`), for the editor's node palette, and
-//! (`--compact`) as the token-cheap wiring view an AI reads instead of
-//! whole `metadata.json` files. Runs locally because the catalog lives
-//! in the project's `nodes/`.
+//! (every node under `nodes/` and beside the code under `src/`), for the
+//! editor's node palette, and (`--compact`) as the token-cheap wiring
+//! view an AI reads instead of whole `metadata.json` files. Runs locally
+//! because the catalog lives in the project's folders.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +19,7 @@ struct NodesResponse<T> {
     // (form-field specs included) is a metadata key. Under `--compact`
     // the values are the filtered wiring view instead, same envelope.
     catalog: BTreeMap<String, T>,
-    /// Soft errors from scanning `nodes/` (malformed metadata.json,
+    /// Soft errors from scanning the node roots (malformed metadata.json,
     /// duplicate types), and names a loaded node spells off the weft way.
     /// Surfaced, not silent: a node mid-rename has a transient parse
     /// error the editor should see but not crash on.

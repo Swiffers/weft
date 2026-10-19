@@ -52,6 +52,54 @@ pub struct ProjectDefinition {
     /// run as written under another.
     #[serde(default, skip_serializing_if = "GivenPlaces::is_empty")]
     pub given: GivenPlaces,
+    /// The parts of the program that do not compile: an included file that
+    /// does not parse, a node whose type did not load, a wire between two
+    /// ports that cannot meet. The program around them still compiles, and
+    /// everything that does not need them runs; a cut that keeps one is
+    /// refused ([`cut::cut`]), naming what is wrong. Empty in a program
+    /// that compiles whole, and in every cut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broken: Vec<Broken>,
+}
+
+impl ProjectDefinition {
+    /// Whether a broken part may hide nodes ([`Broken::hides`]), so a
+    /// trigger or an infra copy this program does not declare is not
+    /// proven gone: every decision that takes something down for being
+    /// absent from the program (an orphan's reap, an orphan entry row,
+    /// a gone copy's disks) asks this first, and leaves it alone.
+    pub fn hides_nodes(&self) -> bool {
+        self.broken.iter().any(|part| part.hides)
+    }
+}
+
+/// One part of a program that does not compile
+/// ([`ProjectDefinition::broken`]).
+// SYNC: Broken <-> packages/weft-graph/src/protocol.ts Broken
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Broken {
+    /// The nodes and groups the problem is about, by id. A cut that keeps
+    /// every one of them needs the broken part: one id for a node or a
+    /// group, the two ends for a wire (a cut that keeps only one end does
+    /// not carry the wire).
+    pub parts: Vec<String>,
+    /// What is wrong, as the compiler says it, with the file and line.
+    pub why: String,
+    /// The part may stand for nodes the program cannot see: an included
+    /// file that does not compile (its placeholder holds none of its
+    /// nodes), a node whose type did not load (nothing says whether it is
+    /// a trigger or infra). While a program has one, what is missing from
+    /// it may only be hidden ([`ProjectDefinition::hides_nodes`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hides: bool,
+}
+
+impl Broken {
+    /// Whether a cut whose nodes and groups are `kept` needs this part.
+    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>) -> bool {
+        !self.parts.is_empty() && self.parts.iter().all(|part| kept.contains(part.as_str()))
+    }
 }
 
 /// See [`ProjectDefinition::given`].
@@ -245,6 +293,29 @@ pub mod boundary_types {
     /// Any boundary type at all.
     pub fn is_boundary(node_type: &str) -> bool {
         matches!(node_type, LOOP_IN | LOOP_OUT)
+    }
+}
+
+/// The node type of an `@include` the compiler does not open up: the
+/// editor's opaque block, and in a build the placeholder an included file
+/// that does not compile leaves at its site ([`own_types`]).
+// SYNC: INCLUDED_GROUP_TYPE <-> packages/weft-graph/src/webview/lib/types/index.ts INCLUDE_NODE_TYPE
+pub const INCLUDED_GROUP_TYPE: &str = "IncludedGroup";
+
+/// The type names weft gives its own nodes and scopes: the language's
+/// `Group` and `Loop`, a loop's two boundaries, and the opaque include.
+/// No catalog may declare one (`weft_catalog` refuses it, naming the
+/// file), so nothing a project wrote is ever mistaken for the
+/// compiler's.
+pub mod own_types {
+    pub const GROUP: &str = "Group";
+    pub const LOOP: &str = "Loop";
+
+    /// Every one of them.
+    pub const ALL: &[&str] = &[GROUP, LOOP, super::boundary_types::LOOP_IN, super::boundary_types::LOOP_OUT, super::INCLUDED_GROUP_TYPE];
+
+    pub fn is_own(node_type: &str) -> bool {
+        ALL.contains(&node_type)
     }
 }
 
@@ -693,10 +764,14 @@ fn default_config() -> Value {
 }
 
 impl NodeDefinition {
-    /// The node's header span, or a default (zero) span when it has none
-    /// (synthetic nodes carry no header). The single home for "point a
-    /// diagnostic at this node's header line", so every diagnostic site uses
-    /// the same fallback rather than repeating `header_span.unwrap_or_default()`.
+    /// The part of the program this node is, as a finding about it names
+    /// it ([`Broken::parts`]): its own id, or for a loop's boundary node its
+    /// loop's, since a cut keeps a loop whole or not at all and the
+    /// boundary is the loop's own business.
+    pub fn part(&self) -> &str {
+        self.group_boundary.as_ref().map(|b| b.group_id.as_str()).unwrap_or(&self.id)
+    }
+
     /// This node's port types at the place `path` reaches (an include
     /// call path, outermost site first; empty at the top).
     pub fn types_at<S: AsRef<str>>(&self, path: &[S]) -> TypesAt<'_> {
@@ -711,6 +786,10 @@ impl NodeDefinition {
         })
     }
 
+    /// The node's header span, or a default (zero) span when it has none
+    /// (synthetic nodes carry no header). The single home for "point a
+    /// diagnostic at this node's header line", so every diagnostic site uses
+    /// the same fallback rather than repeating `header_span.unwrap_or_default()`.
     pub fn header_span_or_default(&self) -> Span {
         self.header_span.unwrap_or_default()
     }
@@ -1483,6 +1562,7 @@ mod address_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let (node, path) = resolve_address(&project, "");
         assert_eq!(node, "");
@@ -1760,6 +1840,10 @@ pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::B
 pub struct DeclaredInfra {
     /// Place -> whether it is per instance.
     places: std::collections::BTreeMap<String, bool>,
+    /// The program hides nodes behind a part that does not compile
+    /// ([`ProjectDefinition::hides_nodes`]), so a copy it does not
+    /// declare may only be hidden.
+    hides: bool,
 }
 
 impl DeclaredInfra {
@@ -1772,18 +1856,25 @@ impl DeclaredInfra {
                 (spelled, per_instance)
             })
             .collect();
-        Self { places }
+        Self { places, hides: project.hides_nodes() }
     }
 
-    /// Whether the program has a copy of `spelled` of this kind: a
-    /// an instance's (`instance_copy`) or the shared one.
+    /// Whether the program has a copy of `spelled` of this kind: an
+    /// instance's (`instance_copy`) or the shared one.
     pub fn declares(&self, spelled: &str, instance_copy: bool) -> bool {
         self.places.get(spelled) == Some(&instance_copy)
     }
 
-    /// Whether the program still declares the copy a host names.
-    pub fn declares_copy(&self, copy: &crate::infra::NodeRef) -> bool {
-        self.declares(&copy.node, copy.is_instance_copy())
+    /// Whether the copy `spelled` of this kind is gone from the program
+    /// for good, so its units and disks may go: it does not declare it,
+    /// and no part that does not compile could be hiding it.
+    pub fn gone(&self, spelled: &str, instance_copy: bool) -> bool {
+        !self.hides && !self.declares(spelled, instance_copy)
+    }
+
+    /// [`Self::gone`] for the copy a host names.
+    pub fn gone_copy(&self, copy: &crate::infra::NodeRef) -> bool {
+        self.gone(&copy.node, copy.is_instance_copy())
     }
 }
 
@@ -1932,6 +2023,7 @@ mod infra_triggers_depend_on_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         }
     }
 
@@ -2160,6 +2252,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert!(v.get("name").is_none(), "name must not serialize: {v}");
@@ -2270,6 +2363,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["groups"][0]["portLiterals"]["_should_flow"], false, "portLiterals key: {v}");
@@ -2354,6 +2448,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         }
     }
 
@@ -2394,10 +2489,27 @@ mod project_wire_tests {
             node: node.into(),
             copy_id: crate::infra::NodeRef::copy_id(project.id, node, of),
         };
-        assert!(declared.declares_copy(&copy("db", None)));
-        assert!(!declared.declares_copy(&copy("db", Some(&alice))));
-        assert!(declared.declares_copy(&copy("mine", Some(&alice))));
-        assert!(!declared.declares_copy(&copy("mine", None)));
+        assert!(!declared.gone_copy(&copy("db", None)));
+        assert!(declared.gone_copy(&copy("db", Some(&alice))));
+        assert!(!declared.gone_copy(&copy("mine", Some(&alice))));
+        assert!(declared.gone_copy(&copy("mine", None)));
+        assert!(declared.gone("gone", false));
+    }
+
+    /// A program with a part that may hide nodes proves nothing gone: a
+    /// copy it does not declare may sit inside the included file that
+    /// does not compile. A broken part that hides nothing proves as much
+    /// as a whole program.
+    #[test]
+    fn a_program_hiding_nodes_proves_no_copy_gone() {
+        let mut project = project_with_nodes(vec![node_with_infra("db", true)]);
+        project.broken = vec![Broken { parts: vec!["db".into()], why: "a wire".into(), hides: false }];
+        assert!(DeclaredInfra::of(&project).gone("other", false), "a wire hides no node");
+        project.broken.push(Broken { parts: vec!["lib".into()], why: "lib.weft does not parse".into(), hides: true });
+        let declared = DeclaredInfra::of(&project);
+        assert!(project.hides_nodes());
+        assert!(!declared.gone("other", false), "it may be inside lib.weft");
+        assert!(declared.declares("db", false), "what it declares, it still declares");
     }
 }
 
@@ -2545,6 +2657,46 @@ mod setup_cut_tests {
         assert_eq!(kicked(&kicks), vec![("text".to_string(), false)]);
         let none = project(&[("a", false, false, &[]), ("b", false, false, &[])], &[], &[("a", &[], "b")]);
         assert!(setup_cut(&none, &infra_places(&none)).is_err(), "nothing to set up is never the whole program");
+    }
+
+    /// A broken part stops only the cuts that need it: a node every one
+    /// of whose places the cut drops, and a wire whose other end it drops,
+    /// are not its business. The refusal names every part it needs.
+    #[test]
+    fn a_cut_is_refused_only_when_it_needs_a_broken_part() {
+        // a ──► b      g.c (inside g)      trig ──► out
+        let mut p = project(
+            &[("a", false, false, &[]), ("b", false, false, &[]), ("g.c", false, false, &["g"]), ("trig", true, false, &[]), ("out", false, false, &[])],
+            &[("g", None)],
+            &[("a", &[], "b"), ("trig", &[], "out")],
+        );
+        p.broken = vec![
+            Broken { parts: vec!["a".into(), "b".into()], why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
+            Broken { parts: vec!["g".into()], why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
+        ];
+        assert!(setup_cut(&p, &places(&["a"])).is_ok(), "a alone does not carry the wire");
+        let refused = setup_cut(&p, &places(&["b"])).unwrap_err();
+        assert!(refused.contains("a.v cannot feed b.v"), "{refused}");
+        assert!(!refused.contains("the group g"), "{refused}");
+        let refused = setup_cut(&p, &places(&["g.c"])).unwrap_err();
+        assert!(refused.contains("the group g is broken\n    second line"), "a reason keeps its lines under it: {refused}");
+        // Fed from outside, g.c needs nothing of g as a scope, so the cut
+        // dissolves g; its member and the wire through its port still run,
+        // and so g's broken part is still needed.
+        let mut fed = project(
+            &[("f", false, false, &[]), ("g.c", false, false, &["g"])],
+            &[("g", None)],
+            &[("f", &[("g", "in")], "g.c")],
+        );
+        let (dissolved, _) = setup_cut(&fed, &places(&["g.c"])).unwrap();
+        assert!(dissolved.groups.is_empty(), "the cut keeps no scope for g: {:?}", dissolved.groups);
+        fed.broken = vec![Broken { parts: vec!["g".into()], why: "a stream through g's port".into(), hides: false }];
+        assert!(setup_cut(&fed, &places(&["g.c"])).unwrap_err().contains("a stream through g's port"));
+        let fire = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
+        assert!(fire.program.broken.is_empty(), "a cut carries nothing broken");
+        p.broken.push(Broken { parts: vec!["out".into()], why: "out did not load".into(), hides: true });
+        let refused = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap_err();
+        assert!(refused.starts_with("a fire of 'trig' cannot run") && refused.contains("out did not load"), "{refused}");
     }
 
     /// A trigger is kicked at the top wherever it sits; the copies around

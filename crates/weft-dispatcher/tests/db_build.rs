@@ -53,6 +53,7 @@ fn image(kind: ImageKind, image_ref: &str) -> PlannedImage {
         node_id: None,
         image_name: None,
         uses: Default::default(),
+        result_file: None,
     }
 }
 
@@ -82,6 +83,13 @@ fn version_asked(project: uuid::Uuid, binary: &str, images: &[PlannedImage], ask
             implementations: Default::default(),
             infra_images: Default::default(),
             replaced_infra_images: Vec::new(),
+            worker_image: images
+                .iter()
+                .find(|image| image.kind == ImageKind::Worker)
+                .map(|image| image.image_ref.clone())
+                .unwrap_or_default(),
+            left_out: Vec::new(),
+            worker_log: None,
         },
         images: refs,
         ask,
@@ -193,6 +201,7 @@ async fn present_images_are_skipped_without_the_gate(pool: PgPool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     fake.set_image_exists("reg:5000/weft-worker:a");
+    built_on_record(&pool, "reg:5000/weft-worker:a").await;
     let gate = gate();
     let asked = ask(&builder(&pool, fake.clone()), &pool, uuid::Uuid::new_v4(), "a", &[image(ImageKind::Worker, "reg:5000/weft-worker:a")], gate.clone())
         .await
@@ -225,7 +234,7 @@ async fn a_stale_image_is_started_and_answered_before_it_ends(pool: PgPool) {
     assert!(gate.let_go.load(Ordering::SeqCst), "let go once the version is written down");
     assert_eq!(status_of(&pool, image_ref).await, "running", "answered while it runs");
     assert_eq!(version_state(&pool, project, underway.build).await.state, VersionBuildStatus::Waiting);
-    fake.set_poll_result(&starts[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&starts[0].name, BuildStatus::Succeeded { result: None });
     assert!(follow::look(&pool, fake.as_ref()).await.unwrap());
     assert_eq!(status_of(&pool, image_ref).await, "succeeded");
     assert!(!follow::look(&pool, fake.as_ref()).await.unwrap(), "nothing runs any more");
@@ -248,7 +257,7 @@ async fn a_waiting_version_registers_by_itself_once_its_builds_succeed(pool: PgP
 
     let early = waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert!(early.waiting && early.registered.is_empty(), "nothing registers while a build runs");
-    fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     let advanced = waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert_eq!(advanced.registered.iter().map(|s| s.id).collect::<Vec<_>>(), [project]);
@@ -262,6 +271,65 @@ async fn a_waiting_version_registers_by_itself_once_its_builds_succeed(pool: PgP
     assert_eq!(claims_of(&pool, underway.build).await, 0, "the claim goes with the registration");
     let uses: i64 = sqlx::query_scalar("SELECT count(*) FROM image_use WHERE project_id = $1").bind(project).fetch_one(&pool).await.unwrap();
     assert_eq!(uses, 2, "its images are the project's running version");
+}
+
+/// A worker build's record of what it left out is kept on its image's row:
+/// the version registers saying so, and a later build that finds the same
+/// image already built registers with the same packages left out, so the
+/// cached image refuses the same runs. A record that does not read fails
+/// the build instead of registering a worker whose gaps nobody refuses.
+#[sqlx::test]
+async fn a_worker_left_out_record_is_kept_and_read_back_when_the_image_is_reused(pool: PgPool) {
+    setup(&pool).await;
+    let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let projects = project_store(&pool, &[first, second]).await;
+    let fake = Arc::new(FakeImageBuilder::new());
+    let worker = "reg:5000/weft-worker:partial";
+    let images = [image(ImageKind::Worker, worker)];
+    let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, first, "partial", &images, gate()).await.unwrap());
+    let record = br#"{"packages":[{"package":"shout","nodeTypes":["Shout"],"error":"error[E0308]: mismatched types"}]}"#;
+    fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded { result: Some(record.to_vec()) });
+    follow::look(&pool, fake.as_ref()).await.unwrap();
+    waiting::advance(&pool, projects.as_ref()).await.unwrap();
+    let registered = version_state(&pool, first, underway.build).await.program.expect("registered");
+    assert_eq!(registered.left_out.len(), 1);
+    assert_eq!(registered.left_out[0].package, "shout");
+    let (left_out, _) = ledger::left_out(&pool, worker).await.unwrap();
+    assert_eq!(left_out.packages[0].node_types, ["Shout"]);
+
+    // Another project's build of the same content finds the image built,
+    // and its version carries the same record.
+    let asked = ask(&builder(&pool, fake.clone()), &pool, second, "partial", &images, gate()).await.unwrap();
+    let VersionBuild::Ready { version, hold } = asked else { panic!("the image is there") };
+    let summary = waiting::register_version(projects.as_ref(), &pool, second, TENANT, &version, waiting::Registrar::Request { hold })
+        .await
+        .unwrap()
+        .expect("it registers");
+    assert_eq!(summary.1.left_out, registered.left_out, "a reused image refuses what it refused before");
+    let mut program: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+        "id": second, "edges": [],
+        "nodes": [{ "id": "loud", "nodeType": "Shout", "inputs": [], "outputs": [], "position": { "x": 0, "y": 0 } }]
+    }))
+    .unwrap();
+    program.broken = weft_core::builds::LeftOut::broken_parts(&summary.1.left_out, &program, None);
+    let refused = weft_core::run_spec::setup_cut(&program, &[weft_core::frames::Located::top("loud")]).unwrap_err();
+    assert!(refused.contains("package 'shout' didn't compile: error[E0308]"), "{refused}");
+
+    // A worker image in the registry with no successful build on record
+    // (its result could not be read, or the process died reading it) is
+    // built again: its gaps are unknown.
+    let unknown = "reg:5000/weft-worker:unrecorded";
+    fake.set_image_exists(unknown);
+    let recorded = PlannedImage { result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()), ..image(ImageKind::Worker, unknown) };
+    let asked = ask(&builder(&pool, fake.clone()), &pool, second, "unrecorded", &[recorded], gate()).await.unwrap();
+    assert!(matches!(asked, VersionBuild::Waiting(_)), "built again rather than run with its gaps unknown");
+
+    // A record that does not read is the build's failure.
+    let broken = "reg:5000/weft-worker:unreadable";
+    let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, first, "unreadable", &[image(ImageKind::Worker, broken)], gate()).await.unwrap());
+    fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded { result: Some(b"not json".to_vec()) });
+    follow::look(&pool, fake.as_ref()).await.unwrap();
+    assert_eq!(status_of(&pool, broken).await, "failed");
 }
 
 /// A version an image build of which failed ends failed, naming every
@@ -278,7 +346,7 @@ async fn a_failed_image_build_ends_its_version_failed(pool: PgPool) {
         let status = if build.image.contains("bad") {
             BuildStatus::Failed { reason: "cargo: error[E0425]".into() }
         } else {
-            BuildStatus::Succeeded
+            BuildStatus::Succeeded { result: None }
         };
         fake.set_poll_result(&build.name, status);
     }
@@ -310,11 +378,11 @@ async fn a_newer_ask_supersedes_the_waiting_version(pool: PgPool) {
     assert!(old_state.reason.is_some_and(|r| r.contains("newer build")));
     assert_eq!(claims_of(&pool, older.build).await, 0, "the superseded version's claim goes");
 
-    fake.set_poll_result(&newer.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&newer.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert_eq!(running_binary(&pool, project).await.as_deref(), Some("new"));
-    fake.set_poll_result(&older.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&older.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     let late = waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert!(late.registered.is_empty(), "the superseded version never registers");
@@ -335,11 +403,20 @@ async fn a_newer_ask_supersedes_the_waiting_version(pool: PgPool) {
     assert_eq!(running_binary(&pool, project).await.as_deref(), Some("new"));
 }
 
+/// `image_ref` built, as a request that found it there finds it: a build
+/// of it succeeded on record, which registration reads what it left out
+/// from (`ledger::left_out`).
+async fn built_on_record(pool: &PgPool, image_ref: &str) {
+    ledger::note_shared(pool, image_ref, crate_now()).await.unwrap();
+}
+
 /// Register `project`'s version `binary` as a request whose ask is `ask`
 /// and that found every image; `false` when it must not land.
 async fn register_asked(pool: &PgPool, projects: &weft_dispatcher::ProjectStore, project: uuid::Uuid, binary: &str, ask: i64) -> bool {
     let hold = ImageHold::new(pool, project);
-    let version = version_asked(project, binary, &[image(ImageKind::Worker, &format!("reg:5000/weft-worker:{binary}"))], ask);
+    let worker = format!("reg:5000/weft-worker:{binary}");
+    built_on_record(pool, &worker).await;
+    let version = version_asked(project, binary, &[image(ImageKind::Worker, &worker)], ask);
     waiting::register_version(projects.as_ref(), pool, project, TENANT, &version, Registrar::Request { hold })
         .await
         .unwrap()
@@ -376,7 +453,7 @@ async fn an_ask_that_registers_settles_the_waiting_version(pool: PgPool) {
     let waiting = wait_asked(&pool, &fake, project, "late", late).await;
     assert!(register_asked(&pool, &projects, project, "early", early).await, "nothing newer registered yet");
     assert_eq!(version_state(&pool, project, waiting.build).await.state, VersionBuildStatus::Waiting, "asked after it: still waits");
-    fake.set_poll_result(&waiting.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&waiting.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert_eq!(running_binary(&pool, project).await.as_deref(), Some("late"), "the newer ask lands over the older");
@@ -390,14 +467,19 @@ async fn an_ask_that_registers_settles_the_waiting_version(pool: PgPool) {
     let state = version_state(&pool, project, older.build).await;
     assert_eq!(state.state, VersionBuildStatus::Superseded);
     assert_eq!(state.reason.as_deref(), Some("a newer build of this project registered first"));
-    fake.set_poll_result(&older.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&older.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     assert!(waiting::advance(&pool, projects.as_ref()).await.unwrap().registered.is_empty());
     assert_eq!(running_binary(&pool, project).await.as_deref(), Some("second"));
 
-    // The same version waiting is ended registered by the request.
+    // The same version waiting is ended registered by the request: its
+    // build finished, and a request finds the image before the waiting
+    // version advances (a worker image counts as there only once a build
+    // of it succeeded on record).
     let third = projects.next_build_ask(project).await.unwrap();
     let same = wait_asked(&pool, &fake, project, "third", third).await;
+    fake.set_poll_result(&same.images[0].name, BuildStatus::Succeeded { result: None });
+    follow::look(&pool, fake.as_ref()).await.unwrap();
     let fourth = projects.next_build_ask(project).await.unwrap();
     assert!(register_asked(&pool, &projects, project, "third", fourth).await);
     let state = version_state(&pool, project, same.build).await;
@@ -419,7 +501,7 @@ async fn an_older_ask_never_lands_over_a_registered_newer_one(pool: PgPool) {
     let slower = projects.next_build_ask(project).await.unwrap();
     let newest = projects.next_build_ask(project).await.unwrap();
     let waiting = wait_asked(&pool, &fake, project, "newest", newest).await;
-    fake.set_poll_result(&waiting.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&waiting.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert_eq!(running_binary(&pool, project).await.as_deref(), Some("newest"));
@@ -442,6 +524,7 @@ async fn no_version_registers_while_a_resync_holds_the_project(pool: PgPool) {
     let projects = project_store(&pool, &[project]).await;
     sqlx::query("UPDATE project SET transition = 'resyncing' WHERE id = $1").bind(project).execute(&pool).await.unwrap();
     let ask = projects.next_build_ask(project).await.unwrap();
+    built_on_record(&pool, "reg:5000/weft-worker:under-resync").await;
     let version = version_asked(project, "under-resync", &[image(ImageKind::Worker, "reg:5000/weft-worker:under-resync")], ask);
     let refused = waiting::register_version(projects.as_ref(), &pool, project, TENANT, &version, Registrar::Request { hold: ImageHold::new(&pool, project) })
         .await
@@ -670,7 +753,7 @@ async fn every_waiter_on_one_build_registers_at_its_end(pool: PgPool) {
     let (a, b) = (waiting_on(a.unwrap()), waiting_on(b.unwrap()));
     assert_eq!(fake.starts().len(), 1, "one build for both");
     assert_eq!(a.images, b.images, "both wait on the same build");
-    fake.set_poll_result(&a.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&a.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     let mut registered: Vec<uuid::Uuid> = waiting::advance(&pool, projects.as_ref()).await.unwrap().registered.iter().map(|s| s.id).collect();
     registered.sort();
@@ -693,7 +776,7 @@ async fn a_build_nobody_follows_is_seen_through_by_the_next_look(pool: PgPool) {
     assert!(ledger::started(&pool, image_ref, &name, &weft_platform_traits::BuildHandle::named(name.clone())).await.unwrap());
     follow::look(&pool, fake.as_ref()).await.unwrap();
     assert_eq!(status_of(&pool, image_ref).await, "running", "still building");
-    fake.set_poll_result(&name, BuildStatus::Succeeded);
+    fake.set_poll_result(&name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     assert_eq!(status_of(&pool, image_ref).await, "succeeded");
     assert_eq!(fake.releases(), vec![name], "freed once its end is recorded");
@@ -712,7 +795,7 @@ async fn a_build_the_builder_named_is_followed_under_that_name(pool: PgPool) {
     let state = version_state(&pool, project, underway.build).await;
     let current = state.images[0].state.build.clone().expect("the builder's id is recorded");
     assert!(current.ends_with("-id"), "the row names the builder's own id: {current}");
-    fake.set_poll_result(&current, BuildStatus::Succeeded);
+    fake.set_poll_result(&current, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     assert_eq!(status_of(&pool, "reg:5000/weft-worker:n").await, "succeeded");
 }
@@ -830,7 +913,7 @@ async fn a_claim_after_the_build_succeeded_builds_nothing(pool: PgPool) {
     let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
-    ledger::finish(&pool, image_ref, &name, ledger::Outcome::Succeeded, crate_now()).await.unwrap();
+    ledger::finish(&pool, image_ref, &name, ledger::Outcome::Succeeded(None), crate_now()).await.unwrap();
     fake.set_image_exists(image_ref);
     let late = ledger::claim(&pool, &fake, image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap();
     assert!(matches!(late, Claim::Built), "{late:?}");
@@ -847,7 +930,7 @@ async fn a_built_image_the_registry_lost_is_built_again(pool: PgPool) {
     let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
-    ledger::finish(&pool, image_ref, &name, ledger::Outcome::Succeeded, crate_now()).await.unwrap();
+    ledger::finish(&pool, image_ref, &name, ledger::Outcome::Succeeded(None), crate_now()).await.unwrap();
     let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, uuid::Uuid::new_v4(), "lost", &[image(ImageKind::Worker, image_ref)], gate()).await.unwrap());
     let starts = fake.starts();
     assert_eq!(starts.len(), 1, "built again");
@@ -1029,7 +1112,7 @@ async fn a_waiting_version_holds_the_transition_until_it_registers(pool: PgPool)
     assert_eq!(joined.images, underway.images);
     projects.release_driver(joiner).await.unwrap();
 
-    fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded);
+    fake.set_poll_result(&underway.images[0].name, BuildStatus::Succeeded { result: None });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     assert!(projects.settle_transition(None, stale_before()).await.unwrap().is_empty(), "the build ended, but both versions wait");
     assert_eq!(transition_of(&projects, own).await, "building");

@@ -2017,7 +2017,12 @@ async fn drive(
             let node_impl = match catalog.lookup(&node_def.node_type) {
                 Some(n) => n,
                 None => {
-                    let err = format!("unknown node type: {}", node_def.node_type);
+                    // A type whose package the build left out says so, and
+                    // where its errors are; any other is unknown.
+                    let err = match catalog.left_out().packages.iter().find(|p| p.node_types.contains(&node_def.node_type)) {
+                        Some(package) => package.reason(None),
+                        None => format!("unknown node type: {}", node_def.node_type),
+                    };
                     let mentioned = std::collections::HashSet::new();
                     handle_node_failure(
                         &node_id, &mentioned, group.run_id, &group.frames, &err, None, false,

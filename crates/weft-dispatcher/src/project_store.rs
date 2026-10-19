@@ -32,6 +32,27 @@ pub type InfraImageTags =
 /// Backing store for project metadata. Implementations:
 /// - `PostgresProjectStore` (production)
 /// - `FakeProjectStore` (tests, behind `test-helpers`).
+/// What a registered worker binary carries for its project: the
+/// implementation fingerprints of its node types, and the node packages its
+/// build left out because they did not compile, with where that build's
+/// log is read. Kept beside the binary (`project_code`), never in the
+/// definition, which is stored and cached under its own hash.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProgramCode {
+    pub implementations: std::collections::BTreeMap<String, String>,
+    pub left_out: Vec<weft_core::builds::LeftOutPackage>,
+    pub worker_log: Option<String>,
+}
+
+/// The project's running version as a run of it needs it: its identity,
+/// and what its worker left out ([`ProgramCode`]).
+#[derive(Debug, Clone)]
+pub struct RunningProgram {
+    pub identity: weft_core::project::hash::ProgramIdentity,
+    pub left_out: Vec<weft_core::builds::LeftOutPackage>,
+    pub worker_log: Option<String>,
+}
+
 #[async_trait]
 pub trait ProjectStoreOps: Send + Sync {
     /// Atomic register-and-hash-advance. Wraps every write of the
@@ -77,7 +98,7 @@ pub trait ProjectStoreOps: Send + Sync {
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
-        implementations: Option<&std::collections::BTreeMap<String, String>>,
+        code: Option<&ProgramCode>,
         source: Option<&weft_core::project::hash::Manifest>,
         settles: Option<&crate::build::waiting::Settles<'_>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>>;
@@ -86,7 +107,13 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest>;
 
     /// Read graph and worker identity from one database snapshot.
-    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>>;
+    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        Ok(self.running_program(id).await?.map(|running| running.identity))
+    }
+
+    /// The running version's identity and what its worker left out
+    /// ([`ProgramCode`]), from one database snapshot.
+    async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>>;
 
     /// The program identity a run names by its two hashes (its
     /// `RunStarted`'s `definition_hash` and `binary_hash`): the
@@ -649,6 +676,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
             binary_hash TEXT NOT NULL,
             implementations JSONB NOT NULL,
+            -- The node packages the worker's build left out because they
+            -- did not compile (weft_core::builds::LeftOutPackage list):
+            -- a run whose cut uses one of their types is refused.
+            left_out JSONB NOT NULL DEFAULT '[]',
+            -- Where that build's log is read, for their full errors.
+            worker_log TEXT,
             PRIMARY KEY (project_id, binary_hash)
         )"#,
         r#"CREATE TABLE IF NOT EXISTS project_definition (
@@ -759,7 +792,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
-        implementations: Option<&std::collections::BTreeMap<String, String>>,
+        code: Option<&ProgramCode>,
         source: Option<&weft_core::project::hash::Manifest>,
         settles: Option<&crate::build::waiting::Settles<'_>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>> {
@@ -840,14 +873,18 @@ impl ProjectStoreOps for PostgresProjectStore {
             .execute(&mut *tx)
             .await?;
         }
-        if let Some(implementations) = implementations {
+        if let Some(code) = code {
             let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
-            let encoded = serde_json::to_value(implementations)?;
+            let encoded = serde_json::to_value(&code.implementations)?;
+            // What the worker left out is its image's (one content, one
+            // build's record), so a registration of the same worker again
+            // says the same; it is taken as the latest registration says.
             let inserted = sqlx::query(
-                "INSERT INTO project_code (project_id, binary_hash, implementations) VALUES ($1, $2, $3) \
-                 ON CONFLICT (project_id, binary_hash) DO UPDATE SET implementations = EXCLUDED.implementations \
+                "INSERT INTO project_code (project_id, binary_hash, implementations, left_out, worker_log) VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (project_id, binary_hash) DO UPDATE SET implementations = EXCLUDED.implementations, \
+                 left_out = EXCLUDED.left_out, worker_log = EXCLUDED.worker_log \
                  WHERE project_code.implementations = EXCLUDED.implementations"
-            ).bind(id).bind(binary).bind(encoded).execute(&mut *tx).await?;
+            ).bind(id).bind(binary).bind(encoded).bind(serde_json::to_value(&code.left_out)?).bind(&code.worker_log).execute(&mut *tx).await?;
             anyhow::ensure!(inserted.rows_affected() == 1, "worker hash {binary} already has different implementation fingerprints");
         }
         // Runnable stamp + infra tags in ONE statement inside this same tx, so a
@@ -885,14 +922,18 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(serde_json::from_value(source)?)
     }
 
-    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
-        let row: Option<(String, String, serde_json::Value)> = sqlx::query_as(
-            "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations \
+    async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>> {
+        let row: Option<(String, String, serde_json::Value, serde_json::Value, Option<String>)> = sqlx::query_as(
+            "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations, c.left_out, c.worker_log \
              FROM project p JOIN project_code c ON c.project_id = p.id AND c.binary_hash = p.running_binary_hash \
              WHERE p.id = $1 AND p.running_definition_hash IS NOT NULL"
         ).bind(id).fetch_optional(&self.pool).await?;
-        row.map(|(definition_hash, binary_hash, implementations)| Ok(weft_core::project::hash::ProgramIdentity {
-            definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
+        row.map(|(definition_hash, binary_hash, implementations, left_out, worker_log)| Ok(RunningProgram {
+            identity: weft_core::project::hash::ProgramIdentity {
+                definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
+            },
+            left_out: serde_json::from_value(left_out)?,
+            worker_log,
         })).transpose()
     }
 
@@ -1407,7 +1448,7 @@ pub struct FakeProjectStore {
     sources: RwLock<HashMap<uuid::Uuid, weft_core::project::hash::Manifest>>,
     inner: RwLock<HashMap<uuid::Uuid, (String, ProjectDefinition)>>,
     binary_hashes: RwLock<HashMap<uuid::Uuid, String>>,
-    implementations: RwLock<HashMap<(uuid::Uuid, String), std::collections::BTreeMap<String, String>>>,
+    code: RwLock<HashMap<(uuid::Uuid, String), ProgramCode>>,
     definition_hashes: RwLock<HashMap<uuid::Uuid, String>>,
     infra_hashes: RwLock<HashMap<uuid::Uuid, String>>,
     /// Mirror of `infra_image_tags_json`, what the last build registered.
@@ -1443,7 +1484,7 @@ impl FakeProjectStore {
             sources: RwLock::new(HashMap::new()),
             inner: RwLock::new(HashMap::new()),
             binary_hashes: RwLock::new(HashMap::new()),
-            implementations: RwLock::new(HashMap::new()),
+            code: RwLock::new(HashMap::new()),
             definition_hashes: RwLock::new(HashMap::new()),
             infra_hashes: RwLock::new(HashMap::new()),
             infra_image_tags: RwLock::new(HashMap::new()),
@@ -1480,7 +1521,7 @@ impl ProjectStoreOps for FakeProjectStore {
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
-        implementations: Option<&std::collections::BTreeMap<String, String>>,
+        code: Option<&ProgramCode>,
         source: Option<&weft_core::project::hash::Manifest>,
         // The fake holds no version builds (they live in Postgres): a
         // registration always lands.
@@ -1509,12 +1550,12 @@ impl ProjectStoreOps for FakeProjectStore {
         // it, mirroring the Postgres conflict arm.
         let has_infra = weft_core::has_infra(&project);
         // Serialize for the history row before moving `project`.
-        if let Some(implementations) = implementations {
+        if let Some(code) = code {
             let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
-            let mut stored = self.implementations.write().await;
+            let mut stored = self.code.write().await;
             let key = (id, binary.to_string());
-            anyhow::ensure!(stored.get(&key).is_none_or(|old| old == implementations), "worker hash {binary} already has different implementation fingerprints");
-            stored.insert(key, implementations.clone());
+            anyhow::ensure!(stored.get(&key).is_none_or(|old| old.implementations == code.implementations), "worker hash {binary} already has different implementation fingerprints");
+            stored.insert(key, code.clone());
         }
         let project_json = serde_json::to_string(&project)?;
         self.inner.write().await.insert(id, (name_owned.clone(), project));
@@ -1561,11 +1602,15 @@ impl ProjectStoreOps for FakeProjectStore {
         }))
     }
 
-    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+    async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>> {
         let Some(binary_hash) = self.binary_hashes.read().await.get(&id).cloned() else { return Ok(None) };
         let Some(definition_hash) = self.definition_hashes.read().await.get(&id).cloned() else { return Ok(None) };
-        let Some(implementations) = self.implementations.read().await.get(&(id, binary_hash.clone())).cloned() else { return Ok(None) };
-        Ok(Some(weft_core::project::hash::ProgramIdentity { definition_hash, binary_hash, implementations }))
+        let Some(code) = self.code.read().await.get(&(id, binary_hash.clone())).cloned() else { return Ok(None) };
+        Ok(Some(RunningProgram {
+            identity: weft_core::project::hash::ProgramIdentity { definition_hash, binary_hash, implementations: code.implementations },
+            left_out: code.left_out,
+            worker_log: code.worker_log,
+        }))
     }
 
     async fn program_identity(
@@ -1574,11 +1619,11 @@ impl ProjectStoreOps for FakeProjectStore {
         definition_hash: &str,
         binary_hash: &str,
     ) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
-        Ok(self.implementations.read().await.get(&(id, binary_hash.to_string())).cloned().map(|implementations| {
+        Ok(self.code.read().await.get(&(id, binary_hash.to_string())).cloned().map(|code| {
             weft_core::project::hash::ProgramIdentity {
                 definition_hash: definition_hash.to_string(),
                 binary_hash: binary_hash.to_string(),
-                implementations,
+                implementations: code.implementations,
             }
         }))
     }

@@ -596,7 +596,7 @@ pub fn compute_trigger_fire(
     let bounds = cut::resolve(&g, &SelectionBounds { fire: Some(firing_node_id.into()), ..Default::default() })?;
     let (walked, baked) = walk_reading_baked(&g, bounds, saved, &BTreeSet::from([fired.clone()]));
     let mut given = Given { inputs: BTreeMap::new(), outputs: baked_stand_ins(&baked) };
-    let program = cut::cut(project, &walked, &mut given);
+    let program = cut::cut(project, &walked, &mut given).map_err(|why| format!("a fire of '{firing_node_id}' cannot run: {why}"))?;
     let kicks = KickPlan::for_program(&program, Some((&Located::new(fired, path), payload)), port_snapshot);
     Ok(TriggerFire { kicks, program, given, baked })
 }
@@ -611,7 +611,10 @@ pub fn setup_cut(project: &ProjectDefinition, targets: &[Located]) -> Result<(Pr
         return Err("a setup phase was asked for with nothing to set up".into());
     }
     let walked = cut::walk_setup(&ProjectGraph::new(project), targets)?;
-    let program = cut::cut(project, &walked, &mut Given::default());
+    let program = cut::cut(project, &walked, &mut Given::default()).map_err(|why| {
+        let spelled: Vec<String> = targets.iter().map(|place| crate::project::address_of(project, &place.id, &place.path)).collect();
+        format!("setting up {} cannot run: {why}", spelled.join(", "))
+    })?;
     let kicks = KickPlan::for_program(&program, None, None);
     Ok((program, kicks))
 }
@@ -948,7 +951,7 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
     // place still leaves out the wires nothing carries in it (onto a gate
     // from a trigger it does not fire, into a trigger), so a gate fed only
     // by a trigger reads its default however the run was bounded.
-    let program = cut::cut(project, &walked, &mut given);
+    let program = cut::cut(project, &walked, &mut given).map_err(Refusal::error)?;
     let kicks = KickPlan::for_program(&program, fire.as_ref().map(|(at, value)| (at, *value)), None);
     if !spec.from.is_empty() && spec.target.is_empty() && spec.before.is_empty() {
         warnings.push("No target or before endpoint: the run continues to the end of its downstream graph.".into());

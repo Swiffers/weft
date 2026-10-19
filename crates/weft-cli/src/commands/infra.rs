@@ -370,6 +370,7 @@ async fn infra_sync(
     for note in resp.host_notes() {
         progress.warn(note);
     }
+    handle.warn_broken(progress);
     if !ctx.json() {
         print_status(&handle.name, &handle.id, &resp);
     }

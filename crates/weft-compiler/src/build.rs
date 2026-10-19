@@ -15,7 +15,6 @@ use serde::Deserialize;
 use crate::codegen;
 use crate::error::{CompileError, CompileResult};
 use crate::project::Project;
-use crate::validate::ValidationMode;
 use crate::worker_image;
 use weft_catalog::FsCatalog;
 
@@ -40,6 +39,22 @@ pub struct StagedImageBuild {
     /// What the build uses of what an install keeps on the machine that
     /// runs it (`WorkerDockerfile::uses`).
     pub uses: weft_core::images::BuildUses,
+    /// Where the built image keeps the record of the node packages its
+    /// build left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`), for
+    /// whoever runs the build to read back; `None` when its Dockerfile
+    /// writes none (a custom template, `WorkerDockerfile::writes_left_out_record`).
+    pub result_file: Option<String>,
+}
+
+impl StagedImageBuild {
+    fn new(build_context: PathBuf, content_hash: String, dockerfile: &worker_image::WorkerDockerfile) -> Self {
+        Self {
+            build_context,
+            content_hash,
+            uses: dockerfile.uses(),
+            result_file: dockerfile.writes_left_out_record.then(|| weft_core::builds::LEFT_OUT_RECORD_PATH.to_string()),
+        }
+    }
 }
 
 /// The cargo crate name of every generated worker. One constant for every
@@ -95,7 +110,7 @@ impl StockProject {
         std::os::unix::fs::symlink(&stdlib, crate::project::base_catalog_dir(dir.path()))
             .map_err(CompileError::Io)?;
         let project = Project::load(dir.path())?;
-        let (definition, catalog) = crate::hash::load_enriched_project(&project)
+        let (definition, catalog) = crate::hash::load_program(&project)
             .map_err(|e| CompileError::Build(format!("compile the stock project: {e}")))?;
         Ok(Self { _dir: dir, project, definition, catalog })
     }
@@ -121,7 +136,8 @@ pub fn standard_worker_hash() -> CompileResult<String> {
 
 /// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
 ///
-/// 1. Validate the (resolved) definition, abort on any error.
+/// 1. Check the (resolved) definition was settled after its last change
+///    (`crate::unsettled`): every error in it is one of its broken parts.
 /// 2. Codegen the cargo crate at `.weft/target/build/`.
 /// 3. Emit the multi-stage Dockerfile at
 ///    `.weft/target/Dockerfile.worker`.
@@ -134,10 +150,8 @@ pub fn standard_worker_hash() -> CompileResult<String> {
 /// recompiling from source: the caller resolves `@asset` refs into the
 /// definition (deferred file markers become concrete file values) BEFORE
 /// this runs, and a fresh compile-from-source here would see the raw
-/// markers instead (a file-typed `@asset` reads as a `String` at parse and
-/// would fail validation against its `File` port). This is also the only
-/// validation gate on the build path, so it runs on the resolved
-/// definition, not the raw source. `Structural` (not `Runtime`): a project
+/// markers instead of the stored files the build resolved them to. The
+/// gate runs on the resolved definition, not the raw source. `Structural` (not `Runtime`): a project
 /// may build without every secret filled; runtime-rule gaps surface at run.
 ///
 /// `bases.builder` is the shared builder-base image ref the caller
@@ -152,11 +166,12 @@ pub fn build_project(
     node_set: weft_core::builds::NodeSet,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
-    crate::bail_on_errors(crate::validate::validate_with_mode(
-        definition,
-        catalog,
-        ValidationMode::Structural,
-    ))?;
+    // What does not compile is already in the definition as broken parts
+    // (`crate::compile_program`), and the build goes on around them: a
+    // part a run needs is refused when the run is cut. Anything else is a
+    // definition changed since its check.
+    let root = project_root.canonicalize().map_err(CompileError::Io)?;
+    crate::bail_on_errors(crate::unsettled(definition, catalog, Some(&root)))?;
     // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
 
@@ -202,7 +217,7 @@ pub fn build_project(
         crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
             .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
 
-    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
+    Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
 
 /// Stage the docker build context under
@@ -213,7 +228,7 @@ pub fn build_project(
 ///   Dockerfile           (copy of Dockerfile.worker)
 ///   build/               (the generated cargo crate)
 ///   weft/                (the weft workspace: crates, Cargo.toml, Cargo.lock)
-///   project-nodes/       (the project's nodes/ dir: every node's source)
+///   project-nodes/       (every node's source, at its path in the project)
 /// ```
 ///
 /// `weft/` carries only the language runtime (the workspace crates the
@@ -224,8 +239,9 @@ pub fn build_project(
 /// `node_modules/`).
 ///
 /// `project-nodes/` holds ONLY the package roots the project actually
-/// references, each copied to its path relative to `nodes/` so the
-/// `#[path]` shims resolve. Discovery already walked `nodes/` and
+/// references, each copied to its path relative to the project root
+/// (`nodes/...`, or `src/...` for a node beside the code) so the
+/// `#[path]` shims resolve. Discovery already walked both node roots and
 /// grouped nodes under package roots; staging copies those roots
 /// rather than re-walking the tree, so there is a single directory
 /// walker (discovery) and nothing for a second walker to disagree
@@ -409,7 +425,7 @@ pub fn build_test_artifact(
 
     let content_hash = node_test_content_hash(project, catalog, package_name)?;
 
-    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
+    Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
 
 /// The node-test image's Dockerfile: the worker recipe, started as the
@@ -1146,7 +1162,8 @@ pub fn drop_built_binary(binary: &Path) {
 }
 
 /// Build the catalog for a project: discover every node under its
-/// `nodes/` directory. That is the single source of truth (the stdlib
+/// `nodes/` directory and beside its code under `src/`
+/// (`crate::project::node_roots`). That is the single source of truth (the stdlib
 /// is cloned in at `weft new`), so the project is self-contained and
 /// nothing reaches into the weft installation at build time. A node or
 /// package that fails to load is left out and recorded
@@ -1208,7 +1225,7 @@ mod tests {
         let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx"), &weft_core::infra::Install::default_install()).expect("stage");
         let crate_root = ctx.join(crate::worker_image::WARMUP_CRATE_DIR);
         let manifest = std::fs::read_to_string(crate_root.join("Cargo.toml")).unwrap();
-        assert!(manifest.contains("pkg_format = { path = \"./pkg_format-"), "{manifest}");
+        assert!(manifest.contains("pkg_format = { optional = true, path = \"./pkg_format-"), "{manifest}");
         assert!(crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME).is_file());
         // Staged at its project-relative path: a node under `nodes/` and
         // one beside the code under `src/` land side by side under the mount.

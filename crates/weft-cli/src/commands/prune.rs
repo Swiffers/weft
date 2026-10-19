@@ -54,7 +54,7 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     // Loudly, because the line below promises the blobs start
     // expiring: if the project does not load, nothing was republished
     // and that promise is false.
-    let (mut definition, _) = weft_compiler::hash::load_enriched_project(project)
+    let (mut definition, _) = weft_compiler::hash::load_program(project)
         .context("the versions were pruned, but the project does not load, so the freed blobs were not released; fix the project and run `weft build`")?;
     for warning in super::assets::resolve_project_assets(&client, &project.root, &mut definition, true).await? {
         eprintln!("warning: {warning}");

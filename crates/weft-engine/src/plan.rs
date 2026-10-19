@@ -375,15 +375,20 @@ type PlanKey = (String, Option<weft_core::instance::InstanceId>, u64, u64);
 /// What a worker keeps of its programs and plans (see the module doc).
 pub(crate) struct Plans {
     project_id: uuid::Uuid,
+    /// What this worker's build left out because it did not compile
+    /// (`weft_core::NodeCatalog::left_out`): a fire whose cut uses one of
+    /// those node types is refused before it starts.
+    left_out: &'static weft_core::builds::LeftOut,
     projects: Mutex<Bounded<String, Arc<ProjectDefinition>>>,
     programs: Mutex<Bounded<ProgramKey, Arc<ProgramTables>>>,
     plans: Mutex<Bounded<PlanKey, Arc<RunPlan>>>,
 }
 
 impl Plans {
-    pub(crate) fn new(project_id: uuid::Uuid) -> Self {
+    pub(crate) fn new(project_id: uuid::Uuid, left_out: &'static weft_core::builds::LeftOut) -> Self {
         Self {
             project_id,
+            left_out,
             projects: Mutex::new(Bounded::new(8)),
             programs: Mutex::new(Bounded::new(64)),
             plans: Mutex::new(Bounded::new(256)),
@@ -407,6 +412,18 @@ impl Plans {
         let project = Arc::new(project);
         self.projects.lock().expect("project cache").insert(definition_hash.to_string(), project.clone());
         Ok(project)
+    }
+
+    /// `project` as this worker can run it: what its build left out added
+    /// to the program's broken parts (`weft_core::builds::LeftOut`), so the
+    /// fire's cut refuses a node it has no code for, naming the package.
+    fn runnable(&self, project: Arc<ProjectDefinition>) -> Arc<ProjectDefinition> {
+        if self.left_out.is_empty() {
+            return project;
+        }
+        let mut runnable = (*project).clone();
+        runnable.broken.extend(weft_core::builds::LeftOut::broken_parts(&self.left_out.packages, &project, None));
+        Arc::new(runnable)
     }
 
     /// The tables of `project`, whose definition hash is `definition_hash`.
@@ -467,7 +484,7 @@ impl Plans {
         if let Some(plan) = self.plans.lock().expect("plan cache").get(&key) {
             return Ok(plan);
         }
-        let project = self.project(clients, &entry.definition_hash).await?;
+        let project = self.runnable(self.project(clients, &entry.definition_hash).await?);
         let plan = Arc::new(RunPlan::build(
             |cut, definition_hash| self.cut(cut, definition_hash),
             &project,
@@ -757,6 +774,29 @@ pub(crate) mod tests {
         assert_eq!(at("img"), WeftType::parse("Image").unwrap());
         assert_eq!(at("vid"), WeftType::parse("Video").unwrap());
         assert_eq!(program.ports("n", &Vec::new()).unwrap().outputs["file"], WeftType::parse("Image").unwrap());
+    }
+
+    /// A worker whose build left a package out refuses, before it starts,
+    /// a fire whose cut uses one of its node types, naming the package and
+    /// its first error; a worker built whole plans the same fire.
+    #[test]
+    fn a_fire_reaching_a_left_out_package_is_refused_up_front() {
+        let left_out: &'static weft_core::builds::LeftOut = Box::leak(Box::new(weft_core::builds::LeftOut {
+            packages: vec![weft_core::builds::LeftOutPackage {
+                package: "relay".into(),
+                node_types: vec!["Pass".into()],
+                error: "error[E0425]: cannot find value `x`".into(),
+            }],
+        }));
+        let whole = Plans::new(uuid::Uuid::from_u128(9), Box::leak(Box::default()));
+        assert!(!matches!(plan_of(&whole.runnable(chain()), "trig", &Default::default()).start, Err(Unready::Refused(_))));
+        let missing = Plans::new(uuid::Uuid::from_u128(9), left_out);
+        let refused = plan_of(&missing.runnable(chain()), "trig", &Default::default());
+        assert!(
+            matches!(&refused.start, Err(Unready::Refused(why)) if why.contains("package 'relay' didn't compile: error[E0425]")),
+            "{:?}",
+            refused.start.as_ref().err()
+        );
     }
 
     /// A plan of a node that is no trigger never starts a run, and says why.

@@ -82,6 +82,12 @@ pub struct BuildRequest {
     /// runs it: a builder on a machine adds it to its install's image
     /// record before it builds, a cloud builder keeps nothing there.
     pub uses: weft_core::images::BuildUses,
+    /// A file inside the built image whose bytes are the build's result
+    /// (`weft_core::builds::LEFT_OUT_RECORD_PATH` for a worker): read
+    /// once the build succeeded, without running the image, and handed
+    /// back on [`BuildStatus::Succeeded`]. A build whose image lacks it
+    /// failed. `None` for an image with nothing to report.
+    pub result_file: Option<String>,
 }
 
 /// What keeps a staged build context on disk: the context exists while
@@ -147,8 +153,9 @@ impl BuildHandle {
 pub enum BuildStatus {
     /// Still running; poll again later.
     Pending,
-    /// Produced `image_ref`.
-    Succeeded,
+    /// Produced `image_ref`, with the bytes of the request's
+    /// `result_file` when it named one.
+    Succeeded { result: Option<Vec<u8>> },
     /// The build failed; `reason` is the builder's error.
     Failed { reason: String },
     /// Nothing runs under this name any more: it was released, or what
@@ -253,7 +260,7 @@ impl ImageBuilder for FakeImageBuilder {
             anyhow::bail!("the builder did not answer");
         }
         let status = inner.poll_results.get(&handle.external_build_id).cloned().unwrap_or(BuildStatus::Pending);
-        if status == BuildStatus::Succeeded {
+        if matches!(status, BuildStatus::Succeeded { .. }) {
             if let Some(image_ref) = inner.pushes.get(&handle.external_build_id).cloned() {
                 inner.existing.insert(image_ref);
             }
@@ -313,13 +320,15 @@ mod tests {
                 image_ref: "reg/weft-worker:x".into(),
                 build_args: Vec::new(),
                 uses: Default::default(),
+                result_file: None,
             })
             .await
             .unwrap();
         assert_eq!(b.starts().len(), 1);
         assert_eq!(b.poll(&handle).await.unwrap(), BuildStatus::Pending);
-        b.set_poll_result(&handle.external_build_id, BuildStatus::Succeeded);
-        assert_eq!(b.poll(&handle).await.unwrap(), BuildStatus::Succeeded);
+        let built = BuildStatus::Succeeded { result: Some(b"{}".to_vec()) };
+        b.set_poll_result(&handle.external_build_id, built.clone());
+        assert_eq!(b.poll(&handle).await.unwrap(), built);
         b.delete_image("reg/weft-worker:present").await.unwrap();
         assert!(!b.image_exists("reg/weft-worker:present").await.unwrap());
     }

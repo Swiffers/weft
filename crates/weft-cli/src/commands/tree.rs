@@ -17,7 +17,7 @@ pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
         // The tree as the dispatcher answered it, plus the one fact only
         // this side knows: which version (if any) the files on disk are.
         // Same answer the human view renders, so the two cannot disagree.
-        let disk = weft_core::project::hash::manifest_version_id(&super::versions::local_manifest(project)?);
+        let disk = weft_core::project::hash::manifest_version_id(&super::versions::local_manifest(&project.root)?);
         let known = tree.versions.iter().any(|v| v.id == disk);
         if let Some(obj) = raw.as_object_mut() {
             obj.insert("diskVersion".into(), if known { serde_json::Value::String(disk) } else { serde_json::Value::Null });

@@ -519,7 +519,11 @@ fn validate_loops(g: &ProjectGraph, walked: &Walk) -> Result<(), String> {
 ///
 /// `given` is what the run is given; it keeps only what goes to a place
 /// the cut keeps, and the cut says where that is.
-pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> ProjectDefinition {
+///
+/// Refused when the cut keeps a part of the program that does not compile
+/// ([`ProjectDefinition::broken`]), naming every one: the program around a
+/// broken part runs, and nothing that needs it does.
+pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Result<ProjectDefinition, String> {
     let g = ProjectGraph::new(project);
     let kept = walked.kept();
     // One reading with the walk's (`walk_up`): a trigger the run does not
@@ -648,9 +652,24 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Pro
         group.child_group_ids.retain(|child| group_ids.contains(child));
     }
 
+    // What the cut needs, for its broken parts: the nodes it keeps, the
+    // groups it keeps as scopes (their gates, their own port values), and
+    // every group a kept wire passes through, whether or not the cut keeps
+    // that group as a scope (a plain group nothing waits on is dissolved,
+    // and the wires through its ports still run). A group a kept node
+    // merely sits in is not among them: an error about the group's own
+    // ports or values is no business of a member that reads none of them.
+    let in_cut: BTreeSet<&str> = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .chain(group_ids.iter().map(String::as_str))
+        .chain(project.edges.iter().filter(|edge| edge_ids.contains(edge.id.as_str())).flat_map(|edge| edge.via.iter().map(|crossing| crossing.group.as_str())))
+        .collect();
+    refuse_broken(&project.broken, &in_cut)?;
+
     given.inputs.retain(|place, _| kept.contains(place) || group_ids.contains(&place.id));
     given.outputs.retain(|place, _| walked.stand_ins.contains(place));
-    ProjectDefinition {
+    Ok(ProjectDefinition {
         id: project.id,
         nodes,
         edges,
@@ -659,7 +678,20 @@ pub fn cut(project: &ProjectDefinition, walked: &Walk, given: &mut Given) -> Pro
         updated_at: project.updated_at,
         defaults: project.defaults,
         given: given.places(),
+        broken: Vec::new(),
+    })
+}
+
+/// The refusal of a cut whose nodes and groups are `in_cut` and which
+/// needs some of `broken`: every one it needs, in the program's order.
+fn refuse_broken(broken: &[super::Broken], in_cut: &BTreeSet<&str>) -> Result<(), String> {
+    // A reason over several lines (an included file's parse errors) keeps
+    // its own lines under its first.
+    let needed: Vec<String> = broken.iter().filter(|part| part.needed_by(in_cut)).map(|part| part.why.replace('\n', "\n    ")).collect();
+    if needed.is_empty() {
+        return Ok(());
     }
+    Err(format!("it needs parts of the program that do not compile:\n  {}", needed.join("\n  ")))
 }
 
 /// `place` as seen from inside the site `site` at the top of the call

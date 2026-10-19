@@ -370,7 +370,7 @@ pub async fn events(ctx: Ctx, run_id: String, mut filter: EventsFilter) -> anyho
     // id, saying why.
     let loaded = ctx.project_here().and_then(|here| match here {
         Some(project) => {
-            let (definition, _) = weft_compiler::hash::load_enriched_project(project)?;
+            let (definition, _) = weft_compiler::hash::load_program(project)?;
             Ok(Some((project, definition)))
         }
         None => Ok(None),

@@ -29,6 +29,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
         updated_at: Utc::now(),
         defaults: Default::default(),
         given: Default::default(),
+        broken: Vec::new(),
     }
 }
 

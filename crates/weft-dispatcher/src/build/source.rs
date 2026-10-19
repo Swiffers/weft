@@ -102,22 +102,17 @@ async fn lay_out(
 }
 
 /// Compile the materialized project: the definition, its catalog, and the
-/// project handle the plan reads. Blocking. A compile failure renders every
-/// diagnostic, one per line, the way the CLI prints its own.
+/// project handle the plan reads. Blocking. What does not compile stays in
+/// the definition as its broken parts (`weft_compiler::compile_program`):
+/// the version registers, and a run that needs one is refused when it is
+/// cut. A failure of the program as a whole renders every diagnostic, one
+/// per line, the way the CLI prints its own.
 pub fn compile(
     root: &Path,
 ) -> Result<(weft_core::ProjectDefinition, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
     let project = weft_compiler::project::Project::load(root).map_err(|e| anyhow!("{e}"))?;
-    let (definition, catalog) = weft_compiler::hash::load_enriched_project_with_diagnostics(&project)
+    let (definition, catalog) = weft_compiler::hash::load_program_with_diagnostics(&project)
         .map_err(|e| anyhow!("compile failed:\n{e}"))?;
-    let diags = weft_compiler::validate::validate_with_mode(
-        &definition,
-        &catalog,
-        weft_compiler::validate::ValidationMode::Structural,
-    );
-    if diags.iter().any(|d| matches!(d.severity, weft_compiler::Severity::Error)) {
-        bail!("compile failed:\n{}", weft_compiler::render_diagnostics(&diags));
-    }
     Ok((definition, catalog, project))
 }
 

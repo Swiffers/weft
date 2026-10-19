@@ -7,9 +7,16 @@
 //!
 //! ```text
 //! .weft/target/build/
-//!   Cargo.toml          # base deps + a path dep on each package crate.
+//!   Cargo.toml          # base deps + an optional path dep on each
+//!                       # package crate, one feature per package,
+//!                       # all of them on by default.
 //!   rust-toolchain.toml # the weft workspace's pinned toolchain.
 //!   weft-cache-gc.sh    # run by the Dockerfile after `cargo build`.
+//!   isolate.json        # the package crates the build may leave out.
+//!   left-out.json       # the record of what it left out (empty until
+//!                       # the build overwrites it); registry.rs embeds it.
+//!   weft-isolate-<slot>/ # the program that builds the crate, leaving
+//!                       # out the packages that do not compile.
 //!   pkg_<name>-<slot>/  # one cargo crate per referenced package,
 //!     Cargo.toml        # carrying its package.toml + deps.toml deps.
 //!     src/lib.rs        # #[path]-includes the package's shared .rs
@@ -26,6 +33,15 @@
 //!
 //! `<slot>` is a hash over the package's files and its generated
 //! manifest and shim, so editing one node recompiles only its package.
+//!
+//! A package that does not compile costs only its own node types: the
+//! image build runs `weft-isolate` (`worker_isolate`), which builds
+//! every package crate it can, turns off the features of the ones that
+//! failed, builds the worker without them, and writes `left-out.json`.
+//! The registry gates each package's arms on its feature and answers
+//! `NodeCatalog::left_out` from that record, and the record is copied
+//! into the image (`weft_core::builds::LEFT_OUT_RECORD_PATH`) for the
+//! install to read. A plain `cargo build` builds everything, as before.
 //!
 //! Pruning: each package's crate is emitted only if at least one of
 //! its nodes is referenced. Within a crate, only referenced node
@@ -105,10 +121,19 @@ pub fn emit(
         &packages,
         &EmitPaths::Container { project_root: project_root.to_path_buf() },
     )?;
-    write_worker_cargo_toml(&crate_root, catalog, &packages, &crate_dirs, crate_name)?;
+    write_worker_cargo_toml(&crate_root, &packages, &crate_dirs, crate_name)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
-    write_cache_gc_script(&crate_root)?;
-    write_registry_rs(&src_dir, &packages)?;
+    let candidates = packages
+        .iter()
+        .map(|pkg| crate::worker_isolate::Candidate {
+            feature: pkg.module_ident.clone(),
+            crate_dir: crate_dirs[&pkg.module_ident].clone(),
+            package: pkg.package.name.clone(),
+            node_types: pkg.node_types.clone(),
+        })
+        .collect();
+    write_image_build_files(&crate_root, crate::worker_isolate::Candidates { packages: candidates })?;
+    write_registry_rs(&src_dir, &packages, PackageGating::Features)?;
     write_main_rs(&src_dir, catalog)?;
 
     Ok(crate_root)
@@ -232,13 +257,18 @@ fn sanitize_pkg_ident(raw: &str) -> String {
 /// [`collect_node_types`] for `Referenced`, every catalog entry for
 /// `Full`. The ONE resolution of the choice; codegen, the Dockerfile
 /// staging and the binary hash all read it.
+///
+/// A type the catalog does not serve is no code to compile: the node
+/// using it is one of the program's broken parts
+/// (`crate::compile_program`), as is the placeholder an included file
+/// that does not compile leaves, and no run that needs it starts.
 pub fn node_types_for(
     project: &ProjectDefinition,
     catalog: &FsCatalog,
     node_set: NodeSet,
 ) -> BTreeSet<String> {
     match node_set {
-        NodeSet::Referenced => collect_node_types(project),
+        NodeSet::Referenced => collect_node_types(project).into_iter().filter(|t| catalog.entry(t).is_some()).collect(),
         NodeSet::Full => catalog.iter().map(|e| e.node_type.clone()).collect(),
     }
 }
@@ -267,90 +297,13 @@ pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
 /// inside each package crate's own `Cargo.toml`, NOT here: a node
 /// that pulls in a heavy dependency stays a recompile-target of its OWN crate,
 /// while the worker keeps cache-hitting on every other build.
-/// The binary crate's build-script contribution. A package may ship a
-/// `build.rs` at its root (declaring `pub fn main()`) plus
-/// `[build-dependencies]` in its nodes' `deps.toml`; linker arguments
-/// only take effect on the crate being LINKED, so these run on the
-/// emitted BINARY crate (worker / test runner), never on the package
-/// lib. Copies each contributing script in as `build_<ident>.rs`,
-/// writes one synthesized `build.rs` calling each, and returns the
-/// `[package]` build line + the `[build-dependencies]` section
-/// (both empty when no package contributes).
-fn write_binary_build_script(
-    crate_root: &Path,
-    catalog: &FsCatalog,
-    packages: &[PackageEmit<'_>],
-) -> CompileResult<(String, String)> {
-    let mut build_deps: BTreeMap<String, toml::Value> = BTreeMap::new();
-    let mut contributors: Vec<&PackageEmit<'_>> = Vec::new();
-    for pkg in packages {
-        if pkg.package.root.join("build.rs").is_file() {
-            contributors.push(pkg);
-        }
-        for node_type in &pkg.node_types {
-            let node_deps = catalog
-                .deps(node_type)
-                .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
-            let Some(node_deps) = node_deps else { continue };
-            for (name, value) in node_deps.build_dependencies {
-                add_dep(
-                    &mut build_deps,
-                    &pkg.package.name,
-                    name,
-                    value,
-                    &format!("node {node_type} (build-dependencies)"),
-                )?;
-            }
-        }
-    }
-    if contributors.is_empty() {
-        if let Some(name) = build_deps.keys().next() {
-            return Err(CompileError::Build(format!(
-                "a deps.toml declares build-dependency '{name}' but no referenced \
-                 package ships a build.rs at its root; build-dependencies exist only \
-                 for a package build script"
-            )));
-        }
-        return Ok((String::new(), String::new()));
-    }
-
-    let mut body = String::from(
-        "// Emitted by weft codegen: runs each referenced package's own\n\
-         // build script (`<package root>/build.rs`, `pub fn main()`).\n\n",
-    );
-    for pkg in &contributors {
-        let file = format!("build_{}.rs", pkg.module_ident);
-        std::fs::copy(pkg.package.root.join("build.rs"), crate_root.join(&file))
-            .map_err(CompileError::Io)?;
-        body.push_str(&format!(
-            "#[path = \"{file}\"]\nmod {ident}_build;\n",
-            ident = pkg.module_ident
-        ));
-    }
-    body.push_str("\nfn main() {\n");
-    for pkg in &contributors {
-        body.push_str(&format!("    {ident}_build::main();\n", ident = pkg.module_ident));
-    }
-    body.push_str("}\n");
-    std::fs::write(crate_root.join("build.rs"), body).map_err(CompileError::Io)?;
-
-    let mut build_deps_fragment = String::from("\n[build-dependencies]\n");
-    for (name, value) in build_deps {
-        build_deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
-    }
-    Ok(("build = \"build.rs\"\n".to_string(), build_deps_fragment))
-}
-
 fn write_worker_cargo_toml(
     crate_root: &Path,
-    catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
     crate_dirs: &BTreeMap<String, String>,
     crate_name: &str,
 ) -> CompileResult<()> {
     let package_name = crate::build::sanitize_crate_name(crate_name);
-    let (build_line, build_deps_fragment) =
-        write_binary_build_script(crate_root, catalog, packages)?;
 
     let mut deps = fixed_worker_deps();
     // One path dep per referenced package crate. These are the ONLY
@@ -359,17 +312,26 @@ fn write_worker_cargo_toml(
     // from this same emission, so a project reuses every rlib it shares
     // with it: the engine, the dependencies, and each stock package crate
     // it did not edit.
+    //
+    // Each is optional behind a feature named like it, all on by default:
+    // a plain `cargo build` builds everything, and `weft-isolate` can
+    // build the worker without a package that failed. Features of this
+    // crate never reach the package crates' own compile, so a package's
+    // rlib is the same unit either way.
     for pkg in packages {
-        insert_dep(
-            &mut deps,
-            &pkg.module_ident,
-            toml::Value::Table(path_table(&format!("./{}", crate_dirs[&pkg.module_ident]))),
-        );
+        let mut dep = path_table(&format!("./{}", crate_dirs[&pkg.module_ident]));
+        dep.insert("optional".into(), toml::Value::Boolean(true));
+        insert_dep(&mut deps, &pkg.module_ident, toml::Value::Table(dep));
     }
 
     let mut deps_fragment = String::new();
     for (name, value) in deps {
         deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
+    }
+    let features: Vec<String> = packages.iter().map(|pkg| toml_inline(&toml::Value::String(pkg.module_ident.clone()))).collect();
+    let mut features_fragment = format!("[features]\ndefault = [{}]\n", features.join(", "));
+    for pkg in packages {
+        features_fragment.push_str(&format!("{ident} = [\"dep:{ident}\"]\n", ident = pkg.module_ident));
     }
 
     let contents = format!(
@@ -380,17 +342,18 @@ fn write_worker_cargo_toml(
 name = "{name}"
 version = "0.1.0"
 edition = "2021"
-{build_line}
+
 [[bin]]
 name = "{name}"
 path = "src/main.rs"
 
+{features}
 [dependencies]
-{deps}{build_deps}"#,
+{deps}"#,
         workspace = STANDALONE_WORKSPACE_HEADER,
         name = package_name,
+        features = features_fragment,
         deps = deps_fragment,
-        build_deps = build_deps_fragment,
     );
     std::fs::write(crate_root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
     Ok(())
@@ -471,6 +434,60 @@ fn package_crate_slot(
     Ok(crate::hash::hex(&hasher.finalize()).chars().take(16).collect())
 }
 
+/// A package's build script, as lines of its package crate's manifest:
+/// the `[package]` build line and the `[build-dependencies]` section,
+/// both empty when the package ships no `build.rs` at its root. The
+/// script is the package crate's own, so it runs (and its
+/// build-dependencies compile) for that package alone: one that fails
+/// leaves only its package unbuilt, which is what lets `weft-isolate`
+/// leave just that package out. Its `cargo:` lines reach what cargo lets
+/// a library's script reach: `rustc-link-lib` and `rustc-link-search`
+/// carry to the binary that links it, `rustc-env`, `rustc-cfg` and
+/// `OUT_DIR` to the package's own code.
+fn package_build_script(
+    catalog: &FsCatalog,
+    pkg: &PackageEmit<'_>,
+    paths: &EmitPaths,
+) -> CompileResult<(String, String)> {
+    let mut build_deps: BTreeMap<String, toml::Value> = BTreeMap::new();
+    for node_type in &pkg.node_types {
+        let node_deps = catalog
+            .deps(node_type)
+            .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
+        let Some(node_deps) = node_deps else { continue };
+        for (name, value) in node_deps.build_dependencies {
+            add_dep(
+                &mut build_deps,
+                &pkg.package.name,
+                name,
+                value,
+                &format!("node {node_type} (build-dependencies)"),
+            )?;
+        }
+    }
+    let script = pkg.package.root.join("build.rs");
+    if !script.is_file() {
+        if let Some(name) = build_deps.keys().next() {
+            return Err(CompileError::Build(format!(
+                "a deps.toml in package '{}' declares build-dependency '{name}' but the \
+                 package ships no build.rs at its root; build-dependencies exist only \
+                 for a package build script",
+                pkg.package.name
+            )));
+        }
+        return Ok((String::new(), String::new()));
+    }
+    let build_line = format!("build = \"{}\"\n", escape_quoted_str(&paths.include_path(&script)?));
+    let mut build_deps_fragment = String::new();
+    if !build_deps.is_empty() {
+        build_deps_fragment.push_str("\n[build-dependencies]\n");
+        for (name, value) in build_deps {
+            build_deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
+        }
+    }
+    Ok((build_line, build_deps_fragment))
+}
+
 fn render_package_cargo_toml(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
@@ -527,6 +544,7 @@ fn render_package_cargo_toml(
     for (name, value) in deps {
         deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
     }
+    let (build_line, build_deps_fragment) = package_build_script(catalog, pkg, paths)?;
 
     let contents = format!(
         r#"# Emitted by weft codegen. Per-package crate for `{pkg_name}`.
@@ -536,7 +554,7 @@ fn render_package_cargo_toml(
 name = "{ident}"
 version = "0.1.0"
 edition = "2021"
-
+{build_line}
 [lib]
 path = "src/lib.rs"
 
@@ -549,10 +567,11 @@ path = "src/lib.rs"
 node-tests = []
 
 [dependencies]
-{deps}"#,
+{deps}{build_deps}"#,
         pkg_name = pkg.package.name,
         ident = pkg.module_ident,
         deps = deps_fragment,
+        build_deps = build_deps_fragment,
     );
     Ok(contents)
 }
@@ -603,19 +622,115 @@ fn render_package_lib_rs(
     Ok(body)
 }
 
-/// Put the compile-cache sweep (`worker_image::CACHE_GC_SCRIPT`) at the
-/// root of a crate that builds inside an image. The Dockerfile's
-/// `cargo build` RUN calls it out of `/work` after the binary is copied
-/// out, and the crate root is what the `COPY build/ /work/` carries, so
-/// this is how the script reaches the build. Every crate the built-in
-/// templates build gets one: the worker crate and the container path's
-/// node-test crate.
-fn write_cache_gc_script(crate_root: &Path) -> Result<(), CompileError> {
+/// Which way an emitted binary crate depends on its package crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageGating {
+    /// Each package behind a feature of its own (the worker), so the
+    /// build can leave out one that does not compile.
+    Features,
+    /// Every package always compiled in (a node-test crate: its one
+    /// package is what it tests).
+    Always,
+}
+
+/// Put what the built-in templates' build RUN calls out of `/work` at the
+/// root of a crate that builds inside an image (the crate root is what
+/// `COPY build/ /work/` carries): the compile-cache sweep
+/// (`worker_image::CACHE_GC_SCRIPT`), `isolate.json` (`candidates`, the
+/// package crates the build may leave out), the empty record
+/// `left-out.json` the build overwrites, and the `weft-isolate` package
+/// that builds the crate ([`isolate_dir_name`]). Every crate the
+/// built-in templates build gets them: the worker crate, and the
+/// container path's node-test crate with no candidates (its one package
+/// is what it tests), for which `weft-isolate` is a plain build.
+///
+/// The record and the helper's sources carry the fixed package date
+/// (`build::package_source_mtime`): the registry embeds the record, so a
+/// wall-clock date would recompile the worker crate on every build, and
+/// the helper compiles once per lane. Content never hides behind the old
+/// date: the build rewrites the record whenever it leaves something out,
+/// and the helper's directory is named by its content.
+fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate::Candidates) -> CompileResult<()> {
     std::fs::write(
         crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME),
         crate::worker_image::CACHE_GC_SCRIPT,
     )
-    .map_err(CompileError::Io)
+    .map_err(CompileError::Io)?;
+    let candidates = serde_json::to_string_pretty(&candidates)
+        .map_err(|e| CompileError::Build(format!("write {ISOLATE_CANDIDATES_FILE}: {e}")))?;
+    std::fs::write(crate_root.join(ISOLATE_CANDIDATES_FILE), candidates).map_err(CompileError::Io)?;
+    let record = crate_root.join(LEFT_OUT_RECORD_FILE);
+    std::fs::write(&record, EMPTY_LEFT_OUT_RECORD).map_err(CompileError::Io)?;
+
+    let helper = crate_root.join(isolate_dir_name());
+    std::fs::create_dir_all(helper.join("src")).map_err(CompileError::Io)?;
+    std::fs::write(helper.join("Cargo.toml"), isolate_cargo_toml()).map_err(CompileError::Io)?;
+    std::fs::write(helper.join("src").join("main.rs"), ISOLATE_SOURCE).map_err(CompileError::Io)?;
+    for file in [record, helper.join("Cargo.toml"), helper.join("src").join("main.rs")] {
+        crate::build::stamp_mtime(&file, crate::build::package_source_mtime());
+    }
+    Ok(())
+}
+
+/// The candidates file `weft-isolate` reads, at the crate root.
+pub const ISOLATE_CANDIDATES_FILE: &str = "isolate.json";
+
+/// The record of the packages the build left out, at the crate root:
+/// what `weft-isolate` writes, the registry embeds, and the runtime
+/// stage copies into the image.
+pub const LEFT_OUT_RECORD_FILE: &str = "left-out.json";
+
+/// What `left-out.json` holds until a build leaves something out.
+const EMPTY_LEFT_OUT_RECORD: &str = "{\"packages\":[]}";
+
+/// The `weft-isolate` program (`worker_isolate`), emitted as its own
+/// package's `main.rs`.
+const ISOLATE_SOURCE: &str = include_str!("worker_isolate.rs");
+
+/// The helper's manifest: its own empty workspace (so cargo never takes it
+/// for a stray member of the worker's), and only serde and serde_json, on
+/// the specs every generated crate uses.
+fn isolate_cargo_toml() -> String {
+    let runtime = base_runtime_deps();
+    let mut deps = String::new();
+    for name in ["serde", "serde_json"] {
+        deps.push_str(&format!("{name} = {}\n", toml_inline(&runtime[name])));
+    }
+    format!(
+        "# Emitted by weft codegen: the program that builds the worker crate,\n\
+         # leaving out the node packages that do not compile. Do not edit.\n\
+         \n\
+         [workspace]\n\
+         \n\
+         [package]\n\
+         name = \"weft-isolate\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"2021\"\n\
+         \n\
+         [[bin]]\n\
+         name = \"weft-isolate\"\n\
+         path = \"src/main.rs\"\n\
+         \n\
+         [dependencies]\n\
+         {deps}"
+    )
+}
+
+/// The directory `weft-isolate` is emitted to under a crate root,
+/// `weft-isolate-<slot>`, the slot sixteen hex characters over its
+/// manifest and source. Cargo tells path packages apart by their path and
+/// trusts a source older than its last compile, so a fixed directory with
+/// the fixed source date would keep running an older helper out of a kept
+/// compile cache; one directory per content cannot.
+pub fn isolate_dir_name() -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"weft-isolate-v1\nCargo.toml:\n");
+    hasher.update(isolate_cargo_toml().as_bytes());
+    hasher.update(b"\nmain.rs:\n");
+    hasher.update(ISOLATE_SOURCE.as_bytes());
+    let slot: String = crate::hash::hex(&hasher.finalize()).chars().take(16).collect();
+    format!("weft-isolate-{slot}")
 }
 
 /// Propagate the workspace's pinned toolchain into the generated
@@ -1004,10 +1119,22 @@ fn merge_dep_specs(a: &toml::Value, b: &toml::Value) -> Result<toml::Value, Stri
     Ok(toml::Value::Table(merged))
 }
 
+/// The binary crate's `src/registry.rs`: the `NodeCatalog` over its
+/// package crates. Under [`PackageGating::Features`] each package's arms
+/// and `all()` entries compile only with its feature, and `left_out`
+/// answers from the record the build embedded (`left-out.json`), so a
+/// worker built without a package names it and why instead of knowing
+/// nothing of its types. The generated code warns neither with every
+/// feature on nor with none.
 fn write_registry_rs(
     src_dir: &Path,
     packages: &[PackageEmit<'_>],
+    gating: PackageGating,
 ) -> CompileResult<()> {
+    let gate = |pkg: &PackageEmit<'_>, indent: &str| match gating {
+        PackageGating::Features => format!("{indent}#[cfg(feature = \"{}\")]\n", pkg.module_ident),
+        PackageGating::Always => String::new(),
+    };
     let mut body = String::new();
     body.push_str("//! Per-project NodeCatalog. Dispatches node_type strings to\n");
     body.push_str("//! the node structs in each `pkg_<name>` crate. Each package\n");
@@ -1021,6 +1148,7 @@ fn write_registry_rs(
     for pkg in packages {
         for node_type in &pkg.node_types {
             let struct_mod = weft_catalog::node_module_name(node_type);
+            body.push_str(&gate(pkg, "            "));
             body.push_str(&format!(
                 "            \"{nt}\" => Some(&{pkg_mod}::{struct_mod}::{nt}Node as &'static dyn Node),\n",
                 nt = node_type,
@@ -1033,13 +1161,42 @@ fn write_registry_rs(
     body.push_str("        }\n");
     body.push_str("    }\n");
     body.push_str("    fn all(&self) -> Vec<&'static str> {\n");
-    body.push_str("        vec![");
-    for pkg in packages {
-        for node_type in &pkg.node_types {
-            body.push_str(&format!("\"{node_type}\", "));
+    match gating {
+        PackageGating::Always => {
+            body.push_str("        vec![");
+            for pkg in packages {
+                for node_type in &pkg.node_types {
+                    body.push_str(&format!("\"{node_type}\", "));
+                }
+            }
+            body.push_str("]\n");
+        }
+        PackageGating::Features => {
+            // `mut` is unused when every feature is off.
+            body.push_str("        #[allow(unused_mut)]\n        let mut all = Vec::new();\n");
+            for pkg in packages {
+                let types: Vec<String> = pkg.node_types.iter().map(|t| format!("\"{t}\"")).collect();
+                body.push_str(&gate(pkg, "        "));
+                body.push_str(&format!("        all.extend([{}]);\n", types.join(", ")));
+            }
+            body.push_str("        all\n");
         }
     }
-    body.push_str("]\n    }\n}\n\n");
+    body.push_str("    }\n");
+    if gating == PackageGating::Features {
+        // The record is this build's own output: one that does not read
+        // is a build bug, and the worker must not run past it.
+        body.push_str(&format!(
+            "    fn left_out(&self) -> &'static weft_core::builds::LeftOut {{\n\
+             \x20       static RECORD: std::sync::OnceLock<weft_core::builds::LeftOut> = std::sync::OnceLock::new();\n\
+             \x20       RECORD.get_or_init(|| {{\n\
+             \x20           weft_core::builds::LeftOut::parse(include_bytes!(\"../{LEFT_OUT_RECORD_FILE}\"))\n\
+             \x20               .unwrap_or_else(|e| panic!(\"{{e}}\"))\n\
+             \x20       }})\n\
+             \x20   }}\n"
+        ));
+    }
+    body.push_str("}\n\n");
     body.push_str("pub static PROJECT_CATALOG: ProjectCatalog = ProjectCatalog;\n");
 
     std::fs::write(src_dir.join("registry.rs"), body).map_err(CompileError::Io)?;
@@ -1207,6 +1364,9 @@ impl NodeCatalog for CatalogRef {{
     fn all(&self) -> Vec<&'static str> {{
         registry::PROJECT_CATALOG.all()
     }}
+    fn left_out(&self) -> &'static weft_core::builds::LeftOut {{
+        registry::PROJECT_CATALOG.left_out()
+    }}
 }}
 "#,
     )
@@ -1371,16 +1531,14 @@ pub fn emit_test_crate(
         let weft_root = crate::build::resolve_weft_root()?;
         write_rust_toolchain(target_root, &weft_root)?;
         // The test image builds with the same Dockerfile fragment a
-        // worker does, and that fragment runs the cache sweep out of
-        // `/work` after `cargo build`: without the script here, every
-        // test image build reported a failed sweep and the test crates'
-        // per-package artifacts never expired from the shared cache.
-        write_cache_gc_script(target_root)?;
+        // worker does, which runs `weft-isolate` and the cache sweep out
+        // of `/work`: without the sweep script, every test image build
+        // reported a failed sweep and the test crates' per-package
+        // artifacts never expired from the shared cache.
+        write_image_build_files(target_root, Default::default())?;
     }
 
     let binary_name = format!("{}_tests", crate::build::sanitize_crate_name(&package.name));
-    let (build_line, build_deps_fragment) =
-        write_binary_build_script(target_root, catalog, std::slice::from_ref(&pkg))?;
     let crate_dirs = write_package_crates(target_root, catalog, std::slice::from_ref(&pkg), paths)?;
 
     // Root Cargo.toml: only what the generated main names directly
@@ -1417,21 +1575,20 @@ pub fn emit_test_crate(
 name = "{binary_name}"
 version = "0.1.0"
 edition = "2021"
-{build_line}
+
 [[bin]]
 name = "{binary_name}"
 path = "src/main.rs"
 
 [dependencies]
-{deps}{build_deps}"#,
+{deps}"#,
         pkg_name = package.name,
         deps = deps_fragment,
-        build_deps = build_deps_fragment,
         workspace_block = if standalone { STANDALONE_WORKSPACE_HEADER } else { "" },
     );
     std::fs::write(target_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
 
-    write_registry_rs(&src_dir, std::slice::from_ref(&pkg))?;
+    write_registry_rs(&src_dir, std::slice::from_ref(&pkg), PackageGating::Always)?;
 
     let type_decls = baked_type_decls(catalog);
     let main_rs = format!(
@@ -1576,6 +1733,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let types = collect_node_types(&project);
         assert!(types.contains("Text"), "user catalog type included: {types:?}");

@@ -5,15 +5,20 @@
 //! the shape, not the verdict. A bare "run stuck" sent one
 //! reader to the dispatcher's HTTP API with curl to find out which node
 //! it was; this report names every firing that holds a pulse, the
-//! ports that arrived, and the wired ports still empty, so the fix
-//! (an unwired input, a producer that never fires, a trigger's program
-//! leaking into another) reads off the message.
+//! ports that arrived, and the wired ports still empty, every scope
+//! that never decided whether to run, and every node a run kicked that
+//! never started, so the fix (an unwired input, a producer that never
+//! fires, a gate nothing feeds) reads off the message.
 
+use std::collections::HashMap;
 use std::fmt;
 
-use crate::frames::LoopFrames;
+use crate::frames::{FiringLocation, LoopFrames};
+use crate::primitive::KickedNode;
+use crate::project::scopes::ScopeCopy;
 use crate::project::{ProgramIndex, ProjectDefinition};
 use crate::pulse::PulseTable;
+use crate::run::scope::ScopeTable;
 use crate::RunId;
 
 /// One firing that can never complete: the pulses it holds and the
@@ -31,19 +36,34 @@ pub struct StuckFiring {
     pub missing: Vec<String>,
 }
 
-/// Every firing a stuck run left holding pulses, in node order.
+/// What a stuck run was left waiting on: every firing holding pulses,
+/// in node order; every copy of a scope that never decided whether to
+/// run though every copy around it opened, in order; every node kicked
+/// that never started (its scope never opened), in order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StuckReport {
     pub firings: Vec<StuckFiring>,
+    pub waiting_scopes: Vec<ScopeCopy>,
+    pub unstarted: Vec<FiringLocation>,
 }
 
-/// Walk the pulse table and name each (node, frames) with a pending
-/// pulse, with what it holds and what it lacks. Pure: the same table
-/// gives the same report.
+impl StuckReport {
+    /// Nothing is left waiting.
+    pub fn is_empty(&self) -> bool {
+        self.firings.is_empty() && self.waiting_scopes.is_empty() && self.unstarted.is_empty()
+    }
+}
+
+/// Walk the run's tables and name each (node, frames) with a pending
+/// pulse, with what it holds and what it lacks, each scope copy still
+/// waiting, and each kick never dispatched. Pure: the same tables give
+/// the same report.
 pub fn stuck_report(
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
     pulses: &PulseTable,
+    scopes: &ScopeTable,
+    kicked: &HashMap<FiringLocation, KickedNode>,
 ) -> StuckReport {
     let mut firings = Vec::new();
     for node in &project.nodes {
@@ -83,7 +103,10 @@ pub fn stuck_report(
             firings.push(StuckFiring { node_id: node.id.clone(), frames, holding, missing });
         }
     }
-    StuckReport { firings }
+    let waiting_scopes = crate::run::scope::waiting_copies(program_idx, scopes);
+    let mut unstarted: Vec<FiringLocation> = kicked.iter().filter(|(_, kick)| !kick.dispatched).map(|(at, _)| at.clone()).collect();
+    unstarted.sort_by(|a, b| (&a.node_id, &a.frames).cmp(&(&b.node_id, &b.frames)));
+    StuckReport { firings, waiting_scopes, unstarted }
 }
 
 /// `#3` for the fourth iteration of one loop, `#3.0` one level deeper,
@@ -101,22 +124,42 @@ impl fmt::Display for StuckReport {
     /// holds the whole shape in one line:
     /// `run stuck: 2 firings hold pulses and can never fire:
     /// theirs has value, still waiting on go; leaf has value, every
-    /// wired input arrived`.
+    /// wired input arrived`, then the scopes that never decided and the
+    /// nodes that never started.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("run stuck")?;
         let n = self.firings.len();
-        write!(
-            f,
-            "run stuck: {n} firing{} pulses and can never fire",
-            if n == 1 { " holds" } else { "s hold" }
-        )?;
-        for (i, firing) in self.firings.iter().enumerate() {
-            write!(f, "{} ", if i == 0 { ":" } else { ";" })?;
-            write!(f, "{}{} has {}", firing.node_id, frames_suffix(&firing.frames), firing.holding.join(", "))?;
-            if firing.missing.is_empty() {
-                write!(f, ", every wired input arrived")?;
-            } else {
-                write!(f, ", still waiting on {}", firing.missing.join(", "))?;
+        if n > 0 {
+            write!(f, ": {n} firing{} pulses and can never fire", if n == 1 { " holds" } else { "s hold" })?;
+            for (i, firing) in self.firings.iter().enumerate() {
+                write!(f, "{} ", if i == 0 { ":" } else { ";" })?;
+                write!(f, "{}{} has {}", firing.node_id, frames_suffix(&firing.frames), firing.holding.join(", "))?;
+                if firing.missing.is_empty() {
+                    write!(f, ", every wired input arrived")?;
+                } else {
+                    write!(f, ", still waiting on {}", firing.missing.join(", "))?;
+                }
             }
+        }
+        if !self.waiting_scopes.is_empty() {
+            let named: Vec<String> = self.waiting_scopes.iter().map(|copy| format!("{}{}", copy.scope, frames_suffix(&copy.frames))).collect();
+            write!(
+                f,
+                "{} {} never decided whether to run (nothing reached {} gate or inputs)",
+                if n > 0 { ";" } else { ":" },
+                named.join(", "),
+                if named.len() == 1 { "its" } else { "their" },
+            )?;
+        }
+        if !self.unstarted.is_empty() {
+            let named: Vec<String> = self.unstarted.iter().map(|at| format!("{}{}", at.node_id, frames_suffix(&at.frames))).collect();
+            write!(
+                f,
+                "{} {} never started, waiting on {} scope to open",
+                if n > 0 || !self.waiting_scopes.is_empty() { ";" } else { ":" },
+                named.join(", "),
+                if named.len() == 1 { "its" } else { "their" },
+            )?;
         }
         Ok(())
     }
@@ -177,7 +220,7 @@ mod tests {
         let run_id = uuid::Uuid::new_v4();
         let mut pulses = PulseTable::new();
         pulses.insert("theirs".into(), vec![pulse(run_id, vec![], "theirs", "value")]);
-        let report = stuck_report(&p, &idx, &pulses);
+        let report = stuck_report(&p, &idx, &pulses, &Default::default(), &Default::default());
         assert_eq!(
             report.firings,
             vec![StuckFiring {
@@ -212,7 +255,7 @@ mod tests {
                 pulse(run_id, f5.clone(), "join", "b"),
             ],
         );
-        let report = stuck_report(&p, &idx, &pulses);
+        let report = stuck_report(&p, &idx, &pulses, &Default::default(), &Default::default());
         assert_eq!(report.firings.len(), 2);
         let text = report.to_string();
         assert!(text.contains("join#2 has a, still waiting on b"), "{text}");
@@ -229,6 +272,6 @@ mod tests {
         absorbed.status = crate::pulse::PulseStatus::Absorbed;
         let mut pulses = PulseTable::new();
         pulses.insert("sink".into(), vec![absorbed]);
-        assert!(stuck_report(&p, &idx, &pulses).firings.is_empty());
+        assert!(stuck_report(&p, &idx, &pulses, &Default::default(), &Default::default()).firings.is_empty());
     }
 }

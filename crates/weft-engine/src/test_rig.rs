@@ -162,6 +162,7 @@ impl LiveTestRunner {
             epoch: 1,
             next_seq: 0,
             redaction: Default::default(),
+            program: None,
         });
         let birth = weft_journal::RunEvent::RunStarted {
             run_id,
@@ -174,7 +175,7 @@ impl LiveTestRunner {
             binary_hash: None,
             source_version: None,
             run_kind: weft_core::run::RunKind::NodeTest,
-            selection: None,
+            cut_from: None,
             seed: None,
             // No picks: a node test runs no program, and its connections
             // are the ones the test itself hands the node, never the

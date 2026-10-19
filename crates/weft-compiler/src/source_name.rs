@@ -18,7 +18,7 @@ use std::path::Path;
 /// in a name, so the id clashes with nothing a person writes, and two
 /// files with one name in two folders are two bodies. The id holds no
 /// `.` (a body's nodes are `<body>.<name>`, split at the first dot) and
-/// no `__` (a boundary is `<group>__in`), so any other character in a
+/// no `__` (a loop's boundary is `<loop>__in`), so any other character in a
 /// path becomes `_`; two paths that land on one id are refused by the
 /// compiler. It is internal: every surface that talks to a person names
 /// the file's nodes through the site that calls them (`one.strip`),
@@ -51,7 +51,7 @@ pub fn body_id(root: &Path, file: &Path) -> String {
 /// already a name a person wrote.
 ///
 /// Every surface that puts a group in front of a person goes through
-/// this: the editor's box header, a boundary node's label, anywhere
+/// this: the editor's box header, a loop boundary's label, anywhere
 /// else that would otherwise print the id.
 // SYNC: display_name <-> packages/weft-graph/src/webview/host-bridge.ts displayName
 pub fn display_name(group_id: &str) -> String {
@@ -106,7 +106,7 @@ pub fn derive_label(file: Option<&Path>) -> String {
 /// PascalCase the stem (split on `-`/`_`/space, capitalize each word, concatenate).
 /// Returns None (so the caller falls back to `Untitled`) if the result isn't a
 /// valid weft bare identifier (`[A-Za-z_][\w]*`) OR is a name the language
-/// reserves (`Group`/`Passthrough`/`self`/`__`-containing). The reserved check
+/// reserves (`Group`/`Loop`/`self`/`__`-containing). The reserved check
 /// keeps the anonymous-root id (which skips the user-name gate) honest: an id a
 /// user couldn't write as a decl name must not sneak in via a filename either.
 fn pascal_case(stem: &str) -> Option<String> {
@@ -201,7 +201,7 @@ mod tests {
         // so the derivation itself must refuse a reserved id). Falls back to
         // `Untitled`, the same as any unusable name.
         assert_eq!(id("/x/Group.weft"), "Untitled");
-        assert_eq!(id("/x/Passthrough.weft"), "Untitled");
+        assert_eq!(id("/x/Loop.weft"), "Untitled");
         // `self.weft` PascalCases to `Self` (capitalized away from the lowercase
         // `self` keyword), which is NOT reserved, so it's allowed.
         assert_eq!(id("/x/self.weft"), "Self");

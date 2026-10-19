@@ -14,7 +14,7 @@
 // scope, moves reject when the moved decl has connections).
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
-import { isContainerNodeType, isLoopNodeType, isBoundaryBoxNodeType, containerKindOf, portValueFirstForm } from '../types';
+import { isContainerNodeType, isLoopNodeType, isScopeBoxNodeType, containerKindOf, portValueFirstForm } from '../types';
 import type { EditOp, EditPortSig, RevertedPortSig } from '../../../protocol';
 import { isGatePort } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
@@ -426,7 +426,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       // include has only the port home: a container's `config` is loop
       // knobs, which ride their own ops, and an include has nothing else.
       const input = node.inputs?.find((p) => p.name === op.key);
-      const portsOnly = isBoundaryBoxNodeType(node.nodeType);
+      const portsOnly = isScopeBoxNodeType(node.nodeType);
       if (portsOnly && input === undefined && !isGatePort(op.key)) {
         throw new Error(`'${op.node}' has no input port '${op.key}'`);
       }

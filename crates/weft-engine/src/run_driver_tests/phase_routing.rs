@@ -144,32 +144,31 @@
         .expect("routing project")
     }
 
-    async fn seed(journal: &MemJournal, project: &ProjectDefinition, run_id: RunId, phase: weft_core::context::Phase, kicks: &[&str]) {
-        // Mirror the dispatcher's birth row: a setup phase carries the
-        // selection that bounds it (its triggers' or infra nodes'
-        // dependencies), and the engine refuses a setup row without one.
-        let selection = match phase {
-            weft_core::context::Phase::TriggerSetup => Some(
-                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::trigger_places(project))
-                    .expect("setup selection"),
-            ),
-            weft_core::context::Phase::InfraSetup => Some(
-                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::infra_places(project))
-                    .expect("setup selection"),
-            ),
-            weft_core::context::Phase::Fire => None,
-        }
-        .map(weft_core::project::selection::RecordedSelection::new);
+    /// The program a run of `phase` runs, as the dispatcher hands it: a
+    /// setup phase runs the cut that sets up its triggers or its infra
+    /// (what they need, and nothing downstream of them), named as cut
+    /// from the program; a fire runs the program whole here.
+    fn phase_program(project: ProjectDefinition, phase: weft_core::context::Phase) -> (ProjectDefinition, Option<String>) {
+        let targets = match phase {
+            weft_core::context::Phase::TriggerSetup => weft_core::project::trigger_places(&project),
+            weft_core::context::Phase::InfraSetup => weft_core::project::infra_places(&project),
+            weft_core::context::Phase::Fire => return (project, None),
+        };
+        let (cut, _) = weft_core::run_spec::setup_cut(&project, &targets).expect("setup cut");
+        (cut, Some("test-hash".into()))
+    }
+
+    async fn seed(journal: &MemJournal, project: &ProjectDefinition, cut_from: Option<String>, run_id: RunId, phase: weft_core::context::Phase, kicks: &[&str]) {
         journal
             .record_event(
-                &RunEvent::RunStarted {
+                &RunEvent::RunStarted { given: Default::default(),
                     run_id,
                     project_id: project.id,
                     entry_node: kicks[0].to_string(),
                     phase,
                     definition_hash: Some("test-hash".into()),
                     binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                    selection,
+                    cut_from,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     settings: Default::default(),
@@ -213,7 +212,8 @@
         });
         let run_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, &project, run_id, phase, kicks).await;
+        let (project, cut_from) = phase_program(project, phase);
+        seed(&journal, &project, cut_from, run_id, phase, kicks).await;
         let outcome = run_checked(
             Arc::new(project), catalog, run_id, journal.clone(), clients(journal.clone()),
             CancellationFlag::new_arc(), None,
@@ -434,14 +434,14 @@
         let journal = Arc::new(MemJournal::default());
         journal
             .record_event(
-                &RunEvent::RunStarted {
+                &RunEvent::RunStarted { given: Default::default(),
                     run_id,
                     project_id: project.id,
                     entry_node: "trig".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                    selection: None,
+                    cut_from: None,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     settings: Default::default(),

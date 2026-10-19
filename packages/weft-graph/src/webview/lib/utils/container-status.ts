@@ -1,11 +1,13 @@
 import type { NodeFiringStatus } from '../types';
 
-/// The status a group or loop card shows for one launch of it, read off
-/// the boundary firings and every member run at play.
+/// The status a group, include or loop card shows for one launch of it,
+/// read off the launch's own state (`inStatus`: a loop's In boundary
+/// firing, a group's or include's scope decision) and every member run
+/// at play.
 ///
-/// A skipped In boundary is the whole story: the container did not run
-/// (its `_should_flow` said no, or a loop had nothing to iterate), and
-/// its members carry the same skip, so the card says skipped rather
+/// A skipped launch is the whole story: the container did not run (its
+/// gate said no, nothing reached it, or a loop had nothing to iterate),
+/// and its members carry the same skip, so the card says skipped rather
 /// than "completed" for a set of rows that are all terminal.
 ///
 /// A member parked on a human (or any suspension) holds the container

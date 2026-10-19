@@ -16,8 +16,8 @@ grade = Loop(cards: List[JsonDict], rubric: String) -> (scores: List[Number | Nu
 grade.cards = pull.rows
 ```
 
-Like a group, a loop is gone before anything runs. The compiler turns it into a
-pair of boundary nodes and the runtime drives the iterations.
+Unlike a group, a loop becomes nodes: the compiler turns it into a `LoopIn` and
+a `LoopOut`, and the runtime drives the iterations between them.
 
 ## The five settings
 

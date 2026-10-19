@@ -15,18 +15,19 @@
 	import { containerStatus } from "../../utils/container-status";
 	import { clampZoom, isOnScreen, zoomAfterCollapse, zoomAfterExpand, zoomAround, zoomFrame, MAX_ZOOM, MIN_ZOOM, ZOOM_ANIMATION_MS } from "../../utils/group-zoom";
 	import { derefKeys, derefType } from '../../utils/deref-menu';
-	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
+	import { loopInId, loopOutId } from "../../../host-bridge";
+	import { scopeFirings, copyFrames, withinFrames, credentialOwner, type ScopeBox } from "../../utils/scope-firings";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputRows, outputsOf } from "../../utils/input-field";
 	import { effectiveAccessValue, installPicksVersion, loadInstallPicks } from "./install-picks.svelte";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
-	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, typeVarBoundRefuses, portValueFirstForm } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isScopeBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, typeVarBoundRefuses, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
 	import InstallSwitch from './InstallSwitch.svelte';
 	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
-	import type { CredentialOwnerKind, EditOp, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
+	import type { EditOp, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
 	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -649,19 +650,6 @@
 	 *  (`rowsByCallPath`). */
 	function firingKey(localId: string): string {
 		return localId;
-	}
-
-	/** Whose key a group's members spent, folded for the group's synthetic
-	 *  run row: one distinct origin passes through, disagreeing
-	 *  members read 'mixed', no cost records means no origin. */
-	function groupCredentialOwner(
-		members: { credentialOwner?: CredentialOwnerKind | 'mixed' }[],
-	): CredentialOwnerKind | 'mixed' | undefined {
-		const origins = new Set(
-			members.map((e) => e.credentialOwner).filter((o) => o !== undefined),
-		);
-		if (origins.size === 0) return undefined;
-		return origins.size === 1 ? [...origins][0] : 'mixed';
 	}
 
 	/// Flip a node's gate between `_should_flow` and `_should_not_flow`.
@@ -1874,6 +1862,8 @@
 		busesByNode: Record<string, string[]>;
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
 		loopEventsByGroup: Record<string, import('../../../../protocol').LoopInspectorEvent[]>;
+		/// Every copy of a scope the run decided, by scope id.
+		scopeDecisions: Record<string, import('../../../../protocol').ScopeDecidedEvent[]>;
 		journalCorruptions: Array<{ site: import('../../../../protocol').CorruptionSite; reason: string }>;
 		/// The run's own tags (`ctx.tag_run`), painted onto every
 		/// node so any node's inspector can show them.
@@ -1897,6 +1887,7 @@
 		runScope: ReadonlySet<string> | null | undefined;
 		callPath: string[];
 		projectNodes: import('../../types').NodeInstance[];
+		projectEdges: import('../../types').Edge[];
 	};
 
 	function readOverlayCtx(): OverlayCtx {
@@ -1925,6 +1916,7 @@
 			busesByNode,
 			busMetaByBus: state?.busMetaByBus ?? {},
 			loopEventsByGroup: state?.loopEventsByGroup ?? {},
+			scopeDecisions: state?.scopeDecisions ?? {},
 			journalCorruptions: state?.journalCorruptions ?? [],
 			runTags: state?.tags ?? [],
 			runTerminal: state?.terminal,
@@ -1945,7 +1937,69 @@
 			// decorate pass on the hottest path).
 			callPath,
 			projectNodes: untrack(() => fold.project.nodes),
+			projectEdges: untrack(() => fold.project.edges),
 		};
+	}
+
+	/// What a group or include box at this level is painted from (see
+	/// `scopeFirings`): the copies its scope was decided in, every row that
+	/// ran inside it with the copy it ran in, and the wires on its faces.
+	function scopeBox(id: string, nodeType: string, ctx: OverlayCtx): ScopeBox {
+		const box = ctx.projectNodes.find((p) => p.id === id);
+		const loopIds = new Set(ctx.projectNodes.filter((p) => isLoopNodeType(p.nodeType)).map((p) => p.id));
+		// Each row with the number of loops between the box and the node it
+		// belongs to, which is how many iterations its frames carry past
+		// the box's copy.
+		const inside: Array<{ row: import('../../types').NodeFiring; loops: number }> = [];
+		const loopsBelow = (scope: readonly string[] | undefined) => {
+			const chain = scope ?? [];
+			return chain.slice(chain.indexOf(id) + 1).filter((s) => loopIds.has(s)).length;
+		};
+		if (isIncludeNodeType(nodeType)) {
+			for (const row of ctx.rows.inside[id] ?? []) inside.push({ row, loops: 0 });
+		}
+		for (const projNode of ctx.projectNodes) {
+			if (!projNode.scope?.includes(id)) continue;
+			const loops = loopsBelow(projNode.scope);
+			for (const row of ctx.rows.here[firingKey(projNode.id)] ?? []) inside.push({ row, loops });
+			for (const row of ctx.rows.inside[projNode.id] ?? []) inside.push({ row, loops });
+		}
+		const loopsOf = new Map(inside.map(({ row, loops }) => [row, loops]));
+		// A wire end on a loop box is one of its boundary nodes: what lands
+		// on the loop reaches its LoopIn, what leaves it is its LoopOut's.
+		const rowsOf = (nodeId: string, side: 'source' | 'target') => {
+			const place = !loopIds.has(nodeId) ? nodeId : side === 'target' ? loopInId(nodeId) : loopOutId(nodeId);
+			return ctx.rows.here[firingKey(place)] ?? [];
+		};
+		return {
+			id,
+			callPath: ctx.callPath,
+			decisions: ctx.scopeDecisions[id] ?? [],
+			inside: inside.map(({ row }) => row),
+			copyOf: (row) => copyFrames(row.frames, ctx.callPath.length, loopsOf.get(row) ?? 0),
+			legs: ctx.projectEdges,
+			rowsOf,
+			inPorts: (box?.inputs ?? []).map((p) => p.name),
+			outPorts: (box?.outputs ?? []).map((p) => p.name),
+			terminal: ctx.runTerminal,
+		};
+	}
+
+	/// Whether the box `id` stands for something the followed run runs at
+	/// this call path. A node is a place; a loop is its LoopIn; a group is
+	/// in the run when one of its members is, and an include when a place
+	/// under its call is.
+	function boxInRun(id: string, nodeType: string, runScope: ReadonlySet<string>, ctx: OverlayCtx): boolean {
+		if (isLoopNodeType(nodeType)) return runScope.has(locatedKey(loopInId(id), ctx.callPath));
+		if (isIncludeNodeType(nodeType)) {
+			const under = `${locatedKey(id, ctx.callPath)}/`;
+			for (const place of runScope) if (place.startsWith(under)) return true;
+			return false;
+		}
+		if (isContainerNodeType(nodeType)) {
+			return ctx.projectNodes.some((p) => p.parentId === id && boxInRun(p.id, p.nodeType, runScope, ctx));
+		}
+		return runScope.has(locatedKey(id, ctx.callPath));
 	}
 
 	/** Paint every dynamic decoration (run state, infra badges, file
@@ -1953,13 +2007,6 @@
 	 *  Pure: spreads each node, never reorders or repositions. Used by BOTH
 	 *  the structural rebuild and the overlay-tick refresh, so the two render
 	 *  paths cannot drift. */
-	/// Is a row at `frames` inside the iteration at `iteration`: the same
-	/// frame stack, or one that extends it (a nested loop's own frames).
-	function withinFrames(frames: Frame[], iteration: Frame[]): boolean {
-		return frames.length >= iteration.length
-			&& iteration.every((f, i) => JSON.stringify(frames[i]) === JSON.stringify(f));
-	}
-
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
 			nodeOutputs, busLogByBus, busesByNode, busMetaByBus,
@@ -2024,28 +2071,23 @@
 
 					let firings: import('../../types').NodeFiring[];
 
-					if (isBoundaryBoxNodeType(nodeType)) {
-						const groupId = n.id;
+					if (isLoopNodeType(nodeType)) {
+						const loopId = n.id;
 
-						// The boundary pair that stands for this box at this level
-						// (one id derivation: host-bridge). A container's halves fire
-						// here around its members; an include's are its call site's
-						// halves, which fire here in the caller's frames, while the
-						// body runs one call frame deeper.
-						const inFirings = nodeFirings[firingKey(boundaryInId(groupId))] || [];
-						const outFirings = nodeFirings[firingKey(boundaryOutId(groupId))] || [];
+						// A loop runs through its two boundary nodes, which fire
+						// here around each iteration (one id derivation:
+						// host-bridge).
+						const inFirings = nodeFirings[firingKey(loopInId(loopId))] || [];
+						const outFirings = nodeFirings[firingKey(loopOutId(loopId))] || [];
 
-						// Everything that ran inside the box: its members at this level
-						// (via scope, against the CURRENT projected nodes, not the stale
-						// initial prop), and every row that ran under a call site that is
-						// the box itself or one of its members, however deep the calls
-						// below go (`ctx.rows.inside` is keyed by the site at this level).
+						// Everything that ran inside the loop: its members at this
+						// level (via scope, against the CURRENT projected nodes, not
+						// the stale initial prop), and every row that ran under a
+						// call site among them, however deep the calls below go
+						// (`ctx.rows.inside` is keyed by the site at this level).
 						const internalFirings: import('../../types').NodeFiring[] = [];
-						if (isIncludeNodeType(nodeType)) {
-							internalFirings.push(...(ctx.rows.inside[groupId] ?? []));
-						}
 						for (const projNode of ctx.projectNodes) {
-							if (!projNode.scope?.includes(groupId)) continue;
+							if (!projNode.scope?.includes(loopId)) continue;
 							internalFirings.push(...(nodeFirings[firingKey(projNode.id)] ?? []));
 							internalFirings.push(...(ctx.rows.inside[projNode.id] ?? []));
 						}
@@ -2055,9 +2097,7 @@
 						// many iterations whose __in / __out events interleave
 						// and arrive out of order, so the i-th __in is not the
 						// i-th __out; matching by framesKey ties each iteration's
-						// in to its own out. (Sequential loops and plain groups
-						// happen to line up by index, but framesKey is correct
-						// for all of them.)
+						// in to its own out.
 						const outByFrames = new Map(outFirings.map((e) => [e.framesKey, e]));
 
 						// Build synthetic run: one per __in run
@@ -2076,41 +2116,46 @@
 								// Frame-stack-keyed id so an iteration's card keeps
 								// a stable identity across ticks even as sibling
 								// iterations' events interleave (index would shuffle).
-								id: `${groupId}-synth-${inFiring.framesKey}`,
-								nodeId: groupId,
+								id: `${loopId}-synth-${inFiring.framesKey}`,
+								nodeId: loopId,
 								status,
 								pulseId: inFiring.pulseId,
 								error: outFiring?.error ?? inFiring.error,
 								startedAt: inFiring.startedAt,
 								completedAt: outFiring?.completedAt ?? inFiring.completedAt,
-								input: inFiring.output, // __in output = what flows into the group
-								output: outFiring?.output, // __out output = what the group produces
+								input: inFiring.output, // __in output = what flows into the loop
+								output: outFiring?.output, // __out output = what the loop produces
 								// Closed input ports surface from the `__in` boundary
-								// (its own `closedPorts` is the set of group-level
+								// (its own `closedPorts` is the set of loop-level
 								// inputs that arrived as closures). Without this, a
-								// group inspector with closed inputs renders a
+								// loop inspector with closed inputs renders a
 								// blank Input panel where the per-node inspector
 								// shows `port: (closed)` rows.
 								closedPorts: inFiring.closedPorts,
+								skipReason: inFiring.skipReason,
 								// A reused input boundary alone does not mean its body was reused.
 								inheritedFrom: allRelated.every((e) => e.inheritedFrom === inFiring.inheritedFrom)
 									? inFiring.inheritedFrom : undefined,
 								providedPorts: inFiring.providedPorts,
-								backupPorts: inFiring.backupPorts,
 								inheritedPorts: inFiring.inheritedPorts,
 								costUsd: allRelated.reduce((sum, e) => sum + (e.costUsd || 0), 0),
 								inheritedCostUsd: allRelated.reduce((sum, e) => sum + (e.inheritedFrom ? e.costUsd : 0), 0),
 								inheritedCostUnknown: allRelated.some((e) => e.inheritedFrom && e.costUnknown),
-								// An unknown member cost keeps the group honest too: the
+								// An unknown member cost keeps the loop honest too: the
 								// summed figure alone would read as the full price.
 								costUnknown: allRelated.some((e) => e.costUnknown),
-								credentialOwner: groupCredentialOwner(allRelated),
+								credentialOwner: credentialOwner(allRelated),
 								logs: [],
 								runId: inFiring.runId,
 								frames: inFiring.frames,
 								framesKey: inFiring.framesKey,
 							};
 						});
+					} else if (isScopeBoxNodeType(nodeType)) {
+						// A group or an include is a scope, no node: its box is
+						// painted from the copies the run decided and from what
+						// ran inside each.
+						firings = scopeFirings(scopeBox(n.id, nodeType, ctx));
 					} else {
 						firings = nodeFirings[firingKey(n.id)] || [];
 					}
@@ -2122,10 +2167,10 @@
 					// dimmed, no status class, never skipped or empty. One more
 					// case of the dimming the subgraph highlight already paints.
 					// A scope names places, which are compiled nodes: a box (a
-					// container, an include) is never one, its In boundary is.
-					const placeId = isBoundaryBoxNodeType(nodeType) ? boundaryInId(n.id) : n.id;
+					// container, an include) is never one, so it is in the run
+					// when something inside it is.
 					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
-						&& !ctx.runScope.has(locatedKey(placeId, ctx.callPath)) && firings.length === 0;
+						&& !boxInRun(n.id, nodeType, ctx.runScope, ctx) && firings.length === 0;
 					// Inheritance is NOT one of these: it is orthogonal to
 					// status, and the node components paint it themselves
 					// (`node-inherited-glow`, from `latestFiring.inheritedFrom`).

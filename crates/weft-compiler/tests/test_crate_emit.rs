@@ -324,6 +324,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         nodes: vec![node],
         edges: Vec::new(),
         groups: Vec::new(),
+        given: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         defaults: Default::default(),

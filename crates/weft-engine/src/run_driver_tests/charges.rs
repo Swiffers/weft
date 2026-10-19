@@ -43,14 +43,14 @@
     /// record an earlier drive left when it let go of the run.
     fn rows(project: &ProjectDefinition, run_id: RunId) -> Vec<RunEvent> {
         vec![
-            RunEvent::RunStarted {
+            RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "node".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
                 binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None,
+                cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None,
                 instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 settings: Default::default(),
             },

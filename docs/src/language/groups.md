@@ -36,26 +36,29 @@ from outside.
 A plain comment as the first thing in the body becomes the group's description,
 which is what the graph shows when it is folded shut.
 
-## They do not exist when the program runs
+## No node stands for a group when the program runs
 
-The compiler turns every group into two nodes, one holding its inputs and one
-holding its outputs, and hands the runtime one flat graph with the scope
-written on each node.
+A wire through a group's ports is one wire, from the node that sends to the
+node that reads, and the group's ports change nothing on the way. The group
+itself is a **scope**: the runtime decides, once for each copy of it (one per
+iteration of a loop around it, one per `@include` of a file), whether it opens
+or skips, and everything inside follows.
 
-So folding a group in the editor costs nothing, nesting five deep costs
-nothing, and a group is never a thing the runtime has to step through. It is a
-way of writing and reading, and it is gone by the time anything runs.
+So folding a group in the editor costs nothing, and neither does nesting five
+deep.
 
 ## When a group starts
 
-The node holding a group's inputs fires like any other node: once everything
-the run wires into it has arrived, `_should_flow` included. A closed input
-counts as arrived. An included file is a group, so each `@include` starts the
-same way.
+A group with a gate wired to it (`_should_flow` or `_should_not_flow`) waits
+for that value and opens or skips on what it says. One with a gate written in its braces decides at once.
+One with no gate opens on the first value that reaches any node inside it from
+outside, or at once when nothing comes in from outside; if every wire coming in
+closes with nothing on it, it skips. An included file is a group, so each
+`@include` starts the same way.
 
-When it fires, every node inside that no wire feeds starts with it. So a node
-with no inputs needs no `_should_flow` to get its turn, and it never runs
-before the group's slowest input has landed.
+When it opens, every node inside that no wire feeds starts with it. So a node
+with no inputs needs no `_should_flow` to get its turn. Every other node inside
+waits on its own inputs, and every output leaves the moment it is made.
 
 It only runs in a run that takes it along, though. A trigger's run holds what
 the trigger feeds plus what those nodes read, so a node with no inputs inside a
@@ -75,7 +78,8 @@ feeding it closes. You would expect the whole group to skip.
 It does not. The closure goes **inside**, and whichever node actually needed
 that value skips there, and the skip cascades from that node outward. Every
 port on a group's boundary is optional, and the requiredness you declared is
-enforced by the node that consumes it.
+enforced by the node that consumes it. Without a gate, the whole group skips
+only when every wire coming into it closes with nothing on it.
 
 That is deliberate. A group is usually several jobs, and one missing input
 often only kills one of them. Skipping the whole group would throw away work
@@ -137,7 +141,7 @@ because a group that did not run has nothing to forward.
 |---|---|
 | Ordinary values, connections, file markers, bus markers | Yes |
 | A closure | Yes, and it cascades to whatever inside needed the value |
-| `_should_flow` and `_should_not_flow` | No. Consumed at the boundary |
+| `_should_flow` and `_should_not_flow` | No. Read by the group itself; no node inside sees it |
 | A stream (`Generator[T]`) | **No** |
 | A wire from inside to outside that skips the interface | No |
 
@@ -151,7 +155,7 @@ to appear on the interface, where somebody reading the group can see it.
 
 ## Names you cannot use
 
-`Group`, `Loop`, `Passthrough`, `LoopIn`, `LoopOut` and `self` are the
+`Group`, `Loop`, `LoopIn`, `LoopOut` and `self` are the
 language's. So is any name containing a double underscore, which is the
 compiler's own separator.
 

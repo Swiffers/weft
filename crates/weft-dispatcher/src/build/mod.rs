@@ -588,7 +588,7 @@ fn infra_places(
     definition: &weft_core::ProjectDefinition,
     images: &[weft_compiler::build_plan::PlannedImage],
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-    let places = weft_core::project::selection::every_place(definition);
+    let places = weft_core::project::places::every_place(definition);
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for img in images.iter().filter(|i| i.kind == weft_compiler::build_plan::ImageKind::Infra) {
         let (Some(node_id), Some(image_name)) = (&img.node_id, &img.image_name) else {

@@ -63,12 +63,10 @@
     /// The record in memory, as a worker's writer lanes see it: every
     /// batch is taken whole, in order, and every event kept in one log
     /// across runs (a seed's runs and the run it seeds), each run's read
-    /// back on its own. Its selections are kept by digest, as the record
-    /// keeps them.
+    /// back on its own.
     #[derive(Default)]
     pub(crate) struct MemJournal {
         pub(super) events: StdMutex<Vec<RunEvent>>,
-        selections: StdMutex<HashMap<String, weft_core::project::selection::RecordedSelection>>,
         /// How many batches the writer sent.
         pub(crate) batches: std::sync::atomic::AtomicUsize,
     }
@@ -76,11 +74,6 @@
         /// Put `events` on record as they are: a run's record (or a seed's)
         /// before a test drives it.
         pub(crate) fn seed(&self, events: &[RunEvent]) {
-            for event in events {
-                if let RunEvent::RunStarted { selection: Some(selection), .. } = event {
-                    self.selections.lock().unwrap().insert(selection.digest().to_string(), selection.clone());
-                }
-            }
             self.events.lock().unwrap().extend(events.iter().cloned());
         }
 
@@ -105,23 +98,14 @@
     impl weft_journal::RecordClient for MemJournal {
         async fn record_batch(&self, batch: Vec<u8>) -> Result<weft_journal::frame::BatchAnswer, weft_journal::BatchError> {
             self.batches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let (head, runs) = crate::test_record::decode_batch(&batch);
-            for stored in head.selections {
-                let selection = weft_core::project::selection::RecordedSelection::read(stored.digest.clone(), stored.selection);
-                self.selections.lock().unwrap().insert(stored.digest, selection);
-            }
+            let (_, runs) = crate::test_record::decode_batch(&batch);
             let fates = runs.iter().map(|_| weft_journal::record::Fate::Accepted).collect();
             self.events.lock().unwrap().extend(runs.into_iter().flat_map(|(_, events)| events));
             Ok(weft_journal::frame::BatchAnswer { fates })
         }
         async fn record_of(&self, run_id: RunId) -> anyhow::Result<weft_journal::record::RawRecord> {
             let events = self.events_of(run_id);
-            let selection = events.iter().find_map(|event| match event {
-                RunEvent::RunStarted { selection: Some(selection), .. } => Some(weft_journal::record::StoredSelection::of(selection)),
-                _ => None,
-            });
             Ok(weft_journal::record::RawRecord {
-                selection,
                 rows: vec![weft_journal::record::RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }],
             })
         }
@@ -349,9 +333,9 @@
         drive_scoped(project, catalog, kicks, None, cancellation).await
     }
 
-    /// `drive` with a journaled run subgraph, the shape a trigger fire
-    /// produces: only the named nodes dispatch, and a pulse landing
-    /// anywhere else is absorbed without a row.
+    /// `drive` over the cut of the program that keeps `subgraph` alone
+    /// ([`cut_to`]), the shape a bounded run takes: only the named nodes
+    /// are in the program it runs.
     pub(super) async fn drive_scoped(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
@@ -364,8 +348,8 @@
 
     /// `drive_scoped` for a TRIGGER FIRE: `firing` names the kick that
     /// is the fired trigger (journaled with `firing: true`, the way the
-    /// worker's door writes a fire's birth), and `subgraph` is the fire's
-    /// computed set. The shape every two-programs test drives.
+    /// worker's door writes a fire's birth), and `subgraph` is what the
+    /// fire's cut keeps. The shape every two-programs test drives.
     pub(super) async fn drive_fire(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
@@ -385,15 +369,18 @@
         cancellation: Arc<CancellationFlag>,
     ) -> (RunOutcome, Vec<RunEvent>) {
         let run_id = weft_core::new_run_id();
-        let mut rows = vec![RunEvent::RunStarted {
+        let (project, cut_from) = match subgraph {
+            Some(nodes) => cut_to(&project, nodes, kicks, firing),
+            None => (project, None),
+        };
+        let mut rows = vec![RunEvent::RunStarted { given: Default::default(),
             run_id,
             project_id: project.id,
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
+            cut_from,
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-            selection: subgraph.map(|s| weft_core::project::selection::RecordedSelection::new(weft_core::project::selection::RunSelection::restricted(
-                &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection"))),
             seed: None,
             instance: None, fired_trigger: None, stand_in: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
@@ -412,6 +399,26 @@
         (drove.expect("run_one ok").outcome, events)
     }
 
+    /// The cut of `project` that runs `nodes` alone (top-level places),
+    /// started at `kicks` with `firing` the fired trigger, and the hash of
+    /// the program it was cut from: the program a bounded run runs.
+    pub(super) fn cut_to(
+        project: &ProjectDefinition,
+        nodes: &[&str],
+        kicks: &[&str],
+        firing: Option<&str>,
+    ) -> (ProjectDefinition, Option<String>) {
+        let places = |ids: &[&str]| ids.iter().map(|id| weft_core::frames::Located::top(*id)).collect::<std::collections::BTreeSet<_>>();
+        let walk = weft_core::project::cut::Walk {
+            runs: places(nodes),
+            starts: places(kicks),
+            fired: firing.map(weft_core::frames::Located::top),
+            ..Default::default()
+        };
+        let program = weft_core::project::cut::cut(project, &walk, &mut Default::default());
+        (program, Some(weft_core::project::hash::compute_definition_hash(project).unwrap()))
+    }
+
     /// THE property this engine rests on: the rows the run wrote,
     /// folded over the program, rebuild the tables the worker held.
     /// Compares the pulses (id, status, closure and its error, frames,
@@ -423,8 +430,11 @@
     /// the scope that skipped it). Record ids, timestamps, logs and
     /// costs are local to each side and are not compared.
     ///
-    /// Selected and seeded runs obey the same equality, including
-    /// which supplied values were used and their original runs.
+    /// The scopes too: every copy decided, and how (when is each side's
+    /// own clock, and is not compared).
+    ///
+    /// Cut and seeded runs obey the same equality, including which
+    /// given values were used and their original runs.
     pub(super) fn assert_fold_matches_live(
         project: &ProjectDefinition,
         events: &[RunEvent],
@@ -434,7 +444,7 @@
         /// One pulse as compared: node, id, status, closed, close
         /// error, frames, port, value (as its JSON text, so the row
         /// orders totally).
-        type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
+        type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, status, error,
         /// suspension token, absorbed pulses.
         type RecordRow =
@@ -486,7 +496,6 @@
                             p.target_port.clone(),
                             p.value.to_string(),
                             p.provided,
-                            p.backup,
                             p.inherited_from,
                         )
                     })
@@ -588,6 +597,13 @@
             v
         };
         assert_eq!(kicks(&live.kicked), kicks(&snap.kicked), "the kicks differ between the run and the fold");
+        let scopes = |table: &weft_core::run::scope::ScopeTable| -> Vec<(String, Vec<String>, String)> {
+            table
+                .iter()
+                .map(|(copy, record)| (copy.scope.clone(), copy.frames.iter().map(|f| format!("{f:?}")).collect(), format!("{:?}", record.state)))
+                .collect()
+        };
+        assert_eq!(scopes(&live.scopes), scopes(&snap.scopes), "the scopes differ between the run and the fold");
     }
 
     /// Drive a run over a journal that already holds `rows` (the
@@ -709,6 +725,7 @@
             epoch: 1,
             next_seq,
             redaction,
+            program: None,
         })
     }
 
@@ -777,13 +794,8 @@
         hand_back: Option<&HandBack>,
         holds: &Arc<crate::run_holds::Holds>,
     ) -> anyhow::Result<Drove> {
-        // The tables a worker's claim builds for the run: the program and
-        // the part of it its birth names.
-        let selection = first.iter().find_map(|event| match event {
-            RunEvent::RunStarted { selection, .. } => selection.clone(),
-            _ => None,
-        });
-        let program = Arc::new(crate::plan::ProgramTables::new(project, selection));
+        // The tables a worker's claim builds for the run's program.
+        let program = Arc::new(crate::plan::ProgramTables::new(project));
         let starts_from = crate::run_driver::StartsFrom::Record(first);
         let hold = Some(holds.of(run_id, None));
         let run = RunDrive { run_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back, hold };

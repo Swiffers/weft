@@ -227,6 +227,25 @@ describe('pausing while the person is away', () => {
   });
 });
 
+describe('scope decisions', () => {
+  it('reach the graph as the copy and its state, the skip reason with them', async () => {
+    const { client, follower, posted } = rig();
+    const following = follower.replay('a');
+    client.subscriptions[0].handlers.onOpen?.();
+    await Promise.resolve();
+    client.reads[0].resolve([
+      { eventId: 'open', kind: 'scope_decided', runId: 'a', projectId: 'p', scope: 'g', frames: [{ index: 0 }], state: 'open', atUnix: 4 },
+      { eventId: 'skip', kind: 'scope_decided', runId: 'a', projectId: 'p', scope: 'inc', frames: [], state: 'skipped', reason: { kind: 'did_not_flow' }, inheritedFrom: 'r0', atUnix: 5 },
+    ]);
+    await following;
+    expect(posted.filter((e) => e.kind === 'scopeDecided')).toEqual([
+      { kind: 'scopeDecided', event: { scope: 'g', frames: [{ index: 0 }], state: 'open', inheritedFrom: undefined, atUnix: 4 } },
+      { kind: 'scopeDecided', event: { scope: 'inc', frames: [], state: 'skipped', reason: { kind: 'did_not_flow' }, inheritedFrom: 'r0', atUnix: 5 } },
+    ]);
+    follower.stop();
+  });
+});
+
 describe('which followed run has not ended', () => {
   const live: LiveRun = { runId: 'a', projectId: 'p' };
 

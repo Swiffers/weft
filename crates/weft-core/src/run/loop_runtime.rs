@@ -973,7 +973,7 @@ pub fn loop_gather_ports(
     group_id: &str,
     carry: &[String],
 ) -> Option<Vec<String>> {
-    let loop_out_id = crate::project::boundary_out_id(group_id);
+    let loop_out_id = crate::project::loop_out_id(group_id);
     project.nodes.iter().find(|n| n.id == loop_out_id).map(|n| {
         n.outputs
             .iter()
@@ -1127,7 +1127,7 @@ pub fn instantiate(
         format!(
             "LoopIn '{}': project has no LoopOut node '{}'; corrupt compiled project shape",
             node_def.id,
-            crate::project::boundary_out_id(&group_id),
+            crate::project::loop_out_id(&group_id),
         )
     })?;
     // Initial carry seeds come from the loop's same-named inputs. A
@@ -1173,11 +1173,11 @@ pub fn instantiate(
     Ok(LoopInFiring { key, config, iter_cap, is_stream, first_instantiation })
 }
 
-/// What one iteration launch put in the world: the body's pulses and
-/// the roots it kicks.
+/// What one iteration launch put in the world: the body's pulses, and
+/// the frames of the iteration, whose copy the caller opens
+/// (`crate::run::scope::open_iteration`).
 pub struct IterationLaunch {
     pub emissions: Vec<PulseEmission>,
-    pub roots: Vec<String>,
     pub body_frames: LoopFrames,
 }
 
@@ -1185,13 +1185,14 @@ pub struct IterationLaunch {
 /// pulses on LoopIn's inside outputs at the iteration's frames (the
 /// `over` slice, every broadcast input, the current carries, the
 /// implicit `index`; a stream iteration's item on its port), close
-/// every inside port this iteration did not emit, and name the body's
-/// roots. Records the launch on the instance. THE one derivation of a
-/// launch, shared by the live engine (which then journals
-/// `LoopIterationLaunched`) and the journal fold (which applies that
-/// row through this). Reads the instance's outer input and carries
-/// as they are NOW: sequential loops launch N+1 after N's carry
-/// writes landed.
+/// every inside port this iteration did not emit, and open the
+/// iteration's copy (`crate::run::scope::open_iteration`: the body's
+/// members no wire feeds start with it). Records the launch on the
+/// instance. THE one derivation of a launch, shared by the live engine
+/// (which then journals `LoopIterationLaunched`) and the journal fold
+/// (which applies that row through this). Reads the instance's outer
+/// input and carries as they are NOW: sequential loops launch N+1 after
+/// N's carry writes landed.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_iteration(
     loop_runtime: &mut LoopRuntime,
@@ -1201,6 +1202,9 @@ pub fn launch_iteration(
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
+    scopes: &mut crate::run::scope::ScopeTable,
+    kicked: &mut HashMap<crate::frames::FiringLocation, crate::primitive::KickedNode>,
+    now: u64,
 ) -> Result<IterationLaunch, String> {
     let group_id = key.group_id.as_str();
     let inst = loop_runtime.get(key).ok_or_else(|| {
@@ -1250,7 +1254,7 @@ pub fn launch_iteration(
     // Implicit `self.index`.
     output.insert("index".to_string(), Arc::new(serde_json::json!(index)));
 
-    let loop_in_id = crate::project::boundary_in_id(group_id);
+    let loop_in_id = crate::project::loop_in_id(group_id);
     let emission_id = iteration_launch_emission(group_id, &key.parent_frames, index);
     let mut emissions = Vec::new();
     let mentioned = postprocess_output(
@@ -1274,12 +1278,9 @@ pub fn launch_iteration(
         &body_frames, project, pulses, program_idx, &mut emissions,
     )
     .map_err(|e| e.to_string())?;
-    // The body's own roots (members no wire feeds) start with the
-    // iteration, at its frames: everything inside a loop runs once per
-    // iteration, wired to the loop's edges or not.
-    let roots = crate::project::scope_body_roots(project, program_idx, group_id, &body_frames);
+    crate::run::scope::open_iteration(project, program_idx, group_id, &body_frames, now, scopes, kicked);
     loop_runtime.record_launched(key, index);
-    Ok(IterationLaunch { emissions, roots, body_frames })
+    Ok(IterationLaunch { emissions, body_frames })
 }
 
 /// What a `LoopOut` firing wrote, read off its bag: per gather port
@@ -1388,7 +1389,7 @@ pub fn emit_loop_outward(
     program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
 ) -> Result<(OutputBag, Vec<PulseEmission>), String> {
-    let loop_out_id = crate::project::boundary_out_id(&key.group_id);
+    let loop_out_id = crate::project::loop_out_id(&key.group_id);
     let mut output = OutputBag::new();
     for (port, slots) in gather {
         // The assembled list is a new value: one element per
@@ -1428,7 +1429,7 @@ pub fn close_loop_outward(
     pulses: &mut PulseTable,
     reason: LoopTerminationReason,
 ) -> Vec<PulseEmission> {
-    crate::run::boundary::close_scope_outward(
+    crate::run::scope::close_loop_outward_ports(
         project,
         program_idx,
         pulses,
@@ -2096,7 +2097,10 @@ mod tests {
                 { "id": "e6", "source": "lp__out", "sourceHandle": "res", "target": "sink", "targetHandle": "res" },
                 { "id": "e7", "source": "lp__out", "sourceHandle": "acc", "target": "sink", "targetHandle": "acc" }
             ],
-            "groups": [],
+            "groups": [{
+                "id": "lp", "kind": "loop", "loopConfig": { "parallel": false, "over": ["items"], "carry": ["acc"] },
+                "label": null, "nodeIds": ["add", "lonely"]
+            }],
             "createdAt": "1970-01-01T00:00:00Z",
             "updatedAt": "1970-01-01T00:00:00Z",
         }))
@@ -2149,9 +2153,15 @@ mod tests {
         let mut pulses = PulseTable::default();
         let input = bag(&[("items", serde_json::json!([10, 20])), ("acc", serde_json::json!(5))]);
         let firing = instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).unwrap();
-        let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses).unwrap();
+        let mut scopes = crate::run::scope::ScopeTable::default();
+        let mut kicked = HashMap::new();
+        let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses, &mut scopes, &mut kicked, 3).unwrap();
         assert_eq!(launch.body_frames, vec![Frame::Loop { index: 1 }]);
-        assert_eq!(launch.roots, vec!["lonely".to_string()]);
+        // The launch opens the iteration's copy of the loop, which kicks
+        // the body's member no wire feeds.
+        let copy = crate::project::scopes::ScopeCopy::new("lp", launch.body_frames.clone());
+        assert_eq!(scopes.get(&copy).map(|record| &record.state), Some(&crate::run::scope::ScopeState::Open));
+        assert_eq!(kicked.keys().cloned().collect::<Vec<_>>(), vec![crate::frames::FiringLocation::new("lonely", launch.body_frames.clone())]);
         let add = pending_at(&pulses, "add");
         let value = |port: &str| add.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
         assert_eq!(value("item"), Some(serde_json::json!(20)), "the over slice at the index");
@@ -2160,9 +2170,9 @@ mod tests {
         assert_eq!(rt.get(&firing.key).unwrap().launched, vec![1]);
         // The same launch replayed puts nothing new on the wires.
         let before = pulses["add"].len();
-        launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses).unwrap();
+        launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses, &mut scopes, &mut kicked, 4).unwrap();
         assert_eq!(pulses["add"].len(), before, "derived ids make a replay idempotent");
-        assert!(launch_iteration(&mut rt, &firing.key, 7, None, &project, &program_idx, &mut pulses).is_err(), "past the list is drift, not null");
+        assert!(launch_iteration(&mut rt, &firing.key, 7, None, &project, &program_idx, &mut pulses, &mut scopes, &mut kicked, 5).is_err(), "past the list is drift, not null");
     }
 
     #[test]

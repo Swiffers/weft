@@ -10,6 +10,7 @@ import type {
 	CallerInspectorEvent,
 	CorruptionSite,
 	LoopInspectorEvent,
+	ScopeDecidedEvent,
 	Frame,
 	NodeFiringStatus,
 	NodeFeaturesWire as NodeFeatures,
@@ -513,10 +514,10 @@ export interface NodeFiring {
 	framesKey: string;
 	/// The run this firing was taken from (a seeded run reused it).
 	inheritedFrom?: string;
-	/// Input ports whose value a person provided (a scoped run).
-	providedPorts?: string[];
+	/// Input ports whose value the run was given (handed in, or sent by
+	/// a node standing in for itself) rather than made by a node of it.
 	// SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent
-	backupPorts?: string[];
+	providedPorts?: string[];
 	inheritedPorts?: Record<string, string>;
 }
 
@@ -541,10 +542,11 @@ export interface RunTerminal {
  */
 export interface RunState {
 	isRunning: boolean;
-	/** The places the followed run is held to (`locatedKey`s); `null`
-	 *  for the whole graph, `undefined` before the run's birth arrived. A
-	 *  node outside it, at the call on screen, is "not in this run":
-	 *  dimmed, no status badge. */
+	/** Every place the followed run's program runs (`locatedKey`s);
+	 *  `null` when the run's program could not be read (nothing is
+	 *  dimmed), `undefined` before the run's birth arrived. A node
+	 *  outside it, at the call on screen, is "not in this run": dimmed,
+	 *  no status badge. */
 	scope?: string[] | null;
 	/** The run this one was seeded from and what it re-ran, or `null`
 	 *  for a run from nothing. */
@@ -582,6 +584,11 @@ export interface RunState {
 	 *  the loop's `groupId`; the parentFrames stack lives on each
 	 *  event so a card can split by nesting/sibling iteration. */
 	loopEventsByGroup: Record<string, LoopInspectorEvent[]>;
+	/** Every copy of a scope the run decided, by scope id (a group, an
+	 *  include's call site, an included file's body), each copy once in
+	 *  the order decided. A group is no node of the run, so these are
+	 *  what its box paints from. */
+	scopeDecisions: Record<string, ScopeDecidedEvent[]>;
 	/** Full ordered log of the live caller exchange (connected /
 	 *  inbound / outbound / errored / disconnected). One caller per
 	 *  run, so this is a flat list, not keyed. Empty for runs
@@ -837,11 +844,10 @@ export function isIncludeNodeType(nodeType: unknown): boolean {
 	return nodeType === INCLUDE_NODE_TYPE;
 }
 
-/** A box whose own run is its boundary pair: a container (its
- *  `__in` / `__out` fire at this level around its members) or an include
- *  (the call site's `__in` / `__out` fire at this level around the body,
- *  which runs one call frame deeper). Both are painted from the pair the
- *  same way. */
-export function isBoundaryBoxNodeType(nodeType: unknown): boolean {
+/** A box that stands for a scope rather than a node: a container (its
+ *  members run inside it at this level) or an include (the call site, whose
+ *  body runs one call frame deeper). Neither is a place of a run; both
+ *  are painted from their members and their scope's decisions. */
+export function isScopeBoxNodeType(nodeType: unknown): boolean {
 	return isContainerNodeType(nodeType) || isIncludeNodeType(nodeType);
 }

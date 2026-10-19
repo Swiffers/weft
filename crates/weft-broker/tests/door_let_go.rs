@@ -37,7 +37,7 @@ fn worker(replica: &str) -> DoorWorker<'_> {
 /// A run driven by `owner`: queued, then claimed by it.
 async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
     let run_id = weft_core::new_run_id();
-    let birth = RunEvent::RunStarted {
+    let birth = RunEvent::RunStarted { given: Default::default(),
         run_id,
         project_id: PROJECT,
         entry_node: "route".into(),
@@ -46,7 +46,7 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
         binary_hash: Some("bin-1".into()),
         source_version: None,
         run_kind: weft_core::run::RunKind::Project,
-        selection: None,
+        cut_from: None,
         seed: None,
         instance: None,
         stand_in: None,
@@ -65,6 +65,7 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
         stale: &[],
         spec: None,
         example: None,
+        program: None,
     };
     assert!(journal.queue_run(queued, false).await.expect("queue the run"));
     let mut conn = pool.acquire().await.unwrap();

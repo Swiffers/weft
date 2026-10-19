@@ -31,7 +31,8 @@ pub struct RmArgs {
     pub journal: bool,
     pub local: bool,
     pub all: bool,
-    /// `weft rm --force`: skip the supervisor terminate-wait window.
+    /// `weft rm --force`: skip the supervisor terminate-wait window, and
+    /// go on past cloud leftovers (never past a worker it cannot kill).
     pub force: bool,
     /// `weft rm --yes`: the confirmation, answered up front.
     pub yes: bool,
@@ -99,11 +100,11 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
 
         // ONE call is the whole dispatcher-side teardown: the dispatcher
         // deactivates the project (wipes its signals, cancels running
-        // runs), terminates its infra processes, reclaims its stored
-        // data, then drops the row. `--force` flips on the dispatcher's
-        // skip-the-wait switch: without it, the dispatcher waits up to
-        // 120s for the supervisor to confirm the terminate command
-        // landed before deleting the project.
+        // runs), kills its workers, terminates its infra processes,
+        // reclaims its stored data, then drops the row. `--force` flips
+        // on the dispatcher's skip-the-wait switch: without it, the
+        // dispatcher waits up to 120s for the supervisor to confirm the
+        // terminate command landed before deleting the project.
         let unregister_path = if force {
             format!("/projects/{project_id}?force=true")
         } else {

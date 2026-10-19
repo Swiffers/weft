@@ -99,7 +99,7 @@
     /// waits `hold_secs`.
     fn birth(run_id: weft_core::RunId, project: &ProjectDefinition, hold_secs: u32) -> Vec<RunEvent> {
         vec![
-            RunEvent::RunStarted {
+            RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "answer".into(),
@@ -108,7 +108,7 @@
                 binary_hash: None,
                 source_version: None,
                 run_kind: RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,
@@ -173,7 +173,7 @@
         let drive = RunDrive {
             run_id,
             journal: run,
-            program: Arc::new(crate::plan::ProgramTables::new(Arc::new(project), None)),
+            program: Arc::new(crate::plan::ProgramTables::new(Arc::new(project))),
             starts_from: StartsFrom::Record(birth),
             cancellation: CancellationFlag::new_arc(),
             exchange: Some(super::engine_test_rig::live_exchange(conn)),

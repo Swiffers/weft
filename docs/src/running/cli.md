@@ -52,12 +52,12 @@ Flags on `weft run`:
 | `--referenced` | Compile only the node types the graph uses, rather than the whole catalog |
 | `--target <node>` | Run this node and what it needs. Repeatable |
 | `--before <node>` | Run what it needs, and not it. Repeatable |
-| `--from <node>=<json>` | Start here, with these values as backups. A real producer still wins |
+| `--from <node>=<json>` | Start here, handing these ports their values. A port you hand a value keeps it: nothing a wire brings replaces it |
 | `--emit <node>=<json>` | Stand in for a node: say what it would have emitted, and do not run it |
 | `--group <group>=<json>` | Run one group, or one included file, on its own, with the values you hand it. A port a node inside needs that you do not hand is refused before the run starts |
-| `--feed <start>` | Also run what feeds this start: for each input you did not hand a value, the node that feeds it (through any group or include doors on the way) and nothing above it. Names a `--from` or `--group` start. Repeatable |
+| `--feed <start>` | Also run what feeds this start: for each input you did not hand a value, the node that feeds it (through any groups and included files on the way) and nothing above it. Names a `--from` or `--group` start. Repeatable |
 | `--fire <trigger>=<json>` | Fire exactly one trigger with this event, using its bake. One per run |
-| `--seed` | Reuse everything from head's run whose slice of the program did not change |
+| `--seed[=<run>]` | Reuse, from head's run or the run you name, everything whose slice of the program did not change (any finished run of the project, one a trigger started or one that failed included). A node that runs again and waited for an answer there gets that answer replayed, if its code did not change |
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
@@ -283,6 +283,7 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 | `weft rm --journal` | Erases its runs one by one before unregistering it; `weft rm` erases them on its own too |
 | `weft rm --local` | Also wipes its build artifacts here |
 | `weft rm --all` | Both of those |
+| `weft rm --force` | Doesn't wait for the infra to confirm it stopped, and goes on past leftovers on the cloud, naming them. A worker it can't kill still stops it: nothing is erased while one runs, and the error says how to stop that worker by hand |
 
 If `weft rm` fails partway, the project stays marked as being removed, and
 the way to finish is to run `weft rm` again in the project's folder. Until

@@ -1016,7 +1016,7 @@ fn parse_picked(v: &Value) -> Result<PickedHandle> {
 /// through, because the id it is keyed by carries the file's PATH and
 /// the language calls that spelling unspellable on purpose.
 fn spellings_of(program: &weft_core::ProjectDefinition, id: &str) -> Result<Vec<String>> {
-    let spellings: Vec<String> = weft_core::project::selection::every_place(program)
+    let spellings: Vec<String> = weft_core::project::places::every_place(program)
         .into_iter()
         .filter(|place| place.id == id)
         .map(|place| weft_core::project::address_of(program, &place.id, &place.path))
@@ -2295,28 +2295,25 @@ mod tests {
 
     /// The shape an include compiles to: the file `src/sweep.weft` is
     /// one body, keyed by its path, and each `@include` of it is a call
-    /// site; a node inside it is keyed under the file's path.
+    /// site (both groups, neither a node); a node inside it is keyed
+    /// under the file's path.
     fn program_including_sweep(sites: &[&str]) -> weft_core::ProjectDefinition {
-        let node = |id: &str, scope: &[&str], boundary: serde_json::Value| {
+        let node = |id: &str, scope: &[&str]| {
             serde_json::json!({
                 "id": id, "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
-                "inputs": [], "outputs": [], "scope": scope, "groupBoundary": boundary,
+                "inputs": [], "outputs": [], "scope": scope,
             })
         };
-        let mut nodes = vec![
-            node("db", &[], serde_json::Value::Null),
-            node("@src:sweep__in", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "In" })),
-            node("@src:sweep.key", &["@src:sweep"], serde_json::Value::Null),
-            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"], serde_json::Value::Null),
-            node("@src:sweep__out", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "Out" })),
+        let nodes = vec![
+            node("db", &[]),
+            node("@src:sweep.key", &["@src:sweep"]),
+            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"]),
         ];
         let mut groups = vec![
             serde_json::json!({ "id": "@src:sweep", "kind": "body", "nodeIds": ["@src:sweep.key"] }),
             serde_json::json!({ "id": "@src:sweep.inner", "kind": "group", "nodeIds": ["@src:sweep.inner.key"] }),
         ];
         for site in sites {
-            nodes.push(node(&format!("{site}__in"), &[], serde_json::json!({ "groupId": site, "role": "In" })));
-            nodes.push(node(&format!("{site}__out"), &[], serde_json::json!({ "groupId": site, "role": "Out" })));
             groups.push(serde_json::json!({ "id": site, "kind": "call", "body": "@src:sweep", "nodeIds": [] }));
         }
         serde_json::from_value(serde_json::json!({

@@ -154,8 +154,13 @@ pub struct VersionRunRequest {
     /// project's running definition moved since.
     pub definition_hash: String,
     pub binary_hash: String,
+    /// Seed from head's run (`weft run --seed`).
     #[serde(default)]
     pub seed: bool,
+    /// Seed from this run instead (`weft run --seed=<run id>`): any
+    /// settled run of the project, whatever started it, of any version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_run: Option<RunId>,
     #[serde(default)]
     pub seed_until: Vec<String>,
     #[serde(default)]
@@ -303,6 +308,7 @@ mod tests {
             definition_hash: "d".into(),
             binary_hash: "b".into(),
             seed: true,
+            seed_run: Some(RunId::nil()),
             seed_until: vec!["n".into()],
             seed_before: Vec::new(),
             root: false,
@@ -310,7 +316,7 @@ mod tests {
             example: Some("e".into()),
         };
         let wire = serde_json::to_value(&body).unwrap();
-        for key in ["definitionHash", "binaryHash", "seedUntil", "seedBefore"] {
+        for key in ["definitionHash", "binaryHash", "seedRun", "seedUntil", "seedBefore"] {
             assert!(wire.get(key).is_some(), "{key} in {wire}");
         }
         let back: VersionRunRequest = serde_json::from_value(wire).unwrap();

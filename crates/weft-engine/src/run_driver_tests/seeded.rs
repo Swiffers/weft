@@ -1,10 +1,12 @@
     //! Layer 3: seeded and scoped runs through the real run loop.
     //!
-    //! A seeded run's birth row names the run it inherits from and the
-    //! nodes it reuses (`RunStarted.seed`); the worker folds
-    //! the seed's rows in (`weft_journal::seed`) and dispatches only the
-    //! stale nodes. A from start records backup inputs on its selection
-    //! and runs without the upstream source. Both
+    //! A seeded run runs a cut of its program where each reused node that
+    //! feeds what runs stands in for itself with what it sent; its birth
+    //! row names the run it inherits from and the nodes it reuses
+    //! (`RunStarted.seed`), the worker folds the seed's rows in
+    //! (`weft_journal::seed`) and dispatches only the stale nodes. A from
+    //! start runs on a cut whose program hands its input a value, without
+    //! the upstream source. Both
     //! are facts about the driver: what it re-dispatches, what reaches
     //! the nodes that run, and what it writes under its own run.
 
@@ -120,40 +122,53 @@
         .expect("program")
     }
 
-    fn birth(run_id: RunId, project: &ProjectDefinition, subgraph: Option<&[&str]>, seed: Option<Seed>) -> RunEvent {
-        birth_given(run_id, project, subgraph, seed, |_| {})
-    }
-
-    /// [`birth`], its selection changed by `given` first (a value given by
-    /// hand, say).
-    fn birth_given(
-        run_id: RunId,
-        project: &ProjectDefinition,
-        subgraph: Option<&[&str]>,
-        seed: Option<Seed>,
-        given: impl FnOnce(&mut weft_core::project::selection::RunSelection),
-    ) -> RunEvent {
-        let mut selection = match subgraph {
-            Some(nodes) => weft_core::project::selection::RunSelection::restricted(project, nodes.iter().map(|node| weft_core::frames::Located::top(*node)).collect()).unwrap(),
-            None => weft_core::project::selection::RunSelection::whole(project),
-        };
-        if let Some(seed) = &seed {
-            selection.nodes.retain(|node| !seed.origins.contains_key(node));
-            selection.suppliers.extend(seed.origins.keys().cloned());
-        }
-        given(&mut selection);
-        RunEvent::RunStarted {
+    /// The birth of `run_id` running `program`, cut from `whole` when it
+    /// is a cut.
+    fn birth(run_id: RunId, program: &ProjectDefinition, given: &weft_core::project::Given, whole: Option<&ProjectDefinition>, seed: Option<Seed>) -> RunEvent {
+        RunEvent::RunStarted { given: Box::new(given.clone()),
             run_id,
-            project_id: project.id,
+            project_id: program.id,
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
-            definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
+            definition_hash: Some(weft_core::project::hash::compute_definition_hash(program).unwrap()),
+            cut_from: whole.map(|whole| weft_core::project::hash::compute_definition_hash(whole).unwrap()),
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-            selection: Some(weft_core::project::selection::RecordedSelection::new(selection)),
             seed,
             instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
         }
+    }
+
+    /// The cut of `program` a run of `runs` runs, `given` what it is
+    /// handed and what stands in for itself, started at `starts`, and what
+    /// a run of it is given.
+    fn cut_of(program: &ProjectDefinition, runs: &[&str], starts: &[&str], mut given: weft_core::project::Given) -> (ProjectDefinition, weft_core::project::Given) {
+        let top = |ids: &[&str]| ids.iter().map(|id| weft_core::frames::Located::top(*id)).collect();
+        let walk = weft_core::project::cut::Walk {
+            runs: top(runs),
+            stand_ins: given.outputs.keys().cloned().collect(),
+            starts: top(starts),
+            ..Default::default()
+        };
+        let cut = weft_core::project::cut::cut(program, &walk, &mut given);
+        (cut, given)
+    }
+
+    /// The program a seeded run runs: `program` cut to `runs`, each of
+    /// `stand_ins` (a node, its port, what it sent there, the run that
+    /// sent it) sending again what it sent instead of running.
+    fn seeded_cut(program: &ProjectDefinition, runs: &[&str], stand_ins: &[(&str, &str, serde_json::Value, RunId)]) -> (ProjectDefinition, weft_core::project::Given) {
+        let outputs = stand_ins
+            .iter()
+            .map(|(node, port, value, run)| {
+                let stand_in = weft_core::project::StandIn {
+                    ports: [(port.to_string(), weft_core::project::GivenPort::Value { value: value.clone() })].into(),
+                    origin: weft_core::project::GivenOrigin::Inherited { run: *run },
+                };
+                (weft_core::frames::Located::top(*node), stand_in)
+            })
+            .collect();
+        cut_of(program, runs, &[], weft_core::project::Given { inputs: Default::default(), outputs })
     }
 
     fn kick(run_id: RunId, node: &str, payload: Option<serde_json::Value>) -> RunEvent {
@@ -161,7 +176,7 @@
     }
 
     fn seed(parent: RunId, kept: &[&str]) -> Seed {
-        Seed { parent, origins: kept.iter().map(|node| (weft_core::frames::Located::top(*node), parent)).collect() }
+        Seed { parent, origins: kept.iter().map(|node| (weft_core::frames::Located::top(*node), parent)).collect(), answers: Default::default() }
     }
 
     fn started_nodes(events: &[RunEvent]) -> Vec<String> {
@@ -206,8 +221,9 @@
         seen.lock().unwrap().clear();
 
         let child = uuid::Uuid::new_v4();
-        let rows = vec![birth(child, &program, None, Some(seed(parent, &["a"])))];
-        let (outcome, child_rows) = drive_seeded(program.clone(), cat(&ran, &seen), child, parent_rows, vec![program], rows).await;
+        let (cut, cut_given) = seeded_cut(&program, &["b", "c"], &[("a", "value", json!("A"), parent)]);
+        let rows = vec![birth(child, &cut, &cut_given, Some(&program), Some(seed(parent, &["a"])))];
+        let (outcome, child_rows) = drive_seeded(cut, cat(&ran, &seen), child, parent_rows, vec![program], rows).await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert_eq!(ran_of(&ran), vec!["echo", "echo"], "a's body never ran again");
         assert_eq!(*seen.lock().unwrap(), vec!["A", "A+echo"], "b read the inherited value, c read b's new one");
@@ -225,13 +241,14 @@
         let (_, parent_rows) = drive(program.clone(), cat(&ran, &seen), &["a"]).await;
         let parent = parent_rows[0].run_id();
         let child = uuid::Uuid::new_v4();
+        let (child_cut, child_cut_given) = seeded_cut(&program, &["b", "c"], &[("a", "value", json!("A"), parent)]);
         let (_, child_rows) = drive_seeded(
-            program.clone(),
+            child_cut.clone(),
             cat(&ran, &seen),
             child,
             parent_rows.clone(),
             vec![program.clone()],
-            vec![birth(child, &program, None, Some(seed(parent, &["a"])))],
+            vec![birth(child, &child_cut, &child_cut_given, Some(&program), Some(seed(parent, &["a"])))],
         )
         .await;
         ran.lock().unwrap().clear();
@@ -240,14 +257,16 @@
         let grandchild = uuid::Uuid::new_v4();
         let mut ancestors = parent_rows;
         ancestors.extend(child_rows);
+        let (cut, cut_given) = seeded_cut(&program, &["c"], &[("b", "value", json!("A+echo"), child)]);
         let (outcome, rows) = drive_seeded(
-            program.clone(),
+            cut.clone(),
             cat(&ran, &seen),
             grandchild,
             ancestors,
-            vec![program.clone()],
-            vec![birth(grandchild, &program, None, Some(Seed { parent: child,
-                origins: [(weft_core::frames::Located::top("a"), parent), (weft_core::frames::Located::top("b"), child)].into_iter().collect() }))],
+            vec![program.clone(), child_cut],
+            vec![birth(grandchild, &cut, &cut_given, Some(&program), Some(Seed { parent: child,
+                origins: [(weft_core::frames::Located::top("a"), parent), (weft_core::frames::Located::top("b"), child)].into_iter().collect(),
+                answers: Default::default() }))],
         )
         .await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
@@ -272,13 +291,14 @@
         let mut child_program = chain(["Source", "Echo", "Echo"], &[("a", "c")]);
         child_program.nodes.retain(|n| n.id != "b");
         let child = uuid::Uuid::new_v4();
+        let (cut, cut_given) = seeded_cut(&child_program, &["c"], &[("a", "value", json!("A"), parent)]);
         let (outcome, rows) = drive_seeded(
-            child_program.clone(),
+            cut.clone(),
             cat(&ran, &seen),
             child,
             parent_rows,
             vec![parent_program],
-            vec![birth(child, &child_program, None, Some(seed(parent, &["a"])))],
+            vec![birth(child, &cut, &cut_given, Some(&child_program), Some(seed(parent, &["a"])))],
         )
         .await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
@@ -300,7 +320,7 @@
 
         let child = uuid::Uuid::new_v4();
         let rows = vec![
-            birth(child, &program, None, Some(seed(parent, &[]))),
+            birth(child, &program, &Default::default(), None, Some(seed(parent, &[]))),
             kick(child, "a", Some(json!({"copied": "from the seed"}))),
         ];
         let (outcome, child_rows) = drive_seeded(program.clone(), cat(&ran, &seen), child, parent_rows, vec![program], rows).await;
@@ -323,13 +343,14 @@
 
         let fixed = chain(["Source", "Echo", "Echo"], &[("a", "b"), ("b", "c")]);
         let child = uuid::Uuid::new_v4();
+        let (cut, cut_given) = seeded_cut(&fixed, &["b", "c"], &[("a", "value", json!("A"), parent)]);
         let (outcome, rows) = drive_seeded(
-            fixed.clone(),
+            cut.clone(),
             cat(&ran, &seen),
             child,
             parent_rows,
             vec![broken],
-            vec![birth(child, &fixed, None, Some(seed(parent, &["a"])))],
+            vec![birth(child, &cut, &cut_given, Some(&fixed), Some(seed(parent, &["a"])))],
         )
         .await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
@@ -337,19 +358,21 @@
         assert_eq!(started_nodes(&rows), vec!["b", "c"]);
     }
 
-    /// A from start receives its backup, then its consumer runs.
-    /// The source outside the cut never runs.
+    /// A from start fires with the value handed to its input, then its
+    /// consumer runs. The source outside the cut never runs.
     #[tokio::test]
-    async fn a_scoped_run_with_a_provided_input_fires_the_from_node_with_that_value() {
+    async fn a_cut_run_with_a_handed_input_fires_the_from_node_with_that_value() {
         let program = chain(["Source", "Echo", "Echo"], &[("a", "b"), ("b", "c")]);
         let ran: Ran = Default::default();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let child = uuid::Uuid::new_v4();
-        let start = birth_given(child, &program, Some(&["b", "c"]), None, |selection| {
-            selection.input.insert(weft_core::frames::Located::top("b"), [("value".into(), json!("by hand"))].into());
-        });
-        let rows = vec![start, kick(child, "b", None)];
-        let (outcome, child_rows) = drive_seeded(program, cat(&ran, &seen), child, Vec::new(), Vec::new(), rows).await;
+        let given = weft_core::project::Given {
+            inputs: [(weft_core::frames::Located::top("b"), [("value".to_string(), json!("by hand"))].into())].into(),
+            outputs: Default::default(),
+        };
+        let (cut, cut_given) = cut_of(&program, &["b", "c"], &["b"], given);
+        let rows = vec![birth(child, &cut, &cut_given, Some(&program), None), kick(child, "b", None)];
+        let (outcome, child_rows) = drive_seeded(cut, cat(&ran, &seen), child, Vec::new(), Vec::new(), rows).await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert_eq!(ran_of(&ran), vec!["echo", "echo"], "a never ran");
         assert_eq!(*seen.lock().unwrap(), vec!["by hand", "by hand+echo"]);
@@ -399,13 +422,14 @@
         took.lock().unwrap().clear();
 
         let child = uuid::Uuid::new_v4();
+        let (cut, cut_given) = seeded_cut(&program, &["consumer"], &[("producer", "out", json!([0, 1, 2, 3, 4]), parent)]);
         let (outcome, rows) = drive_seeded(
-            program.clone(),
+            cut.clone(),
             nodes(),
             child,
             parent_rows,
             vec![program.clone()],
-            vec![birth(child, &program, None, Some(seed(parent, &["producer"])))],
+            vec![birth(child, &cut, &cut_given, Some(&program), Some(seed(parent, &["producer"])))],
         )
         .await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");

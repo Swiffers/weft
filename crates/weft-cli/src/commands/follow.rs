@@ -64,7 +64,11 @@ pub async fn follow_run_id(
         let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
         let row = serde_json::to_value(event)?;
         match definition {
-            Some(definition) => if let Some(spelled) = super::runs::spell_node(row, definition) { print_event(&spelled) },
+            Some(definition) => {
+                if let Some(row) = super::runs::spell_node(row, definition) {
+                    print_event(&row);
+                }
+            }
             None => print_event(&row),
         }
         Ok(match Outcome::ended(&event.event)? {

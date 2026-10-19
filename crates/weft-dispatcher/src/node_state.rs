@@ -13,8 +13,10 @@ use axum::http::StatusCode;
 use weft_core::frames::{FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{AwaitedEntryKind, LoopInstanceKey, LoopTerminationReason, RunSnapshot};
 use weft_core::program::{NodeState, NodeStatus};
-use weft_core::project::selection::{members_in, state_place, StatePlace};
-use weft_core::project::{boundary_in_id, boundary_out_id, ProjectDefinition};
+use weft_core::project::places::{members_in, scopes_around, state_place, StatePlace};
+use weft_core::project::scopes::ScopeCopy;
+use weft_core::project::{loop_in_id, loop_out_id, ProjectDefinition};
+use weft_core::run::scope::ScopeState;
 use weft_core::run::{firing_at, NodeFiringStatus};
 use weft_core::signal::listener_protocol::LastAnswer;
 use weft_core::RunId;
@@ -36,7 +38,19 @@ pub async fn read(state: &DispatcherState, project_id: uuid::Uuid, run_id: RunId
         let why = lookup.unpaintable().map(|(_, reason)| reason.to_string()).unwrap_or_else(|| format!("run {run_id} ran no program"));
         (StatusCode::CONFLICT, why)
     })?;
-    let place = state_place(&program, spelled).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let place = state_place(&program, spelled).map_err(|why| {
+        // A run started on part of its program runs a cut of it: a node
+        // the cut left out is no node of what this run runs.
+        let (id, _) = weft_core::project::resolve_address(&program, spelled);
+        let left_out = program.nodes.iter().all(|n| n.id != id) && program.groups.iter().all(|g| g.id != id);
+        match &owner {
+            Some(owner) if owner.cut_from.is_some() && left_out => (
+                StatusCode::BAD_REQUEST,
+                format!("run {run_id} runs only part of its program, and '{spelled}' is not in that part"),
+            ),
+            _ => (StatusCode::BAD_REQUEST, why),
+        }
+    })?;
     let mut folds = crate::projection::reconstruct_run(state, run_id).await.map_err(internal("the run's record"))?;
     let fold = folds.remove(&run_id).ok_or_else(|| internal("the run's record")(anyhow::anyhow!("its own fold is missing")))?;
     let snapshot = fold.current_snapshot();
@@ -67,17 +81,25 @@ impl Seen {
 /// by a test without a database.
 pub(crate) fn seen_at(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &StatePlace) -> Seen {
     match place {
-        StatePlace::Node(place) => node_seen(snapshot, place),
+        StatePlace::Node(place) => node_seen(project, snapshot, place),
         StatePlace::Loop(place) => loop_seen(project, snapshot, place),
     }
 }
 
-fn node_seen(snapshot: &RunSnapshot, place: &Located) -> Seen {
+fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located) -> Seen {
     let frames = place.frames();
     // A node outside every loop fires once in a run; a seeded run holds the
     // firing it took over under its own id too.
     let Some(firing) = firing_at(&snapshot.firings, &place.id, snapshot.run_id, &frames) else {
-        return Seen::of(NodeStatus::Pending);
+        // Not fired yet: it never will when a scope around it (a group, a
+        // site, the included file's body) decided not to run, before the
+        // skip reached the node itself.
+        let graph = weft_core::project::graph::ProjectGraph::new(project);
+        let skipped = scopes_around(&graph, place).into_iter().any(|scope| {
+            let copy = ScopeCopy::new(scope.id.clone(), scope.frames());
+            snapshot.scopes.get(&copy).is_some_and(|record| matches!(record.state, ScopeState::Skipped { .. }))
+        });
+        return Seen::of(if skipped { NodeStatus::Skipped } else { NodeStatus::Pending });
     };
     let pending_wait = || {
         snapshot.awaited_sequences.get(&FiringLocation::new(place.id.clone(), frames.clone()))?.iter().rev().find_map(|entry| match &entry.kind {
@@ -118,7 +140,7 @@ fn loop_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
         Some(LoopTerminationReason::Failed) => {
             let graph = weft_core::project::graph::ProjectGraph::new(project);
             let inside = |frames: &LoopFrames| frames.len() > parent_frames.len() && frames.starts_with(&parent_frames);
-            let boundaries = [boundary_in_id(&place.id), boundary_out_id(&place.id)];
+            let boundaries = [loop_in_id(&place.id), loop_out_id(&place.id)];
             let members = members_in(&graph, &place.id, &place.path);
             let error = boundaries
                 .iter()
@@ -170,9 +192,9 @@ mod tests {
             "id": "00000000-0000-0000-0000-000000000000",
             "nodes": [
                 node("a", &[], Value::Null), node("b", &[], Value::Null),
-                node("g__in", &[], json!({"groupId": "g", "role": "In"})),
+                node(&loop_in_id("g"), &[], json!({"groupId": "g", "role": "In"})),
                 node("c", &["g"], Value::Null),
-                node("g__out", &[], json!({"groupId": "g", "role": "Out"}))
+                node(&loop_out_id("g"), &[], json!({"groupId": "g", "role": "Out"}))
             ],
             "edges": [],
             "groups": [{"id": "g", "kind": "loop", "loopConfig": {}, "nodeIds": ["c"]}]
@@ -234,6 +256,35 @@ mod tests {
         let suspended = RunEvent::NodeSuspended { run_id: RUN, node_id: "a".into(), frames: vec![], token: "t1".into(), at_unix: 3 };
         let paused = seen(&[started("a"), registered("a", "t1"), suspended], "a");
         assert_eq!((paused.status, paused.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
+    }
+
+    /// A node inside a group that did not run reads skipped from the
+    /// group's decision, before (or without) any firing of its own.
+    #[test]
+    fn a_node_in_a_scope_that_did_not_run_reads_skipped() {
+        let mut project = program();
+        project.nodes.push(serde_json::from_value(json!({
+            "id": "inside", "nodeType": "T", "label": null, "config": {},
+            "position": {"x": 0, "y": 0}, "inputs": [], "outputs": [],
+            "features": {}, "scope": ["off"], "requiresInfra": false
+        })).unwrap());
+        project.groups.push(serde_json::from_value(json!({
+            "id": "off", "kind": "group", "nodeIds": ["inside"],
+            "portLiterals": { "_should_flow": false }
+        })).unwrap());
+        let started = RunEvent::RunStarted {
+            run_id: RUN, project_id: project.id, entry_node: "a".into(), phase: weft_core::context::Phase::Fire,
+            definition_hash: None, binary_hash: None, cut_from: None, source_version: None,
+            run_kind: weft_core::run::RunKind::Project, seed: None, instance: None, stand_in: None,
+            fired_trigger: None, settings: Default::default(), instance_values: Default::default(),
+            picks: Default::default(), at_unix: 0, given: Default::default(),
+        };
+        let snapshot = weft_journal::fold_to_snapshot(RUN, Arc::new(project.clone()), &[started]);
+        let place = state_place(&project, "inside").unwrap();
+        assert_eq!(seen_at(&project, &snapshot, &place).status, NodeStatus::Skipped);
+        assert!(state_place(&project, "off").unwrap_err().contains("is a group"));
+        let refusal = state_place(&project, "c").unwrap_err();
+        assert!(refusal.contains("inside loop 'g'") && refusal.contains("read the loop 'g'"), "{refusal}");
     }
 
     /// A loop reads whole: pending before it starts, running while it goes,

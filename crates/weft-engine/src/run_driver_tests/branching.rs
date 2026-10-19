@@ -13,6 +13,7 @@
     use async_trait::async_trait;
     use serde_json::json;
     use weft_core::error::WeftResult;
+    use weft_core::run::scope::ScopeState;
     use weft_core::run::skip::{SkipReason, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
     use weft_core::node::{Node, NodeOutput};
     use weft_core::{RunContext, NodeCatalog, ProjectDefinition};
@@ -124,31 +125,28 @@
 
     use super::engine_test_rig::catalog;
 
-    /// A group boundary never journals a row: what it did is what the
-    /// fold derives, so a test reads it off the snapshot.
+    /// A scope never journals a row: how each copy was decided is what
+    /// the fold derives, so a test reads it off the snapshot.
     fn fold(project: ProjectDefinition, events: &[RunEvent]) -> weft_core::primitive::RunSnapshot {
-        fold_with_boundaries(project, events).0
+        fold_with_scopes(project, events).0
     }
 
-    /// The fold plus every boundary firing it derived, as `(node, skip
-    /// reason)`: what the live bridge paints the boundary from.
-    fn fold_with_boundaries(
+    /// The fold plus every scope copy it decided, as `(scope, state)` in
+    /// the order it decided them: what the live bridge paints the group
+    /// from.
+    fn fold_with_scopes(
         project: ProjectDefinition,
         events: &[RunEvent],
-    ) -> (weft_core::primitive::RunSnapshot, Vec<(String, Option<SkipReason>)>) {
+    ) -> (weft_core::primitive::RunSnapshot, Vec<(String, ScopeState)>) {
         let run_id = events.first().expect("journal has rows").run_id();
         let mut fold = weft_journal::Fold::new(run_id, Arc::new(project));
-        let mut boundaries = Vec::new();
+        let mut decided = Vec::new();
         for e in events {
-            for b in fold.apply(e).boundaries {
-                if let weft_core::run::boundary::BoundaryOutcome::Fired { skip_reason, .. } = b.outcome {
-                    boundaries.push((b.node_id, skip_reason.map(|reason| *reason)));
-                }
-            }
+            decided.extend(fold.apply(e).scopes.into_iter().map(|(copy, state)| (copy.scope, state)));
         }
         let snap = fold.into_snapshot();
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        (snap, boundaries)
+        (snap, decided)
     }
 
     /// A run that reached its end folds to the same end: every record
@@ -178,14 +176,17 @@
         );
     }
 
-    /// The skip reason a boundary fired with, off the fold: `None` is
-    /// a boundary that fired and ran. A boundary that never fired is a
-    /// failed assertion here, never a `None`.
-    fn boundary_skip_reason(boundaries: &[(String, Option<SkipReason>)], node: &str) -> Option<SkipReason> {
-        let mut reasons: Vec<Option<SkipReason>> =
-            boundaries.iter().filter(|(n, _)| n == node).map(|(_, r)| r.clone()).collect();
-        assert_eq!(reasons.len(), 1, "one boundary firing per location, '{node}' has {}", reasons.len());
-        reasons.pop().flatten()
+    /// How the one copy of `scope` was decided, off the fold. A scope
+    /// decided twice, or never, is a failed assertion here.
+    fn scope_state(decided: &[(String, ScopeState)], scope: &str) -> ScopeState {
+        let mut states: Vec<ScopeState> = decided.iter().filter(|(s, _)| s == scope).map(|(_, state)| state.clone()).collect();
+        assert_eq!(states.len(), 1, "one decision per copy, '{scope}' has {}", states.len());
+        states.pop().expect("one decision")
+    }
+
+    /// How the top-level copy of `scope` stands in `snap`.
+    fn snapshot_scope(snap: &weft_core::primitive::RunSnapshot, scope: &str) -> Option<ScopeState> {
+        snap.scopes.get(&weft_core::project::scopes::ScopeCopy::new(scope, vec![])).map(|record| record.state.clone())
     }
 
     /// source.value -> guarded.value, source.allowed -> guarded._should_flow,
@@ -466,14 +467,11 @@
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
     }
 
-    /// A journaled run subgraph (a trigger fire's program) holds the
-    /// run to that boundary: a pulse into an out-of-scope node is
-    /// absorbed silently, no row, its body does not run, and the run
-    /// completes. The subgraph is read back from the journaled
-    /// `RunStarted`, the same row a resume folds, so this also
-    /// pins the resume boundary.
+    /// A run of a cut (a trigger fire's program) stays inside it: a node
+    /// the cut left out gets no row, its body does not run, and the run
+    /// completes.
     #[tokio::test]
-    async fn a_run_subgraph_absorbs_the_outside_silently() {
+    async fn a_cut_run_leaves_the_outside_untouched() {
         use super::engine_test_rig::drive_scoped;
         use weft_core::cancellation::CancellationFlag;
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -495,21 +493,21 @@
     }
 
     /// Two programs in one file sharing an upstream node, the shape a
-    /// trigger fire journals its subgraph for.
+    /// trigger fire runs a cut of.
     ///
     ///   my_trigger ──► mine ──► leaf          (the fired program; `leaf`
     ///   shared ───────┘                        feeds no output)
     ///   shared ──► theirs ◄── their_trigger   (the other program)
     ///
     /// `shared` feeds both programs and emits down every wire it has,
-    /// so on a fire of `my_trigger` a pulse lands on `theirs` too. Two
-    /// things are pinned. Anything outside the journaled program absorbs
-    /// SILENTLY: no row, it is not this run's business (here the driver
-    /// is handed a program that leaves `leaf` out; the dispatcher's own
-    /// walk, the downstream of the fired trigger plus what it needs, is
-    /// pinned in the dispatcher). And without the boundary the same fire
-    /// ends Stuck, `theirs` parked on a partial input set, which is the
-    /// failure every two-trigger project used to hit on every fire.
+    /// so on a fire of `my_trigger` run whole a pulse lands on `theirs`
+    /// too. Two things are pinned. Anything outside the cut leaves no
+    /// row: it is not this run's business (here the driver is handed a
+    /// cut that leaves `leaf` out; the walk a fire's cut comes from, the
+    /// downstream of the fired trigger plus what it needs, is pinned in
+    /// `weft_core::run_spec`). And run whole, the same fire ends Stuck,
+    /// `theirs` parked on a partial input set, which is the failure
+    /// every two-trigger project used to hit on every fire.
     fn two_programs_project() -> ProjectDefinition {
         fn source(id: &str, trigger: bool) -> serde_json::Value {
             json!({
@@ -596,7 +594,7 @@
         // Outside the program the driver was handed: nothing either.
         assert!(!touched(&events, "leaf"), "{events:?}");
 
-        // The same fire with no boundary: the shared pulse parks on
+        // The same fire run whole: the shared pulse parks on
         // `theirs`, whose other input never comes, and the run is Stuck.
         // Pinned so "trigger fires run the whole graph" cannot come back
         // looking harmless.
@@ -617,12 +615,12 @@
         assert!(text.contains("theirs has value, still waiting on go"), "{text}");
     }
 
-    /// An out-of-scope node fed by only SOME of its parents (its other
-    /// parent is an unkicked entry node outside the subgraph) is
-    /// absorbed immediately instead of parking its pulse forever waiting
-    /// for an input that will never come.
+    /// A node outside the cut fed by only SOME of its parents (its other
+    /// parent is an entry node outside the cut too) never parks a pulse
+    /// waiting for an input that will never come: the cut holds neither
+    /// it nor the wires into it.
     #[tokio::test]
-    async fn a_partially_fed_out_of_scope_node_absorbs_instead_of_parking() {
+    async fn a_partially_fed_node_outside_the_cut_never_parks() {
         use super::engine_test_rig::drive_scoped;
         use weft_core::cancellation::CancellationFlag;
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -700,11 +698,11 @@
         assert!(!touched(&events, "b"), "{events:?}");
     }
 
-    /// Pulses reaching an out-of-scope node across SEPARATE ticks (one
-    /// parent emits now, the other closes later) leave no trace either
-    /// time: every batch is absorbed silently.
+    /// A node outside the cut whose parents inside it send across
+    /// SEPARATE ticks (one emits now, the other later) leaves no trace
+    /// either time.
     #[tokio::test]
-    async fn an_out_of_scope_node_fed_across_ticks_never_appears() {
+    async fn a_node_outside_the_cut_fed_across_ticks_never_appears() {
         use super::engine_test_rig::drive_scoped;
         use weft_core::cancellation::CancellationFlag;
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -771,27 +769,31 @@
         assert!(!touched(&events, "b"), "no row for the out-of-scope node: {events:?}");
     }
 
+    /// A group of the program: its id, the group around it, its input
+    /// and output ports (each `String`), the literals written on its
+    /// ports (its gate's included), and its direct members.
+    fn group(id: &str, parent: Option<&str>, ins: &[&str], outs: &[&str], literals: serde_json::Value, members: &[&str]) -> serde_json::Value {
+        let ports = |names: &[&str]| names.iter().map(|name| json!({ "name": name, "portType": "String", "required": false })).collect::<Vec<_>>();
+        json!({
+            "id": id, "kind": "group", "parentGroupId": parent,
+            "inPorts": ports(ins), "outPorts": ports(outs),
+            "portLiterals": literals, "nodeIds": members
+        })
+    }
+
+    /// One wire end to end, crossing the group ports `via` on the way,
+    /// each `(group, port, side)`.
+    fn through(id: &str, source: &str, source_port: &str, via: &[(&str, &str, &str)], target: &str, target_port: &str) -> serde_json::Value {
+        json!({
+            "id": id, "source": source, "target": target, "sourceHandle": source_port, "targetHandle": target_port,
+            "via": via.iter().map(|(group, port, side)| json!({ "group": group, "port": port, "side": side })).collect::<Vec<_>>()
+        })
+    }
+
     /// A group nested two deep, guarded from the outer group's braces.
-    /// source -> outer__in -> outer.inner__in -> deep -> inner__out ->
-    /// outer__out -> after.
+    /// source -> outer.value -> outer.inner.value -> deep ->
+    /// outer.inner.value -> outer.value -> after, each one wire.
     fn nested_group_project() -> ProjectDefinition {
-        // A boundary's `scope` is the chain OUTSIDE its container, the
-        // way the compiler flattens it: a nested group's boundaries are
-        // members of the enclosing body.
-        let boundary = |id: &str, group: &str, role: &str, literal: bool, scope: serde_json::Value| {
-            json!({
-                "id": id, "nodeType": "Passthrough", "label": null,
-                "config": { "parentId": group }, "position": { "x": 0.0, "y": 0.0 },
-                "inputs": [
-                    { "name": "value", "portType": "String", "required": false, "optional": true },
-                    { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
-                ],
-                "outputs": [{ "name": "value", "portType": "String", "required": false }],
-                "features": {}, "scope": scope, "requiresInfra": false, "images": [],
-                "groupBoundary": { "groupId": group, "role": role },
-                "portLiterals": if literal { json!({ SHOULD_FLOW_PORT: false }) } else { json!({}) }
-            })
-        };
         let echo = |id: &str, scope: serde_json::Value| {
             json!({
                 "id": id, "nodeType": id, "label": null,
@@ -804,10 +806,6 @@
                 "features": {}, "scope": scope, "groupBoundary": null,
                 "requiresInfra": false, "images": []
             })
-        };
-        let edge = |id: &str, source: &str, target: &str| {
-            json!({ "id": id, "source": source, "target": target,
-                    "sourceHandle": "value", "targetHandle": "value" })
         };
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
@@ -823,34 +821,35 @@
                     "features": {}, "scope": [], "groupBoundary": null,
                     "requiresInfra": false, "images": []
                 },
-                boundary("outer__in", "outer", "In", true, json!([])),
-                boundary("outer.inner__in", "outer.inner", "In", false, json!(["outer"])),
                 echo("deep", json!(["outer", "outer.inner"])),
-                boundary("outer.inner__out", "outer.inner", "Out", false, json!(["outer"])),
-                boundary("outer__out", "outer", "Out", false, json!([])),
                 echo("after", json!([]))
             ],
             "edges": [
-                edge("e1", "source", "outer__in"),
-                edge("e2", "outer__in", "outer.inner__in"),
-                edge("e3", "outer.inner__in", "deep"),
-                edge("e4", "deep", "outer.inner__out"),
-                edge("e5", "outer.inner__out", "outer__out"),
-                edge("e6", "outer__out", "after")
+                through("e1", "source", "value", &[("outer", "value", "in"), ("outer.inner", "value", "in")], "deep", "value"),
+                through("e2", "deep", "value", &[("outer.inner", "value", "out"), ("outer", "value", "out")], "after", "value")
             ],
             "groups": [
-                { "id": "outer", "kind": "group", "parentId": null },
-                { "id": "outer.inner", "kind": "group", "parentId": "outer" }
+                group("outer", None, &["value"], &["value"], json!({ SHOULD_FLOW_PORT: false }), &[]),
+                group("outer.inner", Some("outer"), &["value"], &["value"], json!({}), &["deep"])
             ]
         }))
         .expect("nested project")
     }
 
+    /// [`nested_group_project`] with its outer gate taken out of the
+    /// braces: both groups run.
+    fn open_nested_group_project() -> ProjectDefinition {
+        let mut project = nested_group_project();
+        let outer = project.groups.iter_mut().find(|g| g.id == "outer").expect("outer");
+        outer.port_literals.remove(SHOULD_FLOW_PORT);
+        project
+    }
+
     /// `_should_flow: false` in a group's braces takes the whole scope
-    /// down, nesting included: the outer boundary skips with its reason
-    /// and its outward ports close (so what comes after skips), and
-    /// every member, the nested group's boundaries and the node two
-    /// levels in alike, logs that its scope did not run.
+    /// down, nesting included: the outer scope does not run, with its
+    /// reason, and the wire leaving it closes (so what comes after
+    /// skips), and everything inside, the nested group and the node two
+    /// levels in alike, is told its scope did not run.
     #[tokio::test]
     async fn a_guarded_group_skips_every_node_nested_inside_it() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -866,12 +865,11 @@
             "nothing inside the group, and nothing after it, may run: {:?}",
             ran.lock().unwrap()
         );
-        let (_, boundaries) = fold_with_boundaries(nested_group_project(), &events);
-        assert_eq!(boundary_skip_reason(&boundaries, "outer__in"), Some(SkipReason::DidNotFlow));
-        let scope_skipped = Some(SkipReason::ScopeSkipped { scope: "outer".into() });
-        assert_eq!(skip_reason(&events, "deep"), scope_skipped, "the node two levels in");
-        assert_eq!(boundary_skip_reason(&boundaries, "outer.inner__in"), scope_skipped, "the nested boundary");
-        assert_eq!(boundary_skip_reason(&boundaries, "outer.inner__out"), scope_skipped);
+        let (_, decided) = fold_with_scopes(nested_group_project(), &events);
+        assert_eq!(scope_state(&decided, "outer"), ScopeState::Skipped { reason: SkipReason::DidNotFlow });
+        let scope_skipped = SkipReason::ScopeSkipped { scope: "outer".into() };
+        assert_eq!(skip_reason(&events, "deep"), Some(scope_skipped.clone()), "the node two levels in");
+        assert_eq!(scope_state(&decided, "outer.inner"), ScopeState::Skipped { reason: scope_skipped }, "the nested group");
         assert_eq!(
             skip_reason(&events, "after"),
             Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
@@ -882,15 +880,13 @@
     }
 
     /// The same nesting with the gate open: the value crosses two
-    /// boundaries in and two out, and the journal (which holds no row
-    /// for any of the four) folds back to the settled run the engine
-    /// held, boundaries included.
+    /// groups in and two out on one wire each way, and the journal
+    /// (which holds no row for either group) folds back to the settled
+    /// run the engine held, both scopes open.
     #[tokio::test]
     async fn a_nested_group_run_folds_back_to_its_settled_state() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
-        let mut project = nested_group_project();
-        let outer_in = project.nodes.iter_mut().find(|n| n.id == "outer__in").expect("outer__in");
-        outer_in.port_literals.remove(SHOULD_FLOW_PORT);
+        let project = open_nested_group_project();
         let project_again = project.clone();
         let cat = catalog(vec![
             ("Source", Box::new(Source { allowed: Some(json!(true)) })),
@@ -901,19 +897,21 @@
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert_eq!(ran.lock().unwrap().as_slice(), &["deep", "after"]);
         assert!(
-            !events.iter().any(|e| matches!(e, RunEvent::NodeStarted { node_id, .. } if node_id.ends_with("__in") || node_id.ends_with("__out"))),
-            "a boundary never journals a row: {events:?}"
+            !events.iter().any(|e| matches!(e, RunEvent::NodeStarted { node_id, .. } if node_id.starts_with("outer"))),
+            "a group never journals a row: {events:?}"
         );
         let snap = fold(project_again.clone(), &events);
-        for boundary in ["outer__in", "outer.inner__in", "outer.inner__out", "outer__out"] {
-            assert_eq!(snap.firings[boundary][0].status, NodeFiringStatus::Completed, "{boundary}");
+        for scope in ["outer", "outer.inner"] {
+            assert_eq!(snapshot_scope(&snap, scope), Some(ScopeState::Open), "{scope}");
         }
         assert_fold_settles(project_again, &events);
     }
 
-    /// A literal written on a container's interface port (`g.b = "fixed"`)
-    /// reaches the children through the In boundary, the same way a
-    /// node's own braces literal reaches the node.
+    /// A literal written on a group's port (`g.b = "fixed"`) reaches the
+    /// members that read it, sent by the group as it opens, the same way
+    /// a node's own braces literal reaches the node. Beside it a wire
+    /// enters on the group's other port (`g.a = source.value`): the group
+    /// opens on that wire's value, then sends the literal.
     #[tokio::test]
     async fn a_literal_on_a_group_port_reaches_the_nodes_inside() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -932,36 +930,22 @@
                     "requiresInfra": false, "images": []
                 },
                 {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [
-                        { "name": "a", "portType": "String", "required": false, "optional": true },
-                        { "name": "b", "portType": "String", "required": false, "optional": true }
-                    ],
-                    "outputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": "b", "portType": "String", "required": false }
-                    ],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" },
-                    "portLiterals": { "b": "fixed" }
-                },
-                {
                     "id": "deep", "nodeType": "deep", "label": null,
                     "config": null, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "value", "portType": "String", "required": true }],
+                    "inputs": [
+                        { "name": "value", "portType": "String", "required": true },
+                        { "name": "other", "portType": "String", "required": true }
+                    ],
                     "outputs": [{ "name": "value", "portType": "String", "required": false }],
                     "features": {}, "scope": ["g"], "groupBoundary": null,
                     "requiresInfra": false, "images": []
                 }
             ],
             "edges": [
-                { "id": "e1", "source": "source", "target": "g__in",
-                  "sourceHandle": "value", "targetHandle": "a" },
-                { "id": "e2", "source": "g__in", "target": "deep",
-                  "sourceHandle": "b", "targetHandle": "value" }
+                through("e0", "source", "value", &[("g", "a", "in")], "deep", "other"),
+                through("e1", "g", "b", &[("g", "b", "in")], "deep", "value")
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &["a", "b"], &[], json!({ "b": "fixed" }), &["deep"])]
         }))
         .expect("literal-port project");
 
@@ -1009,67 +993,35 @@
                 "sourceHandle": source_port, "targetHandle": target_port })
     }
 
-    /// `source -> g__in.a` with `g`'s `_should_flow` wired from a gate,
-    /// and inside `g` a ROOT (`seed`, no inputs at all) feeding `deep`.
-    /// A body root has no wire to start it: the scope launcher kicks it
-    /// when the group starts.
+    /// `source.allowed` wired into `g`'s `_should_flow`, and inside `g` a
+    /// ROOT (`seed`, no inputs at all) feeding `deep`. A body root has
+    /// no wire to start it: the group kicks it when it opens.
     fn rooted_group_project() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [
-                        { "name": "a", "portType": "String", "required": false, "optional": true },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
-                    ],
-                    "outputs": [{ "name": "a", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
                 plain_node("seed", "Seed", json!(["g"]), &[]),
                 plain_node("deep", "deep", json!(["g"]), &[("value", true)])
             ],
             "edges": [
-                edge("e1", "source", "value", "g__in", "a"),
-                edge("e2", "source", "allowed", "g__in", SHOULD_FLOW_PORT),
+                edge("e2", "source", "allowed", "g", SHOULD_FLOW_PORT),
                 edge("e3", "seed", "value", "deep", "value")
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &[], &[], json!({}), &["seed", "deep"])]
         }))
         .expect("rooted group project")
     }
 
-    /// `source -> g__in.a`, and inside `g` a root `boom` that FAILS, feeding
-    /// `g__out.v`; outside, `watcher` runs on `g__out.v` NOT arriving
-    /// (`_should_not_flow`) with its own `value` from `source`.
+    /// Inside `g` a root `boom` that FAILS, its value leaving `g` on `v`
+    /// for `watcher`, which runs on it NOT arriving (`_should_not_flow`)
+    /// with its own `value` from `source`.
     fn failing_group_watched_project() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [
-                        { "name": "a", "portType": "String", "required": false, "optional": true },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
-                    ],
-                    "outputs": [{ "name": "a", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
                 plain_node("boom", "Boom", json!(["g"]), &[]),
-                {
-                    "id": "g__out", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "v", "portType": "String", "required": false, "optional": true }],
-                    "outputs": [{ "name": "v", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "Out" }
-                },
                 {
                     "id": "watcher", "nodeType": "Echo", "label": null,
                     "config": null, "position": { "x": 0.0, "y": 0.0 },
@@ -1083,20 +1035,18 @@
                 }
             ],
             "edges": [
-                edge("e1", "source", "value", "g__in", "a"),
-                edge("e2", "boom", "value", "g__out", "v"),
-                edge("e3", "g__out", "v", "watcher", SHOULD_NOT_FLOW_PORT),
+                through("e2", "boom", "value", &[("g", "v", "out")], "watcher", SHOULD_NOT_FLOW_PORT),
                 edge("e4", "source", "value", "watcher", "value")
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &[], &["v"], json!({}), &["boom"])]
         }))
         .expect("failing group watched project")
     }
 
     /// A failure INSIDE a group reaches a watcher outside as a failure.
-    /// The group's Out boundary forwards the failed closure with its
-    /// error rather than laundering it into a plain "nothing came", so
-    /// the branch written for the absence stays off one scope up too.
+    /// The closure that leaves the group carries its error rather than a
+    /// plain "nothing came", so the branch written for the absence stays
+    /// off one scope up too.
     #[tokio::test]
     async fn a_failure_inside_a_group_keeps_an_outside_inverted_gate_off() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -1109,12 +1059,12 @@
 
         assert!(
             ran.lock().unwrap().is_empty(),
-            "the failure crossed the boundary as one, so the watcher stayed off: {:?}",
+            "the failure left the group as one, so the watcher stayed off: {:?}",
             ran.lock().unwrap()
         );
         match skip_reason(&events, "watcher") {
             Some(SkipReason::WatchedNodeFailed { failure }) => {
-                assert!(failure.error.contains("the database is down"), "the boundary kept the error: {failure}");
+                assert!(failure.error.contains("the database is down"), "the wire kept the error: {failure}");
             }
             other => panic!("expected the watched-node-failed reason through the group, got {other:?}"),
         }
@@ -1191,34 +1141,16 @@
         assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
     }
 
-    /// `boom.value -> g__in._should_flow`, a live root `inner` inside `g`
-    /// feeding `g__out.v`, and `g__out.v -> watcher._should_not_flow`.
-    /// The group never starts because its gate closed on a failure.
+    /// `boom.value -> g._should_flow`, a live root `inner` inside `g`
+    /// whose value leaves `g` on `v` for `watcher._should_not_flow`. The
+    /// group never runs because its gate closed on a failure.
     fn failure_gated_group_project() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
                 plain_node("boom", "Boom", json!([]), &[]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
-                    ],
-                    "outputs": [],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
                 plain_node("inner", "Inner", json!(["g"]), &[]),
-                {
-                    "id": "g__out", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "v", "portType": "String", "required": false, "optional": true }],
-                    "outputs": [{ "name": "v", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "Out" }
-                },
                 {
                     "id": "watcher", "nodeType": "Echo", "label": null,
                     "config": null, "position": { "x": 0.0, "y": 0.0 },
@@ -1232,12 +1164,11 @@
                 }
             ],
             "edges": [
-                edge("e1", "boom", "value", "g__in", SHOULD_FLOW_PORT),
-                edge("e2", "inner", "value", "g__out", "v"),
-                edge("e3", "g__out", "v", "watcher", SHOULD_NOT_FLOW_PORT),
+                edge("e1", "boom", "value", "g", SHOULD_FLOW_PORT),
+                through("e2", "inner", "value", &[("g", "v", "out")], "watcher", SHOULD_NOT_FLOW_PORT),
                 edge("e4", "source", "value", "watcher", "value")
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &[], &["v"], json!({}), &["inner"])]
         }))
         .expect("failure gated group project")
     }
@@ -1257,16 +1188,16 @@
         let (outcome, events) = drive(failure_gated_group_project(), cat, &["source", "boom"]).await;
 
         assert!(ran.lock().unwrap().is_empty(), "the watcher stayed off: {:?}", ran.lock().unwrap());
-        let (_, boundaries) = fold_with_boundaries(failure_gated_group_project(), &events);
-        match boundary_skip_reason(&boundaries, "g__in") {
-            Some(SkipReason::FlowClosed { failure: Some(failure) }) => {
+        let (_, decided) = fold_with_scopes(failure_gated_group_project(), &events);
+        match scope_state(&decided, "g") {
+            ScopeState::Skipped { reason: SkipReason::FlowClosed { failure: Some(failure) } } => {
                 assert_eq!(failure.node, "boom", "the gate's skip names the node that broke: {failure}");
                 assert!(failure.error.contains("the database is down"), "and its error: {failure}");
             }
             other => panic!("expected the gate closed ON A FAILURE, got {other:?}"),
         }
-        // Two hops on (the scope's gate skipped, its outward closure
-        // reached the watcher), the failure still names `boom`.
+        // Two hops on (the scope did not run, the wire leaving it
+        // closed on to the watcher), the failure still names `boom`.
         match skip_reason(&events, "watcher") {
             Some(SkipReason::WatchedNodeFailed { failure }) => {
                 assert_eq!(failure.node, "boom", "the origin survives the skips: {failure}");
@@ -1278,7 +1209,7 @@
     }
 
     /// A node inside a group that nothing feeds starts when the group
-    /// does: the launcher kicks it at the group's frames, and what it
+    /// does: the opening kicks it at the group's frames, and what it
     /// emits reaches the member behind it.
     #[tokio::test]
     async fn a_group_body_root_starts_when_the_group_starts() {
@@ -1294,9 +1225,9 @@
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "the root's value reached deep");
         let snap = fold(rooted_group_project(), &events);
-        let kick = snap.kicked.get(&FiringLocation::new("seed", vec![])).expect("the launch kicked the root");
+        let kick = snap.kicked.get(&FiringLocation::new("seed", vec![])).expect("the opening kicked the root");
         assert!(kick.dispatched && kick.scope_skipped.is_none(), "{kick:?}");
-        assert_eq!(snap.firings["g__in"][0].status, NodeFiringStatus::Completed);
+        assert_eq!(snapshot_scope(&snap, "g"), Some(ScopeState::Open));
     }
 
     /// The same root when the group's `_should_flow` says no: nothing
@@ -1315,10 +1246,10 @@
 
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
-        // The boundary itself journals nothing; the fold holds its
-        // skipped record and the skip kicks of every member.
+        // The group itself journals nothing; the fold holds its
+        // decision and the skip kicks of every member.
         let snap = fold(rooted_group_project(), &events);
-        assert_eq!(snap.firings["g__in"][0].status, NodeFiringStatus::Skipped);
+        assert_eq!(snapshot_scope(&snap, "g"), Some(ScopeState::Skipped { reason: SkipReason::DidNotFlow }));
         assert_eq!(
             snap.kicked.get(&FiringLocation::new("seed", vec![])).map(|k| k.scope_skipped.as_deref()),
             Some(Some("g")),
@@ -1330,18 +1261,10 @@
     }
 
     /// The same group with its gate wired the OTHER way round, built by
-    /// renaming the port and the edge, which is what the editor's flip
-    /// does.
+    /// renaming the gate the wire lands on, which is what the editor's
+    /// flip does.
     fn inverted_rooted_group_project() -> ProjectDefinition {
         let mut project = rooted_group_project();
-        for node in &mut project.nodes {
-            for port in &mut node.inputs {
-                if port.name == SHOULD_FLOW_PORT {
-                    port.name = SHOULD_NOT_FLOW_PORT.to_string();
-                    port.port.name = SHOULD_NOT_FLOW_PORT.to_string();
-                }
-            }
-        }
         for edge in &mut project.edges {
             if edge.target_handle.as_deref() == Some(SHOULD_FLOW_PORT) {
                 edge.target_handle = Some(SHOULD_NOT_FLOW_PORT.to_string());
@@ -1351,8 +1274,8 @@
     }
 
     /// A whole SCOPE gated on an absence. The thing the group watches
-    /// never arrived, so the group runs, and everything the launcher
-    /// owes it runs too: the body root nothing feeds is kicked at the
+    /// never arrived, so the group runs, and everything its opening
+    /// starts runs too: the body root nothing feeds is kicked at the
     /// group's frames exactly as it is under the plain gate.
     #[tokio::test]
     async fn a_closed_inverted_group_gate_launches_the_whole_scope() {
@@ -1377,9 +1300,9 @@
         let kick = snap
             .kicked
             .get(&FiringLocation::new("seed", vec![]))
-            .expect("the launch kicked the root of a scope an absence opened");
+            .expect("the opening kicked the root of a scope an absence opened");
         assert!(kick.dispatched && kick.scope_skipped.is_none(), "{kick:?}");
-        assert_eq!(snap.firings["g__in"][0].status, NodeFiringStatus::Completed);
+        assert_eq!(snapshot_scope(&snap, "g"), Some(ScopeState::Open));
     }
 
     /// And the mirror: the thing DID arrive, so the scope stays shut and
@@ -1398,8 +1321,7 @@
 
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
-        let (snap, boundaries) = fold_with_boundaries(inverted_rooted_group_project(), &events);
-        assert_eq!(snap.firings["g__in"][0].status, NodeFiringStatus::Skipped);
+        let (snap, decided) = fold_with_scopes(inverted_rooted_group_project(), &events);
         assert_eq!(
             snap.kicked.get(&FiringLocation::new("seed", vec![])).map(|k| k.scope_skipped.as_deref()),
             Some(Some("g")),
@@ -1409,15 +1331,15 @@
         assert_eq!(skip_reason(&events, "seed"), scope_skipped, "the root, which no wire feeds");
         assert_eq!(skip_reason(&events, "deep"), scope_skipped);
         assert_eq!(
-            boundary_skip_reason(&boundaries, "g__in"),
-            Some(SkipReason::DidFlow),
-            "the boundary's OWN reason says which gate decided"
+            scope_state(&decided, "g"),
+            ScopeState::Skipped { reason: SkipReason::DidFlow },
+            "the scope's OWN reason says which gate decided"
         );
     }
 
     /// `_should_flow` on a group from outside, when whatever decides it
-    /// never spoke: the closure is a no for the boundary (its own
-    /// reason), and the members carry the scope's.
+    /// never spoke: the closure is a no for the scope (its own reason),
+    /// and the members carry the scope's.
     #[tokio::test]
     async fn a_closed_group_guard_skips_the_scope_with_its_own_reason() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -1428,27 +1350,15 @@
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
                 plain_node("gate", "gate", json!([]), &[("value", true), (SHOULD_FLOW_PORT, false)]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [
-                        { "name": "a", "portType": "String", "required": false, "optional": true },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
-                    ],
-                    "outputs": [{ "name": "a", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
                 plain_node("deep", "deep", json!(["g"]), &[("value", true)])
             ],
             "edges": [
                 edge("e1", "source", "value", "gate", "value"),
                 edge("e2", "source", "allowed", "gate", SHOULD_FLOW_PORT),
-                edge("e3", "source", "value", "g__in", "a"),
-                edge("e4", "gate", "value", "g__in", SHOULD_FLOW_PORT),
-                edge("e5", "g__in", "a", "deep", "value")
+                through("e3", "source", "value", &[("g", "a", "in")], "deep", "value"),
+                edge("e4", "gate", "value", "g", SHOULD_FLOW_PORT)
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &["a"], &[], json!({}), &["deep"])]
         }))
         .expect("closed guard project");
         let cat = catalog(vec![
@@ -1462,8 +1372,8 @@
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
         assert_eq!(skip_reason(&events, "gate"), Some(SkipReason::DidNotFlow));
-        let (_, boundaries) = fold_with_boundaries(project_again, &events);
-        assert_eq!(boundary_skip_reason(&boundaries, "g__in"), Some(SkipReason::FlowClosed { failure: None }));
+        let (_, decided) = fold_with_scopes(project_again, &events);
+        assert_eq!(scope_state(&decided, "g"), ScopeState::Skipped { reason: SkipReason::FlowClosed { failure: None } });
         assert_eq!(skip_reason(&events, "deep"), Some(SkipReason::ScopeSkipped { scope: "g".into() }));
     }
 
@@ -1479,33 +1389,16 @@
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
                 plain_node("gate", "gate", json!([]), &[("value", true), (SHOULD_FLOW_PORT, false)]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [
-                        { "name": "a", "portType": "String", "required": false, "optional": true },
-                        { "name": "b", "portType": "String", "required": false, "optional": true },
-                        { "name": SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false, "optional": true }
-                    ],
-                    "outputs": [
-                        { "name": "a", "portType": "String", "required": false },
-                        { "name": "b", "portType": "String", "required": false }
-                    ],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
                 plain_node("reads_a", "reads_a", json!(["g"]), &[("value", true)]),
                 plain_node("reads_b", "reads_b", json!(["g"]), &[("value", true)])
             ],
             "edges": [
                 edge("e1", "source", "value", "gate", "value"),
                 edge("e2", "source", "allowed", "gate", SHOULD_FLOW_PORT),
-                edge("e3", "source", "value", "g__in", "a"),
-                edge("e4", "gate", "value", "g__in", "b"),
-                edge("e5", "g__in", "a", "reads_a", "value"),
-                edge("e6", "g__in", "b", "reads_b", "value")
+                through("e3", "source", "value", &[("g", "a", "in")], "reads_a", "value"),
+                through("e4", "gate", "value", &[("g", "b", "in")], "reads_b", "value")
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &["a", "b"], &[], json!({}), &["reads_a", "reads_b"])]
         }))
         .expect("closed input project");
         let cat = catalog(vec![
@@ -1519,12 +1412,11 @@
 
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "reads_a ran on the open port");
-        // Boundaries never journal: the group's own firing is read off
-        // the fold, and it ran (a closed input gates a member, never
-        // the group).
-        let (snap, boundaries) = fold_with_boundaries(project_again, &events);
-        assert_eq!(boundary_skip_reason(&boundaries, "g__in"), None, "the group itself runs");
-        assert_eq!(snap.firings["g__in"][0].status, NodeFiringStatus::Completed);
+        // A group never journals: how it was decided is read off the
+        // fold, and it ran (a closed input gates a member, never the
+        // group, as long as another input brought a value).
+        let (_, decided) = fold_with_scopes(project_again, &events);
+        assert_eq!(scope_state(&decided, "g"), ScopeState::Open, "the group itself runs");
         assert_eq!(
             skip_reason(&events, "reads_b"),
             Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
@@ -1532,14 +1424,12 @@
         );
     }
 
-    /// A group whose ONLY input arrives closed still starts: the In
-    /// boundary has no gate but `_should_flow`, so it forwards the
-    /// closure, its body root is kicked and runs, the member reading the
-    /// closed edge skips on its own rule, and the run completes instead
-    /// of parking on a body nobody started (the collapsed-group
-    /// regression: a boundary that rendered green with empty panels).
+    /// A group with no gate whose ONLY input arrives closed does not run:
+    /// nothing it was written to work on came, so its body root is
+    /// kicked into the scope's skip with every other member, and the run
+    /// completes instead of parking on a body nobody started.
     #[tokio::test]
-    async fn a_group_whose_only_input_closes_still_starts_its_body_roots() {
+    async fn a_group_whose_every_input_closes_does_not_run() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let project: ProjectDefinition = serde_json::from_value(json!({
@@ -1547,14 +1437,6 @@
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
                 plain_node("gate", "gate", json!([]), &[("value", true), (SHOULD_FLOW_PORT, false)]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "a", "portType": "String", "required": false, "optional": true }],
-                    "outputs": [{ "name": "a", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
                 plain_node("seed", "Seed", json!(["g"]), &[]),
                 plain_node("deep", "deep", json!(["g"]), &[("value", true)]),
                 plain_node("reads_a", "reads_a", json!(["g"]), &[("value", true)])
@@ -1562,11 +1444,10 @@
             "edges": [
                 edge("e1", "source", "value", "gate", "value"),
                 edge("e2", "source", "allowed", "gate", SHOULD_FLOW_PORT),
-                edge("e3", "gate", "value", "g__in", "a"),
-                edge("e4", "seed", "value", "deep", "value"),
-                edge("e5", "g__in", "a", "reads_a", "value")
+                through("e3", "gate", "value", &[("g", "a", "in")], "reads_a", "value"),
+                edge("e4", "seed", "value", "deep", "value")
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &["a"], &[], json!({}), &["seed", "deep", "reads_a"])]
         }))
         .expect("closed-only-input project");
         let cat = catalog(vec![
@@ -1580,28 +1461,23 @@
         let (outcome, events) = drive(project, cat, &["source"]).await;
 
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
-        let snap = fold(project_again, &events);
+        let (snap, decided) = fold_with_scopes(project_again, &events);
+        assert_eq!(scope_state(&decided, "g"), ScopeState::Skipped { reason: SkipReason::EveryInputClosed { failure: None } });
+        assert!(seen.lock().unwrap().is_empty(), "nothing inside ran: {:?}", seen.lock().unwrap());
+        let scope_skipped = Some(SkipReason::ScopeSkipped { scope: "g".into() });
+        for member in ["seed", "deep", "reads_a"] {
+            assert_eq!(skip_reason(&events, member), scope_skipped, "{member}");
+        }
         assert_eq!(
-            snap.firings["g__in"][0].status,
-            NodeFiringStatus::Completed,
-            "the boundary is not gated by its inputs"
-        );
-        assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "the root ran and fed deep");
-        assert_eq!(
-            skip_reason(&events, "reads_a"),
-            Some(SkipReason::RequiredInputClosed { port: "value".into(), failure: None }),
-            "the member on the closed edge skips on its own rule"
-        );
-        assert_eq!(skip_reason(&events, "seed"), None);
-        assert!(
-            snap.kicked.get(&FiringLocation::new("seed", vec![])).is_some_and(|k| k.scope_skipped.is_none()),
-            "the scope launched for real"
+            snap.kicked.get(&FiringLocation::new("seed", vec![])).map(|k| k.scope_skipped.as_deref()),
+            Some(Some("g")),
+            "the root is kicked into the scope's skip"
         );
     }
 
     /// A node inside a LOOP body that nothing feeds fires once per
-    /// iteration, at the iteration's frames: the launcher kicks it
-    /// alongside the body pulses, so every iteration sees its own copy.
+    /// iteration, at the iteration's frames: each launch opens its
+    /// iteration and kicks it, so every iteration sees its own copy.
     #[tokio::test]
     async fn a_loop_body_root_fires_once_per_iteration() {
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
@@ -1648,7 +1524,7 @@
                 edge("e2", "seed", "value", "tally", "value"),
                 edge("e3", "tally", "value", "l__out", "results")
             ],
-            "groups": [{ "id": "l", "kind": "loop", "parentId": null,
+            "groups": [{ "id": "l", "kind": "loop", "nodeIds": ["seed", "tally"],
                          "loopConfig": { "parallel": false, "over": ["items"], "carry": [] } }]
         }))
         .expect("loop root project");
@@ -1757,15 +1633,12 @@
 
     /// The cancel walk's closures get the same pass a turn's would: a
     /// node parked two groups deep is cancelled with its output port
-    /// never written, so the closure the walk puts on that port makes
-    /// both Out boundaries ready, and they fire (records, closures
-    /// forwarded outward) on the worker exactly as the fold fires them
-    /// from the `NodeCancelled` row (`drive` compares the two).
+    /// never written, and the closure the walk puts on that port travels
+    /// its one wire out of both groups on the worker exactly as the fold
+    /// sends it from the `NodeCancelled` row (`drive` compares the two).
     #[tokio::test]
     async fn a_cancelled_body_closes_its_groups_outward() {
-        let mut project = nested_group_project();
-        let outer_in = project.nodes.iter_mut().find(|n| n.id == "outer__in").expect("outer__in");
-        outer_in.port_literals.remove(SHOULD_FLOW_PORT);
+        let project = open_nested_group_project();
         let project_again = project.clone();
         let cat = catalog(vec![
             ("Source", Box::new(Source { allowed: Some(json!(true)) })),
@@ -1775,59 +1648,53 @@
         assert!(matches!(outcome, RunOutcome::Cancelled { .. }), "{outcome:?}");
         let snap = fold(project_again, &events);
         assert_eq!(snap.firings["deep"][0].status, NodeFiringStatus::Cancelled);
-        for boundary in ["outer.inner__out", "outer__out"] {
-            assert_eq!(
-                snap.firings.get(boundary).map(|r| r[0].status.clone()),
-                Some(NodeFiringStatus::Completed),
-                "{boundary} fired on the cancelled body's closure"
-            );
+        for scope in ["outer", "outer.inner"] {
+            assert_eq!(snapshot_scope(&snap, scope), Some(ScopeState::Open), "{scope}");
         }
         let after: Vec<_> = snap.pulses["after"].iter().collect();
         assert_eq!(after.len(), 1, "the closure reached past both groups: {after:?}");
         assert!(after[0].closed);
     }
 
-    /// A group whose In boundary FAILS (its port refuses the value that
-    /// reached it) never starts, and every member is told. A member fed
-    /// both by the In boundary and by another member gets one skip and
-    /// nothing left pending: the run ends Failed with every record
-    /// terminal, never Stuck on a closure nobody takes.
+    /// A group whose gate closed on a FAILURE never runs, and every
+    /// member is told. A member fed both from outside the group and by
+    /// another member gets one skip and nothing left pending: the run
+    /// ends Failed with every record terminal, never Stuck on a closure
+    /// nobody takes.
     #[tokio::test]
-    async fn a_failed_in_boundary_settles_a_member_fed_from_inside_too() {
+    async fn a_group_gated_off_by_a_failure_settles_a_member_fed_from_inside_too() {
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [
                 plain_node("source", "Source", json!([]), &[]),
-                {
-                    "id": "g__in", "nodeType": "Passthrough", "label": null,
-                    "config": { "parentId": "g" }, "position": { "x": 0.0, "y": 0.0 },
-                    "inputs": [{ "name": "a", "portType": "Number", "required": false, "optional": true }],
-                    "outputs": [{ "name": "a", "portType": "Number", "required": false }],
-                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
-                    "groupBoundary": { "groupId": "g", "role": "In" }
-                },
+                plain_node("boom", "Boom", json!([]), &[]),
                 plain_node("lone", "Source", json!(["g"]), &[]),
                 plain_node("both", "Recorder", json!(["g"]), &[("value", true), ("other", true)]),
             ],
             "edges": [
-                edge("e1", "source", "value", "g__in", "a"),
-                edge("e2", "g__in", "a", "both", "value"),
+                edge("e1", "boom", "value", "g", SHOULD_FLOW_PORT),
+                through("e2", "source", "value", &[("g", "a", "in")], "both", "value"),
                 edge("e3", "lone", "value", "both", "other"),
             ],
-            "groups": [{ "id": "g", "kind": "group", "parentId": null }]
+            "groups": [group("g", None, &["a"], &[], json!({}), &["lone", "both"])]
         }))
         .expect("failing-group project");
         let project_again = project.clone();
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let cat = catalog(vec![
             ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("Boom", Box::new(FailingSource)),
             ("Recorder", Box::new(Recorder { seen: Arc::new(StdMutex::new(Vec::new())), ran: ran.clone() })),
         ]);
-        let (outcome, events) = drive(project, cat, &["source"]).await;
+        let (outcome, events) = drive(project, cat, &["source", "boom"]).await;
         assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "nothing inside a scope that never started runs");
         let snap = fold(project_again, &events);
-        assert_eq!(snap.firings["g__in"][0].status, NodeFiringStatus::Failed);
+        assert!(
+            matches!(snapshot_scope(&snap, "g"), Some(ScopeState::Skipped { reason: SkipReason::FlowClosed { failure: Some(_) } })),
+            "{:?}",
+            snapshot_scope(&snap, "g")
+        );
         for member in ["lone", "both"] {
             let records = &snap.firings[member];
             assert_eq!(records.len(), 1, "{member} fires once: {records:?}");
@@ -1844,4 +1711,134 @@
             Some(true),
             "the fold reaches the live engine's conclusion: ended, failed"
         );
+    }
+
+    /// Holds its value back until `release` lets it go, then emits it,
+    /// writing down that it was released. A failsafe lets it go on its
+    /// own after a while, written down as such, so a run that never
+    /// releases it fails its test by name instead of hanging.
+    struct HeldBack {
+        name: &'static str,
+        release: Arc<tokio::sync::Notify>,
+        log: Arc<StdMutex<Vec<String>>>,
+    }
+    test_manifest!(HeldBack, "HeldBack");
+    #[async_trait]
+    impl Node for HeldBack {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let how = match tokio::time::timeout(std::time::Duration::from_secs(10), self.release.notified()).await {
+                Ok(()) => "released",
+                Err(_) => "gave up waiting",
+            };
+            self.log.lock().unwrap().push(format!("{} {how}", self.name));
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!(self.name))).await
+        }
+    }
+
+    /// Writes down that it ran, and lets `release` go when it has one.
+    /// Emits nothing.
+    struct Mark {
+        name: &'static str,
+        release: Option<Arc<tokio::sync::Notify>>,
+        log: Arc<StdMutex<Vec<String>>>,
+    }
+    test_manifest!(Mark, "Mark");
+    #[async_trait]
+    impl Node for Mark {
+        async fn run(&self, _ctx: RunContext) -> WeftResult<()> {
+            self.log.lock().unwrap().push(format!("{} ran", self.name));
+            if let Some(release) = &self.release {
+                release.notify_one();
+            }
+            Ok(())
+        }
+    }
+
+    /// Where `entry` sits in `log`, failing when it is not there.
+    fn logged_at(log: &[String], entry: &str) -> usize {
+        log.iter().position(|e| e == entry).unwrap_or_else(|| panic!("'{entry}' is not in the log: {log:?}"))
+    }
+
+    /// A member with no input starts the moment its group opens, without
+    /// waiting for the group's other inputs. `g` opens on `fast`'s value
+    /// reaching `uses`; `late`, which feeds `g`'s other input, holds its
+    /// value back until `m`, a member nothing feeds, has run. Were `m`
+    /// held until every input of `g` had arrived, `late` would never be
+    /// released.
+    #[tokio::test]
+    async fn a_member_with_no_input_starts_when_its_group_opens_before_the_other_inputs_arrive() {
+        let log: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                plain_node("fast", "Source", json!([]), &[]),
+                plain_node("late", "HeldBack", json!([]), &[]),
+                plain_node("m", "M", json!(["g"]), &[]),
+                plain_node("uses", "Uses", json!(["g"]), &[("early", true), ("late", true)])
+            ],
+            "edges": [
+                through("e1", "fast", "value", &[("g", "early", "in")], "uses", "early"),
+                through("e2", "late", "value", &[("g", "late", "in")], "uses", "late")
+            ],
+            "groups": [group("g", None, &["early", "late"], &[], json!({}), &["m", "uses"])]
+        }))
+        .expect("late input project");
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("HeldBack", Box::new(HeldBack { name: "late", release: release.clone(), log: log.clone() })),
+            ("M", Box::new(Mark { name: "m", release: Some(release), log: log.clone() })),
+            ("Uses", Box::new(Mark { name: "uses", release: None, log: log.clone() })),
+        ]);
+        let project_again = project.clone();
+        let (outcome, events) = drive(project, cat, &["fast", "late"]).await;
+
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        let log = log.lock().unwrap().clone();
+        assert!(logged_at(&log, "m ran") < logged_at(&log, "late released"), "m ran before g's other input existed: {log:?}");
+        assert!(logged_at(&log, "late released") < logged_at(&log, "uses ran"), "uses waited for both its inputs: {log:?}");
+        assert_eq!(snapshot_scope(&fold(project_again, &events), "g"), Some(ScopeState::Open));
+    }
+
+    /// A member's output reaches its consumer outside the group the
+    /// moment it is made, before the group's other outputs exist. `g`
+    /// holds `quick`, whose value leaves on `q` for `consumer`, and
+    /// `slow`, which holds its value (leaving on `s` for `after`) back
+    /// until `consumer` has run. Were a group's outputs held until all
+    /// of them existed, `slow` would never be released.
+    #[tokio::test]
+    async fn a_member_output_reaches_its_consumer_before_the_groups_other_outputs_exist() {
+        let log: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                plain_node("start", "Start", json!([]), &[]),
+                plain_node("quick", "Source", json!(["g"]), &[]),
+                plain_node("slow", "HeldBack", json!(["g"]), &[]),
+                plain_node("consumer", "Consumer", json!([]), &[("value", true)]),
+                plain_node("after", "After", json!([]), &[("value", true)])
+            ],
+            "edges": [
+                through("e1", "quick", "value", &[("g", "q", "out")], "consumer", "value"),
+                through("e2", "slow", "value", &[("g", "s", "out")], "after", "value")
+            ],
+            "groups": [group("g", None, &[], &["q", "s"], json!({}), &["quick", "slow"])]
+        }))
+        .expect("early output project");
+        let cat = catalog(vec![
+            ("Start", Box::new(Mark { name: "start", release: None, log: log.clone() })),
+            ("Source", Box::new(Source { allowed: Some(json!(true)) })),
+            ("HeldBack", Box::new(HeldBack { name: "slow", release: release.clone(), log: log.clone() })),
+            ("Consumer", Box::new(Mark { name: "consumer", release: Some(release), log: log.clone() })),
+            ("After", Box::new(Mark { name: "after", release: None, log: log.clone() })),
+        ]);
+        let project_again = project.clone();
+        let (outcome, events) = drive(project, cat, &["start"]).await;
+
+        assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
+        let log = log.lock().unwrap().clone();
+        assert!(logged_at(&log, "consumer ran") < logged_at(&log, "slow released"), "quick's value left g before slow's existed: {log:?}");
+        assert!(logged_at(&log, "slow released") < logged_at(&log, "after ran"), "{log:?}");
+        assert_eq!(snapshot_scope(&fold(project_again, &events), "g"), Some(ScopeState::Open));
     }

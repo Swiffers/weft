@@ -265,7 +265,7 @@ async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::R
         "a required crossing with no value is refused: {refused}"
     );
     let refused = project.weft_refused(&["run", "--json", "--from", "out", "--target", "src"]).await?;
-    anyhow::ensure!(refused.contains("selection is empty"), "{refused}");
+    anyhow::ensure!(refused.contains("nothing runs between these starts and endpoints"), "{refused}");
     let refused = project.weft_refused(&["run", "--json", "--fire", "src={}"]).await?;
     anyhow::ensure!(refused.contains("is not a trigger"), "{refused}");
     // Saved, then run by name: the value by hand reaches `mid`, `src` never runs.

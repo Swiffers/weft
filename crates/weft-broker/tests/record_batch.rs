@@ -38,7 +38,7 @@ async fn schema(pool: &PgPool) {
 }
 
 fn birth(run_id: weft_core::RunId, keeping: Keeping) -> RunEvent {
-    RunEvent::RunStarted {
+    RunEvent::RunStarted { given: Default::default(),
         run_id,
         project_id: PROJECT,
         entry_node: "route".into(),
@@ -47,7 +47,7 @@ fn birth(run_id: weft_core::RunId, keeping: Keeping) -> RunEvent {
         binary_hash: Some("bin-1".into()),
         source_version: Some("v1".into()),
         run_kind: weft_core::run::RunKind::Project,
-        selection: None,
+        cut_from: None,
         seed: None,
         instance: None,
         stand_in: None,
@@ -110,6 +110,17 @@ async fn send_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts:
 
 /// Write `parts` as [`send_on`] does; each run's whole answer, in order.
 async fn answers_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts: &[Part]) -> Vec<weft_journal::record::Recorded> {
+    answers_with(conn, writer, lane, parts, Vec::new()).await
+}
+
+/// [`answers_on`], the batch also carrying `programs`, the cuts its runs run.
+async fn answers_with(
+    conn: &mut sqlx::PgConnection,
+    writer: &str,
+    lane: &str,
+    parts: &[Part],
+    programs: Vec<weft_journal::record::StoredProgram>,
+) -> Vec<weft_journal::record::Recorded> {
     let encoded: Vec<Vec<Vec<u8>>> =
         parts.iter().map(|part| part.rows.iter().map(|row| weft_journal::stored::encode(row)).collect()).collect();
     let head = BatchHead {
@@ -128,10 +139,85 @@ async fn answers_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, par
                 wrote_files: false,
             })
             .collect(),
-        selections: Vec::new(),
+        programs,
     };
     let batch = Batch { head, rows: encoded.iter().flatten().map(Vec::as_slice).collect() };
     record_batch(conn, writer, TENANT, lane, &batch).await.unwrap()
+}
+
+/// [`birth`] of a run of `program`, a cut of the registered `def-1`, for
+/// `project`: its birth names the cut and what it was cut from.
+fn cut_birth(run_id: weft_core::RunId, project: uuid::Uuid, program: &weft_journal::record::RunsProgram) -> RunEvent {
+    let mut born = birth(run_id, Keeping::Fast);
+    if let RunEvent::RunStarted { project_id, definition_hash, cut_from, .. } = &mut born {
+        *project_id = project;
+        *definition_hash = Some(program.definition_hash().to_string());
+        *cut_from = program.cut_from().map(str::to_string);
+    }
+    born
+}
+
+/// The cut program of `project`: no node at all, so never `def-1`.
+fn cut_of(project: uuid::Uuid) -> weft_journal::record::RunsProgram {
+    let cut: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+        "id": project, "nodes": [], "edges": [], "groups": [],
+    })).unwrap();
+    let program = weft_journal::record::RunsProgram::of("def-1", project, &cut).unwrap();
+    assert_eq!(program.cut_from(), Some("def-1"), "a cut, not the registered program");
+    program
+}
+
+/// What `project_definition` keeps under `hash` for `project`: each row's
+/// program and what it was cut from.
+async fn kept(pool: &PgPool, project: uuid::Uuid, hash: &str) -> Vec<(String, Option<String>)> {
+    sqlx::query_as("SELECT project_json, cut_from FROM project_definition WHERE project_id = $1 AND definition_hash = $2")
+        .bind(project).bind(hash).fetch_all(pool).await.unwrap()
+}
+
+/// A run of a cut names the cut by its hash, and the batch that bears it
+/// carries the cut: the write keeps it with the project's programs, once
+/// however often a batch carries it again, marked with what it was cut
+/// from, so the run reads back what it ran and the cut never reads as a
+/// registered version.
+#[sqlx::test]
+async fn a_batch_keeps_the_cut_its_runs_run(pool: PgPool) {
+    schema(&pool).await;
+    let program = cut_of(PROJECT);
+    let carried = program.kept().expect("a cut is carried").as_ref().clone();
+    for _ in 0..2 {
+        let run = weft_core::new_run_id();
+        let mut conn = pool.acquire().await.unwrap();
+        let answers = answers_with(&mut conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![cut_birth(run, PROJECT, &program)]])], vec![carried.clone()]).await;
+        assert_eq!(answers[0].fate, Fate::Accepted);
+    }
+    let rows = kept(&pool, PROJECT, program.definition_hash()).await;
+    assert_eq!(rows.len(), 1, "one row however often it is carried");
+    assert_eq!(rows[0].1.as_deref(), Some("def-1"), "kept as a cut of def-1");
+    let read: weft_core::ProjectDefinition = serde_json::from_str(&rows[0].0).unwrap();
+    assert_eq!(weft_core::project::hash::compute_definition_hash(&read).unwrap(), program.definition_hash());
+}
+
+/// A cut is kept only with a run that went in naming it: a birth refused
+/// (its project is not there) keeps nothing of its cut, and a cut carried
+/// beside a birth that runs the registered program is not kept either.
+#[sqlx::test]
+async fn a_batch_keeps_no_cut_without_a_run_that_went_in(pool: PgPool) {
+    schema(&pool).await;
+    let gone = uuid::Uuid::from_u128(2);
+    let program = cut_of(gone);
+    let run = weft_core::new_run_id();
+    let mut conn = pool.acquire().await.unwrap();
+    let carried = program.kept().expect("a cut is carried").as_ref().clone();
+    let answers = answers_with(&mut conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![cut_birth(run, gone, &program)]])], vec![carried]).await;
+    assert_eq!(answers[0].fate, Fate::Refused);
+    assert!(kept(&pool, gone, program.definition_hash()).await.is_empty(), "a refused birth keeps nothing");
+
+    let unnamed = cut_of(PROJECT);
+    let run = weft_core::new_run_id();
+    let carried = unnamed.kept().expect("a cut is carried").as_ref().clone();
+    let answers = answers_with(&mut conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])], vec![carried]).await;
+    assert_eq!(answers[0].fate, Fate::Accepted);
+    assert!(kept(&pool, PROJECT, unnamed.definition_hash()).await.is_empty(), "no birth runs it as a cut");
 }
 
 /// A run born running under a writer whose lease was never written (it

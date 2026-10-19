@@ -42,11 +42,14 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
     let mut expected = super::versions::output_wires(&client, &run.run_id.to_string()).await?;
     // `--expect` and the run's node list are both spelled from the top
     // (`triage.last`, `one.strip` through its site).
-    for node in &expect {
-        if let Some((group, _)) = node.rsplit_once("__in").or_else(|| node.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
-            bail!("cannot focus '{node}': it is a group boundary the compiler made; name the group, `--expect {group}`");
+    // A name the run has is taken as it is, so only a name it lacks can
+    // be a loop's boundary the compiler made, and only when its loop is
+    // among the run's places (a loop is spelled there by its name).
+    if let Some(node) = expect.iter().find(|node| !expected.nodes.contains(*node)) {
+        if let Some(group) = weft_core::project::boundary_loop(node).filter(|group| expected.nodes.iter().any(|known| known == group)) {
+            bail!("cannot focus '{node}': it is a loop's boundary the compiler made; name the loop, `--expect {group}`");
         }
-        if !expected.nodes.contains(node) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.run_id.to_string())); }
+        bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.run_id.to_string()));
     }
     expected.focus = expect.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let facts = outside_facts(&rows)?;

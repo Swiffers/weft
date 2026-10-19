@@ -160,6 +160,17 @@ fn unquote(s: &str) -> Option<String> {
 
 /// Freeze scoped type names into their portable wire spelling before leaving
 /// the source scope. The source text and its edit spans remain untouched.
+/// Whether a written field is ONE file marker, recorded as file-backed (a
+/// node's field or a group's port alike): a marker at the top
+/// (`systemPrompt: @file(...)`), or the fallback of an
+/// `@instance_filled(@file(...))`, which the editor puts back inside the
+/// marker. A list of markers resolves each one and is recorded as none:
+/// editing through a field is a thing you do to one file.
+fn is_one_marker(value: &serde_json::Value) -> bool {
+    value.as_str().is_some()
+        || weft_core::instance::as_instance_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string())
+}
+
 pub(crate) fn resolve_marker_types(value: &mut serde_json::Value) {
     each_value_mut(value, &mut |leaf| {
         let Some(raw) = leaf.as_str() else { return };
@@ -261,6 +272,7 @@ impl MarkedValues for weft_core::project::ProjectDefinition {
             .flat_map(|node| {
                 node.config.as_object().map(|o| o.values()).into_iter().flatten().chain(node.port_literals.values())
             })
+            .chain(self.groups.iter().flat_map(|group| group.port_literals.values()))
             .collect()
     }
 
@@ -275,6 +287,7 @@ impl MarkedValues for weft_core::project::ProjectDefinition {
                     .flatten()
                     .chain(node.port_literals.values_mut())
             })
+            .chain(self.groups.iter_mut().flat_map(|group| group.port_literals.values_mut()))
             .collect()
     }
 }
@@ -544,15 +557,9 @@ pub(crate) fn resolve_project_file_refs(
         // A present field span with no file names the main source, even
         // when its owner is a group that came from an included file.
         let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(node.source_file.as_deref());
-        // A marker sits at the top of a field (`systemPrompt: @file(...)`)
-        // or inside a list (`attachments: [@asset(...), @asset(...)]`), and
-        // every one of them resolves. Only a field that is ONE marker is
-        // recorded as file-backed: that record drives editing the file
-        // through the field, which is a thing you do to one file. A
-        // `@instance_filled(@file(...))` fallback is one marker too, so the
-        // editor can put it back inside the marker.
-        let single = value.as_str().is_some()
-            || weft_core::instance::as_instance_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string());
+        // Every marker resolves, at the top of a field or inside a list;
+        // only a field that is one marker is recorded ([`is_one_marker`]).
+        let single = is_one_marker(value);
         each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
             Ok(Some(file_ref)) if single => {
                 node.file_refs.insert(key.clone(), file_ref);
@@ -561,6 +568,26 @@ pub(crate) fn resolve_project_file_refs(
             Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
         });
       }
+    }
+    // A literal on a group's own port (`g.x = @file(...)`, or
+    // `alias.x = ...` on an include site) resolves the same way: the
+    // group sends it to the members that read the port. A loop's literals
+    // sit on its `LoopIn` too, resolved with the nodes above.
+    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+        let spans = &group.port_literal_spans;
+        for (key, value) in group.port_literals.iter_mut() {
+            let field = spans.get(key);
+            let span = field.map(|s| s.span).unwrap_or(group.header_span.or(group.span).unwrap_or_default());
+            let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(group.source_file.as_deref());
+            let single = is_one_marker(value);
+            each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
+                Ok(Some(file_ref)) if single => {
+                    group.file_refs.insert(key.clone(), file_ref);
+                }
+                Ok(_) => {}
+                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
+            });
+        }
     }
 }
 

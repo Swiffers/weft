@@ -245,6 +245,7 @@
       busParticipantsByBus: bareRecord(),
       journalCorruptions: [],
       loopEventsByGroup: {},
+      scopeDecisions: bareRecord(),
       callerLog: [],
     };
   }
@@ -651,7 +652,6 @@
               output: e.output,
               inheritedFrom: e.inheritedFrom,
               providedPorts: e.providedPorts,
-              backupPorts: e.backupPorts,
               inheritedPorts: e.inheritedPorts,
             },
           ];
@@ -670,7 +670,6 @@
             }
             if (e.inheritedFrom !== undefined) updated.inheritedFrom = e.inheritedFrom;
             if (e.providedPorts !== undefined) updated.providedPorts = e.providedPorts;
-            if (e.backupPorts !== undefined) updated.backupPorts = e.backupPorts;
             if (e.inheritedPorts !== undefined) updated.inheritedPorts = e.inheritedPorts;
             // closedPorts may arrive on node_started (state=running) or
             // node_skipped (state=skipped); always refresh from the event
@@ -701,6 +700,18 @@
             [e.nodeId]: e.output,
           });
         }
+        return;
+      }
+      if (msg.kind === 'scopeDecided') {
+        // A copy is decided once; the replay and the live stream overlap,
+        // so the same decision can arrive twice and the first one stands.
+        const e = msg.event;
+        const framesKey = JSON.stringify(e.frames);
+        const decided = runState.scopeDecisions[e.scope] ?? [];
+        if (decided.some((d) => JSON.stringify(d.frames) === framesKey)) return;
+        runState.scopeDecisions = bareRecord(runState.scopeDecisions, {
+          [e.scope]: [...decided, e],
+        });
         return;
       }
       if (msg.kind === 'busEvent') {

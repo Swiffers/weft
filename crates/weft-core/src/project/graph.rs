@@ -13,20 +13,20 @@
 
 use std::collections::HashMap;
 
-use super::{boundary_in_id, boundary_out_id, Edge, GroupDefinition, GroupKind, NodeDefinition, ProjectDefinition};
+use super::{loop_in_id, loop_out_id, Edge, GroupDefinition, GroupKind, NodeDefinition, ProjectDefinition};
 
 pub struct ProjectGraph<'a> {
     project: &'a ProjectDefinition,
     nodes: HashMap<&'a str, &'a NodeDefinition>,
     groups: HashMap<&'a str, &'a GroupDefinition>,
-    edges: HashMap<&'a str, &'a Edge>,
     into: HashMap<&'a str, Vec<&'a Edge>>,
     out_of: HashMap<&'a str, Vec<&'a Edge>>,
-    /// Per group: its members and its two boundaries, in the program's
-    /// node order.
+    /// Per group: every node inside it however deep (a loop's own
+    /// `LoopIn` and `LoopOut` among its loop's), in the program's node
+    /// order.
     members: HashMap<&'a str, Vec<&'a NodeDefinition>>,
-    /// Per group: the call sites among its members, the group itself
-    /// when it is one, in the program's group order.
+    /// Per group: the call sites inside it however deep, the group
+    /// itself when it is one, in the program's group order.
     sites: HashMap<&'a str, Vec<&'a GroupDefinition>>,
 }
 
@@ -40,16 +40,15 @@ impl<'a> ProjectGraph<'a> {
         for group in &project.groups {
             groups.entry(group.id.as_str()).or_insert(group);
         }
-        let mut edges = HashMap::with_capacity(project.edges.len());
         let mut into: HashMap<&str, Vec<&Edge>> = HashMap::new();
         let mut out_of: HashMap<&str, Vec<&Edge>> = HashMap::new();
         for edge in &project.edges {
-            edges.entry(edge.id.as_str()).or_insert(edge);
             into.entry(edge.target.as_str()).or_default().push(edge);
             out_of.entry(edge.source.as_str()).or_default().push(edge);
         }
         // Indices first, so a node in a group's scope that is also one of
-        // its boundaries is listed once, at its place in the node order.
+        // its loop's boundaries is listed once, at its place in the node
+        // order.
         let mut member_indices: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, node) in project.nodes.iter().enumerate() {
             for group in &node.scope {
@@ -58,8 +57,8 @@ impl<'a> ProjectGraph<'a> {
         }
         let position: HashMap<&str, usize> =
             project.nodes.iter().enumerate().rev().map(|(index, node)| (node.id.as_str(), index)).collect();
-        for group in &project.groups {
-            for boundary in [boundary_in_id(&group.id), boundary_out_id(&group.id)] {
+        for group in project.groups.iter().filter(|g| matches!(g.kind, GroupKind::Loop { .. })) {
+            for boundary in [loop_in_id(&group.id), loop_out_id(&group.id)] {
                 if let Some(index) = position.get(boundary.as_str()) {
                     member_indices.entry(group.id.as_str()).or_default().push(*index);
                 }
@@ -75,12 +74,8 @@ impl<'a> ProjectGraph<'a> {
             .collect();
         let mut site_indices: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, site) in project.groups.iter().enumerate().filter(|(_, g)| matches!(g.kind, GroupKind::Call { .. })) {
-            site_indices.entry(site.id.as_str()).or_default().push(index);
-            // Every node with the entry's id counts, as a scan would.
-            for entry in project.nodes.iter().filter(|n| n.id == boundary_in_id(&site.id)) {
-                for group in &entry.scope {
-                    site_indices.entry(group.as_str()).or_default().push(index);
-                }
+            for around in groups_around(&groups, site) {
+                site_indices.entry(around).or_default().push(index);
             }
         }
         let sites = site_indices
@@ -91,7 +86,7 @@ impl<'a> ProjectGraph<'a> {
                 (group, indices.into_iter().map(|index| &project.groups[index]).collect())
             })
             .collect();
-        Self { project, nodes, groups, edges, into, out_of, members, sites }
+        Self { project, nodes, groups, into, out_of, members, sites }
     }
 
 }
@@ -106,16 +101,14 @@ pub trait GraphView {
     fn node(&self, id: &str) -> Option<&NodeDefinition>;
     /// The group with this id (the first, as a scan would find).
     fn group(&self, id: &str) -> Option<&GroupDefinition>;
-    /// The wire with this id.
-    fn edge(&self, id: &str) -> Option<&Edge>;
     /// The wires into the node `id`, in the program's order.
     fn edges_into(&self, id: &str) -> impl Iterator<Item = &Edge>;
     /// The wires out of the node `id`, in the program's order.
     fn edges_out_of(&self, id: &str) -> impl Iterator<Item = &Edge>;
     /// A group's members and its two boundaries, in the program's order.
     fn members(&self, group: &str) -> impl Iterator<Item = &NodeDefinition>;
-    /// The call sites among a group's members, and the group itself when
-    /// it is one, in the program's order.
+    /// The call sites inside a group however deep, and the group itself
+    /// when it is one, in the program's order.
     fn sites(&self, group: &str) -> impl Iterator<Item = &GroupDefinition>;
 
     fn is_loop(&self, group: &str) -> bool {
@@ -129,17 +122,14 @@ pub trait GraphView {
     /// The shared body a call site's group stands for, when `group` is one.
     fn body_of(&self, group: &str) -> Option<&str> {
         self.group(group).and_then(|g| match &g.kind {
-            GroupKind::Call { body } => Some(body.as_str()),
+            GroupKind::Call { body, .. } => Some(body.as_str()),
             _ => None,
         })
     }
 
-    /// Whether `id` is a boundary of a group, a call site or a body: one
-    /// whose ports are walked one at a time.
-    fn is_ordinary_boundary(&self, id: &str) -> bool {
-        self.node(id).and_then(|n| n.group_boundary.as_ref()).is_some_and(|b| {
-            self.group(&b.group_id).is_some_and(|g| matches!(g.kind, GroupKind::Group | GroupKind::Call { .. } | GroupKind::Body))
-        })
+    /// Whether `group` is a call site.
+    fn is_site(&self, group: &str) -> bool {
+        self.group(group).is_some_and(|g| matches!(g.kind, GroupKind::Call { .. }))
     }
 }
 
@@ -152,9 +142,6 @@ impl GraphView for ProjectGraph<'_> {
     }
     fn group(&self, id: &str) -> Option<&GroupDefinition> {
         self.groups.get(id).copied()
-    }
-    fn edge(&self, id: &str) -> Option<&Edge> {
-        self.edges.get(id).copied()
     }
     fn edges_into(&self, id: &str) -> impl Iterator<Item = &Edge> {
         self.into.get(id).into_iter().flatten().copied()
@@ -180,9 +167,6 @@ impl GraphView for ProjectDefinition {
     fn group(&self, id: &str) -> Option<&GroupDefinition> {
         self.groups.iter().find(|g| g.id == id)
     }
-    fn edge(&self, id: &str) -> Option<&Edge> {
-        self.edges.iter().find(|e| e.id == id)
-    }
     fn edges_into(&self, id: &str) -> impl Iterator<Item = &Edge> {
         self.edges.iter().filter(move |e| e.target == id)
     }
@@ -190,12 +174,25 @@ impl GraphView for ProjectDefinition {
         self.edges.iter().filter(move |e| e.source == id)
     }
     fn members(&self, group: &str) -> impl Iterator<Item = &NodeDefinition> {
-        let (entry, exit) = (boundary_in_id(group), boundary_out_id(group));
-        self.nodes.iter().filter(move |n| n.scope.iter().any(|g| g == group) || n.id == entry || n.id == exit)
+        let is_loop = GraphView::is_loop(self, group);
+        let (entry, exit) = (loop_in_id(group), loop_out_id(group));
+        self.nodes.iter().filter(move |n| n.scope.iter().any(|g| g == group) || (is_loop && (n.id == entry || n.id == exit)))
     }
     fn sites(&self, group: &str) -> impl Iterator<Item = &GroupDefinition> {
-        self.groups.iter().filter(|site| matches!(site.kind, GroupKind::Call { .. })).filter(move |site| {
-            site.id == group || self.nodes.iter().any(|n| n.id == boundary_in_id(&site.id) && n.scope.iter().any(|g| g == group))
-        })
+        let groups: HashMap<&str, &GroupDefinition> = self.groups.iter().map(|g| (g.id.as_str(), g)).collect();
+        self.groups.iter().filter(|site| matches!(site.kind, GroupKind::Call { .. }))
+            .filter(move |site| groups_around(&groups, site).contains(&group))
+            .collect::<Vec<_>>().into_iter()
     }
+}
+
+/// `group` and every group around it in its file, innermost first.
+fn groups_around<'a>(groups: &HashMap<&'a str, &'a GroupDefinition>, group: &'a GroupDefinition) -> Vec<&'a str> {
+    let mut out = vec![group.id.as_str()];
+    let mut at = group;
+    while let Some(parent) = at.parent_group_id.as_deref().and_then(|p| groups.get(p)) {
+        out.push(parent.id.as_str());
+        at = parent;
+    }
+    out
 }

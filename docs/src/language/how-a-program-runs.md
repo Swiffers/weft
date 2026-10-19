@@ -201,16 +201,19 @@ output now and another later. Whatever it never mentions is closed when it
 finishes. Generators and buses have their own rules, in
 [streams and buses](streams-and-buses.md).
 
-## Groups and loops are gone before anything runs
+## A group is not a node at run time
 
-The compiler turns each group into a pair of boundary nodes, each loop into a
-`LoopIn` and a `LoopOut`, and each included file into a call pair plus one
-shared body. What the runtime gets is one flat graph with the scope information
-attached.
+A wire that passes through a group's ports is one wire, from the node that
+sends to the node that reads, and it only notes which groups it enters and
+leaves on the way. The group itself is a **scope**: the runtime decides, once
+for each copy of it, whether it opens or skips, and the nodes inside follow
+that decision. An included file works the same way: its body is in the program
+once, and each `@include` of it is its own copy. Only a loop becomes nodes, a
+`LoopIn` and a `LoopOut`.
 
 So folding a group in the editor costs nothing at run time, and neither does
-nesting groups five deep. For the boundary rules, go and read
-[groups](groups.md) and [loops](loops.md).
+nesting groups five deep. For when a group opens, go and read
+[groups](groups.md), and for loops, [loops](loops.md).
 
 ## What happens when you hit run
 
@@ -228,8 +231,13 @@ weft run --target dailyReport --target alert
 weft takes those nodes and everything feeding into them, stopping the walk when
 it reaches a trigger. A node that several branches share does not drag those
 other branches in. A target inside a group brings only the work needed through
-it, with the group's own `_should_flow` still applied. A loop is the exception:
-it comes along whole, and cutting inside one is refused.
+it, and the group's `_should_flow` comes along too, unless it is wired straight
+from a trigger the run does not fire. A loop is the exception: it comes along
+whole, and cutting inside one is refused.
+
+What runs is a **cut**: a smaller program holding only what the walk kept,
+with every node under its own name, so the journal and the inspector line up
+with your source.
 
 You can also start in the middle, handing values in where the walk begins:
 
@@ -238,8 +246,8 @@ weft run --from classify='{"text":"..."}' --target reply
 weft run --group triage='{"text":"..."}'
 ```
 
-A value a real run produced beats one you handed in, and a producer that
-is still running is waited for. For which flag picks which part of the graph,
+A value you hand in is that port's value: in this run the wire into that port
+delivers nothing there, so nothing upstream can replace it. For which flag picks which part of the graph,
 go and read [versions, seeds and frozen examples](../running/versions.md).
 
 `--group` runs the group's own nodes and nothing that feeds it, so a group
@@ -263,7 +271,7 @@ The flag in the message is the one the start was named with: `--group` for a
 lands, and the way to hand it a value is to start there.
 
 The input is named at the start you gave, even when the missing value would
-cross more doors on the way (a group inside an included file), and a value you
+pass through more group ports on the way (a group inside an included file), and a value you
 hand there feeds everything behind it. A trigger's own inputs never count: a
 run that does not fire it never reads them. An input that only feeds inputs written with `?`
 just closes, with a warning.
@@ -278,24 +286,23 @@ weft run --from 'hear.note={}' --feed hear.note --target hear.note
 
 For each input of `hear.note` you did not hand a value, that runs the node
 feeding it and nothing above that node. The value is followed through every
-door it crosses, however deeply the groups nest, and a feeder shared by several
+group port it passes, however deeply the groups nest, and a feeder shared by several
 inputs runs once. A loop's result comes from the whole loop, so a loop feeding
 the start runs whole. You can also
 name the feeders as starts yourself (`--from db --from accounts --from
 hear.note`): when one start lies upstream of another, the run keeps both, and
 `--target` still leaves out every branch that target does not need.
 
-A start that could only ever skip is refused too. When the start's
-`_should_flow`, or that of a group it sits inside, only comes from triggers the
-run does not fire, or from outside the run altogether, the gate closes and
-nothing you started would run, even with every input fed. The refusal names
-the gate and the trigger, if there is one. Hand the gate a value to run as if
-the condition held, or `--fire` the trigger with an event. A value reaches a
-gate only at its own door: for the start's own gate that is the start
-(`--from 'triage={"_should_flow": true}'`), and for a surrounding group's it
-is that group, so the refusal asks you to start there instead, with the flag
-you used (`--from 'outer={"_should_flow": true}'`, or `--group` if you ran a
-group).
+A gate only holds a start back when something in the run decides it. The walk
+upstream stops at a start, so the start's own `_should_flow`, and that of each
+group it sits inside, stays out of the cut unless another start, or the
+trigger you fire, runs whatever feeds it. A group's gate wired straight from a trigger the run
+does not fire stays out too, for a start or a target. A wired gate left out
+acts as if nothing were wired to it, so the node or group runs (a gate written
+in the braces still applies): that is how a node inside a group gated by a
+`Route` runs when you start it by hand. If you want the condition checked,
+start further up instead, so whatever decides it runs too, or drop the start
+and `--fire` the trigger with an event.
 
 Without `--target`, a run goes everywhere downstream of its starts, so
 `--from db` alone runs every branch `db` feeds. `--target` narrows that to

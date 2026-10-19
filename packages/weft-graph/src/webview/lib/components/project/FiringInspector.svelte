@@ -168,29 +168,26 @@
 			.join('\n\n');
 	}
 
-	/// How an input port got its value when it did not travel a wire in
-	/// this run: a backup the run was started with, an output someone
-	/// supplied in place of the node upstream, or a value reused from
-	/// the seed run. `null` for an ordinary wired value. `short` cuts
-	/// the origin run's id to what the banner shows; the copy text
-	/// keeps the whole id.
+	/// How an input port got its value when no node of this run made
+	/// it: a value the run was given (handed to this input, or sent by a
+	/// node upstream standing in for itself), or a value reused from the
+	/// seed run. `null` for an ordinary wired value. `short` cuts the
+	/// origin run's id to what the banner shows; the copy text keeps the
+	/// whole id.
 	function portOrigin(
 		firing: {
 			providedPorts?: string[];
-			backupPorts?: string[];
 			inheritedPorts?: Record<string, string>;
 		},
 		port: string,
 		short: boolean,
 	): string | null {
 		const origin = firing.inheritedPorts?.[port];
-		const how = firing.backupPorts?.includes(port)
-			? 'backup used'
-			: firing.providedPorts?.includes(port)
-				? 'supplied output'
-				: origin
-					? 'reused input'
-					: null;
+		const how = firing.providedPorts?.includes(port)
+			? 'given to the run'
+			: origin
+				? 'reused input'
+				: null;
 		if (!how) return null;
 		return origin ? `${how} from run ${short ? origin.slice(0, 8) : origin}` : how;
 	}

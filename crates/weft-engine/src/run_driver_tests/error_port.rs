@@ -196,14 +196,14 @@
     /// kicked, started, nothing after.
     fn crashed_rows(project: &ProjectDefinition, run_id: RunId) -> Vec<RunEvent> {
         vec![
-            RunEvent::RunStarted {
+            RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "node".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
                 binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None,
+                cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None,
                 instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 settings: Default::default(),
             },
@@ -284,7 +284,7 @@
         let mut rows = crashed_rows(&project, run_id);
         rows.push(RunEvent::PortEmitted {
             run_id, emission_id: uuid::Uuid::new_v4(), node_id: "node".into(), frames: vec![],
-            port: "_error".into(), value: Arc::new(json!("the service refused")), provided: false, at_unix: 0,
+            port: "_error".into(), value: Arc::new(json!("the service refused")), at_unix: 0,
         });
         let (outcome, events) = drive_journal(project, nodes(), run_id, rows, CancellationFlag::new_arc()).await;
         let outcome = outcome.expect("the drive runs");
@@ -339,7 +339,7 @@
         let mut rows = crashed_rows(&project, run_id);
         rows.push(RunEvent::PortEmitted {
             run_id, emission_id: uuid::Uuid::new_v4(), node_id: "node".into(), frames: vec![],
-            port: "out".into(), value: Arc::new(json!("once")), provided: false, at_unix: 0,
+            port: "out".into(), value: Arc::new(json!("once")), at_unix: 0,
         });
         let (outcome, events) = drive_journal(project, nodes(), run_id, rows, CancellationFlag::new_arc()).await;
         let outcome = outcome.expect("the drive runs");

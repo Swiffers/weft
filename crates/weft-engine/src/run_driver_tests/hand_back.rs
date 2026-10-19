@@ -56,7 +56,7 @@
 
     fn birth(project: &ProjectDefinition, run_id: RunId) -> Vec<RunEvent> {
         vec![
-            RunEvent::RunStarted {
+            RunEvent::RunStarted { given: Default::default(),
                 run_id,
                 project_id: project.id,
                 entry_node: "gate".into(),
@@ -65,7 +65,7 @@
                 binary_hash: None,
                 source_version: None,
                 run_kind: weft_core::run::RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,

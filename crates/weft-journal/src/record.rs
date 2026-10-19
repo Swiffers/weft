@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use weft_core::run::CancelCause;
-use weft_core::project::selection::{RecordedSelection, RunSelection};
+use weft_core::project::ProjectDefinition;
 use weft_core::projects::PROJECT_BEING_REMOVED;
 use weft_core::run_settings::KeepFor;
 use weft_core::RunId;
@@ -43,24 +43,86 @@ pub struct RunLogRow {
     pub events: Vec<u8>,
 }
 
-/// A run's selection as the record keeps it (`run_selection`).
+/// A program a run runs, as the record keeps it (`project_definition`,
+/// under its hash). A run started with bounds runs a cut of its project
+/// (`weft_core::project::cut`): the cut is a program of its own, kept the
+/// first time a run names it, so the run reads it back by its hash like
+/// any other (on every resume, for every reader of its record).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredSelection {
-    pub digest: String,
-    pub selection: RunSelection,
+pub struct StoredProgram {
+    pub project_id: uuid::Uuid,
+    pub definition_hash: String,
+    pub project_json: String,
 }
 
-impl StoredSelection {
-    pub fn of(recorded: &RecordedSelection) -> Self {
-        Self { digest: recorded.digest().to_string(), selection: (**recorded.selection()).clone() }
+impl StoredProgram {
+    /// `program`, of `project_id`, under the hash it is read back by.
+    pub fn of(project_id: uuid::Uuid, program: &ProjectDefinition) -> anyhow::Result<Self> {
+        Ok(Self {
+            project_id,
+            definition_hash: weft_core::project::hash::compute_definition_hash(program)?,
+            project_json: serde_json::to_string(program)?,
+        })
+    }
+
+    /// Refuse a program that is not what it says: its JSON is no program
+    /// of its project, or does not hash to the hash it is kept under (a
+    /// run reading it back by that hash would run something else).
+    pub fn check(&self) -> anyhow::Result<()> {
+        let program: ProjectDefinition = serde_json::from_str(&self.project_json)
+            .map_err(|e| anyhow::anyhow!("program {} does not read as a program: {e}", self.definition_hash))?;
+        anyhow::ensure!(program.id == self.project_id, "program {} is of project {}, not {}", self.definition_hash, program.id, self.project_id);
+        let hash = weft_core::project::hash::compute_definition_hash(&program)?;
+        anyhow::ensure!(hash == self.definition_hash, "program {} hashes to {hash}", self.definition_hash);
+        Ok(())
     }
 }
 
-/// A run's record as read, raw: the selection its birth names (read with
-/// it, so its birth decodes) and its rows from some `seq` on.
+/// The program a run runs, as its birth names it and its start keeps it:
+/// the program (a cut of the registered one, or the registered one
+/// itself when the cut keeps everything) and, for a cut, the registered
+/// program it was cut from. Built once ([`Self::of`]); the birth
+/// (`crate::birth::Birth`) names the run's program from it, and the start
+/// that keeps the cut ([`Queued`], a worker's batch) keeps it from it, so
+/// the two cannot name different programs.
+#[derive(Debug, Clone)]
+pub struct RunsProgram {
+    stored: std::sync::Arc<StoredProgram>,
+    cut_from: Option<String>,
+}
+
+impl RunsProgram {
+    /// `cut`, of `project_id`, cut from the registered program whose hash
+    /// is `registered_hash`. A cut that hashes to the registered program
+    /// is that program: it names no `cut_from` and keeps nothing.
+    pub fn of(registered_hash: &str, project_id: uuid::Uuid, cut: &ProjectDefinition) -> anyhow::Result<Self> {
+        let stored = StoredProgram::of(project_id, cut)?;
+        let cut_from = (stored.definition_hash != registered_hash).then(|| registered_hash.to_string());
+        Ok(Self { stored: std::sync::Arc::new(stored), cut_from })
+    }
+
+    /// The hash the run's birth names its program by.
+    pub fn definition_hash(&self) -> &str {
+        &self.stored.definition_hash
+    }
+
+    /// The registered program a cut was cut from
+    /// (`RunEvent::RunStarted::cut_from`); `None` for the registered
+    /// program itself.
+    pub fn cut_from(&self) -> Option<&str> {
+        self.cut_from.as_deref()
+    }
+
+    /// What the run's start keeps with it: the cut, when it is one. The
+    /// registered program is kept already, by the build that registered it.
+    pub fn kept(&self) -> Option<&std::sync::Arc<StoredProgram>> {
+        self.cut_from.is_some().then_some(&self.stored)
+    }
+}
+
+/// A run's record as read, raw: its rows from some `seq` on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawRecord {
-    pub selection: Option<StoredSelection>,
     pub rows: Vec<RunLogRow>,
 }
 
@@ -80,11 +142,10 @@ impl RawRecord {
     /// reason of each row that does not, naming it, so a reader shows
     /// what exists and says what it cannot.
     pub fn decode_lossy(&self, run_id: RunId) -> (Vec<JournalRow>, Vec<String>) {
-        let selection = self.selection.as_ref().map(|stored| RecordedSelection::read(stored.digest.clone(), stored.selection.clone()));
         let mut decoded = Vec::new();
         let mut bad = Vec::new();
         for row in &self.rows {
-            match crate::stored::decode(run_id, selection.as_ref(), &row.events) {
+            match crate::stored::decode(run_id, &row.events) {
                 Ok(events) => decoded
                     .extend(events.into_iter().enumerate().map(|(index, event)| JournalRow { seq: row.seq, index: index as u32, event })),
                 Err(reason) => bad.push(reason),
@@ -218,8 +279,10 @@ pub struct Born {
     pub fired_by: Option<String>,
     pub source_version: Option<String>,
     pub definition_hash: Option<String>,
+    /// The registered program a run of a cut was cut from
+    /// (`RunEvent::RunStarted::cut_from`).
+    pub cut_from: Option<String>,
     pub binary_hash: Option<String>,
-    pub selection: Option<String>,
     pub seed_of: Option<RunId>,
     pub started_at: i64,
     pub keep_for: Option<i64>,
@@ -230,7 +293,7 @@ impl Born {
     /// when `birth` is not a birth.
     pub fn of(birth: &RunEvent, keep_for: KeepFor) -> Option<Self> {
         let RunEvent::RunStarted {
-            project_id, entry_node, phase, definition_hash, binary_hash, source_version, run_kind, selection, seed, instance,
+            project_id, entry_node, phase, definition_hash, cut_from, binary_hash, source_version, run_kind, seed, instance,
             fired_trigger, settings, at_unix, ..
         } = birth
         else {
@@ -247,8 +310,8 @@ impl Born {
             fired_by: fired_trigger.clone(),
             source_version: source_version.clone(),
             definition_hash: definition_hash.clone(),
+            cut_from: cut_from.clone(),
             binary_hash: binary_hash.clone(),
-            selection: selection.as_ref().map(|selection| selection.digest().to_string()),
             seed_of: seed.as_ref().map(|seed| seed.parent),
             started_at: *at_unix as i64,
             keep_for: keep_for.seconds(),
@@ -388,7 +451,7 @@ pub async fn record_batch(
     .bind(&rows)
     .bind(&resolved_run)
     .bind(&resolved_token)
-    .bind(sqlx::types::Json(&head.selections))
+    .bind(sqlx::types::Json(&head.programs))
     .fetch_all(&mut *conn)
     .await?;
     anyhow::ensure!(
@@ -422,10 +485,14 @@ pub struct Queued<'a> {
     pub stale: &'a [String],
     pub spec: Option<&'a serde_json::Value>,
     pub example: Option<&'a str>,
+    /// The program its birth was born naming (`crate::birth::Birth`): its
+    /// cut is kept with the run, once. `None` for a birth built by hand
+    /// that names a registered program or none.
+    pub program: Option<&'a RunsProgram>,
 }
 
 /// Start `queued` on the caller's transaction: its row (`queued`, no owner,
-/// never claimed), its record's first row and its selection, and the
+/// never claimed), its record's first row and the cut it runs, and the
 /// delivery woken. `false` when the run is already on record (a retried
 /// start, by its id): nothing is written then. Errs, writing nothing, when
 /// its project has no row or is being removed. A queued run is started by
@@ -438,8 +505,20 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     if let Some(stray) = queued.events.iter().find(|event| event.run_id() != run_id) {
         anyhow::bail!("the start of run {run_id} carries a row of run {}", stray.run_id());
     }
-    if let RunEvent::RunStarted { selection: Some(selection), .. } = birth {
-        insert_selection_in(conn, selection).await?;
+    // The birth names the program it was born with: a cut it names is the
+    // one kept with it, and nothing else is.
+    let (named, cut_from) = match queued.program {
+        Some(program) => (Some(program.definition_hash()), program.cut_from()),
+        None => (born.definition_hash.as_deref(), None),
+    };
+    anyhow::ensure!(
+        born.definition_hash.as_deref() == named && born.cut_from.as_deref() == cut_from,
+        "run {run_id} is born naming program {:?} cut from {:?}, but is started with program {named:?} cut from {cut_from:?}",
+        born.definition_hash,
+        born.cut_from,
+    );
+    if let Some(cut) = queued.program.and_then(RunsProgram::kept) {
+        anyhow::ensure!(cut.project_id == born.project_id, "run {run_id} of project {} is started with a cut of project {}", born.project_id, cut.project_id);
     }
     let written = Written::of(queued.events);
     // A queued run has not run: an ending in its start would leave a row
@@ -450,10 +529,10 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     // started once the mark is in would outlive the take-down.
     let inserted = sqlx::query(
         "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
-             fired_by, source_version, definition_hash, binary_hash, selection, seed_of, stale, spec, example, state, \
-             epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for) \
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'queued', \
-             0, 0, 0, $19, $20, $21, $22, $23 \
+             fired_by, source_version, definition_hash, binary_hash, seed_of, stale, spec, example, state, \
+             epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for, cut_from) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'queued', \
+             0, 0, 0, $18, $19, $20, $21, $22, $23 \
          WHERE EXISTS (SELECT 1 FROM project WHERE id = $2 AND NOT removing) \
          ON CONFLICT (run_id) DO NOTHING",
     )
@@ -470,7 +549,6 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .bind(&born.source_version)
     .bind(&born.definition_hash)
     .bind(&born.binary_hash)
-    .bind(&born.selection)
     .bind(born.seed_of)
     .bind(queued.stale)
     .bind(queued.spec)
@@ -480,6 +558,7 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .bind(written.skipped)
     .bind(written.cost_micro_usd)
     .bind(born.keep_for)
+    .bind(&born.cut_from)
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -493,6 +572,10 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
             Some(true) => anyhow::bail!("run {run_id} is not started for project {project}: {PROJECT_BEING_REMOVED}"),
             None => anyhow::bail!("run {run_id} is started for project {project}, which has no row: it was removed, or was never registered"),
         };
+    }
+    // Only now that the run is on record: a refused start keeps nothing.
+    if let Some(program) = queued.program {
+        insert_cut_in(conn, program).await?;
     }
     sqlx::query("INSERT INTO run_log (run_id, seq, events, writer, written_at) VALUES ($1, 0, $2, $3, $4)")
         .bind(run_id)
@@ -516,13 +599,23 @@ pub async fn notify_queued_in(conn: &mut PgConnection, project_id: uuid::Uuid) -
     Ok(())
 }
 
-/// Keep `selection` in the record, once.
-pub async fn insert_selection_in(conn: &mut PgConnection, selection: &RecordedSelection) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO run_selection (digest, selection) VALUES ($1, $2) ON CONFLICT (digest) DO NOTHING")
-        .bind(selection.digest())
-        .bind(sqlx::types::Json(&**selection.selection()))
-        .execute(&mut *conn)
-        .await?;
+/// Keep the cut `program` runs in the record, once, marked with the
+/// registered program it was cut from (`project_definition.cut_from`, so
+/// it never reads as a registered version). Nothing for a run of the
+/// registered program itself.
+async fn insert_cut_in(conn: &mut PgConnection, program: &RunsProgram) -> anyhow::Result<()> {
+    let Some(cut) = program.kept() else { return Ok(()) };
+    sqlx::query(
+        "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (project_id, definition_hash) DO NOTHING",
+    )
+    .bind(cut.project_id)
+    .bind(&cut.definition_hash)
+    .bind(&cut.project_json)
+    .bind(unix_now())
+    .bind(program.cut_from())
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -868,25 +961,15 @@ pub async fn claim(conn: &mut PgConnection, run_id: RunId, project_id: uuid::Uui
 }
 
 /// The record of `run_id`: its rows after `after` (every row when
-/// `None`, with the selection its birth names).
+/// `None`).
 pub async fn read_record(conn: &mut PgConnection, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
-    let selection = match after {
-        Some(_) => None,
-        None => sqlx::query_as::<_, (String, sqlx::types::Json<RunSelection>)>(
-            "SELECT s.digest, s.selection FROM run r JOIN run_selection s ON s.digest = r.selection WHERE r.run_id = $1",
-        )
-        .bind(run_id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .map(|(digest, selection)| StoredSelection { digest, selection: selection.0 }),
-    };
     let rows: Vec<(i32, Vec<u8>)> =
         sqlx::query_as("SELECT seq, events FROM run_log WHERE run_id = $1 AND seq > $2 ORDER BY seq")
             .bind(run_id)
             .bind(after.unwrap_or(-1))
             .fetch_all(&mut *conn)
             .await?;
-    Ok(RawRecord { selection, rows: rows.into_iter().map(|(seq, events)| RunLogRow { seq, events }).collect() })
+    Ok(RawRecord { rows: rows.into_iter().map(|(seq, events)| RunLogRow { seq, events }).collect() })
 }
 
 fn unix_now() -> i64 {
@@ -935,7 +1018,6 @@ mod tests {
         let run_id = run();
         let completed = RunEvent::RunCompleted { run_id, at_unix: 2 };
         let record = RawRecord {
-            selection: None,
             rows: vec![
                 RunLogRow { seq: 1, events: b"not zstd".to_vec() },
                 RunLogRow { seq: 2, events: crate::stored::encode(std::slice::from_ref(&completed)) },
@@ -989,22 +1071,20 @@ mod tests {
         assert_eq!(written.ended, Some(Ending { at: 3, outcome: Outcome::Failed, error: Some("boom".into()), cancel_cause: None }));
     }
 
-    /// A record read raw decodes to its events with their places, its
-    /// birth's selection resolved from what was read with it.
+    /// A record read raw decodes to its events with their places, and
+    /// crosses the wire whole.
     #[test]
     fn a_raw_record_decodes_with_its_places() {
         let run_id = run();
-        let selection = RecordedSelection::new(RunSelection::default());
         let birth = RunEvent::RunStarted {
             run_id,
             project_id: uuid::Uuid::nil(),
             entry_node: "door".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("d".into()),
-            binary_hash: None,
+            binary_hash: None, cut_from: None, given: Default::default(),
             source_version: None,
             run_kind: weft_core::run::RunKind::Project,
-            selection: Some(selection.clone()),
             seed: None,
             instance: None,
             instance_values: Default::default(),
@@ -1015,7 +1095,6 @@ mod tests {
         };
         let done = RunEvent::RunCompleted { run_id, at_unix: 1 };
         let record = RawRecord {
-            selection: Some(StoredSelection::of(&selection)),
             rows: vec![
                 RunLogRow { seq: 0, events: crate::stored::encode(std::slice::from_ref(&birth)) },
                 RunLogRow { seq: 1, events: crate::stored::encode(std::slice::from_ref(&done)) },
@@ -1023,10 +1102,8 @@ mod tests {
         };
         let rows = record.decode(run_id).unwrap();
         assert_eq!(rows.iter().map(|row| (row.seq, row.index)).collect::<Vec<_>>(), vec![(0, 0), (1, 0)]);
-        assert!(matches!(&rows[0].event, RunEvent::RunStarted { selection: Some(read), .. } if *read == selection));
+        assert!(matches!(&rows[0].event, RunEvent::RunStarted { entry_node, .. } if entry_node == "door"));
         let wire = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<RawRecord>(&wire).unwrap(), record, "a record crosses the wire whole");
-        let without = RawRecord { selection: None, ..record };
-        assert!(without.decode(run_id).unwrap_err().contains(selection.digest()), "a birth needs its selection");
     }
 }

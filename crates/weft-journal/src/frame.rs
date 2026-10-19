@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use weft_core::RunId;
 
-use crate::record::{Born, Fate, StoredSelection, Written};
+use crate::record::{Born, Fate, StoredProgram, Written};
 
 /// What a batch says besides its rows.
 // SYNC: BatchHead <-> crate::record::record_batch (what it binds)
@@ -25,9 +25,9 @@ pub struct BatchHead {
     /// its own (`version_runs.lane`).
     pub lane: u16,
     pub runs: Vec<RunHead>,
-    /// The selections the batch's births name that the lane has not sent
-    /// before; the record keeps each once.
-    pub selections: Vec<StoredSelection>,
+    /// The cut programs the batch's births run that the lane has not sent
+    /// before (`crate::record::StoredProgram`); the record keeps each once.
+    pub programs: Vec<StoredProgram>,
 }
 
 /// One run's share of a batch.
@@ -119,7 +119,7 @@ mod tests {
                     wrote_files: false,
                 })
                 .collect(),
-            selections: Vec::new(),
+            programs: Vec::new(),
         }
     }
 

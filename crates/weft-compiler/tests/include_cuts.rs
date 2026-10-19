@@ -1,12 +1,15 @@
 //! Layer-3: a compiled program with one file included three times (two
 //! chained sites at the top, one inside a loop), cut through its sites.
-//! The compiler is real; the selection is what the run is held to.
+//! The compiler is real; the cut is the program the run runs.
 use std::collections::BTreeSet;
 
 use weft_compiler::weft_compiler::compile;
 use weft_compiler::CompileFs;
-use weft_core::frames::Located;
-use weft_core::project::selection::{RunSelection, SelectionBounds};
+use weft_core::frames::{Frame, Located};
+use weft_core::project::cut::{self, SelectionBounds};
+use weft_core::project::graph::ProjectGraph;
+use weft_core::project::ProgramIndex;
+use weft_core::run_spec::KickPlan;
 
 const CLEAN: &str = r#"
 Group(text: String) -> (out: String, count: Number) {
@@ -63,40 +66,52 @@ fn compiled() -> weft_core::ProjectDefinition {
     compile(MAIN, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile")
 }
 
+fn walk(project: &weft_core::ProjectDefinition, bounds: SelectionBounds) -> Result<cut::Walk, String> {
+    cut::walk(&ProjectGraph::new(project), &bounds)
+}
+
+fn call(site: &str) -> Vec<Frame> {
+    vec![Frame::Call { site: site.into() }]
+}
+
 /// From a node in the first call to the same node in the second: the
-/// rest of the first call on the way out, the second site, and the
-/// second call's gate; the same id is two places, and only the first
-/// place has the backup.
+/// rest of the first call on the way out and the second call's node; the
+/// same id is two places, and the cut runs each call's own part of the
+/// shared file (`GroupKind::Call::runs`).
 #[test]
 fn a_cut_from_one_call_to_the_next_holds_the_path_between_them() {
     let project = compiled();
-    let cut = RunSelection::carve(&project, &SelectionBounds { from: vec!["one.strip".into()], target: vec!["two.strip".into()], ..Default::default() }).unwrap();
+    let walked = walk(&project, SelectionBounds { from: vec!["one.strip".into()], target: vec!["two.strip".into()], ..Default::default() }).unwrap();
     let expected: BTreeSet<Located> = [
-        at("@lib:clean.strip", &["one"]), at("@lib:clean.loud", &["one"]), at("@lib:clean__out", &["one"]), at("one__out", &[]),
-        at("two__in", &[]), at("@lib:clean__in", &["two"]), at("@lib:clean.strip", &["two"]),
-        at("one__in", &[]), at("@lib:clean__in", &["one"]),
+        at("@lib:clean.strip", &["one"]), at("@lib:clean.loud", &["one"]), at("@lib:clean.strip", &["two"]),
     ].into();
-    assert_eq!(cut.nodes, expected, "{:?}", cut.nodes);
-    assert_eq!(cut.roots(&project), vec![at("one__in", &[])]);
-    assert!(cut.has_edge(&project, &at("@lib:clean.strip", &["one"]), project.edges.iter().find(|e| e.source == "@lib:clean.strip" && e.target == "@lib:clean.loud").unwrap(), true));
-    assert!(!cut.has_edge(&project, &at("@lib:clean.strip", &["two"]), project.edges.iter().find(|e| e.source == "@lib:clean.strip" && e.target == "@lib:clean.loud").unwrap(), true));
-    // Before the second place: its gate opens, the node does not run.
-    let before = RunSelection::carve(&project, &SelectionBounds { from: vec!["one.strip".into()], before: vec!["two.strip".into()], ..Default::default() }).unwrap();
-    assert!(before.nodes.contains(&at("@lib:clean__in", &["two"])) && !before.nodes.contains(&at("@lib:clean.strip", &["two"])));
+    assert_eq!(walked.runs, expected, "{:?}", walked.runs);
+    let program = cut::cut(&project, &walked, &mut Default::default());
+    let index = ProgramIndex::build(&program);
+    assert!(index.admits("@lib:clean.loud", &call("one")) && !index.admits("@lib:clean.loud", &call("two")));
+    assert!(index.admits("@lib:clean.strip", &call("two")));
+    let strip_to_loud = program.edges.iter().find(|e| e.source == "@lib:clean.strip" && e.target == "@lib:clean.loud").expect("the wire inside the file");
+    assert!(index.frames_across(strip_to_loud, &call("one")).is_some());
+    assert!(index.get_outgoing(&program, "@lib:clean.strip", &call("two")).iter().all(|edge| edge.target != "@lib:clean.loud"),
+        "the second call's strip feeds nothing in the cut");
+    // Before the second place: the node does not run.
+    let before = walk(&project, SelectionBounds { from: vec!["one.strip".into()], before: vec!["two.strip".into()], ..Default::default() }).unwrap();
+    assert!(before.runs.contains(&at("@lib:clean.loud", &["one"])) && !before.runs.contains(&at("@lib:clean.strip", &["two"])));
     // Up to a node in the second call: everything the top feeds it through.
-    let to = RunSelection::carve(&project, &SelectionBounds { target: vec!["two.strip".into()], ..Default::default() }).unwrap();
-    assert!(to.nodes.contains(&at("src", &[])) && to.nodes.contains(&at("@lib:clean.loud", &["one"])) && !to.nodes.iter().any(|p| p.id == "@lib:clean.loud" && p.path == ["two"]));
-    assert_eq!(to.roots(&project), vec![at("src", &[])]);
+    let to = walk(&project, SelectionBounds { target: vec!["two.strip".into()], ..Default::default() }).unwrap();
+    assert!(to.runs.contains(&at("src", &[])) && to.runs.contains(&at("@lib:clean.loud", &["one"])) && !to.runs.iter().any(|p| p.id == "@lib:clean.loud" && p.path == ["two"]));
+    let kicks = KickPlan::for_program(&cut::cut(&project, &to, &mut Default::default()), None, None);
+    assert_eq!(kicks.iter().map(|kick| kick.node.as_str()).collect::<Vec<_>>(), vec!["src"]);
     // `--group one` runs the first call whole, spelled from main; the
     // loop `each` inside the file goes in with it.
-    let grouped = RunSelection::carve(&project, &SelectionBounds { group: Some("one".into()), ..Default::default() }).unwrap();
-    for place in [at("one__in", &[]), at("@lib:clean.strip", &["one"]), at("@lib:clean.each.mark", &["one"]), at("@lib:clean.tally", &["one"]), at("one__out", &[])] {
-        assert!(grouped.nodes.contains(&place), "{place} in {:?}", grouped.nodes);
+    let grouped = walk(&project, SelectionBounds { group: Some("one".into()), ..Default::default() }).unwrap();
+    for place in [at("@lib:clean.strip", &["one"]), at("@lib:clean.each.mark", &["one"]), at("@lib:clean.tally", &["one"])] {
+        assert!(grouped.runs.contains(&place), "{place} in {:?}", grouped.runs);
     }
-    assert!(!grouped.nodes.iter().any(|p| p.id == "src" || p.id == "out" || p.path == ["two"]));
+    assert!(!grouped.runs.iter().any(|p| p.id == "src" || p.id == "out" || p.path == ["two"]));
     // The site inside the loop is cut with the loop.
-    let err = RunSelection::carve(&project, &SelectionBounds { target: vec!["outer.call.strip".into()], ..Default::default() }).unwrap_err();
+    let err = walk(&project, SelectionBounds { target: vec!["outer.call.strip".into()], ..Default::default() }).unwrap_err();
     assert!(err.contains("inside loop 'outer'"), "{err}");
-    let whole = RunSelection::whole(&project);
-    assert!(whole.nodes.contains(&at("@lib:clean.each.mark", &["outer.call"])) && whole.nodes.contains(&at("@lib:clean.each.mark", &["one"])));
+    let whole = weft_core::project::places::every_place(&project);
+    assert!(whole.contains(&at("@lib:clean.each.mark", &["outer.call"])) && whole.contains(&at("@lib:clean.each.mark", &["one"])));
 }

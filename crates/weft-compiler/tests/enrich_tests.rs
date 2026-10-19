@@ -80,6 +80,35 @@ sink.data = hello.value
     );
 }
 
+/// A source's type variable binds against the first group port that
+/// declares a type, read with only the keys written up to that port: a
+/// key the inside reads past it (`self.x.name`) is not part of what the
+/// source sends.
+#[test]
+fn a_typevar_binds_against_the_group_port_with_the_keys_before_it() {
+    let source_out = |out: &str| format!(
+        r#"
+a = ExecPython() -> (out: {out}) {{ code: "return {{'out': {{'name': 'x'}}}}" }}
+g = Group(x: {{ name: String }}) -> (y: String) {{
+    m = Text {{ value: self.x.name }}
+    self.y = m.value
+}}
+g.x = a.out
+"#
+    );
+    let out_type = |source: &str| {
+        let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        enrich(&mut project, &catalog()).expect("enrich");
+        let a = project.nodes.iter().find(|n| n.id == "a").unwrap();
+        a.outputs.iter().find(|p| p.name == "out").unwrap().port_type.clone()
+    };
+    let named = weft_core::weft_type::WeftType::parse("{ name: String }").unwrap();
+    // `{ name: T }` against `{ name: String }`: T is String.
+    assert_eq!(out_type(&source_out("{ name: T }")), named);
+    // `T` against `{name: String}`: T is the whole record.
+    assert_eq!(out_type(&source_out("T")), named);
+}
+
 #[test]
 fn enrich_rejects_unknown_node_type() {
     let source = r#"
@@ -372,12 +401,13 @@ outer = Loop(items: List[String]) -> (results: List[String | Null]) {
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
-    // Group lowers to Passthrough boundary nodes.
-    assert!(
-        project.nodes.iter().any(|n| n.id == "outer.inner__in" && n.node_type == "Passthrough"),
-        "Group nested in Loop must lower to a Passthrough boundary; nodes: {:?}",
-        project.nodes.iter().map(|n| (n.id.clone(), n.node_type.clone())).collect::<Vec<_>>()
-    );
+    // A group is no node: it stays a group, inside the loop, around its
+    // member.
+    assert!(!project.nodes.iter().any(|n| n.id.starts_with("outer.inner__")), "a group lowers to no boundary node");
+    let inner = project.groups.iter().find(|g| g.id == "outer.inner").expect("the group");
+    assert_eq!(inner.parent_group_id.as_deref(), Some("outer"));
+    let p = project.nodes.iter().find(|n| n.id == "outer.inner.p").expect("its member");
+    assert_eq!(p.scope, vec!["outer".to_string(), "outer.inner".to_string()]);
 }
 
 #[test]
@@ -413,8 +443,6 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
         ("l1__out", "LoopOut"),
         ("l1.l2__in", "LoopIn"),
         ("l1.l2__out", "LoopOut"),
-        ("l1.l2.g__in", "Passthrough"),
-        ("l1.l2.g__out", "Passthrough"),
         ("l1.l2.g.l3__in", "LoopIn"),
         ("l1.l2.g.l3__out", "LoopOut"),
     ];
@@ -429,6 +457,9 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
             "missing {want_id} ({want_type}) in nested lowering; got: {ids:?}"
         );
     }
+    let g = project.groups.iter().find(|g| g.id == "l1.l2.g").expect("the group between the loops");
+    assert_eq!(g.parent_group_id.as_deref(), Some("l1.l2"));
+    assert!(!ids.iter().any(|(id, _)| id.starts_with("l1.l2.g__")), "a group lowers to no boundary node");
 }
 
 #[test]
@@ -760,15 +791,10 @@ out = Debug { data: g.y }
             .any(|p| p.name == "_should_flow")
     };
     assert!(has_flow("out"), "a catalog node takes the flow port");
-    assert!(has_flow("g__in"), "a group takes it on its In boundary");
     assert!(
-        !has_flow("g__out"),
-        "the Out boundary forwards what reached it; a group that did not run has nothing to forward"
-    );
-    assert!(
-        project.edges.iter().any(|e| e.target == "g__in"
+        project.edges.iter().any(|e| e.target == "g" && e.via.is_empty()
             && e.target_handle.as_deref() == Some("_should_flow")),
-        "the guard wire lands on the In boundary"
+        "the guard wire lands on the group itself"
     );
 }
 

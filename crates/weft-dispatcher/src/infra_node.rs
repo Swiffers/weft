@@ -530,28 +530,29 @@ pub async fn pending_ops(
         ops.push(PendingOp { kind, node, copies, order: id, setup: None, asked_unix: issued_at_unix });
     }
     // A setup run that has not ended brings up the infra places its
-    // selection holds, for its instance.
+    // program (its cut of the project) runs, for its instance.
     let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
-    /// run_id, instance_id, started_at, selection.
-    type SetupRow =
-        (weft_core::RunId, Option<String>, i64, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>);
+    /// run_id, instance_id, started_at, the program it runs.
+    type SetupRow = (weft_core::RunId, Option<String>, i64, Option<String>);
     let setups: Vec<SetupRow> = sqlx::query_as(
-        "SELECT r.run_id, r.instance_id, r.started_at, s.selection FROM run r \
-         LEFT JOIN run_selection s ON s.digest = r.selection \
+        "SELECT r.run_id, r.instance_id, r.started_at, d.project_json FROM run r \
+         LEFT JOIN project_definition d ON d.project_id = r.project_id AND d.definition_hash = r.definition_hash \
          WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    for (run_id, instance, started_at, subgraph) in setups {
+    for (run_id, instance, started_at, program) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
             .transpose()
             .map_err(|e| anyhow::anyhow!("infra setup {run_id} instance: {e}"))?;
-        let Some(sqlx::types::Json(subgraph)) = subgraph else {
-            anyhow::bail!("infra setup {run_id} was born without its selection; it cannot say what it brings up");
+        let Some(program) = program else {
+            anyhow::bail!("infra setup {run_id} names a program its project does not keep; it cannot say what it brings up");
         };
-        for place in &subgraph.nodes {
+        let program: weft_core::ProjectDefinition = serde_json::from_str(&program)
+            .map_err(|e| anyhow::anyhow!("infra setup {run_id}'s program does not read: {e}"))?;
+        for place in weft_core::project::places::running_places(&program) {
             let spelled = weft_core::project::address_of(project, &place.id, &place.path);
             if infra.contains(&spelled) {
                 ops.push(PendingOp {

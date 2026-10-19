@@ -1832,7 +1832,7 @@ fn keyword_shaped_names_are_refused() {
     }
     // As a node type: reserved type keywords are refused (they must not be
     // authored as a plain node through this door).
-    for kw in ["Group", "Loop", "LoopIn", "LoopOut", "Passthrough"] {
+    for kw in ["Group", "Loop", "LoopIn", "LoopOut"] {
         let err = apply_edits(
             src,
             "Untitled",
@@ -1849,7 +1849,7 @@ fn keyword_shaped_names_are_refused() {
 #[test]
 fn ops_refuse_a_reserved_local_id() {
     let src = "a = Text {}\n";
-    for bad in ["self", "Group", "Loop", "LoopIn", "Passthrough", "a__b"] {
+    for bad in ["self", "Group", "Loop", "LoopIn", "LoopOut", "a__b"] {
         let err = apply_edits(
             src,
             "Untitled",

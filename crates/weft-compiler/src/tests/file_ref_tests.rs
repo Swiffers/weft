@@ -567,9 +567,9 @@ g.input = @file("a.txt", TextAlias)
     let local = project.nodes.iter().find(|n| n.id == "n").unwrap();
     assert_eq!(local.config["value"], serde_json::json!("local text"));
     assert!(matches!(&local.file_refs["value"].ty, WeftType::Named { name, .. } if name == "TextAlias"));
-    let boundary = project.nodes.iter().find(|n| n.id == "g__in").unwrap();
-    assert_eq!(boundary.port_literals["input"], serde_json::json!("local text"));
-    assert!(boundary.file_refs.contains_key("input"));
+    let group = project.groups.iter().find(|g| g.id == "g").unwrap();
+    assert_eq!(group.port_literals["input"], serde_json::json!("local text"));
+    assert!(group.file_refs.contains_key("input"));
     let remote = crate::file_ref::collect_text_refs(&project);
     assert_eq!(remote.len(), 1);
     assert!(matches!(&remote[0].ty, WeftType::Named { name, .. } if name == "LocalText"));
@@ -593,9 +593,9 @@ fn include_arguments_and_body_files_resolve_from_the_project_root() {
         ).unwrap();
         match mode {
             crate::weft_compiler::IncludeMode::Full => {
-                let boundary = project.nodes.iter().find(|n| n.id == "box__in").unwrap();
-                assert_eq!(boundary.port_literals["input"], serde_json::json!("caller"));
-                assert_eq!(boundary.file_refs["input"].path, "input.txt");
+                let site = project.groups.iter().find(|g| g.id == "box").unwrap();
+                assert_eq!(site.port_literals["input"], serde_json::json!("caller"));
+                assert_eq!(site.file_refs["input"].path, "input.txt");
                 let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
                 assert_eq!(body.config["value"], serde_json::json!("caller"));
                 assert_eq!(body.file_refs["value"].path, "input.txt");

@@ -5,11 +5,12 @@
 //! canAddInputPorts/canAddOutputPorts, and validate that every
 //! referenced node type exists.
 //!
-//! Three node-types are built-in (not catalog): `Passthrough` (group
-//! boundary), `LoopIn` / `LoopOut` (loop boundary). Their port shapes
-//! are written by the compiler's lowering (`flatten_group` in
-//! `weft_compiler.rs`); enrich does not consult the catalog for them
-//! (it `continue`s past these node types).
+//! Two node-types are built-in (not catalog): `LoopIn` / `LoopOut`, a
+//! loop's boundaries. Their port shapes are written by the compiler's
+//! lowering (`push_loop_boundaries` in `weft_compiler.rs`); enrich does
+//! not consult the catalog for them (it `continue`s past these node
+//! types). A group is no node: what enrich does for its ports (cast the
+//! literals written on them) it does on the group itself.
 
 use weft_core::run::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
 use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
@@ -206,10 +207,9 @@ pub enum EnrichPolicy {
     Lenient,
 }
 
-/// Node-types written by the compiler's lowering passes (Passthrough by
-/// group-flatten, LoopIn/LoopOut by loop-lowering). They have no catalog
-/// entry by design: enrich fills their ports itself, and diagnostics must
-/// not flag them as unknown types.
+/// Node-types written by the compiler's lowering (a loop's LoopIn and
+/// LoopOut). They have no catalog entry by design: enrich fills their
+/// ports itself, and diagnostics must not flag them as unknown types.
 pub fn is_lowering_builtin(node_type: &str) -> bool {
     weft_core::project::boundary_types::is_boundary(node_type)
 }
@@ -331,8 +331,8 @@ pub fn enrich_collecting(
 ) -> Vec<EnrichError> {
     let mut errors: Vec<EnrichError> = Vec::new();
     // One [reserved-node-type] error per offending TYPE, not per node:
-    // boundary types appear on two nodes per group, and a project full
-    // of groups would otherwise report the same corrupt catalog entry
+    // boundary types appear on two nodes per loop, and a project full
+    // of loops would otherwise report the same corrupt catalog entry
     // 2xN times.
     let mut reported_reserved: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -370,18 +370,17 @@ pub fn enrich_collecting(
             // gets the one home every port constant has, so the editor
             // shows and edits it like any node's. The build, which
             // inlines the file, lands the same line on the call site's
-            // boundary.
+            // port.
             normalize_port_literals(node);
             continue;
         }
 
         // Built-in boundary node-types. Their ports are written by the
-        // compiler's lowering pass (Passthrough by group-flatten, LoopIn
-        // / LoopOut by loop-lowering); enrich does not consult the
-        // catalog for them. A catalog entry that masquerades as one of
-        // these built-in names is rejected loud as a corrupt catalog:
-        // letting a catalog impl shadow the runtime built-in would
-        // silently break group / loop boundaries.
+        // compiler's loop lowering (LoopIn / LoopOut); enrich does not
+        // consult the catalog for them. A catalog entry that masquerades
+        // as one of these built-in names is rejected loud as a corrupt
+        // catalog: letting a catalog impl shadow the runtime built-in
+        // would silently break loop boundaries.
         if is_lowering_builtin(&node.node_type) {
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
@@ -829,6 +828,20 @@ pub fn enrich_collecting(
         }
         cast_literals(node);
     }
+    // A literal on a group's own port is cast the same way, against the
+    // type the group declares there: the group sends it to every member
+    // that reads the port (`weft_core::run::scope`). A loop's sit on its
+    // `LoopIn`, cast above.
+    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+        for input in &group.in_ports {
+            if input.port_type.is_unresolved() { continue; }
+            let Some(value) = group.port_literals.get(&input.name).cloned() else { continue };
+            if WeftType::is_compatible(&crate::file_ref::literal_type(&value), &input.port_type) { continue; }
+            if let Ok(cast) = input.port_type.cast_value(&value) {
+                group.port_literals.insert(input.name.clone(), cast);
+            }
+        }
+    }
     mark_per_instance_slice(project);
     errors
 }
@@ -840,12 +853,16 @@ pub fn enrich_collecting(
 /// wires reads that instance's value, so it exists per instance as well: a
 /// trigger reading an instance's bridge address is armed once per instance,
 /// and a node reading an instance's connection runs in that instance's runs.
-/// Group, loop and include boundaries are ordinary nodes after
-/// flattening, so the walk crosses them without knowing they exist. A
-/// node an include's body shares between call sites is one node, so one
-/// per-instance site makes it per-instance for every site: the conservative
-/// answer, and the one that never lets an instance's value reach a shared
-/// run unnoticed.
+/// A wire runs straight from a node to the node that reads it, through any
+/// group's port, so the walk follows wires and nothing else, with one more
+/// step: a wire landing on a group's gate decides whether the group runs,
+/// so everything inside a group whose gate reads a per-instance value runs
+/// per instance too. A loop's boundaries are ordinary nodes the wires
+/// cross, and its `LoopIn` (where its gate lands) launches every
+/// iteration, so reaching it reaches the loop's inside. A node an include's body
+/// shares between call sites is one node, so one per-instance site makes
+/// it per-instance for every site: the conservative answer, and the one
+/// that never lets an instance's value reach a shared run unnoticed.
 ///
 /// Derived and filled marks are recomputed from scratch each time, so a
 /// stale one can never outlive what it came from.
@@ -855,31 +872,58 @@ pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
         if matches!(node.per_instance, Some(PerInstance::Derived | PerInstance::Filled)) {
             node.per_instance = None;
         }
-    }
-    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for edge in &project.edges {
-        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
-    }
-    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // The second starting point: a node with a field each instance fills.
-    for node in project.nodes.iter_mut() {
+        // The second starting point: a node with a field each instance fills.
         if node.per_instance.is_none() && weft_core::instance::instance_filled_fields(node).next().is_some() {
             node.per_instance = Some(PerInstance::Filled);
         }
     }
+    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for edge in project.edges.iter().filter(|edge| !edge.to_group_port()) {
+        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+    }
+    // A group reached through its gate reaches everything inside it, and
+    // a call site the body it calls.
+    let mut inside: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for node in &project.nodes {
+        for group in &node.scope {
+            inside.entry(group.as_str()).or_default().push(node.id.as_str());
+        }
+    }
+    for group in &project.groups {
+        if let weft_core::project::GroupKind::Call { body, .. } = &group.kind {
+            inside.entry(group.id.as_str()).or_default().push(body.as_str());
+        }
+    }
+    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut frontier: Vec<&str> = project
         .nodes
         .iter()
         .filter(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled)))
         .map(|n| n.id.as_str())
         .collect();
+    let groups: std::collections::HashSet<&str> = project.groups.iter().map(|g| g.id.as_str()).collect();
+    // A loop's gate lands on its `LoopIn`, which launches every iteration:
+    // reaching it reaches the loop's inside, the members no wire feeds
+    // among them.
+    let loop_of: std::collections::HashMap<&str, &str> = project.nodes.iter()
+        .filter_map(|n| n.group_boundary.as_ref()
+            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+            .map(|b| (n.id.as_str(), b.group_id.as_str())))
+        .collect();
     while let Some(id) = frontier.pop() {
-        for &next in downstream.get(id).map(Vec::as_slice).unwrap_or_default() {
+        let opens = if groups.contains(id) { Some(id) } else { loop_of.get(id).copied() };
+        let next = downstream.get(id).map(Vec::as_slice).unwrap_or_default().iter()
+            // A gate reached: the group's inside. A group's own port (a
+            // wire from it) is reached only through its gate, never on
+            // its own: a literal is no instance's value.
+            .chain(opens.and_then(|group| inside.get(group)).into_iter().flatten());
+        for &next in next {
             if reached.insert(next.to_string()) {
                 frontier.push(next);
             }
         }
     }
+    let reached: std::collections::BTreeSet<String> = reached;
     for node in project.nodes.iter_mut() {
         if node.per_instance.is_none() && reached.contains(&node.id) {
             node.per_instance = Some(PerInstance::Derived);
@@ -941,44 +985,74 @@ fn holds_empty(ty: &WeftType) -> bool {
 }
 
 /// Work out every type variable from what is connected, at every place
-/// a node runs. A node inside an included file runs once per site that
-/// includes it (however deep), and each place resolves its variables on
-/// its own: `blur` included once for an Image and once for a Video holds
-/// `T = Image` at one place and `T = Video` at the other. The node stays
-/// one node; where its places disagree, it carries each place's types
-/// ([`weft_core::project::NodeDefinition::place_types`]).
+/// a node or a group runs. A node inside an included file runs once per
+/// site that includes it (however deep), and each place resolves its
+/// variables on its own: `blur` included once for an Image and once for
+/// a Video holds `T = Image` at one place and `T = Video` at the other.
+/// The node stays one node; where its places disagree, it carries each
+/// place's types ([`weft_core::project::NodeDefinition::place_types`]).
+/// A group's ports are typed the same way, place by place (a group inside
+/// an included file, the file's own body among them, is one group run at
+/// every place a site reaches it): a wire through group ports is a chain
+/// of stretches, from its source through each group port it passes to its
+/// target, and each stretch binds its two ends against each other, so a
+/// port that declares a concrete type is what both sides of it agree to
+/// and a port typed by a variable takes what reaches it and hands it on.
 fn resolve_type_vars(project: &mut ProjectDefinition) {
     use weft_core::frames::Located;
+    use weft_core::project::graph::GraphView;
+    let graph = weft_core::project::graph::ProjectGraph::new(project);
     let position: std::collections::HashMap<String, usize> =
         project.nodes.iter().enumerate().map(|(at, n)| (n.id.clone(), at)).collect();
     // Each place's own copy of what resolution changes: the port types and
-    // the type parameters, nothing else of the node.
-    let mut typed: std::collections::BTreeMap<Located, PlacePorts> = weft_core::project::selection::every_place(project)
+    // the type parameters, nothing else of the node or the group. A loop's
+    // ports are its two boundaries', which are nodes.
+    let mut typed: std::collections::BTreeMap<Located, PlacePorts> = weft_core::project::places::every_place(project)
         .into_iter()
         .filter_map(|at| {
             let node = &project.nodes[*position.get(&at.id)?];
             Some((at, PlacePorts::of(node)))
         })
         .collect();
-    let wires: Vec<(String, String, Vec<String>, Located, Located)> =
-        weft_core::project::selection::located_wires(project)
-            .into_iter()
-            .filter_map(|(edge, source, target)| {
-                Some((
-                    edge.source_handle.clone()?,
-                    edge.target_handle.clone()?,
-                    edge.path.clone(),
-                    source,
-                    target,
-                ))
-            })
-            .collect();
-    // The sibling half of a group's boundary, at the same place.
+    for at in weft_core::project::places::every_group_place(project) {
+        let Some(group) = graph.group(&at.id) else { continue };
+        if matches!(group.kind, weft_core::project::GroupKind::Loop { .. }) { continue; }
+        typed.insert(at, PlacePorts::of_group(group));
+    }
+    // Each wire at every place it runs, as its stretches: the port each
+    // starts at, the keys it reads on the way, the port it lands at.
+    let mut stretches: Vec<(Slot, Vec<String>, Slot)> = Vec::new();
+    // A wire that stops at a group port nobody reads still types the
+    // ports it passes.
+    for (edge, source, target) in weft_core::project::places::wires_at_places(project) {
+        let places = weft_core::project::places::crossing_places(&graph, edge, &source);
+        let mut from: Option<Slot> = (!edge.from_group_port())
+            .then(|| (source.clone(), weft_core::project::CrossingSide::Out, edge.source_port().to_string()));
+        let mut keys: Vec<String> = Vec::new();
+        for (crossing, at) in edge.via.iter().zip(places) {
+            keys.extend(crossing.path.iter().cloned());
+            if !typed.contains_key(&at) { continue; }
+            let here: Slot = (at, crossing.side, crossing.port.clone());
+            if let Some(start) = from.take() {
+                stretches.push((start, std::mem::take(&mut keys), here.clone()));
+            }
+            keys.clear();
+            from = Some(here);
+        }
+        let (Some(start), Some(target)) = (from, target) else { continue };
+        let keys = match edge.via.len() {
+            0 => edge.path.clone(),
+            n => { let mut rest = keys; rest.extend(edge.path_after(n - 1)); rest }
+        };
+        stretches.push((start, keys, (target, weft_core::project::CrossingSide::In, edge.target_port().to_string())));
+    }
+    // The other half of a loop's boundary, at the same place: the two
+    // share the loop's variables.
     let sibling = |at: &Located| -> Option<Located> {
         let boundary = project.nodes[*position.get(&at.id)?].group_boundary.as_ref()?;
         let id = match boundary.role {
-            weft_core::project::GroupBoundaryRole::In => weft_core::project::boundary_out_id(&boundary.group_id),
-            weft_core::project::GroupBoundaryRole::Out => weft_core::project::boundary_in_id(&boundary.group_id),
+            weft_core::project::GroupBoundaryRole::In => weft_core::project::loop_out_id(&boundary.group_id),
+            weft_core::project::GroupBoundaryRole::Out => weft_core::project::loop_in_id(&boundary.group_id),
         };
         Some(Located::new(id, at.path.clone()))
     };
@@ -998,12 +1072,18 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
     // about its items (`[]` pins no `T` in `List[T]`; a wire may still).
     let mut literal_bindings: Vec<(Located, String, WeftType)> = Vec::new();
     for (at, ports) in &typed {
-        let node = &project.nodes[position[&at.id]];
+        let literals = match position.get(&at.id) {
+            Some(&node) => &project.nodes[node].port_literals,
+            None => match graph.group(&at.id) {
+                Some(group) => &group.port_literals,
+                None => continue,
+            },
+        };
         for (name, port_type) in &ports.inputs {
             if !port_type.contains_unresolved_leaf() {
                 continue;
             }
-            let Some(value) = node.port_literals.get(name) else { continue };
+            let Some(value) = literals.get(name) else { continue };
             if weft_core::picks::fills_later(value) {
                 continue;
             }
@@ -1025,33 +1105,26 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
     }
     loop {
         let mut changed = false;
-        for (source_port, target_port, path, source, target) in &wires {
-            // What the wire DELIVERS: the source port's type with the
-            // edge's path read off it. A path that does not fit binds
-            // nothing; validate names the problem.
-            let Some(src_type) = typed
-                .get(source)
-                .and_then(|ports| ports.output(source_port))
-                .and_then(|ty| weft_core::deref::walk_path(ty, path).ok())
-            else {
-                continue;
-            };
-            let Some(tgt_type) = typed.get(target).and_then(|ports| ports.input(target_port)).cloned() else {
-                continue;
-            };
+        for ((from, from_side, from_port), keys, (to, to_side, to_port)) in &stretches {
+            let Some(from_type) = typed.get(from).and_then(|ports| ports.on(*from_side, from_port)).cloned() else { continue };
+            let Some(to_type) = typed.get(to).and_then(|ports| ports.on(*to_side, to_port)).cloned() else { continue };
+            // What the stretch DELIVERS: its start's type with the keys
+            // read on the way. A path that does not fit binds nothing;
+            // validate names the problem.
+            let Ok(delivered) = weft_core::deref::walk_path(&from_type, keys) else { continue };
             // Bind typevars at ANY depth (a `List[T]` port wired to a
             // `List[Number]` binds `T = Number`), matching what the
             // validator counts as unresolved; a bare-`T`-only binder
             // would leave nested vars unresolved forever.
             let mut bindings = Vec::new();
-            collect_type_var_bindings(&tgt_type, &src_type, &mut bindings);
+            collect_type_var_bindings(&to_type, &delivered, &mut bindings);
             for (name, concrete) in &bindings {
-                changed |= substitute(&mut typed, target, name, concrete);
+                changed |= substitute(&mut typed, to, name, concrete);
             }
             let mut bindings = Vec::new();
-            collect_type_var_bindings(&src_type, &tgt_type, &mut bindings);
+            collect_type_var_bindings(&delivered, &to_type, &mut bindings);
             for (name, concrete) in &bindings {
-                changed |= substitute(&mut typed, source, name, concrete);
+                changed |= substitute(&mut typed, from, name, concrete);
             }
         }
         if !changed {
@@ -1059,37 +1132,56 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
         }
     }
 
-    // Back onto the nodes: one set of types where every place agrees,
-    // and each place's where they do not.
-    let mut by_node: std::collections::HashMap<String, Vec<(Located, PlacePorts)>> = std::collections::HashMap::new();
+    // Back onto the nodes and the groups: one set of types where every
+    // place agrees, and each place's where they do not.
+    let mut by_owner: std::collections::HashMap<String, Vec<(Located, PlacePorts)>> = std::collections::HashMap::new();
     for (at, ports) in typed {
-        by_node.entry(at.id.clone()).or_default().push((at, ports));
+        by_owner.entry(at.id.clone()).or_default().push((at, ports));
     }
-    for node in project.nodes.iter_mut() {
-        let Some(places) = by_node.remove(&node.id) else { continue };
+    let per_place = |places: Vec<(Located, PlacePorts)>| -> Vec<weft_core::project::PlaceTypes> {
         let first = &places[0].1;
+        if places.iter().all(|(_, ports)| ports == first) {
+            return Vec::new();
+        }
+        places
+            .into_iter()
+            .map(|(at, ports)| weft_core::project::PlaceTypes {
+                place: at.path,
+                inputs: ports.inputs.into_iter().collect(),
+                outputs: ports.outputs.into_iter().collect(),
+                type_params: ports.type_params,
+            })
+            .collect()
+    };
+    for node in project.nodes.iter_mut() {
+        let Some(places) = by_owner.remove(&node.id) else { continue };
+        let first = places[0].1.clone();
         for (input, (_, resolved)) in node.inputs.iter_mut().zip(&first.inputs) {
             input.port_type = resolved.clone();
         }
         for (output, (_, resolved)) in node.outputs.iter_mut().zip(&first.outputs) {
             output.port_type = resolved.clone();
         }
-        node.type_params = first.type_params.clone();
-        node.place_types = if places.iter().all(|(_, ports)| ports == first) {
-            Vec::new()
-        } else {
-            places
-                .into_iter()
-                .map(|(at, ports)| weft_core::project::PlaceTypes {
-                    place: at.path,
-                    inputs: ports.inputs.into_iter().collect(),
-                    outputs: ports.outputs.into_iter().collect(),
-                    type_params: ports.type_params,
-                })
-                .collect()
-        };
+        node.type_params = first.type_params;
+        node.place_types = per_place(places);
+    }
+    for group in project.groups.iter_mut() {
+        let Some(places) = by_owner.remove(&group.id) else { continue };
+        let first = places[0].1.clone();
+        for (port, (_, resolved)) in group.in_ports.iter_mut().zip(&first.inputs) {
+            port.port_type = resolved.clone();
+        }
+        for (port, (_, resolved)) in group.out_ports.iter_mut().zip(&first.outputs) {
+            port.port_type = resolved.clone();
+        }
+        group.type_params = first.type_params;
+        group.place_types = per_place(places);
     }
 }
+
+/// One end of a stretch of wire in type resolution: the place (a node's
+/// or a group's), which side of it, and the port.
+type Slot = (weft_core::frames::Located, weft_core::project::CrossingSide, String);
 
 /// One place's copy of what type resolution works out: a node's port
 /// types, in the node's port order, and its type parameters.
@@ -1109,12 +1201,22 @@ impl PlacePorts {
         }
     }
 
-    fn input(&self, port: &str) -> Option<&WeftType> {
-        self.inputs.iter().find(|(name, _)| name == port).map(|(_, ty)| ty)
+    fn of_group(group: &weft_core::project::GroupDefinition) -> Self {
+        Self {
+            inputs: group.in_ports.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            outputs: group.out_ports.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            type_params: group.type_params.clone(),
+        }
     }
 
-    fn output(&self, port: &str) -> Option<&WeftType> {
-        self.outputs.iter().find(|(name, _)| name == port).map(|(_, ty)| ty)
+    /// The type of `port` on one side: a node's input or a group's in
+    /// port (`In`), a node's output or a group's out port (`Out`).
+    fn on(&self, side: weft_core::project::CrossingSide, port: &str) -> Option<&WeftType> {
+        let ports = match side {
+            weft_core::project::CrossingSide::In => &self.inputs,
+            weft_core::project::CrossingSide::Out => &self.outputs,
+        };
+        ports.iter().find(|(name, _)| name == port).map(|(_, ty)| ty)
     }
 
     fn substitute(&mut self, var_name: &str, concrete: &WeftType) -> bool {

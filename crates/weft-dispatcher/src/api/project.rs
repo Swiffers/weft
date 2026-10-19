@@ -405,8 +405,10 @@ pub async fn get(
 pub struct RemoveQuery {
     /// `weft rm --force` sets this. When true, the dispatcher skips
     /// the supervisor terminate-wait window and drops the project's
-    /// infra rows straight away. Use when the supervisor is wedged and
-    /// the user wants the project gone NOW.
+    /// infra rows straight away, and goes on past cloud leftovers it
+    /// names. Use when the supervisor is wedged and the user wants the
+    /// project gone NOW. It never goes past workers that cannot be
+    /// killed: nothing is erased while one runs.
     #[serde(default)]
     pub force: bool,
 }
@@ -460,23 +462,34 @@ pub async fn remove(
         // The row vanished mid-remove (a concurrent rm won): that IS
         // rm's desired end state, so it gets the marker too.
         .ok_or(StatusError::NotMyProject)?;
-    // Its frontends first: one whose service cannot be removed stops the
+    // Its workers, killed outright before anything of the project is
+    // erased: one left alive would keep serving from what it remembers of
+    // a project that is gone (the programs it holds as on record among
+    // them). Not before the take-down above, which ends every run of the
+    // project: a run still waking up could start a fresh worker after the
+    // kill. `--force` does not get past this one: what is still running is
+    // named, with how to stop it by hand.
+    state.runner.kill_workers(tenant.as_str(), id).await.map_err(|e| StatusError::Other(
+        StatusCode::BAD_GATEWAY,
+        format!("the project's workers could not be stopped, so none of its data was erased: {e:#}; once they are stopped, run `weft rm` again"),
+    ))?;
+    // Its frontends: one whose service cannot be removed stops the
     // removal with everything else still whole (`--force` forgets it, and
     // the answer names what stays on the cloud).
     let mut left = crate::frontends::remove_project(&state, &tenant, id, query.force).await.map_err(|e| {
         (StatusCode::BAD_GATEWAY, format!("remove the project's frontends: {e:#}; retry `weft rm`, or `weft rm --force`"))
     })?;
-    // Its workers, and what the platform keeps for them (on a cloud the
-    // service, its revisions and its account; here stopped containers),
-    // the same way: what cannot be removed stops the removal, unless
-    // `--force`, whose answer names what stays.
+    // What the platform keeps for the project once its workers are gone
+    // (on a cloud, the account they ran as), the same way: what cannot be
+    // removed stops the removal, unless `--force`, whose answer names
+    // what stays.
     match state.runner.retire(tenant.as_str(), id).await {
         Ok(()) => {}
-        Err(e) if query.force => left.push(format!("the project's workers and what the platform keeps for them: {e:#}")),
+        Err(e) if query.force => left.push(format!("what the platform keeps for the project's workers: {e:#}")),
         Err(e) => {
             return Err(StatusError::Other(
                 StatusCode::BAD_GATEWAY,
-                format!("remove the project's workers: {e:#}; retry `weft rm`, or `weft rm --force`"),
+                format!("remove what the platform keeps for the project's workers: {e:#}; retry `weft rm`, or `weft rm --force`"),
             ))
         }
     }
@@ -594,24 +607,40 @@ pub(crate) async fn coherent_definition(
 /// (supervisor_trigger_deps) need it; one definition, no clones.
 pub use weft_core::project::compute_trigger_deps;
 
-/// A setup phase kicks the roots of `seeds`' run subgraph, payload-less
-/// and with no terminators (a trigger's setup needs its inputs). The
-/// engine bounds the same phase with the same subgraph.
-fn setup_kicks(project: &ProjectDefinition, seeds: Vec<Located>) -> Result<Vec<Kick>, String> {
+/// What a setup phase of `seeds` runs: its cut of `project` (everything
+/// the seeds need, a trigger's inputs included) and the roots that cut
+/// kicks, payload-less (`weft_core::run_spec::setup_cut`). `None` with
+/// nothing to set up.
+fn setup_cut(project: &ProjectDefinition, seeds: &[Located]) -> Result<Option<(ProjectDefinition, Vec<Kick>)>, String> {
     if seeds.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let selection = weft_core::project::selection::RunSelection::setup(project, &seeds)?;
-    Ok(selection.roots(project)
-        .into_iter()
-        .map(|place| Kick {
-            frames: place.frames(),
-            node: place.id,
-            firing: false,
-            payload: None,
-            port_snapshot: None,
-        })
-        .collect())
+    weft_core::run_spec::setup_cut(project, seeds).map(Some)
+}
+
+/// What a setup run is recorded as started by: its first kick, or, when
+/// every root it runs starts with the group around it (kicked as that group
+/// opens, not at the start), the first place it runs.
+fn setup_entry(project: &ProjectDefinition, cut: &ProjectDefinition, kicks: &[Kick]) -> String {
+    match kicks.first() {
+        Some(kick) => kick_place(project, kick),
+        None => weft_core::project::places::running_places(cut)
+            .into_iter()
+            .next()
+            .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
+            .expect("a setup's cut runs the places it sets up"),
+    }
+}
+
+/// The program a run the dispatcher starts runs: `cut`, a cut of the
+/// registered program `registered` (`weft_core::project::cut`), as its
+/// birth names it and its start keeps it.
+pub(crate) fn runs_program(
+    registered: &weft_core::project::hash::ProgramIdentity,
+    cut: &ProjectDefinition,
+) -> Result<weft_journal::record::RunsProgram, (StatusCode, String)> {
+    weft_journal::record::RunsProgram::of(&registered.definition_hash, cut.id, cut)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the run's program: {e:#}")))
 }
 
 /// The place a kick fires at, spelled the way the program reads it
@@ -721,9 +750,10 @@ pub(crate) struct QueueAs<'a> {
 
 /// THE one way the dispatcher starts a run (entrance 3): its birth (its
 /// `RunStarted`, one `NodeKicked` per root) and `extra_rows` (birth
-/// facts beyond the kicks: a scoped run's provided values as `PortEmitted
-/// { provided: true }`), written as its first record row with its `run`
-/// row, `queued`, in one transaction; delivery hands it to a worker. Every
+/// facts beyond the kicks: the log lines of the baked infra it reads),
+/// written as its first record row with its `run` row, `queued`, and the
+/// cut its birth names (`Birth::program`), in one transaction; delivery
+/// hands it to a worker. Every
 /// start path (`run`, trigger setup, infra setup) goes through here.
 pub(crate) async fn start_queued_run_with(
     state: &DispatcherState,
@@ -741,6 +771,7 @@ pub(crate) async fn start_queued_run_with(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let run_id = birth.run_id;
     let keep_for = birth.settings.kept_for(defaults.keep_for());
+    let program = birth.program;
     let (start, kicks) = weft_journal::birth::birth_events(birth);
     let mut events = Vec::with_capacity(1 + kicks.len() + extra_rows.len());
     events.push(start);
@@ -754,6 +785,7 @@ pub(crate) async fn start_queued_run_with(
         stale: queue_as.stale,
         spec: queue_as.spec,
         example: queue_as.example,
+        program: Some(program),
     };
     let inserted = state
         .journal
@@ -865,28 +897,27 @@ pub(crate) async fn saved_for_run(
     Ok(weft_core::infra::bake::saved_for_run(project, &up, instance))
 }
 
-/// What a run for `instance` over `selection` starts with: the instance's
-/// stored values (with `overlay` made: the change a store call is about
-/// to commit, which the setup it re-arms has to run with), checked
-/// against the program by `weft_core::run_spec::instance_run_values`.
+/// What a run of `program` (its cut) for `instance` starts with: the
+/// instance's stored values (with `overlay` made: the change a store call
+/// is about to commit, which the setup it re-arms has to run with),
+/// checked against the program by `weft_core::run_spec::instance_run_values`.
 /// Answers a 422 carrying the refusal, the same shape every run refusal
 /// has, naming every field the instance left unfilled or filled wrong.
 pub(crate) async fn instance_values_for_run(
     state: &DispatcherState,
     project_id: uuid::Uuid,
-    project: &ProjectDefinition,
-    selection: &weft_core::project::selection::RunSelection,
+    program: &ProjectDefinition,
     instance: &weft_core::instance::InstanceId,
     overlay: Option<&weft_core::instance::ValueChanges>,
 ) -> Result<weft_core::instance::InstanceValues, (StatusCode, String)> {
     let stored = stored_instance_values(state, project_id, instance, overlay, Read::Held).await?;
-    match weft_core::run_spec::instance_run_values(project, selection, instance, &stored) {
+    match weft_core::run_spec::instance_run_values(program, instance, &stored) {
         Ok(values) => Ok(values),
         // Refused on what this process kept: confirmed against the rows,
         // since a value stored a moment ago may not have been heard yet.
         Err(_) => {
             let stored = stored_instance_values(state, project_id, instance, overlay, Read::Fresh).await?;
-            weft_core::run_spec::instance_run_values(project, selection, instance, &stored).map_err(|refusal| refusal_error(&refusal))
+            weft_core::run_spec::instance_run_values(program, instance, &stored).map_err(|refusal| refusal_error(&refusal))
         }
     }
 }
@@ -936,27 +967,21 @@ pub(crate) fn refusal_error(refusal: &weft_core::run_spec::Refusal) -> (StatusCo
     )
 }
 
-/// THE infra gate on a run over `selection`, scoped to the places it
-/// executes (spelled the way their infra rows are keyed): a run aimed at
-/// part of the graph waits on that part's infra alone, a whole-graph run
-/// on all of it, and an instance's run on that instance's copies of the
-/// per-instance ones. A run that reaches something per instance and names
-/// no instance is told so first: which instance's copies to check is what it
-/// has not said.
+/// THE infra gate on a run of `program` (its cut of the project), scoped
+/// to the places it executes (`weft_core::infra::run_gate::copies_read`):
+/// a run aimed at part of the graph waits on that part's infra alone, a
+/// whole-graph run on all of it, and an instance's run on that instance's
+/// copies of the per-instance ones. A run that reaches something per
+/// instance and names no instance is told so first: which instance's
+/// copies to check is what it has not said.
 pub(crate) async fn require_run_infra(
     state: &DispatcherState,
     project_id: uuid::Uuid,
-    project: &ProjectDefinition,
-    selection: &weft_core::project::selection::RunSelection,
+    program: &ProjectDefinition,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<(), (StatusCode, String)> {
-    weft_core::run_spec::refuse_instanceless(project, selection, instance).map_err(|refusal| refusal_error(&refusal))?;
-    let within: HashSet<String> = selection
-        .nodes
-        .iter()
-        .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
-        .collect();
-    let missing = missing_infra_nodes(state, project_id, project, Some(&within), instance).await?;
+    weft_core::run_spec::refuse_instanceless(program, instance).map_err(|refusal| refusal_error(&refusal))?;
+    let missing = missing_infra_nodes(state, project_id, program, None, instance).await?;
     if !missing.is_empty() {
         return Err((StatusCode::PRECONDITION_REQUIRED, infra_not_running(&missing)));
     }
@@ -993,19 +1018,17 @@ pub async fn start_infra_setup(
             Located::new(id, path)
         })
         .collect();
-    let selection = weft_core::project::selection::RunSelection::setup(&project, &places)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let kicks = setup_kicks(&project, places).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    if kicks.is_empty() {
+    let Some((cut, kicks)) = setup_cut(&project, &places).map_err(|error| (StatusCode::BAD_REQUEST, error))? else {
         return Ok(None);
-    }
+    };
+    let run_program = runs_program(&program, &cut)?;
     // An instance's copy is set up from what reaches it, which may be what
     // that instance provides.
     let instance_values = match instance {
-        Some(instance) => instance_values_for_run(state, project_id, &project, &selection, instance, None).await?,
+        Some(instance) => instance_values_for_run(state, project_id, &cut, instance, None).await?,
         None => Default::default(),
     };
-    let picks = picks_for_run(state, project_id, &project, &selection).await?;
+    let picks = picks_for_run(state, project_id, &cut).await?;
     let run_id = weft_core::new_run_id();
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to the
@@ -1015,7 +1038,7 @@ pub async fn start_infra_setup(
 
     // Infra reconciliation already holds the project transition lock.
     let source_version = super::versions::record_program_source_locked(state, project_id, &program).await?;
-    let entry_node = kick_place(&project, &kicks[0]);
+    let entry_node = setup_entry(&project, &cut, &kicks);
     start_queued_run_with(
         state,
         &project.defaults,
@@ -1025,9 +1048,10 @@ pub async fn start_infra_setup(
             phase: weft_core::context::Phase::InfraSetup,
             entry_node: &entry_node,
             kicks: &kicks,
-            definition_hash: &program.definition_hash,
+            program: &run_program,
+            // A setup is handed nothing and stands nothing in.
+            given: &Default::default(),
             binary_hash: &program.binary_hash,
-            selection: Some(&weft_core::project::selection::RecordedSelection::new(selection)),
             seed: None,
             source_version: Some(&source_version),
             instance: instance.map(|instance| weft_journal::birth::RunFor { instance, values: &instance_values }),
@@ -1797,8 +1821,8 @@ pub(crate) async fn gather_action_snapshot(
         .collect();
     let has_triggers = !shared_triggers.is_empty();
     let shared_trigger_infra: std::collections::BTreeSet<String> =
-        weft_core::project::selection::RunSelection::dependencies(project, &shared_triggers)
-            .nodes
+        weft_core::project::cut::walk_bounds(&weft_core::project::graph::ProjectGraph::new(project), &weft_core::project::cut::Bounds::setup(&shared_triggers))
+            .runs
             .iter()
             .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
             .filter(|spelled| source_infra.contains(spelled))
@@ -2497,10 +2521,10 @@ pub(crate) async fn require_trigger_infra(
     // (a trigger inside a half-selected loop) is a 400 about the graph,
     // not a story about infra.
     let places = key_places(project, keys);
-    let selection = weft_core::project::selection::RunSelection::setup(project, &places)
+    let walked = weft_core::project::cut::walk_setup(&weft_core::project::graph::ProjectGraph::new(project), &places)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let within: HashSet<String> = selection
-        .nodes
+    let within: HashSet<String> = walked
+        .runs
         .iter()
         .filter(|place| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra))
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
@@ -2941,25 +2965,24 @@ pub(crate) struct Rearm<'a> {
     pub store: Option<crate::activation_store::ValuesStore<'a>>,
 }
 
-/// The install's picks a run over `selection` carries, checked by
+/// The install's picks a run of `program` (its cut) carries, checked by
 /// `weft_core::picks::run_picks`: a 422 naming every required connection
 /// nobody picked on this install.
 pub(crate) async fn picks_for_run(
     state: &DispatcherState,
     project_id: uuid::Uuid,
-    project: &ProjectDefinition,
-    selection: &weft_core::project::selection::RunSelection,
+    program: &ProjectDefinition,
 ) -> Result<weft_core::picks::Picks, (StatusCode, String)> {
-    if weft_core::picks::picked_places(project).is_empty() {
+    if weft_core::picks::picked_places(program).is_empty() {
         return Ok(Default::default());
     }
     let stored = held_picks(state, project_id, Read::Held).await?;
-    match weft_core::picks::run_picks(project, selection, &stored.rows) {
+    match weft_core::picks::run_picks(program, &stored.rows) {
         Ok(picks) => Ok(picks),
         // Confirmed against the rows before refusing (see `Read`).
         Err(_) => {
             let stored = held_picks(state, project_id, Read::Fresh).await?;
-            weft_core::picks::run_picks(project, selection, &stored.rows).map_err(|refusal| refusal_error(&refusal))
+            weft_core::picks::run_picks(program, &stored.rows).map_err(|refusal| refusal_error(&refusal))
         }
     }
 }
@@ -4175,16 +4198,17 @@ async fn run_trigger_setup(
 ) -> Result<crate::journal::TriggerBake, (StatusCode, String)> {
     let run_id = activation.unwrap_or_else(weft_core::new_run_id);
     let places = key_places(project, keys);
-    let selection = weft_core::project::selection::RunSelection::setup(project, &places)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let kicks = setup_kicks(project, places).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let (cut, kicks) = setup_cut(project, &places)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "a trigger setup was asked for with no trigger to set up".to_string()))?;
+    let run_program = runs_program(program, &cut)?;
     let instance = keys_instance(keys);
     // An instance's triggers are set up with what that instance provides.
     let instance_values = match instance {
-        Some(instance) => instance_values_for_run(state, project_id, project, &selection, instance, overlay).await?,
+        Some(instance) => instance_values_for_run(state, project_id, &cut, instance, overlay).await?,
         None => Default::default(),
     };
-    let picks = picks_for_run(state, project_id, project, &selection).await?;
+    let picks = picks_for_run(state, project_id, &cut).await?;
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to
     // the completion event.
@@ -4216,7 +4240,7 @@ async fn run_trigger_setup(
     // rows and no task; the run the row recorded above then names a
     // run that never existed, which the rollback's cancel finds ownerless
     // and skips.
-    let entry_node = kick_place(project, &kicks[0]);
+    let entry_node = setup_entry(project, &cut, &kicks);
     start_queued_run(
         state,
         program,
@@ -4227,9 +4251,10 @@ async fn run_trigger_setup(
             phase: weft_core::context::Phase::TriggerSetup,
             entry_node: &entry_node,
             kicks: &kicks,
-            definition_hash: &program.definition_hash,
+            program: &run_program,
+            // A setup is handed nothing and stands nothing in.
+            given: &Default::default(),
             binary_hash: &program.binary_hash,
-            selection: Some(&weft_core::project::selection::RecordedSelection::new(selection)),
             seed: None,
             source_version: None,
             instance: instance.map(|instance| weft_journal::birth::RunFor { instance, values: &instance_values }),
@@ -4379,61 +4404,53 @@ mod trigger_kick_tests {
     use weft_core::run_spec::{compute_trigger_fire, TriggerFire};
     use super::*;
     use weft_core::project::{infra_places, trigger_places};
-    use weft_core::project::{GroupBoundary, GroupBoundaryRole};
 
     /// Build a minimal ProjectDefinition from a JSON spec. Tests
     /// only care about node id, trigger status, the scope a node sits
     /// in, and edges; everything else is defaulted. The third element
-    /// is the node's scope chain (empty at the top level).
+    /// is the node's scope chain (empty at the top level). Every edge
+    /// is `v -> v`: these tests are about which nodes a kick reaches,
+    /// not which port feeds which.
     fn project(nodes: &[(&str, bool, &[&str])], edges: &[(&str, &str)]) -> ProjectDefinition {
-        let mut n_json = Vec::new();
-        for (id, is_trigger, scope) in nodes {
-            n_json.push(serde_json::json!({
-                "id": id,
-                "nodeType": "T",
-                "label": null,
-                "config": {},
-                "position": { "x": 0, "y": 0 },
-                "scope": scope,
-                "features": {
-                    "isTrigger": is_trigger,
-                },
-            }));
-        }
-        let e_json: Vec<Value> = edges
-            .iter()
-            .map(|(s, t)| {
-                // The names `Edge` reads (see `infra_kick_and_dep_tests`
-                // for what the older `sourcePort` spelling silently did).
-                // One port name on both ends: a boundary's port keeps its
-                // name across it, and these tests are about which nodes a
-                // kick reaches, not which port feeds which.
-                serde_json::json!({
-                    "id": format!("e_{}_{}", s, t),
-                    "source": s,
-                    "sourceHandle": "v",
-                    "target": t,
-                    "targetHandle": "v"
-                })
-            })
-            .collect();
-        // A `{g}__in` id is the In boundary of the group `g`, the way the
-        // compiler flattens one, and the group has to EXIST for the walk
-        // to treat the boundary as one: with no `groups` entry the
-        // boundary is an ordinary node and every "group" test here would
-        // pass without touching the boundary logic it is about.
-        let groups: Vec<Value> = nodes
-            .iter()
-            .filter_map(|(id, _, _)| id.strip_suffix("__in"))
-            .map(|g| serde_json::json!({ "id": g, "kind": "group" }))
-            .collect();
-        let body = serde_json::json!({
+        let wires: Vec<Value> = edges.iter().map(|(s, t)| wire(s, t, &[])).collect();
+        project_with(nodes, wires, Vec::new())
+    }
+
+    /// A wire `source.v -> target.v` through the group ports `via`, each
+    /// a group, its port and the side it is crossed on.
+    fn wire(source: &str, target: &str, via: &[(&str, &str, &str)]) -> Value {
+        serde_json::json!({
+            "id": format!("e_{source}_{target}"),
+            "source": source,
+            "sourceHandle": "v",
+            "target": target,
+            "targetHandle": if via.last().is_some_and(|(group, _, _)| *group == target) { via.last().unwrap().1 } else { "v" },
+            "via": via.iter().map(|(group, port, side)| serde_json::json!({ "group": group, "port": port, "side": side })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn project_with(nodes: &[(&str, bool, &[&str])], edges: Vec<Value>, groups: Vec<Value>) -> ProjectDefinition {
+        let n_json: Vec<Value> = nodes.iter().map(|(id, is_trigger, scope)| serde_json::json!({
+            "id": id,
+            "nodeType": "T",
+            "label": null,
+            "config": {},
+            "position": { "x": 0, "y": 0 },
+            "scope": scope,
+            "features": { "isTrigger": is_trigger },
+        })).collect();
+        serde_json::from_value(serde_json::json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": n_json,
-            "edges": e_json,
+            "edges": edges,
             "groups": groups
-        });
-        serde_json::from_value(body).expect("valid test project")
+        })).expect("valid test project")
+    }
+
+    /// The group `g` holding `members`, with an input `x` and an output `y`.
+    fn group_g(members: &[&str]) -> Value {
+        let port = |name: &str| serde_json::json!({ "name": name, "portType": "Number", "required": false });
+        serde_json::json!({ "id": "g", "kind": "group", "nodeIds": members, "inPorts": [port("x")], "outPorts": [port("y")] })
     }
 
     fn ids(kicks: &[Kick]) -> Vec<String> {
@@ -4442,12 +4459,18 @@ mod trigger_kick_tests {
         v
     }
 
-    fn sorted(set: &weft_core::project::selection::RunSelection) -> Vec<String> {
-        set.nodes.iter().map(|place| place.to_string()).collect()
+    /// Every place a program runs, spelled.
+    fn sorted(program: &ProjectDefinition) -> Vec<String> {
+        weft_core::project::places::running_places(program).iter().map(|place| place.to_string()).collect()
     }
 
     fn fire(p: &ProjectDefinition, node: &str, payload: Value) -> TriggerFire {
         compute_trigger_fire(p, node, &payload, None, &Default::default()).expect("the fire reaches an output")
+    }
+
+    /// The program and kicks of the setup of `targets`.
+    fn setup(p: &ProjectDefinition, targets: Vec<weft_core::frames::Located>) -> Result<(ProjectDefinition, Vec<Kick>), String> {
+        setup_cut(p, &targets).map(|cut| cut.expect("a setup with targets"))
     }
 
     #[test]
@@ -4464,7 +4487,7 @@ mod trigger_kick_tests {
             ],
             &[("a", "trigger_x"), ("trigger_x", "b"), ("b", "out")],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::String("payload".into()));
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::String("payload".into()));
         assert_eq!(
             ids(&kicks),
             vec!["trigger_x".to_string()],
@@ -4472,7 +4495,7 @@ mod trigger_kick_tests {
         );
         assert_eq!(kicks[0].payload, Some(Value::String("payload".into())));
         assert_eq!(
-            sorted(&subgraph),
+            sorted(&program),
             vec!["b".to_string(), "out".to_string(), "trigger_x".to_string()],
             "A feeds only the trigger, so it is outside the fire's subgraph"
         );
@@ -4501,13 +4524,13 @@ mod trigger_kick_tests {
                 ("b", "out"),
             ],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::String("payload".into()));
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::String("payload".into()));
         assert_eq!(
             ids(&kicks),
             vec!["a".to_string(), "trigger_x".to_string()],
             "A must run via its non-trigger path; trigger carries payload"
         );
-        assert_eq!(sorted(&subgraph), vec!["a", "b", "c", "out", "trigger_x"]);
+        assert_eq!(sorted(&program), vec!["a", "b", "c", "out", "trigger_x"]);
         for k in &kicks {
             if k.node == "trigger_x" {
                 assert_eq!(k.payload, Some(Value::String("payload".into())));
@@ -4530,9 +4553,9 @@ mod trigger_kick_tests {
             ],
             &[("trigger_x", "out"), ("trigger_y", "out")],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::String("fire".into()));
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::String("fire".into()));
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string(), "trigger_y".to_string()]);
-        assert_eq!(sorted(&subgraph), vec!["out", "trigger_x", "trigger_y"]);
+        assert_eq!(sorted(&program), vec!["out", "trigger_x", "trigger_y"]);
         for k in &kicks {
             if k.node == "trigger_x" {
                 assert_eq!(k.payload, Some(Value::String("fire".into())));
@@ -4557,9 +4580,9 @@ mod trigger_kick_tests {
             ],
             &[("trigger_x", "node_x"), ("trigger_y", "node_y")],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::Null);
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::Null);
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string()]);
-        assert_eq!(sorted(&subgraph), vec!["node_x", "trigger_x"]);
+        assert_eq!(sorted(&program), vec!["node_x", "trigger_x"]);
     }
 
     #[test]
@@ -4570,109 +4593,97 @@ mod trigger_kick_tests {
             &[("trigger_x", true, &[]), ("dead_end", false, &[])],
             &[("trigger_x", "dead_end")],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::Null);
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::Null);
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string()]);
-        assert_eq!(sorted(&subgraph), vec!["dead_end", "trigger_x"]);
+        assert_eq!(sorted(&program), vec!["dead_end", "trigger_x"]);
     }
 
     /// A trigger sitting in the middle of a group fires there: it is
-    /// the run's one kick, the group comes whole around it (the sibling
-    /// its output feeds, and the sibling's other input's source), and
-    /// nothing outside the group is kicked to reach it.
+    /// the run's one firing kick, the group comes whole around it (the
+    /// sibling its output feeds, and the sibling's other input's source),
+    /// and nothing outside the group is kicked to reach it but that source.
     #[test]
     fn a_trigger_in_the_middle_of_a_group_starts_the_run_from_itself() {
-        // cfg ──► g__in ──► g.a ──► g.join ──► g__out ──► out
-        //                   g.trig ─────────┘
-        let mut p = project(
+        // cfg ──► g.x ──► g.a ──► g.join ──► g.y ──► out
+        //                 g.trig ─────────┘
+        let p = project_with(
             &[
                 ("cfg", false, &[]),
-                ("g__in", false, &[]),
                 ("g.a", false, &["g"]),
                 ("g.trig", true, &["g"]),
                 ("g.join", false, &["g"]),
-                ("g__out", false, &[]),
                 ("out", false, &[]),
             ],
-            &[
-                ("cfg", "g__in"),
-                ("g__in", "g.a"),
-                ("g.a", "g.join"),
-                ("g.trig", "g.join"),
-                ("g.join", "g__out"),
-                ("g__out", "out"),
+            vec![
+                wire("cfg", "g.a", &[("g", "x", "in")]),
+                wire("g.a", "g.join", &[]),
+                wire("g.trig", "g.join", &[]),
+                wire("g.join", "out", &[("g", "y", "out")]),
             ],
+            vec![group_g(&["g.a", "g.trig", "g.join"])],
         );
-        for (id, role) in [("g__in", GroupBoundaryRole::In), ("g__out", GroupBoundaryRole::Out)] {
-            let node = p.nodes.iter_mut().find(|n| n.id == id).expect(id);
-            node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
-        }
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "g.trig", serde_json::json!({ "hi": 1 }));
+        let TriggerFire { kicks, program, .. } = fire(&p, "g.trig", serde_json::json!({ "hi": 1 }));
         assert_eq!(
-            sorted(&subgraph),
-            vec!["cfg", "g.a", "g.join", "g.trig", "g__in", "g__out", "out"],
-            "the run includes the join's dependencies and the selected group path"
+            sorted(&program),
+            vec!["cfg", "g.a", "g.join", "g.trig", "out"],
+            "the run includes the join's dependencies and the group path"
         );
         let firing: Vec<&str> = kicks.iter().filter(|k| k.firing).map(|k| k.node.as_str()).collect();
         assert_eq!(firing, vec!["g.trig"], "the trigger is the one firing kick");
         assert_eq!(
             ids(&kicks),
             vec!["cfg".to_string(), "g.trig".to_string()],
-            "the group's input source is kicked so g.join's other side arrives; the group's \
-             instances start when the group does"
+            "the group's input source is kicked so g.join's other side arrives"
         );
     }
 
     #[test]
     fn a_scope_the_fire_touches_excludes_unrelated_instances() {
-        // TriggerX ──► g__in ──► g.a ──► g__out ──► Out
-        //              g.seed (no wire feeds it; the scope launcher's)
-        // Reaching the group's input follows only connected work.
-        // Its unwired seed is outside this trigger's program.
-        let p = project(
+        // TriggerX ──► g.x ──► g.a ──► g.y ──► Out
+        //                      g.seed (no wire feeds it)
+        // Reaching the group's input follows only connected work. Its
+        // unwired member is outside this trigger's program.
+        let p = project_with(
             &[
                 ("trigger_x", true, &[]),
-                ("g__in", false, &[]),
                 ("g.a", false, &["g"]),
                 ("g.seed", false, &["g"]),
-                ("g__out", false, &[]),
                 ("out", false, &[]),
             ],
-            &[("trigger_x", "g__in"), ("g__in", "g.a"), ("g.a", "g__out"), ("g__out", "out")],
+            vec![wire("trigger_x", "g.a", &[("g", "x", "in")]), wire("g.a", "out", &[("g", "y", "out")])],
+            vec![group_g(&["g.a", "g.seed"])],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::Null);
-        assert_eq!(ids(&kicks), vec!["trigger_x".to_string()], "the body's seed is not the run's root");
-        assert_eq!(sorted(&subgraph), vec!["g.a", "g__in", "g__out", "out", "trigger_x"]);
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::Null);
+        assert_eq!(ids(&kicks), vec!["trigger_x".to_string()], "the group's unwired member is not the run's root");
+        assert_eq!(sorted(&program), vec!["g.a", "out", "trigger_x"]);
     }
 
+    /// Each setup keeps its own target inside the group, which opens with
+    /// nothing reaching it and starts that target itself. Neither the
+    /// unused group input nor its source joins the setup.
     #[test]
     fn setup_phases_reach_a_trigger_or_infra_node_inside_a_group() {
-        // cfg ──► g__in ──► g.db (infra, unwired inside the body)
-        //                   g.trig (trigger, unwired inside the body)
-        // Each setup keeps its own target and enclosing gate. Neither
-        // the unused group input nor its source joins the selection.
-        let mut p = project(
+        // cfg ──► g.x (read by nobody inside)
+        //         g.db (infra), g.trig (trigger), both unwired
+        let mut p = project_with(
             &[
                 ("cfg", false, &[]),
-                ("g__in", false, &[]),
                 ("g.db", false, &["g"]),
                 ("g.trig", true, &["g"]),
-                ("g__out", false, &[]),
             ],
-            &[("cfg", "g__in")],
+            vec![wire("cfg", "g", &[("g", "x", "in")])],
+            vec![group_g(&["g.db", "g.trig"])],
         );
-        for (id, role) in [("g__in", GroupBoundaryRole::In), ("g__out", GroupBoundaryRole::Out)] {
-            let node = p.nodes.iter_mut().find(|n| n.id == id).expect(id);
-            node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
-        }
         p.nodes.iter_mut().find(|n| n.id == "g.db").unwrap().requires_infra = true;
-        p.groups.push(serde_json::from_value(serde_json::json!({
-            "id": "g", "kind": "group", "nodeIds": ["g.db", "g.trig"]
-        })).unwrap());
-        assert_eq!(ids(&setup_kicks(&p, infra_places(&p)).unwrap()), vec!["g.db".to_string(), "g__in".to_string()]);
-        assert_eq!(ids(&setup_kicks(&p, trigger_places(&p)).unwrap()), vec!["g.trig".to_string(), "g__in".to_string()]);
+        let (program, kicks) = setup(&p, infra_places(&p)).unwrap();
+        assert_eq!(sorted(&program), vec!["g.db"]);
+        assert!(kicks.is_empty(), "the group starts g.db as it opens: {kicks:?}");
+        assert_eq!(setup_entry(&p, &program, &kicks), "g.db");
+        let (program, _) = setup(&p, trigger_places(&p)).unwrap();
+        assert_eq!(sorted(&program), vec!["g.trig"]);
         p.groups[0].kind = weft_core::project::GroupKind::Loop { loop_config: serde_json::json!({}) };
-        assert!(setup_kicks(&p, infra_places(&p)).unwrap_err().contains("inside loop"));
-        assert!(setup_kicks(&p, trigger_places(&p)).unwrap_err().contains("inside loop"));
+        assert!(setup(&p, infra_places(&p)).unwrap_err().contains("inside loop"));
+        assert!(setup(&p, trigger_places(&p)).unwrap_err().contains("inside loop"));
         assert!(compute_trigger_fire(&p, "g.trig", &Value::Null, None, &Default::default()).unwrap_err().contains("inside loop"));
     }
 
@@ -4716,10 +4727,10 @@ mod trigger_kick_tests {
                 ("by", "out_y"),
             ],
         );
-        let TriggerFire { kicks, subgraph, .. } = fire(&p, "trigger_x", Value::String("msg".into()));
+        let TriggerFire { kicks, program, .. } = fire(&p, "trigger_x", Value::String("msg".into()));
         assert_eq!(ids(&kicks), vec!["shared".to_string(), "trigger_x".to_string()]);
         assert_eq!(
-            sorted(&subgraph),
+            sorted(&program),
             vec!["bx", "out_x", "shared", "trigger_x"],
             "the other program's trigger and consumers stay outside the fire"
         );
@@ -4777,6 +4788,12 @@ mod infra_kick_and_dep_tests {
         let mut v: Vec<String> = kicks.iter().map(|k| k.node.clone()).collect();
         v.sort();
         v
+    }
+
+    /// The kicks of the setup of `targets`: none when there is nothing to
+    /// set up.
+    fn setup_kicks(p: &ProjectDefinition, targets: Vec<weft_core::frames::Located>) -> Result<Vec<Kick>, String> {
+        setup_cut(p, &targets).map(|cut| cut.map(|(_, kicks)| kicks).unwrap_or_default())
     }
 
     #[test]
@@ -5045,11 +5062,11 @@ mod run_subgraph_tests {
     use super::infra_kick_and_dep_tests::project;
     use super::*;
 
-    /// The fire-side aim: what a fire that reached `targets` runs.
-    fn aimed_at(p: &ProjectDefinition, targets: &[&str]) -> weft_core::project::selection::RunSelection {
-        weft_core::project::selection::RunSelection::carve(p, &weft_core::project::selection::SelectionBounds {
+    /// What a run aimed at `targets` keeps.
+    fn aimed_at(p: &ProjectDefinition, targets: &[&str]) -> std::collections::BTreeSet<Located> {
+        weft_core::project::cut::walk(&weft_core::project::graph::ProjectGraph::new(p), &weft_core::project::cut::SelectionBounds {
             target: targets.iter().map(|s| s.to_string()).collect(), ..Default::default()
-        }).unwrap()
+        }).unwrap().kept()
     }
 
     /// Diamond: src feeds two branches, only one is aimed at. The
@@ -5068,7 +5085,7 @@ mod run_subgraph_tests {
             &[("src", "a"), ("a", "out1"), ("src", "b"), ("b", "out2")],
         );
         let sub = aimed_at(&p, &["out1"]);
-        let mut nodes: Vec<&str> = sub.nodes.iter().map(|s| s.id.as_str()).collect();
+        let mut nodes: Vec<&str> = sub.iter().map(|s| s.id.as_str()).collect();
         nodes.sort();
         assert_eq!(nodes, vec!["a", "out1", "src"]);
     }
@@ -5087,8 +5104,8 @@ mod run_subgraph_tests {
             &[("setup", "trig"), ("trig", "mid"), ("mid", "out")],
         );
         let sub = aimed_at(&p, &["out"]);
-        assert!(sub.nodes.contains(&Located::top("trig")));
-        assert!(!sub.nodes.contains(&Located::top("setup")), "the trigger's own upstream stays out");
+        assert!(sub.contains(&Located::top("trig")));
+        assert!(!sub.contains(&Located::top("setup")), "the trigger's own upstream stays out");
 
         let resolved = weft_core::run_spec::resolve_spec(&weft_core::run_spec::RunSpec {
             target: vec!["out".into()], ..weft_core::run_spec::RunSpec::whole("x")

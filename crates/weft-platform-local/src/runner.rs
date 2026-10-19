@@ -506,18 +506,34 @@ impl Runner for LocalRunner {
         Ok(())
     }
 
-    async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
+    async fn kill_workers(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
         self.fronts.lock().remove(&project);
         let project_label = project.to_string();
-        let names: Vec<String> = docker::containers(self.docker.as_ref(), self.cfg.install.label_value(), &[(labels::PROJECT, &project_label)])
-            .await?
+        let install = self.cfg.install.label_value();
+        let names: Vec<String> = docker::containers(self.docker.as_ref(), install, &[(labels::PROJECT, &project_label)])
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "could not list the project's worker containers ({e:#}); find them with \
+                 `docker ps --all --filter label={}={install} --filter label={}={project_label} --filter label={}={}` \
+                 and stop them with `docker rm --force <name>...`",
+                labels::INSTALL, labels::PROJECT, labels::ROLE, roles::WORKER,
+            ))?
             .into_iter()
             .filter(is_program_container)
             .map(|c| c.name)
             .collect();
-        docker::remove_containers(self.docker.as_ref(), &names).await?;
+        // Forced: killed, not asked to stop.
+        docker::remove_containers(self.docker.as_ref(), &names).await.map_err(|e| anyhow::anyhow!(
+            "could not kill the project's worker containers {} ({e:#}); stop them by hand with `docker rm --force {}`",
+            names.join(", "), names.join(" "),
+        ))?;
         let prefix = worker_name_prefix(project);
         self.forget_where(|r| !r.name.starts_with(&prefix));
+        Ok(())
+    }
+
+    /// Nothing is kept here past the workers' containers.
+    async fn retire(&self, _tenant: &str, _project: uuid::Uuid) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -807,6 +823,23 @@ mod tests {
         let started = calls.iter().position(|c| c.first().map(String::as_str) == Some("run")).unwrap();
         assert!(stopped < started, "the port is freed before the new front takes it");
         assert!(!calls.iter().any(|c| c.first().map(String::as_str) == Some("stop") && c.contains(&"weft-w-mine".to_string())), "one of this life's is never stopped here");
+    }
+
+    /// Killing a project's workers force-removes every worker container
+    /// it has; one that cannot be removed is named, with the command that
+    /// stops it by hand.
+    #[tokio::test]
+    async fn killing_a_projects_workers_removes_them_by_force_or_names_them() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["ps"], "{\"Names\":\"weft-w-a\",\"State\":\"running\",\"Labels\":\"weft.role=worker\"}\n");
+        let r = runner(docker.clone(), FakeClock::new(), &scratch());
+        let project = target(0).project;
+        r.kill_workers("local", project).await.unwrap();
+        assert_eq!(docker.calls_to("rm"), vec![vec!["rm".to_string(), "--force".into(), "weft-w-a".into()]]);
+
+        docker.fail(&["rm"], "Error response from daemon: cannot remove container");
+        let e = r.kill_workers("local", project).await.expect_err("refused");
+        assert!(format!("{e:#}").contains("`docker rm --force weft-w-a`"), "{e:#}");
     }
 
     /// A port another program holds is told apart from any other failure

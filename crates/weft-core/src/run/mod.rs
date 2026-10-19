@@ -5,7 +5,6 @@
 //! run from its rows, so a resumed worker holds what the live
 //! one held.
 
-pub mod boundary;
 pub mod cancel;
 pub mod completion;
 pub mod emission;
@@ -15,6 +14,7 @@ pub mod loop_runtime;
 pub mod postprocess;
 pub mod ready;
 pub mod run_kind;
+pub mod scope;
 pub mod skip;
 pub mod stuck;
 

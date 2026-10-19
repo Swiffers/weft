@@ -63,6 +63,7 @@ struct RunRow {
     instance: Option<weft_core::instance::InstanceId>,
     fired_by: Option<String>,
     definition_hash: Option<String>,
+    cut_from: Option<String>,
     binary_hash: Option<String>,
     source_version: Option<String>,
     started_at: u64,
@@ -70,6 +71,8 @@ struct RunRow {
     state: &'static str,
     keeping: weft_core::run_settings::Keeping,
     owner: Option<String>,
+    /// Asked to stop while a worker drove it (`run.cancel_requested`).
+    cancel_requested: Option<weft_core::run::CancelCause>,
     ending: Option<RunEvent>,
     skipped: u64,
 }
@@ -188,7 +191,7 @@ impl FakeJournal {
 /// from the project's, as Postgres reads it from the `project` row.
 fn born(g: &FakeState, birth: &RunEvent, state: &'static str, owner: Option<String>) -> anyhow::Result<RunRow> {
     let RunEvent::RunStarted {
-        run_id, project_id, entry_node, phase, definition_hash, binary_hash, source_version, run_kind, instance, fired_trigger,
+        run_id, project_id, entry_node, phase, definition_hash, cut_from, binary_hash, source_version, run_kind, instance, fired_trigger,
         settings, at_unix, ..
     } = birth
     else {
@@ -209,12 +212,14 @@ fn born(g: &FakeState, birth: &RunEvent, state: &'static str, owner: Option<Stri
         instance: instance.clone(),
         fired_by: fired_trigger.clone(),
         definition_hash: definition_hash.clone(),
+        cut_from: cut_from.clone(),
         binary_hash: binary_hash.clone(),
         source_version: source_version.clone(),
         started_at: *at_unix,
         state,
         keeping: settings.keeping(),
         owner,
+        cancel_requested: None,
         ending: None,
         skipped: 0,
     })
@@ -385,10 +390,13 @@ impl Journal for FakeJournal {
         let mut g = self.inner.lock().unwrap();
         let (removed, cancel_calls) = remove_run_waits(&mut g, run_id, true);
         let mut write = crate::journal::CancelWrite { removed, cancel_calls, ..Default::default() };
-        let Some(row) = g.runs.get(&run_id) else { return Ok(write) };
+        let Some(row) = g.runs.get_mut(&run_id) else { return Ok(write) };
         match (row.state, row.owner.is_some()) {
             ("ended", _) => {}
-            (_, true) => write.requested = true,
+            (_, true) => {
+                row.cancel_requested = Some(cause.clone());
+                write.requested = true;
+            }
             (_, false) => {
                 end_unowned(&mut g, run_id, cause)?;
                 write.node_cancellations = Some(0);
@@ -411,6 +419,11 @@ impl Journal for FakeJournal {
             return Ok(Lost::NotLost);
         }
         row.owner = None;
+        // Asked to stop: it ends here, for what asked, whatever it keeps.
+        if let Some(cause) = row.cancel_requested.clone() {
+            end_unowned(&mut g, run_id, &cause)?;
+            return Ok(Lost::Ended);
+        }
         if row.keeping.is_durable() {
             row.state = "queued";
             return Ok(Lost::Requeued);
@@ -499,6 +512,7 @@ impl Journal for FakeJournal {
             fired_by: r.fired_by.clone(),
             phase: r.phase,
             definition_hash: r.definition_hash.clone(),
+            cut_from: r.cut_from.clone(),
             binary_hash: r.binary_hash.clone(),
             source_version: r.source_version.clone(),
         }))
@@ -948,14 +962,14 @@ pub(crate) mod tests {
         let run = weft_core::RunId::new_v4();
         let test = weft_core::RunId::new_v4();
         j.record_event(&started(run, PROJECT)).await.unwrap();
-        j.record_event(&RunEvent::RunStarted {
+        j.record_event(&RunEvent::RunStarted { given: Default::default(),
             run_id: test,
             project_id: PROJECT,
             entry_node: "node-test:MyNode::t".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: None,
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::NodeTest,
-            selection: None,
+            cut_from: None,
             seed: None,
             instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
@@ -967,14 +981,14 @@ pub(crate) mod tests {
     }
 
     fn started(run_id: weft_core::RunId, project_id: uuid::Uuid) -> RunEvent {
-        RunEvent::RunStarted {
+        RunEvent::RunStarted { given: Default::default(),
             run_id,
             project_id,
             entry_node: "entry".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-            selection: None,
+            cut_from: None,
             seed: None,
             instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
@@ -1016,14 +1030,14 @@ pub(crate) mod tests {
     }
 
     fn started_at(run_id: weft_core::RunId, project_id: uuid::Uuid, at_unix: u64) -> RunEvent {
-        RunEvent::RunStarted {
+        RunEvent::RunStarted { given: Default::default(),
             run_id,
             project_id,
             entry_node: "entry".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-            selection: None,
+            cut_from: None,
             seed: None,
             instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix,
             settings: Default::default(),
@@ -1313,12 +1327,12 @@ pub(crate) mod tests {
         let fire = weft_core::RunId::new_v4();
         let setup = weft_core::RunId::new_v4();
         j.record_event(&started_at(fire, PROJECT, 10)).await.unwrap();
-        let RunEvent::RunStarted { run_id, project_id, entry_node, definition_hash, run_kind, selection, seed, at_unix, .. } =
+        let RunEvent::RunStarted { run_id, project_id, entry_node, definition_hash, run_kind, cut_from, seed, at_unix, .. } =
             started_at(setup, PROJECT, 20)
         else {
             unreachable!()
         };
-        j.record_event(&RunEvent::RunStarted {
+        j.record_event(&RunEvent::RunStarted { given: Default::default(),
             run_id,
             project_id,
             entry_node,
@@ -1327,7 +1341,7 @@ pub(crate) mod tests {
             binary_hash: None,
             run_kind,
             source_version: None,
-            selection,
+            cut_from,
             seed,
             instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix,
             settings: Default::default(),

@@ -64,6 +64,7 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 		case 'required_input_closed':
 			return `the required input '${reason.port}' closed${afterFailure(reason.failure)}`;
 		case 'nothing_joined': return `none of the branches it joins delivered${afterFailure(reason.failure)}`;
+		case 'every_input_closed': return `every wire into it closed with nothing on it${afterFailure(reason.failure)}`;
 		case 'one_of_group_closed':
 			return `every input of the group (${reason.ports.join(', ')}) closed${afterFailure(reason.failure)}`;
 		case 'scope_skipped': return `the scope '${reason.scope}' it lives in did not run`;

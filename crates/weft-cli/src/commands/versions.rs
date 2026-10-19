@@ -954,6 +954,11 @@ mod tests {
             // The standard library is a folder of the project's nodes
             // like any other.
             "nodes/base_catalog/x/mod.rs",
+            // A program a package ships and the prompt it reads, which
+            // a build on the install compiles from the version through
+            // `__catalog/`.
+            "nodes/base_catalog/computer/agent.weft",
+            "nodes/base_catalog/computer/agent_prompt.md",
         ] {
             assert!(covers(yes), "{yes} is part of a version");
         }

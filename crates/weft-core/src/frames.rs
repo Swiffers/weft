@@ -84,8 +84,8 @@ pub fn call_path(frames: &LoopFrames) -> Vec<&str> {
 /// program down, outermost first; empty outside every included file).
 /// A body is compiled once and reached through every site that
 /// includes it, so `Clean.strip` under `one` and under `two` are two
-/// places in a run, with their own gates, wires, backups and results:
-/// what a run selection, a kick plan and a seed are keyed by. The loop
+/// places in a run, with their own gates, wires, handed values and
+/// results: what a cut, a kick plan and a seed are keyed by. The loop
 /// iterations a place runs in are not part of it (see
 /// `FiringLocation` for one run).
 ///
@@ -174,7 +174,7 @@ impl TryFrom<String> for Located {
 /// (see `liveness`) and the persisted `awaited_sequences` on
 /// `NodeRunState`. Lives here, not in `liveness`, because it is a
 /// pure identity the parse-only build needs too.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FiringLocation {
     pub node_id: String,
     pub frames: LoopFrames,

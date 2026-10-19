@@ -2073,114 +2073,21 @@
       }
     },
     {
-      "id": "credit__in",
-      "nodeType": "Passthrough",
-      "label": "credit (in)",
+      "id": "credit.who",
+      "nodeType": "ExecPython",
+      "label": null,
       "config": {
+        "code": "# The query takes its parameters as a list; the sender's id arrives as\n# one string. Wrap it.\nreturn {\"params\": [user]}\n",
         "parentId": "credit"
       },
       "position": {
         "x": 0.0,
         "y": 0.0
       },
-      "scope": [],
-      "groupBoundary": {
-        "groupId": "credit",
-        "role": "In"
-      },
-      "inputs": [
-        {
-          "name": "db",
-          "portType": "Access",
-          "required": false,
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "textarea"
-          }
-        },
-        {
-          "name": "telegramUser",
-          "portType": "String",
-          "required": false,
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "text"
-          }
-        },
-        {
-          "name": "_should_flow",
-          "portType": "T__in___should_flow",
-          "required": false,
-          "description": "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn.",
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "textarea"
-          }
-        },
-        {
-          "name": "_should_not_flow",
-          "portType": "T__in___should_not_flow",
-          "required": false,
-          "description": "Whether this group runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "textarea"
-          }
-        }
+      "scope": [
+        "credit"
       ],
-      "outputs": [
-        {
-          "name": "db",
-          "portType": "Access",
-          "required": true
-        },
-        {
-          "name": "telegramUser",
-          "portType": "String",
-          "required": true
-        }
-      ],
-      "features": {},
-      "requiresInfra": false,
-      "headerSpan": {
-        "startLine": 24,
-        "startColumn": 0,
-        "endLine": 24,
-        "endColumn": 84
-      }
-    },
-    {
-      "id": "credit__out",
-      "nodeType": "Passthrough",
-      "label": "credit (out)",
-      "config": {
-        "parentId": "credit"
-      },
-      "position": {
-        "x": 0.0,
-        "y": 0.0
-      },
-      "scope": [],
-      "groupBoundary": {
-        "groupId": "credit",
-        "role": "Out"
-      },
+      "groupBoundary": null,
       "inputs": [
         {
           "name": "paid",
@@ -2525,146 +2432,6 @@
           "type": "String",
           "marker": "file"
         }
-      }
-    },
-    {
-      "id": "brief__in",
-      "nodeType": "Passthrough",
-      "label": "brief (in)",
-      "config": {
-        "parentId": "brief"
-      },
-      "position": {
-        "x": 0.0,
-        "y": 0.0
-      },
-      "scope": [],
-      "groupBoundary": {
-        "groupId": "brief",
-        "role": "In"
-      },
-      "inputs": [
-        {
-          "name": "request",
-          "portType": "String",
-          "required": false,
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "text"
-          }
-        },
-        {
-          "name": "provider",
-          "portType": "LlmProvider=JsonDict",
-          "required": false,
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "textarea"
-          }
-        },
-        {
-          "name": "_should_flow",
-          "portType": "Boolean",
-          "required": false,
-          "description": "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn.",
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "checkbox"
-          }
-        },
-        {
-          "name": "_should_not_flow",
-          "portType": "T__in___should_not_flow",
-          "required": false,
-          "description": "Whether this group runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "textarea"
-          }
-        }
-      ],
-      "outputs": [
-        {
-          "name": "request",
-          "portType": "String",
-          "required": true
-        },
-        {
-          "name": "provider",
-          "portType": "LlmProvider=JsonDict",
-          "required": true
-        }
-      ],
-      "features": {},
-      "requiresInfra": false,
-      "headerSpan": {
-        "startLine": 51,
-        "startColumn": 0,
-        "endLine": 51,
-        "endColumn": 73
-      }
-    },
-    {
-      "id": "brief__out",
-      "nodeType": "Passthrough",
-      "label": "brief (out)",
-      "config": {
-        "parentId": "brief"
-      },
-      "position": {
-        "x": 0.0,
-        "y": 0.0
-      },
-      "scope": [],
-      "groupBoundary": {
-        "groupId": "brief",
-        "role": "Out"
-      },
-      "inputs": [
-        {
-          "name": "prompt",
-          "portType": "String",
-          "required": false,
-          "accepts": [
-            "literal",
-            "wire"
-          ],
-          "optional": true,
-          "widget": {
-            "kind": "text"
-          }
-        }
-      ],
-      "outputs": [
-        {
-          "name": "prompt",
-          "portType": "String",
-          "required": true
-        }
-      ],
-      "features": {},
-      "requiresInfra": false,
-      "headerSpan": {
-        "startLine": 51,
-        "startColumn": 0,
-        "endLine": 51,
-        "endColumn": 73
       }
     },
     {
@@ -3189,81 +2956,81 @@
   ],
   "edges": [
     {
-      "id": "e-pg-access-credit-db",
+      "id": "e-pg-access-in:credit:db-credit.debit-account",
       "source": "pg",
-      "target": "credit__in",
+      "target": "credit.debit",
       "sourceHandle": "access",
-      "targetHandle": "db",
+      "targetHandle": "account",
+      "via": [
+        {
+          "group": "credit",
+          "port": "db",
+          "side": "in",
+          "span": {
+            "startLine": 43,
+            "startColumn": 0,
+            "endLine": 43,
+            "endColumn": 21
+          }
+        }
+      ],
       "span": {
-        "startLine": 42,
-        "startColumn": 0,
-        "endLine": 42,
-        "endColumn": 21
+        "startLine": 30,
+        "startColumn": 4,
+        "endLine": 30,
+        "endColumn": 20
       }
     },
     {
-      "id": "e-ask-user-credit-telegramUser",
+      "id": "e-ask-user-in:credit:telegramUser-credit.who-user",
       "source": "ask",
-      "target": "credit__in",
+      "target": "credit.who",
       "sourceHandle": "user",
-      "targetHandle": "telegramUser",
+      "targetHandle": "user",
+      "via": [
+        {
+          "group": "credit",
+          "port": "telegramUser",
+          "side": "in",
+          "span": {
+            "startLine": 44,
+            "startColumn": 0,
+            "endLine": 44,
+            "endColumn": 30
+          }
+        }
+      ],
       "span": {
-        "startLine": 43,
-        "startColumn": 0,
-        "endLine": 43,
-        "endColumn": 30
+        "startLine": 25,
+        "startColumn": 4,
+        "endLine": 25,
+        "endColumn": 27
       }
     },
     {
-      "id": "e-ask-text-brief-request",
+      "id": "e-ask-text-in:brief:request-brief.write-prompt",
       "source": "ask",
-      "target": "brief__in",
+      "target": "brief.write",
       "sourceHandle": "text",
-      "targetHandle": "request",
+      "targetHandle": "prompt",
+      "via": [
+        {
+          "group": "brief",
+          "port": "request",
+          "side": "in",
+          "span": {
+            "startLine": 62,
+            "startColumn": 0,
+            "endLine": 62,
+            "endColumn": 24
+          }
+        }
+      ],
       "span": {
-        "startLine": 60,
-        "startColumn": 0,
-        "endLine": 60,
+        "startLine": 56,
+        "startColumn": 4,
+        "endLine": 56,
         "endColumn": 24
-      }
-    },
-    {
-      "id": "e-writer-provider-brief-provider",
-      "source": "writer",
-      "target": "brief__in",
-      "sourceHandle": "provider",
-      "targetHandle": "provider",
-      "span": {
-        "startLine": 61,
-        "startColumn": 0,
-        "endLine": 61,
-        "endColumn": 32
-      }
-    },
-    {
-      "id": "e-credit-paid-brief-_should_flow",
-      "source": "credit__out",
-      "target": "brief__in",
-      "sourceHandle": "paid",
-      "targetHandle": "_should_flow",
-      "span": {
-        "startLine": 62,
-        "startColumn": 0,
-        "endLine": 62,
-        "endColumn": 32
-      }
-    },
-    {
-      "id": "e-openrouter-access-writer-access",
-      "source": "openrouter",
-      "target": "writer",
-      "sourceHandle": "access",
-      "targetHandle": "access",
-      "span": {
-        "startLine": 18,
-        "startColumn": 27,
-        "endLine": 18,
-        "endColumn": 52
       }
     },
     {
@@ -3306,19 +3073,6 @@
       }
     },
     {
-      "id": "e-credit-refusal-sorry-text",
-      "source": "credit__out",
-      "target": "sorry",
-      "sourceHandle": "refusal",
-      "targetHandle": "text",
-      "span": {
-        "startLine": 48,
-        "startColumn": 2,
-        "endLine": 48,
-        "endColumn": 22
-      }
-    },
-    {
       "id": "e-fal-access-picture-account",
       "source": "fal",
       "target": "picture",
@@ -3329,19 +3083,6 @@
         "startColumn": 2,
         "endLine": 67,
         "endColumn": 21
-      }
-    },
-    {
-      "id": "e-brief-prompt-picture-prompt",
-      "source": "brief__out",
-      "target": "picture",
-      "sourceHandle": "prompt",
-      "targetHandle": "prompt",
-      "span": {
-        "startLine": 68,
-        "startColumn": 2,
-        "endLine": 68,
-        "endColumn": 22
       }
     },
     {
@@ -3381,19 +3122,6 @@
         "startColumn": 2,
         "endLine": 75,
         "endColumn": 21
-      }
-    },
-    {
-      "id": "e-brief-prompt-reply-caption",
-      "source": "brief__out",
-      "target": "reply",
-      "sourceHandle": "prompt",
-      "targetHandle": "caption",
-      "span": {
-        "startLine": 76,
-        "startColumn": 2,
-        "endLine": 76,
-        "endColumn": 23
       }
     },
     {
@@ -3462,21 +3190,34 @@
       }
     },
     {
-      "id": "e-credit__in-db-credit.debit-account",
-      "source": "credit__in",
-      "target": "credit.debit",
-      "sourceHandle": "db",
+      "id": "e-pg-access-enroll-account",
+      "source": "pg",
+      "target": "enroll",
+      "sourceHandle": "access",
       "targetHandle": "account",
       "span": {
-        "startLine": 29,
-        "startColumn": 4,
-        "endLine": 29,
+        "startLine": 112,
+        "startColumn": 2,
+        "endLine": 112,
         "endColumn": 20
       }
     },
     {
-      "id": "e-credit__in-telegramUser-credit.debit-telegram_id",
-      "source": "credit__in",
+      "id": "e-signup-params-enroll-params",
+      "source": "signup",
+      "target": "enroll",
+      "sourceHandle": "params",
+      "targetHandle": "params",
+      "span": {
+        "startLine": 113,
+        "startColumn": 2,
+        "endLine": 113,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "e-credit.who-params-credit.debit-params",
+      "source": "credit.who",
       "target": "credit.debit",
       "sourceHandle": "telegramUser",
       "targetHandle": "telegram_id",
@@ -3501,42 +3242,55 @@
       }
     },
     {
-      "id": "e-credit.read-paid-credit__out-paid",
+      "id": "e-credit.read-paid-out:credit:paid-brief-_should_flow",
       "source": "credit.read",
-      "target": "credit__out",
+      "target": "brief",
       "sourceHandle": "paid",
-      "targetHandle": "paid",
+      "targetHandle": "_should_flow",
+      "via": [
+        {
+          "group": "credit",
+          "port": "paid",
+          "side": "out",
+          "span": {
+            "startLine": 40,
+            "startColumn": 2,
+            "endLine": 40,
+            "endColumn": 23
+          }
+        }
+      ],
       "span": {
-        "startLine": 39,
-        "startColumn": 2,
-        "endLine": 39,
-        "endColumn": 23
+        "startLine": 63,
+        "startColumn": 0,
+        "endLine": 63,
+        "endColumn": 32
       }
     },
     {
-      "id": "e-credit.read-refusal-credit__out-refusal",
+      "id": "e-credit.read-refusal-out:credit:refusal-sorry-text",
       "source": "credit.read",
-      "target": "credit__out",
+      "target": "sorry",
       "sourceHandle": "refusal",
-      "targetHandle": "refusal",
+      "targetHandle": "text",
+      "via": [
+        {
+          "group": "credit",
+          "port": "refusal",
+          "side": "out",
+          "span": {
+            "startLine": 41,
+            "startColumn": 2,
+            "endLine": 41,
+            "endColumn": 29
+          }
+        }
+      ],
       "span": {
-        "startLine": 40,
+        "startLine": 50,
         "startColumn": 2,
-        "endLine": 40,
-        "endColumn": 29
-      }
-    },
-    {
-      "id": "e-brief__in-request-brief.write-prompt",
-      "source": "brief__in",
-      "target": "brief.write",
-      "sourceHandle": "request",
-      "targetHandle": "prompt",
-      "span": {
-        "startLine": 54,
-        "startColumn": 4,
-        "endLine": 54,
-        "endColumn": 24
+        "endLine": 50,
+        "endColumn": 22
       }
     },
     {
@@ -3566,16 +3320,55 @@
       }
     },
     {
-      "id": "e-brief.write-response-brief__out-prompt",
+      "id": "e-brief.write-response-out:brief:prompt-picture-prompt",
       "source": "brief.write",
-      "target": "brief__out",
+      "target": "picture",
       "sourceHandle": "response",
       "targetHandle": "prompt",
+      "via": [
+        {
+          "group": "brief",
+          "port": "prompt",
+          "side": "out",
+          "span": {
+            "startLine": 60,
+            "startColumn": 2,
+            "endLine": 60,
+            "endColumn": 30
+          }
+        }
+      ],
       "span": {
-        "startLine": 58,
+        "startLine": 69,
         "startColumn": 2,
-        "endLine": 58,
-        "endColumn": 30
+        "endLine": 69,
+        "endColumn": 22
+      }
+    },
+    {
+      "id": "e-brief.write-response-out:brief:prompt-reply-caption",
+      "source": "brief.write",
+      "target": "reply",
+      "sourceHandle": "response",
+      "targetHandle": "caption",
+      "via": [
+        {
+          "group": "brief",
+          "port": "prompt",
+          "side": "out",
+          "span": {
+            "startLine": 60,
+            "startColumn": 2,
+            "endLine": 60,
+            "endColumn": 30
+          }
+        }
+      ],
+      "span": {
+        "startLine": 78,
+        "startColumn": 2,
+        "endLine": 78,
+        "endColumn": 23
       }
     }
   ],

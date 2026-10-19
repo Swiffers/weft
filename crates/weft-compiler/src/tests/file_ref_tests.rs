@@ -567,9 +567,9 @@ g.input = @file("a.txt", TextAlias)
     let local = project.nodes.iter().find(|n| n.id == "n").unwrap();
     assert_eq!(local.config["value"], serde_json::json!("local text"));
     assert!(matches!(&local.file_refs["value"].ty, WeftType::Named { name, .. } if name == "TextAlias"));
-    let boundary = project.nodes.iter().find(|n| n.id == "g__in").unwrap();
-    assert_eq!(boundary.port_literals["input"], serde_json::json!("local text"));
-    assert!(boundary.file_refs.contains_key("input"));
+    let group = project.groups.iter().find(|g| g.id == "g").unwrap();
+    assert_eq!(group.port_literals["input"], serde_json::json!("local text"));
+    assert!(group.file_refs.contains_key("input"));
     let remote = crate::file_ref::collect_text_refs(&project);
     assert_eq!(remote.len(), 1);
     assert!(matches!(&remote[0].ty, WeftType::Named { name, .. } if name == "LocalText"));
@@ -593,9 +593,9 @@ fn include_arguments_and_body_files_resolve_from_the_project_root() {
         ).unwrap();
         match mode {
             crate::weft_compiler::IncludeMode::Full => {
-                let boundary = project.nodes.iter().find(|n| n.id == "box__in").unwrap();
-                assert_eq!(boundary.port_literals["input"], serde_json::json!("caller"));
-                assert_eq!(boundary.file_refs["input"].path, "input.txt");
+                let site = project.groups.iter().find(|g| g.id == "box").unwrap();
+                assert_eq!(site.port_literals["input"], serde_json::json!("caller"));
+                assert_eq!(site.file_refs["input"].path, "input.txt");
                 let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
                 assert_eq!(body.config["value"], serde_json::json!("caller"));
                 assert_eq!(body.file_refs["value"].path, "input.txt");
@@ -693,6 +693,83 @@ fn a_tilde_path_expands_to_the_home_directory() {
     .unwrap();
     let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
     assert_eq!(node.file_refs["value"].path, home.join("pics/logo.png").to_str().unwrap());
+}
+
+/// A program includes a file the stdlib ships under `nodes/`: the file
+/// reads its prompt through `__catalog/` too, and its own relative
+/// include resolves against its own folder. Its nodes take their id
+/// from their path under the root, and every ref leaves the compiler
+/// spelled as the file it is (`nodes/...`), so no consumer needs the
+/// prefix.
+#[test]
+fn a_program_includes_a_stdlib_file_through_the_catalog_prefix() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (
+            std::path::PathBuf::from("/project/nodes/base_catalog/computer/agent.weft"),
+            "Group {\n n = Text { value: @file(\"__catalog/base_catalog/computer/agent_prompt.md\") }\n p = @include(\"perform.weft\")\n}".into(),
+        ),
+        (std::path::PathBuf::from("/project/nodes/base_catalog/computer/agent_prompt.md"), "Act carefully.".into()),
+        (std::path::PathBuf::from("/project/nodes/base_catalog/computer/perform.weft"), "Group {\n m = Text { value: \"go\" }\n}".into()),
+        (std::path::PathBuf::from("/project/nodes/my_pkg/x.weft"), "Group {\n k = Text { value: @asset(\"__catalog/my_pkg/pic.png\", Image) }\n}".into()),
+    ]));
+    let fs = crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project")))
+        .anchored_at(Some(std::path::Path::new("/project/src")));
+    let project = crate::weft_compiler::compile(
+        "agent = @include(\"__catalog/base_catalog/computer/agent.weft\")\nown = @include(\"__catalog/my_pkg/x.weft\")\n",
+        uuid::Uuid::nil(),
+        fs,
+    )
+    .unwrap();
+    let prompt = project.nodes.iter().find(|n| n.id == "@nodes:base_catalog:computer:agent.n").unwrap();
+    assert_eq!(prompt.config["value"], serde_json::json!("Act carefully."));
+    assert_eq!(prompt.file_refs["value"].path, "nodes/base_catalog/computer/agent_prompt.md");
+    assert!(project.nodes.iter().any(|n| n.id == "@nodes:base_catalog:computer:perform.m"), "the nested include resolved beside its file");
+    let pic = project.nodes.iter().find(|n| n.id == "@nodes:my_pkg:x.k").unwrap();
+    assert_eq!(pic.file_refs["value"].path, "nodes/my_pkg/pic.png");
+    assert_eq!(pic.config["value"], serde_json::json!("@asset(\"nodes/my_pkg/pic.png\", Image)"));
+}
+
+/// A `@file` through `__catalog/` that climbs out of `nodes/` is refused
+/// on its spelling, before the normalization that would hide the climb.
+#[test]
+fn a_file_marker_through_the_catalog_prefix_may_not_leave_nodes() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/project/src/secret.txt"), "not for you".into()),
+    ]));
+    let errs = crate::weft_compiler::compile(
+        "n = Text { value: @file(\"__catalog/../src/secret.txt\") }\n",
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.message
+            == "@file(\"__catalog/../src/secret.txt\") escapes the project's nodes/ folder: a `__catalog/` path is read from nodes/ and has to stay inside it"),
+        "{errs:?}"
+    );
+}
+
+/// The same, on disk, through the reader every build uses: a program in
+/// `src/` includes a package's file, which includes its sibling. A
+/// broken `.weft` beside them that nobody includes is never read.
+#[test]
+fn a_catalog_include_compiles_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("nodes/my_pkg/flows")).unwrap();
+    std::fs::write(root.join("nodes/my_pkg/flows/broken.weft"), "this is { not weft").unwrap();
+    std::fs::write(root.join("nodes/my_pkg/flows/outer.weft"), "Group {\n inner = @include(\"inner.weft\")\n}").unwrap();
+    std::fs::write(root.join("nodes/my_pkg/flows/inner.weft"), "Group {\n m = Text { value: @file(\"__catalog/my_pkg/note.md\") }\n}").unwrap();
+    std::fs::write(root.join("nodes/my_pkg/note.md"), "hello").unwrap();
+    let project = crate::weft_compiler::compile(
+        "outer = @include(\"__catalog/my_pkg/flows/outer.weft\")\n",
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::disk(&root).anchored_at(Some(&root.join("src"))),
+    )
+    .unwrap();
+    let inner = project.nodes.iter().find(|n| n.id == "@nodes:my_pkg:flows:inner.m").unwrap();
+    assert_eq!(inner.config["value"], serde_json::json!("hello"));
 }
 
 /// The values a run hands in (`--from`, `--emit`, `--group`, `--fire`)

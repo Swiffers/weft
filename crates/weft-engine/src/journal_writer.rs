@@ -48,7 +48,7 @@ use std::time::Duration;
 use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
 use weft_core::RunId;
 use weft_journal::frame::{BatchAnswer, BatchHead, RunHead};
-use weft_journal::record::{Born, Fate, StoredSelection, Written};
+use weft_journal::record::{Born, Fate, StoredProgram, Written};
 use weft_journal::unrecorded::UnrecordedNote;
 use weft_journal::{BatchError, RunEvent, JournalClient, RecordClient};
 
@@ -143,6 +143,11 @@ pub struct RunSpec {
     pub next_seq: i32,
     /// The credentials its caller sent, cleaned from every event it writes.
     pub redaction: weft_core::caller::Redaction,
+    /// The cut of its project it runs, for a run born here on one
+    /// (`crate::plan`): its first write carries it, unless its lane put it
+    /// on record already, so the record never holds a run without the
+    /// program it runs.
+    pub program: Option<Arc<StoredProgram>>,
 }
 
 impl WorkerJournal {
@@ -159,6 +164,7 @@ impl WorkerJournal {
                     wake: tokio::sync::Notify::new(),
                     urgent: tokio::sync::Notify::new(),
                     idle: tokio::sync::Notify::new(),
+                    programs_on_record: Mutex::new(std::collections::HashSet::new()),
                 })
             })
             .collect();
@@ -184,6 +190,7 @@ impl WorkerJournal {
             keeping: spec.settings.keeping(),
             keep_for: spec.keep_for,
             redaction: spec.redaction,
+            program: spec.program,
             state: Mutex::new(RunState {
                 epoch: spec.epoch,
                 next_seq: spec.next_seq,
@@ -443,6 +450,12 @@ struct Lane {
     urgent: tokio::sync::Notify,
     /// The lane went idle: nothing queued, nothing on its way.
     idle: tokio::sync::Notify,
+    /// The hashes of the cut programs this lane's batches put on record
+    /// (answered with a run that runs one accepted, so in the database: a
+    /// cut is kept only with a run that went in), a birth on one of them
+    /// carries nothing more. Only the lane's own task touches it, one
+    /// batch at a time.
+    programs_on_record: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -467,6 +480,8 @@ struct RunLog {
     keeping: Keeping,
     keep_for: KeepFor,
     redaction: weft_core::caller::Redaction,
+    /// See [`RunSpec::program`].
+    program: Option<Arc<StoredProgram>>,
     state: Mutex<RunState>,
     poison: Poison,
     /// How many of the events handed are on record.
@@ -603,8 +618,13 @@ async fn lane_loop(lane: Arc<Lane>, record: Arc<dyn RecordClient>, budget: Arc<B
         }
         let taken = take_batch(&lane, &budget);
         if !taken.is_empty() {
-            let (body, head_runs) = frame(lane.index, &taken);
+            let (body, head_runs, programs) = frame(&lane, &taken);
             let answer = send(record.as_ref(), body).await;
+            if let Ok(answer) = &answer {
+                let went_in = |at: usize| matches!(answer.fates.get(at), Some(Fate::Accepted | Fate::AlreadyApplied));
+                lane.programs_on_record.lock().expect("record writer")
+                    .extend(programs.into_iter().filter(|(at, _)| went_in(*at)).map(|(_, hash)| hash));
+            }
             let unwritten = answered(&taken, head_runs, answer);
             budget.release(taken.iter().map(|taken| taken.bytes).sum());
             for run in unwritten {
@@ -677,17 +697,24 @@ fn take_batch(lane: &Lane, budget: &Budget) -> Vec<Taken> {
     taken
 }
 
-/// `taken` as one call's body, off every lock: each run's events
-/// serialized and compressed once, here, and what its row learns from
-/// them.
-fn frame(lane: u16, taken: &[Taken]) -> (Vec<u8>, usize) {
-    let mut head = BatchHead { durable: false, lane, runs: Vec::with_capacity(taken.len()), selections: Vec::new() };
+/// `taken` as one call's body, off every lock but the lane's set of
+/// programs on record: each run's events serialized and compressed once,
+/// here, and what its row learns from them. Answers the body, how many
+/// runs it holds, and each birth on a cut not yet on record with the
+/// cut's hash (the program is on record once one of them went in).
+fn frame(lane: &Lane, taken: &[Taken]) -> (Vec<u8>, usize, Vec<(usize, String)>) {
+    let mut head = BatchHead { durable: false, lane: lane.index, runs: Vec::with_capacity(taken.len()), programs: Vec::new() };
     let mut rows = Vec::with_capacity(taken.len());
-    for taken in taken {
+    let mut births = Vec::new();
+    let on_record = lane.programs_on_record.lock().expect("record writer");
+    for (at, taken) in taken.iter().enumerate() {
         let born = (taken.first_seq == 0).then(|| Born::of(&taken.events[0], taken.run.keep_for)).flatten();
-        if let Some(RunEvent::RunStarted { selection: Some(selection), .. }) = born.as_ref().map(|_| &taken.events[0]) {
-            if !head.selections.iter().any(|stored| stored.digest == selection.digest()) {
-                head.selections.push(StoredSelection::of(selection));
+        if let (Some(_), Some(program)) = (&born, &taken.run.program) {
+            if !on_record.contains(&program.definition_hash) {
+                if !head.programs.iter().any(|carried| carried.definition_hash == program.definition_hash) {
+                    head.programs.push((**program).clone());
+                }
+                births.push((at, program.definition_hash.clone()));
             }
         }
         let row = weft_journal::stored::encode(&taken.events);
@@ -703,8 +730,9 @@ fn frame(lane: u16, taken: &[Taken]) -> (Vec<u8>, usize) {
         });
         rows.push(row);
     }
+    drop(on_record);
     let runs = head.runs.len();
-    (weft_journal::frame::encode(&head, rows.iter().map(Vec::as_slice)), runs)
+    (weft_journal::frame::encode(&head, rows.iter().map(Vec::as_slice)), runs, births)
 }
 
 /// Send `body` until it is answered, within [`RESEND_FOR`]. A batch sent
@@ -1039,7 +1067,7 @@ mod tests {
     }
 
     fn spec(run_id: RunId, settings: RunSettings) -> RunSpec {
-        RunSpec { run_id, settings, keep_for: KeepFor::WEFT_DEFAULT, epoch: 1, next_seq: 0, redaction: Default::default() }
+        RunSpec { run_id, settings, keep_for: KeepFor::WEFT_DEFAULT, epoch: 1, next_seq: 0, redaction: Default::default(), program: None }
     }
 
     fn fast(writer: &Arc<WorkerJournal>) -> (RunId, Arc<DriveJournal>) {

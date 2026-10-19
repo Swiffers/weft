@@ -2263,8 +2263,8 @@ pub enum Condition {
     /// (the compiler's per-instance slice). For a node that cannot be
     /// copied per instance, like a trigger serving one public address.
     /// `{perInstanceReason}` in the message says why, path included
-    /// ("it reads 'blender'", "it sits inside group 'work', which
-    /// receives 'blender'").
+    /// ("it reads 'blender'", "it sits inside group 'work', whose gate
+    /// reads 'blender'").
     /// Braced (`{}`) so a stray field on it is refused.
     PerInstance {},
     /// Every name the input's written value holds is something of this
@@ -2597,8 +2597,8 @@ pub struct NodeFeatures {
     /// catalog node type that executes but must not appear in
     /// user-facing tooling. Users cannot declare a hidden node type
     /// in source; the parser rejects them with a dedicated error.
-    /// (Group/Loop boundary lowering does NOT use this: those are
-    /// not catalog nodes, they're inline-dispatched in the engine.)
+    /// (A loop's boundaries do NOT use this: they are not catalog
+    /// nodes, the engine runs them inline.)
     #[serde(default, rename = "hidden", skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
 }

@@ -16,8 +16,8 @@ grade = Loop(cards: List[JsonDict], rubric: String) -> (scores: List[Number | Nu
 grade.cards = pull.rows
 ```
 
-Like a group, a loop is gone before anything runs. The compiler turns it into a
-pair of boundary nodes and the runtime drives the iterations.
+Unlike a group, a loop becomes nodes: the compiler turns it into a `LoopIn` and
+a `LoopOut`, and the runtime drives the iterations between them.
 
 ## The five settings
 
@@ -53,9 +53,18 @@ iteration ever wrote, because a port that produces nothing at all would leave
 whatever is downstream waiting forever.
 
 A carried value that an iteration does not write keeps what it had, as long as
-nothing broke: a branch not taken or a gate that said no is fine. If you do
-not wire a seed, it starts at the zero for its type: `0` for a number, `""` for
-a string, `[]` for a list.
+nothing broke: a branch not taken or a gate that said no is fine.
+
+A carried value needs a seed from outside, wired or written
+(`myLoop.total = 0` for a loop named `myLoop`); without one, the build fails
+with `required input 'myLoop.total' has no driver`. The one case it can go
+without: you declare it among the loop's inputs with a `?` (`total?: Number`)
+and nothing inside wires it into an input written without `?`. Then it
+starts at the zero for its type: `0` for a number, `""` for a string, `false`
+for a boolean, `[]` for a list, `{}` for a dict, and null for a type with no
+empty value, such as a `File` or an `Image`. A seed that is wired but arrives
+as null starts at the zero too, and for a type like `Number | Null` that zero
+is `0`, not null.
 
 ## Two implicit ports
 

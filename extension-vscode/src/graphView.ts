@@ -29,6 +29,7 @@ import { displayedNodeOf, displayRoutesOf, displayStreamPath, infraNodeIdsOf, ow
 import * as nodePath from 'node:path';
 import { readProjectIdFromToml, readProjectNameFromToml, findProjectRoot } from './sidebar/projects';
 import { NODE_GLOBS } from './diagnostics';
+import { includeRelativeToFile } from './includePath';
 
 /// What a parse answers for a project the dispatcher has never seen.
 const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
@@ -731,7 +732,10 @@ export class GraphViewController {
           if (!typeReferencesFile(ref.type)) fileRel.add(ref.path);
         }
       }
-      if (n.includePath) includeRel.add(n.includePath);
+      // As written, but a `__catalog/` path is respelled from this file
+      // (it names a file under `nodes/` wherever it is written).
+      const included = n.includePath && includeRelativeToFile(n.includePath, doc.uri.fsPath, rootDir);
+      if (included) includeRel.add(included);
       // Files reached THROUGH that include, nested ones too, each already
       // relative to the project root (an `@include` path is relative to
       // the file that wrote it, so a nested one is meaningless against
@@ -2245,7 +2249,14 @@ export class GraphViewController {
     // ONE derivation of the file to open, so the value checked is the
     // value opened. Built from the current document's URI so a remote
     // session keeps its scheme; `Uri.file` would point at the local disk.
-    const targetUri = vscode.Uri.joinPath(current.uri, '..', relPath);
+    // A `__catalog/` path names a file under `nodes/` wherever it is
+    // written, respelled from the current file so the join below holds.
+    const fromHere = includeRelativeToFile(relPath, current.uri.fsPath, root);
+    if (fromHere === undefined) {
+      console.error('[weft] refusing openInclude: path escapes the nodes folder', relPath);
+      return;
+    }
+    const targetUri = vscode.Uri.joinPath(current.uri, '..', fromHere);
     const rel = nodePath.relative(root, targetUri.fsPath);
     if (rel.startsWith('..') || nodePath.isAbsolute(rel)) {
       console.error('[weft] refusing openInclude: path escapes project root', relPath);

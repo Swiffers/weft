@@ -58,6 +58,12 @@ fn output_type(project: &weft_core::ProjectDefinition, node: &str, port: &str) -
     node.outputs.iter().find(|p| p.name == port).unwrap_or_else(|| panic!("port {port}")).port_type.clone()
 }
 
+/// The type of a group's out port, as enrich resolved it.
+fn group_out(project: &weft_core::ProjectDefinition, group: &str, port: &str) -> WeftType {
+    let group = project.groups.iter().find(|g| g.id == group).unwrap_or_else(|| panic!("group {group}"));
+    group.out_ports.iter().find(|p| p.name == port).unwrap_or_else(|| panic!("port {port}")).port_type.clone()
+}
+
 fn ty(text: &str) -> WeftType {
     WeftType::try_parse(text).unwrap_or_else(|why| panic!("`{text}`: {why}"))
 }
@@ -201,9 +207,49 @@ still.x = img.out
 clip = ExecPython(x: Video) { code: "return {}" }
 clip.x = vid.out
 "#;
-    let (_, enrich_errors, d) = check_in(source, CompileFs::disk(dir.path()));
+    let (project, enrich_errors, d) = check_in(source, CompileFs::disk(dir.path()));
     assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
     assert!(codes(&d).is_empty(), "{d:?}");
+    // The inner file's own group is one group with a port type per place,
+    // the way a node inside it would be.
+    let inner = project.groups.iter()
+        .find(|g| matches!(g.kind, weft_core::project::GroupKind::Body) && g.id.contains("inner"))
+        .expect("the inner file's body");
+    let outs: std::collections::BTreeSet<String> = inner.place_types.iter().map(|place| place.outputs["out"].to_string()).collect();
+    assert_eq!(outs, ["Image".to_string(), "Video".to_string()].into(), "{:?}", inner.place_types);
+    for place in &inner.place_types {
+        assert_eq!(place.place.len(), 2, "under the outer site, then the inner one: {:?}", place.place);
+    }
+}
+
+/// A wire out of one call of an included file into a group port nobody
+/// reads is typed at that call alone: the other call, typed apart, is
+/// never held to it.
+#[test]
+fn a_wire_to_an_unread_group_port_is_typed_at_its_own_call_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("lib")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("lib/f.weft"),
+        "Group(x: T) -> (r: T) {\n  n = ExecPython(v: T) -> (r: T) { code: \"return {}\" }\n  n.v = self.x\n  self.r = n.r\n}\n",
+    )
+    .expect("write");
+    let source = r#"
+a = ExecPython() -> (s: String, k: Number) { code: "return {}" }
+one = @include("lib/f.weft")
+one.x = a.s
+two = @include("lib/f.weft")
+two.x = a.k
+show = Debug
+show.data = two.r
+g = Group(y?: String) -> (o: String) {
+  self.o = self.y
+}
+g.y = one.r
+"#;
+    let (_, enrich_errors, d) = check_in(source, CompileFs::disk(dir.path()));
+    assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
+    assert!(!codes(&d).contains(&"type-mismatch"), "{d:?}");
 }
 
 /// An included file's node fed by the file's port is decided only when
@@ -274,13 +320,13 @@ show.data = g.out
     );
     assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
     assert!(!codes(&d).contains(&"type-mismatch"), "{d:?}");
-    assert_eq!(output_type(&project, "g__out", "out"), ty("List[Number]"));
+    assert_eq!(group_out(&project, "g", "out"), ty("List[Number]"));
 }
 
-/// A group's two boundaries are one header: `T` pinned on the way in is
-/// the `T` that comes out, and the bound is reported once.
+/// A group's header is one: `T` pinned on the way in is the `T` that
+/// comes out, and the bound is reported once.
 #[test]
-fn a_group_type_parameter_is_one_variable_across_its_boundaries() {
+fn a_group_type_parameter_is_one_variable_across_its_ports() {
     let (project, enrich_errors, d) = check(
         r#"
 src = ExecPython() -> (clip: Video) { code: "return {}" }
@@ -294,7 +340,7 @@ show.data = g.out
     );
     assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
     assert!(codes(&d).is_empty(), "{d:?}");
-    assert_eq!(output_type(&project, "g__out", "out"), ty("Video"));
+    assert_eq!(group_out(&project, "g", "out"), ty("Video"));
 
     let (_, _, d) = check(
         r#"
@@ -607,6 +653,20 @@ my.items = seed.items
     let constant = ungated_group.replace("g.x = seed.value\n", "g.x = \"hi\"\n");
     let (_, _, d) = check(&constant);
     assert!(!codes(&d).contains(&"run-undecided"), "{d:?}");
+
+    // Not on the output of the same name: nothing writes it, so nothing
+    // arrives on it.
+    let out_named_alike = r#"
+h = Group(x?: String) -> (x: String) {
+  i = ExecPython(v?: String) -> (r: String) { code: "return {}" }
+  i.v = self.x
+}
+h.x = "hi"
+m = ExecPython(v?: String) -> (r: String) { code: "return {}" }
+m.v = h.x
+"#;
+    let (_, _, d) = check(out_named_alike);
+    assert!(message_of(&d, "run-undecided").contains("'m'"), "{d:?}");
 
     // A loop's index is always there too.
     let index = loop_item.replace("p = ExecPython(v?: String)", "p = ExecPython(v?: Number)").replace("p.v = self.items", "p.v = self.index");

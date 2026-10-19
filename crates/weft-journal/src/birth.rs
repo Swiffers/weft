@@ -11,16 +11,15 @@ pub struct Birth<'a> {
     pub phase: weft_core::context::Phase,
     pub entry_node: &'a str,
     pub kicks: &'a [weft_core::run_spec::KickPlan],
-    /// The program the run executes: its definition and its worker binary.
-    pub definition_hash: &'a str,
+    /// The program the run executes (a cut of the project's program,
+    /// stored under its own hash) and the registered program it was cut
+    /// from, as the run's start keeps it: the birth names both from it.
+    pub program: &'a crate::record::RunsProgram,
+    /// What the run is given at the places its program says (handed
+    /// values, stand-ins' outputs): the run's own, on its birth.
+    pub given: &'a weft_core::project::Given,
+    /// The worker binary the run executes on.
     pub binary_hash: &'a str,
-    /// The run's selection, recorded so the engine dispatches nothing
-    /// outside it and a resume rebuilds the same boundary. Every trigger
-    /// fire, targeted manual run and setup phase carries one (a setup
-    /// phase's is `RunSelection::setup` over its triggers or infra
-    /// nodes, and the engine refuses a setup row without it); `None`
-    /// only for a manual run of the whole graph.
-    pub selection: Option<&'a weft_core::project::selection::RecordedSelection>,
     /// The run this one inherits from (`weft run --seed`); `None` for a
     /// run from nothing, which is every fire and every setup phase.
     pub seed: Option<crate::Seed>,
@@ -51,7 +50,7 @@ pub struct Birth<'a> {
 /// events do not.
 pub fn birth_events(birth: Birth<'_>) -> (RunEvent, Vec<RunEvent>) {
     let Birth {
-        run_id, project_id, phase, entry_node, kicks, definition_hash, binary_hash, selection, seed, source_version, instance, picks,
+        run_id, project_id, phase, entry_node, kicks, program, given, binary_hash, seed, source_version, instance, picks,
         fired_trigger, stand_in, settings, at_unix,
     } = birth;
     let start = RunEvent::RunStarted {
@@ -59,17 +58,18 @@ pub fn birth_events(birth: Birth<'_>) -> (RunEvent, Vec<RunEvent>) {
         project_id,
         entry_node: entry_node.to_string(),
         phase,
-        definition_hash: Some(definition_hash.to_string()),
+        definition_hash: Some(program.definition_hash().to_string()),
+        cut_from: program.cut_from().map(str::to_string),
+        given: Box::new(given.clone()),
         binary_hash: Some(binary_hash.to_string()),
         source_version: source_version.map(str::to_string),
         run_kind: weft_core::run::RunKind::Project,
-        selection: selection.cloned(),
         seed,
         instance: instance.map(|m| m.instance.clone()),
         instance_values: Box::new(instance.map(|m| m.values.clone()).unwrap_or_default()),
         picks: Box::new(picks.clone()),
         fired_trigger: fired_trigger.map(str::to_string),
-        stand_in: stand_in.cloned(),
+        stand_in: stand_in.cloned().map(Box::new),
         settings,
         at_unix,
     };
@@ -88,94 +88,32 @@ pub fn birth_events(birth: Birth<'_>) -> (RunEvent, Vec<RunEvent>) {
     (start, kick_events)
 }
 
-/// The rows a run is born with for what its suppliers hand it instead of
-/// running (`RunSelection::suppliers`: an `--emit` by hand, an infra
-/// place read baked): each value a source supplies, as that source's
-/// own emission (`provided: true`), a stream's items one by one then
-/// closed, and every output a source supplies nothing for closed. A
-/// source is a node at the frames it emits under, with its values by port.
-pub fn supplied_rows<'a>(
-    project: &weft_core::ProjectDefinition,
-    run_id: weft_core::RunId,
-    sources: impl IntoIterator<Item = (&'a str, &'a weft_core::frames::LoopFrames, std::collections::BTreeMap<&'a str, &'a serde_json::Value>)>,
-    at_unix: u64,
-) -> Vec<RunEvent> {
-    let mut events = Vec::new();
-    for (source, frames, ports) in sources {
-        let Some(node) = project.nodes.iter().find(|node| node.id == source) else { continue };
-        // Two places of one node (a file included twice) emit under their
-        // own frames; their ids differ by them.
-        let at = if frames.is_empty() { source.to_string() } else { format!("{source}\0{}", weft_core::frames::frames_text(frames)) };
-        for port in &node.outputs {
-            let supplied = ports.get(port.name.as_str()).copied();
-            let generator = matches!(port.port_type, weft_core::weft_type::WeftType::Generator(_));
-            let values: Vec<&serde_json::Value> = match supplied {
-                Some(serde_json::Value::Array(items)) if generator => items.iter().collect(),
-                Some(value) => vec![value],
-                None => vec![],
-            };
-            for (index, value) in values.into_iter().enumerate() {
-                events.push(RunEvent::PortEmitted {
-                    run_id,
-                    emission_id: uuid::Uuid::new_v5(&run_id, format!("supplied\0{at}\0{}\0{index}", port.name).as_bytes()),
-                    node_id: source.to_string(),
-                    frames: frames.clone(),
-                    port: port.name.clone(),
-                    value: std::sync::Arc::new(value.clone()),
-                    provided: true,
-                    at_unix,
-                });
-            }
-            if generator || supplied.is_none() {
-                events.push(RunEvent::PortClosed {
-                    run_id,
-                    emission_id: uuid::Uuid::new_v5(&run_id, format!("supplied-end\0{at}\0{}", port.name).as_bytes()),
-                    node_id: source.to_string(),
-                    frames: frames.clone(),
-                    port: port.name.clone(),
-                    provided: true,
-                    at_unix,
-                });
-            }
-        }
-    }
-    events
-}
-
 /// The rows a run is born with for the infra places it reads baked
-/// (`weft_core::infra::bake::covered`): their saved values, as they
-/// supply them ([`supplied_rows`]), and a line in each one's log saying
-/// it did not run and why.
+/// (`weft_core::infra::bake::covered`): a line in each one's log saying it
+/// did not run and why. Their saved values go out from what the run is
+/// given, where its program has each stand in for itself
+/// (`weft_core::project::Given`).
 pub fn baked_rows(
-    project: &weft_core::ProjectDefinition,
     run_id: weft_core::RunId,
     baked: &weft_core::infra::bake::Saved,
     at_unix: u64,
 ) -> Vec<RunEvent> {
-    let frames: Vec<(&weft_core::frames::Located, weft_core::frames::LoopFrames)> = baked.keys().map(|place| (place, place.frames())).collect();
-    let mut rows: Vec<RunEvent> = frames
+    baked
         .iter()
-        .map(|(place, frames)| RunEvent::LogLine {
+        .map(|(place, values)| RunEvent::LogLine {
             run_id,
             node_id: place.id.clone(),
-            frames: frames.clone(),
+            frames: place.frames(),
             level: "info".to_string(),
             message: format!(
                 "did not run: everything this run reads from it is baked, so its saved {} went out instead",
-                baked[*place].keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+                values.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
             ),
             at_unix_ms: None,
             seq: None,
             at_unix,
         })
-        .collect();
-    rows.extend(supplied_rows(
-        project,
-        run_id,
-        frames.iter().map(|(place, frames)| (place.id.as_str(), frames, baked[*place].iter().map(|(port, value)| (port.as_str(), value)).collect())),
-        at_unix,
-    ));
-    rows
+        .collect()
 }
 
 /// Which instance a run is for, and what it provides for its `@instance_filled`
@@ -186,39 +124,4 @@ pub fn baked_rows(
 pub struct RunFor<'a> {
     pub instance: &'a weft_core::instance::InstanceId,
     pub values: &'a weft_core::instance::InstanceValues,
-}
-
-
-#[cfg(test)]
-mod supplied_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn a_supplier_is_born_with_its_values_and_its_other_outputs_closed() {
-        let project: weft_core::ProjectDefinition = serde_json::from_value(json!({
-            "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": [{
-                "id": "db", "nodeType": "T", "label": null, "config": {}, "position": {"x": 0, "y": 0},
-                "inputs": [], "features": {}, "requiresInfra": false,
-                "outputs": [
-                    {"name": "access", "portType": "String", "required": true},
-                    {"name": "status", "portType": "String", "required": true}
-                ]
-            }],
-            "edges": []
-        }))
-        .unwrap();
-        let run_id = weft_core::RunId::from_u128(9);
-        let frames = weft_core::frames::LoopFrames::new();
-        let value = json!("a1");
-        let supplied = || [("db", &frames, std::collections::BTreeMap::from([("access", &value)]))];
-        let rows = supplied_rows(&project, run_id, supplied(), 5);
-        assert!(matches!(&rows[0], RunEvent::PortEmitted { node_id, port, value, provided: true, .. }
-            if node_id == "db" && port == "access" && **value == json!("a1")));
-        assert!(matches!(&rows[1], RunEvent::PortClosed { port, provided: true, .. } if port == "status"));
-        assert_eq!(rows.len(), 2);
-        let again = serde_json::to_value(supplied_rows(&project, run_id, supplied(), 5)).unwrap();
-        assert_eq!(again, serde_json::to_value(&rows).unwrap(), "the same run is born the same");
-    }
 }

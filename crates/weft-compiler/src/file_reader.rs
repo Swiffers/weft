@@ -1,9 +1,11 @@
 //! The filesystem view the compiler reads `@file`/`@include` content through.
 //!
-//! `@file("path")` and `@include("path")` name external content relative to the
-//! referencing file's directory. Resolving them is two steps: turn `(base,
-//! relative_path)` into a canonical identity (with a containment check), then
-//! read that identity's bytes. Today there are two backings for those bytes:
+//! `@include("path")` names external content relative to the referencing
+//! file's directory, `@file("path")` relative to the project root, and
+//! either one starting `__catalog/` relative to the project's `nodes/`.
+//! Resolving them is two steps: turn `(base, relative_path)` into a
+//! canonical identity (with a containment check), then read that
+//! identity's bytes. Today there are two backings for those bytes:
 //!
 //!   - disk (the CLI on a laptop; a project folder unpacked to a temp dir and
 //!     compiled from disk the same way),
@@ -35,6 +37,25 @@ pub struct ResolvedFile {
     pub content: String,
 }
 
+/// Where a marker's path lands, worked out from its spelling alone,
+/// before any backing is asked about the file.
+#[derive(Debug)]
+pub struct SpelledPath {
+    /// The path joined onto its anchor and normalized, inside `root`.
+    pub path: PathBuf,
+    /// The project root, which the file read may not leave either (the
+    /// disk backing follows symlinks). A `__catalog/` path is held to
+    /// `nodes/` on its spelling alone ([`catalog_path`]); the file it
+    /// lands on is held to the project, like `nodes/...` written out, so
+    /// the two spellings of one path read the same file in every marker.
+    pub root: PathBuf,
+}
+
+/// The refusal for a path, as written, that leaves the project root.
+pub fn escapes_root(relative: &Path) -> String {
+    format!("path {relative:?} escapes the project root")
+}
+
 /// Resolve and read the content named by `relative` against `base`.
 ///
 /// `base` is the directory the reference is relative to (the referencing file's
@@ -49,8 +70,39 @@ pub trait FileReader {
     /// lives in `src/`, so `@include("../lib/x.weft")` in
     /// `src/billing/charge.weft` climbs one level and lands inside the
     /// project. A `@file` / `@asset` path is relative to the project root
-    /// wherever it is written, so for those the two are the same.
-    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String>;
+    /// wherever it is written, so for those the two are the same. A path
+    /// that starts with `__catalog/` is the exception to both: it is read
+    /// from the project's `nodes/`, and its spelling may not climb out of
+    /// it ([`catalog_path`]).
+    ///
+    /// Every backing resolves through this one method, so the rule is
+    /// checked on the spelling, before the file is touched: a `../` that
+    /// climbs out is refused as such whether or not something is there
+    /// (a typo'd path used to report "no such file" instead of the rule).
+    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
+        let root = self.identity(root)?;
+        let path = match catalog_path(relative) {
+            Some(path) => root.join(path.map_err(|why| format!("path {relative:?} {why}"))?),
+            None => {
+                let base = self.identity(base)?;
+                // A `..` that merely balances out a base component
+                // (`proj/../secret.txt`) survives the climb check yet
+                // leaves the root, so the joined path is checked against
+                // the root as well.
+                normalize_lexical(&base.join(relative)).ok_or_else(|| escapes_root(relative))?
+            }
+        };
+        if !path.starts_with(&root) {
+            return Err(escapes_root(relative));
+        }
+        let spelled = SpelledPath { path, root };
+        self.read_spelled(&spelled, relative)
+    }
+
+    /// Read the file at `spelled.path`, already checked to sit inside
+    /// `spelled.root` as spelled. `relative` is the path as written, for
+    /// the messages.
+    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String>;
 
     /// The identity `resolve_and_read` would give `path` (the disk backing
     /// canonicalizes, the map backing normalizes lexically), so a caller can
@@ -59,9 +111,39 @@ pub trait FileReader {
     fn identity(&self, path: &Path) -> Result<PathBuf, String>;
 }
 
-/// The on-disk backing. Joins `relative` onto `base`, rejects a
-/// spelling that climbs out of `root`, canonicalizes (resolving
-/// symlinks), rejects anything that lands outside `root`, then reads
+/// The path a `__catalog/` marker path names from the project root
+/// (`__catalog/base_catalog/computer/agent.weft` is
+/// `nodes/base_catalog/computer/agent.weft`), or `None` for a path that
+/// does not start with that segment. Its rest is normalized on its own,
+/// so any `..` that climbs out of `nodes/` is refused, even one that
+/// comes back in (`__catalog/x/../../nodes/y`); the refusal is the
+/// reason alone, [`CATALOG_ESCAPE`], for the caller to put after the
+/// path the way its own messages name one.
+///
+/// THE prefix rule: every backing reaches it through
+/// [`FileReader::resolve_and_read`] (`@include`), and every `@file` /
+/// `@asset` through `file_ref::spell_from_root`, which spells the
+/// marker from the root before any read.
+// SYNC: catalog_path <-> extension-vscode/src/includePath.ts includeRelativeToFile
+pub fn catalog_path(written: &Path) -> Option<Result<PathBuf, &'static str>> {
+    let mut components = written.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first == crate::project::CATALOG_PREFIX => {}
+        _ => return None,
+    }
+    Some(
+        normalize_lexical(components.as_path())
+            .map(|rest| Path::new(crate::project::NODES_DIR).join(rest))
+            .ok_or(CATALOG_ESCAPE),
+    )
+}
+
+/// Why a `__catalog/` path that climbs out of `nodes/` is refused.
+pub const CATALOG_ESCAPE: &str =
+    "escapes the project's nodes/ folder: a `__catalog/` path is read from nodes/ and has to stay inside it";
+
+/// The on-disk backing. Canonicalizes the spelled path (resolving
+/// symlinks), rejects anything that lands outside the root, then reads
 /// the bytes.
 ///
 /// The project tree is TRUSTED: this runs at build time on the user's own
@@ -69,29 +151,19 @@ pub trait FileReader {
 /// check guards against an accidental `../` typo pulling a file from outside
 /// the project into the build. It is robust for that: `canonicalize`
 /// resolves `..` and follows symlinks before the prefix check, so any
-/// path that lands outside `root` (including via a symlink) is rejected.
+/// path that lands outside the root (including via a symlink) is rejected.
 /// (`@asset` is different: it may name a file anywhere on the machine
 /// by an absolute path, read from where it sits and uploaded at compile.)
 pub struct DiskFileReader;
 
 impl FileReader for DiskFileReader {
-    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
-        let escapes = || format!("path {relative:?} escapes the project root");
-        let canonical_root = self.identity(root)?;
-        // The rule is checked on the spelling, before the file is
-        // touched: a `../` that climbs out of the project is refused as
-        // such whether or not something is there (a typo'd path used to
-        // report "no such file" instead of the rule).
-        let base = self.identity(base)?;
-        let spelled = normalize_lexical(&base.join(relative)).ok_or_else(escapes)?;
-        if !spelled.starts_with(&canonical_root) {
-            return Err(escapes());
-        }
+    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String> {
         let identity = spelled
+            .path
             .canonicalize()
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-        if !identity.starts_with(&canonical_root) {
-            return Err(escapes());
+        if !identity.starts_with(&spelled.root) {
+            return Err(escapes_root(relative));
         }
         let content = std::fs::read_to_string(&identity)
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
@@ -108,14 +180,13 @@ impl FileReader for DiskFileReader {
 /// parse path (the editor feeds it the project's open files) and by tests that
 /// exercise `@file`/`@include` without touching a real filesystem.
 ///
-/// Resolution is LEXICAL (no filesystem): `relative` is joined onto `base` and
-/// normalized (`.` and `..` collapsed), and that normalized path is both the
-/// identity and the map key. Containment is enforced the same way the disk
-/// reader enforces it: a normalized path that climbs above `root` (a leading
-/// `..` survives normalization) escapes and is rejected, so a `@file("../x")`
-/// at the root fails identically on both backings. Keys in the map must be the
-/// normalized form the compiler resolves to (callers build the map from the
-/// same paths the source references).
+/// Resolution is LEXICAL (no filesystem): the spelled path is both the
+/// identity and the map key, and its containment was checked on the
+/// spelling, the same check the disk backing makes before it touches the
+/// disk, so a `@file("../x")` at the root fails identically on both
+/// backings. Keys in the map must be the normalized form the compiler
+/// resolves to (callers build the map from the same paths the source
+/// references).
 pub struct MapFileReader {
     files: std::collections::BTreeMap<PathBuf, String>,
 }
@@ -127,22 +198,10 @@ impl MapFileReader {
 }
 
 impl FileReader for MapFileReader {
-    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
-        let escapes = || format!("path {relative:?} escapes the project root");
-        // Normalize the root and the joined path, then enforce the SAME
-        // containment the disk reader enforces (`starts_with(root)`). A `..` that
-        // merely balances out a base component (e.g. `proj/../secret.txt`)
-        // survives the per-path climb check yet leaves the root, so checking
-        // "climbs above its own root" is not enough: the normalized join must
-        // still sit under the normalized root.
-        let canonical_root = self.identity(root)?;
-        let identity = normalize_lexical(&base.join(relative)).ok_or_else(escapes)?;
-        if !identity.starts_with(&canonical_root) {
-            return Err(escapes());
-        }
-        match self.files.get(&identity) {
+    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String> {
+        match self.files.get(&spelled.path) {
             Some(content) => Ok(ResolvedFile {
-                identity,
+                identity: spelled.path.clone(),
                 content: content.clone(),
             }),
             None => Err(format!("path {relative:?} not found")),

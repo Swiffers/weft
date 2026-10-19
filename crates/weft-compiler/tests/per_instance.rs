@@ -62,9 +62,9 @@ fn a_shared_part_beside_it_stays_shared() {
     assert_eq!(per_instance(&project, "q"), None);
 }
 
-/// The slice crosses group boundaries: the boundary is an ordinary node
-/// after flattening. An instance's connection starts one like an instance's
-/// container does.
+/// The slice crosses a group: the wire runs through the group's port to
+/// the member that reads it. An instance's connection starts one like an
+/// instance's container does.
 #[test]
 fn the_slice_crosses_a_group() {
     let project = build(
@@ -79,6 +79,26 @@ g.access = slack.access
     );
     assert_eq!(per_instance(&project, "slack"), Some(PerInstance::Filled));
     assert_eq!(per_instance(&project, "g.d"), Some(PerInstance::Derived));
+}
+
+/// A loop's gate lands on its `LoopIn`, which launches every iteration:
+/// a gate reading an instance's value makes the whole inside per
+/// instance, a member no wire feeds included.
+#[test]
+fn the_slice_reaches_a_loop_through_its_gate() {
+    let project = build(
+        r#"
+slack = SlackAccess { account: @instance_filled }
+l = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  t = Text { value: "x" }
+  self.results = t.value
+}
+l.items = ["a"]
+l._should_flow = slack.access
+"#,
+    );
+    assert_eq!(per_instance(&project, "l.t"), Some(PerInstance::Derived));
 }
 
 /// Only an infra node may carry the mark; an access node is pointed at

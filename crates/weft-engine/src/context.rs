@@ -2431,7 +2431,6 @@ pub async fn ship_port_emissions(
                 frames: frames.clone(),
                 port: port.clone(),
                 value: value.clone(),
-                provided: false,
                 at_unix: now_unix(),
             },
             replica,
@@ -2457,7 +2456,6 @@ pub async fn ship_port_closed(
         node_id: node_id.to_string(),
         frames: frames.clone(),
         port: port.to_string(),
-        provided: false,
         at_unix: now_unix(),
     };
     record_from_replica(journal, event, replica).await;

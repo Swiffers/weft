@@ -143,6 +143,23 @@ pub fn is_rust_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// True if `s` can name a Rust module as written: a plain identifier
+/// ([`is_rust_identifier`]) that is neither a keyword (strict, reserved,
+/// or one a later edition takes) nor `_`. Codegen writes a module per
+/// node (its type in snake_case: `Loop` is `loop`) and per shared file
+/// of a package, so the catalog refuses a package holding a name that
+/// fails this.
+pub fn is_rust_module_name(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl",
+        "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "static", "struct",
+        "super", "Self", "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn", "abstract",
+        "become", "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+        "gen",
+    ];
+    is_rust_identifier(s) && s != "_" && !KEYWORDS.contains(&s)
+}
+
 // Re-export `inventory` so the `register_signal_kind!` macro
 // expanded in third-party crates (or other workspace crates) can
 // reach the same crate version without adding a direct dep.
@@ -267,6 +284,16 @@ mod helper_tests {
         }
         for bad in ["", "1abc", "my-node", "my.node", "with space", "émoji", "a\"b"] {
             assert!(!is_rust_identifier(bad), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn rust_module_name_check() {
+        for ok in ["text", "run_command", "_hidden", "looped", "types"] {
+            assert!(is_rust_module_name(ok), "{ok} should pass");
+        }
+        for bad in ["loop", "type", "self", "Self", "match", "gen", "_", "my-node", ""] {
+            assert!(!is_rust_module_name(bad), "{bad} should fail");
         }
     }
 

@@ -336,7 +336,7 @@ fn displays_of(project: &weft_core::project::ProjectDefinition) -> Displays<'_> 
     // an outside client polls.
     let by_id: std::collections::HashMap<&str, &weft_core::project::NodeDefinition> =
         project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    weft_core::project::selection::every_place(project)
+    weft_core::project::places::every_place(project)
         .into_iter()
         .filter_map(|place| {
             let node = *by_id.get(place.id.as_str())?;

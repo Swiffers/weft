@@ -1,5 +1,27 @@
 use weft_compiler::weft_compiler::*;
 use weft_compiler::CompileFs;
+use weft_core::project::{CrossingSide, Edge, ProjectDefinition};
+
+/// The one wire from `source` to `target`.
+fn wire<'a>(project: &'a ProjectDefinition, source: &str, target: &str) -> &'a Edge {
+    let found: Vec<&Edge> = project.edges.iter().filter(|e| e.source == source && e.target == target).collect();
+    assert_eq!(found.len(), 1, "one wire {source} -> {target}: {:?}", project.edges.iter().map(|e| &e.id).collect::<Vec<_>>());
+    found[0]
+}
+
+/// The group ports a wire passes, in order, each `group.port` with its
+/// side.
+fn via(edge: &Edge) -> Vec<(String, CrossingSide)> {
+    edge.via.iter().map(|c| (format!("{}.{}", c.group, c.port), c.side)).collect()
+}
+
+fn ins(ports: &[&str]) -> Vec<(String, CrossingSide)> {
+    ports.iter().map(|p| (p.to_string(), CrossingSide::In)).collect()
+}
+
+fn outs(ports: &[&str]) -> Vec<(String, CrossingSide)> {
+    ports.iter().map(|p| (p.to_string(), CrossingSide::Out)).collect()
+}
 use weft_core::weft_type::{WeftPrimitive, WeftType};
 use weft_core::node::{MetadataCatalog, NodeMetadata};
 
@@ -209,7 +231,7 @@ gen = ExecPython() -> (result: String) {
 }
 
 #[test]
-fn a_group_compiles_to_two_passthrough_boundaries() {
+fn a_group_compiles_to_a_scope_and_wires_that_pass_its_ports() {
     let source = r#"
 
 input = Text { value: "hello" }
@@ -231,37 +253,21 @@ output = Debug {}
 output.data = preprocessor.result
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-    // input, preprocessor__in, preprocessor__out, preprocessor.clean, output = 5
-    assert_eq!(result.nodes.len(), 5);
-
-    let pt_in = result.nodes.iter().find(|n| n.id == "preprocessor__in").expect("input passthrough");
-    assert_eq!(pt_in.node_type, "Passthrough");
-    // The group's own port, plus BOTH spellings of the gate: a group is
-    // guarded on its In boundary, so guarding it takes everything inside
-    // with it, and it can be guarded on an absence the same way a node
-    // can (the author uses one spelling; wiring both is a compile error).
-    assert_eq!(
-        pt_in.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-        vec!["raw", "_should_flow", "_should_not_flow"]
-    );
-
-    let pt_out = result.nodes.iter().find(|n| n.id == "preprocessor__out").expect("output passthrough");
-    assert_eq!(pt_out.node_type, "Passthrough");
-    assert_eq!(pt_out.outputs.len(), 1);
-    assert_eq!(pt_out.outputs[0].name, "result");
-
-    // Edge from input to preprocessor should be rewritten to preprocessor__in
-    let edge_to_group = result.edges.iter().find(|e| e.source == "input").expect("edge to group");
-    assert_eq!(edge_to_group.target, "preprocessor__in");
-
-    // Edge from preprocessor to output should be rewritten to preprocessor__out
-    let edge_from_group = result.edges.iter().find(|e| e.target == "output").expect("edge from group");
-    assert_eq!(edge_from_group.source, "preprocessor__out");
-
+    // input, preprocessor.clean, output: a group is no node.
+    assert_eq!(result.nodes.len(), 3);
+    let group = result.groups.iter().find(|g| g.id == "preprocessor").expect("the group");
+    assert_eq!(group.in_ports.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["raw"]);
+    assert_eq!(group.out_ports.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["result"]);
+    // One wire end to end in, through the group's input; one out.
+    let into = wire(&result, "input", "preprocessor.clean");
+    assert_eq!(via(into), ins(&["preprocessor.raw"]));
+    assert_eq!((into.source_handle.as_deref(), into.target_handle.as_deref()), (Some("value"), Some("value")));
+    let out = wire(&result, "preprocessor.clean", "output");
+    assert_eq!(via(out), outs(&["preprocessor.result"]));
 }
 
 #[test]
-fn nested_groups_each_get_their_own_boundaries() {
+fn nested_groups_are_nested_scopes() {
     let source = r#"
 
 outer = Group(data: String) -> (result: String) {
@@ -279,16 +285,18 @@ outer = Group(data: String) -> (result: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-    // outer__in + outer__out + outer.inner__in + outer.inner__out + outer.inner.proc = 5
-    assert_eq!(result.nodes.len(), 5);
-
-    let inner_in = result.nodes.iter().find(|n| n.id == "outer.inner__in").unwrap();
-    assert_eq!(inner_in.node_type, "Passthrough");
-    let inner_out = result.nodes.iter().find(|n| n.id == "outer.inner__out").unwrap();
-    assert_eq!(inner_out.node_type, "Passthrough");
-
+    assert_eq!(result.nodes.len(), 1, "only the node inside");
     let proc_node = result.nodes.iter().find(|n| n.id == "outer.inner.proc").unwrap();
     assert_eq!(proc_node.node_type, "Template");
+    assert_eq!(proc_node.scope, vec!["outer".to_string(), "outer.inner".to_string()]);
+    let inner = result.groups.iter().find(|g| g.id == "outer.inner").unwrap();
+    assert_eq!(inner.parent_group_id.as_deref(), Some("outer"));
+    // Nothing feeds `outer.data` from outside, so `outer` sends it (a
+    // closure, as it opens) through both groups' ports.
+    assert_eq!(via(wire(&result, "outer", "outer.inner.proc")), ins(&["outer.data", "outer.inner.x"]));
+    // What `proc` writes leaves through both outputs, and nobody reads
+    // `outer.result`: the wire ends there.
+    assert_eq!(via(wire(&result, "outer.inner.proc", "outer")), outs(&["outer.inner.y", "outer.result"]));
 }
 
 #[test]
@@ -329,7 +337,7 @@ b.data = a.value
 }
 
 #[test]
-fn self_ports_wire_through_the_group_boundaries() {
+fn self_ports_are_the_groups_own_ports() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "{{data}}" }
@@ -338,17 +346,16 @@ grp = Group(data: String) -> (result: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-    // self.data on right = group input = grp__in
-    let edge_in = result.edges.iter().find(|e| e.source == "grp__in").expect("self input edge");
-    assert_eq!(edge_in.target, "grp.worker");
+    // `self.data` on the right: the group's input, sent as it opens.
+    let edge_in = wire(&result, "grp", "grp.worker");
     assert_eq!(edge_in.target_handle.as_deref(), Some("value"));
     assert_eq!(edge_in.source_handle.as_deref(), Some("data"));
-
-    // self.result on left = group output = grp__out
-    let edge_out = result.edges.iter().find(|e| e.target == "grp__out").expect("self output edge");
-    assert_eq!(edge_out.source, "grp.worker");
+    assert_eq!(via(edge_in), ins(&["grp.data"]));
+    // `self.result` on the left: the group's output, read by nobody.
+    let edge_out = wire(&result, "grp.worker", "grp");
     assert_eq!(edge_out.source_handle.as_deref(), Some("output"));
     assert_eq!(edge_out.target_handle.as_deref(), Some("result"));
+    assert_eq!(via(edge_out), outs(&["grp.result"]));
 }
 
 #[test]
@@ -421,7 +428,7 @@ node = ExecPython(
 }
 
 #[test]
-fn group_boundaries_carry_the_declared_port_types() {
+fn group_ports_carry_the_declared_port_types() {
     // Types are declared as-is in the signature.
     let source = r#"
 batch = Group(items: List[String]) -> (results: List[String]) {
@@ -431,12 +438,9 @@ batch = Group(items: List[String]) -> (results: List[String]) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group ports");
-    let pt_in = result.nodes.iter().find(|n| n.id == "batch__in").unwrap();
-    assert_eq!(pt_in.inputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
-
-    let pt_out = result.nodes.iter().find(|n| n.id == "batch__out").unwrap();
-    assert_eq!(pt_out.outputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
-    assert_eq!(pt_out.inputs[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
+    let group = result.groups.iter().find(|g| g.id == "batch").unwrap();
+    assert_eq!(group.in_ports[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
+    assert_eq!(group.out_ports[0].port_type, WeftType::list(WeftType::Primitive(WeftPrimitive::String)));
 }
 
 #[test]
@@ -505,7 +509,7 @@ grp = Group(data: String) -> (result: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile with group description");
-    assert_eq!(result.nodes.len(), 3); // grp__in, grp__out, grp.worker
+    assert_eq!(result.nodes.len(), 1); // grp.worker
 }
 
 #[test]
@@ -538,7 +542,7 @@ node = ExecPython(data) -> (result) {}
 }
 
 #[test]
-fn wires_cross_three_levels_of_group_boundaries() {
+fn wires_cross_three_levels_of_groups() {
     let source = r#"
 
 input_text = Text { value: "hello" }
@@ -575,32 +579,16 @@ output = Debug {}
 output.data = level1.result
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile triple nested");
-
-    // The critical edge: input_text -> level1__in must exist
-    let has_input_to_l1 = result.edges.iter().any(|e| {
-        e.source == "input_text" && e.target == "level1__in"
-            && e.source_handle.as_deref() == Some("value")
-            && e.target_handle.as_deref() == Some("data")
-    });
-    assert!(has_input_to_l1, "input_text.value -> level1__in.data edge must exist");
-
-    // level1__in -> level1.l1_code
-    let has_l1in_to_code = result.edges.iter().any(|e| {
-        e.source == "level1__in" && e.target == "level1.l1_code"
-    });
-    assert!(has_l1in_to_code, "level1__in -> level1.l1_code edge must exist");
-
-    // level1.l1_code -> level1.level2__in
-    let has_l1code_to_l2 = result.edges.iter().any(|e| {
-        e.source == "level1.l1_code" && e.target == "level1.level2__in"
-    });
-    assert!(has_l1code_to_l2, "level1.l1_code -> level1.level2__in edge must exist");
-
-    // level1.level2__in -> level1.level2.l2_code
-    let has_l2in_to_code = result.edges.iter().any(|e| {
-        e.source == "level1.level2__in" && e.target == "level1.level2.l2_code"
-    });
-    assert!(has_l2in_to_code, "level1.level2__in -> level1.level2.l2_code edge must exist");
+    let into = wire(&result, "input_text", "level1.l1_code");
+    assert_eq!(via(into), ins(&["level1.data"]));
+    assert_eq!((into.source_handle.as_deref(), into.target_handle.as_deref()), (Some("value"), Some("data")));
+    assert_eq!(via(wire(&result, "level1.l1_code", "level1.level2.l2_code")), ins(&["level1.level2.data"]));
+    assert_eq!(via(wire(&result, "level1.level2.l2_code", "level1.level2.level3.l3_code")), ins(&["level1.level2.level3.data"]));
+    // The innermost result leaves all three groups on its way out.
+    assert_eq!(
+        via(wire(&result, "level1.level2.level3.l3_code", "output")),
+        outs(&["level1.level2.level3.result", "level1.level2.result", "level1.result"])
+    );
 }
 
 #[test]
@@ -652,8 +640,8 @@ return {\"output\": \"hello\"}
 ";
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none())
         .expect("should compile nested node with multi-line signature");
-    // outer__in, outer__out, outer.inner_node = 3 nodes
-    assert_eq!(result.nodes.len(), 3);
+    // outer.inner_node alone: a group is no node.
+    assert_eq!(result.nodes.len(), 1);
     let inner = result.nodes.iter().find(|n| n.id == "outer.inner_node").unwrap();
     assert_eq!(inner.node_type, "ExecPython");
     assert_eq!(inner.label.as_deref(), Some("Inner"));
@@ -714,14 +702,13 @@ node = ExecPython(data: Any) -> (result: String) {}
 }
 
 #[test]
-fn a_group_without_braces_still_gets_boundaries() {
+fn a_group_without_braces_is_still_a_group() {
     let source = r#"
 grp = Group(data: String) -> (result: String)
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group with no body");
-    // Should still create passthrough nodes
-    let pt_in = result.nodes.iter().find(|n| n.id == "grp__in");
-    assert!(pt_in.is_some());
+    let group = result.groups.iter().find(|g| g.id == "grp").expect("the group");
+    assert_eq!((group.in_ports.len(), group.out_ports.len()), (1, 1));
 }
 
 #[test]
@@ -1626,15 +1613,13 @@ target.y = src2.value
 // ─── Group Edge Cases ──────────────────────────────────────────────────────
 
 #[test]
-fn an_empty_group_body_still_gets_boundaries() {
+fn an_empty_group_body_is_still_a_group() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {}
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile empty group body");
-    let pt_in = result.nodes.iter().find(|n| n.id == "grp__in").unwrap();
-    let pt_out = result.nodes.iter().find(|n| n.id == "grp__out").unwrap();
-    assert_eq!(pt_in.node_type, "Passthrough");
-    assert_eq!(pt_out.node_type, "Passthrough");
+    assert!(result.nodes.is_empty());
+    assert!(result.groups.iter().any(|g| g.id == "grp"));
 }
 
 #[test]
@@ -1644,11 +1629,12 @@ grp = Group(data: String) -> (result: String) {
     self.result = self.data
 }
 "#;
-    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group with passthrough wiring");
-    // Only passthrough nodes, no child nodes
-    assert_eq!(result.nodes.len(), 2); // grp__in, grp__out
-    // Connection from __in to __out
-    assert!(result.edges.iter().any(|e| e.source == "grp__in" && e.target == "grp__out"));
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile group with a straight wire");
+    assert!(result.nodes.is_empty());
+    // The group's own input, sent as it opens, straight out to its own
+    // output, which nobody reads.
+    let straight = wire(&result, "grp", "grp");
+    assert_eq!(via(straight), vec![("grp.data".to_string(), CrossingSide::In), ("grp.result".to_string(), CrossingSide::Out)]);
 }
 
 #[test]
@@ -1721,11 +1707,13 @@ output = Debug {}
 output.data = llm.response
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile full workflow");
-    // input + processor__in + processor__out + processor.trimmer + llm + output = 6
-    assert_eq!(result.nodes.len(), 6);
-    // input->processor__in, processor__in->trimmer, trimmer->processor__out,
-    // processor__out->llm, llm->output = 5 edges
-    assert_eq!(result.edges.len(), 5);
+    // input + processor.trimmer + llm + output = 4
+    assert_eq!(result.nodes.len(), 4);
+    // input->trimmer through processor.raw, trimmer->llm through
+    // processor.clean, llm->output = 3 wires
+    assert_eq!(result.edges.len(), 3);
+    assert_eq!(via(wire(&result, "input", "processor.trimmer")), ins(&["processor.raw"]));
+    assert_eq!(via(wire(&result, "processor.trimmer", "llm")), outs(&["processor.clean"]));
 
     let llm = result.nodes.iter().find(|n| n.id == "llm").unwrap();
     assert_eq!(llm.label.as_deref(), Some("Summarizer"));
@@ -1749,7 +1737,7 @@ b = Template { template: "{{data}}" }
 }
 
 #[test]
-fn a_groups_boundaries_sit_in_its_parent_scope_and_children_in_its_own() {
+fn a_groups_members_sit_in_its_scope_and_the_group_in_its_parents() {
     let source = r#"
 grp = Group(data: String) -> (result: String) {
     worker = Template { template: "{{data}}" }
@@ -1758,22 +1746,9 @@ grp = Group(data: String) -> (result: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-
-    // __in passthrough: boundary In, scope = [] (parent is top-level)
-    let pt_in = result.nodes.iter().find(|n| n.id == "grp__in").unwrap();
-    assert!(pt_in.scope.is_empty(), "__in scope should be empty (top-level group)");
-    let gb_in = pt_in.group_boundary.as_ref().expect("__in should have groupBoundary");
-    assert_eq!(gb_in.group_id, "grp");
-    assert_eq!(gb_in.role, weft_core::GroupBoundaryRole::In);
-
-    // __out passthrough: boundary Out, scope = []
-    let pt_out = result.nodes.iter().find(|n| n.id == "grp__out").unwrap();
-    assert!(pt_out.scope.is_empty());
-    let gb_out = pt_out.group_boundary.as_ref().expect("__out should have groupBoundary");
-    assert_eq!(gb_out.group_id, "grp");
-    assert_eq!(gb_out.role, weft_core::GroupBoundaryRole::Out);
-
-    // Internal node: scope = ["grp"], no boundary
+    let group = result.groups.iter().find(|g| g.id == "grp").unwrap();
+    assert_eq!(group.parent_group_id, None, "a top-level group");
+    assert_eq!(group.node_ids, vec!["grp.worker".to_string()]);
     let worker = result.nodes.iter().find(|n| n.id == "grp.worker").unwrap();
     assert_eq!(worker.scope, vec!["grp"]);
     assert!(worker.group_boundary.is_none());
@@ -1802,10 +1777,6 @@ g = Group(data: String, extra?: String) -> (text: String, body: String) {
     // signature round-trips as written.
     let required: Vec<(&str, bool)> = group.in_ports.iter().map(|p| (p.name.as_str(), p.required)).collect();
     assert_eq!(required, vec![("data", true), ("extra", false)]);
-    for boundary in ["g__in", "g__out"] {
-        let node = result.nodes.iter().find(|n| n.id == boundary).expect(boundary);
-        assert!(node.outputs.iter().all(|p| p.required), "{boundary}: {:?}", node.outputs);
-    }
 }
 
 #[test]
@@ -1822,29 +1793,11 @@ outer = Group(data: String) -> (result: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile nested groups");
-
-    // outer__in: scope = [], boundary In for "outer"
-    let outer_in = result.nodes.iter().find(|n| n.id == "outer__in").unwrap();
-    assert!(outer_in.scope.is_empty());
-    assert_eq!(outer_in.group_boundary.as_ref().unwrap().group_id, "outer");
-
-    // outer__out: scope = [], boundary Out for "outer"
-    let outer_out = result.nodes.iter().find(|n| n.id == "outer__out").unwrap();
-    assert!(outer_out.scope.is_empty());
-
-    // inner__in: scope = ["outer"], boundary In for "outer.inner"
-    let inner_in = result.nodes.iter().find(|n| n.id == "outer.inner__in").unwrap();
-    assert_eq!(inner_in.scope, vec!["outer"]);
-    let gb = inner_in.group_boundary.as_ref().unwrap();
-    assert_eq!(gb.group_id, "outer.inner");
-    assert_eq!(gb.role, weft_core::GroupBoundaryRole::In);
-
-    // inner__out: scope = ["outer"], boundary Out for "outer.inner"
-    let inner_out = result.nodes.iter().find(|n| n.id == "outer.inner__out").unwrap();
-    assert_eq!(inner_out.scope, vec!["outer"]);
-    assert_eq!(inner_out.group_boundary.as_ref().unwrap().group_id, "outer.inner");
-
-    // worker inside inner: scope = ["outer", "outer.inner"]
+    let outer = result.groups.iter().find(|g| g.id == "outer").unwrap();
+    assert_eq!(outer.parent_group_id, None);
+    assert_eq!(outer.child_group_ids, vec!["outer.inner".to_string()]);
+    let inner = result.groups.iter().find(|g| g.id == "outer.inner").unwrap();
+    assert_eq!(inner.parent_group_id.as_deref(), Some("outer"));
     let worker = result.nodes.iter().find(|n| n.id == "outer.inner.worker").unwrap();
     assert_eq!(worker.scope, vec!["outer", "outer.inner"]);
     assert!(worker.group_boundary.is_none());
@@ -1868,22 +1821,12 @@ a = Group(x: String) -> (y: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile triple nested");
-
     let node = result.nodes.iter().find(|n| n.id == "a.b.c.node").unwrap();
     assert_eq!(node.scope, vec!["a", "a.b", "a.b.c"]);
-
-    // c's boundaries: scope = ["a", "a.b"]
-    let c_in = result.nodes.iter().find(|n| n.id == "a.b.c__in").unwrap();
-    assert_eq!(c_in.scope, vec!["a", "a.b"]);
-    assert_eq!(c_in.group_boundary.as_ref().unwrap().group_id, "a.b.c");
-
-    // b's boundaries: scope = ["a"]
-    let b_in = result.nodes.iter().find(|n| n.id == "a.b__in").unwrap();
-    assert_eq!(b_in.scope, vec!["a"]);
-
-    // a's boundaries: scope = []
-    let a_in = result.nodes.iter().find(|n| n.id == "a__in").unwrap();
-    assert!(a_in.scope.is_empty());
+    let parent = |id: &str| result.groups.iter().find(|g| g.id == id).unwrap().parent_group_id.clone();
+    assert_eq!(parent("a.b.c").as_deref(), Some("a.b"));
+    assert_eq!(parent("a.b").as_deref(), Some("a"));
+    assert_eq!(parent("a"), None);
 }
 
 #[test]
@@ -2048,30 +1991,21 @@ fn include_full_inlines_group() {
     let source = r#"
 c = @include("cleaner.weft")
 "#;
-    // Full mode (build): the file compiles ONCE as the body `Cleaner`
-    // (its id is the file's name), with IncludeIn / IncludeOut boundaries
-    // and its own nodes under it; the alias is a call site, a CallIn /
-    // CallOut pair wired to the body's boundaries port for port.
+    // Full mode (build): the file compiles ONCE as the body `@cleaner`
+    // (its id is the file's name) with its own nodes under it; the alias
+    // is a call site, and a wire through it passes the site's port and
+    // then the body's.
     let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
-    let ty = |id: &str| project.nodes.iter().find(|n| n.id == id).map(|n| n.node_type.as_str()).unwrap_or_else(|| panic!("no node {id}: {:?}", project.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()));
-    assert_eq!(ty("c__in"), "CallIn");
-    assert_eq!(ty("c__out"), "CallOut");
-    assert_eq!(ty("@cleaner__in"), "IncludeIn");
-    assert_eq!(ty("@cleaner__out"), "IncludeOut");
-    assert_eq!(ty("@cleaner.strip"), "Text");
-    let has_edge = |s: &str, sp: &str, t: &str, tp: &str| project.edges.iter().any(|e| e.source == s && e.source_handle.as_deref() == Some(sp) && e.target == t && e.target_handle.as_deref() == Some(tp));
-    assert!(has_edge("c__in", "raw", "@cleaner__in", "raw"), "the site hands its input to the body");
-    assert!(has_edge("@cleaner__out", "cleaned", "c__out", "cleaned"), "the body's result comes back to the site");
+    assert_eq!(project.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["@cleaner.strip"]);
+    // Nobody reads `c.cleaned`: the wire out ends at the site.
+    assert_eq!(via(wire(&project, "@cleaner.strip", "c")), outs(&["@cleaner.cleaned", "c.cleaned"]));
     let group = |id: &str| project.groups.iter().find(|g| g.id == id).unwrap_or_else(|| panic!("no group {id}"));
-    assert!(matches!(&group("c").kind, weft_core::GroupKind::Call { body } if body == "@cleaner"));
+    assert!(matches!(&group("c").kind, weft_core::GroupKind::Call { body, .. } if body == "@cleaner"));
     assert!(matches!(group("@cleaner").kind, weft_core::GroupKind::Body));
     // The body's node sits in the body's scope, not the site's.
     assert_eq!(project.nodes.iter().find(|n| n.id == "@cleaner.strip").unwrap().scope, vec!["@cleaner".to_string()]);
 }
 
-/// Two sites of one file share one body: one copy of its nodes, two call
-/// sites, both wired to the same boundaries. What tells the two calls
-/// apart at run time is the call frame each site's In pushes.
 #[test]
 fn a_file_included_twice_compiles_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -2081,9 +2015,7 @@ fn a_file_included_twice_compiles_once() {
     assert_eq!(project.nodes.iter().filter(|n| n.id == "@cleaner.strip").count(), 1);
     assert_eq!(project.groups.iter().filter(|g| matches!(g.kind, weft_core::GroupKind::Body)).count(), 1);
     for site in ["a", "b"] {
-        assert!(project.nodes.iter().any(|n| n.id == format!("{site}__in") && n.node_type == "CallIn"), "{site}");
-        assert!(project.edges.iter().any(|e| e.source == format!("{site}__in") && e.target == "@cleaner__in"), "{site} feeds the body");
-        assert!(project.edges.iter().any(|e| e.source == "@cleaner__out" && e.target == format!("{site}__out")), "the body answers {site}");
+        assert_eq!(via(wire(&project, "@cleaner.strip", site)), outs(&["@cleaner.cleaned", &format!("{site}.cleaned")]), "the body answers {site}");
     }
 }
 
@@ -2119,7 +2051,7 @@ fn two_included_files_with_one_name_are_two_bodies() {
         assert!(project.groups.iter().any(|g| g.id == body && matches!(g.kind, weft_core::GroupKind::Body)), "{body}");
         assert!(project.nodes.iter().any(|n| n.id == format!("{body}.strip")), "{body}.strip");
     }
-    assert!(matches!(&project.groups.iter().find(|g| g.id == "x").unwrap().kind, weft_core::GroupKind::Call { body } if body == "@a:cleaner"));
+    assert!(matches!(&project.groups.iter().find(|g| g.id == "x").unwrap().kind, weft_core::GroupKind::Call { body, .. } if body == "@a:cleaner"));
 }
 
 /// Two files that land on one body id are refused, even when the
@@ -2171,12 +2103,10 @@ fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
     // `Inner`, the middle file's under `Mid`.
     assert!(file_of("@inner.deep").ends_with("inner.weft"), "{}", file_of("@inner.deep"));
     assert!(file_of("@mid.m").ends_with("mid.weft"), "{}", file_of("@mid.m"));
-    // The inner body's IN boundary belongs to inner.weft. The site `i`
-    // that calls it is written in mid.weft, and so is the fill
-    // `i.raw = "from-mid"`, which lands on that site's In.
-    assert!(file_of("@inner__in").ends_with("inner.weft"), "{}", file_of("@inner__in"));
-    let site = node("@mid.i__in");
-    assert_eq!(site.node_type, "CallIn");
+    // The site `i` that calls the inner body is written in mid.weft, and
+    // so is the fill `i.raw = "from-mid"`, which lands on that site.
+    let site = project.groups.iter().find(|g| g.id == "@mid.i").expect("the site");
+    assert!(matches!(site.kind, weft_core::GroupKind::Call { .. }));
     assert!(site.source_file.as_deref().unwrap_or_default().ends_with("mid.weft"), "{:?}", site.source_file);
     let fill = site.port_literal_spans.get("raw").expect("fill span");
     assert!(
@@ -2184,16 +2114,17 @@ fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
         "{:?}",
         fill.source_file
     );
-    // An edge written inside the inner file names it too.
+    // The leg of a wire written inside the inner file names it too.
     let edge = project
         .edges
         .iter()
         .find(|e| e.source == "@inner.deep")
         .expect("inner edge");
+    assert_eq!(edge.via[0].group, "@inner");
     assert!(
-        edge.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
+        edge.via[0].source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
         "{:?}",
-        edge.source_file
+        edge.via[0].source_file
     );
 }
 
@@ -2210,16 +2141,14 @@ fn include_with_nested_group_scopes_under_the_body() {
     ).unwrap();
     let project = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let ids: std::collections::HashSet<&str> = project.nodes.iter().map(|n| n.id.as_str()).collect();
-    // The site's pair in the caller, the body's boundaries and the nested
-    // sub-group's, all under the body's id in one pass.
-    assert!(ids.contains("c__in") && ids.contains("c__out"), "site boundaries: {ids:?}");
-    assert!(ids.contains("@comp__in") && ids.contains("@comp__out"), "body boundaries: {ids:?}");
-    assert!(ids.contains("@comp.sub__in") && ids.contains("@comp.sub__out"), "nested-group boundaries: {ids:?}");
+    // The site in the caller, the body and its nested sub-group, all
+    // under the body's id in one pass.
+    let groups: std::collections::HashSet<&str> = project.groups.iter().map(|g| g.id.as_str()).collect();
+    assert!(groups.contains("c") && groups.contains("@comp") && groups.contains("@comp.sub"), "{groups:?}");
     assert!(ids.contains("@comp.sub.inner"), "deep child: {ids:?}");
     // The inline-expr anon node is scoped under the body too.
     assert!(ids.contains("@comp.pick__value"), "inline anon under the body: {ids:?}");
-    // Nothing of the body is scoped under the alias: the alias holds the
-    // site's two boundaries and nothing else.
+    // Nothing of the body is scoped under the alias.
     assert!(!ids.iter().any(|i| i.starts_with("c.")), "nothing under the alias: {ids:?}");
 }
 
@@ -2387,7 +2316,7 @@ Group(raw: String) -> (cleaned: String) {
     let child = project.groups.iter().find(|g| g.id == "Cleaner.sub").expect("child group under root");
     assert_eq!(child.label, None);
     assert!(project.nodes.iter().any(|n| n.id == "Cleaner.sub.inner"));
-    assert!(project.nodes.iter().any(|n| n.id == "Cleaner__out"));
+    assert_eq!(root.out_ports.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["cleaned"]);
 }
 
 /// `__` is reserved for compiler-generated ids (`{group}__in`/`__out` boundary
@@ -2566,12 +2495,12 @@ fn bare_port_name_reference_is_loud_not_a_literal() {
     let u = p.nodes.iter().find(|n| n.id == "g.u").expect("node g.u");
     assert!(u.config.get("text").is_none(), "no silent literal `text: \"raw\"`: {:?}", u.config);
 
-    // The correct `self.raw` form wires the group input boundary into the node.
+    // The correct `self.raw` form wires the group's input into the node.
     let wired = "g = Group(raw: String) -> (o: String) {\n  u = Upper {}\n  u.text = self.raw\n  self.o = u.out\n}\n";
     let (p2, errs2) = compile_lenient(wired, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, Some("Top"));
     assert!(!errs2.iter().any(|e| e.message.contains("invalid value")), "self.raw is valid: {errs2:?}");
     assert!(
-        p2.edges.iter().any(|e| e.source == "g__in" && e.target == "g.u"),
+        p2.edges.iter().any(|e| e.source == "g" && e.target == "g.u"),
         "self.raw wires the group input into u: {:?}", p2.edges.iter().map(|e| (&e.source, &e.target)).collect::<Vec<_>>()
     );
 }
@@ -2689,7 +2618,7 @@ clean = @include("cleaner.weft")
     let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let cfg = project.nodes.iter().find(|n| n.id == "cfg").expect("cfg");
     assert_eq!(cfg.config.get("systemPrompt").and_then(|v| v.as_str()), Some("be concise"));
-    assert!(project.nodes.iter().any(|n| n.id == "clean__in"));
+    assert!(project.groups.iter().any(|g| g.id == "clean"));
     assert!(project.nodes.iter().any(|n| n.id == "@cleaner.strip"));
 }
 
@@ -3101,9 +3030,8 @@ fn separate_line_post_body_output_syntax_is_no_longer_accepted() {
 fn include_with_internal_loop_lowers() {
     // Full-mode @include with a Loop inside the included file: the
     // loop's LoopIn/LoopOut boundary nodes land scoped under the body's
-    // id, one level below its own IncludeIn/IncludeOut. A regression in
-    // the include resolution would either drop the Loop or scope it
-    // wrong.
+    // id. A regression in the include resolution would either drop the
+    // Loop or scope it wrong.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("inner.weft"),
@@ -3125,11 +3053,8 @@ fn include_with_internal_loop_lowers() {
         .iter()
         .map(|n| (n.id.clone(), n.node_type.clone()))
         .collect();
-    // The site's pair in the caller, then the body's own boundaries.
-    assert!(ids.contains(&("c__in".into(), "CallIn".into())), "site in: {ids:?}");
-    assert!(ids.contains(&("c__out".into(), "CallOut".into())), "site out: {ids:?}");
-    assert!(ids.contains(&("@inner__in".into(), "IncludeIn".into())), "body in: {ids:?}");
-    assert!(ids.contains(&("@inner__out".into(), "IncludeOut".into())), "body out: {ids:?}");
+    assert!(project.groups.iter().any(|g| g.id == "c" && matches!(g.kind, weft_core::GroupKind::Call { .. })));
+    assert!(project.groups.iter().any(|g| g.id == "@inner" && matches!(g.kind, weft_core::GroupKind::Body)));
     // The loop's boundary nodes one level inside the body.
     assert!(ids.contains(&("@inner.doit__in".into(), "LoopIn".into())), "loop in: {ids:?}");
     assert!(ids.contains(&("@inner.doit__out".into(), "LoopOut".into())), "loop out: {ids:?}");
@@ -3150,11 +3075,11 @@ outer = Group(x: String) -> (y: String) {
 }
 "#;
     let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-    let pt_in = result.nodes.iter().find(|n| n.id == "outer__in").expect("in boundary");
+    let group = result.groups.iter().find(|g| g.id == "outer").expect("the group");
     assert_eq!(
-        pt_in.port_literals.get("_should_flow"),
+        group.port_literals.get("_should_flow"),
         Some(&serde_json::Value::Bool(false)),
-        "the literal guards the whole subgraph from the boundary"
+        "the literal guards the whole subgraph from the group"
     );
 }
 
@@ -3177,7 +3102,7 @@ outer = Group(x: String) -> (y: String) {
         .iter()
         .find(|e| e.target_handle.as_deref() == Some("_should_flow"))
         .expect("a wired guard is an ordinary edge");
-    assert_eq!(edge.target, "outer__in");
+    assert_eq!(edge.target, "outer");
     assert_eq!(edge.source, "check");
 }
 
@@ -3225,8 +3150,8 @@ fn every_written_form_of_should_flow() {
         }
     }
 
-    // An include alias is a group: the guard lands on its In boundary
-    // from outside the same way.
+    // An include alias is a group: the guard lands on it from outside the
+    // same way.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("sub.weft"),
@@ -3236,16 +3161,16 @@ fn every_written_form_of_should_flow() {
     let src = "c = Debug {}\na = @include(\"sub.weft\")\na.raw = \"x\"\na._should_flow = c.data\nout = Debug { data: a.cleaned }\n";
     let p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("include alias takes the guard");
     assert!(
-        p.edges.iter().any(|e| e.target == "a__in" && e.target_handle.as_deref() == Some("_should_flow")),
-        "the guard wire lands on the alias's In boundary: {:?}",
+        p.edges.iter().any(|e| e.target == "a" && e.target_handle.as_deref() == Some("_should_flow")),
+        "the guard wire lands on the alias: {:?}",
         p.edges.iter().map(|e| (&e.target, &e.target_handle)).collect::<Vec<_>>()
     );
 
-    // From outside, a literal on a container's port lands on its In
-    // boundary, the node those ports belong to.
+    // From outside, a literal on a container's port lands on the
+    // container, whose ports those are.
     let outside = "g = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\ng.x = \"hi\"\ng._should_flow = false\nout = Debug {}\nout.data = g.y\n";
     let p = compile(outside, uuid::Uuid::new_v4(), CompileFs::none()).expect("outside literals compile");
-    let pt_in = p.nodes.iter().find(|n| n.id == "g__in").expect("in boundary");
+    let pt_in = p.groups.iter().find(|g| g.id == "g").expect("the group");
     assert_eq!(pt_in.port_literals.get("x"), Some(&serde_json::json!("hi")));
     assert_eq!(pt_in.port_literals.get("_should_flow"), Some(&serde_json::json!(false)));
 
@@ -3269,7 +3194,7 @@ outer = Group(x: String) -> (y: String) {
 }
 "#;
     let p = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
-    let pt_in = p.nodes.iter().find(|n| n.id == "outer.inner__in").expect("in boundary");
+    let pt_in = p.groups.iter().find(|g| g.id == "outer.inner").expect("the inner group");
     assert_eq!(pt_in.port_literals.get("v"), Some(&serde_json::json!("fixed")));
     assert_eq!(pt_in.port_literals.get("_should_flow"), Some(&serde_json::json!(false)));
 }
@@ -3287,7 +3212,7 @@ fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
 
     // Build path: the include is inlined, so the alias IS a group.
     let p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("inlined include");
-    let pt_in = p.nodes.iter().find(|n| n.id == "c__in").expect("in boundary");
+    let pt_in = p.groups.iter().find(|g| g.id == "c").expect("the site");
     assert_eq!(pt_in.port_literals.get("raw"), Some(&serde_json::json!("hi")));
 
     // Editor path: the include is one opaque node carrying the same ports,
@@ -3307,7 +3232,7 @@ fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
 fn label_and_mock_are_ordinary_port_names() {
     let group = "g = Group(label: String, mock: String) -> (y: String) {\n  self.y = self.label\n}\ng.label = \"hi\"\ng.mock = \"m\"\nout = Debug {}\nout.data = g.y\n";
     let p = compile(group, uuid::Uuid::new_v4(), CompileFs::none()).expect("a group port called label");
-    let pt_in = p.nodes.iter().find(|n| n.id == "g__in").expect("in boundary");
+    let pt_in = p.groups.iter().find(|g| g.id == "g").expect("the group");
     assert_eq!(pt_in.port_literals.get("label"), Some(&serde_json::json!("hi")));
     assert_eq!(pt_in.port_literals.get("mock"), Some(&serde_json::json!("m")));
 
@@ -3316,7 +3241,7 @@ fn label_and_mock_are_ordinary_port_names() {
         "Group(label: String) -> (y: String) {\n  self.y = self.label\n}\n").unwrap();
     let src = "m = @include(\"mark.weft\")\nm.label = \"hi\"\nout = Debug {}\nout.data = m.y\n";
     let p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("an include port called label");
-    let pt_in = p.nodes.iter().find(|n| n.id == "m__in").expect("in boundary");
+    let pt_in = p.groups.iter().find(|g| g.id == "m").expect("the site");
     assert_eq!(pt_in.port_literals.get("label"), Some(&serde_json::json!("hi")));
     let (p2, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None);
     assert!(errs.is_empty(), "{errs:?}");

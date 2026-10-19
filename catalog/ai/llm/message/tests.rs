@@ -14,6 +14,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("appends_a_user_message_to_the_conversation_file", appends_user),
         NodeTest::fake("with_no_file_a_message_starts_a_new_conversation_file", starts_a_file),
         NodeTest::fake("media_rides_the_appended_message_as_stored_slots", appends_media),
+        NodeTest::fake("a_null_in_a_media_list_is_left_out", null_media_left_out),
         NodeTest::fake("a_tool_message_needs_its_call_id", tool_needs_call_id),
         NodeTest::fake("a_call_id_only_belongs_on_a_tool_message", call_id_only_on_tool),
         NodeTest::fake("refuses_a_message_with_no_substance", refuses_empty),
@@ -62,6 +63,28 @@ async fn appends_media(rig: FakeRig) -> WeftResult<()> {
         "the media slot must hold the stored value, got {}",
         parts[1]["image_url"]["url"]
     );
+    Ok(())
+}
+
+async fn null_media_left_out(rig: FakeRig) -> WeftResult<()> {
+    // A loop's gathered list: a null for each iteration that made no image.
+    let first = rig.store_file("one.png", "image/png", b"ONE".to_vec());
+    let second = rig.store_file("two.png", "image/png", b"TWO".to_vec());
+    let outcome = rig
+        .run(
+            &ChatHistoryAppendNode,
+            json!({ "role": "user", "text": "the screenshots", "media": [null, first, null, second] }),
+        )
+        .await
+        .ok()?;
+    let out = conversation(&rig, outcome.output("historyFile")?)?;
+    let parts = out[0]["content"].as_array().expect("parts");
+    let kinds: Vec<&str> = parts.iter().map(|p| p["type"].as_str().expect("a type")).collect();
+    assert_eq!(kinds, vec!["text", "image_url", "image_url"], "{parts:?}");
+    // Every slot null is no media at all: a message with nothing else is refused.
+    let empty = rig.run(&ChatHistoryAppendNode, json!({ "role": "user", "media": [null, null] })).await;
+    let err = empty.result.expect_err("only nulls is no media").to_string();
+    assert!(err.contains("text or media"), "{err}");
     Ok(())
 }
 

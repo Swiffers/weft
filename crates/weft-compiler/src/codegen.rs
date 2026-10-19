@@ -82,7 +82,7 @@ pub fn emit(
 
     // The CATALOG node types this binary compiles in: what the project
     // references, or the whole catalog under `NodeSet::Full`. Runtime-
-    // internal built-ins (Passthrough, LoopIn, LoopOut, ...) are never
+    // internal built-ins (LoopIn, LoopOut) are never
     // among them: the engine dispatches them inline, so they don't need
     // a catalog shim and the catalog doesn't carry them.
     let referenced = node_types_for(project, catalog, node_set);
@@ -244,8 +244,8 @@ pub fn node_types_for(
 }
 
 /// The set of CATALOG node types this project references, sorted.
-/// Runtime-internal built-in node types (Passthrough, LoopIn,
-/// LoopOut, ...) are excluded: they live in the engine, not the
+/// Runtime-internal built-in node types (LoopIn, LoopOut) are
+/// excluded: they live in the engine, not the
 /// catalog, and the codegen / hash / docker passes that consume this
 /// set would otherwise fail to resolve them. Exposed so callers
 /// outside codegen (e.g. Dockerfile emission) walk the same set
@@ -452,7 +452,7 @@ fn write_package_crates(
 }
 
 /// The slot a package crate compiles in: sixteen hex characters over
-/// the package's files (the node-tree walk the binary hash uses, so
+/// the package's files (the package walk the binary hash uses, so
 /// the same files count) and the generated manifest and shim.
 fn package_crate_slot(
     pkg: &PackageEmit<'_>,
@@ -462,7 +462,7 @@ fn package_crate_slot(
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"weft-package-crate-v1\n");
-    crate::hash::hash_path(&mut hasher, &pkg.module_ident, &pkg.package.root)
+    crate::hash::hash_package_root(&mut hasher, &pkg.module_ident, &pkg.package.root)
         .map_err(|e| CompileError::Build(format!("hash package {}: {e}", pkg.package.name)))?;
     hasher.update(b"Cargo.toml:\n");
     hasher.update(cargo_toml.as_bytes());
@@ -583,18 +583,9 @@ fn render_package_lib_rs(
                     shared_path.display()
                 ))
             })?;
-        // The stem becomes a generated `pub mod {mod_name};`, so a
-        // stem that is not a plain identifier must fail here, naming
-        // the file, instead of as a rustc error inside the crate.
-        if !weft_core::is_rust_identifier(mod_name) {
-            return Err(CompileError::Build(format!(
-                "package {}: shared file {} would become module `{mod_name}`, \
-                 which is not a valid Rust identifier ([A-Za-z_][A-Za-z0-9_]*); \
-                 rename the file",
-                pkg.package.name,
-                shared_path.display()
-            )));
-        }
+        // The stem becomes a generated `pub mod {mod_name};`: the catalog
+        // refused the package at load if it is not a module name its crate
+        // can hold (`weft_catalog`'s `module_problem`).
         let include = escape_quoted_str(&paths.include_path(shared_path)?);
         body.push_str(&format!(
             "#[path = \"{include}\"]\npub mod {mod_name};\n\n"
@@ -604,7 +595,7 @@ fn render_package_lib_rs(
         let entry = catalog.entry(node_type).expect("collected from catalog");
         let mod_rs = entry.source_dir.join("mod.rs");
         let include = escape_quoted_str(&paths.include_path(&mod_rs)?);
-        let mod_name = ident_for_node_type(node_type);
+        let mod_name = weft_catalog::node_module_name(node_type);
         body.push_str(&format!(
             "#[path = \"{include}\"]\npub mod {mod_name};\n\n"
         ));
@@ -1029,7 +1020,7 @@ fn write_registry_rs(
     body.push_str("        match node_type {\n");
     for pkg in packages {
         for node_type in &pkg.node_types {
-            let struct_mod = ident_for_node_type(node_type);
+            let struct_mod = weft_catalog::node_module_name(node_type);
             body.push_str(&format!(
                 "            \"{nt}\" => Some(&{pkg_mod}::{struct_mod}::{nt}Node as &'static dyn Node),\n",
                 nt = node_type,
@@ -1055,24 +1046,6 @@ fn write_registry_rs(
     Ok(())
 }
 
-/// Convert a PascalCase node type (e.g. `ApiKeyAuth`, `HumanQuery`,
-/// `LlmInference`) into a snake_case Rust module identifier
-/// (`api_key_auth`, `human_query`, `open_router_inference`). Rules: lowercase
-/// the first char; insert `_` before every subsequent uppercase.
-fn ident_for_node_type(node_type: &str) -> String {
-    let mut out = String::with_capacity(node_type.len() + 4);
-    for (i, ch) in node_type.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
 
 // Each package crate is an EXTERNAL cargo dep (path = "./pkg_<name>-<slot>"
 // in Cargo.toml), so the worker binary just uses them as crates and
@@ -1584,7 +1557,7 @@ mod tests {
 
     /// Regression: codegen's `collect_node_types` used to return every
     /// node's `node_type` verbatim, including runtime-internal built-ins
-    /// (Passthrough, LoopIn, LoopOut). Downstream callers (worker-image
+    /// (LoopIn, LoopOut). Downstream callers (worker-image
     /// build, source-hash) then fed those to the catalog and the build
     /// failed with `node 'LoopIn' not found in catalog`. The filter
     /// must drop those before the catalog lookup.
@@ -1596,20 +1569,18 @@ mod tests {
                 make_node("user_node", "Text"),
                 make_node("my_loop__in", "LoopIn"),
                 make_node("my_loop__out", "LoopOut"),
-                make_node("my_group__in", "Passthrough"),
-                make_node("my_group__out", "Passthrough"),
             ],
             edges: Vec::new(),
             groups: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
         };
         let types = collect_node_types(&project);
         assert!(types.contains("Text"), "user catalog type included: {types:?}");
         assert!(!types.contains("LoopIn"), "LoopIn excluded: {types:?}");
         assert!(!types.contains("LoopOut"), "LoopOut excluded: {types:?}");
-        assert!(!types.contains("Passthrough"), "Passthrough excluded: {types:?}");
     }
 
     use super::{add_dep, merge_dep_specs};

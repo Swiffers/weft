@@ -10,21 +10,22 @@
 //! plain `weft run` is this endpoint with no seed and no scope.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::Value;
-use weft_core::run_spec::{resolve_spec, Refusal, Resolved, RunSpec};
+use weft_core::run_spec::{resolve_seeded, resolve_spec, Refusal, RunSpec};
 use weft_core::frames::Located;
 use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
 use weft_core::RunId;
 
-use crate::api::project::{coherent_definition, require_action, Kick};
+use crate::api::project::{coherent_definition, require_action};
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
-use crate::versions::{plan_prune, resolve_seed, version_id, Manifest, RunRow, SeedChoice, VersionRow};
+use crate::versions::{plan_prune, resolve_seed, version_id, Manifest, SeedChoice, VersionRow};
 use weft_core::versions::{
     manifest_diff, CheckpointRequest, Head, HeadRequest, HeadResponse, PruneResponse, RunStarted, VersionRun, RunUpdate,
     RunningSource, SweepResponse, VersionRunRequest, VersionSummary, VersionTree, VersionUpsert,
@@ -319,88 +320,118 @@ async fn settled_run_ids(
     state.journal.settled_run_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
 }
 
-/// The seed run folded, with its program: what the stale set reads.
+/// The seed run folded: the complete results it holds, by place (its
+/// own, and those it reused from earlier runs, each from the run that made
+/// it), and the places that waited in it with the fingerprint of their
+/// code there.
 struct SeededFrom {
     run_id: RunId,
     outcomes: BTreeMap<Located, SeedOutcome>,
-    outputs: Vec<weft_core::run_spec::OutputWire>,
+    answered: BTreeMap<Located, weft_core::project::hash::SourceHash>,
 }
 
-async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -> Result<SeededFrom, ApiError> {
-    if run.project_id != project { return Err((StatusCode::NOT_FOUND, "seed is outside this project".into())); }
-    let sources = crate::projection::reconstruct_run(state, run.run_id).await.map_err(|e| internal("seed sources", e))?;
-    let definition = sources[&run.run_id].project().as_ref();
-    let snapshot = sources[&run.run_id].snapshot();
-    let outputs = sources[&run.run_id].output_wires().map_err(|e| internal("seed outputs", e))?;
+/// The registered program a run was run against (the one its cut was cut
+/// from, or its own: `DispatcherState::registered_identity`) and that
+/// program's identity: what a seed holds the run's results against.
+async fn registered_of(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+    run_id: RunId,
+    snapshot: &weft_core::primitive::RunSnapshot,
+) -> Result<(Arc<weft_core::ProjectDefinition>, weft_core::project::hash::ProgramIdentity), ApiError> {
+    let (Some(definition_hash), Some(binary_hash)) = (snapshot.definition_hash.as_deref(), snapshot.binary_hash.as_deref()) else {
+        return Err(internal("seed identity", format!("run {run_id} has no production code identity")));
+    };
+    let identity = state.registered_identity(run_id, project, definition_hash, snapshot.cut_from.as_deref(), binary_hash).await
+        .map_err(|e| internal("seed identity", e))?;
+    let hash = &identity.definition_hash;
+    let registered = state.program(project, hash).await.map_err(|e| internal("seed program", e))?
+        .ok_or_else(|| internal("seed program", format!("run {run_id} ran against program {hash}, which this project no longer records")))?;
+    Ok((registered, identity))
+}
+
+/// Fold `run_id`, a settled run of `project`, for a seed (see
+/// [`SeededFrom`]).
+async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run_id: RunId) -> Result<SeededFrom, ApiError> {
+    let sources = crate::projection::reconstruct_run(state, run_id).await.map_err(|e| internal("seed sources", e))?;
+    let fold = &sources[&run_id];
+    if fold.project().id != project {
+        return Err((StatusCode::NOT_FOUND, "seed is outside this project".into()));
+    }
+    let snapshot = fold.snapshot();
+    let outputs = fold.output_wires().map_err(|e| internal("seed outputs", e))?;
     let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
         .map(|wire| wire.place()).collect();
-    let mut identities = BTreeMap::new();
+    // Per run a result comes from: its slices over the program it was run
+    // against, and its output history.
+    let mut slices: BTreeMap<RunId, BTreeMap<Located, weft_core::project::hash::SourceHash>> = BTreeMap::new();
+    let mut histories: BTreeMap<RunId, Vec<weft_core::run_spec::OutputWire>> = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
-    for place in inheritable_nodes(definition, snapshot) {
-        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.run_id);
-        let (original, graph) = if origin == run.run_id { (snapshot, definition) } else {
-            let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
-            (source.snapshot(), source.project().as_ref())
-        };
-        if let std::collections::btree_map::Entry::Vacant(slot) = identities.entry(origin) {
-            let binary_hash = original.binary_hash.as_deref()
-                .ok_or_else(|| internal("seed identity", format!("run {origin} has no production code identity")))?;
-            let definition_hash = weft_core::project::hash::compute_definition_hash(graph).map_err(|e| internal("seed identity", e))?;
-            let program = state.projects.program_identity(project, &definition_hash, binary_hash).await
-                .map_err(|e| internal("seed identity", e))?
-                .ok_or_else(|| internal("seed identity", format!("run {origin} ran on worker {binary_hash}, which this project no longer records")))?;
-            slot.insert(program.slice_hashes(graph).map_err(|e| internal("seed identity", e))?);
+    for place in inheritable_nodes(fold.project(), snapshot) {
+        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run_id);
+        let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
+        let (original, graph) = (source.snapshot(), source.project());
+        if let std::collections::btree_map::Entry::Vacant(slice) = slices.entry(origin) {
+            let (registered, identity) = registered_of(state, project, origin, original).await?;
+            slice.insert(identity.slice_hashes(&registered).map_err(|e| internal("seed identity", e))?);
+            histories.insert(origin, source.output_wires().map_err(|e| internal("seed outputs", e))?);
         }
-        let mut used_backups = BTreeMap::new();
-        let mut backup_origins = BTreeMap::new();
-        let mut absent_ports = BTreeSet::new();
         let declaration = graph.nodes.iter().find(|n| n.id == place.id).ok_or_else(|| internal("seed node", &place.id))?;
-        for record in original.firings.get(&place.id).into_iter().flatten()
-            .filter(|record| Located::at(&place.id, &record.frames) == place)
-        {
-            for port in &record.received.backup_ports {
-                let value = original.selection.as_ref().and_then(|selection| selection.input.get(&place))
-                    .and_then(|ports| ports.get(port)).ok_or_else(|| internal("seed backup", format!("{origin}: {place}.{port} has no recorded backup")))?;
-                used_backups.insert(port.clone(), value.clone());
-                backup_origins.insert(port.clone(), record.received.inherited_ports.get(port).copied().unwrap_or(origin));
-            }
-            absent_ports.extend(declaration.inputs.iter().filter(|port| !record.received.input.contains_key(&port.name)).map(|port| port.name.clone()));
-        }
-        let boundary_ports = original.selection.as_ref().and_then(|selection| selection.boundary_ports.get(&place)).cloned().unwrap_or_default();
-        let slice_hash = identities[&origin].get(&place).ok_or_else(|| internal("seed identity", format!("run {origin} has no slice for {place}")))?.clone();
-        outcomes.insert(place.clone(), SeedOutcome { origin, slice_hash, used_backups, backup_origins, absent_ports, boundary_ports,
+        let slice_hash = slices[&origin].get(&place).ok_or_else(|| internal("seed identity", format!("run {origin} has no slice for {place}")))?.clone();
+        outcomes.insert(place.clone(), SeedOutcome {
+            origin,
+            slice_hash,
+            handed: original.given.inputs.get(&place).cloned().unwrap_or_default(),
+            gates: weft_core::seeding::gates_handed_around(&original.given, graph, &place),
             emitted_live_handle: live_nodes.contains(&place),
             fire: original.kicked.iter().find(|(location, kick)| Located::at(&location.node_id, &location.frames) == place && kick.firing)
                 .map(|(_, kick)| kick.payload.clone().unwrap_or(Value::Null)),
+            outputs: weft_core::seeding::sent_ports(declaration, &place, &histories[&origin]),
         });
     }
-    Ok(SeededFrom { run_id: run.run_id, outcomes, outputs })
+    // The places that waited here and were answered, each with its code's
+    // fingerprint: what a run that runs one again replays.
+    let mut answered = BTreeMap::new();
+    let waited: BTreeSet<Located> = snapshot.awaited_sequences.iter()
+        .filter(|(_, entries)| !weft_core::primitive::answered_steps(entries).is_empty())
+        .map(|(at, _)| Located::at(&at.node_id, &at.frames))
+        .collect();
+    if !waited.is_empty() {
+        let (registered, identity) = registered_of(state, project, run_id, snapshot).await?;
+        for place in waited {
+            answered.insert(place.clone(), identity.node_hash(&registered, &place.id).map_err(|e| internal("seed answers", e))?);
+        }
+    }
+    Ok(SeededFrom { run_id, outcomes, answered })
 }
 
-/// Refuse a seed that would reuse an output naming a stored file the
-/// file has moved on from: a reused node's saved result says what the
+/// Refuse a seed that would hand this run an output naming a stored file
+/// the file has moved on from: a reused node's saved result says what the
 /// node made, and a file edited since (by a later node, by another run)
-/// or gone no longer holds it. Every such output is named at once, so
-/// one refusal says everything to hand in or re-run.
+/// or gone no longer holds it. Only what stands in for itself here
+/// (`stand_ins`) hands this run anything; a place reused and read by
+/// nothing that runs hands it nothing. Every such output is named at
+/// once, so one refusal says everything to hand in or re-run.
 async fn refuse_moved_files(
     state: &DispatcherState,
     project: &weft_core::ProjectDefinition,
-    reused: &BTreeMap<Located, RunId>,
-    outputs: &[weft_core::run_spec::OutputWire],
+    stand_ins: &BTreeMap<Located, weft_core::project::StandIn>,
 ) -> Result<(), ApiError> {
     let mut refusals = Vec::new();
-    for wire in outputs.iter().filter(|wire| !wire.closed && reused.contains_key(&wire.place())) {
-        for file in weft_core::storage::stored_files_within(&wire.value) {
-            let now = match crate::storage::file_meta(state, &file.key).await {
-                Ok(meta) => weft_core::seeding::FileNow::At(meta.version),
-                Err(e) if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() => {
-                    weft_core::seeding::FileNow::Gone
-                }
-                Err(e) => return Err(internal("read a reused output's file", e)),
-            };
-            let place = wire.place();
-            let node = weft_core::project::address_of(project, &place.id, &place.path);
-            refusals.extend(weft_core::seeding::moved_file_refusal(&node, &wire.port, &file, now));
+    for (place, stand_in) in stand_ins {
+        for (port, given) in &stand_in.ports {
+            let weft_core::project::GivenPort::Value { value } = given else { continue };
+            for file in weft_core::storage::stored_files_within(value) {
+                let now = match crate::storage::file_meta(state, &file.key).await {
+                    Ok(meta) => weft_core::seeding::FileNow::At(meta.version),
+                    Err(e) if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() => {
+                        weft_core::seeding::FileNow::Gone
+                    }
+                    Err(e) => return Err(internal("read a reused output's file", e)),
+                };
+                let node = weft_core::project::address_of(project, &place.id, &place.path);
+                refusals.extend(weft_core::seeding::moved_file_refusal(&node, port, &file, now));
+            }
         }
     }
     if refusals.is_empty() {
@@ -418,8 +449,14 @@ pub async fn run(
 ) -> Result<Json<RunStarted>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
     require_action(&state, id, None, &["run"]).await?;
-    if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed {
+    if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed && body.seed_run.is_none() {
         return Err((StatusCode::BAD_REQUEST, "`--seed-until` and `--seed-before` need `--seed`".into()));
+    }
+    if body.root && (body.seed || body.seed_run.is_some()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "`--root` starts a new tree, with nothing before this run to reuse, so it cannot go with `--seed`: drop one of them".into(),
+        ));
     }
     let (program, project) = coherent_definition(&state, id).await?;
     let definition_hash = program.definition_hash.clone();
@@ -464,22 +501,34 @@ pub async fn run(
     // Head for the SEED choice. The version's parent reads head again
     // inside the lock, where it cannot be stale.
     let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-    let seed_run: Option<RunRow> = if body.seed && !body.root {
-        let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
-        let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let settled = settled_run_ids(&state, id).await?;
-        match resolve_seed(&head, &versions, &runs, |c| settled.contains(&c)) {
-            SeedChoice::Run(run_id) => runs.into_iter().find(|r| r.run_id == run_id),
-            SeedChoice::Nothing => None,
-            SeedChoice::HeadRunning(run_id) => {
+    let seed_run: Option<RunId> = match (body.seed, body.seed_run) {
+        // Any settled run of the project: one a trigger started, one that
+        // failed, one of any version.
+        (_, Some(run_id)) => {
+            if !settled_run_ids(&state, id).await?.contains(&run_id) {
                 return Err((
                     StatusCode::CONFLICT,
-                    format!("head {run_id} is still running; `weft stop {run_id}` or wait, then run again"),
+                    format!("run {run_id} is not a settled run of this project (it is still going, or it is not this project's): `weft stop {run_id}` or wait, then run again"),
                 ));
             }
+            Some(run_id)
         }
-    } else {
-        None
+        (true, None) => {
+            let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
+            let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
+            let settled = settled_run_ids(&state, id).await?;
+            match resolve_seed(&head, &versions, &runs, |c| settled.contains(&c)) {
+                SeedChoice::Run(run_id) => Some(run_id),
+                SeedChoice::Nothing => None,
+                SeedChoice::HeadRunning(run_id) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("head {run_id} is still running; `weft stop {run_id}` or wait, then run again"),
+                    ));
+                }
+            }
+        }
+        _ => None,
     };
 
     let spec = body.spec.clone().unwrap_or_else(|| RunSpec::whole("run"));
@@ -487,7 +536,7 @@ pub async fn run(
     // copies; an infra node it reads nothing but saved values of does not
     // run.
     let saved = crate::api::project::saved_for_run(&state, id, &project, spec.instance.as_ref()).await?;
-    let mut resolved = resolve_spec(&spec, &project, &saved).map_err(|r| refused(&r))?;
+    let authored = resolve_spec(&spec, &project, &saved).map_err(|r| refused(&r))?;
     let bakes = if spec.fire.is_some() {
         // An instance's trigger was baked with that instance's values: the
         // fire replays the instance's bake.
@@ -507,10 +556,13 @@ pub async fn run(
     let mut stand_in: Option<weft_core::primitive::SignalSpec> = None;
     // The trigger `--fire` names, spelled: the run is that trigger's.
     let mut fired_trigger: Option<String> = None;
+    // What the fired trigger's setup captured on its ports, which its
+    // firing kick replays.
+    let mut fired_ports: Option<Value> = None;
     // How the run is kept: a fire starts the way its trigger says (the
     // spec its bake captured), with what the run asks for by hand over it.
     let mut kept_by_trigger = weft_core::run_settings::RunSettings::default();
-    for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
+    for kick in authored.kicks.iter().filter(|kick| kick.firing) {
         // A bake captures a trigger under its place (`one.door` for the
         // `door` an include site `one` reaches), so the kick is spelled
         // through its call frames before the lookup.
@@ -521,7 +573,7 @@ pub async fn run(
         let capture = bakes.iter().find(|bake| bake.program == program)
             .and_then(|bake| bake.captured.get(&address))
             .expect("validated bake contains this trigger for this program");
-        kick.port_snapshot = Some(capture.ports.clone());
+        fired_ports = Some(capture.ports.clone());
         kept_by_trigger = capture.spec.settings;
         if weft_core::signal::caller_protocol(&capture.spec.kind).is_some() {
             let payload = spec
@@ -534,40 +586,41 @@ pub async fn run(
         }
     }
 
-    // The infra gate (`require_run_infra`), against the definition this
-    // run was just built from and the places it executes before any seed
-    // narrows them: a node a seed stands in for still calls the infra it
-    // was wired to. `require_action` above deliberately does not enforce
-    // the whole-graph fact (it reports it, for the bar's unaimed button),
-    // the way it leaves the trigger facts to `require_trigger_infra`.
-    crate::api::project::require_run_infra(&state, id, &project, &resolved.selection, spec.instance.as_ref()).await?;
+    // The infra gate (`require_run_infra`), against the program this run
+    // was cut to before any seed narrows it: a node a seed stands in for
+    // still calls the infra it was wired to. `require_action` above
+    // deliberately does not enforce the whole-graph fact (it reports it,
+    // for the bar's unaimed button), the way it leaves the trigger facts
+    // to `require_trigger_infra`.
+    crate::api::project::require_run_infra(&state, id, &authored.program, spec.instance.as_ref()).await?;
     let settings = spec.settings.over(kept_by_trigger).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
 
-    // What the run inherits and what it kicks.
+    // What the run reuses, and what it runs.
     let mut starting_parameters = spec.clone();
-    let (seed, stale, kicks) = match &seed_run {
-        Some(run) => {
-            let from = fold_seed(&state, id, run).await?;
-            let planned = seed_plan(&project, &program, &resolved.selection, &spec, &from.outcomes,
+    let (mut resolved, seed) = match seed_run {
+        Some(seed_run) => {
+            let from = fold_seed(&state, id, seed_run).await?;
+            let planned = seed_plan(&project, &program, &authored, &spec, &from.outcomes, &from.answered,
                 &body.seed_until, &body.seed_before)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-            refuse_moved_files(&state, &project, &planned.origins, &from.outputs).await?;
-            starting_parameters = weft_core::seeding::starting_parameters(&project, &spec, &resolved.selection, &planned, &from.outcomes, &from.outputs)
+            refuse_moved_files(&state, &project, &planned.stand_ins).await?;
+            starting_parameters = weft_core::seeding::starting_parameters(&project, &spec, &authored.walk, &planned, &from.outcomes)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-            resolved.warnings.extend(planned.warnings);
-            resolved.selection = planned.selection;
-            let stale = resolved.selection.nodes.clone();
-            let kicks = seeded_kicks(&resolved, &stale);
-            let seed = weft_journal::Seed { parent: from.run_id, origins: planned.origins };
-            (Some(seed), stale, kicks)
+            let mut resolved = resolve_seeded(&spec, &project, &saved, Some(&planned)).map_err(|r| refused(&r))?;
+            resolved.warnings.extend(planned.warnings.iter().cloned());
+            let seed = weft_journal::Seed { parent: from.run_id, origins: planned.origins, answers: planned.answers };
+            (resolved, Some(seed))
         }
-        None => (None, resolved.selection.nodes.clone(), resolved.kicks.clone()),
+        None => (authored, None),
     };
-    // Against the selection as it will run: a seed's history may have
-    // fed a crossing the authored cut left open. When it did not, say
-    // which run was read and why its results could not stand in, or
-    // `--seed` reads as ignored.
-    weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).map_err(|mut refusal| {
+    for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
+        kick.port_snapshot = fired_ports.clone();
+    }
+    // Against the program as it will run: a seed's history may have fed a
+    // crossing the authored cut left open. When it did not, say which run
+    // was read and why its results could not stand in, or `--seed` reads
+    // as ignored.
+    weft_core::run_spec::refuse_unrunnable(&project, &resolved, &spec).map_err(|mut refusal| {
         if let Some(seed) = &seed {
             refusal.errors.push(format!(
                 "--seed read run {}: a saved result stands in only for a node that run completed and whose \
@@ -584,31 +637,28 @@ pub async fn run(
     // node mid-run. The run carries what was read.
     let instance_values = match &spec.instance {
         Some(instance) => {
-            crate::api::project::instance_values_for_run(&state, id, &project, &resolved.selection, instance, None).await?
+            crate::api::project::instance_values_for_run(&state, id, &resolved.program, instance, None).await?
         }
         None => Default::default(),
     };
     // The program's own connections, as this install picked them: a
     // required one nobody picked is refused now, naming the command.
-    let picks = crate::api::project::picks_for_run(&state, id, &project, &resolved.selection).await?;
-    // A stale node with no kick still runs: its inputs are inherited
-    // pulses the worker folds in, and it fires the moment they settle
-    // after the selected reuse boundary. Only a run with
-    // nothing stale, nothing kicked and nothing provided has no work.
+    let picks = crate::api::project::picks_for_run(&state, id, &resolved.program).await?;
+    let run_program = crate::api::project::runs_program(&program, &resolved.program)?;
+    let stale = resolved.runs.clone();
+    let kicks = resolved.kicks.clone();
     let run_id = weft_core::new_run_id();
     let now = crate::lease::now_unix() as u64;
-    let mut birth_rows = supplied_output_events(&project, &spec, &resolved, run_id, now);
-    birth_rows.extend(weft_journal::birth::baked_rows(&project, run_id, &resolved.baked, now));
+    let birth_rows = weft_journal::birth::baked_rows(run_id, &resolved.baked, now);
     // An empty `entry_node` is the journal's marker for a row that no
-    // longer decodes, and `weft runs` prints `?` for it. A
-    // seeded re-run of a mid-graph node has no kick and no provided
-    // value, so falling back to the empty string labelled a perfectly
-    // good run as corrupt. A stale node is the honest answer instead:
-    // this label is display only (nothing routes on it), and `stale` is
-    // a sorted set, so this is the alphabetically first node the run
-    // re-runs, chosen because it is stable, not because it is first in
-    // any graph order. A seeded run that inherited every node it
-    // selected kicks nothing and re-runs nothing; it says so.
+    // longer decodes, and `weft runs` prints `?` for it. A run with
+    // nothing kicked (a seeded run of a node fed by what it reuses, a run
+    // fed by `--emit` alone) is named after a place it runs instead: this
+    // label is display only (nothing routes on it), and `stale` is a
+    // sorted set, so this is the alphabetically first place the run runs,
+    // chosen because it is stable, not because it is first in any graph
+    // order. A seeded run that reuses everything it reaches runs nothing;
+    // it says so.
     // Named the way the program reads them (`one.strip` for a node of
     // an included file under the site `one`).
     let spell = |place: &Located| weft_core::project::address_of(&project, &place.id, &place.path);
@@ -620,9 +670,6 @@ pub async fn run(
     let entry_node = kicks.iter()
         .min_by_key(|k| (!k.firing, is_trigger(&k.node), k.frames.len(), order(&k.node)))
         .map(|k| crate::api::project::kick_place(&project, k))
-        // A provided value's consumers sit inside the call the value is
-        // emitted under, so they are spelled through its frames too.
-        .or_else(|| resolved.provided.iter().find_map(|p| p.consumers.first().map(|(n, _)| spell(&Located::at(n, &p.frames)))))
         .or_else(|| stale.iter().next().map(spell))
         .unwrap_or_else(|| "everything inherited".into());
     // Recording the run and starting it happen under the project's
@@ -646,9 +693,7 @@ pub async fn run(
     // so holds a pooled connection while it runs. Everything expensive
     // this handler does, the seed fold above and the response below,
     // stays outside it.
-    // A group's boundaries spell as the group, so a set dedupes them.
     let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
-    let selection = weft_core::project::selection::RecordedSelection::new(resolved.selection.clone());
     let (version, moved) = with_tree_lock(&state, id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
@@ -667,9 +712,9 @@ pub async fn run(
                 phase: weft_core::context::Phase::Fire,
                 entry_node: &entry_node,
                 kicks: &kicks,
-                definition_hash: &program.definition_hash,
+                program: &run_program,
+                given: &resolved.given,
                 binary_hash: &program.binary_hash,
-                selection: Some(&selection),
                 seed: seed.clone(),
                 source_version: Some(&version.version),
                 instance: spec.instance.as_ref().map(|instance| weft_journal::birth::RunFor { instance, values: &instance_values }),
@@ -730,7 +775,7 @@ pub async fn run(
         ));
     }
 
-    let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
+    let ran: Vec<String> = stale_vec.clone();
     let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect::<BTreeSet<_>>().into_iter().collect()).unwrap_or_default();
     Ok(Json(RunStarted {
         run_id,
@@ -793,29 +838,6 @@ fn stand_in_caller(
     })
 }
 
-fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, run_id: RunId, at_unix: u64) -> Vec<weft_journal::RunEvent> {
-    // Seed suppliers carry their original events. Only authored emits create
-    // new supplied facts, including closures for an explicit empty port map,
-    // and only the emits the cut kept (`--before` can drop one).
-    // The resolver already turned each emit into the source's id and
-    // the frames it emits under; one row set per source.
-    let mut by_source: std::collections::BTreeMap<&str, (weft_core::frames::LoopFrames, std::collections::BTreeMap<&str, &Value>)> = Default::default();
-    for emission in resolved.provided.iter().filter(|e| resolved.selection.suppliers.contains(&Located::at(&e.source_node, &e.frames))) {
-        let entry = by_source.entry(emission.source_node.as_str()).or_insert_with(|| (emission.frames.clone(), Default::default()));
-        entry.1.insert(emission.source_port.as_str(), &emission.value);
-    }
-    // An emit with an empty port map still closes every output.
-    for spelled in spec.emit.keys() {
-        let (source, path) = weft_core::project::resolve_address(project, spelled);
-        let place = Located::new(source, path);
-        if resolved.selection.suppliers.contains(&place) {
-            by_source.entry(project.nodes.iter().find(|n| n.id == place.id).map(|n| n.id.as_str()).expect("resolved source exists"))
-                .or_insert_with(|| (place.frames(), Default::default()));
-        }
-    }
-    weft_journal::birth::supplied_rows(project, run_id, by_source.iter().map(|(source, (frames, ports))| (*source, frames, ports.clone())), at_unix)
-}
-
 /// Whose bakes a preview asks about: the shared triggers' by default.
 #[derive(Debug, Default, Deserialize)]
 pub struct BakesQuery {
@@ -833,19 +855,6 @@ pub async fn trigger_bakes(
     authorize_project(&state, &caller.0, id).await?;
     let bakes = state.journal.trigger_bakes(id, query.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
     Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
-}
-
-/// A seeded run kicks its stale roots and every explicitly fired trigger.
-fn seeded_kicks(
-    resolved: &Resolved,
-    stale: &BTreeSet<Located>,
-) -> Vec<Kick> {
-    resolved
-        .kicks
-        .iter()
-        .filter(|k| k.firing || stale.contains(&Located::at(&k.node, &k.frames)))
-        .cloned()
-        .collect()
 }
 
 // ----- tree --------------------------------------------------------------
@@ -1254,32 +1263,8 @@ mod blob_key_tests {
 mod fire_snapshot_tests {
     use super::*;
 
-    #[test]
-    fn supplied_events_only_describe_authored_emits() {
-        let project: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
-            "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": [{
-                "id": "source", "nodeType": "Text", "config": {},
-                "position": {"x": 0, "y": 0}, "inputs": [],
-                "outputs": [{"name": "value", "portType": "String", "required": true}]
-            }], "edges": []
-        })).unwrap();
-        let run_id = RunId::new_v4();
-        let mut spec = RunSpec::whole("reuse");
-        let resolved = |spec: &RunSpec| resolve_spec(spec, &project, &Default::default()).expect("one node resolves");
-        assert!(supplied_output_events(&project, &spec, &resolved(&spec), run_id, 0).is_empty());
-        spec.emit.insert("source".into(), BTreeMap::new());
-        let events = supplied_output_events(&project, &spec, &resolved(&spec), run_id, 0);
-        assert!(matches!(&events[..], [weft_journal::RunEvent::PortClosed { node_id, port, provided: true, .. }]
-            if node_id == "source" && port == "value"));
-        spec.emit.get_mut("source").unwrap().insert("value".into(), serde_json::json!("manual"));
-        let events = supplied_output_events(&project, &spec, &resolved(&spec), run_id, 0);
-        assert!(matches!(&events[..], [weft_journal::RunEvent::PortEmitted { value, provided: true, .. }]
-            if **value == serde_json::json!("manual")));
-    }
-
-    fn plan(node: &str, firing: bool) -> Kick {
-        Kick { node: node.to_string(), frames: Vec::new(), firing, payload: None, port_snapshot: None }
+    fn plan(node: &str, firing: bool) -> crate::api::project::Kick {
+        crate::api::project::Kick { node: node.to_string(), frames: Vec::new(), firing, payload: None, port_snapshot: None }
     }
 
     /// A fired trigger replays the ports it registered at activation,
@@ -1300,29 +1285,6 @@ mod fire_snapshot_tests {
         assert_eq!(ask.port_snapshot, Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" })));
         let bridge = kicks.iter().find(|k| k.node == "bridge").expect("kicked");
         assert_eq!(bridge.port_snapshot, None);
-    }
-
-    /// A seeded run's kicks go through the same conversion, so a fire
-    /// keeps its snapshot there too. Building them separately is what
-    /// used to drop it.
-    #[test]
-    fn a_seeded_fire_keeps_its_snapshot() {
-        let mut fired = plan("ask", true);
-        fired.port_snapshot = Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" }));
-        let resolved = Resolved {
-            selection: weft_core::project::selection::RunSelection {
-                nodes: [Located::top("ask")].into_iter().collect(),
-                ..Default::default()
-            },
-            kicks: vec![fired],
-            provided: vec![],
-            crossings: vec![],
-            warnings: vec![],
-            baked: Default::default(),
-        };
-        let stale: BTreeSet<Located> = [Located::top("ask")].into_iter().collect();
-        let kicks = seeded_kicks(&resolved, &stale);
-        assert_eq!(kicks[0].port_snapshot, Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" })));
     }
 
     /// A trigger with no wired input (a timer, the common case) fires
@@ -1349,7 +1311,7 @@ mod fire_snapshot_tests {
             fire: Some(("tick".into(), serde_json::json!({ "scheduledTime": "t" }))),
             ..RunSpec::whole("fire")
         };
-        let resolved = resolve_spec(&spec, &project, &Default::default()).expect("graph selection needs no external facts");
+        let resolved = resolve_spec(&spec, &project, &Default::default()).expect("the walk needs no external facts");
         assert!(resolved.kicks.iter().any(|k| k.node == "tick" && k.firing));
     }
 

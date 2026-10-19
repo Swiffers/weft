@@ -157,14 +157,14 @@
 
     /// The run's birth, its listed nodes kicked.
     fn birth(project: &ProjectDefinition, run_id: RunId, kicks: &[&str]) -> Vec<RunEvent> {
-        let mut rows = vec![RunEvent::RunStarted {
+        let mut rows = vec![RunEvent::RunStarted { given: Default::default(),
             run_id,
             project_id: project.id,
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
             binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-            selection: None, seed: None, instance: None, fired_trigger: None, stand_in: None,
+            cut_from: None, seed: None, instance: None, fired_trigger: None, stand_in: None,
             instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
         }];

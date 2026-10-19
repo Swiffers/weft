@@ -55,8 +55,12 @@ function bigPipeline(): ProjectDefinition {
 	const node = (id: string, nodeType: string, inputs: unknown[], outputs: unknown[], scope: string[] = [], extra: Record<string, unknown> = {}) => {
 		nodes.push({ id, nodeType, label: null, config: {}, position: { x: 0, y: 0 }, scope, groupBoundary: null, inputs: [flow, ...inputs], outputs, ...extra });
 	};
-	const edge = (source: string, sourceHandle: string, target: string, targetHandle: string) => {
-		edges.push({ id: `${source}.${sourceHandle}->${target}.${targetHandle}`, source, target, sourceHandle, targetHandle });
+	// A wire end to end, through the group ports it passes (`via`), the
+	// way the compiler joins the legs a person wrote.
+	type Via = Array<{ group: string; port: string; side: 'in' | 'out' }>;
+	const edge = (source: string, sourceHandle: string, target: string, targetHandle: string, via: Via = []) => {
+		const crossings = via.map(c => `-${c.side}:${c.group}:${c.port}`).join('');
+		edges.push({ id: `e-${source}-${sourceHandle}${crossings}-${target}-${targetHandle}`, source, target, sourceHandle, targetHandle, ...(via.length ? { via } : {}) });
 	};
 	node('db', 'PostgresDatabase', [], [{ name: 'access', portType: 'Access', required: false }], [], { requiresInfra: true });
 	node('llm_access', 'OpenRouterAccess', [], [{ name: 'access', portType: 'Access', required: false }]);
@@ -78,13 +82,7 @@ function bigPipeline(): ProjectDefinition {
 		}
 		const g = `${program}_think`;
 		groups.push({ id: g, kind: 'group', label: null, anonymous: false, inPorts: [str('text'), access('db'), { name: 'provider', portType: 'LlmProvider', required: true }, { name: 'params', portType: 'Dict[String, String]', required: true }, str('botName')], outPorts: [str('answer', false)], parentGroupId: null, childGroupIds: [], nodeIds: ['history', 'interrupted', 'rendered', 'analyst_prompt', 'analyst', 'persona_prompt', 'persona'].map(l => `${g}.${l}`) });
-		node(`${g}__in`, 'Passthrough', [str('text'), access('db'), { name: 'provider', portType: 'LlmProvider', required: true }, { name: 'params', portType: 'Dict[String, String]', required: true }, str('botName')], [str('text', false), { name: 'db', portType: 'Access', required: false }, { name: 'provider', portType: 'LlmProvider', required: false }, { name: 'params', portType: 'Dict[String, String]', required: false }, str('botName', false)], [], { groupBoundary: { groupId: g, role: 'In' } });
-		node(`${g}__out`, 'Passthrough', [str('answer', false)], [str('answer', false)], [], { groupBoundary: { groupId: g, role: 'Out' } });
-		edge(prev, prevPort, `${g}__in`, 'text');
-		edge('db', 'access', `${g}__in`, 'db');
-		edge('llm', 'provider', `${g}__in`, 'provider');
-		edge('params', 'params', `${g}__in`, 'params');
-		edge('bot_name', 'value', `${g}__in`, 'botName');
+		const into = (port: string): Via => [{ group: g, port, side: 'in' }];
 		const inner = (local: string) => `${g}.${local}`;
 		node(inner('history'), 'PostgresExecuteQuery', [access('account'), str('query')], [str('rows', false)], [g]);
 		node(inner('interrupted'), 'PostgresExecuteQuery', [access('account'), str('query')], [str('rows', false)], [g]);
@@ -94,30 +92,31 @@ function bigPipeline(): ProjectDefinition {
 		node(inner('persona_prompt'), 'ExecPython', [str('transcript'), str('guidance'), str('bot_name')], [str('prompt', false)], [g]);
 		node(inner('persona'), 'LlmInference', [str('prompt'), { name: 'provider', portType: 'LlmProvider', required: true }, { name: 'params', portType: 'Dict[String, String]', required: true }], [str('answer', false)], [g]);
 		for (const q of ['history', 'interrupted']) {
-			edge(`${g}__in`, 'db', inner(q), 'account');
-			edge(`${g}__in`, 'text', inner(q), 'query');
-			edge(`${g}__in`, '_should_flow', inner(q), '_should_flow');
+			edge('db', 'access', inner(q), 'account', into('db'));
+			edge(prev, prevPort, inner(q), 'query', into('text'));
 		}
 		edge(inner('history'), 'rows', inner('rendered'), 'rows');
 		edge(inner('interrupted'), 'rows', inner('rendered'), 'interrupted');
 		edge(inner('rendered'), 'transcript', inner('analyst_prompt'), 'transcript');
-		edge(`${g}__in`, 'botName', inner('analyst_prompt'), 'bot_name');
+		edge('bot_name', 'value', inner('analyst_prompt'), 'bot_name', into('botName'));
 		edge(inner('analyst_prompt'), 'prompt', inner('analyst'), 'prompt');
-		edge(`${g}__in`, 'provider', inner('analyst'), 'provider');
-		edge(`${g}__in`, 'params', inner('analyst'), 'params');
+		edge('llm', 'provider', inner('analyst'), 'provider', into('provider'));
+		edge('params', 'params', inner('analyst'), 'params', into('params'));
 		edge(inner('rendered'), 'transcript', inner('persona_prompt'), 'transcript');
 		edge(inner('analyst'), 'guidance', inner('persona_prompt'), 'guidance');
-		edge(`${g}__in`, 'botName', inner('persona_prompt'), 'bot_name');
+		edge('bot_name', 'value', inner('persona_prompt'), 'bot_name', into('botName'));
 		edge(inner('persona_prompt'), 'prompt', inner('persona'), 'prompt');
-		edge(`${g}__in`, 'provider', inner('persona'), 'provider');
-		edge(`${g}__in`, 'params', inner('persona'), 'params');
-		edge(inner('persona'), 'answer', `${g}__out`, 'answer');
-		prev = `${g}__out`; prevPort = 'answer';
+		edge('llm', 'provider', inner('persona'), 'provider', into('provider'));
+		edge('params', 'params', inner('persona'), 'params', into('params'));
+		// The group's answer leaves through its output into the next node.
+		let leaving: Via = [{ group: g, port: 'answer', side: 'out' }];
+		prev = inner('persona'); prevPort = 'answer';
 		for (let i = 0; i < 4; i++) {
 			const id = `${program}_post${i}`;
 			node(id, i % 2 ? 'PostgresExecuteQuery' : 'ExecPython', i % 2 ? [access('account'), str('query')] : [str('text')], [str('rows', false)]);
 			if (i % 2) edge('db', 'access', id, 'account');
-			edge(prev, prevPort, id, i % 2 ? 'query' : 'text');
+			edge(prev, prevPort, id, i % 2 ? 'query' : 'text', leaving);
+			leaving = [];
 			prev = id; prevPort = 'rows';
 		}
 		node(`${program}_out`, 'Debug', [{ name: 'data', portType: 'T', required: true }], [], []);

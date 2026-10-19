@@ -153,14 +153,14 @@
         // so it becomes ready (it has no real inputs).
         journal
             .record_event(
-                &RunEvent::RunStarted {
+                &RunEvent::RunStarted { given: Default::default(),
                     run_id,
                     project_id: project.id,
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                    selection: None,
+                    cut_from: None,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     settings: Default::default(),
@@ -302,10 +302,10 @@
         .expect("waiter project");
         let run_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        journal.record_event(&RunEvent::RunStarted {
+        journal.record_event(&RunEvent::RunStarted { given: Default::default(),
             run_id, project_id: project.id, entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
         }, None).await.unwrap();
         journal.record_event(&RunEvent::NodeKicked {
@@ -544,10 +544,10 @@
     async fn run_test(project: ProjectDefinition, creator: &str) -> RunOutcome {
         let run_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        journal.record_event(&RunEvent::RunStarted {
+        journal.record_event(&RunEvent::RunStarted { given: Default::default(),
             run_id, project_id: project.id, entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
         }, None).await.unwrap();
         journal.record_event(&RunEvent::NodeKicked {
@@ -1029,10 +1029,10 @@
 
             let run_id = uuid::Uuid::new_v4();
             let journal = Arc::new(MemJournal::default());
-            journal.record_event(&RunEvent::RunStarted {
+            journal.record_event(&RunEvent::RunStarted { given: Default::default(),
                 run_id, project_id: pid, entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
             }, None).await.unwrap();
             journal.record_event(&RunEvent::NodeKicked {
@@ -1198,14 +1198,14 @@
         let j = journal.clone();
         let handle = tokio::spawn(async move {
             j.record_event(
-                &RunEvent::RunStarted {
+                &RunEvent::RunStarted { given: Default::default(),
                     run_id,
                     project_id: pid,
                     entry_node: entry,
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                    selection: None,
+                    cut_from: None,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     settings: weft_core::run_settings::RunSettings::default().holding_for(hold_secs).unwrap(),
@@ -1833,14 +1833,14 @@
     async fn seed_holding(journal: &MemJournal, run_id: RunId, project: &ProjectDefinition, entry: &str, hold_secs: u32) {
         journal
             .record_event(
-                &RunEvent::RunStarted {
+                &RunEvent::RunStarted { given: Default::default(),
                     run_id,
                     project_id: project.id,
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                    selection: None,
+                    cut_from: None,
                     seed: None,
                     instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     settings: weft_core::run_settings::RunSettings::default().holding_for(hold_secs).unwrap(),
@@ -2169,10 +2169,10 @@
         let run_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         // Kick both reader nodes.
-        journal.record_event(&RunEvent::RunStarted {
+        journal.record_event(&RunEvent::RunStarted { given: Default::default(),
             run_id, project_id: project.id, entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             settings: Default::default(),
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
@@ -2701,7 +2701,7 @@
                 { "id": "e2", "source": "body", "sourceHandle": "out", "target": "g__out", "targetHandle": "results" },
                 { "id": "e3", "source": "g__out", "sourceHandle": "results", "target": "sink", "targetHandle": "data" }
             ],
-            "groups": []
+            "groups": [{ "id": "g", "kind": "loop", "loopConfig": {}, "nodeIds": ["body"] }]
         })).expect("loop-caller project");
 
         let run_id = uuid::Uuid::new_v4();

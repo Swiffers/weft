@@ -411,11 +411,13 @@ pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
 /// What a spelling a person wrote names in the compiled definition:
 /// the thing's own id and the call path that use of it runs under
 /// (`auth.check` is the node `Auth.check` under `["auth"]`).
+#[derive(Debug)]
 pub enum Spelled {
     Node { id: String, call_path: Vec<String> },
     /// A group, a loop or an include site. The commands that take a
     /// node refuse it; `weft events --node` takes it, because a
-    /// group's own rows are its boundaries' and come with it.
+    /// group has rows of its own: its `scope_decided` rows (and a
+    /// loop's, its boundaries' rows).
     Group { id: String, call_path: Vec<String> },
 }
 
@@ -483,14 +485,14 @@ pub fn resolve_spelling(
 /// and names through the call site everywhere a person can see. It
 /// resolves, because it IS the id, and taking it would teach a person a
 /// spelling no other command accepts; so it is refused with the one
-/// that works. A boundary the compiler made (`gate__in`) is named by
-/// its group.
+/// that works. A loop's boundary the compiler made (`doubler__in`) is
+/// named by its loop; any other name ending that way is read as written.
 fn read_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> anyhow::Result<Spelled> {
-    if let Some((group, _)) = spelled.rsplit_once("__in").or_else(|| spelled.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
-        anyhow::bail!("'{spelled}' is a group boundary the compiler made; name the group, `{group}`, and its rows come with it");
-    }
-    if let Some((group, _)) = spelled.rsplit_once(".__in").or_else(|| spelled.rsplit_once(".__out")).filter(|(_, rest)| rest.is_empty()) {
-        anyhow::bail!("'{spelled}' is a boundary the compiler made; name the site, `{group}`, and its rows come with it");
+    if let Some(group) = weft_core::project::boundary_loop(spelled) {
+        let (id, _) = weft_core::project::resolve_address(definition, group);
+        if definition.groups.iter().any(|g| g.id == id && matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+            anyhow::bail!("'{spelled}' is a loop's boundary the compiler made; name the loop, `{group}`, and its rows come with it");
+        }
     }
     let (id, call_path) = weft_core::project::resolve_address(definition, spelled);
     let Some(node) = definition.nodes.iter().find(|n| n.id == id) else {
@@ -503,7 +505,7 @@ fn read_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> an
             spelled.rsplit('.').next().unwrap_or(spelled)
         );
     };
-    if call_path.is_empty() && weft_core::project::selection::enclosing_body(definition, node).is_some() {
+    if call_path.is_empty() && weft_core::project::places::enclosing_body(definition, node).is_some() {
         anyhow::bail!(
             "'{spelled}' is inside an included file; name it through the site that \
              includes the file, like `site.{}`",
@@ -668,5 +670,30 @@ mod tests {
         })
         .unwrap();
         assert_eq!(url, "http://x");
+    }
+
+    /// A name ending `__in` or `__out` is refused as a loop's boundary only
+    /// when what comes before it is a loop; any other such name is read as
+    /// written.
+    #[test]
+    fn only_a_loops_boundary_is_refused_as_one() {
+        let definition: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [{
+                "id": "fan__out", "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [], "outputs": [],
+            }],
+            "edges": [],
+            "groups": [
+                { "id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": [] },
+                { "id": "g", "kind": "group", "nodeIds": [] },
+            ],
+        }))
+        .unwrap();
+        let refused = super::read_spelling(&definition, "lp__in").unwrap_err().to_string();
+        assert!(refused.contains("loop's boundary") && refused.contains("`lp`"), "{refused}");
+        assert!(matches!(super::read_spelling(&definition, "fan__out"), Ok(super::Spelled::Node { id, .. }) if id == "fan__out"));
+        let unknown = super::read_spelling(&definition, "g__in").unwrap_err().to_string();
+        assert!(unknown.contains("names no node") && !unknown.contains("boundary"), "{unknown}");
     }
 }

@@ -435,12 +435,11 @@ pub async fn outputs(
     let sources = crate::projection::reconstruct_run(&state, run_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
     let project = sources[&run_id].project();
-    // A forwarding boundary is the compiler's: what entered a group is
-    // the wire of the node that fed it, what left is the wire of the
-    // node that filled it, so its wire says nothing a person's wire
-    // does not, and its name (the group's) would collide with theirs.
-    // A loop's Out is different: the list it gathers over the
-    // iterations exists nowhere else, so it stays, as the loop's own
+    // A loop's `LoopIn` is the compiler's: what it hands the body is the
+    // wire of the node that fed the loop, so its wire says nothing a
+    // person's wire does not, and its name (the loop's) would collide
+    // with theirs. Its `LoopOut` is different: the list it gathers over
+    // the iterations exists nowhere else, so it stays, as the loop's own
     // output (`doubler.results`).
     let boundary = |id: &str| project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some()
         && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
@@ -450,7 +449,7 @@ pub async fn outputs(
         .map(|wire| weft_core::run_spec::ExpectedWire::spell(project, wire)).collect();
     // Every place of the run, spelled the way the wires are: a node in
     // an included file once per site that reaches it, a group once.
-    let nodes = weft_core::project::selection::every_place(project).iter()
+    let nodes = weft_core::project::places::every_place(project).iter()
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))

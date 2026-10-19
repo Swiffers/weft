@@ -153,6 +153,32 @@ async fn a_version_builds_from_its_own_edited_standard_library() {
     assert!(label.starts_with("Edited "), "{label}");
 }
 
+/// A `.weft` file a package ships, and the prompt it reads, travel in the
+/// version like the package's code, so a program that includes it
+/// through `__catalog/` builds on the install from the version alone.
+#[tokio::test]
+async fn a_version_builds_a_program_that_includes_a_file_from_nodes() {
+    let catalog = base_catalog_basic(|_, bytes| bytes);
+    let mut files: Vec<(&str, &[u8])> = vec![
+        PROGRAM[0],
+        ("src/main.weft", b"greet = @include(\"__catalog/base_catalog/flows/greet.weft\")\n"),
+        ("nodes/base_catalog/flows/greet.weft", b"# Say hello.\nGroup {\n hello = Text { value: @file(\"__catalog/base_catalog/flows/greeting.md\") }\n}\n"),
+        ("nodes/base_catalog/flows/greeting.md", b"hello from the stdlib"),
+    ];
+    files.extend(catalog.iter().map(|(p, b)| (p.as_str(), b.as_slice())));
+    let (storage, manifest) = storage_with("local", &files);
+    let (_blobs, cache) = fresh_cache();
+    let root = tempfile::tempdir().unwrap();
+    source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap();
+    let (definition, _, _) = source::compile(root.path()).unwrap();
+    let hello = definition
+        .nodes
+        .iter()
+        .find(|n| n.id == "@nodes:base_catalog:flows:greet.hello")
+        .expect("the included file's node");
+    assert_eq!(hello.written_value("value"), Some(&serde_json::json!("hello from the stdlib")));
+}
+
 /// A version without `nodes/base_catalog/` has no standard library: the
 /// build fails on the node it lacks instead of borrowing this install's.
 #[tokio::test]

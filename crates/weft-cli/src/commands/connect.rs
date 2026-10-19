@@ -875,7 +875,8 @@ fn discover(
     }
     let mut out = Vec::new();
     let mut visited: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
-    collect_targets(&project.main_weft(), &root, &program, catalog, &mut out, others, &mut visited)?;
+    let entry = read_through_compiler(&root, &root.join(weft_compiler::project::SRC_DIR), weft_compiler::project::ENTRY_FILE, "the entry file")?;
+    collect_targets(entry, &root, &program, catalog, &mut out, others, &mut visited)?;
     Ok((out, program))
 }
 
@@ -884,7 +885,7 @@ fn discover(
 /// A file reached again is one file already collected, so nothing is
 /// added: its every name came from `program` the first time.
 fn collect_targets(
-    file: &std::path::Path,
+    file: weft_compiler::ResolvedFile,
     root: &std::path::Path,
     program: &weft_core::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
@@ -892,14 +893,10 @@ fn collect_targets(
     others: &mut Vec<OtherNode>,
     visited: &mut std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<()> {
-    let canonical = file
-        .canonicalize()
-        .with_context(|| format!("resolve {}", file.display()))?;
+    let weft_compiler::ResolvedFile { identity: canonical, content: source } = file;
     if !visited.insert(canonical.clone()) {
         return Ok(());
     }
-    let source = std::fs::read_to_string(&canonical)
-        .with_context(|| format!("read {}", canonical.display()))?;
     // The ids this parse hands out have to be the ones `program` keys
     // its places by, or `spellings_of` finds nothing. An included file's
     // nodes are keyed under the file's body id on both sides; the entry
@@ -986,9 +983,25 @@ fn collect_targets(
         });
     }
     for path in includes {
-        collect_targets(&base.join(&path), root, program, catalog, out, others, visited)?;
+        collect_targets(read_through_compiler(root, &base, &path, "@include")?, root, program, catalog, out, others, visited)?;
     }
     Ok(())
+}
+
+/// Read the file a program names from `base`, through the compiler's own
+/// resolution, so the walk reaches exactly the file the build includes
+/// (a `__catalog/` path included) and refuses what the build refuses.
+/// `what` names the file in a refusal (`@include`, the entry file).
+fn read_through_compiler(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    path: &str,
+    what: &str,
+) -> Result<weft_compiler::ResolvedFile> {
+    use weft_compiler::FileReader as _;
+    weft_compiler::DiskFileReader
+        .resolve_and_read(root, base, std::path::Path::new(path))
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))
 }
 
 /// Parse a picker config value into the handle it must be.
@@ -1016,7 +1029,7 @@ fn parse_picked(v: &Value) -> Result<PickedHandle> {
 /// through, because the id it is keyed by carries the file's PATH and
 /// the language calls that spelling unspellable on purpose.
 fn spellings_of(program: &weft_core::ProjectDefinition, id: &str) -> Result<Vec<String>> {
-    let spellings: Vec<String> = weft_core::project::selection::every_place(program)
+    let spellings: Vec<String> = weft_core::project::places::every_place(program)
         .into_iter()
         .filter(|place| place.id == id)
         .map(|place| weft_core::project::address_of(program, &place.id, &place.path))
@@ -2295,28 +2308,25 @@ mod tests {
 
     /// The shape an include compiles to: the file `src/sweep.weft` is
     /// one body, keyed by its path, and each `@include` of it is a call
-    /// site; a node inside it is keyed under the file's path.
+    /// site (both groups, neither a node); a node inside it is keyed
+    /// under the file's path.
     fn program_including_sweep(sites: &[&str]) -> weft_core::ProjectDefinition {
-        let node = |id: &str, scope: &[&str], boundary: serde_json::Value| {
+        let node = |id: &str, scope: &[&str]| {
             serde_json::json!({
                 "id": id, "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
-                "inputs": [], "outputs": [], "scope": scope, "groupBoundary": boundary,
+                "inputs": [], "outputs": [], "scope": scope,
             })
         };
-        let mut nodes = vec![
-            node("db", &[], serde_json::Value::Null),
-            node("@src:sweep__in", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "In" })),
-            node("@src:sweep.key", &["@src:sweep"], serde_json::Value::Null),
-            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"], serde_json::Value::Null),
-            node("@src:sweep__out", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "Out" })),
+        let nodes = vec![
+            node("db", &[]),
+            node("@src:sweep.key", &["@src:sweep"]),
+            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"]),
         ];
         let mut groups = vec![
             serde_json::json!({ "id": "@src:sweep", "kind": "body", "nodeIds": ["@src:sweep.key"] }),
             serde_json::json!({ "id": "@src:sweep.inner", "kind": "group", "nodeIds": ["@src:sweep.inner.key"] }),
         ];
         for site in sites {
-            nodes.push(node(&format!("{site}__in"), &[], serde_json::json!({ "groupId": site, "role": "In" })));
-            nodes.push(node(&format!("{site}__out"), &[], serde_json::json!({ "groupId": site, "role": "Out" })));
             groups.push(serde_json::json!({ "id": site, "kind": "call", "body": "@src:sweep", "nodeIds": [] }));
         }
         serde_json::from_value(serde_json::json!({

@@ -50,7 +50,7 @@
     /// repeat until the wall-clock deadline).
     fn two_await_events() -> (String, Vec<RunEvent>) {
         let emission = uuid::Uuid::new_v4();
-        let pid = weft_core::run::emission::pulse_id(emission, "out", "n", "in", false).to_string();
+        let pid = weft_core::run::emission::pulse_id(emission, "e", false).to_string();
         let events = vec![
             started("src"),
             RunEvent::PortEmitted {
@@ -60,7 +60,6 @@
                 frames: vec![],
                 port: "out".into(),
                 value: Arc::new(json!("x")),
-                provided: false,
                 at_unix: 0,
             },
             RunEvent::NodeCompleted { run_id: run_id(), node_id: "src".into(), frames: vec![], at_unix: 0 },
@@ -132,9 +131,9 @@
         let mut kicked = HashMap::new();
         let mut awaited = HashMap::new();
         let mut loops = LoopRuntime::new();
-        let program = crate::plan::ProgramTables::new(project.clone(), None);
+        let program = crate::plan::ProgramTables::new(project.clone());
         let crashed = apply_snapshot(
-            &program, snap, &mut pulses, &mut firings, &mut kicked, &mut awaited, &mut loops,
+            &program, snap, &mut pulses, &mut firings, &mut kicked, &mut ScopeTable::default(), &mut awaited, &mut loops,
         );
         (pulses, firings, kicked, crashed.into_iter().map(|firing| firing.loc).collect())
     }
@@ -189,7 +188,7 @@
             "edges": [
                 { "id": "e", "source": "producer", "target": "consumer", "sourceHandle": "out", "targetHandle": "in" }
             ],
-            "groups": []
+            "groups": [{ "id": "work", "kind": "loop", "loopConfig": {}, "nodeIds": [] }]
         }))
         .expect("stream project"))
     }
@@ -207,8 +206,8 @@
         let mut pulses = PulseTable::default();
         let mut firings = NodeFiringTable::default();
         apply_snapshot(
-            &crate::plan::ProgramTables::new(project.clone(), None), snap, &mut pulses, &mut firings,
-            &mut HashMap::new(), &mut HashMap::new(), &mut LoopRuntime::new(),
+            &crate::plan::ProgramTables::new(project.clone()), snap, &mut pulses, &mut firings,
+            &mut HashMap::new(), &mut ScopeTable::default(), &mut HashMap::new(), &mut LoopRuntime::new(),
         )
         .into_iter()
         .map(|firing| (firing.loc, firing.consumed_a_stream))
@@ -222,14 +221,14 @@
     #[tokio::test]
     async fn a_journal_that_will_not_fold_fails_the_run_with_a_terminal() {
         let rows = vec![
-            RunEvent::RunStarted {
+            RunEvent::RunStarted { given: Default::default(),
                 run_id: run_id(),
                 project_id: uuid::Uuid::nil(),
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("test-hash".into()),
                 binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                selection: None,
+                cut_from: None,
                 seed: None,
                 instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 settings: Default::default(),

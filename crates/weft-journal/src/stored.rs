@@ -1,16 +1,14 @@
 //! A run's events as its record stores them: one row of `run_log` per
 //! write of the run (its `seq`), holding that write's events in order as a
 //! JSON array, compressed with zstd by whoever writes it. The events leave
-//! out their run (`RunEvent`'s `run_id`, which the row carries) and
-//! the run's selection (written as its digest, kept once in
-//! `run_selection`); decoding sets both back.
+//! out their run (`RunEvent`'s `run_id`, which the row carries);
+//! decoding sets it back.
 //!
 //! Postgres does not compress a value under about 2 KB, and a ping's events
 //! are about that, so the writer compresses them: the database stores and
 //! the line carries a third of the bytes, and only the readers (which are
 //! few and rarely hot) pay for decompressing.
 
-use weft_core::project::selection::RecordedSelection;
 use weft_core::RunId;
 
 use crate::events::RunEvent;
@@ -25,16 +23,12 @@ pub fn encode(events: &[RunEvent]) -> Vec<u8> {
 }
 
 /// The events of one stored row of `run_id`, in order, its id set
-/// back on each. A birth in it names its selection by digest, resolved
-/// against `selection` (the run's, read with it). A row that does not
+/// back on each. A row that does not
 /// decode fails with the one wording every reader shares, which names the
 /// run and how to remove it.
-pub fn decode(run_id: RunId, selection: Option<&RecordedSelection>, row: &[u8]) -> Result<Vec<RunEvent>, String> {
+pub fn decode(run_id: RunId, row: &[u8]) -> Result<Vec<RunEvent>, String> {
     let json = zstd::stream::decode_all(row).map_err(|e| undecodable(run_id, &e))?;
-    let mut events: Vec<RunEvent> = RecordedSelection::resolving(selection.map(std::slice::from_ref).unwrap_or_default(), || {
-        serde_json::from_slice(&json)
-    })
-    .map_err(|e| undecodable(run_id, &e))?;
+    let mut events: Vec<RunEvent> = serde_json::from_slice(&json).map_err(|e| undecodable(run_id, &e))?;
     for event in &mut events {
         *event.run_id_mut() = run_id;
     }
@@ -84,7 +78,7 @@ mod tests {
         let row = encode(&written);
         let json = String::from_utf8(zstd::stream::decode_all(&row[..]).unwrap()).unwrap();
         assert!(!json.contains("run_id"), "{json}");
-        let read = decode(run(), None, &row).unwrap();
+        let read = decode(run(), &row).unwrap();
         assert_eq!(serde_json::to_value(&read).unwrap(), serde_json::to_value(&written).unwrap());
         assert!(read.iter().all(|event| event.run_id() == run()));
     }
@@ -92,7 +86,7 @@ mod tests {
     /// A row that does not decode names its run and the way out.
     #[test]
     fn a_damaged_row_names_its_run_and_the_way_out() {
-        let why = decode(run(), None, b"not zstd").unwrap_err();
+        let why = decode(run(), b"not zstd").unwrap_err();
         assert!(why.contains(&run().to_string()) && why.contains("weft clean"), "{why}");
     }
 }

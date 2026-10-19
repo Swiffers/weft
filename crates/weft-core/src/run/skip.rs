@@ -84,6 +84,14 @@ pub enum SkipReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<Failure>,
     },
+    /// A group with no gate whose every wire coming in closed with
+    /// nothing on it: nothing reached it, so it does not run. A scope's
+    /// reason only; the nodes inside it carry [`Self::ScopeSkipped`].
+    /// `failure` when one of those wires closed because its producer broke.
+    EveryInputClosed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<Failure>,
+    },
     /// Every port of a `@require_one_of` group arrived closed.
     /// `failure` when one of them closed because its producer broke.
     OneOfGroupClosed {
@@ -91,9 +99,11 @@ pub enum SkipReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<Failure>,
     },
-    /// The scope this node lives in (a group or a loop) did not run:
-    /// its `_should_flow` said no, or a loop's list never came. Every
-    /// node inside a gated scope carries this, however deep.
+    /// The scope this node lives in (a group, a call site, an included
+    /// body or a loop) did not run: its gate said no, every input of a
+    /// group closed with nothing on it, or a loop's list never came.
+    /// Every node inside a scope that did not run carries this, however
+    /// deep, naming the outermost one that did not.
     ScopeSkipped { scope: String },
     /// A person skipped what the node was waiting for (a form's skip):
     /// it ended there, with nothing to send on.
@@ -117,6 +127,7 @@ impl SkipReason {
             Self::FlowClosed { failure }
             | Self::RequiredInputClosed { failure, .. }
             | Self::NothingJoined { failure }
+            | Self::EveryInputClosed { failure }
             | Self::OneOfGroupClosed { failure, .. } => failure.as_ref(),
         }
     }
@@ -150,6 +161,9 @@ impl std::fmt::Display for SkipReason {
             }
             Self::NothingJoined { failure } => {
                 write!(f, "none of the branches it joins delivered{}", after_failure(failure))
+            }
+            Self::EveryInputClosed { failure } => {
+                write!(f, "every wire into it closed with nothing on it{}", after_failure(failure))
             }
             Self::OneOfGroupClosed { ports, failure } => {
                 write!(f, "every input of the group ({}) closed{}", ports.join(", "), after_failure(failure))
@@ -212,6 +226,15 @@ pub fn is_gate_port(name: &str) -> bool {
 /// rules never see: with nothing wired there is nothing to close, but
 /// a `_should_flow: false` literal still turns the node off).
 pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> Option<SkipReason> {
+    flow_verdict(group_pulses, &node.port_literals)
+}
+
+/// The gate's verdict from what reached it (`group_pulses`, the pulses at
+/// one firing or one scope's copy) and what is written on it
+/// (`literals`): `Some` with why it says no, `None` for go. THE one
+/// reading of a gate, for a node's own and for a group's alike (a group
+/// is gated by the wires that land on it and the literal in its braces).
+pub fn flow_verdict(group_pulses: &[&Pulse], literals: &std::collections::BTreeMap<String, serde_json::Value>) -> Option<SkipReason> {
     // The plain gate first. A node carries one or the other, never both
     // (the compiler refuses that), so whichever one speaks decides.
     let plain = match super::ready::resolve_port_value(group_pulses, SHOULD_FLOW_PORT) {
@@ -224,7 +247,7 @@ pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> 
         // A value arrived and it is not `false`: this node flows.
         Some(_) => Some(None),
         // Nothing on the wire: a literal in the braces still decides.
-        None => match node.port_literals.get(SHOULD_FLOW_PORT) {
+        None => match literals.get(SHOULD_FLOW_PORT) {
             Some(serde_json::Value::Bool(false)) => Some(Some(SkipReason::DidNotFlow)),
             Some(_) => Some(None),
             None => None,
@@ -253,7 +276,7 @@ pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> 
         // Something real arrived, so the absence this node waits for did
         // not happen.
         Some(_) => Some(SkipReason::DidFlow),
-        None => match node.port_literals.get(SHOULD_NOT_FLOW_PORT) {
+        None => match literals.get(SHOULD_NOT_FLOW_PORT) {
             Some(serde_json::Value::Bool(false)) => None,
             // `_should_not_flow: true` written into the braces is the
             // literal way to say "never run this", the mirror of

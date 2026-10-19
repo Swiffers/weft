@@ -69,7 +69,7 @@
         // The port half of `node.port`.
         { className: 'symbol', begin: '(?<=\\.)' + IDENT },
 
-        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|Passthrough|self|type)\\b' },
+        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|self|type)\\b' },
 
         {
           className: 'type',

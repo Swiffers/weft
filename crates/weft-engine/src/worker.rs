@@ -185,7 +185,7 @@ impl StandIn {
     /// the line was on the worker that bore its run, and none follows it.
     fn of(events: &[RunEvent]) -> Result<Option<Self>> {
         let Some(spec) = events.iter().find_map(|event| match event {
-            RunEvent::RunStarted { stand_in, .. } => stand_in.clone(),
+            RunEvent::RunStarted { stand_in, .. } => stand_in.as_deref().cloned(),
             _ => None,
         }) else {
             return Ok(None);
@@ -361,6 +361,7 @@ impl Worker {
             epoch: claimed.epoch,
             next_seq,
             redaction: Default::default(),
+            program: None,
         });
         // A record this worker cannot read, a program it cannot fetch, or a
         // stand-in it cannot serve still ends the run: it is this worker's
@@ -368,11 +369,7 @@ impl Worker {
         let opened = project.and_then(|project| {
             let events = first?;
             let exchange = StandIn::of(&events)?.map(|stand_in| stand_in.exchange(run_id, journal.clone(), &self.replica)).transpose()?;
-            let selection = events.iter().find_map(|event| match event {
-                RunEvent::RunStarted { selection, .. } => Some(selection.clone()),
-                _ => None,
-            });
-            let program = self.plans.program(&project, &claimed.definition_hash, selection.flatten());
+            let program = self.plans.program(&project, &claimed.definition_hash);
             Ok((program, events, exchange))
         });
         let (program, events, exchange) = match opened {
@@ -1389,9 +1386,17 @@ impl Worker {
         // this without the run waiting for it.
         let plan = self.plans.plan(&self.clients, self.door.broker().as_ref(), trigger, entry, instance, triggers_version).await.map_err(Turned::Unread)?;
         let startable = plan.start.as_ref().map_err(|unready| Turned::Unready(unready.clone()))?;
-        let opening = startable.opening(run_id, &payload).map_err(|e| Turned::Internal(format!("the run's first state: {e}")))?;
+        let opening = startable.opening(&payload);
         let settings = entry.spec.settings;
-        let journal = self.clients.writer.run(RunSpec { run_id, settings, keep_for: plan.keep_for, epoch: 1, next_seq: 0, redaction });
+        let journal = self.clients.writer.run(RunSpec {
+            run_id,
+            settings,
+            keep_for: plan.keep_for,
+            epoch: 1,
+            next_seq: 0,
+            redaction,
+            program: startable.runs.kept().cloned(),
+        });
         let birth = startable.birth(&plan, run_id, &payload, crate::now_unix());
         weft_journal::JournalClient::record_events(journal.as_ref(), &birth, Some(&self.replica))
             .await
@@ -1414,12 +1419,13 @@ impl Worker {
             instance_values: startable.ready.instance_values.clone(),
             picks: startable.ready.picks.clone(),
             settings,
+            given: startable.given.clone(),
         };
         Ok(RunStart {
             run_id,
             journal,
             program: startable.program.clone(),
-            starts_from: StartsFrom::Plan { born_with, opening },
+            starts_from: StartsFrom::Plan { born_with, kicked: opening },
             exchange: None,
             registered,
             slot: None,
@@ -2224,6 +2230,7 @@ mod tests {
             epoch: 1,
             next_seq: 0,
             redaction: Default::default(),
+            program: None,
         });
         journal.hand(&RunEvent::RunFailed { run_id, error: "on its way".into(), at_unix: 0 }, None).unwrap();
         tokio::time::sleep(HOUR - RUN_CAP_MARGIN + std::time::Duration::from_secs(1)).await;

@@ -552,8 +552,16 @@ pub trait Runner: Send + Sync {
     /// any more (every trigger it has was wiped). Its workers go once idle.
     async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Remove everything the platform keeps for the project's workers
-    /// (a service, stopped containers). Idempotent.
+    /// Kill every worker the project has, outright (the runs on them die
+    /// with them), and remove what runs them (a service, stopped
+    /// containers). What removing a project does before it erases a row:
+    /// a worker left alive would keep serving from what it remembers of a
+    /// project that is gone. An error names what still runs and how to
+    /// stop it by hand. Idempotent.
+    async fn kill_workers(&self, tenant: &str, project: uuid::Uuid) -> anyhow::Result<()>;
+
+    /// Remove what the platform keeps for the project once its workers
+    /// are gone (on a cloud, the account its workers ran as). Idempotent.
     async fn retire(&self, tenant: &str, project: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Remove what the platform keeps running from `image` (a container,
@@ -573,6 +581,7 @@ pub mod fake {
         Endpoint { project: uuid::Uuid },
         Front { target: WorkerTarget, port: Option<u16> },
         LetFrontGo { project: uuid::Uuid },
+        KillWorkers { project: uuid::Uuid },
         Retire { project: uuid::Uuid },
         ForgetImage(String),
     }
@@ -609,6 +618,10 @@ pub mod fake {
         }
         async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
             self.calls.lock().push(RunnerCall::LetFrontGo { project });
+            Ok(())
+        }
+        async fn kill_workers(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
+            self.calls.lock().push(RunnerCall::KillWorkers { project });
             Ok(())
         }
         async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {

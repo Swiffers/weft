@@ -25,7 +25,21 @@ Both refuse a path that climbs out of the project, and `@include` refuses it on
 the spelling before it even looks, so a `../` that escapes is refused whether
 or not anything is there.
 
-`@asset` is the exception: it may name a file anywhere on your machine by an
+A path starting with `__catalog/` is measured from neither place: it is
+measured from the project's `nodes/` folder, where the standard library and
+your shared nodes live, and it may not climb out of `nodes/`. If you want to
+include `nodes/my_pkg/triage.weft`, write
+`@include("__catalog/my_pkg/triage.weft")`, and that spelling reaches it from
+any file in the project. In `@file` and `@asset`, which are already measured
+from the root, `__catalog/x` is `nodes/x`, so a file under `nodes/` can name
+its neighbours the same way in all three.
+
+If you put a `.weft` file under `nodes/` for others to include, make its
+first line a `#` comment saying what it does: `weft describe-nodes --list`
+ends with every such file, spelled the way you include it, with that line
+beside it.
+
+`@asset` is the one exception to the rule that a path stays inside the project: it may name a file anywhere on your machine by an
 absolute path, or under `~`, and it is read from where it sits and uploaded
 when you build.
 

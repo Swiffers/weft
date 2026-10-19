@@ -311,9 +311,9 @@ pub(crate) fn triggers_reading<'a>(
         .filter(|a| instance.is_none_or(|m| a.key.instance() == Some(m)))
         .filter(|a| {
             let (id, path) = weft_core::project::resolve_address(project, &a.key.trigger);
-            weft_core::project::selection::RunSelection::setup(project, &[weft_core::frames::Located::new(id, path)])
+            weft_core::project::cut::walk_setup(&weft_core::project::graph::ProjectGraph::new(project), &[weft_core::frames::Located::new(id, path)])
                 .map(|setup| {
-                    setup.nodes.iter().any(|place| {
+                    setup.runs.iter().any(|place| {
                         touched.contains(weft_core::project::address_of(project, &place.id, &place.path).as_str())
                     })
                 })

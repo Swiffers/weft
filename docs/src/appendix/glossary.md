@@ -40,6 +40,10 @@ which is data.
 **Connection.** One account somebody connected to a service. Its credential
 lives in weft's store, sealed, and never in your program.
 
+**Cut.** The smaller program a partial run actually runs, holding only the
+part of the graph its `--from`, `--target`, `--before`, `--group` or `--fire`
+walk keeps.
+
 **Dispatcher.** The control plane. It routes events, decides what runs where,
 and answers every request about a project or a run.
 
@@ -73,8 +77,9 @@ be `List[T | Null]`, because a failed iteration leaves an empty slot.
 **Generator.** A stream: one producer, one consumer, ordered, typed, and it
 ends. A closure on one is its end rather than a skip.
 
-**Group.** Several nodes under one name, with declared inputs and outputs. It
-does not exist when the program runs.
+**Group.** Several nodes under one name, with declared inputs and outputs. No
+node stands for it when the program runs: it is a scope that opens or skips as
+one.
 
 **head.** The version your next checkpoint sits under, and the run a `--seed`
 inherits from.
@@ -125,13 +130,13 @@ What you run after editing anything a live trigger reads.
 **Root.** A node no wire feeds. A manual run starts every root at the top
 level, plus every trigger.
 
-**Scope (run).** Which part of the graph a run covers, set by `--from`,
-`--target`, `--before`, `--group` or `--fire`.
+**Scope (run time).** A group, an included file, or one loop iteration, as the
+runtime sees it: each copy of it opens or skips as one.
 
 **Scope (storage).** Which of run, project, shared, asset or instance a
 file belongs to. It decides where new files go and how long they live.
 
-**Seed.** The run a `--seed` run inherits from. By default head's run.
+**Seed.** The run a `--seed` run inherits from: head's run, or the run you name.
 
 **Sequential Diffusion Programming.** Building a program stage by stage against
 a real case, rather than describing the whole thing and hoping.

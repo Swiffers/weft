@@ -1,0 +1,235 @@
+{
+  "type": "Computer",
+  "label": "Computer",
+  "description": "A computer a program works on: a screen with a window manager, a terminal and a browser (Firefox), a mouse, a keyboard, and a shell. Every action node (Screenshot, Click, TypeText, RunCommand, ...) takes its `computer` output. Its home folder is a disk kept across `weft infra stop`, so a stopped computer keeps its work, and `weft infra terminate` deletes it. No credential is inside unless the program puts one there. If you want to get into it yourself (to look around, check a build, or let a person work in it), give it `sshKeys`: it then opens SSH to the install's own network, and `weft infra list-doors` prints the address to use as `ssh -p <port> user@<host>`; that is the way in for anything interactive, rather than streaming commands through RunCommand. One computer has one screen, so agents working at the same time each want a computer of their own (a `@per_instance` Computer gives each instance one), coordinating through a shared git repository. To have a model work it, include `__catalog/base_catalog/computer/agent.weft`, or build your own agent around `__catalog/base_catalog/computer/perform.weft` (copy either into your own `src/` and change it when your case differs).",
+  "tags": [
+    "computer",
+    "desktop",
+    "screen",
+    "shell",
+    "agent",
+    "infra"
+  ],
+  "inputs": [
+    {
+      "name": "screen",
+      "type": "String",
+      "default": "1280x800",
+      "label": "Screen size",
+      "placeholder": "1280x800",
+      "description": "Width and height of the screen in pixels, which is also the size of every screenshot. 1280x800 fits within every model vendor's image limits, so a coordinate a model reads off a screenshot is a real screen pixel."
+    },
+    {
+      "name": "packages",
+      "type": "String",
+      "label": "Extra packages",
+      "placeholder": "libreoffice gimp",
+      "description": "Debian packages to install at every start, separated by spaces. The machine already has Firefox, a terminal, git, curl and Python 3; anything else a program can also install itself with `sudo apt-get install` through RunCommand."
+    },
+    {
+      "name": "sshKeys",
+      "type": "String",
+      "label": "SSH keys",
+      "widget": {
+        "kind": "textarea"
+      },
+      "placeholder": "ssh-ed25519 AAAA... you@laptop",
+      "description": "Public SSH keys allowed in as the computer's user, one per line (the lines of an `authorized_keys` file). Set, they open SSH to the install's own network (your machine on a local install, the install's private network on a cloud one; never the internet) and replace the computer's `~/.ssh/authorized_keys` at every start. Public keys are not secrets, so they can live in the program. Left out, the computer has no SSH."
+    },
+    {
+      "name": "disk",
+      "type": "String",
+      "default": "10Gi",
+      "label": "Home disk",
+      "description": "Size of the disk holding the home folder, a number followed by Gi, Mi, G or M (`10Gi`)."
+    },
+    {
+      "name": "cpu",
+      "type": "String",
+      "default": "1",
+      "label": "CPUs",
+      "description": "CPUs the machine sustains (`1`, `2`, `500m`). A cloud install picks its cheapest machine holding this and `memory`. A local install does not cap the container."
+    },
+    {
+      "name": "memory",
+      "type": "String",
+      "default": "2Gi",
+      "label": "Memory",
+      "description": "Memory, a number followed by Gi, Mi, G or M (`2Gi`). A browser wants about 1Gi of it. Sized with `cpu`; a local install does not cap the container."
+    },
+    {
+      "name": "machineType",
+      "type": "String",
+      "label": "Machine type",
+      "placeholder": "picked from CPUs and memory",
+      "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "description": "The computer's handle. Wire it into the `computer` input of every action node. Baked: made when the computer's infra is applied, so a run that reads only this output uses the saved handle and does not run this node.",
+      "baked": true
+    }
+  ],
+  "requiresInfra": true,
+  "images": [
+    "images/computer"
+  ],
+  "features": {
+    "liveEndpoint": "api"
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "screen"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "screen",
+              "regex": "^[1-9][0-9]{2,3}x[1-9][0-9]{2,3}$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Computer '{id}' has a `screen` it cannot read. Write the width and height in pixels, joined by x (1280x800).",
+        "level": "structural",
+        "severity": "error",
+        "port": "screen"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "packages"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "packages",
+              "regex": "^[a-z0-9][a-z0-9.+-]*(\\s+[a-z0-9][a-z0-9.+-]*)*\\s*$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Computer '{id}' has `packages` that are not Debian package names. Write the names separated by spaces (libreoffice gimp).",
+        "level": "structural",
+        "severity": "error",
+        "port": "packages"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "disk"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "disk",
+              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Computer '{id}' has a `disk` it cannot read. Write a number followed by Gi, Mi, G or M (10Gi).",
+        "level": "structural",
+        "severity": "error",
+        "port": "disk"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "cpu"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "cpu",
+              "regex": "^[0-9]+(\\.[0-9]+)?m?$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Computer '{id}' has a `cpu` it cannot read. Write a number, or thousandths with m (1, 500m).",
+        "level": "structural",
+        "severity": "error",
+        "port": "cpu"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "memory"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "memory",
+              "regex": "^[0-9]+(\\.[0-9]+)?(Gi|Mi|G|M)$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Computer '{id}' has a `memory` it cannot read. Write a number followed by Gi, Mi, G or M (2Gi).",
+        "level": "structural",
+        "severity": "error",
+        "port": "memory"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "sshKeys"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "sshKeys",
+              "regex": "^\\s*((ssh-|ecdsa-|sk-)\\S+\\s+\\S+[^\\n]*(\\n\\s*|$))+$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Computer '{id}' has `sshKeys` that are not public SSH keys. Write one key per line, as in an authorized_keys file (ssh-ed25519 AAAA... you@laptop).",
+        "level": "structural",
+        "severity": "error",
+        "port": "sshKeys"
+      }
+    }
+  ]
+}

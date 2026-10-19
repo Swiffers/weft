@@ -80,6 +80,24 @@ async fn write_batch(state: &BrokerState, caller: &CallerIdentity, body: &Bytes)
         tracing::warn!(target: "weft_broker::scope", caller_project = %project, born_in = %stray.project_id, "broker refused a birth in another project");
         return Err((StatusCode::FORBIDDEN, "a worker bears runs of its own project only".into()));
     }
+    // A cut a birth runs is kept under its hash, and every later reader
+    // runs what that hash names: it is of this project, is what it says it
+    // is, and is the cut a birth in this batch runs.
+    for program in &batch.head.programs {
+        if program.project_id != project {
+            tracing::warn!(target: "weft_broker::scope", caller_project = %project, stored_for = %program.project_id, "broker refused a program of another project");
+            return Err((StatusCode::FORBIDDEN, "a worker stores programs of its own project only".into()));
+        }
+        program.check().map_err(|e| (StatusCode::BAD_REQUEST, format!("a batch of records carries a program that is not what it says: {e:#}")))?;
+        let named = batch.head.runs.iter().filter_map(|run| run.born.as_ref())
+            .any(|born| born.cut_from.is_some() && born.definition_hash.as_deref() == Some(program.definition_hash.as_str()));
+        if !named {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("a batch of records carries program {}, which no birth in it runs as a cut", program.definition_hash),
+            ));
+        }
+    }
     // How many runs a batch carries, for a measurement of the write path
     // (the bench reads it with `weft_broker::batch=debug`).
     tracing::debug!(target: "weft_broker::batch", runs = batch.head.runs.len(), bytes = body.len(), "a batch of records");

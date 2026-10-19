@@ -127,7 +127,7 @@ pub fn postprocess_output(
             continue;
         }
         let target_handle = d.edge.target_handle.as_deref().unwrap_or("default");
-        let Some(landing_frames) = frames_across(project, program_idx, d.edge, frames) else { continue };
+        let Some(landing_frames) = program_idx.frames_across(d.edge, frames) else { continue };
         let earlier_value_pending = pulses.get(&d.edge.target).is_some_and(|ps| {
             ps.iter().any(|p| {
                 p.status.is_pending()
@@ -154,10 +154,10 @@ pub fn postprocess_output(
     for d in deliveries {
         match d.value {
             Some(value) => emit_value_on_edge(
-                project, program_idx, node_id, d.edge, d.port, value, emission_id, run_id, frames, pulses, emissions,
+                program_idx, node_id, d.edge, d.port, value, emission_id, run_id, frames, pulses, emissions,
             ),
             None => emit_closure_on_edge(
-                project, program_idx, node_id, d.edge, d.port, emission_id, run_id, frames, None, pulses, emissions,
+                program_idx, node_id, d.edge, d.port, emission_id, run_id, frames, None, pulses, emissions,
             ),
         }
     }
@@ -193,39 +193,8 @@ struct Delivery<'a> {
 ///   same wire replayed (a journal row applied twice); one pulse,
 ///   never two. The id names the wire end to end, so two output ports
 ///   of one emission into one input port are two ids.
-/// The frames a pulse carries across `edge`, given the frames its
-/// source fired at, or `None` when the edge is not taken at these
-/// frames. Every wire carries the source's frames unchanged, except
-/// the two that cross a call boundary: leaving a call site's In
-/// boundary pushes the site's call frame (the shared body fires one
-/// frame deeper), and reaching a call site's Out boundary pops it, and
-/// only the site the top frame names takes the wire (a body's Out is
-/// wired to every site that calls it; the frame says whose result this
-/// is). THE one place frames change on a wire, shared by values and
-/// closures, so the live engine and the journal fold agree.
-pub fn frames_across(project: &ProjectDefinition, program_idx: &ProgramIndex, edge: &Edge, frames: &LoopFrames) -> Option<LoopFrames> {
-    use crate::frames::Frame;
-    use crate::project::boundary_types::{CALL_IN, CALL_OUT};
-    let node = |id: &str| program_idx.node(project, id);
-    if let Some(source) = node(&edge.source).filter(|n| n.node_type == CALL_IN) {
-        let site = source.group_boundary.as_ref().expect("a call site's In carries its site").group_id.clone();
-        let mut out = frames.clone();
-        out.push(Frame::Call { site });
-        return Some(out);
-    }
-    if let Some(target) = node(&edge.target).filter(|n| n.node_type == CALL_OUT) {
-        let site = &target.group_boundary.as_ref().expect("a call site's Out carries its site").group_id;
-        return match frames.last() {
-            Some(Frame::Call { site: top }) if top == site => Some(frames[..frames.len() - 1].to_vec()),
-            _ => None,
-        };
-    }
-    Some(frames.clone())
-}
-
 #[allow(clippy::too_many_arguments)]
-fn emit_value_on_edge(
-    project: &ProjectDefinition,
+pub(crate) fn emit_value_on_edge(
     program_idx: &ProgramIndex,
     source_node: &str,
     edge: &Edge,
@@ -237,10 +206,10 @@ fn emit_value_on_edge(
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
-    let Some(frames) = frames_across(project, program_idx, edge, frames) else { return };
+    let Some(frames) = program_idx.frames_across(edge, frames) else { return };
     let frames = &frames;
-    let target_handle = edge.target_handle.as_deref().unwrap_or("default");
-    let id = pulse_id(emission_id, port, &edge.target, target_handle, false);
+    let target_handle = edge.target_port();
+    let id = pulse_id(emission_id, &edge.id, false);
 
     let bucket = pulses.entry(edge.target.clone()).or_default();
     if bucket.iter().any(|p| p.id == id) {
@@ -292,7 +261,7 @@ fn emit_value_on_edge(
 /// generator ports' closures as a FAILED end, so the consumer's pull
 /// surfaces the producer's error through `?` instead of reading a
 /// clean finish over a truncated stream. Scalar closures retain it too,
-/// so input backups cannot hide a producer failure.
+/// so a skip further down still names the node that broke.
 #[allow(clippy::too_many_arguments)]
 pub fn close_unmentioned_downstream(
     node_id: &str,
@@ -323,7 +292,7 @@ pub fn close_unmentioned_downstream(
             continue;
         }
         emit_closure_on_outgoing(
-            project, program_idx, node_id, &port.name, emission_id, run_id, frames, failure, &outgoing,
+            program_idx, node_id, &port.name, emission_id, run_id, frames, failure, &outgoing,
             pulses, emissions,
         );
     }
@@ -370,7 +339,7 @@ pub fn emit_port_closure(
     }
     let outgoing = program_idx.get_outgoing(project, node_id, frames);
     emit_closure_on_outgoing(
-        project, program_idx, node_id, port_name, emission_id, run_id, frames, failure, &outgoing, pulses, emissions,
+        program_idx, node_id, port_name, emission_id, run_id, frames, failure, &outgoing, pulses, emissions,
     );
     Ok(())
 }
@@ -422,7 +391,6 @@ pub fn close_failed_then_unmentioned_downstream(
 /// Emit a closure on every outgoing edge of `port_name`.
 #[allow(clippy::too_many_arguments)]
 fn emit_closure_on_outgoing(
-    project: &ProjectDefinition,
     program_idx: &ProgramIndex,
     node_id: &str,
     port_name: &str,
@@ -439,7 +407,7 @@ fn emit_closure_on_outgoing(
         .filter(|e| e.source_handle.as_deref() == Some(port_name))
     {
         emit_closure_on_edge(
-            project, program_idx, node_id, edge, port_name, emission_id, run_id, frames, failure, pulses,
+            program_idx, node_id, edge, port_name, emission_id, run_id, frames, failure, pulses,
             emissions,
         );
     }
@@ -453,8 +421,7 @@ fn emit_closure_on_outgoing(
 /// second one. A closure whose id is already in the bucket is the same
 /// emission replayed, and dedups like the value case.
 #[allow(clippy::too_many_arguments)]
-fn emit_closure_on_edge(
-    project: &ProjectDefinition,
+pub(crate) fn emit_closure_on_edge(
     program_idx: &ProgramIndex,
     node_id: &str,
     edge: &Edge,
@@ -466,11 +433,11 @@ fn emit_closure_on_edge(
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
-    let Some(frames) = frames_across(project, program_idx, edge, frames) else { return };
+    let Some(frames) = program_idx.frames_across(edge, frames) else { return };
     let frames = &frames;
-    let target_handle = edge.target_handle.as_deref().unwrap_or("default");
+    let target_handle = edge.target_port();
     let generator_target = super::ready::edge_targets_generator(program_idx, edge);
-    let id = pulse_id(emission_id, port_name, &edge.target, target_handle, true);
+    let id = pulse_id(emission_id, &edge.id, true);
 
     let bucket = pulses.entry(edge.target.clone()).or_default();
     if bucket.iter().any(|p| p.id == id) {
@@ -533,6 +500,7 @@ mod fan_in_tests {
             target: target.into(),
             target_handle: Some(target_handle.into()),
             path: Vec::new(),
+            via: Vec::new(),
             span: None,
             source_file: None,
         }
@@ -555,7 +523,7 @@ mod fan_in_tests {
     }
 
     #[test]
-    fn failed_scalar_closure_keeps_its_reason_to_prevent_backup_substitution() {
+    fn failed_scalar_closure_keeps_its_reason() {
         let mut project = direct_project();
         project.edges.push(edge("out", "consumer", "in"));
         let index = ProgramIndex::build(&project);
@@ -603,8 +571,8 @@ mod fan_in_tests {
         let frames: LoopFrames = Vec::new();
 
         let project = direct_project();
-        emit_value_on_edge(&project, &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions);
-        emit_value_on_edge(&project, &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions);
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
         let pending: Vec<_> = consumer_bucket
@@ -658,10 +626,10 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_closure_on_outgoing(
-            &project, &ProgramIndex::build(&project), "src1", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src1", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_value_on_edge(
-            &project, &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
@@ -687,11 +655,11 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_value_on_edge(
-            &project, &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), run_id, &frames, &mut pulses, &mut emissions,
         );
         let emissions_before = emissions.len();
         emit_closure_on_outgoing(
-            &project, &ProgramIndex::build(&project), "src2", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src2", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         assert_eq!(
             emissions.len(),
@@ -863,10 +831,10 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_closure_on_outgoing(
-            &project, &ProgramIndex::build(&project), "src1", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src1", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_closure_on_outgoing(
-            &project, &ProgramIndex::build(&project), "src2", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &ProgramIndex::build(&project), "src2", "out", emission(), run_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");

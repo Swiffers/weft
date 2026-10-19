@@ -5,30 +5,21 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use weft_core::project::selection::RecordedSelection;
 use weft_core::RunId;
 use weft_journal::frame::{BatchAnswer, BatchHead, RunHead};
 use weft_journal::record::{Fate, RawRecord, RunLogRow};
 use weft_journal::{BatchError, RunEvent, RecordClient};
 
-/// A batch as a lane sent it: each run's head and its events, read back
-/// with the selections the batch carried.
+/// A batch as a lane sent it: each run's head and its events.
 pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<RunEvent>)>) {
     let batch = weft_journal::frame::decode(body).expect("a lane frames what it sends");
-    let selections: HashMap<String, RecordedSelection> = batch
-        .head
-        .selections
-        .iter()
-        .map(|stored| (stored.digest.clone(), RecordedSelection::read(stored.digest.clone(), stored.selection.clone())))
-        .collect();
     let runs = batch
         .head
         .runs
         .iter()
         .zip(&batch.rows)
         .map(|(run, row)| {
-            let selection = run.born.as_ref().and_then(|born| born.selection.as_ref()).map(|digest| &selections[digest]);
-            let events = weft_journal::stored::decode(run.run_id, selection, row).expect("a lane writes rows that read back");
+            let events = weft_journal::stored::decode(run.run_id, row).expect("a lane writes rows that read back");
             (run.clone(), events)
         })
         .collect();
@@ -176,7 +167,7 @@ impl RecordClient for FakeRecord {
 
     async fn record_of(&self, run_id: RunId) -> anyhow::Result<RawRecord> {
         let events = self.events(run_id);
-        Ok(RawRecord { selection: None, rows: vec![RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }] })
+        Ok(RawRecord { rows: vec![RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }] })
     }
 
     async fn give_up(&self, run_id: RunId, why: String) -> Result<(), BatchError> {

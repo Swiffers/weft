@@ -656,6 +656,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             definition_hash TEXT NOT NULL,
             project_json TEXT NOT NULL,
             recorded_at_unix BIGINT NOT NULL,
+            -- For a cut a run runs (`weft_journal::record::RunsProgram`),
+            -- the registered program it was cut from; NULL for a version
+            -- a build registered. A cut is no version: the running hashes
+            -- never point at one (`advance_running_hashes`).
+            cut_from TEXT,
             PRIMARY KEY (project_id, definition_hash)
             -- No foreign key to `project`: the project's removal erases
             -- its runs first and drops these in its own transaction
@@ -674,9 +679,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// Folding the tags into this one statement is what guarantees a project is
 /// never observed stamped runnable (new binary hash) with its infra tags absent
 /// or half-written. Zero rows updated fails loudly: either the project row is
-/// missing, or the definition hash has no history row (the project must be
-/// registered with that definition first; registering is the only writer of
-/// history rows).
+/// missing, or the definition hash has no history row a build registered (the
+/// project must be registered with that definition first; a cut a run keeps
+/// there, marked `cut_from`, is no registered version).
 async fn advance_running_hashes(
     conn: &mut sqlx::PgConnection,
     id: uuid::Uuid,
@@ -712,7 +717,7 @@ async fn advance_running_hashes(
              updated_at = $4 \
          WHERE id = $5 AND ($2 IS NULL OR EXISTS ( \
              SELECT 1 FROM project_definition \
-             WHERE project_id = $5 AND definition_hash = $2 \
+             WHERE project_id = $5 AND definition_hash = $2 AND cut_from IS NULL \
          ))",
     )
     .bind(binary_hash)
@@ -734,7 +739,7 @@ async fn advance_running_hashes(
         }
         anyhow::bail!(
             "refuse to set running_definition_hash to {hash} for project {id}: \
-             no project_definition history row exists for that hash; \
+             no registered project_definition history row exists for that hash; \
              register the project with this definition first",
             hash = definition_hash.unwrap_or("<none>"),
         );
@@ -820,11 +825,13 @@ impl ProjectStoreOps for PostgresProjectStore {
             // then pointer advance. Inside the transaction the FK
             // precondition is satisfied as of the same snapshot, so
             // the pointer-setter's existence check sees the freshly
-            // inserted history row.
+            // inserted history row. A cut some run kept under the same
+            // hash is the same program, and is now a registered version
+            // too.
             sqlx::query(
                 "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix) \
                  VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (project_id, definition_hash) DO NOTHING",
+                 ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL",
             )
             .bind(id)
             .bind(hash)

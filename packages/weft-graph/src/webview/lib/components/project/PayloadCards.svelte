@@ -20,7 +20,7 @@
 		/// saying so, after the ports that did carry one.
 		closedPorts?: string[];
 		/// Where a port's value came from when it did not travel a wire
-		/// in this run (a backup, a supplied output, the seed run).
+		/// in this run (a value given to the run, the seed run).
 		noteFor?: (port: string) => string | undefined;
 		/// What to say when the payload carries nothing at all.
 		empty?: string;

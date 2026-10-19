@@ -39,16 +39,13 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use weft_core::run::boundary::{
-    is_passthrough, kick_scope, settle_table, tear_down_scope, BoundaryOutcome,
-};
+use weft_core::run::scope::{scope_permission, settle_table, tear_down_loop, ScopePermission, ScopeTable};
 use weft_core::run::emission::{body_emission, terminal_sweep_emission};
 use weft_core::run::loop_runtime::{
     self as loops, classify_loop_out, close_loop_outward, instantiate, LoopAdvance, LoopRuntime,
     LoopStreamItem,
 };
 use weft_core::run::ready::owned_bag;
-use weft_core::run::boundary::{scope_permission, ScopePermission};
 use weft_core::run::{
     check_completion, firing_at, firing_at_mut,
     postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag},
@@ -161,6 +158,9 @@ pub(crate) struct BornWith {
     pub(crate) instance_values: weft_core::instance::InstanceValues,
     pub(crate) picks: weft_core::picks::Picks,
     pub(crate) settings: weft_core::run_settings::RunSettings,
+    /// What the run is given at the places its program says (handed
+    /// values, stand-ins' outputs): its own, never its program's.
+    pub(crate) given: std::sync::Arc<weft_core::project::Given>,
 }
 
 impl BornWith {
@@ -170,12 +170,13 @@ impl BornWith {
         events
             .iter()
             .find_map(|e| match e {
-                RunEvent::RunStarted { phase, instance, instance_values, picks, settings, .. } => Some(Self {
+                RunEvent::RunStarted { phase, instance, instance_values, picks, settings, given, .. } => Some(Self {
                     phase: *phase,
                     instance: instance.clone(),
                     instance_values: (**instance_values).clone(),
                     picks: (**picks).clone(),
                     settings: *settings,
+                    given: std::sync::Arc::new((**given).clone()),
                 }),
                 _ => None,
             })
@@ -185,9 +186,10 @@ impl BornWith {
 
 /// What a run starts from.
 pub(crate) enum StartsFrom {
-    /// Born here from a plan (`crate::plan`): its first state as the plan
-    /// makes it, its birth already handed to its record. Nothing is folded.
-    Plan { born_with: BornWith, opening: crate::plan::Opening },
+    /// Born here from a plan (`crate::plan`): its roots kicked as the plan
+    /// makes them (`crate::plan::Startable::opening`), its birth already
+    /// handed to its record. Nothing is folded.
+    Plan { born_with: BornWith, kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode> },
     /// Carried on from its record, as the worker's claim read it: folded.
     Record(Vec<RunEvent>),
 }
@@ -241,6 +243,7 @@ pub(crate) struct Drove {
     pub(crate) firings: NodeFiringTable,
     pub(crate) loop_runtime: LoopRuntime,
     pub(crate) kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    pub(crate) scopes: ScopeTable,
 }
 
 /// `run_one`, keeping the worker's tables.
@@ -660,12 +663,15 @@ async fn drive_run_id(
     let mut firings: NodeFiringTable = Default::default();
     // Kicked nodes (the run's entry points: the firing trigger,
     // manual-run roots, infra-setup roots, at frames `[]`; and every
-    // scope body's own roots, at the scope's frames). Folded from
-    // `RunEvent::NodeKicked`, a group's In boundary firing and
+    // scope's own roots, at the copy's frames). Folded from
+    // `RunEvent::NodeKicked`, a scope's opening and
     // `LoopIterationLaunched`. The scheduler dispatches each
     // not-yet-dispatched kick once at its own frames; the payload for
     // the firing trigger threads through to the `ctx.wake` bag.
     let mut kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode> = HashMap::new();
+    // What the run decided about its scopes (`weft_core::run::scope`):
+    // no row of its own, the fold decides the same from the same rows.
+    let mut scopes = ScopeTable::default();
     // Per-(node, frames) ordered list of past `await_signal` calls.
     // Pre-loaded from the journal fold; consumed by the body's
     // `await_signal` calls in call_index order.
@@ -681,30 +687,22 @@ async fn drive_run_id(
         // inside this worker (its caller refused or gone before
         // attaching), or one waiting for it when it was claimed.
         let outcome = RunOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) };
-        return Ok(Drove { outcome, pulses, firings, loop_runtime, kicked });
+        return Ok(Drove { outcome, pulses, firings, loop_runtime, kicked, scopes });
     }
     let (born_with, mut fold) = match starts_from {
-        StartsFrom::Plan { born_with, opening } => {
-            pulses = opening.pulses;
-            kicked = opening.kicked;
+        StartsFrom::Plan { born_with, kicked: opening } => {
+            // The run's values go where its program says it is given
+            // something, and nowhere else. A run carried on from its record
+            // is held to the same by the fold of that record (its snapshot
+            // refuses a birth that breaks it).
+            born_with.given.check_against(project).map_err(|why| anyhow::anyhow!("run {run_id} cannot run: {why}"))?;
+            kicked = opening;
             (born_with, RunFold::unborn(run_id, project_arc.clone()))
         }
         StartsFrom::Record(events) => {
             // What a run starts from always holds its birth: the record a
             // claim reads begins with it.
             let born_with = BornWith::of_record(run_id, &events)?;
-            // A setup phase is bounded by construction (the dispatcher
-            // journals `RunSelection::setup` over its triggers or infra
-            // nodes). A setup row with no selection would dispatch the
-            // whole business graph and paint everything downstream of a
-            // trigger as skipped, so it is refused instead of run.
-            if born_with.phase != weft_core::context::Phase::Fire && program.selection.is_none() {
-                anyhow::bail!(
-                    "run {run_id} is a {} run whose RunStarted carries no selection; \
-                     the dispatcher contract is broken",
-                    born_with.phase.as_str()
-                );
-            }
             // One chain for the whole drive: the ancestors are terminal
             // and their rows never change.
             let projects = &clients.project;
@@ -716,7 +714,7 @@ async fn drive_run_id(
             drop(events);
             let snap = fold.snapshot()?;
             let crashed = apply_snapshot(
-                &program, snap, &mut pulses, &mut firings, &mut kicked, &mut awaited_sequences,
+                &program, snap, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut awaited_sequences,
                 &mut loop_runtime,
             );
             fail_crashed_firings(
@@ -727,7 +725,7 @@ async fn drive_run_id(
             (born_with, fold)
         }
     };
-    let BornWith { phase, instance, instance_values, picks, settings } = born_with;
+    let BornWith { phase, instance, instance_values, picks, settings, given } = born_with;
 
     let mut outcome = drive(
         &program,
@@ -746,12 +744,14 @@ async fn drive_run_id(
         &mut pulses,
         &mut firings,
         &mut kicked,
+        &mut scopes,
         awaited_sequences,
         &mut loop_runtime,
         phase,
         instance.as_ref(),
         &instance_values,
         &picks,
+        &given,
         settings,
         &mut fold,
         hand_back,
@@ -766,7 +766,7 @@ async fn drive_run_id(
     if matches!(outcome, RunOutcome::Completed) && caller.as_ref().is_some_and(|c| c.owes_answer()) {
         outcome = RunOutcome::Failed { error: weft_core::caller::NO_ANSWER.to_string(), held_too_long: false };
     }
-    Ok(Drove { outcome, pulses, firings, loop_runtime, kicked })
+    Ok(Drove { outcome, pulses, firings, loop_runtime, kicked, scopes })
 }
 
 /// Hold again, before anything of the run runs, every charge its record
@@ -1178,12 +1178,14 @@ fn apply_snapshot(
     pulses: &mut PulseTable,
     firings: &mut NodeFiringTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut LoopRuntime,
 ) -> Vec<CrashedFiring> {
     *pulses = snap.pulses;
     *firings = snap.firings;
     *kicked = snap.kicked;
+    *scopes = snap.scopes;
     *awaited_sequences = snap.awaited_sequences;
     // The fold drove every loop instance from the loop rows; the
     // resumed worker takes them over as its own runtime. Buffered
@@ -1229,8 +1231,8 @@ fn apply_snapshot(
     // (`resume_resolved_suspensions_in_place`) a Running firing is a live
     // task, not a dead one, so that path omits it.
     //
-    // A group boundary (a LoopIn, a group's In or Out) is re-dispatched
-    // too: runtime machinery, not user code, whose whole state (launched,
+    // A loop's boundary (its LoopIn or LoopOut) is re-dispatched too:
+    // runtime machinery, not user code, whose whole state (launched,
     // out_fired, stream_end) is journal-backed so its re-fire is
     // idempotent.
     let mut run_again: std::collections::HashSet<FiringLocation> =
@@ -1389,6 +1391,7 @@ async fn drive(
     pulses: &mut PulseTable,
     firings: &mut NodeFiringTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut LoopRuntime,
     phase: weft_core::context::Phase,
@@ -1402,6 +1405,9 @@ async fn drive(
     // `RunStarted`): every connection picked on the install reads
     // these.
     picks: &weft_core::picks::Picks,
+    // What the run is given, as its `RunStarted` says: handed values and
+    // stand-ins' outputs at the places its program says.
+    given: &weft_core::project::Given,
     // How the run is kept, from its `RunStarted`: whether it can
     // pause, and how long a wait it cannot pause on holds.
     settings: weft_core::run_settings::RunSettings,
@@ -1414,8 +1420,6 @@ async fn drive(
 ) -> anyhow::Result<RunOutcome> {
     let project: &ProjectDefinition = &program.project;
     let program_idx = &program.index;
-    // The nodes this run may dispatch; None = the whole graph.
-    let dispatchable = program.dispatchable.as_ref();
     // The driver's rows and its nodes' (through their `RunRecord`) go to
     // the run's record in the background, in one order (`DriveJournal`).
     let journal: &dyn JournalClient = drive_journal.as_ref();
@@ -1524,78 +1528,42 @@ async fn drive(
                 replica,
                 loop_runtime,
                 kicked,
+                scopes,
                 &mut stream_rt,
                 &recorded_cancel_cause(cancellation).to_string(),
                 phase,
-                dispatchable,
+                given,
             )
             .await;
             return Ok(RunOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
         }
 
-        // Group boundaries fire here, synchronously and without a
-        // journal row: a boundary is a pure function of its inputs, so
-        // the fold fires it from the same pass and holds the same
-        // record. Every pulse a boundary absorbed settles its delivery
-        // gate exactly as an ordinary dispatch would.
-        // The same pass the fold runs after every row (`settle_table`):
-        // boundaries, then what this run never dispatches settles with
-        // no row (a pulse on a node outside the run's set is absorbed,
-        // a pulse into a trigger at Fire is dropped). A producer that
-        // yield_downstream'ed into any of those is parked on the
-        // pulses; its wait fails loudly instead of hanging.
-        let pass = settle_table(
-            project, program_idx, phase, dispatchable, run_id, now_unix(), pulses, firings, kicked,
-        );
-        let boundaries = pass.boundaries;
-        for b in &boundaries {
-            match &b.outcome {
-                BoundaryOutcome::OutOfScope => {
-                    let msg = format!(
-                        "the consumer '{}' is outside the part of the graph this \
-                         run runs, so the awaited delivery can never happen",
-                        b.node_id
-                    );
-                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Skipped { reason: &msg });
-                }
-                BoundaryOutcome::Fired { skip_reason: Some(reason), .. } => {
-                    let msg = format!(
-                        "the consumer '{}' skipped ({reason}), so the awaited delivery can \
-                         never happen",
-                        b.node_id
-                    );
-                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Skipped { reason: &msg });
-                }
-                // A boundary that failed before forwarding (a port
-                // refused its value) delivered nothing: its producers'
-                // waits fail with the reason, as a skip's do.
-                BoundaryOutcome::Fired { error: Some(err), .. } => {
-                    let msg = format!(
-                        "the consumer '{}' failed before running ({err}), so the awaited \
-                         delivery can never happen",
-                        b.node_id
-                    );
-                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Skipped { reason: &msg });
-                }
-                BoundaryOutcome::Fired { .. } => {
-                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Taken);
-                }
-            }
-        }
-        let boundaries_fired = !boundaries.is_empty();
-        if boundaries_fired {
+        // The run's scopes are decided here, synchronously and without a
+        // journal row: a decision is a function of the program and of the
+        // pulses, so the fold decides the same from the same rows
+        // (`settle_table`, which it runs after every row). What opened
+        // sends what starts at its ports and kicks its members no wire
+        // feeds; what did not run closes what leaves it and is told,
+        // however deep. What the run will never take settles with no row
+        // (a pulse inside a copy that did not run, or on a gate already
+        // decided, is absorbed; a pulse into a trigger at Fire is
+        // dropped). A producer that yield_downstream'ed into any of those
+        // is parked on the pulses; its wait fails loudly instead of
+        // hanging.
+        let pass = settle_table(project, program_idx, given, phase, run_id, now_unix(), pulses, scopes, kicked);
+        let scopes_moved = !pass.decided.is_empty() || !pass.emissions.is_empty();
+        if scopes_moved {
             idled_since_progress = false;
         }
-
         stream_rt.on_pulses_absorbed(
-            &pass.out_of_run.absorbed,
+            &pass.absorbed,
             AbsorbKind::Skipped {
-                reason: "the consumer is outside the part of the graph this run runs, \
-                         so the awaited delivery can never happen",
+                reason: "the consumer will never take it (the scope around it did not run, or the gate it \
+                         feeds was decided already), so the awaited delivery can never happen",
             },
         );
         stream_rt.on_pulses_absorbed(
-            &pass.out_of_run.dropped,
+            &pass.dropped,
             AbsorbKind::Skipped {
                 reason: "the target is a trigger; wires into a trigger are inert at Fire (its \
                          ports replay the setup-time snapshot), so the awaited delivery can \
@@ -1603,12 +1571,12 @@ async fn drive(
             },
         );
 
-        // Gates and empty-stream backups settle before either kind of stream
+        // Gates settle before either kind of stream
         // consumer sees an end. Routing still precedes readiness so a running
         // consumer cannot dispatch a second time over its queued items.
         let acted = route_stream_pulses(
             run_id, project, program_idx, pulses, firings, journal, replica,
-            &mut stream_rt, loop_runtime, kicked,
+            &mut stream_rt, loop_runtime, kicked, scopes,
         ).await;
         if acted > 0 { idled_since_progress = false; }
 
@@ -1657,10 +1625,10 @@ async fn drive(
             .await);
         }
 
-        let mut ready = program.ready(pulses);
+        let mut ready = program.ready(pulses, given);
         ready.retain_mut(|(id, group)| {
             let node = program.node(id).expect("ready node belongs to project");
-            match scope_permission(project, program_idx, node, &group.frames, firings) {
+            match scope_permission(program_idx, node, &group.frames, scopes) {
                 ScopePermission::Pending => false,
                 ScopePermission::Allowed => true,
                 ScopePermission::Skipped(scope) => {
@@ -1705,16 +1673,19 @@ async fn drive(
             if info.dispatched {
                 continue;
             }
-            if dispatchable.is_some_and(|s| !s.contains(&weft_core::frames::Located::at(&loc.node_id, &loc.frames))) {
-                info.dispatched = true;
-                continue;
-            }
             let node = program.node(&loc.node_id)
                 .ok_or_else(|| anyhow::anyhow!("kick names unknown node '{}'", loc.node_id))?;
-            match scope_permission(project, program_idx, node, &loc.frames, firings) {
-                ScopePermission::Pending => continue,
-                ScopePermission::Allowed => {}
-                ScopePermission::Skipped(scope) => info.scope_skipped = Some(scope),
+            // A kick a scope's teardown left (`scope_skipped`) is decided
+            // already: it dispatches into its skip whatever the copies
+            // around it say (a loop torn down before any iteration tells
+            // its body at the loop's own frames, where no copy is ever
+            // decided). Every other kick obeys the copies around it.
+            if info.scope_skipped.is_none() {
+                match scope_permission(program_idx, node, &loc.frames, scopes) {
+                    ScopePermission::Pending => continue,
+                    ScopePermission::Allowed => {}
+                    ScopePermission::Skipped(scope) => info.scope_skipped = Some(scope),
+                }
             }
             // Not yet dispatched. If a pulse-driven ReadyGroup at this
             // location already covers the node (the entry node also
@@ -1729,7 +1700,7 @@ async fn drive(
                 // Synthesize a ReadyGroup at the kick's frames from the
                 // node's written constants (and a firing trigger's port
                 // snapshot): `kicked_group` is the one derivation, shared
-                // with the boundary pass. A kick naming a node the
+                // with the fold. A kick naming a node the
                 // project does not have is a corrupt compiled shape;
                 // fail the drive loudly instead of parking the kick
                 // forever.
@@ -1746,11 +1717,10 @@ async fn drive(
                 // pulse, so folding one in would leave it pending for
                 // ever and the run could never complete. A
                 // trigger's pulses are dropped outright in the firing
-                // phase (`settle_out_of_run`). Authored `--emit`
-                // outputs supply a source without running its body.
+                // phase (`settle_table`).
                 ready.push((
                     loc.node_id.clone(),
-                    weft_core::run::ready::kicked_group(def, info, &loc.frames, run_id, project, program_idx),
+                    weft_core::run::ready::kicked_group(def, info, &loc.frames, run_id, project, program_idx, given),
                 ));
             }
             info.dispatched = true;
@@ -1773,7 +1743,7 @@ async fn drive(
             idled_since_progress = false;
         }
 
-        let dispatched_this_turn = boundaries_fired || !ready.is_empty();
+        let dispatched_this_turn = scopes_moved || !ready.is_empty();
         // A body that ended in the poll that started it frees its
         // location like one reaped below.
         let mut ended_at_start = false;
@@ -1808,30 +1778,6 @@ async fn drive(
                      project definition; corrupt compiled project shape"
                 ));
             };
-            // Group boundaries (Passthrough) fire in the boundary pass
-            // at the top of the turn, never here: the pass absorbs their
-            // pulses before readiness runs and consumes their kicks. One
-            // reaching this loop means a pulse landed on a boundary
-            // between the pass and readiness, which nothing in between
-            // does; fail loud BEFORE anything is absorbed or journaled
-            // (a boundary never has a row, and the fold refuses one).
-            if is_passthrough(node_def) {
-                return Err(anyhow::anyhow!(
-                    "dispatch: group boundary '{node_id}' reached the node dispatch loop; \
-                     boundaries fire in the boundary pass (engine invariant violated)"
-                ));
-            }
-            // Scope is decided inside `find_ready_nodes`: an out-of-scope
-            // node forms a group on ANY pending pulse. `settle_out_of_run`
-            // absorbed every such pulse right before this scan, so a
-            // group here means the scan and the settle disagree on the
-            // run's node set.
-            if group.out_of_scope {
-                return Err(anyhow::anyhow!(
-                    "'{node_id}' formed a group outside the run's node set after the \
-                     out-of-run settle (engine invariant violated)"
-                ));
-            }
             // A record already at this location makes the dispatch a
             // resume, and only two kinds are: a firing parked on a wait
             // whose answer is in, and one left Running with no body (a
@@ -2006,7 +1952,7 @@ async fn drive(
             if let Some(reason) = &group.skip {
                 handle_node_skip(
                     &node_id, group.run_id, &group.frames, reason,
-                    project, program_idx, pulses, firings, kicked, journal, replica,
+                    project, program_idx, pulses, firings, kicked, scopes, journal, replica,
                 )
                 .await;
                 continue;
@@ -2046,6 +1992,7 @@ async fn drive(
                     loop_runtime,
                     &mut stream_rt,
                     kicked,
+                    scopes,
                 )
                 .await;
                 match outcome {
@@ -2616,7 +2563,7 @@ async fn drive(
             if held_back {
                 return Ok(RunOutcome::HandedBack);
             }
-            return terminate(project, program_idx, pulses, firings, &waiting).await;
+            return terminate(project, program_idx, pulses, firings, kicked, scopes, &waiting).await;
         }
 
         // Stuck-check: we drained twice without progress, with at least
@@ -2904,10 +2851,11 @@ async fn drive(
                     replica,
                     loop_runtime,
                     kicked,
+                    scopes,
                     &mut stream_rt,
                     &recorded_cancel_cause(cancellation).to_string(),
                     phase,
-                    dispatchable,
+                    given,
                 )
                 .await;
                 return Ok(RunOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
@@ -3097,6 +3045,7 @@ pub(crate) async fn handle_loop_boundary_firing(
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
 ) -> Result<(), String> {
     use weft_core::primitive::LoopTerminationReason;
 
@@ -3222,7 +3171,7 @@ pub(crate) async fn handle_loop_boundary_firing(
             for index in to_launch {
                 launch_iteration(
                     project, program_idx, pulses, journal, replica, &key, index, None, loop_runtime,
-                    kicked,
+                    kicked, scopes,
                 )
                 .await?;
             }
@@ -3278,14 +3227,14 @@ pub(crate) async fn handle_loop_boundary_firing(
             LoopAdvance::LaunchNext { index: next, stream_item: Some(item) } => {
                 launch_stream_iteration(
                     project, program_idx, pulses, journal, replica, &key, next, item, loop_runtime,
-                    stream_rt, kicked,
+                    stream_rt, kicked, scopes,
                 )
                 .await
             }
             LoopAdvance::LaunchNext { index: next, stream_item: None } => {
                 launch_iteration(
                     project, program_idx, pulses, journal, replica, &key, next, None, loop_runtime,
-                    kicked,
+                    kicked, scopes,
                 )
                 .await
             }
@@ -3298,7 +3247,7 @@ pub(crate) async fn handle_loop_boundary_firing(
                 // A stream-driven loop that terminated (a done vote,
                 // the max cap) may leave buffered items behind; they
                 // can never launch, so drop them durably.
-                let loop_in_id = weft_core::project::boundary_in_id(&group_id);
+                let loop_in_id = weft_core::project::loop_in_id(&group_id);
                 drop_loop_stream_leftovers(
                     &key, &loop_in_id, group.run_id, pulses, journal, replica,
                     loop_runtime, stream_rt,
@@ -3310,9 +3259,10 @@ pub(crate) async fn handle_loop_boundary_firing(
     }
 }
 
-/// Launch one iteration: put the body's pulses on the wires (the pure
-/// derivation in `weft_core::run::loop_runtime::launch_iteration`),
-/// journal the launch row, and kick the body's roots. The row is the
+/// Launch one iteration: put the body's pulses on the wires and open the
+/// iteration's copy of the loop, kicking the body's roots (the pure
+/// derivation in `weft_core::run::loop_runtime::launch_iteration`), and
+/// journal the launch row. The row is the
 /// ONE fact of the launch; on crash-resume `launched.contains(index)`
 /// is true iff the fold put the body pulses on the wires from that
 /// row, so `record_loop_out`'s already-launched guard correctly
@@ -3329,10 +3279,11 @@ pub(crate) async fn launch_iteration(
     stream_item: Option<LoopStreamItem>,
     loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
 ) -> Result<(), String> {
     let stream_pulse = stream_item.as_ref().map(|item| item.pulse.to_string());
-    let launch = loops::launch_iteration(
-        loop_runtime, key, index, stream_item, project, program_idx, pulses,
+    loops::launch_iteration(
+        loop_runtime, key, index, stream_item, project, program_idx, pulses, scopes, kicked, now_unix(),
     )?;
     crate::context::record_from_replica(
         journal,
@@ -3347,7 +3298,6 @@ pub(crate) async fn launch_iteration(
         replica,
     )
     .await;
-    kick_scope(kicked, &launch.roots, &launch.body_frames, None);
     Ok(())
 }
 
@@ -3790,40 +3740,34 @@ async fn handle_node_skip(
     pulses: &mut PulseTable,
     firings: &mut NodeFiringTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
     journal: &dyn JournalClient,
     replica: &str,
 ) {
     mark_skipped(firings, node_id, run_id, frames, reason);
-    // A node inside a gated scope carries NO closures: every member of
-    // that scope gets its own `ScopeSkipped` row from the scope's
-    // sweep (nested scopes included), and the scope's outward closures
-    // rode its In boundary's skip row. A cascade here would only
-    // manufacture a second firing for nodes the sweep already settled.
+    // A node inside a scope that did not run carries NO closures: the
+    // scope's teardown closed every wire leaving it and kicked every
+    // node inside into its own `ScopeSkipped` skip (nested scopes
+    // included). A cascade here would only manufacture a second firing
+    // for nodes the teardown already settled.
     if matches!(reason, weft_core::run::skip::SkipReason::ScopeSkipped { .. }) {
         ship_node_skipped(journal, replica, run_id, node_id, frames, reason).await;
         return;
     }
-    // A skipped scope (its In boundary said no: a LoopIn here, a
-    // group's In boundary fires in the boundary pass) needs its own
-    // teardown: the generic sweep below deliberately no-ops for loop
-    // boundaries (per-iteration firings must not auto-close the
-    // outward ports). The scope's skip surface is its outward ports at
-    // the scope's own frames; the NodeSkipped row is the fact the fold
-    // closes them from. Then every member is kicked into a skip that
-    // says its scope did not run.
-    let skipped_scope = project
-        .nodes
-        .iter()
-        .find(|n| n.id == node_id)
+    // A LoopIn that skipped (its loop gated off) takes its loop down: the
+    // generic sweep below deliberately no-ops for loop boundaries
+    // (per-iteration firings must not auto-close the outward ports). The
+    // loop's skip surface is its outward ports at the loop's own frames;
+    // the NodeSkipped row is the fact the fold closes them from. Then
+    // everything inside is kicked into a skip that says its loop did not
+    // run.
+    let skipped_loop = program_idx
+        .node(project, node_id)
+        .filter(|n| n.node_type == weft_core::project::boundary_types::LOOP_IN)
         .and_then(|n| n.group_boundary.as_ref())
-        .filter(|gb| gb.role == weft_core::project::GroupBoundaryRole::In)
         .map(|gb| gb.group_id.clone());
-    if let Some(group_id) = skipped_scope {
-        let emission_id = terminal_sweep_emission(node_id, frames);
-        tear_down_scope(
-            project, program_idx, pulses, kicked, emission_id, run_id, &group_id, frames, Some(reason),
-            reason.inherited_failure(),
-        );
+    if let Some(loop_id) = skipped_loop {
+        tear_down_loop(project, program_idx, &loop_id, frames, reason, run_id, now_unix(), pulses, scopes, kicked);
         ship_node_skipped(journal, replica, run_id, node_id, frames, reason).await;
         return;
     }
@@ -3933,12 +3877,13 @@ async fn cancel_cleanup(
     replica: &str,
     loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
     stream_rt: &mut StreamRuntime,
     // The cause in words, what every cancelled record carries as its
     // error (the same text the `NodeCancelled` rows will carry).
     reason: &str,
     phase: weft_core::context::Phase,
-    dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
+    given: &weft_core::project::Given,
 ) {
     // An in-flight node's future is aborted immediately; it needs no window
     // to wrap up first. A paid call's answer may be read on a task of a
@@ -3962,8 +3907,8 @@ async fn cancel_cleanup(
     stream_rt.fail_all_gates("the run was cancelled");
     // 3. The cancel walk.
     cancel_open_firings(
-        firings, pulses, kicked, loop_runtime, run_id, project, program_idx, journal, replica,
-        reason, phase, dispatchable,
+        firings, pulses, kicked, scopes, loop_runtime, run_id, project, program_idx, journal, replica,
+        reason, phase, given,
     )
     .await;
 }
@@ -3981,6 +3926,7 @@ async fn cancel_open_firings(
     firings: &mut NodeFiringTable,
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
     loop_runtime: &mut LoopRuntime,
     run_id: RunId,
     project: &ProjectDefinition,
@@ -3989,7 +3935,7 @@ async fn cancel_open_firings(
     replica: &str,
     reason: &str,
     phase: weft_core::context::Phase,
-    dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
+    given: &weft_core::project::Given,
 ) {
     let open: Vec<FiringLocation> = firings
         .iter()
@@ -4031,11 +3977,11 @@ async fn cancel_open_firings(
     // close at the right level too.
     cancel_loop_instances(loop_runtime, run_id, project, program_idx, pulses, journal, replica).await;
     // The closures just put on the wires get the pass any turn's would
-    // (the fold runs it after every row it closes from): a boundary
-    // they made ready fires, and what the run never dispatches settles.
-    // No waiter is parked on any of it: the gates all failed above, or
-    // never existed on the refetch-kill path.
-    settle_table(project, program_idx, phase, dispatchable, run_id, now_unix(), pulses, firings, kicked);
+    // (the fold runs it after every row it closes from): a scope they
+    // decide is decided, and what the run will never take settles. No
+    // waiter is parked on any of it: the gates all failed above, or never
+    // existed on the refetch-kill path.
+    settle_table(project, program_idx, given, phase, run_id, now_unix(), pulses, scopes, kicked);
 }
 
 /// On cancellation, walk every non-terminated `LoopInstance` for this
@@ -4110,6 +4056,7 @@ async fn route_stream_pulses(
     stream_rt: &mut StreamRuntime,
     loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
 ) -> usize {
     // Scan phase: decide an action per routable pulse.
     let mut actions: Vec<RouteAction> = Vec::new();
@@ -4305,7 +4252,7 @@ async fn route_stream_pulses(
                         // takes; it must not kill the whole drive.
                         if let Err(e) = launch_stream_iteration(
                             project, program_idx, pulses, journal, replica,
-                            &key, index, item, loop_runtime, stream_rt, kicked,
+                            &key, index, item, loop_runtime, stream_rt, kicked, scopes,
                         )
                         .await
                         {
@@ -4573,16 +4520,17 @@ async fn launch_stream_iteration(
     loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &mut ScopeTable,
 ) -> Result<(), String> {
     let pulse = item.pulse;
     launch_iteration(
-        project, program_idx, pulses, journal, replica, key, index, Some(item), loop_runtime, kicked,
+        project, program_idx, pulses, journal, replica, key, index, Some(item), loop_runtime, kicked, scopes,
     )
     .await?;
     // The launch row (with `stream_pulse`) is the take's durability;
     // the RAM removal + gate resolution mirror it here. No separate
     // PulsesConsumed row: the fold reads it off the launch row.
-    let loop_in_id = weft_core::project::boundary_in_id(&key.group_id);
+    let loop_in_id = weft_core::project::loop_in_id(&key.group_id);
     drop_consumed_pulses(pulses, &loop_in_id, &[pulse]);
     stream_rt.on_pulses_absorbed(&[pulse], AbsorbKind::Taken);
     Ok(())
@@ -4642,7 +4590,7 @@ async fn settle_rehydrated_stream_ends(
         // The one derivation the whole driver uses; the rehydrate
         // already proved this node exists for every instance in the
         // map, so no re-validation here.
-        let loop_in_id = weft_core::project::boundary_in_id(&key.group_id);
+        let loop_in_id = weft_core::project::loop_in_id(&key.group_id);
         if matches!(end, StreamEnd::Finished) {
             let items_pending = pulses.get(&loop_in_id).is_some_and(|bucket| {
                 bucket.iter().any(|p| {
@@ -5274,6 +5222,8 @@ async fn terminate(
     program_idx: &ProgramIndex,
     pulses: &PulseTable,
     firings: &mut NodeFiringTable,
+    kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    scopes: &ScopeTable,
     waiting: &HashMap<String, FiringLocation>,
 ) -> anyhow::Result<RunOutcome> {
     // `waiting` only tracks suspensions that fired in *this* drive
@@ -5285,7 +5235,15 @@ async fn terminate(
     let has_waiting = waiting_count(firings) > 0;
     let local_waiting = waiting.len();
 
+    let report = || weft_core::run::stuck_report(project, program_idx, pulses, scopes, kicked);
     let completion = check_completion(pulses, firings);
+    // Everything that ran ended, and a node the run kicked never started
+    // (its scope never decided): the run did not do what it was asked.
+    if completion.is_some() && kicked.values().any(|kick| !kick.dispatched) {
+        let report = report();
+        tracing::warn!(target: "weft_engine", %report, "a kicked node never started");
+        return Ok(RunOutcome::Stuck { report });
+    }
     match completion {
         Some(false) => Ok(RunOutcome::Completed),
         Some(true) => {
@@ -5305,7 +5263,7 @@ async fn terminate(
                 );
                 return Ok(RunOutcome::Stalled);
             }
-            let report = weft_core::run::stuck_report(project, program_idx, pulses);
+            let report = report();
             tracing::warn!(target: "weft_engine", %report, "no ready nodes and no suspensions");
             Ok(RunOutcome::Stuck { report })
         }

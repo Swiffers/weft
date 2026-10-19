@@ -1,0 +1,36 @@
+{
+  "type": "CursorPosition",
+  "label": "Cursor position",
+  "description": "Read where the mouse is on the computer's screen, in screen pixels. It runs when `computer` arrives: in a tool loop, gate it on RouteComputerCall's `cursor` port through `_should_flow`.",
+  "tags": [
+    "computer",
+    "mouse",
+    "cursor"
+  ],
+  "icon": "Crosshair",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "The position as a model reads it back, `X=512, Y=384`."
+    },
+    {
+      "name": "x",
+      "type": "Number",
+      "description": "Pixels from the left edge."
+    },
+    {
+      "name": "y",
+      "type": "Number",
+      "description": "Pixels from the top edge."
+    }
+  ]
+}

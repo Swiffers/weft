@@ -9,9 +9,11 @@
 //!    CST and lowers it, resolves `@include` (the build compiles each
 //!    included file once, as one shared body group, and each use of it
 //!    is a call site group naming that body; the editor's `Interface`
-//!    mode leaves one opaque node), then flattens: a group becomes two
-//!    `Passthrough` boundary nodes and a loop a `LoopIn` / `LoopOut` pair, so what
-//!    comes out is one flat `ProjectDefinition` of nodes and edges.
+//!    mode leaves one opaque node), then flattens: a group's members join
+//!    the program with the group in their scope, the lines through its
+//!    ports are joined into wires end to end (`wires`), and a loop gets a
+//!    `LoopIn` / `LoopOut` pair, so what comes out is one flat
+//!    `ProjectDefinition` of nodes, wires and the groups as scopes.
 //!    `@file` / `@asset` values resolve last, on that flat graph; a
 //!    file-typed `@asset` stays a marker for the build's asset sync.
 //!    (`compile_lenient` is the same pipeline for the editor, collecting
@@ -40,6 +42,7 @@
 pub mod project;
 pub mod source_name;
 pub mod weft_compiler;
+pub(crate) mod wires;
 pub mod cst;
 pub mod edit;
 pub mod file_reader;
@@ -79,7 +82,7 @@ pub use weft_compiler::{compile as compile_source, CompileError as SourceError};
 use uuid::Uuid;
 use weft_core::{MetadataCatalog, ProjectDefinition};
 
-pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, ResolvedFile};
+pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, ResolvedFile, SpelledPath};
 
 // Re-export weft_core's Diagnostic/Severity so downstream callers
 // keep using weft_compiler::Diagnostic without touching node impls.
@@ -171,10 +174,9 @@ fn parse_only_inner(
         if node.include_path.is_some() {
             continue;
         }
-        // Compiler-synthesized boundary nodes (group/loop lowering) have no
-        // catalog entry by design; flagging them painted phantom line-0
-        // "unknown node type 'Passthrough'" warnings on every project with
-        // a group.
+        // A loop's two boundary nodes are the compiler's, with no catalog
+        // entry by design; flagging them painted phantom line-0 "unknown
+        // node type 'LoopIn'" warnings on every project with a loop.
         if enrich::is_lowering_builtin(&node.node_type) {
             continue;
         }
@@ -376,5 +378,6 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         defaults: Default::default(),
+        given: Default::default(),
     }
 }

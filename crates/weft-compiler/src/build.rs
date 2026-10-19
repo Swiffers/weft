@@ -291,12 +291,12 @@ fn stage_project_nodes(
                 project_root.display()
             ))
         })?;
-        // The shared node-tree exclude (same set the source hash walks
-        // over), so staging and hashing agree on a node's byte-content:
-        // a file the build copies but the hash skips (or vice versa)
-        // is how a stale worker image gets served.
+        // The package-build exclude (same set the package hash walks
+        // over, `hash::hash_package_root`), so staging and hashing agree
+        // on a node's byte-content: a file the build copies but the hash
+        // skips (or vice versa) is how a stale worker image gets served.
         let staged = dest.join(rel);
-        copy_dir_filtered(&root, &staged, &weft_catalog::is_node_tree_excluded)?;
+        copy_dir_filtered(&root, &staged, &weft_catalog::is_left_out_of_package_build)?;
         stamp_package_tree(&staged)?;
     }
     Ok(())

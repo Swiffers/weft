@@ -13,10 +13,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::run::skip::{check_flow_permission, check_should_skip, SkipReason};
-use crate::frames::{Located, LoopFrames};
+use crate::frames::LoopFrames;
 use crate::project::{Edge, ProgramIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
-use crate::primitive::Phase;
-use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
+use crate::pulse::{Failure, Pulse, PulseTable};
 use crate::weft_type::WeftType;
 use crate::RunId;
 
@@ -42,11 +41,6 @@ pub struct ReadyGroup {
     pub skip: Option<SkipReason>,
     pub pulse_ids: Vec<uuid::Uuid>,
     pub error: Option<String>,
-    /// This node is outside the part of the graph the run runs
-    /// (a setup phase's closure, a trigger fire's program): the pulses
-    /// that reached it are absorbed silently, nothing is journaled, and
-    /// the body never runs. Never set on a kicked node.
-    pub out_of_scope: bool,
 }
 
 /// THE single rule for "which pulse does a firing see on `port`?".
@@ -79,62 +73,33 @@ pub fn resolve_port_value<'a>(group_pulses: &[&'a Pulse], port: &str) -> Option<
     winner
 }
 
-/// Resolve authored backups only after the ordinary supplier has ended or
-/// is absent. These derived input facts are never journaled as wire emissions.
-pub fn effective_input_pulses(
-    node: &NodeDefinition,
-    actual: &[&Pulse],
-    wired: &HashSet<&str>,
-    project: &ProjectDefinition,
-    program_idx: &ProgramIndex,
-    run_id: RunId,
-    frames: &LoopFrames,
-) -> Vec<Pulse> {
-    let mut effective: Vec<_> = actual.iter().map(|pulse| (*pulse).clone()).collect();
-    let Some(selection) = program_idx.selection() else { return effective };
-    let at = Located::at(&node.id, frames);
-    for port in &node.inputs {
-        if !selection.includes_port(&at, node, &port.name) { continue; }
-        let winner = resolve_port_value(actual, &port.name);
-        if winner.is_some_and(|pulse| !pulse.closed || pulse.failure.is_some()) { continue; }
-        if winner.is_none() && selection.has_supplier(project, &at, &port.name) { continue; }
-        if winner.is_none() && !wired.contains(port.name.as_str())
-            && node.port_literals.get(&port.name).is_some_and(|v| literal_is_data(node, &port.name, v))
-        { continue; }
-        if matches!(port.port_type, WeftType::Generator(_)) { continue; }
-        let backup = selection.input.get(&at).and_then(|ports| ports.get(&port.name));
-        if let Some(value) = backup {
-            let mut pulse = Pulse::new(uuid::Uuid::nil(), run_id, frames.clone(), &node.id, &port.name, Arc::new(value.clone()));
-            pulse.provided = true;
-            pulse.backup = true;
-            pulse.inherited_from = selection.input_origins.get(&at).and_then(|ports| ports.get(&port.name)).copied();
-            effective.push(pulse);
-        } else if winner.is_none() && wired.contains(port.name.as_str()) {
-            effective.push(Pulse::closure(uuid::Uuid::nil(), run_id, frames.clone(), &node.id, &port.name));
-        }
-    }
-    effective
-}
-
 /// Higher rank wins. Data (1) > closure (0).
 fn pulse_rank(p: &Pulse) -> u8 {
     if p.closed { 0 } else { 1 }
 }
 
-/// The input ports of `node_id` a wire feeds at `frames`. What
-/// readiness waits on, and what the input bag treats as authoritative
-/// over body literals.
+/// The input ports of `node_id` a wire feeds at `frames`, and its stream
+/// inputs handed a value there (their items arrive as pulses, as a
+/// wire's would, `crate::run::scope`). What readiness waits on, what
+/// gets a live feed, and what the input bag treats as authoritative over
+/// body literals.
 pub fn wired_inputs<'a>(
     project: &'a ProjectDefinition,
     program_idx: &ProgramIndex,
     node_id: &str,
     frames: &LoopFrames,
 ) -> HashSet<&'a str> {
-    program_idx
+    let mut wired: HashSet<&'a str> = program_idx
         .get_incoming(project, node_id, frames)
         .iter()
         .map(|e| e.target_handle.as_deref().unwrap_or("default"))
-        .collect()
+        .collect();
+    if let (Some(handed), Some(node)) = (program_idx.handed_ports(node_id, frames), program_idx.node(project, node_id)) {
+        wired.extend(node.inputs.iter()
+            .filter(|input| input.is_generator() && handed.contains(&input.name))
+            .map(|input| input.name.as_str()));
+    }
+    wired
 }
 
 /// Whether `port` is an input of `node` that takes a stream
@@ -158,56 +123,6 @@ pub fn generator_inputs(node: &NodeDefinition) -> HashSet<&str> {
         .collect()
 }
 
-/// The pulses a settle pass took out of the run: see
-/// [`settle_out_of_run`].
-#[derive(Debug, Default)]
-pub struct OutOfRun {
-    /// Pending pulses on nodes outside the run's node set, now
-    /// Absorbed.
-    pub absorbed: Vec<uuid::Uuid>,
-    /// Pending pulses into a trigger at Fire, removed from the table.
-    pub dropped: Vec<uuid::Uuid>,
-}
-
-/// Settle what this run will never dispatch, with no row of its own:
-/// a pulse on a node outside `dispatchable` (a setup phase's closure,
-/// a fire's subgraph: engine plumbing the user never chose, or another
-/// program's node, so neither is this run's business to paint) is
-/// absorbed as it lands; at Fire, a pulse into a trigger is dropped
-/// with its bucket (a trigger's ports replay its setup-time snapshot,
-/// so an upstream node that ran for the output path must not
-/// re-dispatch it with a live value). Runs after every change to the
-/// table on both sides (the worker's turn, the fold's row), so the two
-/// hold the same pulses.
-pub fn settle_out_of_run(
-    project: &ProjectDefinition,
-    phase: Phase,
-    dispatchable: Option<&HashSet<Located>>,
-    pulses: &mut PulseTable,
-) -> OutOfRun {
-    let mut out = OutOfRun::default();
-    if let Some(dispatchable) = dispatchable {
-        for node in &project.nodes {
-            if let Some(bucket) = pulses.get_mut(&node.id) {
-                for p in bucket.iter_mut().filter(|p| p.status == PulseStatus::Pending
-                    && !dispatchable.contains(&Located::at(&node.id, &p.frames)))
-                {
-                    p.absorb();
-                    out.absorbed.push(p.id);
-                }
-            }
-        }
-    }
-    if matches!(phase, Phase::Fire) {
-        for trigger in project.nodes.iter().filter(|n| n.features.is_trigger) {
-            if let Some(bucket) = pulses.remove(&trigger.id) {
-                out.dropped.extend(bucket.iter().filter(|p| p.status == PulseStatus::Pending).map(|p| p.id));
-            }
-        }
-    }
-    out
-}
-
 /// Whether `edge` lands on a stream input of its target. Two equal
 /// items on such an edge are two items, and a closure (the stream's
 /// end) coexists with still-buffered ones, so every dedup and every
@@ -217,35 +132,30 @@ pub fn edge_targets_generator(program_idx: &ProgramIndex, edge: &Edge) -> bool {
     program_idx.stream_inputs(&edge.target).iter().any(|input| input == handle)
 }
 
-/// `dispatchable`, when set, is the only part of the graph this
-/// run may dispatch (a setup phase's closure, or a manual run's
-/// subgraph). A node outside it is READY THE MOMENT ANY PULSE LANDS on
-/// it, as a skip: waiting for its full input set would park the pulse
-/// forever when one of its other parents is itself outside the set and
-/// never fires (an unkicked entry node feeding a side branch). (Named
-/// `dispatchable`, not `scope`: `NodeDefinition.scope` in this file is
-/// a node's group-nesting path, a different thing entirely.)
+/// Every node whose pending pulses make it ready, with the group each
+/// forms. `given` is what the run is given at the places its program says
+/// ([`crate::project::Given`]).
 pub fn find_ready_nodes(
     project: &ProjectDefinition,
     pulses: &PulseTable,
     program_idx: &ProgramIndex,
-    dispatchable: Option<&HashSet<Located>>,
+    given: &crate::project::Given,
 ) -> Vec<(String, ReadyGroup)> {
-    find_ready_among(project, project.nodes.iter(), pulses, program_idx, dispatchable)
+    find_ready_among(project, project.nodes.iter(), pulses, program_idx, given)
         .into_iter()
         .map(|(node, group)| (node.id.clone(), group))
         .collect()
 }
 
-/// `find_ready_nodes` over a chosen set of nodes: the boundary pass
-/// asks only about the group boundaries, after every journal row, so
-/// it must not walk the whole program each time.
+/// `find_ready_nodes` over a chosen set of nodes: the engine asks only
+/// the nodes some pending pulse waits at, so it never walks the whole
+/// program each turn.
 pub fn find_ready_among<'a>(
     project: &ProjectDefinition,
     candidates: impl IntoIterator<Item = &'a NodeDefinition>,
     pulses: &PulseTable,
     program_idx: &ProgramIndex,
-    dispatchable: Option<&HashSet<Located>>,
+    given: &crate::project::Given,
 ) -> Vec<(&'a NodeDefinition, ReadyGroup)> {
     let mut result = Vec::new();
 
@@ -270,12 +180,11 @@ pub fn find_ready_among<'a>(
             }
         }
         for ((run_id, frames), group_pulses) in groups {
-            let out_of_scope = dispatchable.is_some_and(|s| !s.contains(&Located::at(&node.id, &frames)));
             let wired = wired_inputs(project, program_idx, &node.id, &frames);
-            let required = required_inputs(node, &wired, &frames, program_idx);
-            let literal_filled = literal_filled_ports(node, &wired, &frames, program_idx);
+            let required = required_inputs(node, &wired);
+            let filled = filled_ports(node, &wired, &frames, program_idx);
             if let Some(group) = ready_group_at(
-                node, &group_pulses, run_id, &frames, &required, &wired, &literal_filled, out_of_scope, project, program_idx,
+                node, &group_pulses, run_id, &frames, &required, &wired, &filled, given,
             ) {
                 result.push((node, group));
             }
@@ -291,7 +200,8 @@ pub fn find_ready_among<'a>(
 
 /// The ready group the pending pulses at one exact `(run_id, frames)`
 /// form for `node`, if they make it ready. `wired` are the ports a wire
-/// feeds at that point, `required` the required ones the run reads.
+/// feeds at that point, `required` the required ones among them,
+/// `filled` the unwired ports a constant or a handed value fills.
 #[allow(clippy::too_many_arguments)]
 fn ready_group_at(
     node: &NodeDefinition,
@@ -300,48 +210,33 @@ fn ready_group_at(
     frames: &LoopFrames,
     required: &HashSet<&str>,
     wired: &HashSet<&str>,
-    literal_filled: &HashSet<&str>,
-    out_of_scope: bool,
-    project: &ProjectDefinition,
-    program_idx: &ProgramIndex,
+    filled: &HashSet<&str>,
+    given: &crate::project::Given,
 ) -> Option<ReadyGroup> {
-    let has_incoming = !wired.is_empty();
-    let effective = effective_input_pulses(node, group_pulses, wired, project, program_idx, run_id, frames);
-    let effective_refs: Vec<_> = effective.iter().collect();
     let all_satisfied = wired.iter().all(|port_name| {
-        effective_refs.iter().any(|p| p.target_port == *port_name)
+        group_pulses.iter().any(|p| p.target_port == *port_name)
     });
-
-    // An out-of-scope node never waits for its full input set: it
-    // will not run, so any pulse that lands is absorbed by a skip
-    // dispatch right away (see `find_ready_nodes`'s doc).
-    if has_incoming && !all_satisfied && !out_of_scope {
+    if !all_satisfied {
         return None;
     }
 
-    let received = firing_input(node, &effective_refs, wired, frames, program_idx);
+    let received = firing_input(node, group_pulses, wired, frames, given);
 
-    // An Out boundary never skips: it forwards whatever came through,
-    // closures and their failures included. An In boundary is decided
-    // like any node.
+    // A loop's `LoopOut` takes whatever came through: only its `LoopIn`
+    // can skip.
     let is_out_boundary = node
         .group_boundary
         .as_ref()
         .map(|gb| gb.role == GroupBoundaryRole::Out)
         .unwrap_or(false);
-    // An entry node (no incoming edges) has nothing wired, so the
-    // closure rules cannot apply; but `_should_flow: false` in its
-    // braces still turns it off, so rule 0 runs on its own there.
-    // An out-of-scope node never runs at all: no skip reason, the
-    // group is absorbed silently by the driver.
-    let skip = if out_of_scope || is_out_boundary || !has_incoming {
-        // Pulses only ever ride edges, so a node with no incoming
-        // edges cannot form a group here; an entry node's
-        // `_should_flow` is decided where its kick is synthesized
-        // (`kicked_group` runs `check_flow_permission`).
+    // Pulses only ever ride edges, so a node with no incoming edges
+    // cannot form a group here; an entry node's `_should_flow` is
+    // decided where its kick is synthesized (`kicked_group` runs
+    // `check_flow_permission`).
+    let skip = if is_out_boundary {
         None
     } else {
-        check_should_skip(node, &effective_refs, required, wired, &filled_ports(literal_filled.clone(), &effective))
+        check_should_skip(node, group_pulses, required, wired, filled)
     };
 
     let pulse_ids: Vec<uuid::Uuid> = group_pulses.iter().map(|p| p.id).collect();
@@ -353,7 +248,6 @@ fn ready_group_at(
         received,
         skip,
         pulse_ids,
-        out_of_scope,
     })
 }
 
@@ -365,7 +259,7 @@ fn ready_group_at(
 /// literal in its braces turns it off; a kick from a scope that was
 /// gated off is dispatched straight into its skip. The ONE derivation
 /// of a kick's dispatch, shared by the live scheduler and the journal
-/// fold (for the group boundaries it dispatches itself).
+/// fold (to read back what a kicked firing received).
 pub fn kicked_group(
     node: &NodeDefinition,
     kick: &crate::primitive::KickedNode,
@@ -373,26 +267,24 @@ pub fn kicked_group(
     run_id: RunId,
     project: &ProjectDefinition,
     program_idx: &ProgramIndex,
+    given: &crate::project::Given,
 ) -> ReadyGroup {
     let wired = wired_inputs(project, program_idx, &node.id, frames);
-    let effective = effective_input_pulses(node, &[], &wired, project, program_idx, run_id, frames);
-    let effective_refs: Vec<_> = effective.iter().collect();
     let received = if kick.firing {
         let (input, errors) = build_kicked_input(node, frames, kick.port_snapshot.as_ref());
         FiringInput { input, type_errors: errors, ..Default::default() }
     } else {
-        firing_input(node, &effective_refs, &wired, frames, program_idx)
+        firing_input(node, &[], &wired, frames, given)
     };
     let skip = match &kick.scope_skipped {
         Some(scope) => Some(SkipReason::ScopeSkipped { scope: scope.clone() }),
         // Trigger preparation already evaluated its wired gate. A fire
         // requires that capture and reads its baked settings. Live pulses
-        // into triggers are dropped by settle_out_of_run; enclosing group
-        // gates still decide scope_permission before this kick dispatches.
+        // into triggers are dropped at Fire by the settle pass; the
+        // scopes around it still decide before this kick dispatches.
         None if kick.firing => check_flow_permission(node, &[]),
-        None => check_should_skip(node, &effective_refs,
-            &required_inputs(node, &wired, frames, program_idx),
-            &wired, &filled_ports(literal_filled_ports(node, &wired, frames, program_idx), &effective)),
+        None => check_should_skip(node, &[], &required_inputs(node, &wired), &wired,
+            &filled_ports(node, &wired, frames, program_idx)),
     };
     ReadyGroup {
         frames: frames.clone(),
@@ -405,11 +297,8 @@ pub fn kicked_group(
         // is driven by this list) and the run could never reach
         // Completed. Whatever is waiting on a wire is read by the
         // ordinary pulse-driven dispatch instead, or, for a trigger in
-        // the firing phase, dropped by `settle_out_of_run`.
+        // the firing phase, dropped by the settle pass.
         pulse_ids: Vec::new(),
-        // A kicked node whose own ports refuse their values fails the
-        // same way a pulsed one does.
-        out_of_scope: false,
     }
 }
 
@@ -433,14 +322,17 @@ pub struct FiringInput {
     pub closed_ports: Vec<String>,
     /// The subset of `closed_ports` whose closure carries WHY: the
     /// producer failed (or was cancelled) rather than declining to emit,
-    /// keyed by port, with the failure the closure carried. A boundary
-    /// forwarding a closure keeps this on the same-named output, so
-    /// "broke" never reads as "nothing there" one scope level up (the
+    /// keyed by port, with the failure the closure carried. A loop's
+    /// boundary forwarding a closure keeps this on the same-named output,
+    /// so "broke" never reads as "nothing there" one level up (the
     /// inverted gate tells the two apart).
     pub closed_failures: BTreeMap<String, Failure>,
     pub type_errors: Vec<String>,
+    /// The ports whose value a person handed in or a stand-in sent
+    /// (`ProjectDefinition::given`), not a node that ran in this run.
     pub provided_ports: Vec<String>,
-    pub backup_ports: Vec<String>,
+    /// The ports whose value a seed's saved result sent, with the run
+    /// that made it.
     pub inherited_ports: BTreeMap<String, RunId>,
 }
 
@@ -460,7 +352,7 @@ pub fn firing_input(
     group_pulses: &[&Pulse],
     wired: &HashSet<&str>,
     frames: &LoopFrames,
-    program_idx: &ProgramIndex,
+    given: &crate::project::Given,
 ) -> FiringInput {
     let mut obj = InputBag::new();
 
@@ -479,8 +371,15 @@ pub fn firing_input(
         }
     }
 
+    // A value handed to a port is the port's (no wire lands there); a
+    // stream's items reach the feed as pulses instead.
+    let handed = given.inputs.get(&crate::frames::Located::at(&node.id, frames));
+    for (port, value) in handed.into_iter().flatten() {
+        if !is_generator_input(node, port) {
+            obj.insert(port.clone(), std::sync::Arc::new(value.clone()));
+        }
+    }
     fill_input_from_literals(node, wired, &mut obj);
-    obj.retain(|port, _| program_idx.includes_port(node, frames, port));
 
     // Runtime type enforcement on input ports: the single check point
     // (see `check_input`). A mismatch on a required port aggregates
@@ -508,17 +407,16 @@ pub fn firing_input(
         })
         .collect();
 
-    let mut provided_ports = Vec::new();
-    let mut backup_ports = Vec::new();
+    let mut provided: std::collections::BTreeSet<String> = handed.into_iter().flatten().map(|(port, _)| port.clone()).collect();
     let mut inherited_ports = BTreeMap::new();
     for port in group_pulses.iter().map(|p| p.target_port.as_str()).collect::<std::collections::BTreeSet<_>>() {
         if let Some(winner) = resolve_port_value(group_pulses, port) {
-            if winner.provided { provided_ports.push(port.to_string()); }
-            if winner.backup { backup_ports.push(port.to_string()); }
+            if winner.provided { provided.insert(port.to_string()); }
             if let Some(origin) = winner.inherited_from { inherited_ports.insert(port.to_string(), origin); }
         }
     }
-    FiringInput { input: obj, closed_ports, closed_failures, type_errors, provided_ports, backup_ports, inherited_ports }
+    let provided_ports = provided.into_iter().collect();
+    FiringInput { input: obj, closed_ports, closed_failures, type_errors, provided_ports, inherited_ports }
 }
 
 /// Runtime type enforcement on input ports: the single check point
@@ -617,55 +515,41 @@ pub fn fill_input_from_literals(
 /// The inputs whose closure skips `node` at this point (rule 1 of
 /// `check_should_skip`): the required ones, and the ones a wire feeds
 /// here that are not `optional` (an input the node's metadata calls
-/// optional is required once wired, unless the program wrote `?`). Only
-/// ports the run reads count.
-pub fn required_inputs<'a>(
-    node: &'a NodeDefinition,
-    wired: &HashSet<&str>,
-    frames: &LoopFrames,
-    program_idx: &ProgramIndex,
-) -> HashSet<&'a str> {
+/// optional is required once wired, unless the program wrote `?`).
+pub fn required_inputs<'a>(node: &'a NodeDefinition, wired: &HashSet<&str>) -> HashSet<&'a str> {
     node.inputs
         .iter()
         // The gates are rule 0's alone: a closure on one is never a
         // required input closing.
         .filter(|p| !crate::run::skip::is_gate_port(&p.name))
-        .filter(|p| p.is_required(wired.contains(p.name.as_str())) && program_idx.includes_port(node, frames, &p.name))
+        .filter(|p| p.is_required(wired.contains(p.name.as_str())))
         .map(|p| p.name.as_str())
         .collect()
 }
 
-/// The ports that hold a value without a wire delivering it: the
-/// literals ([`literal_filled_ports`]) and the values a carved run hands
-/// in for wires outside its selection (the open backup pulses). The skip
-/// rules read this on the pulse path and on a kicked root alike, so a
-/// join or a `@require_one_of` handed its values is never taken for one
-/// that has none.
-fn filled_ports<'a>(mut filled: HashSet<&'a str>, effective: &'a [Pulse]) -> HashSet<&'a str> {
-    filled.extend(effective.iter().filter(|p| p.backup && !p.closed).map(|p| p.target_port.as_str()));
-    filled
-}
-
-/// The unwired ports a written constant fills at `frames`: what keeps a
-/// node with no live wire alive in the skip rules. An `@instance_filled`
-/// literal counts, since a run is only born once each such field it
-/// needs has the instance's value or a fallback; it is left out of the
-/// bag itself ([`fill_input_from_literals`]) only until the engine puts
-/// that value in. The ONE reading both the pulse path and a kicked
-/// scope root use: reading it off the bag instead made a node whose
+/// The unwired ports a written constant or a handed value fills at
+/// `frames`: what keeps a node with no live wire alive in the skip rules.
+/// An `@instance_filled` literal counts, since a run is only born once
+/// each such field it needs has the instance's value or a fallback; it is
+/// left out of the bag itself ([`fill_input_from_literals`]) only until
+/// the engine puts that value in. The ONE reading both the pulse path and
+/// a kicked root use: reading it off the bag instead made a node whose
 /// every setting is `@instance_filled` look like it had nothing, and skip.
-pub fn literal_filled_ports<'a>(
+pub fn filled_ports<'a>(
     node: &'a NodeDefinition,
     wired: &HashSet<&str>,
     frames: &LoopFrames,
     program_idx: &ProgramIndex,
 ) -> HashSet<&'a str> {
-    node.port_literals
+    let handed = program_idx.handed_ports(&node.id, frames);
+    node.inputs
         .iter()
-        .filter(|(name, value)| {
-            program_idx.includes_port(node, frames, name) && !wired.contains(name.as_str()) && literal_is_data(node, name, value)
+        .map(|input| input.name.as_str())
+        .filter(|name| !wired.contains(name))
+        .filter(|name| {
+            handed.is_some_and(|ports| ports.contains(*name))
+                || node.port_literals.get(*name).is_some_and(|value| literal_is_data(node, name, value))
         })
-        .map(|(name, _)| name.as_str())
         .collect()
 }
 
@@ -789,7 +673,7 @@ mod tests {
     use super::{build_kicked_input, check_input, resolve_port_value, InputCheck};
     use serde_json::Value;
     use crate::project::{ProgramIndex, InputDefinition, NodeDefinition, Position, ProjectDefinition};
-    use super::{effective_input_pulses, firing_input};
+    use super::firing_input;
     use std::collections::HashSet;
     use crate::pulse::Pulse;
     use crate::NodeFeatures;
@@ -801,62 +685,6 @@ mod tests {
 
     fn data(run_id: uuid::Uuid, frames: Vec<Frame>, node: &str, port: &str, value: serde_json::Value) -> Pulse {
         Pulse::new(uuid::Uuid::new_v4(), run_id, frames, node, port, std::sync::Arc::new(value))
-    }
-
-    /// The settle pass absorbs what lands outside the run's node set
-    /// and, at Fire, drops what lands on a trigger; a setup phase
-    /// leaves the trigger's bucket alone, and an untargeted run
-    /// absorbs nothing.
-    #[test]
-    fn the_settle_pass_absorbs_outside_the_run_and_drops_trigger_pulses_at_fire() {
-        use crate::primitive::Phase;
-        use crate::pulse::PulseStatus;
-        let project: crate::project::ProjectDefinition = serde_json::from_value(json!({
-            "id": "00000000-0000-0000-0000-000000000000",
-            "name": "settle", "description": null,
-            "nodes": [
-                { "id": "trig", "nodeType": "T", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
-                  "inputs": [{ "name": "in", "portType": "String", "required": true }], "outputs": [],
-                  "features": { "isTrigger": true }, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
-                { "id": "inside", "nodeType": "T", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
-                  "inputs": [{ "name": "in", "portType": "String", "required": true }], "outputs": [],
-                  "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
-                { "id": "outside", "nodeType": "T", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
-                  "inputs": [{ "name": "in", "portType": "String", "required": true }], "outputs": [],
-                  "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
-            ],
-            "edges": [], "groups": [],
-            "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-01T00:00:00Z"
-        }))
-        .unwrap();
-        let run_id = uuid::Uuid::nil();
-        let table = || {
-            let mut t = crate::pulse::PulseTable::default();
-            for node in ["trig", "inside", "outside"] {
-                t.entry(node.into()).or_default().push(data(run_id, vec![], node, "in", json!("v")));
-            }
-            t
-        };
-        let run: std::collections::HashSet<Located> = ["trig", "inside"].iter().map(|s| Located::top(*s)).collect();
-
-        let mut fire = table();
-        let out = super::settle_out_of_run(&project, Phase::Fire, Some(&run), &mut fire);
-        assert_eq!(out.absorbed, vec![fire["outside"][0].id]);
-        assert_eq!(fire["outside"][0].status, PulseStatus::Absorbed);
-        assert_eq!(out.dropped.len(), 1, "the trigger's pending pulse is reported dropped");
-        assert!(!fire.contains_key("trig"), "the trigger's bucket is gone");
-        assert_eq!(fire["inside"][0].status, PulseStatus::Pending, "a pulse inside the run is untouched");
-
-        let mut setup = table();
-        let out = super::settle_out_of_run(&project, Phase::TriggerSetup, Some(&run), &mut setup);
-        assert_eq!(out.absorbed.len(), 1);
-        assert!(out.dropped.is_empty());
-        assert_eq!(setup["trig"][0].status, PulseStatus::Pending, "a setup phase feeds the trigger");
-
-        let mut untargeted = table();
-        let out = super::settle_out_of_run(&project, Phase::Fire, None, &mut untargeted);
-        assert!(out.absorbed.is_empty(), "no node set: nothing is outside the run");
-        assert_eq!(out.dropped.len(), 1);
     }
 
     /// An input the metadata calls optional is required once wired: wired
@@ -901,7 +729,7 @@ mod tests {
             bucket.push(data(run_id, vec![], "n", "data", json!("d")));
             bucket.extend(instance);
             let index = ProgramIndex::build(project);
-            let mut found = super::find_ready_nodes(project, &table, &index, None);
+            let mut found = super::find_ready_nodes(project, &table, &index, &Default::default());
             assert_eq!(found.len(), 1, "the node's group is formed");
             found.remove(0).1
         };
@@ -941,17 +769,11 @@ mod tests {
             data(run_id, firing_frames.clone(), "k", "p", json!("exact")),
         ];
         let wired: std::collections::HashSet<&str> = ["p"].into_iter().collect();
-        let project = ProjectDefinition {
-            id: run_id, nodes: vec![node.clone()], edges: vec![], groups: vec![],
-            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(),
-        };
-        let index = ProgramIndex::build(&project);
         let groups: Vec<_> = pulses.iter().map(|p| p.frames.clone()).collect::<std::collections::BTreeSet<_>>().into_iter()
             .filter_map(|frames| {
                 let at: Vec<&Pulse> = pulses.iter().filter(|p| p.frames == frames).collect();
                 super::ready_group_at(&node, &at, run_id, &frames, &std::collections::HashSet::new(), &wired,
-                    &std::collections::HashSet::new(), false, &project, &index)
+                    &std::collections::HashSet::new(), &Default::default())
             }).collect();
         assert_eq!(groups.len(), 3, "one group per frame stack");
         let exact = groups.iter().find(|g| g.frames == firing_frames).expect("the exact group");
@@ -1205,28 +1027,29 @@ mod tests {
         }
     }
 
+    /// A value handed to a port (the program says the port is handed, the
+    /// run carries the value) is the port's: the firing reads it with no
+    /// pulse behind it, says it was handed, and a wire into that port lands
+    /// nothing there.
     #[test]
-    fn a_selected_boundary_cannot_receive_or_validate_excluded_literals_and_backups() {
-        let mut node = kicked_node("Passthrough", vec![port("String", true)], json!({"p": 99}));
-        let mut included = port("String", true);
-        included.name = "selected".into();
-        node.inputs.push(included);
-        node.port_literals.insert("selected".into(), json!("kept"));
-        let project = ProjectDefinition {
-            id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
-            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(),
+    fn a_handed_value_fills_its_port_and_says_so() {
+        let node = kicked_node("X", vec![port("String", true)], json!({}));
+        let mut source = node.clone();
+        source.id = "source".into();
+        let mut project = ProjectDefinition {
+            id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
+            edges: vec![serde_json::from_value(json!({"id":"wire", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"p"})).unwrap()],
+            groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(), given: Default::default(),
         };
-        let mut selection = crate::project::selection::RunSelection::default();
-        selection.nodes.insert(Located::top(&node.id));
-        selection.boundary_ports.insert(Located::top(&node.id), ["selected".into()].into());
-        selection.input.insert(Located::top(&node.id), [("p".into(), json!("unused"))].into());
-        let index = ProgramIndex::selected(&project, selection);
-        let effective = effective_input_pulses(&node, &[], &HashSet::new(), &project, &index, project.id, &vec![]);
-        assert!(effective.is_empty());
-        let received = firing_input(&node, &[], &HashSet::new(), &vec![], &index);
-        assert_eq!(super::owned_bag(&received.input), json!({"selected":"kept"}).as_object().unwrap().clone());
-        assert!(received.type_errors.is_empty(), "the excluded invalid literal cannot fail this boundary");
+        let mut given = crate::project::Given::default();
+        given.inputs.insert(Located::top("k"), [("p".into(), json!("handed"))].into());
+        project.given = given.places();
+        let index = ProgramIndex::build(&project);
+        let received = firing_input(&node, &[], &HashSet::new(), &vec![], &given);
+        assert_eq!(*received.input["p"], json!("handed"));
+        assert_eq!(received.provided_ports, vec!["p".to_string()]);
+        assert!(index.get_incoming(&project, "k", &vec![]).is_empty(), "nothing lands on a handed port");
     }
 
     /// A scope root whose only setting is `@instance_filled` runs when its
@@ -1241,20 +1064,20 @@ mod tests {
         let project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(),
+            defaults: Default::default(), given: Default::default(),
         };
-        let index = ProgramIndex::selected(&project, crate::project::selection::RunSelection::whole(&project));
+        let index = ProgramIndex::build(&project);
         let kick = crate::primitive::KickedNode {
             firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
         };
-        let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index);
+        let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index, &Default::default());
         assert!(group.skip.is_none(), "{:?}", group.skip);
         assert!(!group.received.input.contains_key("p"), "the marker waits for the instance's value");
     }
 
-    /// A join a carved run starts at, its branches handed in for wires
-    /// outside the selection, runs on those values: a handed-in branch
-    /// delivers, the same on a kicked root as on the pulse path.
+    /// A join a run starts at, one branch handed a value (the wire
+    /// from the branch's source is outside the run), runs on that value:
+    /// a handed branch delivers on a kicked root.
     #[test]
     fn a_kicked_join_handed_its_branches_runs() {
         let branch = |name: &str| -> InputDefinition {
@@ -1263,70 +1086,21 @@ mod tests {
         };
         let mut node = kicked_node("Join", vec![branch("a"), branch("b")], json!({}));
         node.features.join = true;
-        let mut source = kicked_node("X", vec![], json!({}));
-        source.id = "source".into();
-        let project = ProjectDefinition {
-            id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
-            edges: vec![
-                serde_json::from_value(json!({"id":"wa", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"a"})).unwrap(),
-                serde_json::from_value(json!({"id":"wb", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"b"})).unwrap(),
-            ],
-            groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(),
+        let mut project = ProjectDefinition {
+            id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(), given: Default::default(),
         };
-        let mut selection = crate::project::selection::RunSelection::whole(&project);
-        selection.nodes.remove(&Located::top("source"));
-        selection.input.entry(Located::top("k")).or_default().insert("a".into(), json!("handed in"));
-        let index = ProgramIndex::selected(&project, selection);
+        let mut given = crate::project::Given::default();
+        given.inputs.insert(Located::top("k"), [("a".into(), json!("handed in"))].into());
+        project.given = given.places();
+        let index = ProgramIndex::build(&project);
         let kick = crate::primitive::KickedNode {
             firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
         };
-        let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index);
+        let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index, &given);
         assert!(group.skip.is_none(), "{:?}", group.skip);
         assert_eq!(*group.received.input["a"], json!("handed in"));
-    }
-
-    #[test]
-    fn backups_wait_for_real_input_and_only_replace_absence() {
-        let node = kicked_node("X", vec![port("String", true)], json!({}));
-        let mut source = node.clone();
-        source.id = "source".into();
-        let project = ProjectDefinition {
-            id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
-            edges: vec![serde_json::from_value(json!({"id":"wire", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"p"})).unwrap()],
-            groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            defaults: Default::default(),
-        };
-        let mut selection = crate::project::selection::RunSelection::whole(&project);
-        selection.input.entry(Located::top("k")).or_default().insert("p".into(), json!("backup"));
-        let index = ProgramIndex::selected(&project, selection.clone());
-        let wired = HashSet::from(["p"]);
-        let run_id = project.id;
-        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, run_id, &vec![]);
-        assert!(effective.is_empty(), "a selected supplier is still pending");
-        let real = data(run_id, vec![], "k", "p", json!("real"));
-        let closure = Pulse::closure(uuid::Uuid::new_v4(), run_id, vec![], "k", "p");
-        for actual in [vec![&real], vec![&closure, &real]] {
-            let effective = effective_input_pulses(&node, &actual, &wired, &project, &index, run_id, &vec![]);
-            let view = firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index);
-            assert_eq!(*view.input["p"], json!("real"));
-            assert!(!effective.iter().any(|p| p.provided));
-        }
-        let effective = effective_input_pulses(&node, &[&closure], &wired, &project, &index, run_id, &vec![]);
-        assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).input["p"], json!("backup"));
-        selection.nodes.remove(&Located::top("source"));
-        let index = ProgramIndex::selected(&project, selection);
-        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, run_id, &vec![]);
-        assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).input["p"], json!("backup"));
-        let null = data(run_id, vec![], "k", "p", Value::Null);
-        let effective = effective_input_pulses(&node, &[&null], &wired, &project, &index, run_id, &vec![]);
-        assert!(!firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).type_errors.is_empty());
-        assert!(!effective.iter().any(|p| p.provided), "invalid real data does not choose a backup");
-        let failure = crate::pulse::Failure { node: "producer".into(), error: "producer failed".into() };
-        let failed = Pulse::closure_with_failure(uuid::Uuid::new_v4(), run_id, vec![], "k", "p", Some(failure.clone()));
-        let effective = effective_input_pulses(&node, &[&failed], &wired, &project, &index, run_id, &vec![]);
-        assert!(effective.iter().all(|p| !p.backup));
-        assert_eq!(effective[0].failure.as_ref(), Some(&failure));
     }
 
     /// Regression: a kicked orphan node (entry node with no incoming

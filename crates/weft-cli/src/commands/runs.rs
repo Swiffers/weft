@@ -181,9 +181,10 @@ impl EventsFilter {
         definition: &weft_core::ProjectDefinition,
     ) -> anyhow::Result<()> {
         if let Some(spelled) = &self.node {
-            // A node or a group: `--node gate` names a group, whose own
-            // two boundaries are its rows too (see `keeps`), so a group
-            // is taken here where the daemon-facing commands refuse it.
+            // A node or a group: `--node gate` names a group, whose
+            // decisions (its `scope_decided` rows) are its rows (see
+            // `keeps`), so a group is taken here where the daemon-facing
+            // commands refuse it.
             let (id, call_path) = match super::resolve_spelling(project, definition, spelled)? {
                 super::Spelled::Node { id, call_path } | super::Spelled::Group { id, call_path } => (id, call_path),
             };
@@ -201,15 +202,17 @@ impl EventsFilter {
     /// as a substring, so `failed` finds both `node_failed` and
     /// `run_failed`, and `loop` finds the loop lifecycle.
     /// `row` is `event` as it reads on the wire: the kind and node filters
-    /// read the wire spelling, the frame filters the typed firing.
+    /// read the wire spelling, the frame filters the typed place (a
+    /// firing, or a scope's copy being decided).
     pub fn keeps(&self, event: &weft_core::live_event::DispatcherEvent, row: &serde_json::Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
-        // `--node gate` names the group: its own two boundaries are
-        // its rows too.
+        // `--node doubler` names the loop: its own two boundaries are its
+        // rows too, and a group's decisions are its rows.
         let node_ok = self.node.as_deref().is_none_or(|n| row_node(row).is_some_and(|id|
-            id == n || id == weft_core::project::boundary_in_id(n) || id == weft_core::project::boundary_out_id(n)));
-        let frames = event.firing_frames();
+            id == n || id == weft_core::project::loop_in_id(n) || id == weft_core::project::loop_out_id(n))
+            || row.get("scope").and_then(|s| s.as_str()) == Some(n));
+        let frames = event.place_frames();
         let call_ok = self.call_path.is_empty()
             || frames.is_some_and(|frames| {
                 weft_core::frames::call_path(frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
@@ -435,21 +438,21 @@ pub async fn events(ctx: Ctx, run_id: String, mut filter: EventsFilter) -> anyho
 
 /// The row with everything it names spelled the way the program
 /// reads: a node of an included file through the site its call frames
-/// say (`one.strip`), so two calls of one file read apart; a group's
-/// boundary as the group (`gate`), with `boundary=in|out` saying which
-/// end; the call frames, a loop's id, a skip's scope, the run's
-/// subgraph, the seed's origins and the completion's outputs the same
-/// way. The loop frames stay, for the iteration.
+/// say (`one.strip`), so two calls of one file read apart; a loop's
+/// boundary as the loop (`doubler`), with `boundary=in|out` saying which
+/// end; the call frames, a loop's id, a decided scope, a skip's scope,
+/// the run's subgraph, the seed's origins and the completion's outputs
+/// the same way. The loop frames stay, for the iteration.
 ///
-/// `None` for a row of an included file's own boundary: the site's
-/// boundary carries the same values under the same name (`one`), and
-/// the hop between the two is the compiler's, not a person's.
+/// `None` for a row that has no line of its own: an included body's
+/// copy being decided. Each call of an included file decides two
+/// copies, the site's and the body's, and both spell as the site; the
+/// site's decision is the call's, so only its row is shown.
 pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefinition) -> Option<serde_json::Value> {
     use serde_json::Value;
     use weft_core::frames::{call_path, Frame, Located, LoopFrames};
-    use weft_core::project::{address_of, group_address, selection::is_body};
-    let boundary_group = |id: &str| project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref());
-    let boundary_of = |id: &str| boundary_group(id)
+    use weft_core::project::{address_of, group_address};
+    let boundary_of = |id: &str| project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref())
         .map(|b| match b.role { weft_core::project::GroupBoundaryRole::In => "in", weft_core::project::GroupBoundaryRole::Out => "out" });
     let spell_place = |place: &Located| address_of(project, &place.id, &place.path);
     let spell_frames = |frames: &LoopFrames| -> Vec<Value> {
@@ -468,9 +471,17 @@ pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefini
     let key = ["node", "nodeId"].into_iter().find(|key| row.get(key).and_then(|v| v.as_str()).is_some());
     if let Some(key) = key {
         let id = row[key].as_str().unwrap_or_default().to_string();
-        if boundary_group(&id).is_some_and(|b| is_body(project, &b.group_id)) { return None; }
         row[key] = Value::String(address_of(project, &id, &path));
         if let Some(role) = boundary_of(&id) { row["boundary"] = Value::String(role.into()); }
+    }
+    // A decided scope names the group or the site at its frames.
+    if row.get("kind").and_then(|k| k.as_str()) == Some("scope_decided") {
+        if let Some(scope) = row.get("scope").and_then(|s| s.as_str()).map(str::to_string) {
+            if weft_core::project::places::is_body(project, &scope) {
+                return None;
+            }
+            row["scope"] = Value::String(group_address(project, &scope, &path));
+        }
     }
     if !frames.is_empty() {
         row["frames"] = Value::Array(spell_frames(&frames));
@@ -1213,6 +1224,56 @@ mod tests {
         let nested = EventsFilter { iteration: super::parse_iteration("3.0").unwrap(), ..Default::default() };
         assert!(keeps(&nested, &inner) && !keeps(&nested, &outer_three));
         assert!(super::parse_iteration("x").is_err() && super::parse_iteration("3.").is_err());
+    }
+
+    /// A scope's decision is a row of the group it decides, so the frame
+    /// filters read its frames as they read a firing's: a group named
+    /// through a call site (`one.g`) keeps the decisions under that call,
+    /// and `--iteration` keeps the decisions inside that iteration.
+    #[test]
+    fn events_filter_reads_a_scope_decisions_frames() {
+        let decided = |scope: &str, frames: serde_json::Value| {
+            replay_row(json!({"kind": "scope_decided", "scope": scope, "frames": frames, "state": "open"}))
+        };
+        let in_one = decided("@src:lib.g", json!([{"site": "one"}]));
+        let in_two = decided("@src:lib.g", json!([{"site": "two"}]));
+        let by_call = EventsFilter { node: Some("@src:lib.g".into()), call_path: vec!["one".into()], ..Default::default() };
+        assert!(keeps(&by_call, &in_one) && !keeps(&by_call, &in_two));
+        let third = decided("lp.inner", json!([{"index": 3}]));
+        let first = decided("lp.inner", json!([{"index": 1}]));
+        let by_iteration = EventsFilter { iteration: super::parse_iteration("3").unwrap(), ..Default::default() };
+        assert!(keeps(&by_iteration, &third) && !keeps(&by_iteration, &first));
+    }
+
+    /// The file `lib` included at two sites, with a group inside it.
+    fn program_including_lib() -> weft_core::ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [], "edges": [],
+            "groups": [
+                { "id": "@src:lib", "kind": "body", "nodeIds": [], "childGroupIds": ["@src:lib.g"] },
+                { "id": "@src:lib.g", "kind": "group", "nodeIds": [], "parentGroupId": "@src:lib" },
+                { "id": "one", "kind": "call", "body": "@src:lib", "nodeIds": [] },
+                { "id": "two", "kind": "call", "body": "@src:lib", "nodeIds": [] },
+            ],
+        }))
+        .expect("the fixture deserializes")
+    }
+
+    /// A decision reads as the group or site it decides, through its call
+    /// site; an included body's own decision has no row, since its site's
+    /// row is the call's and both would read the same.
+    #[test]
+    fn a_scope_decision_is_spelled_and_a_bodys_copy_dropped() {
+        let p = program_including_lib();
+        let decided = |scope: &str, frames: serde_json::Value| {
+            replay_row(json!({"kind": "scope_decided", "scope": scope, "frames": frames, "state": "open"})).1
+        };
+        let site = super::spell_node(decided("one", json!([])), &p).expect("a site's decision is shown");
+        assert_eq!(site["scope"], "one");
+        assert!(super::spell_node(decided("@src:lib", json!([{"site": "one"}])), &p).is_none());
+        let nested = super::spell_node(decided("@src:lib.g", json!([{"site": "two"}])), &p).expect("a group's decision is shown");
+        assert_eq!(nested["scope"], "two.g");
     }
 
     /// The compact line cuts a long value at the summary width on a

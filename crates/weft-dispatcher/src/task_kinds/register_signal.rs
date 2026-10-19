@@ -327,7 +327,7 @@ impl RegisterSignalExecutor {
         let resume_run_id = payload.is_resume.then_some(run_id);
         let spec_json = serde_json::to_string(&payload.spec)?;
 
-        let program = match (&owner.definition_hash, &owner.binary_hash) {
+        let program = match (owner.registered_hash(), &owner.binary_hash) {
             (Some(definition_hash), Some(binary_hash)) => Some(
                 state
                     .projects

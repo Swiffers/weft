@@ -197,7 +197,7 @@ mod fs_hashes {
     ///
     /// An unreferenced node can't change the worker binary, so it does
     /// not flip this hash. The same node walked through `weft_catalog`'s
-    /// `is_node_tree_excluded` policy that `stage_build_context` uses, so
+    /// `is_left_out_of_package_build` policy that `stage_build_context` uses, so
     /// what the binary sees and what we hash agree byte-for-byte.
     pub fn compute_binary_hash(
         definition: &ProjectDefinition,
@@ -372,9 +372,17 @@ mod fs_hashes {
             hasher.update(b"package:");
             hasher.update(label.as_bytes());
             hasher.update(b"\n");
-            hash_path(hasher, &label, root)?;
+            hash_package_root(hasher, &label, root)?;
         }
         Ok(())
+    }
+
+    /// Hash one package root as the build stages it
+    /// (`build::stage_project_nodes`): every file but what
+    /// `weft_catalog::is_left_out_of_package_build` names, so a `.weft`
+    /// file a program includes from the package flips no package hash.
+    pub fn hash_package_root(hasher: &mut Sha256, label: &str, root: &Path) -> Result<()> {
+        hash_path_skipping(hasher, label, root, &|name, _| weft_catalog::is_left_out_of_package_build(name))
     }
 
     /// Content hash of everything that can change a package's node-test
@@ -745,16 +753,16 @@ mod fs_hashes {
             let catalog = FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
             let empty: ProjectDefinition = serde_json::from_value(serde_json::json!({"id":project.id(),"nodes":[],"edges":[]})).unwrap();
-            let mut grouped = empty.clone();
-            grouped.nodes.push(serde_json::from_value(serde_json::json!({
-                "id":"g__in", "nodeType":"Passthrough", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
-                "groupBoundary":{"groupId":"g","role":"In"}
+            let mut looped = empty.clone();
+            looped.nodes.push(serde_json::from_value(serde_json::json!({
+                "id":"l__in", "nodeType":"LoopIn", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
+                "groupBoundary":{"groupId":"l","role":"In"}
             })).unwrap());
             for set in [weft_core::builds::NodeSet::Full, weft_core::builds::NodeSet::Referenced] {
                 let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
-                let after = implementation_hashes(&grouped, &project, root, &catalog, set).unwrap();
+                let after = implementation_hashes(&looped, &project, root, &catalog, set).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
-                assert!(before.contains_key("Passthrough") && before.contains_key("IncludeIn") && before.contains_key("CallOut"));
+                assert!(before.contains_key("LoopIn") && before.contains_key("LoopOut"));
                 if matches!(set, weft_core::builds::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
         }
@@ -863,6 +871,28 @@ mod fs_hashes {
             std::fs::create_dir_all(a.join("target")).unwrap();
             std::fs::write(a.join("target/output"), "build artifact").unwrap();
             assert_eq!(previous, hash(&a));
+        }
+
+        /// A `.weft` file a program includes from a package is read into
+        /// the program, never compiled into the package: adding or editing
+        /// one moves no package hash, so no worker rebuilds and no node test
+        /// reruns. Any other file still does, a prompt included (node code
+        /// may `include_str!` it).
+        #[test]
+        fn a_weft_file_in_a_package_moves_no_package_hash() {
+            let temp = tempfile::tempdir().unwrap();
+            let pkg = temp.path().join("nodes/computer");
+            std::fs::create_dir_all(pkg.join("click")).unwrap();
+            std::fs::write(pkg.join("click/mod.rs"), "node body").unwrap();
+            let hash = || digest(std::slice::from_ref(&pkg), &[temp.path()]);
+            let before = hash();
+            std::fs::write(pkg.join("agent.weft"), "Group {}").unwrap();
+            std::fs::write(pkg.join("click/flow.weft"), "Group {}").unwrap();
+            assert_eq!(hash(), before);
+            std::fs::write(pkg.join("agent.weft"), "Group { edited }").unwrap();
+            assert_eq!(hash(), before);
+            std::fs::write(pkg.join("agent_prompt.md"), "Act carefully.").unwrap();
+            assert_ne!(hash(), before);
         }
     }
 }

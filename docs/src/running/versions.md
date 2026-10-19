@@ -53,6 +53,20 @@ Reuse everything from head's run whose slice of the program did not change, and
 run only the rest. That is the loop when you are iterating on node nine of a
 twelve-node program and nodes one to eight cost real money.
 
+If you want to reuse a different run, name it: `weft run --seed=<run-id>` takes
+any finished run of the project, including one a trigger started or one that
+failed. A run that is still going is refused until it ends or you `weft stop`
+it.
+
+If a node that runs again waited for somebody in that run, the answers they
+gave it are replayed, so it carries on instead of asking again. That only
+holds while the node's own code is unchanged; if it changed, the node asks
+again and weft says so:
+
+```text
+'review' runs again and asks again: its code changed since the seed run answered it
+```
+
 ### What will not be reused
 
 | | Why |
@@ -85,18 +99,14 @@ by keeping it out of the seed (`--seed-before ask`).
 
 ### The one that surprises people
 
-A value you hand in at a start is a **backup**. It stands in only when nothing
-upstream supplies that port.
-
-Under a seed the upstream result is usually right there in history, so your
-backup goes unused and the node is reused exactly as it was. The run reports
-success and nothing ran, which is correct and invisible, so weft says it out
-loud:
+A `--from` start is reused like any other node. If its code and the values you hand it
+are what they were in the seed run, it keeps that run's result and does not
+run. The run reports success and nothing ran, which is correct and invisible,
+so weft says it out loud:
 
 ```text
-'classify.text' keeps the value run 3f2a1111 gave it; the value supplied at
-this start is a backup and only stands in when nothing upstream supplies the
-port. Run without --seed to hand it in.
+'classify' keeps the result run 3f2a1111-0c4e-4b1a-9d2e-5a7b8c9d0e1f gave it:
+its code and what it is handed are as they were. Run without --seed to run it again.
 ```
 
 ## Frozen examples

@@ -1,0 +1,32 @@
+{
+  "type": "Scroll",
+  "label": "Scroll",
+  "description": "Scroll on the computer's screen: `args` is `{ x, y, direction, amount, modifiers }`. `direction` is up, down, left or right; `amount` is how many clicks of the wheel (1 by default); `x` and `y` move the mouse there first (optional, in screen pixels); `modifiers` are keys held while scrolling, joined by + (optional).",
+  "tags": [
+    "computer",
+    "mouse",
+    "scroll"
+  ],
+  "icon": "ArrowDownUp",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "ScrollArgs",
+      "required": true,
+      "description": "The scroll, in the shape the node's description gives. RouteComputerCall's `scroll` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "What happened, in a sentence a model can read back as the tool's result."
+    }
+  ]
+}

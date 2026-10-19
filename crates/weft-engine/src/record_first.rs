@@ -259,6 +259,7 @@ mod tests {
                 epoch: 1,
                 next_seq: 0,
                 redaction: Default::default(),
+                program: None,
             });
             let mut birth: weft_journal::RunEvent = serde_json::from_value(serde_json::json!({
                 "kind": "run_started", "project_id": run, "entry_node": "a", "phase": "fire", "at_unix": 0

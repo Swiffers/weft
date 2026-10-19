@@ -27,7 +27,7 @@ describe('containerStatus', () => {
 		expect(containerStatus('completed', rows('completed', 'skipped', 'cancelled'))).toBe('completed');
 	});
 
-	it('falls back to the In boundary while nothing is terminal yet', () => {
+	it('falls back to the launch\'s own state while nothing is terminal yet', () => {
 		expect(containerStatus('completed', [])).toBe('completed');
 	});
 });

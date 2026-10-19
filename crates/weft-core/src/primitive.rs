@@ -284,12 +284,22 @@ impl SignalRouting {
 #[derive(Debug, Clone)]
 pub struct RunSnapshot {
     pub run_id: RunId,
-    /// The immutable selection and supplied inputs recorded at birth.
-    pub selection: Option<crate::project::selection::RunSelection>,
+    /// Every scope copy decided so far (`crate::run::scope`): derived
+    /// from the pulses, never from a row of its own.
+    pub scopes: crate::run::scope::ScopeTable,
     /// The worker binary the run was born on (`RunStarted`): with
     /// the definition hash it names the program identity, read from the
     /// project's stored code when reuse needs it.
     pub binary_hash: Option<String>,
+    /// The hash of the program the run runs (`RunStarted`): its cut, for
+    /// a run of a cut.
+    pub definition_hash: Option<String>,
+    /// The registered program the run's own was cut from (`RunStarted`),
+    /// for a run of a cut: the program its results are held against when
+    /// a seed reuses them.
+    pub cut_from: Option<String>,
+    /// What the run is given at the places its program says (`RunStarted`).
+    pub given: std::sync::Arc<crate::project::Given>,
     /// Chosen history includes bodies of zero-iteration loops, which have no
     /// firing record on which to store an origin.
     pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, RunId>,
@@ -303,9 +313,9 @@ pub struct RunSnapshot {
     /// scheduler dispatches a kicked node once even when it has no
     /// wired pending inputs (it IS an entry point). Folded from
     /// `RunEvent::NodeKicked` (the run's roots, at frames `[]`), from
-    /// a group's In boundary firing (the body's roots, at the group's
-    /// frames) and from `RunEvent::LoopIterationLaunched` (a loop
-    /// body's roots, at the iteration's frames). `dispatched=true` once
+    /// a scope's copy opening (its members no wire feeds, at its frames)
+    /// and from `RunEvent::LoopIterationLaunched` (a loop body's roots,
+    /// at the iteration's frames). `dispatched=true` once
     /// the engine has consumed the kick (the node started at that
     /// location; further kicks at the same location are a no-op).
     pub kicked: HashMap<crate::frames::FiringLocation, KickedNode>,
@@ -390,6 +400,10 @@ pub enum CorruptionSite {
     /// `LoopTerminated` arrived for a `LoopInstanceKey` with no preceding
     /// `LoopInstantiated`, or its outward emit cannot be rebuilt.
     LoopTerminated,
+    /// `RunEvent::RunStarted` gives the run values at places its program
+    /// does not say it is given something, or misses one it says
+    /// (`weft_core::project::Given::check_against`).
+    RunGiven,
     /// A journal row whose JSON no longer decodes to any `RunEvent`
     /// at all (the display read surfaces it; state-rebuilding reads
     /// refuse the whole log instead).
@@ -485,6 +499,26 @@ pub fn wait_skipped() -> crate::error::WeftError {
 pub enum ReplayedAwait {
     Resolved(Value),
     Pending { token: String },
+}
+
+/// The steps of a firing's journal a new firing of the same code may
+/// replay (a seeded run re-running a node, `weft run --seed`): in call
+/// order from the first, every `ctx.run` and every wait somebody
+/// answered, up to the first wait that was not (still open, given up,
+/// skipped) or a gap in the order. The new firing asks that one again.
+pub fn answered_steps(entries: &[AwaitedEntry]) -> Vec<AwaitedEntry> {
+    let mut ordered: Vec<&AwaitedEntry> = entries.iter().collect();
+    ordered.sort_by_key(|entry| entry.call_index);
+    let mut steps = Vec::new();
+    for (at, entry) in ordered.into_iter().enumerate() {
+        let settled = match &entry.kind {
+            AwaitedEntryKind::Run { .. } => true,
+            AwaitedEntryKind::Await { ended, .. } => matches!(ended, Some(AwaitEnd::Answered { .. })),
+        };
+        if !settled || entry.call_index as usize != at { break; }
+        steps.push(entry.clone());
+    }
+    steps
 }
 
 /// The replay decision for a `ctx.await_signal` at `call_index`: pops
@@ -694,4 +728,30 @@ impl Phase {
 
     /// Every phase, for a caller that has to offer the choice.
     pub const ALL: [Phase; 3] = [Self::InfraSetup, Self::TriggerSetup, Self::Fire];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(call_index: u32) -> AwaitedEntry {
+        AwaitedEntry { call_index, kind: AwaitedEntryKind::Run { name: format!("step{call_index}"), value: Value::from(call_index) } }
+    }
+
+    fn wait(call_index: u32, ended: Option<AwaitEnd>) -> AwaitedEntry {
+        AwaitedEntry { call_index, kind: AwaitedEntryKind::Await { token: format!("t{call_index}"), ended } }
+    }
+
+    /// A new firing replays, in call order, every step up to the first
+    /// wait nobody answered, and asks that one again.
+    #[test]
+    fn answered_steps_stop_at_the_first_wait_nobody_answered() {
+        let answered = wait(1, Some(AwaitEnd::Answered { value: Value::from("yes") }));
+        let entries = vec![wait(2, None), answered.clone(), run(0), run(3)];
+        assert_eq!(answered_steps(&entries), vec![run(0), answered.clone()]);
+        let gave_up = vec![run(0), wait(1, Some(AwaitEnd::GaveUp { error: "gone".into() })), run(2)];
+        assert_eq!(answered_steps(&gave_up), vec![run(0)]);
+        assert_eq!(answered_steps(&[wait(0, Some(AwaitEnd::Skipped))]), Vec::new());
+        assert_eq!(answered_steps(&[run(0), run(2)]), vec![run(0)], "a gap in the order ends the replay");
+    }
 }

@@ -35,6 +35,8 @@ import type {
   LoopTerminationReason,
   NodeFiringEvent,
   Seed,
+  ScopeDecidedEvent,
+  ScopeState,
   SkipReason,
   StreamEnd,
 } from '../../packages/weft-graph/src/protocol';
@@ -56,9 +58,11 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'run_started'; runId: string; entryNode: string; phase: RunPhase; subgraph?: string[]; seed?: Seed; projectId: string; atUnix: number }
   // `inheritedFrom` is set when the firing was taken from the run this
   // one was seeded from (`weft run --seed`); `providedPorts` names the
-  // input ports supplied at a run's `--from` or `--group` start.
+  // input ports the run was given (a value handed in at a `--from` or
+  // `--group` start, or an output a node stood in with), `inheritedPorts`
+  // the ones a seed's saved result sent.
   // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
-  | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: unknown; closedPorts: string[]; providedPorts?: string[]; backupPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
+  | { kind: 'node_started'; runId: string; node: string; frames: Frame[]; input: unknown; closedPorts: string[]; providedPorts?: string[]; inheritedPorts?: Record<string, string>; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_suspended'; runId: string; node: string; frames: Frame[]; token: string; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_resumed'; runId: string; node: string; frames: Frame[]; token: string | null; inheritedFrom?: string; projectId: string; atUnix: number }
   // A wait of the firing ended, the first ending on record. A wait the run
@@ -69,6 +73,11 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'node_completed'; runId: string; node: string; frames: Frame[]; output: unknown; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_failed'; runId: string; node: string; frames: Frame[]; error: string; inheritedFrom?: string; projectId: string; atUnix: number }
   | { kind: 'node_skipped'; runId: string; node: string; frames: Frame[]; closedPorts: string[]; reason: SkipReason; inheritedFrom?: string; projectId: string; atUnix: number }
+  // A copy of a scope (a group, an include's call site, an included
+  // body, a loop's iteration, at `frames`) was decided: open, or skipped
+  // with why. A group is no node, so the graph paints it from these.
+  // SYNC: DispatcherEvent scope_decided <-> crates/weft-core/src/live_event.rs DispatcherEvent::ScopeDecided, packages/weft-graph/src/protocol.ts ScopeDecidedEvent
+  | ({ kind: 'scope_decided'; runId: string; projectId: string; scope: string; frames: Frame[]; inheritedFrom?: string; atUnix: number } & ScopeState)
   | { kind: 'run_completed'; runId: string; projectId: string; outputs: unknown; atUnix: number }
   | { kind: 'run_failed'; runId: string; projectId: string; error: string; atUnix: number }
   | { kind: 'run_cancelled'; runId: string; projectId: string; reason: string; cause?: CancelCause; atUnix: number }
@@ -408,7 +417,6 @@ export class RunFollower implements vscode.Disposable {
           input: e.input,
           closedPorts: e.closedPorts,
           providedPorts: e.providedPorts,
-          backupPorts: e.backupPorts,
           inheritedPorts: e.inheritedPorts,
           inheritedFrom: e.inheritedFrom,
         };
@@ -495,6 +503,14 @@ export class RunFollower implements vscode.Disposable {
           inheritedFrom: e.inheritedFrom,
         };
         this.post({ kind: 'firingEvent', event: firingEvent });
+        break;
+      }
+      case 'scope_decided': {
+        const copy = { scope: e.scope, frames: e.frames, inheritedFrom: e.inheritedFrom, atUnix: e.atUnix };
+        const event: ScopeDecidedEvent = e.state === 'open'
+          ? { ...copy, state: 'open' }
+          : { ...copy, state: 'skipped', reason: e.reason };
+        this.post({ kind: 'scopeDecided', event });
         break;
       }
       case 'run_completed':

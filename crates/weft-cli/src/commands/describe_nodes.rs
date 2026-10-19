@@ -39,6 +39,42 @@ struct ListRow<'a> {
     description: &'a str,
 }
 
+/// `--list --json`: the node rows, and apart from them the `.weft` files
+/// shipped under `nodes/` that a program can `@include`, so a file is
+/// never read as a node type.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Listing<'a> {
+    nodes: Vec<ListRow<'a>>,
+    include_files: Vec<IncludeRow>,
+}
+
+/// One shipped `.weft` file: the path a program writes in `@include`
+/// (`__catalog/base_catalog/computer/agent.weft`), and its first-line
+/// comment when it has one.
+#[derive(Serialize)]
+struct IncludeRow {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// Every `.weft` file under `root` as an [`IncludeRow`], its path spelled
+/// the way a program reaches it: `__catalog/` then `under`, the folder
+/// `root` is inside `nodes/` (none for the project's `nodes/` itself,
+/// `base_catalog` for the bundled stdlib, which a project holds there).
+fn include_rows(root: &std::path::Path, under: Option<&str>) -> Result<Vec<IncludeRow>> {
+    let files = weft_catalog::include_files(root).map_err(|e| anyhow::anyhow!("list the .weft files under {}: {e}", root.display()))?;
+    let prefix = match under {
+        Some(under) => format!("{}/{under}/", weft_compiler::project::CATALOG_PREFIX),
+        None => format!("{}/", weft_compiler::project::CATALOG_PREFIX),
+    };
+    Ok(files
+        .into_iter()
+        .map(|file| IncludeRow { path: format!("{prefix}{}", file.path), description: file.description })
+        .collect())
+}
+
 /// The first sentence of a description: up to and including the first
 /// full stop that ends one. A stop ends a sentence when it is followed
 /// by whitespace or is the last character, sits outside any open
@@ -120,8 +156,16 @@ pub async fn run(
         for warning in cat.warnings() {
             eprintln!("warning: {warning}");
         }
+        // Only `nodes/` is reachable through `__catalog/`, so a `.weft`
+        // beside the code under `src/` is not listed.
+        let include_files = if stdlib {
+            include_rows(&roots[0], Some(weft_compiler::project::BASE_CATALOG_DIR))?
+        } else {
+            include_rows(&ctx.project()?.nodes_dir(), None)?
+        };
         if ctx.json() {
-            println!("{}", serde_json::to_string(&rows).context("serialize node listing")?);
+            let listing = Listing { nodes: rows, include_files };
+            println!("{}", serde_json::to_string(&listing).context("serialize node listing")?);
             return Ok(());
         }
         let width = rows.iter().map(|r| r.node_type.len()).max().unwrap_or(0);
@@ -132,6 +176,19 @@ pub async fn run(
                 format!("[{}] ", row.tags.join(","))
             };
             println!("{:<width$}  {tags}{}", row.node_type, row.description);
+        }
+        // The files after the types, under their own heading: each line
+        // starts with the path a program writes, so a grep for a word
+        // still lands on a line that says what to do with it.
+        if !include_files.is_empty() {
+            println!("\nFiles a program can @include(\"<path>\"):");
+            let width = include_files.iter().map(|f| f.path.len()).max().unwrap_or(0);
+            for file in &include_files {
+                match &file.description {
+                    Some(description) => println!("{:<width$}  {description}", file.path),
+                    None => println!("{}", file.path),
+                }
+            }
         }
         return Ok(());
     }
@@ -188,8 +245,8 @@ fn language_construct(name: &str) -> Option<String> {
         "Group" => ("a group, written `name = Group(...) { ... }`", "docs/src/language/groups.md"),
         "Loop" => ("a loop, written `name = Loop(...) { ... }`", "docs/src/language/loops.md"),
         "Include" => ("an include, written `name = @include(\"file.weft\")`", "docs/src/language/files-and-reuse.md"),
-        weft_core::project::boundary_types::PASSTHROUGH | weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
-            "a node the compiler makes out of a group or a loop; you never write it",
+        weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
+            "a node the compiler makes out of a loop; you never write it",
             "docs/src/language/how-a-program-runs.md",
         ),
         _ => return None,

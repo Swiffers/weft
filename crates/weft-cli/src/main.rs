@@ -219,10 +219,15 @@ enum Cmd {
         /// Compile only nodes used by the graph. Default: the whole catalog.
         #[arg(long)]
         referenced: bool,
-        /// Reuse from head's run every node whose slice of the program
-        /// did not change (and completed), re-running only the rest.
-        #[arg(long)]
-        seed: bool,
+        /// Reuse every node whose slice of the program did not change (and
+        /// completed), re-running only the rest: from head's run, or from
+        /// the run named (`--seed=<run>`: any run of the project, one a
+        /// trigger started or one that failed included). A node that runs
+        /// again and waited there replays the answers it was given, when
+        /// its code did not change. The run is named after `=`, so a bare
+        /// word after `--seed` stays the example name.
+        #[arg(long, value_name = "run", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        seed: Option<String>,
         /// With --seed: reuse through this node, inclusively. Repeatable.
         #[arg(long, value_name = "node-id")]
         seed_until: Vec<String>,
@@ -233,9 +238,10 @@ enum Cmd {
         /// is seeded.
         #[arg(long)]
         root: bool,
-        /// Start the cut at this node, optionally supplying backup inputs
-        /// as node='{"port": value}'. Repeatable; real input values win,
-        /// and with --seed an unchanged start is reused like any other node.
+        /// Start the cut at this node, optionally handing it inputs as
+        /// node='{"port": value}': a handed port takes that value, and no
+        /// wire into it runs. Repeatable; with --seed an unchanged start is
+        /// reused like any other node.
         #[arg(long, value_name = "node[=json]")]
         from: Vec<String>,
         /// Run only this node and what it needs (repeatable: several
@@ -250,13 +256,13 @@ enum Cmd {
         #[arg(long, value_name = "node-id")]
         before: Vec<String>,
         /// Run one group (or `@include`d file, by its alias) alone, with
-        /// its boundary inputs provided.
+        /// the values its inputs take handed as JSON.
         #[arg(long, value_name = "group[=json]")]
         group: Option<String>,
         /// Also run what feeds this start (a --from node or the --group):
         /// for each of its inputs you did not hand a value, the node that
-        /// feeds it, through any group or include doors on the way, and
-        /// nothing above that node. Repeatable.
+        /// feeds it, through any groups and included files on the way,
+        /// and nothing above that node. Repeatable.
         #[arg(long, value_name = "start")]
         feed: Vec<String>,
         /// Fire exactly one trigger with this wake payload, using a matching
@@ -566,9 +572,10 @@ enum Cmd {
         local: bool,
         #[arg(long)]
         all: bool,
-        /// Skip the supervisor terminate-wait window. Use when the
-        /// supervisor is wedged or the install is unreachable
-        /// and the user wants the project gone NOW.
+        /// Skip the supervisor terminate-wait window, and go on past
+        /// cloud leftovers (named in the answer). Use when the supervisor
+        /// is wedged and the user wants the project gone NOW. Workers
+        /// that cannot be killed still stop the removal.
         #[arg(long)]
         force: bool,
         /// Answer the confirmation. Required when there is no terminal

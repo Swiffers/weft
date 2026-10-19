@@ -242,7 +242,7 @@ pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     let system_prompt: String = params.get_or("systemPrompt", String::new())?;
     prepare_conversation(&mut stored, &system_prompt)?;
     let prompt: Option<String> = ctx.inputs.opt("prompt")?;
-    let media: Vec<Value> = ctx.inputs.list("media")?;
+    let media = chat::media_input(ctx)?;
     let mut new_turn = 0;
     if prompt.is_some() || !media.is_empty() {
         stored.push(chat::stored_message("user", prompt.as_deref().unwrap_or(""), &media, None)?);

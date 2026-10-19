@@ -337,6 +337,7 @@ out.data = a.value
         source_handle: Some("value".into()),
         target_handle: Some("data".into()),
         path: Vec::new(),
+        via: Vec::new(),
         span: None,
         source_file: None,
     };
@@ -1099,6 +1100,7 @@ out.data = b.value
         source_handle: Some("value".into()),
         target_handle: Some("value".into()),
         path: Vec::new(),
+        via: Vec::new(),
         span: None,
         source_file: None,
     });
@@ -1537,21 +1539,19 @@ out.data = c.value
 }
 
 /// A NESTED typevar port (`List[T]`) wired to a concrete list on both
-/// sides resolves cleanly, and a genuinely unwired one is refused by
-/// the unresolved-typevar diagnostic (the binder and the validator
-/// must agree on what "unresolved" means; a bare-`T`-only binder left
-/// nested vars unresolved forever, which the validator then rejected
-/// on a perfectly wired graph).
+/// sides resolves cleanly (a bare-`T`-only binder left nested vars
+/// unresolved forever, which the validator then rejected on a perfectly
+/// wired graph), and a genuinely unwired one is refused. Both halves sit
+/// on a node's port: a group's port is no node, and enrich binds no
+/// variable on it.
 #[test]
 fn nested_typevar_resolves_through_edges_or_fails_loud() {
     let wired = r#"
 py = ExecPython(a: Number) -> (b: List[Number]) { code: "return {'b': [a]}", a: 1 }
-g = Group(items: List[T]) -> (out: List[T]) {
-    self.out = self.items
-}
-g.items = py.b
+count = ExecPython(items: List[T]) -> (n: Number) { code: "return {'n': len(items)}" }
+count.items = py.b
 sink = Debug
-sink.data = g.out
+sink.data = count.n
 "#;
     let result = weft_compiler::compile_checked(
         wired,
@@ -1563,11 +1563,9 @@ sink.data = g.out
     assert!(result.is_ok(), "a wired List[T] must resolve: {:?}", result.err());
 
     let unwired = r#"
-g = Group(items: List[T]) -> (out: List[T]) {
-    self.out = self.items
-}
+make = ExecPython() -> (items: List[T]) { code: "return {'items': []}" }
 sink = Debug
-sink.data = g.out
+sink.data = make.items
 "#;
     let err = weft_compiler::compile_checked(
         unwired,
@@ -1577,7 +1575,10 @@ sink.data = g.out
         weft_compiler::validate::ValidationMode::Structural,
     )
     .expect_err("an unwired List[T] port must be refused");
-    assert!(format!("{err:?}").contains("'List[T]' unresolved"), "{err:?}");
+    // Nothing binds `T`: the output stays `List[T]`, and the wire out of
+    // it is refused.
+    let err = format!("{err:?}");
+    assert!(err.contains("source port 'make.items' type 'List[T]' unresolved"), "{err}");
 }
 
 /// A Cast output nothing pins (no declaration, and it feeds a port of
@@ -3137,6 +3138,135 @@ outer = Group(db: String, items: List[String]) -> (done: List[String | Null]) {
     assert!(hint.message.contains("run.db = self.db"), "{}", hint.message);
 }
 
+/// The same for a group nested in a group: `self.db` inside `inner` is
+/// `inner`'s own input, which it lacks, and the message names the
+/// enclosing group that has it and how to thread it in. Nothing reaches
+/// that port, so the wire from it exists only for the mistake to be
+/// reported on its own line, once.
+#[test]
+fn a_group_reading_the_enclosing_groups_self_is_told_to_thread_it_in() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+outer = Group(db: String) -> (done: String) {
+    inner = Group() -> (out: String) {
+        py = ExecPython(db: String) -> (out: String) {
+            code: "return {'out': db}"
+            db: self.db
+        }
+        self.out = py.out
+    }
+    self.done = inner.out
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hints: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("unknown-source-port")).collect();
+    assert_eq!(hints.len(), 1, "{d:?}");
+    assert!(hints[0].message.contains("inside the group 'outer.inner'"), "{}", hints[0].message);
+    assert!(hints[0].message.contains("enclosing group 'outer'"), "{}", hints[0].message);
+    assert!(hints[0].message.contains("inner.db = self.db"), "{}", hints[0].message);
+    assert_eq!(hints[0].line, 6, "on the line that reads it: {:?}", hints[0]);
+}
+
+/// A line starting at a group port the group does not declare is reported
+/// on that line, from outside (`g.yy`) and from inside (`self.xx`) alike,
+/// though no wire could start there.
+#[test]
+fn a_line_from_a_missing_group_port_is_reported() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+g = Group(x: String) -> (y: String) {
+    t = Text { value: self.x }
+    self.y = t.value
+}
+g.x = "seed"
+b = Debug
+b.data = g.yy
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("unknown-source-port")).collect();
+    assert_eq!(unknown.len(), 1, "{d:?}");
+    assert!(unknown[0].message.contains("group 'g' has no output 'yy'. Did you mean 'y'?"), "{}", unknown[0].message);
+    assert_eq!(unknown[0].line, 8, "{:?}", unknown[0]);
+
+    let (project, _) = parse_enrich_lenient(
+        r#"
+g = Group(x: String) -> (y: String) {
+    self.y = self.xx
+}
+g.x = "seed"
+b = Debug
+b.data = g.y
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("unknown-source-port")).collect();
+    assert_eq!(unknown.len(), 1, "{d:?}");
+    assert!(unknown[0].message.contains("group 'g' has no input 'xx'. Did you mean 'x'?"), "{}", unknown[0].message);
+    assert_eq!(unknown[0].line, 3, "{:?}", unknown[0]);
+}
+
+/// Group ports joined into a loop with no node on it would pass a value
+/// round for ever: refused once, however many lines make the loop.
+#[test]
+fn a_loop_of_group_ports_alone_is_refused_once() {
+    let (_, errors) = parse_enrich_lenient(
+        r#"
+g = Group(x: String) -> (y: String) {
+    self.y = self.x
+}
+g.x = g.y
+"#,
+    );
+    let loops: Vec<_> = errors.iter().filter(|e| e.message.contains("come back to it without passing any node")).collect();
+    assert_eq!(loops.len(), 1, "{errors:?}");
+}
+
+/// A wrong type on the line into a group's port is reported once, on that
+/// line: the stretch past the port fits, and the wire is not checked end
+/// to end on top.
+#[test]
+fn a_mismatch_into_a_group_port_is_reported_once_on_its_line() {
+    let project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+g = Group(x: Number) -> (out: Number) {
+    m = ExecPython(n: Number) -> (r: Number) { code: "return {'r': n}" }
+    m.n = self.x
+    self.out = m.r
+}
+g.x = a.value
+sink = Debug
+sink.data = g.out
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let mismatches: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("type-mismatch")).collect();
+    assert_eq!(mismatches.len(), 1, "{d:?}");
+    assert_eq!(mismatches[0].line, 8, "on `g.x = a.value`: {:?}", mismatches[0]);
+}
+
+/// Two lines into one port: the one written first is the driver the second
+/// is told about, whatever the order the wires are kept in.
+#[test]
+fn a_second_driver_names_the_first_written() {
+    let project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+b = Text { value: "y" }
+out = Debug
+out.data = b.value
+out.data = a.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let dup: Vec<_> = d.iter().filter(|e| e.code.as_deref() == Some("duplicate-input-port")).collect();
+    assert_eq!(dup.len(), 1, "{d:?}");
+    assert_eq!(dup[0].line, 6, "{:?}", dup[0]);
+    assert!(dup[0].message.contains("already has a driver at line 5"), "{}", dup[0].message);
+}
+
 /// A container's boundaries hold their ports optional by construction
 /// (a closed group input reaches the inside as a closure; a loop's
 /// gathers are optional), so the "no required input" warning never
@@ -3447,16 +3577,11 @@ fn an_anonymous_group_beside_loose_nodes_is_an_ordinary_item() {
         .find(|g| g.anonymous)
         .map(|g| g.id.clone())
         .expect("the anonymous group");
-    project.edges.push(weft_core::project::Edge {
-        id: "z15-root".into(),
-        source: "z15".into(),
-        target: weft_core::project::boundary_in_id(&root),
-        source_handle: Some("data".into()),
-        target_handle: Some("raw".into()),
-        path: Vec::new(),
-        span: None,
-        source_file: None,
-    });
+    // The wire the group's unfed `raw` sent from its own port now comes
+    // from the loose node.
+    let into = project.edges.iter_mut().find(|edge| edge.source == root).expect("the group's own input reaches q");
+    into.source = "z15".into();
+    into.source_handle = Some("data".into());
     let d = validate(&project, &catalog());
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "{d:?}");
@@ -3499,6 +3624,27 @@ fn a_wire_into_a_group_joins_the_group_to_the_branch() {
         "{}",
         warned[0].message
     );
+}
+
+/// A wire through an include site links the site to both of its ends:
+/// eight nodes into the site and eight out of it are one part of
+/// seventeen, though the wires run to the body's member and no node of
+/// this level touches the site.
+#[test]
+fn a_wire_through_an_include_site_joins_the_branch() {
+    let main = format!(
+        "{}alias = @include(\"sub.weft\")\nalias.x = a7.data\n{}",
+        chain("a", 8, None),
+        chain("b", 8, Some("alias.y")).trim_start_matches('\n')
+    );
+    let project = compile_with_files(
+        &main,
+        &[("sub.weft", "Group(x: String) -> (y: String) {\n  t = Text { value: self.x }\n  self.y = t.value\n}\n")],
+    );
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(warned[0].message.contains("one connected part of the top level holds 17 items"), "{}", warned[0].message);
 }
 
 /// A component file's members live under its root group, and that IS
@@ -3814,10 +3960,10 @@ fn a_route_that_ended_up_per_instance_is_refused_naming_why() {
 
 /// The refusal tells the path the way it runs. A route reading a group's
 /// port that carries the instance's value reads that value. A route
-/// reading ANOTHER port of a group that receives one is per instance
-/// only because the group is (a group receiving a per-instance value on
-/// any port makes everything reading its ports per instance), so the
-/// message says it sits inside that group.
+/// reading ANOTHER port of that group is shared: each wire through a
+/// group carries only its own value. A group whose gate reads the
+/// instance's value runs once per instance, and so does everything in
+/// it, so the message says the route sits inside that group.
 #[test]
 fn the_per_instance_refusal_names_the_path_through_a_group() {
     let refusal = |source: &str| -> String {
@@ -3829,9 +3975,40 @@ fn the_per_instance_refusal_names_the_path_through_a_group() {
     assert!(m.contains("because it reads 'gate', but"), "{m}");
 
     let beside = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
-    let m = refusal(beside);
-    assert!(m.contains("because it sits inside group 'work', which receives 'gate', but"), "{m}");
+    let found = messages(beside);
+    assert!(!found.iter().any(|m| m.contains("would exist once per instance")), "{found:?}");
+
+    let gated = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.o = shared.access\nwork._should_flow = gate.access\n";
+    let m = refusal(gated);
+    assert!(m.contains("because it sits inside group 'work', whose gate reads 'gate', but"), "{m}");
     assert!(!m.contains("it reads"), "{m}");
+}
+
+/// An included file runs wherever a call site of it runs, so a site whose
+/// gate reads the instance's value runs the file's route once per
+/// instance, and the refusal names that site.
+#[test]
+fn the_per_instance_refusal_names_the_call_site_whose_gate_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hook.weft"),
+        "Group() {\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\n",
+    ).unwrap();
+    let src = "gate = ApiKeyAuth { account: @instance_filled }\none = @include(\"hook.weft\")\none._should_flow = gate.access\n";
+    let found: Vec<String> = entry_program(src, dir.path()).into_iter().map(|d| d.message).collect();
+    let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
+    assert!(m.contains("because it sits inside group 'one', whose gate reads 'gate', but"), "{m}");
+}
+
+/// A loop runs everything inside it once per item its list holds, so a
+/// list made from the instance's value runs the loop's route once per
+/// instance, and the refusal names the loop.
+#[test]
+fn the_per_instance_refusal_names_the_loop_whose_list_reads_it() {
+    let src = "gate = ApiKeyAuth { account: @instance_filled }\nlist = ExecPython(a: Access) -> (items: List[String]) { code: \"x\" }\nlist.a = gate.access\neach = Loop(items: List[String]) -> (seen: List[String | Null]) {\n  parallel: false\n  over: [\"items\"]\n  t = Route { path: \"hook\" }\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  self.seen = self.items\n}\neach.items = list.items\n";
+    let found = messages(src);
+    let m = found.iter().find(|m| m.contains("would exist once per instance")).unwrap_or_else(|| panic!("the route is refused: {found:?}"));
+    assert!(m.contains("because it sits inside loop 'each', which runs on what 'gate' gives it, but"), "{m}");
 }
 
 /// `run_reaches` with a capability: a route counts any node declaring
@@ -4119,9 +4296,8 @@ fn one_gate_alone_is_fine_in_either_spelling() {
 }
 
 /// A group takes a gate too (it decides whether the whole subgraph
-/// runs), and flatten homes it on the group's boundary node. Both
-/// gates there is the same mistake, reached through a different door:
-/// one written in the group's body, one filled from outside.
+/// runs). Both gates there is the same mistake as on a node: one
+/// written in the group's body, one filled from outside.
 #[test]
 fn both_gates_on_a_group_are_refused() {
     let p = parse_enrich(
@@ -4135,7 +4311,27 @@ fn both_gates_on_a_group_are_refused() {
     let d = validate(&p, &catalog());
     assert!(
         d.iter().any(|x| x.code.as_deref() == Some("two-gates")),
-        "a boundary node carries one gate like any other node: {d:?}"
+        "a group has one gate like any node: {d:?}"
+    );
+}
+
+/// A group's gate written in its braces and wired from outside has two
+/// drivers, as a node's gate would.
+#[test]
+fn a_group_gate_written_and_wired_is_double_driven() {
+    let p = parse_enrich(
+        "a = Text { value: \"y\" }\n\
+         g = Group() -> (out: String) {\n\
+        \x20   _should_flow: false\n\
+        \x20   p = Text { value: \"x\" }\n\
+        \x20   self.out = p.value\n\
+         }\n\
+         g._should_flow = a.value\n",
+    );
+    let d = validate(&p, &catalog());
+    assert!(
+        d.iter().any(|x| x.code.as_deref() == Some("double-driven-port") && x.message.contains("'_should_flow'")),
+        "{d:?}"
     );
 }
 

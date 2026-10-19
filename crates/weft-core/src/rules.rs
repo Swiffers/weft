@@ -48,14 +48,14 @@ impl<'a> RuleContext<'a> {
     }
 
     fn places(&self) -> &BTreeSet<Located> {
-        self.places.get_or_init(|| crate::project::selection::every_place_in(&self.graph))
+        self.places.get_or_init(|| crate::project::places::every_place_in(&self.graph))
     }
 
     /// Whether the run seeded at `seed` (a fire when it is a trigger, a
     /// cut from it otherwise) holds a place `holds` accepts. A seed that
     /// cannot be carved answers false.
     fn run_holds(&self, seed: &Located, holds: impl Fn(&BTreeSet<Located>) -> bool) -> bool {
-        use crate::project::selection::{RunSelection, SelectionBounds};
+        use crate::project::cut::SelectionBounds;
         if let Some(run) = self.runs.borrow().get(seed) {
             return run.as_ref().is_some_and(&holds);
         }
@@ -65,7 +65,7 @@ impl<'a> RuleContext<'a> {
         } else {
             SelectionBounds { from: vec![spelled], ..Default::default() }
         };
-        let run = RunSelection::carve_in(&self.graph, &bounds).ok().map(|run| run.nodes);
+        let run = crate::project::cut::walk(&self.graph, &bounds).ok().map(|run| run.kept());
         let answer = run.as_ref().is_some_and(&holds);
         self.runs.borrow_mut().insert(seed.clone(), run);
         answer
@@ -89,7 +89,7 @@ pub fn fires(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, cus
 /// The message a fired rule shows: `{id}`, `{port}`, `{field}` and
 /// `{customOutputs}` replaced from the node; `{perInstanceReason}`
 /// with why it is per instance ("it reads 'blender'", "it sits inside
-/// group 'work', which receives 'blender'"); `{names}` with the names
+/// group 'work', whose gate reads 'blender'"); `{names}` with the names
 /// its `input_names` conditions refuse, each with the full spelling it
 /// most likely meant when one exists (`'box' (did you mean
 /// 'work.box'?)`); `{with}` with the nodes its
@@ -241,9 +241,9 @@ fn settle(parts: &[Condition], decisive: bool, answer: impl Fn(&Condition) -> Op
 }
 
 /// Whether `node` sits in a run with a node of one of `types`, looking
-/// `direction` from it. The run is the same selection a fire computes
-/// (`RunSelection::carve`: forward from the seed, then back for what
-/// that needs), taken at every place the node runs (once per call
+/// `direction` from it. The run is the same walk a fire computes
+/// (`crate::project::cut::walk`: forward from the seed, then back for
+/// what that needs), taken at every place the node runs (once per call
 /// site for a node inside an included file). Downstream: every run
 /// seeded at the node holds one of the types. Upstream: every place
 /// of the node is in the run of some node of one of the types. A seed
@@ -262,12 +262,18 @@ fn run_reaches(node: &NodeDefinition, cx: &RuleContext, direction: RunDirection,
     }
 }
 
-/// Every node upstream of `node` along the wires (itself included when
-/// a loop's wiring leads back to it), walked through the boundaries
-/// flattening left, which are ordinary nodes: the program's backward
-/// closure ([`crate::project::upstream_closure`]) from what feeds it.
+/// Every node upstream of `node` (itself included when a loop's wiring
+/// leads back to it): the program's backward closure
+/// ([`crate::project::upstream_closure`]) from what feeds it and from
+/// the groups around it, whose gates decide whether it runs. By id, as a
+/// rule is asked of one definition: what feeds any call of an included
+/// file is upstream of that file's members, the answer for the call
+/// where it holds.
 fn upstream_of<'a>(node: &NodeDefinition, cx: &'a RuleContext) -> Vec<&'a NodeDefinition> {
-    let feeders: Vec<String> = cx.graph.edges_into(&node.id).map(|e| e.source.clone()).collect();
+    let feeders: Vec<String> = cx.graph.edges_into(&node.id)
+        .map(|e| e.source.clone())
+        .chain(node.scope.iter().cloned())
+        .collect();
     let seen = crate::project::upstream_closure(&cx.graph, &feeders);
     cx.project().nodes.iter().filter(|n| seen.contains(&n.id)).collect()
 }
@@ -281,15 +287,12 @@ fn upstream_with(node: &NodeDefinition, cx: &RuleContext, with: &NodeWith) -> Ve
 /// so (the ones marked `@per_instance` or holding an `@instance_filled`
 /// field, among itself and everything upstream of it), each telling the
 /// path the way it runs:
-/// - "it reads 'blender'" when the value flows into `node` along wires,
-///   through a group's port of the same name when there is one;
-/// - "it sits inside group 'work', which receives 'blender'" when it only
-///   reaches `node` because a group enclosing it takes the value in: a
-///   group that receives a per-instance value on any port makes
-///   everything reading any of its ports per instance, so `node` may
-///   read none of that value itself;
-/// - "it reads from group 'work', which receives 'blender'" the same way
-///   through a group that does not enclose `node`.
+/// - "it reads 'blender'" when the value flows into `node` along wires;
+/// - "it sits inside group 'work', whose gate reads 'blender'" when the
+///   value decides whether a group around `node` runs: the group runs
+///   once per instance, and so does everything inside it;
+/// - "it sits inside loop 'each', which runs on what 'blender' gives it"
+///   when the value reaches what starts a loop around `node`.
 fn per_instance_reasons(node: &NodeDefinition, cx: &RuleContext) -> Vec<String> {
     use crate::instance::PerInstance;
     let mut out: Vec<String> = Vec::new();
@@ -303,39 +306,71 @@ fn per_instance_reasons(node: &NodeDefinition, cx: &RuleContext) -> Vec<String> 
     let along_wires = reads_along_wires(node, cx);
     for origin in upstream.iter().filter(|n| starts(n) && n.id != node.id) {
         if along_wires.contains(origin.id.as_str()) {
-            out.push(format!("it reads '{}'", origin.id));
+            out.push(format!("it reads '{}'", crate::project::plain_id(&origin.id)));
             continue;
         }
-        // The value reached `node` through a group boundary where it
-        // changed ports: a group taking it in. The one enclosing `node`,
-        // outermost first, is the truest name; any other on the way
-        // otherwise.
-        let mut receiving: Vec<&str> = upstream
-            .iter()
-            .filter(|b| upstream_of(b, cx).iter().any(|u| u.id == origin.id))
-            .filter_map(|b| b.group_boundary.as_ref().map(|g| g.group_id.as_str()))
-            .collect();
-        receiving.sort();
-        let clause = match node.scope.iter().find(|group| receiving.contains(&group.as_str())) {
-            Some(group) => format!("it sits inside group '{group}', which receives '{}'", origin.id),
-            None => match receiving.first() {
-                Some(group) => format!("it reads from group '{group}', which receives '{}'", origin.id),
-                None => format!("it reads '{}'", origin.id),
-            },
-        };
-        out.push(clause);
+        // Not along the wires: the value reaches a gate of a group around
+        // `node`, or what starts a loop around it (its `LoopIn` reads the
+        // list and the gate alike), outermost first.
+        let gated = enclosing_groups(node, cx).into_iter().find_map(|group| {
+            let is_loop = cx.graph.group(&group).is_some_and(|g| matches!(g.kind, crate::project::GroupKind::Loop { .. }));
+            let decides: Vec<String> = if is_loop {
+                cx.graph.edges_into(&crate::project::loop_in_id(&group)).map(|edge| edge.source.clone()).collect()
+            } else {
+                cx.graph.edges_into(&group)
+                    .filter(|edge| crate::run::skip::is_gate_port(edge.target_port()) && !edge.to_group_port())
+                    .map(|edge| edge.source.clone()).collect()
+            };
+            crate::project::upstream_closure(&cx.graph, &decides).contains(&origin.id).then_some((group, is_loop))
+        });
+        out.push(match gated {
+            Some((group, false)) => format!("it sits inside group '{}', whose gate reads '{}'", crate::project::plain_id(&group), crate::project::plain_id(&origin.id)),
+            Some((group, true)) => format!("it sits inside loop '{}', which runs on what '{}' gives it", crate::project::plain_id(&group), crate::project::plain_id(&origin.id)),
+            None => format!("it reads '{}'", crate::project::plain_id(&origin.id)),
+        });
     }
+    out
+}
+
+/// Every group whose gate decides whether `node` runs, outermost first:
+/// the groups around it, and for a member of an included body, each call
+/// site of that body with the groups around it.
+fn enclosing_groups(node: &NodeDefinition, cx: &RuleContext) -> Vec<String> {
+    fn add(chain: Vec<String>, cx: &RuleContext, out: &mut Vec<String>) {
+        for group in chain {
+            if out.contains(&group) { continue; }
+            let sites: Vec<String> = cx.project().groups.iter()
+                .filter(|site| matches!(&site.kind, crate::project::GroupKind::Call { body, .. } if *body == group))
+                .map(|site| site.id.clone())
+                .collect();
+            for site in sites {
+                add(chain_to(&site, cx), cx, out);
+            }
+            out.push(group);
+        }
+    }
+    // A group and the groups around it, outermost first.
+    fn chain_to(group: &str, cx: &RuleContext) -> Vec<String> {
+        let mut chain = vec![group.to_string()];
+        while let Some(parent) = cx.graph.group(chain.last().unwrap()).and_then(|g| g.parent_group_id.clone()) {
+            chain.push(parent);
+        }
+        chain.reverse();
+        chain
+    }
+    let mut out = Vec::new();
+    add(node.scope.clone(), cx, &mut out);
     out
 }
 
 /// The nodes whose value flows into `node` along wires, port to port,
 /// from any place `node` runs at: the plain data walk
-/// ([`crate::project::selection::upstream_by_wires`]), where an ordinary
-/// node passes any input to every output and a group boundary passes
+/// ([`crate::project::places::upstream_by_wires`]), where an ordinary
+/// node passes any input to every output and a loop's boundary passes
 /// each port straight through, so only the input of the same name.
 fn reads_along_wires<'a>(node: &NodeDefinition, cx: &'a RuleContext) -> BTreeSet<&'a str> {
     let here: Vec<Located> = cx.places().iter().filter(|place| place.id == node.id).cloned().collect();
-    let reached = crate::project::selection::upstream_by_wires(&cx.graph, &here);
+    let reached = crate::project::places::upstream_by_wires(&cx.graph, &here);
     reached.iter().filter_map(|place| cx.graph.node(&place.id)).map(|n| n.id.as_str()).collect()
 }
 
@@ -371,7 +406,7 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
             let filled = crate::instance::instance_filled_fields(found).any(|(f, _)| f == field);
             has_field && instance_filled.is_none_or(|wanted| filled == wanted)
         }
-        Named::State {} => crate::project::selection::state_place(project, spelled).is_ok(),
+        Named::State {} => crate::project::places::state_place(project, spelled).is_ok(),
     };
     names.into_iter().filter(|name| !fits(name)).map(str::to_string).collect()
 }

@@ -12,9 +12,10 @@
 //! render the graph (see `edit_envelope` in `weft-cli`). One flatten, not two.
 //!
 //! Scoped-id rule (mirrors `flatten`): a decl's scoped id is the dot-joined
-//! chain of enclosing GROUP_DECL labels plus the decl's own local id. (The
-//! `{group}__in`/`__out` boundary passthroughs are a flatten-side concern; this
-//! module works in the as-written `grp.port` form, never the boundary ids.)
+//! chain of enclosing GROUP_DECL labels plus the decl's own local id. (Joining
+//! the lines through a group's ports into wires, and a loop's `__in`/`__out`
+//! boundary ids, are flatten-side concerns; this module works in the
+//! as-written `grp.port` form.)
 
 use super::kind::{SyntaxKind, SyntaxNode, SyntaxToken};
 
@@ -637,9 +638,9 @@ fn scoped_with(prefix: &[String], local: &str) -> String {
 /// (the id-rewriter): "an id is local iff it's a direct child of the immediate
 /// scope" (`all_ids.contains("{scope}.id")` here == `local_children.contains(id)`
 /// there). The two functions are NOT mergeable: this one RESOLVES for matching
-/// (self -> None), the other REWRITES for flatten (self -> the `__in`/`__out`
-/// boundary). The shared rule is pinned by `endpoint_resolution_matches_flatten`
-/// so the two can't silently diverge.
+/// (self -> None), the other REWRITES for flatten (self -> the group's own port
+/// seen from inside). The shared rule is pinned by
+/// `endpoint_resolution_matches_flatten` so the two can't silently diverge.
 /// SYNC: endpoint_resolves_to <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/weft_compiler.rs rescope_endpoint, packages/weft-graph/src/webview/lib/projection/apply.ts resolveEndpoint
 fn endpoint_resolves_to(ep: &Endpoint, scope: &[String], all_ids: &std::collections::HashSet<String>) -> Option<String> {
     let (id, _) = ep.parts();

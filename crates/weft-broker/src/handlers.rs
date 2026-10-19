@@ -661,10 +661,12 @@ pub async fn infra_bake(
 /// re-registered the project in the meantime.
 ///
 /// The history table `project_definition` (append-only, keyed on
-/// `(project_id, definition_hash)`) is written by the dispatcher's
-/// register handler. A missing row means no register has ever
-/// happened under this hash for this project; that's a 404 (the
-/// caller's expected_hash is genuinely invalid, not just stale).
+/// `(project_id, definition_hash)`) holds every version a build
+/// registered and every cut a run runs (kept with the run that went in
+/// naming it, `cut_from` set): a run reads its program back by its hash
+/// either way. A missing row means no version or run ever named this
+/// hash for this project; that's a 404 (the caller's expected_hash is
+/// genuinely invalid, not just stale).
 pub async fn project_fetch_definition(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,

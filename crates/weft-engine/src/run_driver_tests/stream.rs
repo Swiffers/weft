@@ -181,47 +181,72 @@
 
     // ----- Plain stream flow -------------------------------------------
 
+    // A stream input handed a value takes that value's items, whatever
+    // the producer wired into it does (sends nothing, sends items, or
+    // fails), or when the producer is not in the run at all: a handed
+    // value always wins over the wire. The rows fold back into the
+    // tables the run held.
     weft_core::stress_test!(
-        name: stream_backup_uses_only_clean_absence_and_matches_replay,
+        name: a_handed_stream_input_wins_over_its_producer_and_matches_replay,
         runs: 16,
         worker_threads: 4,
         async fn body() {
-            for (selected, count, failed) in [(true, 0, false), (true, 2, false), (true, 1, true), (false, 0, false)] {
-                let project = stream_project();
+            for (kept, count, failed) in [(true, 0, false), (true, 2, false), (true, 1, true), (false, 0, false)] {
+                let whole = stream_project();
                 let run_id = uuid::Uuid::new_v4();
                 let log: Log = Arc::new(StdMutex::new(Vec::new()));
                 let cat = catalog(vec![
                     ("Yielder", Box::new(Yielder { count, delivered: false, fail_after: failed.then_some(0), log: log.clone() })),
                     ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
                 ]);
-                let mut selection = weft_core::project::selection::RunSelection::whole(&project);
-                if !selected { selection.nodes.remove(&weft_core::frames::Located::top("producer")); }
-                selection.input.entry(weft_core::frames::Located::top("consumer")).or_default().insert("in".into(), json!([8, 9]));
-                let root = if selected { "producer" } else { "consumer" };
-                let rows = vec![
-                    RunEvent::RunStarted {
+                let consumer = weft_core::frames::Located::top("consumer");
+                let root = if kept { "producer" } else { "consumer" };
+                let walk = weft_core::project::cut::Walk {
+                    runs: [Some(consumer.clone()), kept.then(|| weft_core::frames::Located::top("producer"))].into_iter().flatten().collect(),
+                    starts: [weft_core::frames::Located::top(root)].into(),
+                    ..Default::default()
+                };
+                let mut given = weft_core::project::Given {
+                    inputs: [(consumer, [("in".to_string(), json!([8, 9]))].into())].into(),
+                    outputs: Default::default(),
+                };
+                let project = weft_core::project::cut::cut(&whole, &walk, &mut given);
+                // The roots the cut's run kicks: with its stream handed,
+                // the consumer is one, as no wire lands on that port.
+                let kicks = weft_core::run_spec::KickPlan::for_program(&project, None, None);
+                let mut rows = vec![
+                    RunEvent::RunStarted { given: Box::new(given),
                         run_id, project_id: project.id, entry_node: root.into(),
-                        phase: Phase::Fire, definition_hash: Some("test-hash".into()), binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
-                        selection: Some(weft_core::project::selection::RecordedSelection::new(selection)), seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                        phase: Phase::Fire, definition_hash: Some("test-hash".into()), cut_from: Some("whole-hash".into()), binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+                        seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                         settings: Default::default(),
                     },
-                    RunEvent::NodeKicked { run_id, node_id: root.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 ];
+                rows.extend(kicks.into_iter().map(|kick| RunEvent::NodeKicked {
+                    run_id, node_id: kick.node, frames: kick.frames, firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                }));
                 let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, run_id, rows, CancellationFlag::new_arc()).await;
                 let drove = drove.expect("stream run drives");
                 super::engine_test_rig::assert_fold_matches_live(&project, &events, &weft_journal::SeedChain::default(), &drove);
                 let entries = log.lock().unwrap().clone();
                 let takes: Vec<_> = entries.iter().filter(|entry| entry.starts_with("took ")).cloned().collect();
+                assert_eq!(node_failed_error(&events, "consumer"), None, "kept {kept}, count {count}, failed {failed}");
+                assert_eq!(takes, vec!["took 8", "took 9"], "kept {kept}, count {count}, failed {failed}: {entries:?}");
+                // The handed stream ends where its items do, whatever the
+                // producer does.
+                assert!(entries.iter().any(|entry| entry == "stream finished"), "kept {kept}, count {count}, failed {failed}: {entries:?}");
                 if failed {
-                    assert!(node_failed_error(&events, "consumer").is_some());
-                    assert!(takes.is_empty());
+                    // The producer's own failure is the run's, though
+                    // nothing it sent reached the consumer.
+                    assert!(
+                        matches!(&drove.outcome, RunOutcome::Failed { error, .. } if error.contains("yielder exploded")),
+                        "{:?}", drove.outcome,
+                    );
                 } else {
                     assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
-                    assert_eq!(takes, if count == 0 { vec!["took 8", "took 9"] } else { vec!["took 0", "took 1"] });
-                    assert!(entries.iter().any(|entry| entry == "stream finished"));
                 }
                 assert_eq!(started_count(&events, "consumer"), 1);
-                assert_eq!(started_count(&events, "producer"), usize::from(selected));
+                assert_eq!(started_count(&events, "producer"), usize::from(kept));
             }
         }
     );
@@ -994,7 +1019,7 @@
                 { "id": "e3", "source": "doubler", "target": "lp__out", "sourceHandle": "d", "targetHandle": "results" },
                 { "id": "e4", "source": "lp__out", "target": "sink", "sourceHandle": "results", "targetHandle": "data" }
             ],
-            "groups": []
+            "groups": [{ "id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": ["doubler"] }]
         }))
         .expect("stream loop project")
     }

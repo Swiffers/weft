@@ -1,0 +1,32 @@
+{
+  "type": "MoveMouse",
+  "label": "Move mouse",
+  "description": "Move the mouse on the computer's screen without clicking, to hover over something. `args` is `{ x, y, modifiers }`: `x` and `y` in screen pixels, `modifiers` keys held during the move, joined by + (optional).",
+  "tags": [
+    "computer",
+    "mouse",
+    "hover"
+  ],
+  "icon": "MousePointer2",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "MoveArgs",
+      "required": true,
+      "description": "Where to move, in the shape the node's description gives. RouteComputerCall's `move` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "What happened, in a sentence a model can read back as the tool's result."
+    }
+  ]
+}

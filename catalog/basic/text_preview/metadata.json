@@ -1,0 +1,87 @@
+{
+  "type": "TextPreview",
+  "label": "Text Preview",
+  "description": "Show a text that may be long to a model without spending its budget: put it between any tool whose output can be long (a shell command's output, a fetched page, rows) and the model. It keeps the text's start, its end, or both with the middle cut (`keep`, `both` by default), within `maxLines` lines and `maxChars` characters, whichever runs out first; a single line longer than that is cut too. With `both`, the start gets `startShare` of each budget and the end the rest. Where something was cut, a line in its place says how much, like `[... 4556 of 4812 lines cut (198312 of 210004 characters), from the middle ...]`, and `cut` is true. Give it `text`, or a stored text `file` (read as UTF-8 as it streams, so a file of gigabytes costs no more memory than the preview). To see another part, the model changes its command rather than this node: `grep` for a pattern, `sed -n '100,200p'` for lines 100 to 200, `tail -n 50` for the end.",
+  "tags": [
+    "text",
+    "preview",
+    "truncate",
+    "llm",
+    "tool",
+    "basic"
+  ],
+  "icon": "Scissors",
+  "color": "#64748b",
+  "inputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "label": "Text",
+      "description": "The text to preview. Give this or `file`, not both."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "label": "File",
+      "description": "A stored text file to preview, read as UTF-8 (a byte that is not UTF-8 reads as �). Give this or `text`, not both."
+    },
+    {
+      "name": "keep",
+      "type": "String",
+      "default": "both",
+      "widget": { "kind": "select", "options": ["start", "end", "both"] },
+      "label": "Keep",
+      "description": "`start` keeps the start and cuts the end, `end` keeps the end and cuts the start, `both` keeps the start and the end and cuts the middle."
+    },
+    {
+      "name": "maxLines",
+      "type": "Number",
+      "default": 256,
+      "widget": { "kind": "number", "min": 1, "step": 1 },
+      "label": "Max lines",
+      "description": "The most lines the preview shows."
+    },
+    {
+      "name": "maxChars",
+      "type": "Number",
+      "default": 10000,
+      "widget": { "kind": "number", "min": 1, "max": 16000, "step": 1 },
+      "label": "Max characters",
+      "description": "The most characters the preview shows, at most 16000 so the preview always fits the 100 KB a wire carries."
+    },
+    {
+      "name": "startShare",
+      "type": "Number",
+      "default": 0.5,
+      "widget": { "kind": "number", "min": 0, "max": 1, "step": 0.05 },
+      "label": "Start share",
+      "description": "With `keep` set to `both`, the share of both budgets the start gets (rounded down), the end getting the rest. Ignored otherwise."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "preview",
+      "type": "String",
+      "description": "What the reader should see: the whole text when it fits, the kept parts with a line in the cut's place saying how much was cut otherwise. An empty text previews as `(empty)`."
+    },
+    {
+      "name": "cut",
+      "type": "Boolean",
+      "description": "True when part of the text was cut."
+    },
+    {
+      "name": "lines",
+      "type": "Number",
+      "description": "Lines in the whole text (a last line without a line break counts)."
+    },
+    {
+      "name": "chars",
+      "type": "Number",
+      "description": "Characters in the whole text."
+    }
+  ],
+  "features": {
+    "oneOfRequired": [["text", "file"]]
+  }
+}

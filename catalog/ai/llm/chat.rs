@@ -49,6 +49,13 @@ pub fn media_part(media: &Value) -> WeftResult<Value> {
     })
 }
 
+/// The media a node was handed on `media`: one, or a list. A null in
+/// the list is no media and is left out, so a loop's gathered list (a
+/// null for each iteration that made none) goes in as it comes.
+pub fn media_input(ctx: &RunContext) -> WeftResult<Vec<Value>> {
+    Ok(ctx.inputs.list::<Value>("media")?.into_iter().filter(|media| !media.is_null()).collect())
+}
+
 /// The stored-form message for one turn: plain text content, or parts
 /// (text first, then each stored media). A tool-result message (`role:
 /// tool`) carries the id of the call it answers.

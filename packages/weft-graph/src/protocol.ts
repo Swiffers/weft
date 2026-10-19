@@ -758,6 +758,15 @@ export interface IncludedContents {
   nodeTypes?: string[];
 }
 
+/// One wire, end to end: from the node that makes a value to the node
+/// that reads it, however many group ports it passes (`via`). Either end
+/// can be a group: a wire landing on a group's `_should_flow` /
+/// `_should_not_flow` is its gate; a wire whose source is a group starts
+/// at one of that group's own ports (`via[0]` is its crossing: a literal
+/// or nothing, sent when the group opens); a wire whose target is a group
+/// on any other port stops at that group's own port (the last crossing),
+/// which nobody on the far side reads. The editor draws each leg between
+/// two stops (`host-bridge.ts legsOf`).
 // SYNC: Edge <-> crates/weft-core/src/project.rs Edge
 export interface Edge {
   id: string;
@@ -766,22 +775,44 @@ export interface Edge {
   sourceHandle: string | null;
   targetHandle: string | null;
   /// The keys read off the source value before it lands
-  /// (`w.seconds = x.profile.wpm` carries `["wpm"]`). Absent or empty
-  /// for a plain wire. The graph draws such a wire dotted with the
-  /// path at its target end.
+  /// (`w.seconds = x.profile.wpm` carries `["wpm"]`), every leg's in
+  /// order. Absent for a plain wire. The graph draws such a wire dotted
+  /// with the path at its target end.
   path?: string[];
+  /// The group ports the wire passes, source to target. Absent for a
+  /// wire between two nodes of one scope.
+  via?: Crossing[];
+  /// The last leg's line.
   span?: Span;
   /// The file the span lives in; absent = the compiled source.
   sourceFile?: string;
 }
+
+/// One group port a wire passes. `path`, `span` and `sourceFile` belong
+/// to the leg that ENDS at this port (the line `g.x = a.out` for the leg
+/// into `g.x`).
+// SYNC: Crossing <-> crates/weft-core/src/project.rs Crossing
+export interface Crossing {
+  group: string;
+  port: string;
+  side: CrossingSide;
+  path?: string[];
+  span?: Span;
+  sourceFile?: string;
+}
+
+/// Into a group through one of its inputs, or out through one of its
+/// outputs.
+// SYNC: CrossingSide <-> crates/weft-core/src/project.rs CrossingSide
+export type CrossingSide = 'in' | 'out';
 
 // SYNC: GroupDefinition <-> crates/weft-core/src/project.rs GroupDefinition
 // SYNC: GroupDefinition (kind + loopConfig) <-> crates/weft-core/src/project.rs GroupKind
 export interface GroupDefinition {
   id: string;
   /// `group` or `loop`. The visual editor renders a loop differently
-  /// (distinct color/glyph + carry-port double rendering) even
-  /// though both flatten through the same boundary-pair shape.
+  /// (distinct color/glyph + carry-port double rendering). A loop runs
+  /// through its two boundary nodes; every other kind has none.
   /// On the Rust side `kind` + `loopConfig` are ONE flattened tagged
   /// enum (GroupKind), so a loop always carries its config and a
   /// payload missing `kind` fails Rust deserialization.
@@ -792,6 +823,10 @@ export interface GroupDefinition {
   /// For a `call`: the id of the shared `body` group (the included
   /// file, compiled once) this site calls. Never for the others.
   body?: string;
+  /// For a `call` in a run's cut program: the places under the site that
+  /// run (`locatedKey`s relative to the site); every place when absent.
+  // SYNC: GroupDefinition.runs <-> crates/weft-core/src/project.rs GroupKind::Call.runs
+  runs?: string[];
   /// Always null today: no group-like decl carries a user label in the
   /// language; the editor derives the display name from the id's local
   /// segment. The slot exists so a future label syntax needs no wire
@@ -818,6 +853,19 @@ export interface GroupDefinition {
   /// Where each `portLiterals` entry was written, and in which form, so an
   /// edit rewrites the value where it already lives.
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
+  /// File-backed `portLiterals` entries, keyed by port: the same record a
+  /// node keeps for a `@file` / `@asset` field (`NodeDefinition.fileRefs`).
+  // SYNC: fileRefs <-> crates/weft-core/src/project.rs GroupDefinition.file_refs
+  fileRefs?: Record<string, FileRef>;
+  /// `[T: Media]` written after `Group`: bounds on the type variables its
+  /// ports use (a loop's sit on its two boundary nodes instead).
+  // SYNC: GroupDefinition.typeParams <-> crates/weft-core/src/project.rs GroupDefinition.type_params
+  typeParams?: TypeParamWire[];
+  /// Set only on a group inside an included file compiled for a build,
+  /// whose port types differ per place the file is included at, the way a
+  /// node's do (`NodeDefinition.placeTypes`). Carried as is.
+  // SYNC: GroupDefinition.placeTypes <-> crates/weft-core/src/project.rs GroupDefinition.place_types
+  placeTypes?: PlaceTypes[];
   /// The file the group's spans live in; absent = the compiled source.
   sourceFile?: string;
 }
@@ -830,6 +878,18 @@ export interface ProjectDefinition {
   nodes: NodeDefinition[];
   edges: Edge[];
   groups: GroupDefinition[];
+  /// Where a run of a cut is given what it does not compute (the values
+  /// are the run's own, never the program's). Absent in a program as
+  /// written, which is every program the editor parses.
+  given?: GivenPlaces;
+}
+
+/// See `ProjectDefinition.given`: per place (`locatedKey`), the input
+/// ports handed a value, and the places that stand in for their node.
+// SYNC: GivenPlaces <-> crates/weft-core/src/project.rs GivenPlaces
+export interface GivenPlaces {
+  inputs?: Record<string, string[]>;
+  outputs?: string[];
 }
 
 export type Severity = 'error' | 'warning' | 'info' | 'hint';
@@ -1097,6 +1157,7 @@ export type SkipReason =
   | { kind: 'watched_node_failed'; failure: Failure }
   | { kind: 'required_input_closed'; port: string; failure?: Failure }
   | { kind: 'nothing_joined'; failure?: Failure }
+  | { kind: 'every_input_closed'; failure?: Failure }
   | { kind: 'one_of_group_closed'; ports: string[]; failure?: Failure }
   | { kind: 'scope_skipped'; scope: string }
   | { kind: 'wait_skipped' };
@@ -1206,7 +1267,7 @@ export function frameText(frame: Frame): string {
 
 /// The key of one place of a run: a node under the call sites that
 /// reach it, `one/Clean.strip`, or the bare id at the top. What a run's
-/// scope, a seed's origins and a run selection are keyed by.
+/// scope and a seed's origins are keyed by.
 // SYNC: locatedKey <-> crates/weft-core/src/frames.rs Located
 export function locatedKey(id: string, callPath: readonly string[]): string {
   return callPath.length === 0 ? id : `${callPath.join('/')}/${id}`;
@@ -1345,6 +1406,9 @@ export interface InstanceInfraEntry {
 export interface Seed {
   parent: string;
   origins: Record<string, string>;
+  /// The places this run runs again that replay the answers their waits
+  /// got in `parent`.
+  answers?: string[];
 }
 
 import type { RunSpec, ResolveSpecResponse } from './run-spec';
@@ -1389,15 +1453,38 @@ export interface NodeFiringEvent {
   /// own firings.
   // SYNC: inheritedFrom <-> crates/weft-core/src/live_event.rs DispatcherEvent inherited_from
   inheritedFrom?: string;
-  /// Input ports whose value a person provided (a scoped run's
-  /// `--from node='{"port":value}'`), on `running`. The inspector paints
-  /// them as provided by hand.
-  // SYNC: providedPorts <-> crates/weft-core/src/live_event.rs DispatcherEvent provided_ports
-  providedPorts?: string[];
+  /// Input ports whose value the run was given rather than a node of it
+  /// making it: a value a person handed in (a scoped run's
+  /// `--from node='{"port":value}'`), or an output a node stood in with
+  /// (`--emit`, a baked infra value), on `running`. `inheritedPorts`
+  /// names the ports a seed's saved result sent, with the run that made
+  /// it.
   // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
-  backupPorts?: string[];
+  providedPorts?: string[];
   inheritedPorts?: Record<string, string>;
 }
+
+/// One copy of a scope (a group, an include's call site, an included
+/// file's body, a loop's iteration): the scope's id and the frames its
+/// direct members fire at. A body's copy ends with the call frame of the
+/// site that called it; a loop's with the iteration's.
+// SYNC: ScopeCopy <-> crates/weft-core/src/project/scopes.rs ScopeCopy
+export interface ScopeCopy {
+  scope: string;
+  frames: Frame[];
+}
+
+/// How a copy of a scope was decided: it opened, or it did not run and why.
+// SYNC: ScopeState <-> crates/weft-core/src/run/scope.rs ScopeState
+export type ScopeState = { state: 'open' } | { state: 'skipped'; reason: SkipReason };
+
+/// The engine decided one copy of a scope. A group is no node, so this
+/// is what the graph paints a group (and an include box) from, per copy;
+/// a copy inside one that did not run is decided skipped with it
+/// (`scope_skipped`, naming the outermost). `inheritedFrom` as on a
+/// firing.
+// SYNC: ScopeDecidedEvent <-> crates/weft-core/src/live_event.rs DispatcherEvent::ScopeDecided, extension-vscode/src/runFollower.ts DispatcherEvent
+export type ScopeDecidedEvent = ScopeCopy & ScopeState & { inheritedFrom?: string; atUnix: number };
 
 /// Live loop event surfaced through the dispatcher SSE stream. Mirrors
 /// the four `LoopInstantiated` / `LoopIterationLaunched` / `LoopOutFired`
@@ -1569,6 +1656,9 @@ export type CorruptionSite =
   | 'LoopIterationLaunched'
   | 'LoopOutFired'
   | 'LoopTerminated'
+  /// The run's birth gives values where its program says nothing is
+  /// given, or misses one it says.
+  | 'RunGiven'
   | 'UndecodableRow'
   /// Not one row: the whole run. The code it ran is no longer
   /// recorded, so no value can be worked out from the journal. Shown
@@ -2168,10 +2258,11 @@ export type HostMessage =
   /// The run tagged itself (`ctx.tag_run`). `tags` is one call's
   /// list; the webview accumulates the run's set.
   | { kind: 'runTags'; runId: string; tags: string[] }
-  /// The run's scope, off its birth row: the places it is held to
-  /// (`locatedKey`s; `null` = the whole graph), so every other node
-  /// paints as not in this run, and the run it was seeded from with
-  /// what it re-ran.
+  /// The run's scope, off its birth row: every place its program runs
+  /// (`locatedKey`s; a place that stands in for itself is not among
+  /// them; `null` when the run's program could not be read), so every
+  /// other node paints as not in this run, and the run it was seeded
+  /// from with what it re-ran.
   // SYNC: runScope <-> crates/weft-core/src/live_event.rs DispatcherEvent::RunStarted (subgraph, seed)
   | { kind: 'runScope'; runId: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
@@ -2199,6 +2290,8 @@ export type HostMessage =
   /// names a loaded node spells off the weft way.
   | { kind: 'catalogError'; error?: string; warnings?: CatalogWarning[] }
   | { kind: 'firingEvent'; event: NodeFiringEvent }
+  /// One copy of a scope decided (live or replay); see `ScopeDecidedEvent`.
+  | { kind: 'scopeDecided'; event: ScopeDecidedEvent }
   /// One metered call's cost record for a firing (a provider meter's
   /// figure). `costId` is the record's stable identity: the same record can
   /// arrive via both the replay and the live stream, so the reducer dedups

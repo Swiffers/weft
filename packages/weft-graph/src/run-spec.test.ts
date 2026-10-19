@@ -124,7 +124,7 @@ describe('run spec', () => {
   it('summarises a spec for a menu', () => {
     expect(specSummary({ name: 'plain' })).toBe('whole graph');
     expect(specSummary({ name: 'g', from: { a: { p: 1 } }, expected: { wires: [] } }))
-      .toBe('from a, 1 input backups, frozen');
+      .toBe('from a, 1 handed value, frozen');
     expect(isFrozen({ name: 'a', expected: { wires: [] } })).toBe(true);
   });
 

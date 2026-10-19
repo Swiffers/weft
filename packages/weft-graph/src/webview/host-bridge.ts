@@ -1,10 +1,12 @@
 // Bridge between the host parse and the graph editor.
 //
-// Responsibility: translate the Rust compiler's ProjectDefinition (flat
-// passthroughs + separate groups array, scoped ids) into the editor's
-// ProjectDefinition shape (groups folded back into `nodes` as
-// nodeType:"Group" NodeInstances with __inner handle routing). The Rust
-// parse is the single source of the graph; this only reshapes it for xyflow.
+// Responsibility: translate the Rust compiler's ProjectDefinition (nodes,
+// end-to-end wires naming the group ports they pass, a separate groups
+// array, scoped ids) into the editor's ProjectDefinition shape (groups
+// folded back into `nodes` as nodeType:"Group" NodeInstances, each wire
+// split back into the legs a person wrote, with __inner handle routing).
+// The Rust parse is the single source of the graph; this only reshapes it
+// for xyflow.
 
 import type {
   ProjectDefinition as HostProject,
@@ -13,6 +15,7 @@ import type {
   GroupDefinition as HostGroup,
   PortDefinition as HostPort,
   InputDefinition as HostInput,
+  FileRef,
 } from '../protocol';
 import type {
   ProjectDefinition as V1Project,
@@ -22,18 +25,19 @@ import type {
 } from './lib/types';
 import { instanceFilled, instanceFilledValue } from '../protocol';
 
-// THE TypeScript spelling of a group's boundary-node ids (the Rust
-// compiler mints these when it flattens a group). The two suffix
-// constants are the one definition; both directions (the builders
-// here and `parseBoundary` below) derive from them.
-// SYNC: BOUNDARY_IN, BOUNDARY_OUT <-> crates/weft-core/src/project.rs boundary_in_id, boundary_out_id
-const BOUNDARY_IN = '__in';
-const BOUNDARY_OUT = '__out';
-export function boundaryInId(groupId: string): string {
-  return `${groupId}${BOUNDARY_IN}`;
+// THE TypeScript spelling of a loop's boundary-node ids (the Rust
+// compiler mints a `LoopIn` and a `LoopOut` per loop, the only boundary
+// nodes it mints). The two suffix constants are the one definition; both
+// directions (the builders here and `parseLoopBoundary` below) derive
+// from them.
+// SYNC: LOOP_IN, LOOP_OUT <-> crates/weft-core/src/project.rs loop_in_id, loop_out_id
+const LOOP_IN = '__in';
+const LOOP_OUT = '__out';
+export function loopInId(loopId: string): string {
+  return `${loopId}${LOOP_IN}`;
 }
-export function boundaryOutId(groupId: string): string {
-  return `${groupId}${BOUNDARY_OUT}`;
+export function loopOutId(loopId: string): string {
+  return `${loopId}${LOOP_OUT}`;
 }
 
 /// A FRESH top-level copy of a wire port. The render shape IS the
@@ -48,56 +52,96 @@ function copyPort(p: HostPort | HostInput): V1Port {
   return { ...p };
 }
 
-function toV1Edge(e: HostEdge, groupIds: Set<string>): V1Edge {
-  // Rewrite boundary edges to v1's shape: endpoints collapse onto
-  // the group id + `__inner` suffix marks the internal side of a
-  // boundary port. Matches v1 parser:4543-4554.
-  let source = e.source;
-  let target = e.target;
-  let sourceHandle = e.sourceHandle ?? null;
-  let targetHandle = e.targetHandle ?? null;
+/// One end of a drawn wire: a node's port, or a container's port on one
+/// of its two faces. The editor spells the face a container's members see
+/// with the `__inner` suffix on the handle (`x__inner` is `self.x`), the
+/// face its surroundings see with the bare port name.
+type LegEnd = { node: string; handle: string | null };
 
-  const srcBound = parseBoundary(e.source, groupIds);
-  const tgtBound = parseBoundary(e.target, groupIds);
-
-  if (srcBound?.role === 'In') {
-    source = srcBound.groupId;
-    sourceHandle = sourceHandle ? `${sourceHandle}__inner` : sourceHandle;
-  } else if (srcBound?.role === 'Out') {
-    source = srcBound.groupId;
-  }
-  if (tgtBound?.role === 'Out') {
-    target = tgtBound.groupId;
-    targetHandle = targetHandle ? `${targetHandle}__inner` : targetHandle;
-  } else if (tgtBound?.role === 'In') {
-    target = tgtBound.groupId;
-  }
-
-  return {
-    id: e.id,
-    source,
-    target,
-    sourceHandle,
-    targetHandle,
-    ...(e.path && e.path.length > 0 ? { path: e.path } : {}),
-  };
+function innerHandle(port: string | null): string | null {
+  return port ? `${port}__inner` : port;
 }
 
-// The inverse of `boundaryInId`/`boundaryOutId`, derived from the same
-// suffix constants so the two directions cannot drift.
-function parseBoundary(
-  id: string,
-  groupIds: Set<string>,
-): { groupId: string; role: 'In' | 'Out' } | null {
-  if (id.endsWith(BOUNDARY_IN)) {
-    const gid = id.slice(0, -BOUNDARY_IN.length);
-    if (groupIds.has(gid)) return { groupId: gid, role: 'In' };
+/// A node end of a wire. A loop's `LoopIn`/`LoopOut` are nodes in the
+/// compiled program but draw as the loop's own two faces, so an end on
+/// one lands on the loop box.
+function nodeEnd(id: string, handle: string | null, side: 'source' | 'target', loopIds: Set<string>): LegEnd {
+  const bound = parseLoopBoundary(id, loopIds);
+  if (!bound) return { node: id, handle };
+  // What leaves a LoopIn and what lands on a LoopOut is the inside face;
+  // what lands on a LoopIn and leaves a LoopOut is the outside one.
+  const inside = (side === 'source') === (bound.role === 'In');
+  return { node: bound.loopId, handle: inside ? innerHandle(handle) : handle };
+}
+
+/// The inverse of `loopInId`/`loopOutId`, derived from the same suffix
+/// constants so the two directions cannot drift.
+function parseLoopBoundary(id: string, loopIds: Set<string>): { loopId: string; role: 'In' | 'Out' } | null {
+  if (id.endsWith(LOOP_IN)) {
+    const loopId = id.slice(0, -LOOP_IN.length);
+    if (loopIds.has(loopId)) return { loopId, role: 'In' };
   }
-  if (id.endsWith(BOUNDARY_OUT)) {
-    const gid = id.slice(0, -BOUNDARY_OUT.length);
-    if (groupIds.has(gid)) return { groupId: gid, role: 'Out' };
+  if (id.endsWith(LOOP_OUT)) {
+    const loopId = id.slice(0, -LOOP_OUT.length);
+    if (loopIds.has(loopId)) return { loopId, role: 'Out' };
   }
   return null;
+}
+
+/// The lines a person wrote for one compiled wire, as the editor draws
+/// them. The compiled wire runs end to end, from the node that makes the
+/// value to the node that reads it, naming every group port it passes
+/// (`via`); the editor draws one line per leg between two of those stops,
+/// because that is what the source says (`g.x = a.out` outside the group,
+/// `m.in = self.x` inside it) and what an edit rewrites.
+///
+/// Arriving at an input the leg lands on the group's outside face, and
+/// the next leg leaves from its inside face; an output is the other way
+/// round. A wire that starts at its source group's own port (a literal or
+/// nothing, sent when the group opens) has no leg before that port, and a
+/// wire that stops at its target group's own port (a port nobody on the
+/// far side reads) has none after it. Each leg keeps its own keys: a
+/// crossing holds the keys of the leg that ends there, and the last leg
+/// has what is left of the wire's path.
+export function legsOf(e: HostEdge, loopIds: Set<string>): V1Edge[] {
+  const via = e.via ?? [];
+  const legs: V1Edge[] = [];
+  const push = (from: LegEnd, to: LegEnd, path: readonly string[]) => {
+    legs.push({
+      id: `e-${from.node}-${from.handle ?? ''}-${to.node}-${to.handle ?? ''}`,
+      source: from.node,
+      target: to.node,
+      sourceHandle: from.handle,
+      targetHandle: to.handle,
+      ...(path.length > 0 ? { path: [...path] } : {}),
+    });
+  };
+  let from: LegEnd | null = via[0]?.group === e.source ? null : nodeEnd(e.source, e.sourceHandle ?? null, 'source', loopIds);
+  let consumed = 0;
+  for (const c of via) {
+    const path = c.path ?? [];
+    if (from) push(from, { node: c.group, handle: c.side === 'in' ? c.port : innerHandle(c.port) }, path);
+    consumed += path.length;
+    from = { node: c.group, handle: c.side === 'in' ? innerHandle(c.port) : c.port };
+  }
+  const endsAtGroupPort = via.length > 0 && via[via.length - 1].group === e.target;
+  if (from && !endsAtGroupPort) {
+    push(from, nodeEnd(e.target, e.targetHandle ?? null, 'target', loopIds), (e.path ?? []).slice(consumed));
+  }
+  return legs;
+}
+
+/// Every leg of every wire, each once: wires that fan out through one
+/// group port share the leg up to it (`g.x = a.out` feeds every member
+/// reading `self.x`), and the source has that line once.
+export function legsOfAll(edges: readonly HostEdge[], loopIds: Set<string>): V1Edge[] {
+  const byId = new Map<string, V1Edge>();
+  for (const e of edges) {
+    for (const leg of legsOf(e, loopIds)) {
+      if (!byId.has(leg.id)) byId.set(leg.id, leg);
+    }
+  }
+  return [...byId.values()];
 }
 
 function resolveParentGroup(node: HostNode, groupIds: Set<string>): string | undefined {
@@ -122,14 +166,36 @@ function displayName(id: string, parentId: string | undefined): string {
   return segments[segments.length - 1] || local;
 }
 
-/// `typeParams`: the bounds the group declares (`Group[T: Media]`), which
-/// the wire carries on its boundary nodes, not on the group.
-function groupToNodeInstance(g: HostGroup, typeParams: HostNode['typeParams']): NodeInstance {
+/** A node's or a group's port literals as the editor holds them. The Rust
+ *  parse resolves `@file` to the file's content, and enrich homes every
+ *  port's constant in `portLiterals`. The editor's invariant is that a
+ *  file-backed port literal holds the structural `@file` MARKER
+ *  ({path, type}), never resolved content, so it serializes safely and
+ *  renders file-backed. This puts the structural ref back from `fileRefs`;
+ *  the resolved content is shown separately via the host's fileContents
+ *  map. An `@instance_filled(@file(...))` field gets its ref back inside
+ *  the marker, as its fallback. Undefined when neither map is present. */
+function withFileMarkers(
+  literals: Record<string, unknown> | undefined,
+  fileRefs: Record<string, FileRef> | undefined,
+): Record<string, unknown> | undefined {
+  if (!literals && !fileRefs) return undefined;
+  const out = { ...(literals ?? {}) };
+  for (const [key, ref] of Object.entries(fileRefs ?? {})) {
+    const marker = { __weftFileRef: { path: ref.path, type: ref.type, marker: ref.marker } };
+    out[key] = instanceFilled(out[key]) ? instanceFilledValue(marker) : marker;
+  }
+  return out;
+}
+
+function groupToNodeInstance(g: HostGroup): NodeInstance {
   // `kind` is required on the wire; if it lands as anything other
-  // than the two known values, the host/webview view of the project
-  // has drifted (version skew, corruption). Silently treating an
-  // unknown kind as Group would render a Loop as a regular group and
-  // hide the divergence; surface it instead.
+  // than the two the editor draws, the host/webview view of the project
+  // has drifted (version skew, corruption, or a full-mode parse: the
+  // editor's parse keeps an `@include` as one opaque node, so a `call`
+  // site or a `body` never reaches it). Silently treating an unknown
+  // kind as Group would render a Loop as a regular group and hide the
+  // divergence; surface it instead.
   if (g.kind !== 'group' && g.kind !== 'loop') {
     throw new Error(`host-bridge: unknown container kind '${String(g.kind)}' for id '${g.id}'`);
   }
@@ -167,12 +233,12 @@ function groupToNodeInstance(g: HostGroup, typeParams: HostNode['typeParams']): 
     sourceLine: g.headerSpan?.startLine ?? g.span?.startLine,
     // A container's interface-port literals reach the view the same way a
     // node's do, so everything downstream reads one place for both.
-    portLiterals: g.portLiterals,
+    portLiterals: withFileMarkers(g.portLiterals, g.fileRefs),
     portLiteralSpans: g.portLiteralSpans,
     inputs: g.inPorts.map(copyPort),
     outputs: g.outPorts.map(copyPort),
     features: {},
-    ...(typeParams ? { typeParams } : {}),
+    ...(g.typeParams ? { typeParams: g.typeParams } : {}),
     scope: parentId ? [parentId] : [],
     // The included file's own group, which the editor opens by default.
     ...(g.anonymous ? { anonymous: true } : {}),
@@ -187,21 +253,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
   // the inline config form.
   const rawConfig = (n.config ?? {}) as Record<string, unknown>;
   const { label: _stripped, ...cleanConfig } = rawConfig;
-  // The Rust parse resolves `@file` to the file's content, and enrich
-  // homes every port's constant in `portLiterals`. The editor's invariant
-  // is that a file-backed port literal holds the structural `@file`
-  // MARKER ({path, type}), never resolved content, so it serializes
-  // safely and renders file-backed. Put the structural ref back from
-  // `fileRefs`; the resolved content is shown separately via the host's
-  // fileContents map. An `@instance_filled(@file(...))` field gets its ref
-  // back inside the marker, as its fallback.
-  const portLiterals = { ...((n.portLiterals as Record<string, unknown> | undefined) ?? {}) };
-  if (n.fileRefs) {
-    for (const [key, ref] of Object.entries(n.fileRefs)) {
-      const marker = { __weftFileRef: { path: ref.path, type: ref.type, marker: ref.marker } };
-      portLiterals[key] = instanceFilled(portLiterals[key]) ? instanceFilledValue(marker) : marker;
-    }
-  }
+  const portLiterals = withFileMarkers(n.portLiterals, n.fileRefs) ?? {};
   const parentId = resolveParentGroup(n, groupIds);
   // Mirror the structural parent into config.parentId, which is where the webview
   // reads it (see groupToNodeInstance for why). Without this a re-parse resets the
@@ -220,8 +272,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     portLiteralSpans: n.portLiteralSpans,
     position: n.position,
     parentId,
-    // The declaration line, for autoOrganize's left-to-right order (a
-    // boundary node carries its container's header line).
+    // The declaration line, for autoOrganize's left-to-right order.
     sourceLine: n.headerSpan?.startLine ?? n.span?.startLine,
     inputs: n.inputs.map(copyPort),
     outputs: n.outputs.map(copyPort),
@@ -241,23 +292,18 @@ export function translateProject(
   layoutCode: string,
 ): V1Project {
   const groupIds = new Set(host.groups.map((g) => g.id));
-  const passthroughIds = new Set<string>();
-  for (const gid of groupIds) {
-    passthroughIds.add(boundaryInId(gid));
-    passthroughIds.add(boundaryOutId(gid));
-  }
+  const loopIds = new Set(host.groups.filter((g) => g.kind === 'loop').map((g) => g.id));
   const structuralNodes: NodeInstance[] = [];
   // Groups first (v1 requires parent-before-child order).
   for (const g of host.groups) {
-    const boundaryIn = host.nodes.find((n) => n.id === boundaryInId(g.id));
-    structuralNodes.push(groupToNodeInstance(g, boundaryIn?.typeParams));
+    structuralNodes.push(groupToNodeInstance(g));
   }
   for (const n of host.nodes) {
-    if (passthroughIds.has(n.id)) continue;
+    // A loop's LoopIn / LoopOut draw as the loop box's two faces.
     if (n.groupBoundary) continue;
     structuralNodes.push(toV1Node(n, groupIds));
   }
-  const edges = host.edges.map((e) => toV1Edge(e, groupIds));
+  const edges = legsOfAll(host.edges, loopIds);
 
   // Position/size/expanded are NOT applied here. The Rust ProjectDefinition emits
   // position=(0,0) and carries no view-state; the companion `.layout` file owns it.

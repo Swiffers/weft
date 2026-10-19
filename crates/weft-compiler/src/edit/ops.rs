@@ -2285,9 +2285,8 @@ impl ContainerKind {
 /// Rename a container (Group or Loop). The two cases share the same
 /// mechanics: rewrite the header's leading IDENT token, then rewrite
 /// every endpoint that resolved to this decl (in any scope). The body
-/// and the lowered LoopIn/LoopOut / Passthrough boundary ids are
-/// reconstructed on the next re-flatten, so renaming the source-level
-/// label is sufficient.
+/// and a loop's lowered LoopIn/LoopOut ids are reconstructed on the next
+/// re-flatten, so renaming the source-level label is sufficient.
 ///
 /// `id` is the container's SCOPED id (e.g. `Outer.Inner`), the same
 /// scoped-id contract `MoveGroupScope` uses, so it is identified
@@ -2548,7 +2547,7 @@ fn check_scope_meaning(
                     None if suffix.starts_with('.') => {
                         if parent.is_empty() { suffix[1..].to_string() } else { format!("{parent}{suffix}") }
                     }
-                    None => continue, // the removed container's own boundary nodes
+                    None => continue, // a removed loop's own boundary nodes
                 }
             }
             _ => node.id.clone(),

@@ -140,7 +140,7 @@
     },
     "reserved-type": {
       "name": "keyword.control.weft",
-      "match": "\\b(Group|Loop|LoopIn|LoopOut|Passthrough|type)\\b"
+      "match": "\\b(Group|Loop|LoopIn|LoopOut|type)\\b"
     },
     "builtin-type": {
       "name": "support.type.weft",

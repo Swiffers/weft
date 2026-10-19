@@ -29,8 +29,8 @@ macro_rules! lost_run {
 }
 pub(crate) use lost_run;
 
-/// Let go of the runs whose owner went away ([`lost_run!`]): a durable
-/// run is queued again, a fast run ends
+/// Let go of the runs whose owner went away ([`lost_run!`]): a run asked
+/// to stop ends, else a durable run is queued again, a fast run ends
 /// (`crate::journal::Journal::let_go_of_lost`). Each run is taken under
 /// its own row lock, so a batch its old owner sends meanwhile and this
 /// sweep never write the run at once, and the epoch this raises refuses
@@ -45,8 +45,8 @@ pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) ->
     let mut failed = Vec::new();
     let mut after: Option<weft_core::RunId> = None;
     loop {
-        let lost: Vec<(weft_core::RunId, uuid::Uuid, String)> = sqlx::query_as(concat!(
-            "SELECT r.run_id, r.project_id, r.keeping FROM run r WHERE ",
+        let lost: Vec<(weft_core::RunId, uuid::Uuid, String, bool)> = sqlx::query_as(concat!(
+            "SELECT r.run_id, r.project_id, r.keeping, r.cancel_requested IS NOT NULL FROM run r WHERE ",
             lost_run!("$1"),
             " AND ($3::UUID IS NULL OR r.run_id > $3) ORDER BY r.run_id LIMIT $2"
         ))
@@ -57,7 +57,7 @@ pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) ->
         .await
         .context("find runs whose worker went away")?;
         let full = lost.len() as i64 == LOST_BATCH;
-        after = lost.last().map(|(run_id, _, _)| *run_id);
+        after = lost.last().map(|(run_id, _, _, _)| *run_id);
         let_go_of(state, lost, lapsed_before, &mut failed).await;
         if !full {
             return Ok(failed);
@@ -69,13 +69,14 @@ pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) ->
 /// `failed`.
 async fn let_go_of(
     state: &crate::state::DispatcherState,
-    lost: Vec<(weft_core::RunId, uuid::Uuid, String)>,
+    lost: Vec<(weft_core::RunId, uuid::Uuid, String, bool)>,
     lapsed_before: i64,
     failed: &mut Vec<crate::lapses::RepairFailed>,
 ) {
-    for (run_id, project_id, keeping) in lost {
-        // Only a fast run's ending folds its per-node cancels.
-        let program = match keeping == weft_core::run_settings::Keeping::Durable.as_str() {
+    for (run_id, project_id, keeping, cancelled) in lost {
+        // Only a run that ends here (a fast one, or one asked to stop)
+        // folds its per-node cancels.
+        let program = match keeping == weft_core::run_settings::Keeping::Durable.as_str() && !cancelled {
             true => Ok(None),
             false => crate::api::run::program_for_cancel(state, run_id).await,
         };

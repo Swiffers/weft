@@ -1,0 +1,90 @@
+{
+  "type": "RouteComputerCall",
+  "label": "Route computer call",
+  "description": "Send a model's tool call to the computer action it asks for. It recognizes the call by name in Anthropic's or OpenAI's style (what ComputerTools declares), puts its arguments, translated to the one shape the action nodes take, on that action's port, and closes every other port: wire each port into its action node, and only that node runs. A call that is no computer action comes out on `other`. Arguments a known action cannot use (a coordinate that is not two numbers, a scroll along both axes) fail this node with the tool and the field named; wire `_error` to hand that back to the model as the call's result.",
+  "tags": [
+    "computer",
+    "agent",
+    "tool",
+    "route"
+  ],
+  "icon": "Split",
+  "inputs": [
+    {
+      "name": "call",
+      "type": "ToolCall",
+      "required": true,
+      "description": "One call from an LLM node's `toolCalls` (a Loop over that list hands them over one at a time)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "screenshot",
+      "type": "Boolean",
+      "description": "A screenshot: true. Wire into Screenshot's `_should_flow`."
+    },
+    {
+      "name": "zoom",
+      "type": "ZoomArgs",
+      "description": "Into Zoom's `args`."
+    },
+    {
+      "name": "click",
+      "type": "ClickArgs",
+      "description": "Any click, double and triple clicks included: into Click's `args`."
+    },
+    {
+      "name": "drag",
+      "type": "DragArgs",
+      "description": "Into Drag's `args`."
+    },
+    {
+      "name": "move",
+      "type": "MoveArgs",
+      "description": "Into MoveMouse's `args`."
+    },
+    {
+      "name": "mouseButton",
+      "type": "MouseButtonArgs",
+      "description": "Into MouseButton's `args`."
+    },
+    {
+      "name": "cursor",
+      "type": "Boolean",
+      "description": "A question about where the mouse is: true. Wire into CursorPosition's `_should_flow`."
+    },
+    {
+      "name": "scroll",
+      "type": "ScrollArgs",
+      "description": "Into Scroll's `args`. OpenAI's scroll in pixels becomes wheel clicks of about 100 pixels each."
+    },
+    {
+      "name": "type",
+      "type": "TypeArgs",
+      "description": "Into TypeText's `args`."
+    },
+    {
+      "name": "key",
+      "type": "KeyArgs",
+      "description": "Any key press or hold, OpenAI's key names turned into xdotool's: into PressKey's `args`."
+    },
+    {
+      "name": "command",
+      "type": "CommandArgs",
+      "description": "The shell (`bash`): into RunCommand's `args`."
+    },
+    {
+      "name": "wait",
+      "type": "Number",
+      "description": "Seconds to wait (OpenAI's wait names none: 1). Into Wait's `seconds`."
+    },
+    {
+      "name": "other",
+      "type": "ToolCall",
+      "description": "The call itself, untouched, when its name is no computer action: route the program's own tools from here."
+    }
+  ],
+  "features": {
+    "pure": true
+  }
+}

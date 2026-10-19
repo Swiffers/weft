@@ -60,7 +60,24 @@ pub enum RunEvent {
         /// definition (a node self-test): a resume against such a
         /// run fails loudly as NotFound instead of resuming
         /// against a sentinel hash.
+        /// A run started with bounds runs a CUT of the program (the
+        /// smaller program its bounds walk, `weft_core::project::cut`),
+        /// stored like any program under its own hash: this names it.
         definition_hash: Option<String>,
+        /// The program `definition_hash` was cut from (the project's
+        /// program as registered), for a run of a cut: what its results
+        /// are held against when a seed reuses them, and what a setup's
+        /// trigger bakes are for. `None` for a run of the registered
+        /// program itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_from: Option<String>,
+        /// What the run is given at the places its program says
+        /// (`weft_core::project::Given`): the values handed to its starts
+        /// and what each stand-in sends. The run's own, never its
+        /// program's, so a resume finds them again here. Boxed: most runs
+        /// are given nothing.
+        #[serde(default, skip_serializing_if = "nothing_given")]
+        given: Box<weft_core::project::Given>,
         /// The worker binary the run executes on. With `definition_hash`
         /// it names the run's program identity
         /// (`weft_core::project::hash::ProgramIdentity`), whose per-node
@@ -77,17 +94,6 @@ pub enum RunEvent {
         /// the test task, so project sweeps never touch it).
         #[serde(default, skip_serializing_if = "weft_core::run::RunKind::is_project")]
         run_kind: weft_core::run::RunKind,
-        /// The node set this run is allowed to dispatch, or
-        /// `None` for the whole graph. A trigger fire records its
-        /// computed program here (the fired trigger's downstream plus
-        /// what that needs), so a pulse into another program's node is
-        /// absorbed and a resume rebuilds the same boundary. A targeted
-        /// manual run also records its selected nodes and dependencies,
-        /// and a setup phase its triggers or infra nodes. Written as its
-        /// digest: the record keeps each selection once
-        /// (`weft_core::project::selection::RecordedSelection`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selection: Option<weft_core::project::selection::RecordedSelection>,
         /// The run this one was seeded from and what it may not take
         /// from it (`weft run --seed`). `None` for a run that starts
         /// from nothing. Rows this run inherited never exist under its
@@ -136,7 +142,7 @@ pub enum RunEvent {
         /// payload, since nobody opened a socket. `None` for every other
         /// run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        stand_in: Option<SignalSpec>,
+        stand_in: Option<Box<SignalSpec>>,
         /// How the run is kept (`weft_core::run_settings`): how long it
         /// may run, fast or durable, recorded or not. Fixed here at birth
         /// from whatever started it: every drive of the run (its first
@@ -293,11 +299,6 @@ pub enum RunEvent {
         /// writing the row copies nothing (serde reads through the
         /// `Arc`).
         value: std::sync::Arc<Value>,
-        /// Authored `--emit` output, supplied without executing its source.
-        /// The fold fans it out through selected wires and marks receiving
-        /// ports as provided. Starting input backups live on RunSelection.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        provided: bool,
         at_unix: u64,
     },
 
@@ -313,8 +314,6 @@ pub enum RunEvent {
         node_id: String,
         frames: LoopFrames,
         port: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        provided: bool,
         at_unix: u64,
     },
 
@@ -758,12 +757,7 @@ pub fn redacted(event: &RunEvent, redaction: &weft_core::caller::Redaction) -> R
     }
     let mut value = serde_json::to_value(event)?;
     redaction.scrub(&mut value);
-    let selection = match event {
-        RunEvent::RunStarted { selection: Some(selection), .. } => std::slice::from_ref(selection),
-        _ => &[],
-    };
-    let mut clean: RunEvent =
-        weft_core::project::selection::RecordedSelection::resolving(selection, || serde_json::from_value(value))?;
+    let mut clean: RunEvent = serde_json::from_value(value)?;
     *clean.run_id_mut() = event.run_id();
     Ok(clean)
 }
@@ -947,15 +941,15 @@ impl RunEvent {
     /// row it queues with this (`weft_engine::journal_writer`), and
     /// writing each row out once more there, besides the write that sends
     /// it, would cost as much as the send. The parts of a fixed shape
-    /// that rarely grow (a signal's spec, a run's selection, a skip's
-    /// reason) count as their inline size.
+    /// that rarely grow (a signal's spec, a run's seed, a skip's reason)
+    /// count as their inline size.
     pub fn held_bytes(&self) -> usize {
         let frames = |frames: &LoopFrames| std::mem::size_of_val(frames.as_slice());
         let texts = |texts: &[String]| texts.iter().map(String::len).sum::<usize>();
         let behind = match self {
-            Self::RunStarted { entry_node, definition_hash, binary_hash, source_version, fired_trigger, .. } => {
+            Self::RunStarted { entry_node, definition_hash, binary_hash, cut_from, source_version, fired_trigger, .. } => {
                 entry_node.len()
-                    + [definition_hash, binary_hash, source_version, fired_trigger]
+                    + [definition_hash, binary_hash, cut_from, source_version, fired_trigger]
                         .into_iter()
                         .map(|text| text.as_ref().map_or(0, String::len))
                         .sum::<usize>()
@@ -1069,6 +1063,11 @@ fn no_instance_values(values: &weft_core::instance::InstanceValues) -> bool {
     values.is_empty()
 }
 
+#[allow(clippy::borrowed_box)]
+fn nothing_given(given: &Box<weft_core::project::Given>) -> bool {
+    given.is_empty()
+}
+
 #[cfg(test)]
 mod wire_tests {
     use super::*;
@@ -1101,7 +1100,6 @@ mod wire_tests {
             frames: Vec::new(),
             port: "out".into(),
             value: std::sync::Arc::new(value),
-            provided: false,
             at_unix: 0,
         };
         let empty = emitted(Value::Null).held_bytes();
@@ -1139,10 +1137,9 @@ mod wire_tests {
                 frames: frames.clone(),
                 port: "out".into(),
                 value: std::sync::Arc::new(json!({ "nested": { "deep": [1, 2, { "k": null }] } })),
-                provided: false,
                 at_unix: 1,
             },
-            RunEvent::PortClosed { run_id: run_id(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), provided: false, at_unix: 1 },
+            RunEvent::PortClosed { run_id: run_id(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), at_unix: 1 },
             RunEvent::LoopInstantiated { run_id: run_id(), group_id: "lp".into(), parent_frames: frames.clone(), at_unix: 1 },
             RunEvent::LoopIterationLaunched { run_id: run_id(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
             RunEvent::LoopOutFired { run_id: run_id(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, at_unix: 1 },
@@ -1203,7 +1200,7 @@ mod wire_tests {
         let old_scope = json!({ "kind": "scope_launched", "run_id": run_id(), "group_id": "g", "frames": [], "roots": [], "at_unix": 1 });
         assert!(serde_json::from_value::<RunEvent>(old_scope).is_err(), "boundaries are never journaled");
         let row = zstd::bulk::compress(format!("[{}]", old_started_text()).as_bytes(), 1).unwrap();
-        let err = crate::stored::decode(run_id(), None, &row).unwrap_err();
+        let err = crate::stored::decode(run_id(), &row).unwrap_err();
         assert!(err.contains("weft clean"), "{err}");
     }
 
@@ -1229,10 +1226,6 @@ mod wire_tests {
     #[test]
     fn every_row_round_trips() {
         use weft_core::bus::WirePayload;
-        let selection = weft_core::project::selection::RecordedSelection::new(weft_core::project::selection::RunSelection {
-            nodes: [Located::top("out"), Located::top("src")].into_iter().collect(),
-            ..Default::default()
-        });
         let spec = weft_core::signal::to_spec(weft_core::signal::Form {
             form_type: "human_query".into(),
             schema: weft_core::signal::FormSchema { fields: Vec::new() },
@@ -1247,9 +1240,15 @@ mod wire_tests {
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
-                binary_hash: Some("b".into()), source_version: Some("version".into()), run_kind: weft_core::run::RunKind::Project,
-                selection: Some(selection.clone()),
-                seed: Some(Seed { parent: run_id(), origins: BTreeMap::from([(Located::top("source"), run_id())]) }),
+                binary_hash: Some("b".into()), cut_from: Some("registered".into()), source_version: Some("version".into()), run_kind: weft_core::run::RunKind::Project,
+                given: Box::new(weft_core::project::Given {
+                    inputs: BTreeMap::from([(Located::top("mid"), BTreeMap::from([("value".to_string(), json!("by hand"))]))]),
+                    outputs: BTreeMap::from([(Located::top("src"), weft_core::project::StandIn {
+                        ports: BTreeMap::from([("out".to_string(), weft_core::project::GivenPort::Value { value: json!(1) })]),
+                        origin: weft_core::project::GivenOrigin::Inherited { run: run_id() },
+                    })]),
+                }),
+                seed: Some(Seed { parent: run_id(), origins: BTreeMap::from([(Located::top("source"), run_id())]), answers: [Located::top("ask")].into() }),
                 instance: Some(weft_core::instance::InstanceId::new("user-42").unwrap()),
                 stand_in: None, fired_trigger: Some("trigger".into()), instance_values: Default::default(), picks: Default::default(),
                 settings: weft_core::run_settings::RunSettings::new(
@@ -1265,8 +1264,8 @@ mod wire_tests {
                 entry_node: "node-test:MyNode::my_test".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,
-                binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::NodeTest,
-                selection: None,
+                binary_hash: None, cut_from: None, source_version: None, run_kind: weft_core::run::RunKind::NodeTest,
+                given: Default::default(),
                 seed: None,
                 instance: None, stand_in: None, fired_trigger: None, settings: Default::default(), instance_values: Default::default(), picks: Default::default(), at_unix: 7,
             },
@@ -1281,8 +1280,8 @@ mod wire_tests {
             RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
             RunEvent::NodeResumed { run_id: run_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
             RunEvent::NodeCancelled { run_id: run_id(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
-            RunEvent::PortEmitted { run_id: run_id(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), provided: true, at_unix: 1 },
-            RunEvent::PortClosed { run_id: run_id(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), provided: false, at_unix: 1 },
+            RunEvent::PortEmitted { run_id: run_id(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), at_unix: 1 },
+            RunEvent::PortClosed { run_id: run_id(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), at_unix: 1 },
             RunEvent::PulsesConsumed { run_id: run_id(), node_id: "n".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
             RunEvent::LoopInstantiated { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
             RunEvent::LoopIterationLaunched { run_id: run_id(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
@@ -1439,7 +1438,7 @@ mod wire_tests {
         assert_eq!(kinds.len(), 37, "a variant has no row above: {kinds:?}");
         for row in rows {
             let kind = row.kind_str();
-            let json = weft_core::project::selection::RecordedSelection::resolving(std::slice::from_ref(&selection), || round_trip(row));
+            let json = round_trip(row);
             assert_eq!(json["kind"], kind);
             assert!(json.get("run_id").is_none(), "the run is the row's, never the event's: {json}");
         }

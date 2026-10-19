@@ -262,7 +262,7 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 
 | Command | What it does |
 |---|---|
-| `weft describe-nodes --list` | One line per node type: its name, its tags, the first sentence of what it does. The cheap first look |
+| `weft describe-nodes --list` | One line per node type: its name, its tags, the first sentence of what it does. The cheap first look. After the types, every `.weft` file under `nodes/` a program can `@include`, spelled the way you write it (`__catalog/...`), with its first-line comment |
 | `weft describe-nodes --node <Type> --compact` | One node's wiring view: ports, types and rules, with the presentation stripped out. A long pick list shows its first eight entries and how many more there are; the plain `--node <Type>` has them all |
 | `weft parse` | Parses source from stdin and prints the project, the catalog and the diagnostics as JSON. Lenient: unknown types become placeholders |
 | `weft validate` | The same input, strict, including the runtime rules like a provider with no model named. Also warns about every node under `nodes/` or `src/` it had to leave out, and every name a node's `metadata.json` spells off the weft way; neither fails it |

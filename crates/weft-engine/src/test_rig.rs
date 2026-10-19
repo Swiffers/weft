@@ -176,6 +176,9 @@ impl LiveTestRunner {
             source_version: None,
             run_kind: weft_core::run::RunKind::NodeTest,
             cut_from: None,
+            // Nothing given: a node test runs no program, so there is no
+            // place to give a value at.
+            given: Default::default(),
             seed: None,
             // No picks: a node test runs no program, and its connections
             // are the ones the test itself hands the node, never the

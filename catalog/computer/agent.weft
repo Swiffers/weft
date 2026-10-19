@@ -1,0 +1,105 @@
+# A default agent: a model works a computer, turn after turn, until it answers without asking for an action.
+Group(task: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, agentId: String) -> (answer: String) {
+  # A model works a computer until it answers without asking for an action, for at most 100 turns. Each turn the model reads the conversation, every action it asked for runs on the computer, and the results go back into the conversation; the screenshots those actions took follow in one message. On the last turn the model is not allowed to call a tool, so it always answers, saying where the task stands if it could not finish. Its commands run in a shell session of its own, named after the run (and `agentId`, when set, for several agents in one run), ended when it answers (a run that fails or is stopped first leaves it up until an EndSession or Restart the shell). A command's output reaches the model cut to its start and end. Agents sharing one computer share its screen, so agents working at once each want a computer of their own.
+  start = ChatHistoryAppend { role: "user", text: self.task }
+
+  # The shell session this agent's commands run in: the run's id, plus `agentId` when it is set, so agents in one run each keep their own folder and variables. If you want the agent's shell to outlive the run (an agent you call again later to carry on), key it on `agentId` alone and drop `end` below: the folder and variables then carry from one call to the next.
+  run = GetRunId
+  session = FirstInOrder {
+    withAgent: Format(run: String, agent?: String) {
+      template: "{{run}}-{{agent}}"
+      run: run.runId
+      agent: self.agentId
+      _should_flow: self.agentId
+    }.text
+    runAlone: run.runId
+  }
+
+  turns = Loop(history: File, answer: String, computer: Infra, tools: List[JsonDict], model: LlmProvider, session: String) -> (history: File, answer: String) {
+    # One turn: the model answers or asks for actions, and each action runs on the computer
+    carry: ["history", "answer"]
+    # The last turn is index 99 (below, in `choice`): change the two together.
+    maxIters: 100
+
+    choice = Group(index: Number) -> (choice: String) {
+      # Tools are allowed on every turn but the last, where the model has to answer
+      which = Switch {
+        value: self.index
+        # 99 is the last index `maxIters: 100` gives: change the two together.
+        cases: [{ "kind": "gte", "value": 99, "port": "last" }, { "kind": "otherwise", "port": "earlier" }]
+      }
+      self.choice = FirstInOrder {
+        last: Text { value: "none", _should_flow: which.last }.value
+        earlier: Text { value: "auto", _should_flow: which.earlier }.value
+      }.value
+    }
+    choice.index = self.index
+
+    ask = LlmInference {
+      historyFile: self.history
+      provider: self.model
+      tools: self.tools
+      toolChoice: choice.choice
+      params: LlmParams { systemPrompt: @file("__catalog/base_catalog/computer/agent_prompt.md") }.params
+    }
+
+    calls = Loop(toolCalls: List[ToolCall], history: File, failed: Boolean, computer: Infra, session: String) -> (history: File, failed: Boolean, images: List[Image | Null], shots: List[Boolean | Null]) {
+      # Each action the model asked for this turn, in order. After one fails, the rest are answered without running, so the model sees the failure before it acts again.
+      over: ["toolCalls"]
+      carry: ["history", "failed"]
+
+      act = @include("__catalog/base_catalog/computer/perform.weft")
+      act.call = self.toolCalls
+      act.computer = self.computer
+      act.session = self.session
+      act._should_flow = Not { value: self.failed }.value
+
+      skipped = Text {
+        value: "Not executed: an earlier computer action in this turn failed."
+        _should_flow: self.failed
+      }
+      reply = ChatHistoryAppend {
+        role: "tool"
+        historyFile: self.history
+        toolCallId: self.toolCalls.id
+        text: FirstInOrder { done: act.result, skipped: skipped.value }.value
+      }
+      self.history = reply.historyFile
+      self.failed = All { failed: act.error }.yes
+      self.images = act.image
+      self.shots = All { shot: act.image }.yes
+    }
+    calls.toolCalls = ask.toolCalls
+    calls.history = ask.historyFile
+    calls.failed = false
+    calls.computer = self.computer
+    calls.session = self.session
+
+    anyShot = Switch {
+      value: calls.shots
+      cases: [{ "kind": "contains", "value": true, "port": "some" }]
+    }
+    look = ChatHistoryAppend {
+      role: "user"
+      text: "The screenshots the actions above took, in the order they took them."
+      media: calls.images
+      historyFile: calls.history
+      _should_flow: anyShot.some
+    }
+
+    self.history = FirstInOrder { looked: look.historyFile, acted: calls.history, answered: ask.historyFile }.value
+    self.answer = ask.response
+    self.done = All { _should_not_flow: ask.toolCalls, answered: ask.response }.yes
+  }
+  turns.history = start.historyFile
+  turns.answer = ""
+  turns.computer = self.computer
+  turns.tools = self.tools
+  turns.model = self.model
+  turns.session = session.value
+
+  # The work is done: whatever the agent's commands left running stops. This runs only once the agent answers: a run that fails or is stopped first leaves the session up, with what its commands left running, until an EndSession on it or Restart the shell on the computer's card.
+  end = EndSession { computer: self.computer, session: session.value, _should_flow: turns.answer }
+
+  self.answer = turns.answer
+}

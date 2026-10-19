@@ -94,6 +94,30 @@ test("an edit to a file main.weft includes, however deep, validates main.weft", 
   ])
 })
 
+test("an edit to a file main.weft includes through __catalog/ validates main.weft", async () => {
+  reset()
+  files.set("/workspace/project/weft.toml", "")
+  files.set("/workspace/project/src/main.weft", "one = @include(\"__catalog//my_pkg/./triage.weft\")\n")
+  files.set("/workspace/project/nodes/my_pkg/triage.weft", "two = @include(\"step.weft\")\n")
+  files.set("/workspace/project/nodes/my_pkg/step.weft", "leaf")
+
+  await run({}, { files: [{ filePath: "project/nodes/my_pkg/step.weft" }] })
+
+  assert.deepEqual(spawns.map(({ command }) => command.at(-1)), ["/workspace/project/src/main.weft"])
+})
+
+test("a __catalog/ path that climbs out of nodes/ leads nowhere, as the compiler refuses it", async () => {
+  reset()
+  files.set("/workspace/project/weft.toml", "")
+  files.set("/workspace/project/src/main.weft", "one = @include(\"__catalog/../src/lib/step.weft\")\ntwo = @include(\"__catalog/x/../../nodes/y.weft\")\n")
+  files.set("/workspace/project/nodes/y.weft", "leaf")
+  files.set("/workspace/project/src/lib/step.weft", "leaf")
+
+  await run({}, { files: [{ filePath: "project/src/lib/step.weft" }] })
+
+  assert.deepEqual(spawns.map(({ command }) => command.at(-1)), ["/workspace/project/src/lib/step.weft"])
+})
+
 test("reports stderr failures and keeps runtime findings out of edit feedback", async () => {
   reset()
   files.set("/workspace/project/weft.toml", "")

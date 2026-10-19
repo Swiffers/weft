@@ -20,8 +20,6 @@
 
 use async_trait::async_trait;
 
-use serde_json::Value;
-
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
@@ -46,7 +44,7 @@ impl Node for ChatHistoryAppendNode {
         let history_file: Option<FileHandle> = ctx.inputs.opt("historyFile")?;
         let role: String = ctx.inputs.get("role")?;
         let text: Option<String> = ctx.inputs.opt("text")?;
-        let media: Vec<Value> = ctx.inputs.list("media")?;
+        let media = chat::media_input(&ctx)?;
         let tool_call_id: Option<String> = ctx.inputs.opt("toolCallId")?;
         let cache_breakpoint: bool = ctx.inputs.get_or("cacheBreakpoint", false)?;
 

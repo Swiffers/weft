@@ -1,0 +1,32 @@
+{
+  "type": "Drag",
+  "label": "Drag",
+  "description": "Drag on the computer's screen: `args` is `{ path, button, modifiers }`. `path` is at least two points `{ x, y }` in screen pixels: the button goes down at the first, the mouse moves through the others, and the button comes up at the last. `button` is left (the default), right, middle, back or forward; `modifiers` are keys held throughout, joined by + (`shift`).",
+  "tags": [
+    "computer",
+    "mouse",
+    "drag"
+  ],
+  "icon": "Move",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "DragArgs",
+      "required": true,
+      "description": "The drag, in the shape the node's description gives. RouteComputerCall's `drag` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "What happened, in a sentence a model can read back as the tool's result."
+    }
+  ]
+}

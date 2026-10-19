@@ -158,8 +158,6 @@ fn unquote(s: &str) -> Option<String> {
     serde_json::from_str(s).ok()
 }
 
-/// Freeze scoped type names into their portable wire spelling before leaving
-/// the source scope. The source text and its edit spans remain untouched.
 /// Whether a written field is ONE file marker, recorded as file-backed (a
 /// node's field or a group's port alike): a marker at the top
 /// (`systemPrompt: @file(...)`), or the fallback of an
@@ -171,6 +169,8 @@ fn is_one_marker(value: &serde_json::Value) -> bool {
         || weft_core::instance::as_instance_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string())
 }
 
+/// Freeze scoped type names into their portable wire spelling before leaving
+/// the source scope. The source text and its edit spans remain untouched.
 pub(crate) fn resolve_marker_types(value: &mut serde_json::Value) {
     each_value_mut(value, &mut |leaf| {
         let Some(raw) = leaf.as_str() else { return };
@@ -487,7 +487,9 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
 /// resolution map) resolves against that one anchor and a ref only ever
 /// leaves the compiler in one spelling. It is normalized (`.` and a
 /// balancing `..` collapse); one that climbs above the root is refused,
-/// there being nothing above the root it could mean.
+/// there being nothing above the root it could mean. A path starting
+/// `__catalog/` names a file under the project's `nodes/` and is spelled
+/// as that (`nodes/...`), so no consumer has to know the prefix.
 ///
 /// A file outside the project is named where it sits, by an absolute
 /// path or one under `~` (expanded to the home directory here, so the
@@ -510,6 +512,10 @@ fn spell_from_root(mut file_ref: FileRef, home: Option<&std::path::Path>) -> Res
         home.join(under_home)
     } else if written.is_absolute() {
         written.to_path_buf()
+    } else if let Some(in_nodes) = crate::file_reader::catalog_path(written) {
+        // `__catalog/x` is `nodes/x`, spelled so here, before the
+        // normalization below could fold a `..` out of the prefix.
+        in_nodes.map_err(|why| format!("{}({:?}) {why}", file_ref.marker.directive(), file_ref.path))?
     } else {
         crate::file_reader::normalize_lexical(written).ok_or_else(|| {
             format!(

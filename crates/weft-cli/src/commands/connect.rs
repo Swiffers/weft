@@ -875,7 +875,8 @@ fn discover(
     }
     let mut out = Vec::new();
     let mut visited: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
-    collect_targets(&project.main_weft(), &root, &program, catalog, &mut out, others, &mut visited)?;
+    let entry = read_through_compiler(&root, &root.join(weft_compiler::project::SRC_DIR), weft_compiler::project::ENTRY_FILE, "the entry file")?;
+    collect_targets(entry, &root, &program, catalog, &mut out, others, &mut visited)?;
     Ok((out, program))
 }
 
@@ -884,7 +885,7 @@ fn discover(
 /// A file reached again is one file already collected, so nothing is
 /// added: its every name came from `program` the first time.
 fn collect_targets(
-    file: &std::path::Path,
+    file: weft_compiler::ResolvedFile,
     root: &std::path::Path,
     program: &weft_core::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
@@ -892,14 +893,10 @@ fn collect_targets(
     others: &mut Vec<OtherNode>,
     visited: &mut std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<()> {
-    let canonical = file
-        .canonicalize()
-        .with_context(|| format!("resolve {}", file.display()))?;
+    let weft_compiler::ResolvedFile { identity: canonical, content: source } = file;
     if !visited.insert(canonical.clone()) {
         return Ok(());
     }
-    let source = std::fs::read_to_string(&canonical)
-        .with_context(|| format!("read {}", canonical.display()))?;
     // The ids this parse hands out have to be the ones `program` keys
     // its places by, or `spellings_of` finds nothing. An included file's
     // nodes are keyed under the file's body id on both sides; the entry
@@ -986,9 +983,25 @@ fn collect_targets(
         });
     }
     for path in includes {
-        collect_targets(&base.join(&path), root, program, catalog, out, others, visited)?;
+        collect_targets(read_through_compiler(root, &base, &path, "@include")?, root, program, catalog, out, others, visited)?;
     }
     Ok(())
+}
+
+/// Read the file a program names from `base`, through the compiler's own
+/// resolution, so the walk reaches exactly the file the build includes
+/// (a `__catalog/` path included) and refuses what the build refuses.
+/// `what` names the file in a refusal (`@include`, the entry file).
+fn read_through_compiler(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    path: &str,
+    what: &str,
+) -> Result<weft_compiler::ResolvedFile> {
+    use weft_compiler::FileReader as _;
+    weft_compiler::DiskFileReader
+        .resolve_and_read(root, base, std::path::Path::new(path))
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))
 }
 
 /// Parse a picker config value into the handle it must be.

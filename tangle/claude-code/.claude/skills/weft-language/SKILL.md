@@ -1252,6 +1252,15 @@ reads), wire that work's result to the edge, into a carry, a gather or
 | `@asset("x.png", Image)` | a file's contents as a value | no |
 | `@asset("x.txt", String)` | a text file's contents inline | no |
 
+An `@include` path is measured from the file that writes it, and an `@file`
+or `@asset` path from the project root. If you want a file that sits under
+`nodes/` (an include file a package ships beside its nodes, or a prompt that
+file reads), start the path with `__catalog/` and it is measured from
+`nodes/` instead: `@include("__catalog/my_pkg/triage.weft")` reads
+`nodes/my_pkg/triage.weft`, and that file reaches the prompt beside it with
+`@file("__catalog/my_pkg/triage.md")`. A `__catalog/` path that climbs out of
+`nodes/` is refused.
+
 A stored file travels a wire as a small reference (its key, name, mime type
 and size), never as bytes. Inside the node that receives it the reference
 also carries a `url`, a download link minted for that one firing; the link

@@ -74,6 +74,7 @@ def project_root(start: str):
 
 
 INCLUDE = re.compile(r'@include\(\s*"([^"]+)"\s*\)')
+CATALOG_PREFIX = "__catalog/"
 
 
 def entry_for(root: str, path: str) -> str:
@@ -83,7 +84,8 @@ def entry_for(root: str, path: str) -> str:
     checked alone misses what its includer wires into it, and reports
     false errors such as an unmet required port); `path` itself when
     nothing includes it. An `@include` path is relative to the file that
-    writes it."""
+    writes it, except one starting `__catalog/`, which is measured from the
+    project's `nodes/` wherever it is written."""
     entry = os.path.join(root, "src", "main.weft")
     if not os.path.isfile(entry):
         return path
@@ -106,7 +108,25 @@ def entry_for(root: str, path: str) -> str:
             if line.lstrip().startswith("#"):
                 continue
             for rel in INCLUDE.findall(line):
-                stack.append(os.path.realpath(os.path.join(os.path.dirname(cur), rel)))
+                if rel.startswith(CATALOG_PREFIX):
+                    # The rest is normalized on its own, the way the
+                    # compiler reads it: any `..` that climbs out of
+                    # `nodes/` (even one that comes back in) is refused
+                    # there, so it leads nowhere here.
+                    parts = []
+                    for part in rel[len(CATALOG_PREFIX):].split("/"):
+                        if part in ("", "."):
+                            continue
+                        if part == "..":
+                            if not parts:
+                                break
+                            parts.pop()
+                            continue
+                        parts.append(part)
+                    else:
+                        stack.append(os.path.realpath(os.path.join(root, "nodes", *parts)))
+                else:
+                    stack.append(os.path.realpath(os.path.join(os.path.dirname(cur), rel)))
     return path
 
 

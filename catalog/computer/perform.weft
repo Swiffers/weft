@@ -1,0 +1,109 @@
+# Do one tool call from a model on a computer, and give back what the model reads as its result.
+Group(call: ToolCall, computer: Infra, session: String) -> (result: String, image: Image, error: String) {
+  # Do one tool call on a computer. `session` is the shell session its commands run in (left out, the computer's default one). `result` is what the model reads back: the action's result, or why it failed, a command's output cut to its start and end. `image` is the screenshot or zoom the action took, closed when it took none. `error` carries the failure, closed when the action worked.
+  route = RouteComputerCall { call: self.call }
+
+  screen = Group(computer: Infra, shot: Boolean, zoom: ZoomArgs, cursor: Boolean) -> (result: String, image: Image, error: String) {
+    # Look at the screen: a screenshot, an enlarged region, or where the mouse is
+    shot = Screenshot { computer: self.computer, _should_flow: self.shot }
+    zoom = Zoom { computer: self.computer, args: self.zoom }
+    cursor = CursorPosition { computer: self.computer, _should_flow: self.cursor }
+    self.result = FirstInOrder {
+      shot: shot.result
+      zoom: zoom.result
+      cursor: cursor.result
+      shotFailed: shot._error
+      zoomFailed: zoom._error
+      cursorFailed: cursor._error
+    }.value
+    self.image = FirstInOrder { shot: shot.image, zoom: zoom.image }.value
+    self.error = FirstInOrder { shot: shot._error, zoom: zoom._error, cursor: cursor._error }.value
+  }
+  screen.computer = self.computer
+  screen.shot = route.screenshot
+  screen.zoom = route.zoom
+  screen.cursor = route.cursor
+
+  mouse = Group(computer: Infra, click: ClickArgs, drag: DragArgs, move: MoveArgs, button: MouseButtonArgs, scroll: ScrollArgs) -> (result: String, error: String) {
+    # Work the mouse: click, drag, move, press or release a button, scroll
+    click = Click { computer: self.computer, args: self.click }
+    drag = Drag { computer: self.computer, args: self.drag }
+    move = MoveMouse { computer: self.computer, args: self.move }
+    button = MouseButton { computer: self.computer, args: self.button }
+    scroll = Scroll { computer: self.computer, args: self.scroll }
+    self.result = FirstInOrder {
+      click: click.result
+      drag: drag.result
+      move: move.result
+      button: button.result
+      scroll: scroll.result
+      clickFailed: click._error
+      dragFailed: drag._error
+      moveFailed: move._error
+      buttonFailed: button._error
+      scrollFailed: scroll._error
+    }.value
+    self.error = FirstInOrder {
+      click: click._error
+      drag: drag._error
+      move: move._error
+      button: button._error
+      scroll: scroll._error
+    }.value
+  }
+  mouse.computer = self.computer
+  mouse.click = route.click
+  mouse.drag = route.drag
+  mouse.move = route.move
+  mouse.button = route.mouseButton
+  mouse.scroll = route.scroll
+
+  keyboard = Group(computer: Infra, text: TypeArgs, keys: KeyArgs) -> (result: String, error: String) {
+    # Work the keyboard: type text, press keys
+    text = TypeText { computer: self.computer, args: self.text }
+    keys = PressKey { computer: self.computer, args: self.keys }
+    self.result = FirstInOrder { text: text.result, keys: keys.result, textFailed: text._error, keysFailed: keys._error }.value
+    self.error = FirstInOrder { text: text._error, keys: keys._error }.value
+  }
+  keyboard.computer = self.computer
+  keyboard.text = route.type
+  keyboard.keys = route.key
+
+  shell = RunCommand(session?: String) { computer: self.computer, args: route.command, session: self.session }
+  # What the model reads of a command: the start and end of its output, then its exit code.
+  preview = TextPreview { file: shell.output }
+  said = Format(preview: String, code: Number) {
+    template: "{{preview}}\n(exit code {{code}})"
+    preview: preview.preview
+    code: shell.exitCode
+  }
+  pause = Wait { seconds: route.wait }
+  unknown = Format(name: String) {
+    template: "There is no computer action called {{name}}."
+    name: route.other.name
+  }
+
+  self.result = FirstInOrder {
+    screen: screen.result
+    mouse: mouse.result
+    keyboard: keyboard.result
+    shell: said.text
+    shellFailed: shell._error
+    previewFailed: preview._error
+    pause: pause.wokeAt
+    pauseFailed: pause._error
+    unknown: unknown.text
+    unreadable: route._error
+  }.value
+  self.image = screen.image
+  self.error = FirstInOrder {
+    screen: screen.error
+    mouse: mouse.error
+    keyboard: keyboard.error
+    shell: shell._error
+    preview: preview._error
+    pause: pause._error
+    unknown: unknown.text
+    unreadable: route._error
+  }.value
+}

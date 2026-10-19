@@ -27,8 +27,8 @@
     },
     {
       "name": "media",
-      "type": "Media | List[Media]",
-      "description": "One stored image, audio clip, or video attached to this prompt, or a list of them."
+      "type": "Media | List[Media | Null]",
+      "description": "One stored image, audio clip, or video attached to this prompt, or a list of them (a null in the list is no media, so a loop's gathered list goes in as it comes)."
     },
     {
       "name": "provider",

@@ -10,7 +10,8 @@
 
 use serde_json::Value;
 
-// SYNC: the /action envelope <-> catalog/postgres/database/images/credential/bootstrap.py, catalog/bailey/bridge/images/bridge/src/actions.js
+// SYNC: the /action envelope <-> catalog/postgres/database/images/credential/bootstrap.py, catalog/bailey/bridge/images/bridge/src/actions.js,
+//       catalog/computer/computer/images/computer/computer.py
 /// The path every infra action is posted to.
 pub const ACTION_PATH: &str = "/action";
 

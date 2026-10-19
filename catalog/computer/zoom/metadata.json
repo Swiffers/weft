@@ -1,0 +1,38 @@
+{
+  "type": "Zoom",
+  "label": "Zoom",
+  "description": "Capture one region of the computer's screen, enlarged to the screen's size with its proportions kept, so small text can be read. `args` is `{ region }`, the region as `[x0, y0, x1, y1]` in screen pixels, top left to bottom right.",
+  "tags": [
+    "computer",
+    "screen",
+    "zoom",
+    "image"
+  ],
+  "icon": "ZoomIn",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "ZoomArgs",
+      "required": true,
+      "description": "The region, in the shape the node's description gives. RouteComputerCall's `zoom` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "A sentence a model can read back as the tool's result."
+    },
+    {
+      "name": "image",
+      "type": "Image",
+      "description": "The enlarged region, a PNG kept past the run."
+    }
+  ]
+}

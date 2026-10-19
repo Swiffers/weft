@@ -1,0 +1,31 @@
+{
+  "type": "EndSession",
+  "label": "End session",
+  "description": "End one of the computer's shell sessions: stop the command it runs, if any, and whatever its commands left running in the background (a server started with `&`), and forget its folder and exported variables, so the name starts over in the home folder the next time a command uses it. A session that does not exist is fine: there is nothing to end. The default agent (`__catalog/base_catalog/computer/agent.weft`) ends its own session when it answers; a run that fails or is stopped first leaves the session up until an EndSession on it, or Restart the shell on the computer's card, which ends every session.",
+  "tags": [
+    "computer",
+    "shell",
+    "session"
+  ],
+  "icon": "SquareX",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "session",
+      "type": "String",
+      "description": "The session to end, as RunCommand names it. Left out, the computer's default session."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "ended",
+      "type": "Boolean",
+      "description": "True when there was such a session to end, false when there was none."
+    }
+  ]
+}

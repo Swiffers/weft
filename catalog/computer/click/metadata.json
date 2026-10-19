@@ -1,0 +1,32 @@
+{
+  "type": "Click",
+  "label": "Click",
+  "description": "Click on the computer's screen: `args` is `{ x, y, button, count, modifiers }`, all optional. `x` and `y` are pixels of the screen (a screenshot's pixels); left out, the click lands where the mouse is. `button` is left (the default), right, middle, back or forward; `count` is 1 (the default), 2 for a double click or 3 for a triple click; `modifiers` are keys held during the click, joined by + (`ctrl+shift`).",
+  "tags": [
+    "computer",
+    "mouse",
+    "click"
+  ],
+  "icon": "MousePointerClick",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "ClickArgs",
+      "required": true,
+      "description": "The click, in the shape the node's description gives. RouteComputerCall's `click` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "What happened, in a sentence a model can read back as the tool's result."
+    }
+  ]
+}

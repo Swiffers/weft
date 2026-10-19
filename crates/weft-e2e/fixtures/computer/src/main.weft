@@ -1,0 +1,29 @@
+# A computer worked by hand, one action after the other: a screenshot, a
+# click on its terminal, text typed into it, and a command in its shell
+# that reads what the typing did. The test swaps this program for the
+# perform and agent ones once the computer is up.
+
+box = Computer
+
+look = Screenshot { computer: box.computer }
+
+focus = Click {
+  computer: box.computer
+  args: { "x": 300, "y": 200 }
+  _should_flow: look.result
+}
+
+typing = TypeText {
+  computer: box.computer
+  args: { "text": "echo typed > /tmp/typed.txt\n" }
+  _should_flow: focus.result
+}
+
+check = RunCommand {
+  computer: box.computer
+  args: { "command": "sleep 1; cat /tmp/typed.txt; echo hi" }
+  _should_flow: typing.result
+}
+
+shot = Debug { data: look.image }
+said = Debug { data: check.output }

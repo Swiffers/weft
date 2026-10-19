@@ -38,8 +38,8 @@
     },
     {
       "name": "media",
-      "type": "Media | List[Media]",
-      "description": "Media attached to this message: one stored image, audio clip, or video, or a list of them."
+      "type": "Media | List[Media | Null]",
+      "description": "Media attached to this message: one stored image, audio clip, or video, or a list of them (a null in the list is no media, so a loop's gathered list goes in as it comes)."
     },
     {
       "name": "toolCallId",

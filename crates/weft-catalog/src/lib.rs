@@ -89,6 +89,149 @@ pub fn is_python_cache(name: &str) -> bool {
     name == "__pycache__" || name.ends_with(".pyc")
 }
 
+/// True if an entry of this name is left out of what a node PACKAGE is
+/// built from: everything [`is_node_tree_excluded`] leaves out, plus a
+/// `.weft` file. A `.weft` file in a package is a program a project
+/// may `@include` (`__catalog/<package>/x.weft`), read by the compiler
+/// into the program's definition and never by cargo, so editing one
+/// must not recompile the package, rebuild a worker image or rerun the
+/// package's node tests. It stays part of the node tree everywhere
+/// else: seeded into a project, published in a version, listed by
+/// `include_files`. The staging copy and the package hash both ask
+/// this, so they agree on a package's bytes.
+pub fn is_left_out_of_package_build(name: &str) -> bool {
+    is_node_tree_excluded(name) || name.ends_with(".weft")
+}
+
+/// The module a node's code compiles into inside its package's crate:
+/// the node type in snake_case (`RunCommand` is `run_command`). Rules:
+/// lowercase the first char; insert `_` before every later uppercase.
+pub fn node_module_name(node_type: &str) -> String {
+    let mut out = String::with_capacity(node_type.len() + 4);
+    for (i, ch) in node_type.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The first thing in a package that cannot be a module of its crate,
+/// as the file to blame and why: a member or a shared file whose module
+/// name Rust refuses, two members whose types make one module, or a
+/// shared file named like a member's module (`computer.rs` beside the
+/// node `Computer`).
+fn module_problem(shared_rs: &[PathBuf], members: &[CatalogEntry]) -> Option<(PathBuf, String)> {
+    let mut taken: BTreeMap<String, String> = BTreeMap::new();
+    for member in members {
+        let metadata = member.source_dir.join("metadata.json");
+        let module = node_module_name(&member.node_type);
+        if !weft_core::is_rust_module_name(&module) {
+            return Some((
+                metadata,
+                format!(
+                    "the node {} would compile into module `{module}`, which Rust cannot take as a module name (a keyword, `_`, or not [A-Za-z_][A-Za-z0-9_]*); rename the type",
+                    member.node_type
+                ),
+            ));
+        }
+        if let Some(other) = taken.insert(module.clone(), member.node_type.clone()) {
+            return Some((
+                metadata,
+                format!("the nodes {other} and {} both compile into module `{module}`; rename one", member.node_type),
+            ));
+        }
+    }
+    shared_rs.iter().find_map(|path| {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        if !weft_core::is_rust_module_name(stem) {
+            return Some((
+                path.clone(),
+                format!(
+                    "this shared file would become module `{stem}`, which Rust cannot take as a module name (a keyword, `_`, or not [A-Za-z_][A-Za-z0-9_]*); rename the file"
+                ),
+            ));
+        }
+        let member = taken.get(stem)?;
+        Some((
+            path.clone(),
+            format!("this shared file would become module `{stem}`, which is also the module of the node {member}; rename the file"),
+        ))
+    })
+}
+
+/// One `.weft` file under a node root, for the listing of what a
+/// program can `@include` from there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeFile {
+    /// Its path under the root, `/`-separated (`computer/agent.weft`).
+    pub path: String,
+    /// The text of its first line when that line is a `#` comment,
+    /// trimmed; `None` when it is not one, or says nothing.
+    pub description: Option<String>,
+}
+
+/// Every `.weft` file under `root`, by its path under it, sorted, each
+/// with the description its first line gives. The walk is the node
+/// tree's (`read_node_dir`: symlinks followed with a loop guard,
+/// excluded names skipped), so a file in a folder the catalog never
+/// reads is never listed. A missing `root` holds none.
+pub fn include_files(root: &Path) -> Result<Vec<IncludeFile>, CatalogError> {
+    let mut out = Vec::new();
+    if root.is_dir() {
+        collect_include_files(root, root, &mut Vec::new(), &mut out)?;
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn collect_include_files(
+    root: &Path,
+    dir: &Path,
+    chain: &mut Vec<PathBuf>,
+    out: &mut Vec<IncludeFile>,
+) -> Result<(), CatalogError> {
+    let canon = guard_node_tree_cycle(dir, chain).map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
+    chain.push(canon);
+    for entry in read_node_dir(dir)? {
+        match entry {
+            NodeDirEntry::Dir(path) => collect_include_files(root, &path, chain, out)?,
+            NodeDirEntry::File(path) if path.extension().is_some_and(|e| e == "weft") => {
+                let first = first_line(&path).map_err(|error| CatalogError::Io { path: path.clone(), error })?;
+                let relative = path.strip_prefix(root).expect("the walk stays under its root");
+                out.push(IncludeFile {
+                    path: relative.to_string_lossy().replace('\\', "/"),
+                    description: first_line_comment(&first),
+                });
+            }
+            NodeDirEntry::File(_) => {}
+        }
+    }
+    chain.pop();
+    Ok(())
+}
+
+/// The first line of the file at `path`, read alone (the listing needs no
+/// more) and decoded leniently: a file that is not UTF-8 is no program
+/// either, but its line still lists it.
+fn first_line(path: &Path) -> std::io::Result<String> {
+    use std::io::BufRead;
+    let mut line = Vec::new();
+    std::io::BufReader::new(fs::File::open(path)?).read_until(b'\n', &mut line)?;
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// The text of a first line when that line is a `#` comment.
+fn first_line_comment(source: &str) -> Option<String> {
+    let comment = source.lines().next()?.trim_start().strip_prefix('#')?.trim();
+    (!comment.is_empty()).then(|| comment.to_string())
+}
+
 /// What one node-tree entry is, symlinks resolved: a symlinked
 /// directory walks as a directory, a symlinked file reads as a file.
 /// The shared traversal mechanic of every node-tree walk (discovery,
@@ -904,6 +1047,25 @@ impl DiscoverCtx<'_> {
         }
         for (node_type, error) in type_clashes {
             self.record(vec![node_type], error);
+        }
+
+        // A package compiles as one crate whose root holds a module per
+        // shared file and per member, so one that cannot be such a module
+        // (a name Rust refuses, two of one name) cannot build. Refused
+        // here, for every program, rather than by rustc in the build of
+        // whichever program happens to use the package. Its entries are
+        // withdrawn after every collision was judged with them, and its
+        // name stays claimed, the way a package whose members all broke
+        // keeps its name.
+        for unit in &mut units_ok {
+            if let Some((path, error)) = module_problem(&unit.shared_rs, &unit.entries) {
+                let error = CatalogError::Parse { path, error };
+                for entry in &unit.entries {
+                    withdraw(&mut withdrawn, entry, &error);
+                }
+                let node_types = unit.entries.drain(..).map(|e| e.node_type).collect();
+                self.record(node_types, error);
+            }
         }
 
         // Services, over what is left.
@@ -1938,6 +2100,52 @@ mod package_tests {
         assert_eq!(cat.warnings().len(), 3, "nothing else complained: {:?}", cat.warnings());
     }
 
+    /// A shared file named like a member's module (`not.rs` beside the
+    /// node `Not`, which compiles into module `not`) would be two modules
+    /// of one name in the package's crate: the whole package is refused
+    /// at load, naming the file, whatever program uses it.
+    #[test]
+    fn a_shared_file_named_like_a_member_module_refuses_the_package() {
+        let root = tempfile::tempdir().expect("temp root");
+        copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &root.path().join("logic"));
+        fs::write(root.path().join("logic/not.rs"), "pub fn helper() {}\n").expect("write");
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.lookup("Not").is_none() && cat.lookup("FirstInOrder").is_none(), "the whole package is out");
+        let problem = cat.problems().iter().find(|p| p.node_types.contains(&"Not".to_string())).expect("a problem");
+        let said = problem.error.to_string();
+        assert!(said.contains("not.rs") && said.contains("module `not`") && said.contains("rename the file"), "{said}");
+
+        // A shared file whose name is no Rust module name is refused the same way.
+        let root = tempfile::tempdir().expect("temp root");
+        copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &root.path().join("logic"));
+        fs::write(root.path().join("logic/my-helper.rs"), "pub fn helper() {}\n").expect("write");
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.lookup("Not").is_none(), "the whole package is out");
+        let said = cat.problems().iter().map(|p| p.error.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(said.contains("my-helper.rs") && said.contains("cannot take as a module name"), "{said}");
+    }
+
+    /// Two members whose types compile into one module (`NOt` and
+    /// `N_ot` are both `n_ot`) refuse the package the same way.
+    #[test]
+    fn two_members_of_one_module_refuse_the_package() {
+        let root = tempfile::tempdir().expect("temp root");
+        let logic = root.path().join("logic");
+        copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &logic);
+        for (folder, node_type) in [("n_ot_one", "NOt"), ("n_ot_two", "N_ot")] {
+            copy_dir(&logic.join("not"), &logic.join(folder));
+            let meta = fs::read_to_string(logic.join(folder).join("metadata.json")).expect("read");
+            fs::write(logic.join(folder).join("metadata.json"), meta.replacen("\"type\": \"Not\"", &format!("\"type\": \"{node_type}\""), 1))
+                .expect("write");
+        }
+
+        let cat = FsCatalog::discover(root.path()).expect("catalog");
+        assert!(cat.lookup("FirstInOrder").is_none(), "the whole package is out");
+        let said = cat.problems().iter().map(|p| p.error.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(said.contains("both compile into module `n_ot`"), "{said}");
+    }
+
     /// A `package.toml` written before any node folder (the real case
     /// that once broke every node) is a package being started: left
     /// out with one line, no problem, and every other node loads.
@@ -1955,6 +2163,83 @@ mod package_tests {
         assert!(!cat.packages().any(|p| p.name == "fresh"));
         assert_eq!(cat.warnings().len(), 1, "{:?}", cat.warnings());
         assert!(cat.warnings()[0].message.contains("has no node in it yet"), "{:?}", cat.warnings());
+    }
+
+    /// A `.weft` file (and a prompt beside it) shipped in a package, in a
+    /// member folder, or in a folder of its own is a program a project
+    /// may include, never a node: the catalog loads exactly what it
+    /// loads without them, and nothing parses them (a broken one changes
+    /// nothing).
+    #[test]
+    fn weft_files_in_a_node_tree_are_never_read_as_nodes() {
+        let with = tempfile::tempdir().expect("temp root");
+        let without = tempfile::tempdir().expect("temp root");
+        for root in [with.path(), without.path()] {
+            copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &root.join("logic"));
+        }
+        fs::write(with.path().join("logic/flow.weft"), "# A flow.\nthis is { not weft\n").expect("write");
+        fs::write(with.path().join("logic/flow_prompt.md"), "Be brief.\n").expect("write");
+        fs::write(with.path().join("logic/not/inside.weft"), "Group {\n").expect("write");
+        fs::create_dir_all(with.path().join("flows")).expect("mkdir");
+        fs::write(with.path().join("flows/only.weft"), "Group {}\n").expect("write");
+
+        let loaded = FsCatalog::discover(with.path()).expect("catalog");
+        let plain = FsCatalog::discover(without.path()).expect("catalog");
+        assert!(loaded.problems().is_empty(), "{:?}", loaded.problems());
+        assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
+        let types = |cat: &FsCatalog| cat.iter().map(|e| e.node_type.clone()).collect::<BTreeSet<_>>();
+        assert_eq!(types(&loaded), types(&plain));
+        assert!(loaded.lookup("FirstInOrder").is_some());
+    }
+
+    /// The listing of what a program can include: every `.weft` file
+    /// under the root by its path, sorted, described by its first line
+    /// when that line is a comment; a folder no node tree holds is not
+    /// walked, and a missing root lists nothing.
+    #[test]
+    fn include_files_are_listed_with_their_first_line_comment() {
+        let root = tempfile::tempdir().expect("temp root");
+        let at = |rel: &str, body: &str| {
+            let path = root.path().join(rel);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            fs::write(path, body).expect("write");
+        };
+        at("base_catalog/computer/agent.weft", "#  Run an agent on a computer.  \nGroup {}\n");
+        at("base_catalog/computer/perform.weft", "Group {}\n# not the first line\n");
+        at("base_catalog/computer/agent_prompt.md", "# A prompt, not a program\n");
+        at("my_pkg/empty.weft", "");
+        at("my_pkg/bare_hash.weft", "#\n");
+        at("my_pkg/node_modules/dep/x.weft", "# never listed\n");
+        let not_utf8 = root.path().join("my_pkg/latin1.weft");
+        fs::write(&not_utf8, b"# caf\xe9\nGroup {}\n").expect("write");
+
+        let listed = include_files(root.path()).expect("listing");
+        let file = |path: &str, description: Option<&str>| IncludeFile {
+            path: path.into(),
+            description: description.map(str::to_string),
+        };
+        assert_eq!(
+            listed,
+            [
+                file("base_catalog/computer/agent.weft", Some("Run an agent on a computer.")),
+                file("base_catalog/computer/perform.weft", None),
+                file("my_pkg/bare_hash.weft", None),
+                file("my_pkg/empty.weft", None),
+                file("my_pkg/latin1.weft", Some("caf\u{fffd}")),
+            ]
+        );
+        assert_eq!(include_files(&root.path().join("absent")).expect("listing"), []);
+    }
+
+    /// A `.weft` file is part of the node tree (it is seeded and listed)
+    /// and never part of what a package builds from.
+    #[test]
+    fn a_weft_file_is_left_out_of_a_package_build_only() {
+        assert!(!is_node_tree_excluded("agent.weft"));
+        assert!(is_left_out_of_package_build("agent.weft"));
+        assert!(!is_left_out_of_package_build("agent_prompt.md"));
+        assert!(!is_left_out_of_package_build("mod.rs"));
+        assert!(is_left_out_of_package_build("node_modules"));
     }
 
     /// A project's own node is held to weft's spelling like the stdlib:

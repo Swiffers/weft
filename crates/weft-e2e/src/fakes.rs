@@ -195,6 +195,96 @@ async fn job_status(State(state): State<JobState>) -> impl IntoResponse {
     }
 }
 
+/// A scripted model behind an OpenAI-compatible chat endpoint
+/// (`POST /chat/completions`), for a `CustomProvider` whose base URL is
+/// [`ChatFake::base_url`]: the Nth call answers the Nth scripted
+/// assistant message (as one streamed chunk when the call asks for a
+/// stream, the way the LLM nodes call), so a test drives an agent through exact turns
+/// without paying for a model. A call past the script answers 500, so
+/// an agent that asked once too often fails loudly. Keeps every request
+/// body, so a test can read what the agent sent back.
+pub struct ChatFake {
+    base_url: String,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    _server: AbortOnDrop,
+}
+
+#[derive(Clone)]
+struct ChatState {
+    script: Arc<Vec<serde_json::Value>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl ChatFake {
+    /// Bind the fake: each of `replies` is one assistant message (`content`,
+    /// and `tool_calls` for a turn that calls tools), answered in order.
+    pub async fn start(replies: Vec<serde_json::Value>) -> Result<Self> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (gateway, listener, port) = bind_host("chat").await?;
+        let state = ChatState { script: Arc::new(replies), requests: requests.clone() };
+        let app = Router::new().route("/chat/completions", axum::routing::post(chat_completion)).with_state(state);
+        Ok(Self { base_url: format!("http://{gateway}:{port}"), requests, _server: serve_axum(listener, app) })
+    }
+
+    /// The base URL a `CustomProvider` takes.
+    pub fn base_url(&self) -> String {
+        self.base_url.clone()
+    }
+
+    /// Every request body received so far, in order.
+    pub async fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().await.clone()
+    }
+}
+
+async fn chat_completion(
+    State(state): State<ChatState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    let streams = body["stream"] == serde_json::json!(true);
+    let turn = {
+        let mut requests = state.requests.lock().await;
+        requests.push(body);
+        requests.len() - 1
+    };
+    let Some(message) = state.script.get(turn) else {
+        let said = format!("the chat fake was scripted for {} calls; this is call {}", state.script.len(), turn + 1);
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, said).into_response();
+    };
+    let finish = if message.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+    let usage = serde_json::json!({ "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 });
+    if streams {
+        // The whole message as one delta (each tool call with its index,
+        // the way a streamed call names which call a piece belongs to),
+        // then the finish, then the end marker.
+        let mut delta = message.clone();
+        if let Some(calls) = delta.get_mut("tool_calls").and_then(serde_json::Value::as_array_mut) {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = serde_json::json!(index);
+            }
+        }
+        let chunk = |choice: serde_json::Value, usage: Option<serde_json::Value>| {
+            let mut frame = serde_json::json!({ "id": format!("chatcmpl-{turn}"), "model": "scripted", "choices": [choice] });
+            if let Some(usage) = usage {
+                frame["usage"] = usage;
+            }
+            format!("data: {frame}\n\n")
+        };
+        let mut sse = chunk(serde_json::json!({ "index": 0, "delta": delta }), None);
+        sse.push_str(&chunk(serde_json::json!({ "index": 0, "delta": {}, "finish_reason": finish }), Some(usage)));
+        sse.push_str("data: [DONE]\n\n");
+        return ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response();
+    }
+    axum::Json(serde_json::json!({
+        "id": format!("chatcmpl-{turn}"),
+        "object": "chat.completion",
+        "model": "scripted",
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+        "usage": usage,
+    }))
+    .into_response()
+}
+
 /// A fake HTTP server that serves fixed bytes at `/bytes`. Used by the storage
 /// fixture: a FetchToStorage node fetches FROM here, so the rig controls the
 /// exact content it can then download back and assert. Reachable like

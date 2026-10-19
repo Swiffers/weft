@@ -1,0 +1,45 @@
+{
+  "type": "RunCommand",
+  "label": "Run command",
+  "description": "Run a command in one of the computer's shell sessions, as its user (who may use sudo), with the screen as its display, so a window it opens shows on the screen. `args` is `{ command, restart, timeoutSecs }`. A session keeps its folder and its exported variables from one command to the next, so a `cd` or an `export` carries over (a plain variable, a readonly one or a function does not); it runs one command at a time, and one sent while another runs fails, naming it, while different sessions run side by side. `session` names it: left out, the computer's default session; a name that does not exist yet starts a new session in the home folder. Nothing stays open between commands, so a session costs nothing while it waits; EndSession stops what its commands left running and forgets it. `restart: true` ends the session first (alone, without a command, it only does that). `timeoutSecs` stops the command, and everything it started, after that many seconds (optional; left out, it runs until it ends). A command that does not end by itself (a server, a watcher) is started in the background with `&`, or it holds its session. A long command parks the run while it goes, holding no worker. The whole output comes out as a file, however long: to show it to a model, pass it through TextPreview. A command that exits non-zero still succeeds here: its exit code is on `exitCode`.",
+  "tags": [
+    "computer",
+    "shell",
+    "terminal",
+    "bash",
+    "command"
+  ],
+  "icon": "SquareTerminal",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "CommandArgs",
+      "required": true,
+      "description": "The command, in the shape the node's description gives. RouteComputerCall's `command` port hands it over from a model's tool call; written by hand, it is a record literal."
+    },
+    {
+      "name": "session",
+      "type": "String",
+      "label": "Session",
+      "description": "Which session to run in: a name you choose, which keeps its own folder and variables. The default agent names its session after the run's id (GetRunId), plus its `agentId` when that is set, so agents running at once keep apart; a name that outlives the run (one per agent you call again later) keeps its folder between runs. Left out, the computer's default session."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "output",
+      "type": "File",
+      "description": "The command's whole output, standard output and standard error together, as a text file stored for this run (wire it through KeepFile to keep it longer)."
+    },
+    {
+      "name": "exitCode",
+      "type": "Number",
+      "description": "The command's exit code: 0 when it succeeded."
+    }
+  ]
+}

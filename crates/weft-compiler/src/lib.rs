@@ -82,7 +82,7 @@ pub use weft_compiler::{compile as compile_source, CompileError as SourceError};
 use uuid::Uuid;
 use weft_core::{MetadataCatalog, ProjectDefinition};
 
-pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, ResolvedFile};
+pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, ResolvedFile, SpelledPath};
 
 // Re-export weft_core's Diagnostic/Severity so downstream callers
 // keep using weft_compiler::Diagnostic without touching node impls.

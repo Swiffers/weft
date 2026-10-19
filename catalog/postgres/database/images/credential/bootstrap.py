@@ -262,7 +262,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _action(self, body: dict) -> None:
         # The graph's button, in the dispatcher's envelope: a refusal
         # travels as `result.error`, which the user reads as it is.
-        # SYNC: the /action envelope <-> crates/weft-core/src/infra/action.rs, catalog/bailey/bridge/images/bridge/src/actions.js
+        # SYNC: the /action envelope <-> crates/weft-core/src/infra/action.rs, catalog/bailey/bridge/images/bridge/src/actions.js,
+        #       catalog/computer/computer/images/computer/computer.py
         action = body.get("action")
         if action != RESET_ACTION:
             self._send(200, {"result": {"error": f"no such action: {action!r}"}})

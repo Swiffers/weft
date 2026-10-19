@@ -366,7 +366,7 @@ impl Project {
 /// `weft new` runs to seed it), replacing it from the installation.
 #[cfg(feature = "build")]
 pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
-    project_root.join("nodes").join("base_catalog")
+    project_root.join(NODES_DIR).join(BASE_CATALOG_DIR)
 }
 
 /// (Re)seed `nodes/base_catalog/` from the weft installation's bundled
@@ -400,7 +400,17 @@ pub const SRC_DIR: &str = "src";
 pub const ENTRY_FILE: &str = "main.weft";
 /// The shared node tree: the standard library under `base_catalog/`
 /// and any node several parts of the program use.
+// SYNC: NODES_DIR <-> extension-vscode/src/includePath.ts NODES_DIR
 pub const NODES_DIR: &str = "nodes";
+/// The standard library's folder inside [`NODES_DIR`].
+pub const BASE_CATALOG_DIR: &str = "base_catalog";
+/// The first segment of a marker path read from [`NODES_DIR`] wherever
+/// it is written: `@include("__catalog/base_catalog/computer/agent.weft")`
+/// names the same file from `src/main.weft`, from a file deep in `src/`,
+/// and from a file under `nodes/` itself. The rule that applies it is
+/// `crate::file_reader::catalog_path`.
+// SYNC: CATALOG_PREFIX <-> extension-vscode/src/includePath.ts CATALOG_PREFIX
+pub const CATALOG_PREFIX: &str = "__catalog";
 
 /// Where a project's nodes are looked for: `nodes/`, and beside the
 /// code under `src/`. A node used by one module sits next to that

@@ -2897,11 +2897,10 @@ fn lower_grouplike_body_in_scope(
                 in_ports.push(ParsedPort {
                     name: out.name,
                     // The carry input mirrors the carry OUTPUT's
-                    // optionality: an optional carry (`acc: Number?`) seeds
-                    // the first iteration from its type's zero value when
-                    // unwired (the engine fills it), so its input must be
-                    // optional too or the LoopIn would never become ready.
-                    // A required carry still demands an explicit seed.
+                    // optionality, and an output is never optional, so a
+                    // carry no input line declares demands a seed. The
+                    // engine's zero seed is for one declared `acc?: T`
+                    // that nothing inside requires.
                     required: out.required,
                     port_type: out.port_type,
                     synthesized_from_carry: true,

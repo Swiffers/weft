@@ -443,8 +443,8 @@ struct BufferFileReader<'a> {
 }
 
 impl weft_compiler::FileReader for BufferFileReader<'_> {
-    fn resolve_and_read(&self, root: &std::path::Path, base: &std::path::Path, relative: &std::path::Path) -> std::result::Result<weft_compiler::ResolvedFile, String> {
-        let mut file = weft_compiler::DiskFileReader.resolve_and_read(root, base, relative)?;
+    fn read_spelled(&self, spelled: &weft_compiler::SpelledPath, relative: &std::path::Path) -> std::result::Result<weft_compiler::ResolvedFile, String> {
+        let mut file = weft_compiler::DiskFileReader.read_spelled(spelled, relative)?;
         if file.identity == self.file { file.content = self.source.to_string(); }
         Ok(file)
     }

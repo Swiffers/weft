@@ -147,6 +147,8 @@ mod tests {
         let root = PathBuf::from("/p");
         assert_eq!(body_id(&root, &root.join("src/lib/clean.weft")), "@src:lib:clean");
         assert_eq!(body_id(&root, &root.join("clean.weft")), "@clean");
+        // A file a program reaches through `__catalog/` sits under `nodes/`.
+        assert_eq!(body_id(&root, &root.join("nodes/base_catalog/computer/agent.weft")), "@nodes:base_catalog:computer:agent");
         assert_eq!(body_id(&root, &PathBuf::from("/elsewhere/clean.weft")), "@clean");
         // Neither a dot nor a boundary marker survives into the id.
         assert_eq!(body_id(&root, &root.join("src/v1.2/clean.gen.weft")), "@src:v1_2:clean_gen");

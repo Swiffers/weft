@@ -46,7 +46,9 @@ impl Node for StreamNode {
         let status: u16 = ctx.inputs.get("status")?;
         let headers: Option<Value> = ctx.inputs.opt("headers")?;
         let caller = ctx.live_caller().await?;
-        let data_type = wire::answer_type(&ctx)?;
+        let wire::Answer::Data(data_type) = wire::answer(&ctx)? else {
+            weft::node_bail!("answerAs is redirect, and a Stream sends messages; a redirect is one answer, so send it with a Reply");
+        };
         // An observer, not a participant: it reads what is retained from
         // the start (a producer that already finished, an LLM whose
         // reply came back fast, is still fully readable) and never

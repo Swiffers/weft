@@ -400,14 +400,14 @@ fn write_package_crates(
         let pkg_dir = crate_root.join(&dir_name);
         let pkg_src = pkg_dir.join("src");
         std::fs::create_dir_all(&pkg_src).map_err(CompileError::Io)?;
-        std::fs::write(pkg_dir.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
-        std::fs::write(pkg_src.join("lib.rs"), lib_rs).map_err(CompileError::Io)?;
+        std::fs::write(pkg_dir.join("Cargo.toml"), &cargo_toml).map_err(CompileError::Io)?;
+        std::fs::write(pkg_src.join("lib.rs"), &lib_rs).map_err(CompileError::Io)?;
         // Dated like the staged sources it includes (see
         // `build::package_source_mtime`): written at wall-clock time it
         // would be newer than every cached rlib, and every package would
         // compile on every build.
-        for generated in [pkg_dir.join("Cargo.toml"), pkg_src.join("lib.rs")] {
-            crate::build::stamp_mtime(&generated, crate::build::package_source_mtime());
+        for (generated, content) in [(pkg_dir.join("Cargo.toml"), &cargo_toml), (pkg_src.join("lib.rs"), &lib_rs)] {
+            crate::build::stamp_mtime(&generated, crate::build::package_source_mtime(content.as_bytes()));
         }
         dirs.insert(pkg.module_ident.clone(), dir_name);
     }
@@ -644,10 +644,10 @@ enum PackageGating {
 /// container path's node-test crate with no candidates (its one package
 /// is what it tests), for which `weft-isolate` is a plain build.
 ///
-/// The record and the helper's sources carry the fixed package date
-/// (`build::package_source_mtime`): the registry embeds the record, so a
+/// The record and the helper's sources carry the date their content gives
+/// them (`build::package_source_mtime`): the registry embeds the record, so a
 /// wall-clock date would recompile the worker crate on every build, and
-/// the helper compiles once per lane. Content never hides behind the old
+/// the helper compiles once per lane. Content never hides behind an old
 /// date: the build rewrites the record whenever it leaves something out,
 /// and the helper's package is named by its content ([`isolate_dir_name`]).
 fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate::Candidates) -> CompileResult<()> {
@@ -667,7 +667,8 @@ fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate:
     std::fs::write(helper.join("Cargo.toml"), isolate_cargo_toml(&isolate_dir_name())).map_err(CompileError::Io)?;
     std::fs::write(helper.join("src").join("main.rs"), ISOLATE_SOURCE).map_err(CompileError::Io)?;
     for file in [record, helper.join("Cargo.toml"), helper.join("src").join("main.rs")] {
-        crate::build::stamp_mtime(&file, crate::build::package_source_mtime());
+        let content = std::fs::read(&file).map_err(CompileError::Io)?;
+        crate::build::stamp_mtime(&file, crate::build::package_source_mtime(&content));
     }
     Ok(())
 }
@@ -719,12 +720,12 @@ fn isolate_cargo_toml(package: &str) -> String {
 
 /// The `weft-isolate` package's name, and the directory it is emitted to
 /// under a crate root: `weft-isolate-<slot>`, the slot sixteen hex
-/// characters over its manifest and source. Its sources carry the fixed
-/// package date, and cargo trusts a source older than its last compile; it
-/// tells the helper's compiles apart by package name, never by directory
-/// (a workspace root's own path hashes the same wherever it sits), so with
-/// a fixed name a kept compile cache would keep running an older helper.
-/// One name per content cannot.
+/// characters over its manifest and source. Its sources carry the date
+/// their content gives them, years back, and cargo trusts a source older
+/// than its last compile; it tells the helper's compiles apart by package
+/// name, never by directory (a workspace root's own path hashes the same
+/// wherever it sits), so with a fixed name a kept compile cache would keep
+/// running an older helper. One name per content cannot.
 pub fn isolate_dir_name() -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();

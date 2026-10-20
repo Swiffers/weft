@@ -362,9 +362,12 @@ export async function fetchPendingTasks(
 /// place.
 /// Scoped like the listing: the api token as bearer, the task one it
 /// lists, the field one the form declares.
-// SYNC: TaskFileLink <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), crates/weft-core/src/signal/form.rs (consumer_file_value, whose URL-backed arm publishes the same four keys)
+// SYNC: TaskFileLink <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), crates/weft-core/src/signal/form.rs (consumer_file_value, whose URL-backed arm publishes the same keys)
 export interface TaskFileLink {
   url: string;
+  /// Whether the open internet opens `url` (false: only this machine, or
+  /// its network, reaches the install it points at).
+  public: boolean;
   mimeType: string;
   sizeBytes: number;
   filename: string;

@@ -84,20 +84,31 @@ pub struct BrokerState {
     /// ever resolves its app here; project metadata never supplies
     /// one (the own door carries the user's own app instead).
     pub app_provider: Arc<dyn crate::app_provider::AppProvider>,
-    /// The stable base URL users hit for this weft. Event subscribe calls
-    /// tell the provider to post to `<base>/events/<service>/<topic>`
-    /// when this is reachable from the internet; a weft with no
-    /// internet-reachable address refuses those subscriptions loudly,
-    /// naming the fix.
+    /// The address the open internet reaches this weft at, as it is now
+    /// (a quick tunnel's is asked each time). Event subscribe calls tell
+    /// the provider to post to `<it>/events/<service>/<topic>`, and a link
+    /// to a stored file goes through it when its project declares no
+    /// visitor address; a weft with none refuses those subscriptions
+    /// loudly, naming the fix.
+    pub internet: weft_platform_traits::config::InternetAddress,
+    /// The stable base URL users hit for this weft: a public infra
+    /// endpoint's address hangs off it when the open internet does not
+    /// reach the install ([`Self::front_door`]).
     pub public_base_url: String,
-    /// An ADDITIONAL internet-reachable address (a tunnel's), preferred
-    /// over the base when telling a provider where to post.
-    pub internet_url: Option<String>,
-    /// True iff the object store's presigned EXTERNAL-audience URLs are
-    /// reachable from the open internet: public file links then skip the
-    /// relay and point straight at the bucket. A local install never
-    /// sets it.
+    /// The install's own address for a link outside callers open when
+    /// neither a site nor the internet carries it (the network address
+    /// when one is set): such a link says `public: false`.
+    pub own_base_url: String,
+    /// True iff the object store's own presigned links are reachable from
+    /// the open internet (Cloud Storage): a link to a stored file for the
+    /// outside is then the store's, straight, and never goes through the
+    /// install. A local install never sets it.
     pub object_store_public_internet: bool,
+    /// What signs and reads the upload slots pages send files through
+    /// (`weft_core::storage::slot`).
+    pub slot_key: weft_core::storage::slot::SlotKey,
+    /// The process's client for asking a quick tunnel its address.
+    pub http: reqwest::Client,
     /// See [`BrokerSettings::supervisor_booking`].
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
 }
@@ -111,9 +122,13 @@ pub struct BrokerSettings {
     pub entitlements: Arc<dyn EntitlementSource>,
     pub credentials: Arc<dyn CredentialSource>,
     pub app_provider: Arc<dyn crate::app_provider::AppProvider>,
+    /// The stable base URL users hit for this weft.
     pub public_base_url: String,
-    pub internet_url: Option<String>,
+    /// The address the open internet reaches this weft at, read live.
+    pub internet: weft_platform_traits::config::InternetAddress,
+    pub own_base_url: String,
     pub object_store_public_internet: bool,
+    pub slot_key: weft_core::storage::slot::SlotKey,
     /// How long this process's platform lets one line live before cutting
     /// it, `None` when it never does (`crate::line::LineFanout::start`).
     pub line_max_age: Option<std::time::Duration>,
@@ -128,14 +143,17 @@ pub struct BrokerSettings {
 }
 
 impl BrokerState {
-    /// The base URL the OPEN INTERNET reaches this weft at, or `None`
-    /// when there is none: the tunnel's address when one is up, else the
-    /// stable base when it is not a loopback. A loopback base counts as
-    /// "not reachable".
-    pub fn internet_base(&self) -> Option<&str> {
-        self.internet_url
-            .as_deref()
-            .or_else(|| Some(self.public_base_url.as_str()).filter(|b| !weft_core::net::is_loopback_url(b)))
+    /// The base URL the OPEN INTERNET reaches this weft at, now, or
+    /// `None` when there is none.
+    pub async fn internet_base(&self) -> anyhow::Result<Option<String>> {
+        self.internet.current(&self.http).await
+    }
+
+    /// The base a public infra endpoint's address handed to a caller (a
+    /// provider's webhook target) is built on: the address the open
+    /// internet reaches this weft at now, else its stable base URL.
+    pub async fn front_door(&self) -> anyhow::Result<String> {
+        Ok(self.internet_base().await?.unwrap_or_else(|| self.public_base_url.clone()))
     }
 
     /// Build the broker state over the process's pool and signal watch.
@@ -161,11 +179,7 @@ impl BrokerState {
         )?;
         let lines = crate::line::LineFanout::start(signals.subscribe(), settings.line_max_age);
         let tasks: Arc<dyn TaskStoreClient> = Arc::new(PostgresTaskStoreClient::new(pool.clone(), signals.clone())?);
-        // A public infra endpoint's address is handed to whoever calls in
-        // (a provider's webhook target), so it is built on the address the
-        // open internet reaches, never the local one.
-        let front_door = settings.internet_url.clone().unwrap_or_else(|| settings.public_base_url.clone());
-        let infra = Arc::new(PostgresInfraReader::new(pool.clone(), Some(front_door)));
+        let infra = Arc::new(PostgresInfraReader::new(pool.clone()));
         let runtime_store = Arc::new(RuntimeStore::new(
             pool.clone(),
             settings.object_store.clone(),
@@ -191,9 +205,12 @@ impl BrokerState {
             entitlements: settings.entitlements,
             credentials: settings.credentials,
             app_provider: settings.app_provider,
+            internet: settings.internet,
             public_base_url: settings.public_base_url,
-            internet_url: settings.internet_url,
+            own_base_url: settings.own_base_url.trim_end_matches('/').to_string(),
             object_store_public_internet: settings.object_store_public_internet,
+            slot_key: settings.slot_key,
+            http: reqwest::Client::new(),
             supervisor_booking: settings.supervisor_booking,
         }))
     }

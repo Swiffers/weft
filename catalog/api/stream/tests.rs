@@ -27,6 +27,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_bus_that_broke_off_closes_a_socket_as_failed", failed_on_a_socket),
         NodeTest::basic("sse_frames_text_per_line_and_json_whole", sse_framing),
         NodeTest::basic("ndjson_is_one_json_value_per_line", ndjson_framing),
+        NodeTest::fake("a_redirect_is_a_replys_answer", redirect_refused),
     ]
 }
 
@@ -53,6 +54,18 @@ fn failed_bus(rig: &FakeRig, messages: &[serde_json::Value]) -> WeftResult<serde
     }
     bus.inner_arc().close(StreamEnd::Failed { error: "the model went away".into() });
     Ok(marker)
+}
+
+/// A redirect is one answer that ends the exchange, so a Stream refuses
+/// it and names the node that sends one; nothing goes out.
+async fn redirect_refused(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(conn.clone());
+    let bus = closed_bus(&rig, &[json!("a")])?;
+    let err = rig.run(&StreamNode, json!({ "bus": bus, "answerAs": "redirect" })).await.failure()?;
+    assert!(err.contains("send it with a Reply"), "{err}");
+    assert!(conn.chunks().is_empty(), "{:?}", conn.chunks());
+    Ok(())
 }
 
 /// The deltas that went out stay sent; then the exchange FAILS, which the

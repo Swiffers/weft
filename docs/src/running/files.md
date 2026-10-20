@@ -89,15 +89,23 @@ Type 'yes' to confirm:
 
 ## Links
 
-Three kinds, for three audiences, and a node picks the right one:
+When somebody needs to open a file, a node makes a link to it, of one of two
+kinds:
 
-- a temporary signed link, about fifteen minutes by default
-- a link the open internet can fetch, when this install serves a public address
-- a link a caller of this install can fetch, which is what a route's answer
-  carries in place of a file
+- an internal one, for code inside the install, straight to storage
+- an external one, for a browser, an app or an outside service, which is what
+  a route's answer carries in place of a file
 
-They all expire, which is why a stored file travels as a marker rather than a
-URL. The marker keeps working; a link does not.
+An external link goes through the cloud store on a cloud install. On a local
+one it goes through the project's visitor address (`weft frontend
+visitor-address`), else weft's tunnel when it is open, else the install's own
+address, which only this machine opens.
+
+A link lives fifteen minutes unless the program set another lifetime (the
+`LinkOptions` node, up to seven days), and opening it in a tab downloads the
+file under its name. It
+expires, which is why a stored file travels as a marker rather than a URL. The
+marker keeps working; a link does not.
 
 ## When a file goes missing
 

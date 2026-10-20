@@ -3,9 +3,10 @@
 	import { listRuntimeFiles } from '../../../host';
 	import { matchesAccept } from '../../utils/file-browser';
 
-	// "Pick a stored file": lists the project's RUNTIME files (its stored
-	// `project/` + `asset/` planes, through the same door `weft files`
-	// uses), with a filename search box. Files matching
+	// "Pick a stored file": lists the RUNTIME files this project's runs
+	// can read (its own `project/` and `instance/` files and the tenant's
+	// `shared/` ones, through the same door `weft files` uses), with a
+	// filename search box. Files matching
 	// the field's accept filter sort first, the rest dimmed but still pickable
 	// (steered, not blocked). Picking hands back the TENANT-LESS storage key
 	// the field writes into its `@asset("<scope-key>", <Type>)` ref.
@@ -83,7 +84,7 @@
 			<input
 				type="text"
 				class="flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-				placeholder="Search this project's stored files…"
+				placeholder="Search the stored files this project can use…"
 				bind:value={query}
 			/>
 			<button class="text-muted-foreground hover:text-foreground shrink-0" title="Close" onclick={onClose}>
@@ -98,7 +99,7 @@
 				<div class="m-2 rounded bg-destructive/10 px-2 py-1 text-[10px] text-destructive">{errorMsg}</div>
 			{:else if shown.length === 0}
 				<div class="px-3 py-6 text-center text-[11px] text-muted-foreground">
-					{query ? 'No stored files match.' : 'This project has no stored files yet.'}
+					{query ? 'No stored files match.' : 'No stored files this project can use yet.'}
 				</div>
 			{:else}
 				{#each shown as file (file.key)}

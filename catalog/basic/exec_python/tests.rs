@@ -194,26 +194,39 @@ async fn absent_input_is_none(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A stored file binds as the inside of its marker (`photo["url"]`,
-/// `photo["filename"]`), and handed back on a file-typed output it
-/// leaves as the marker the wire expects, kind read off its mime.
+/// A stored file binds as the inside of its marker (`photo["filename"]`)
+/// with its links beside it (`internalUrl` for the script, `externalUrl`
+/// and `public` for another service), and handed back on a file-typed
+/// output it leaves as the marker the wire expects, kind read off its
+/// mime, without the links.
 async fn file_round_trip(rig: FakeRig) -> WeftResult<()> {
     let file = rig.store_file("p.png", "image/png", b"PNG!".to_vec());
+    let key = weft::storage::StoredFile::from_value(&file)?.key;
     rig.input_type("photo", WeftType::parse("Image").expect("Image parses"));
     rig.output_type("name", WeftType::parse("String").expect("String parses"));
+    rig.output_type("links", WeftType::parse("String").expect("String parses"));
     rig.output_type("same", WeftType::parse("Image").expect("Image parses"));
     let outcome = rig
         .run(
             &ExecPythonNode,
             json!({
-                "code": "assert '__weft_image__' not in photo\nreturn {'name': photo['filename'] + ':' + photo['mimeType'], 'same': photo}",
+                "code": "assert '__weft_image__' not in photo\nreturn {'name': photo['filename'] + ':' + photo['mimeType'], 'links': ' '.join([photo['internalUrl'], photo['externalUrl'], str(photo['public'])]), 'same': photo}",
                 "photo": file,
             }),
         )
         .await
         .ok()?;
     assert_eq!(outcome.outputs["name"], json!("p.png:image/png"));
-    assert_eq!(outcome.outputs["same"], file, "the marker comes back whole");
+    let ttl = weft::storage::DEFAULT_LINK_SECS;
+    assert_eq!(
+        outcome.outputs["links"],
+        json!(format!(
+            "{}/{key}?ttl={ttl} {}/files/{key}?ttl={ttl} False",
+            weft::node_test::FAKE_STORE_BASE,
+            weft::node_test::FAKE_LINK_BASE
+        ))
+    );
+    assert_eq!(outcome.outputs["same"], file, "the marker comes back whole, without the links");
     Ok(())
 }
 

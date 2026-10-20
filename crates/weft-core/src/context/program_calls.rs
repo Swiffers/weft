@@ -122,7 +122,7 @@ impl RunContext {
         let value = match replayed {
             Some(value) => value,
             None => {
-                let value = crate::storage::media::strip_links(&self.handle.program_call(call, stop_self, call_index).await?);
+                let value = self.handle.program_call(call, stop_self, call_index).await?;
                 self.handle.run_record(name, call_index, &value).await?;
                 value
             }

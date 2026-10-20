@@ -95,13 +95,20 @@ pub struct DispatcherState {
     pub project_reclaimer: Arc<dyn crate::reclaim::ProjectReclaimer>,
     /// The STABLE base URL people and editors reach this install at.
     pub public_base_url: String,
-    /// An ADDITIONAL address the open internet reaches this install at (a
-    /// tunnel's), when one exists. Never a replacement for the base:
-    /// local surfaces (the OAuth callback shown to the operator, storage
-    /// links) stay on the stable base, and only internet-facing surfaces
-    /// (activation URLs, event pushes) prefer this one via
+    /// Where the open internet reaches this install (a tunnel's address,
+    /// a fixed one), read each time it is used
+    /// ([`weft_platform_traits::config::InternetAddress::current`]): a quick
+    /// tunnel opened again comes back under a new name, and an address
+    /// read once at boot would point at the old one from then on. Never a
+    /// replacement for the base: local surfaces (the OAuth callback shown
+    /// to the operator) stay on the stable base, and only internet-facing
+    /// surfaces (activation URLs, event pushes) prefer this one via
     /// [`DispatcherState::external_base_url`].
-    pub internet_url: Option<String>,
+    pub internet: weft_platform_traits::config::InternetAddress,
+    /// Where the files door passes requests on to (`crate::files_door`):
+    /// `None` on a store the open internet reaches itself, whose links
+    /// never go through the install.
+    pub files: Option<crate::files_door::FilesTarget>,
     /// What the install allows at its public edge (trusted proxy hops,
     /// the token-guessing bound); see `entry_limits`.
     pub edge: crate::entry_limits::EdgeConfig,
@@ -136,12 +143,47 @@ pub struct DispatcherState {
     pub booking: Option<weft_task_store::drain::Booking>,
 }
 
+/// The base for outside URLs of one answer
+/// ([`DispatcherState::external_base`]): read the first time a path is put
+/// on it, then kept for the rest of that answer only, so one answer hands
+/// out every address under the same base.
+pub struct ExternalBase<'a> {
+    state: &'a DispatcherState,
+    base: tokio::sync::OnceCell<String>,
+}
+
+impl ExternalBase<'_> {
+    /// `path` (an address's path on this install) as outside callers reach
+    /// it. The first call reads the base, and fails as
+    /// [`DispatcherState::external_base_url`] does.
+    pub async fn url(&self, path: &str) -> anyhow::Result<String> {
+        let base = self.base.get_or_try_init(|| self.state.external_base_url()).await?;
+        Ok(weft_core::infra::public_url(base, path))
+    }
+}
+
 impl DispatcherState {
+    /// The address the open internet reaches this install at right now,
+    /// `None` when it reaches none. A quick tunnel that does not say its
+    /// address is an error naming it.
+    pub async fn internet_url(&self) -> anyhow::Result<Option<String>> {
+        self.internet.current(&self.http).await
+    }
+
     /// The base for URLs handed to OUTSIDE callers (webhook activation
-    /// URLs, addresses a provider posts events to): the additional
-    /// internet address when one exists, the stable base otherwise.
-    pub fn external_base_url(&self) -> &str {
-        self.internet_url.as_deref().unwrap_or(&self.public_base_url)
+    /// URLs, addresses a provider posts events to): the internet address
+    /// as it is now when there is one, the stable base otherwise.
+    pub async fn external_base_url(&self) -> anyhow::Result<String> {
+        Ok(self.internet_url().await?.unwrap_or_else(|| self.public_base_url.clone()))
+    }
+
+    /// The base for outside URLs ([`DispatcherState::external_base_url`]),
+    /// read only when an answer first puts a path on it: an answer that
+    /// hands out no outside address (a cron-only activation, a run whose
+    /// waits have no resume link) never waits on a tunnel, and fails on
+    /// none that is down or still connecting.
+    pub fn external_base(&self) -> ExternalBase<'_> {
+        ExternalBase { state: self, base: tokio::sync::OnceCell::new() }
     }
 
     /// The program `project` recorded under `hash`, parsed; `None` when

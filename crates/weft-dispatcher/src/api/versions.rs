@@ -1110,8 +1110,8 @@ pub async fn prune(
             // away, so there is nothing to do and nothing to report;
             // calling it a failure told the person to run a command
             // that answers 404 for ever on that run.
-            Err(StatusCode::NOT_FOUND) => {}
-            Err(status) => failed.push(format!("{run_id} ({status})")),
+            Err(e) if e.status() == StatusCode::NOT_FOUND => {}
+            Err(e) => failed.push(format!("{run_id} ({}: {})", e.status(), e.message())),
         }
     }
     if !failed.is_empty() {

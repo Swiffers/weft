@@ -56,7 +56,7 @@
         "step": 1
       },
       "label": "Keep for (days, 0 = forever)",
-      "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: a run file is swept soon after its run, a project file lives until deleted."
+      "description": "Lifetime since last access (any read, download or link resets it); 0 never expires. Empty: a run file is swept soon after its run, a project file lives until deleted."
     }
   ],
   "outputs": [

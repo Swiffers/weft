@@ -1,7 +1,7 @@
 {
   "type": "Reply",
   "label": "Reply",
-  "description": "Answer the caller of this run with one message: behind a Route, the whole response (status, headers, body) and the exchange ends; behind a Socket, one message and the socket stays open (status and headers refused). A stored file anywhere in a json body goes out as `{ url, mimeType, filename, sizeBytes }`; sent as bytes it goes out under its own content type and filename unless `headers` sets them.",
+  "description": "Answer the caller of this run with one message: behind a Route, the whole response (status, headers, body) and the exchange ends; behind a Socket, one message and the socket stays open (status and headers refused). A file anywhere in a json body (a stored one or a url file) goes out as `{ url, mimeType, filename, sizeBytes }`, the url a link the caller fetches it from (the same link for a while, so a page that asks again keeps its video playing); sent as bytes it goes out under its own content type and filename unless `headers` sets them; `answerAs: redirect` sends the caller to the file's link.",
   "tags": [
     "api",
     "http",
@@ -27,11 +27,12 @@
           "",
           "json",
           "text",
-          "bytes"
+          "bytes",
+          "redirect"
         ]
       },
       "label": "Answer as",
-      "description": "`json`, `text` or `bytes`; empty follows the trigger's `dataType`. A GET answering a picture sets `bytes`."
+      "description": "`json`, `text` or `bytes`; empty follows the trigger's `dataType`. A GET answering a picture sets `bytes`. `redirect` (Route only) answers a file with a redirect to its link (302, or the 3xx `status` sets), so the browser fetches the file straight from where it is stored."
     },
     {
       "name": "status",

@@ -834,7 +834,7 @@ enum Cmd {
         full: bool,
     },
     /// Browse + manage stored files (the tenant's runtime storage):
-    /// project files, shared spaces, past-run survivors.
+    /// run, project, instance, shared and asset spaces.
     Files {
         #[command(subcommand)]
         action: FilesAction,
@@ -1373,16 +1373,17 @@ struct InfraNodesOpts {
 
 #[derive(Debug, Subcommand)]
 enum FilesAction {
-    /// List stored files, organized by space (project files, shared
-    /// spaces, past-run survivors). Optional prefix filter.
+    /// List stored files, grouped by space (run, project, instance,
+    /// shared and asset). Optional prefix filter.
     Ls {
         #[arg(value_name = "prefix")]
         prefix: Option<String>,
     },
     /// Show one file's full metadata.
     Inspect { key: String },
-    /// Download a file: handshake with the dispatcher for a presigned URL,
-    /// then stream the bytes DIRECTLY from the storage bucket.
+    /// Download a file: the install hands a short-lived link straight to
+    /// the file store, and the bytes stream from there, resuming where
+    /// they stopped when the connection drops.
     Download {
         key: String,
         /// Output path; defaults to the stored filename.
@@ -1553,10 +1554,27 @@ enum FrontendAction {
         /// The GitHub repository whose CI deploys it to the install.
         #[arg(long, value_name = "owner/name")]
         repo: Option<String>,
+        /// Where the frontend's server passes weft's doors on to its
+        /// visitors (its `weftPassThrough` mount, like
+        /// https://shop.example/weft): links to the project's stored files
+        /// then go through the site.
+        #[arg(long, value_name = "url")]
+        visitor_address: Option<String>,
     },
     /// The project's frontends, and where each runs.
     #[command(alias = "list")]
     Ls,
+    /// Set where a frontend's server passes weft's doors on to its
+    /// visitors (its `weftPassThrough` mount, like
+    /// https://shop.example/weft): links to the project's stored files then
+    /// go through the site. One frontend of a project has one at most.
+    VisitorAddress {
+        name: String,
+        /// The frontend's `weftPassThrough` mount, like
+        /// https://shop.example/weft, or `off` to clear it.
+        #[arg(value_name = "url|off")]
+        url: String,
+    },
     /// Remove a frontend: its tokens stop working, and a service the
     /// install made for it is deleted.
     Rm {
@@ -1580,8 +1598,9 @@ enum FrontendAction {
 impl From<FrontendAction> for commands::frontend::FrontendAction {
     fn from(value: FrontendAction) -> Self {
         match value {
-            FrontendAction::Add { name, repo } => Self::Add { name, repo },
+            FrontendAction::Add { name, repo, visitor_address } => Self::Add { name, repo, visitor_address },
             FrontendAction::Ls => Self::List,
+            FrontendAction::VisitorAddress { name, url } => Self::VisitorAddress { name, address: (url != "off").then_some(url) },
             FrontendAction::Rm { name, force } => Self::Rm { name, force },
             FrontendAction::Token { name, done } => Self::Token { name, done },
         }

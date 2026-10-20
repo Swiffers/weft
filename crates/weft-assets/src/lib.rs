@@ -102,7 +102,7 @@ pub fn referenced_asset_keys(project: &ProjectDefinition) -> Result<Vec<String>>
         for port in &node.inputs {
             let Some(value) = node.written_value(&port.name).or(port.default.as_ref()) else { continue };
             for slot in media_slots(value, &port.port_type) {
-                if let MediaSlotContent::Stored { handle: FileHandle::Key(key), .. } =
+                if let MediaSlotContent::Stored { handle: FileHandle::Key { key, .. }, .. } =
                     classify_media_slot(&slot).map_err(anyhow::Error::msg)?
                 {
                     let parsed = parse_key(&key).map_err(anyhow::Error::msg)?;
@@ -376,6 +376,7 @@ pub async fn sync_assets(
             filename: r.path.clone(),
             // An asset is addressed by its content and never replaced.
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         };
         map.insert(r.resolution_key(), weft_core::storage::typed_file_value(&file, &r.ty));
     }

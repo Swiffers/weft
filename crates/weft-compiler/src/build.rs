@@ -311,15 +311,14 @@ fn stage_project_nodes(
         // over, `hash::hash_package_root`), so staging and hashing agree
         // on a node's byte-content: a file the build copies but the hash
         // skips (or vice versa) is how a stale worker image gets served.
-        let staged = dest.join(rel);
-        copy_dir_filtered(&root, &staged, &weft_catalog::is_left_out_of_package_build)?;
-        stamp_package_tree(&staged)?;
+        copy_dir_dated(&root, &dest.join(rel), &weft_catalog::is_left_out_of_package_build, FileDates::FromContent)?;
     }
     Ok(())
 }
 
-/// The modification time every staged package file carries, whatever the
-/// file had on disk.
+/// The modification time a staged package file with `content` carries,
+/// whatever the file had on disk: a date in 2020 to 2024, to the
+/// nanosecond, read off the content's sha256.
 ///
 /// Cargo reuses a compiled crate only while none of its sources is newer
 /// than the compile, and a package compiles in a crate whose directory is
@@ -329,20 +328,27 @@ fn stage_project_nodes(
 /// from one checkout and a cloud build stages the standard library from
 /// another (the runtime image's copy), and a fresh checkout dates every
 /// file at the moment it was made, so every precompiled package looked
-/// edited and every cloud build compiled the whole library again. One
-/// fixed date on both sides makes an unchanged package reused wherever it
-/// was compiled; a changed one lands in a new directory and compiles.
-pub(crate) fn package_source_mtime() -> std::time::SystemTime {
-    // 2020-01-01.
-    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)
-}
-
-/// Give every file under `dir` [`package_source_mtime`].
-fn stamp_package_tree(dir: &Path) -> CompileResult<()> {
-    for file in crate::hash::walk_dir(dir).map_err(|e| CompileError::Build(format!("walk {}: {e}", dir.display())))? {
-        stamp_mtime(&file, package_source_mtime());
-    }
-    Ok(())
+/// edited and every cloud build compiled the whole library again. A date
+/// read off the content is the same on both sides for the same file, so
+/// an unchanged package is reused wherever it was compiled. It is never
+/// one fixed date: Docker sends a build context's files again only when
+/// their size or date changed since the last build of that context, so a
+/// fixed date kept an edit that left a file's size alone (a letter's case)
+/// out of the build, which then compiled the old file. The seconds and
+/// the nanoseconds come from separate parts of the digest, so two
+/// contents of one size share a date about once in 10^17.
+pub(crate) fn package_source_mtime(content: &[u8]) -> std::time::SystemTime {
+    use sha2::Digest;
+    // 2020-01-01, and five years past it: always in the past, so a cached
+    // compile is never older than its sources.
+    const START: u64 = 1_577_836_800;
+    const SPAN: u64 = 5 * 365 * 24 * 3600;
+    let digest = sha2::Sha256::digest(content);
+    let word = |at: usize| u64::from_be_bytes(digest[at..at + 8].try_into().expect("a sha256 is 32 bytes"));
+    let secs = word(0) % SPAN;
+    // The low 30 bits of another word, folded under a second.
+    let nanos = (word(8) & ((1 << 30) - 1)) % 1_000_000_000;
+    std::time::UNIX_EPOCH + std::time::Duration::new(START + secs, nanos as u32)
 }
 
 /// The bare content-addressed node-test image tag,
@@ -803,19 +809,32 @@ pub fn install_of_cache_key(key: &str) -> Option<&str> {
 /// the immediate entry name. Skips symlinks to avoid infinite
 /// recursion and unexpected escapes from the staged context.
 ///
-/// Preserves mtime on every copied file. The staged build context
-/// feeds straight into docker, which preserves the host mtime on
-/// `COPY`. Cargo's fingerprint short-circuits a clean crate when
-/// every source file's mtime is older than the crate's rlib in the
-/// target dir; without mtime preservation a fresh stage gives every
-/// file a wall-clock mtime, every per-package crate looks dirty,
-/// and cargo recompiles all of them on every edit. Preserving the
-/// host mtime keeps unchanged sources looking unchanged inside the
-/// container, so cargo only rebuilds the package whose node source
-/// genuinely changed (plus the worker relink).
+/// Preserves mtime on every copied file. A staged build context feeds
+/// straight into docker, which preserves the host mtime on `COPY`, and
+/// cargo's fingerprint short-circuits a clean crate only while every
+/// source file's mtime is older than the crate's rlib in the target dir:
+/// with wall-clock mtimes every crate staged this way (the workspace
+/// slice a worker links) would look dirty on every build. A package's
+/// staged files are dated by their content instead
+/// ([`package_source_mtime`], through [`copy_dir_dated`]).
 /// `exclude` names the entries left out, at any depth.
 pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool) -> CompileResult<()> {
-    copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
+    copy_dir_dated(src, dst, exclude, FileDates::Mirrored)
+}
+
+/// What date a copied file carries.
+#[derive(Clone, Copy)]
+enum FileDates {
+    /// The source file's.
+    Mirrored,
+    /// The one its content gives it ([`package_source_mtime`]), read off
+    /// the bytes as they are copied.
+    FromContent,
+}
+
+/// [`copy_dir_filtered`], each file dated as `dates` says.
+fn copy_dir_dated(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool, dates: FileDates) -> CompileResult<()> {
+    copy_dir_filtered_inner(src, dst, exclude, dates, &mut Default::default())
 }
 
 /// Symlinks are followed and their TARGET bytes copied (`fs::copy`
@@ -826,11 +845,12 @@ fn copy_dir_filtered_inner(
     src: &Path,
     dst: &Path,
     exclude: &dyn Fn(&str) -> bool,
+    dates: FileDates,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(CompileError::Io)?;
     chain.push(canon);
-    let result = copy_dir_filtered_entries(src, dst, exclude, chain);
+    let result = copy_dir_filtered_entries(src, dst, exclude, dates, chain);
     chain.pop();
     result
 }
@@ -839,6 +859,7 @@ fn copy_dir_filtered_entries(
     src: &Path,
     dst: &Path,
     exclude: &dyn Fn(&str) -> bool,
+    dates: FileDates,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
@@ -853,10 +874,23 @@ fn copy_dir_filtered_entries(
         let to = dst.join(&name);
         let kind = weft_catalog::node_tree_entry_kind(&from).map_err(CompileError::Io)?;
         if kind == weft_catalog::NodeTreeEntryKind::Dir {
-            copy_dir_filtered_inner(&from, &to, exclude, chain)?;
+            copy_dir_filtered_inner(&from, &to, exclude, dates, chain)?;
         } else {
-            std::fs::copy(&from, &to).map_err(CompileError::Io)?;
-            mirror_mtime(&from, &to);
+            match dates {
+                FileDates::Mirrored => {
+                    std::fs::copy(&from, &to).map_err(CompileError::Io)?;
+                    mirror_mtime(&from, &to);
+                }
+                FileDates::FromContent => {
+                    // Read once, for the copy and its date alike; the
+                    // mode goes along as `fs::copy` would take it.
+                    let content = std::fs::read(&from).map_err(CompileError::Io)?;
+                    std::fs::write(&to, &content).map_err(CompileError::Io)?;
+                    let mode = std::fs::metadata(&from).map_err(CompileError::Io)?.permissions();
+                    std::fs::set_permissions(&to, mode).map_err(CompileError::Io)?;
+                    stamp_mtime(&to, package_source_mtime(&content));
+                }
+            }
         }
     }
     Ok(())
@@ -1211,6 +1245,24 @@ mod tests {
         assert_eq!(super::test_server_dockerfile(&format!("{recipe}\n")), expected);
     }
 
+    /// A staged file's date is read off its content: the same everywhere
+    /// for the same file, and never the same across an edit, even one that
+    /// keeps the file's size (Docker resends a context's file only when its
+    /// size or date changed).
+    #[test]
+    fn a_package_files_date_is_its_contents() {
+        let date = super::package_source_mtime;
+        assert_eq!(date(b"FileHandle::key"), date(b"FileHandle::key"), "the same content, the same date, on every checkout");
+        assert_ne!(date(b"FileHandle::Key"), date(b"FileHandle::key"), "an edit of the same size changes the date");
+        let nanos = |content: &[u8]| date(content).duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        assert_ne!((nanos(b"FileHandle::Key"), nanos(b"FileHandle::key")), (0, 0), "dated to the nanosecond");
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        for content in [&b""[..], b"x", b"fn main() {}"] {
+            let at = date(content);
+            assert!(at >= start && at < std::time::SystemTime::now(), "a date in the past");
+        }
+    }
+
     /// The builder base compiles the STOCK WORKER: the staged context
     /// carries a package crate per stdlib package (so their rlibs, and the
     /// dependencies they pull in, are baked with the feature unification a
@@ -1230,8 +1282,9 @@ mod tests {
         // Staged at its project-relative path: a node under `nodes/` and
         // one beside the code under `src/` land side by side under the mount.
         assert!(ctx.join("project-nodes/nodes/base_catalog/basic/format/mod.rs").is_file());
-        // Every package file, staged and generated, carries the one fixed
-        // date, so a package compiled from another checkout is reused.
+        // Every package file, staged and generated, carries the date its
+        // content gives it, so a package compiled from another checkout is
+        // reused.
         let pkg_dir = std::fs::read_dir(&crate_root)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1243,7 +1296,7 @@ mod tests {
             pkg_dir.join("src/lib.rs"),
         ] {
             let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
-            assert_eq!(modified, super::package_source_mtime(), "{}", file.display());
+            assert_eq!(modified, super::package_source_mtime(&std::fs::read(&file).unwrap()), "{}", file.display());
         }
         let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");

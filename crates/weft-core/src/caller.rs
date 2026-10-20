@@ -76,12 +76,9 @@ pub struct LiveRequest {
     pub caller: Option<Value>,
     /// The address the caller reached this install at (its request's own
     /// `Host` / `X-Forwarded-*`, [`crate::net::request_base_url`]),
-    /// stated by the birth that read the caller's request. What a link
-    /// this caller will fetch is built on (a route's answer carrying a
-    /// file): a browser on the loopback port gets a loopback link, one
-    /// on the tunnel a tunnel link. `None` for a run no real request
-    /// started (`weft run --fire`), whose links fall back to the
-    /// install's configured address.
+    /// stated by the birth that read the caller's request: plain
+    /// information about the request, like its headers. `None` for a run
+    /// no real request started (`weft run --fire`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }

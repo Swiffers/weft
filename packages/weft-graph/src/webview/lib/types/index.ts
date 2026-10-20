@@ -336,7 +336,8 @@ export function typeVarBoundRefuses(
 
 // The marker->type table lives in the protocol leaf beside
 // parseFileValue (one definition; see STORED_FILE_MARKER_TYPES there).
-const FILE_HANDLE_KEYS = ['url', 'data', 'key'];
+// SYNC: FILE_HANDLE_KEYS <-> crates/weft-core/src/weft_type.rs detect_file_type
+const FILE_HANDLE_KEYS = ['url', 'key'];
 
 // The bus sentinel (`{"__weft_bus__": ...}`); the access sentinel is
 // imported from the protocol module.

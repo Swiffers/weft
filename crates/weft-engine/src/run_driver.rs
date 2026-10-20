@@ -2233,7 +2233,7 @@ async fn drive(
             // run-time dispatch built above, so provision bodies read
             // the same view a `run` body would.
             let provision_input = inputs.clone();
-            let mut ctx = RunContext::new(
+            let ctx = RunContext::new(
                 project.id,
                 node_id.clone(),
                 node_def.node_type.clone(),
@@ -2245,26 +2245,9 @@ async fn drive(
                 handle,
             )
             .marked_pure(node_def.features.pure);
-            // Every stored file among the inputs gets a link the body
-            // can fetch, minted for this firing (see
-            // `RunContext::link_file_inputs`). The journal row
-            // for this start was written from the delivered values
-            // above, so it never carries one. A link that cannot be
-            // minted fails the firing loudly, like a bag it cannot read.
-            // A pure body fetches nothing, so it gets none.
-            // The two reasons a firing cannot start, down one path: the
-            // links its body would read cannot be minted, or the payload
-            // that woke it is not what the trigger declared.
-            let linked = match node_def.features.pure {
-                true => Ok(()),
-                // Each input at its type where this firing runs.
-                false => ctx.link_file_inputs(node_ports.inputs.iter().map(|(name, ty)| (name.as_str(), ty))).await,
-            };
-            let cannot_start = match linked {
-                Err(err) => Some(err.to_string()),
-                Ok(()) => fire_payload_refusal,
-            };
-            if let Some(err) = cannot_start {
+            // A firing cannot start when the payload that woke it is not
+            // what the trigger declared.
+            if let Some(err) = fire_payload_refusal {
                 if !generator_ports.is_empty() {
                     let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                     retire_consumer_streams(

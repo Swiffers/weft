@@ -47,7 +47,7 @@ impl Node for WipeInstanceNode {
         ctx.tokens().instance(instance.clone()).revoke().await?;
         let files = ctx.storage(StorageScope::instance_of(instance.clone()));
         for file in files.list().await? {
-            files.delete(&FileHandle::Key(file.key)).await?;
+            files.delete(&FileHandle::key(file.key)).await?;
         }
         ctx.runs().instance(instance).clean(StillGoing::Cancel, stop_self(&ctx)?).await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await

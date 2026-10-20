@@ -8,9 +8,10 @@
 //! ([`weft_platform_traits::WORKER_AUTH_HEADER`]), so a caller's own
 //! `Authorization` reaches the upstream untouched. The door says who the
 //! caller is and which address it used, since the upstream sees the door
-//! as its peer and its own address as the host: that is what it builds
-//! links from (`weft_core::net::request_base_url`) and counts callers by
-//! (`weft_core::net::caller_address`). Any server is told the usual way
+//! as its peer and its own address as the host: that is where it reads
+//! the address the caller used (`weft_core::net::request_base_url`: a run
+//! is told it, and a live socket's ticket points back at it) and who the
+//! caller is (`weft_core::net::caller_address`). Any server is told the usual way
 //! (`X-Forwarded-For`, `-Host`, `-Proto`); a project's worker is told in
 //! weft's own hop headers, which it removes, so the run reads the request
 //! as its caller sent it ([`Forwarding`]).

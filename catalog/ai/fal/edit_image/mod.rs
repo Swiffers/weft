@@ -41,14 +41,14 @@ impl Node for FalEditImageNode {
         // a dead end: `params: { "image_urls": null }` takes it back off,
         // which is what a null extra means.
         let storage = ctx.storage(StorageScope::Run);
-        let image_url = storage.external_url(&image).await?;
+        let image_url = storage.external_file(&image).await?.url;
         let mut payload = json!({
             "prompt": prompt,
             "image_url": image_url.clone(),
             "image_urls": [image_url],
         });
         if let Some(mask) = &mask {
-            payload["mask_url"] = json!(storage.external_url(mask).await?);
+            payload["mask_url"] = json!(storage.external_file(mask).await?.url);
         }
         merge_params(&mut payload, params.as_ref());
 

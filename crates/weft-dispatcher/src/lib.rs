@@ -30,6 +30,7 @@ pub mod frontends;
 pub mod held;
 pub mod holders;
 pub mod entry_limits;
+pub mod files_door;
 pub mod display_feeds;
 pub mod events;
 pub mod infra_event;

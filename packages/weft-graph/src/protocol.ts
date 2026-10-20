@@ -2520,11 +2520,12 @@ export type HostMessage =
   /// `assets/<name>` for stored bytes). Empty means the user cancelled;
   /// a single-file field takes the first. `error` on failure.
   | { kind: 'assetPicked'; requestId: number; paths?: string[]; error?: string }
-  /// Reply to `listRuntimeFiles`: the project's STORED runtime files (its
-  /// `project/` + `asset/` storage scopes), keys tenant-less (the short
-  /// address a picked ref writes into source). `error` is the failure
-  /// reason when the listing itself failed; an empty `files` with no
-  /// `error` genuinely means the project has no stored files.
+  /// Reply to `listRuntimeFiles`: the STORED runtime files this project's
+  /// runs can read (its own `project/` and `instance/` files, and the
+  /// tenant's `shared/` ones), keys tenant-less (the short address a
+  /// picked ref writes into source). `error` is the failure reason when
+  /// the listing itself failed; an empty `files` with no `error`
+  /// genuinely means there is no such file.
   | {
       kind: 'runtimeFiles';
       requestId: number;
@@ -2687,18 +2688,18 @@ export type WebviewMessage =
   /// to read them.
   | { kind: 'dismissError' }
   /// User clicked Download on a stored-file value in the replay
-  /// inspector. The host runs the brokered handshake (POST
-  /// `/storage/files/download`; the dispatcher authenticates + asks
-  /// the tenant's storage box to mint a short-lived capability) and
-  /// opens the returned box URL externally: the BYTES stream
-  /// browser<->box directly, never through the dispatcher. A 404
+  /// inspector. The host POSTs `/storage/files/download` (the
+  /// dispatcher authenticates and answers a short-lived presigned link
+  /// straight to the object store) and opens that link in the browser,
+  /// which saves the file under its name: the store answers it as an
+  /// attachment, and the bytes never pass through the dispatcher. A 404
   /// surfaces as "expired or deleted" (the metadata in the value
   /// stays readable; the bytes are gone).
   | { kind: 'downloadStoredFile'; key: string; filename?: string }
   /// Drive one storage-plane verb through the host: the host POSTs `body`
   /// as JSON to the dispatcher's `/storage/<path>` route and replies with a
   /// correlated `storageResult`. This is the ONE channel for storage control
-  /// calls (the inline preview's download handshake); bytes never ride it.
+  /// calls (the inline preview's download link); bytes never ride it.
   | { kind: 'storageCall'; requestId: number; path: string; body: unknown }
   /// Drive one access-store verb through the host: the host sends
   /// `method` to the dispatcher's `/access/<path>` route (stamping the
@@ -2739,26 +2740,46 @@ export type WebviewMessage =
       /// Files dropped onto the field, in drop order, as base64 bytes.
       dropped?: { name: string; bytesBase64: string }[];
     }
-  /// The file-picker modal asks for the project's STORED runtime files
-  /// (reply: `runtimeFiles`): what the storage plane holds for this project,
-  /// listed through the same door `weft files` uses. Picking one writes
-  /// `@asset("<scope-key>", <Type>)` into config.
+  /// The file-picker modal asks for the STORED runtime files this project
+  /// can use (reply: `runtimeFiles`), listed through the same door
+  /// `weft files` uses. Picking one writes `@asset("<scope-key>", <Type>)`
+  /// into config.
   | { kind: 'listRuntimeFiles'; requestId: number };
 
 // SYNC: FileValueWire <-> crates/weft-core/src/storage/mod.rs StoredFile
 //       (`version` is backend-only: the editor never reads it)
 /// The payload INSIDE a concrete file marker: self-describing metadata
 /// plus exactly ONE handle saying where the bytes live. A bucket-backed
-/// file carries a `key` (bytes fetched via the authenticated handshake
-/// above); a file pointing at an external resource carries a `url`
-/// (rendered/fetched directly). `data` (inline base64) is deliberately
-/// NOT a handle here: the read paths don't resolve it, so it falls
-/// through to the raw-JSON rendering instead of a broken preview.
+/// file carries a `key` (its bytes load from the presigned store link
+/// `/storage/files/download` answers), and may carry `linkSecs`: how
+/// long, in seconds, a link handed out for this value lives, when
+/// whoever made the value chose. A file pointing at an external
+/// resource carries a `url` (rendered/fetched directly). `data` (inline
+/// base64) is deliberately NOT a handle here: the read paths don't
+/// resolve it, so it falls through to the raw-JSON rendering instead of
+/// a broken preview.
 export type FileValueWire = {
   mimeType: string;
   sizeBytes: number;
   filename: string;
-} & ({ key: string; url?: undefined } | { url: string; key?: undefined });
+} & (
+  | { key: string; linkSecs?: number; url?: undefined }
+  | { url: string; key?: undefined; linkSecs?: undefined }
+);
+
+// SYNC: StoredFileDownload <-> crates/weft-core/src/storage/mod.rs PresignResult
+/// What `/storage/files/download` answers: a link to a stored file's
+/// bytes (the store answers it as an attachment under `filename`), the
+/// file's size, the version it was when the link was made, and whether
+/// the open internet opens the link (`false`: only this install's own
+/// network does).
+export type StoredFileDownload = {
+  url: string;
+  filename: string;
+  sizeBytes: number;
+  version: number;
+  public: boolean;
+};
 
 // SYNC: FileEditWire <-> crates/weft-core/src/storage/mod.rs FileEdit
 /// One change a firing made to a stored file: which file, the version it
@@ -2793,8 +2814,10 @@ export const STORED_FILE_MARKER_TYPES: Map<string, WeftPrimitive> = new Map([
 /// external resource; `key` wins when both are somehow present, the
 /// bucket copy is authoritative), or null for anything that is not a
 /// resolvable file value (including data-backed markers, which no read
-/// path resolves). Every consumer (inspector card, node preview)
-/// routes through here so the shape is validated identically.
+/// path resolves, and a key-backed one whose `linkSecs` is not a whole
+/// number of seconds, which the runtime refuses too). Every consumer
+/// (inspector card, node preview) routes through here so the shape is
+/// validated identically.
 export function parseFileValue(value: unknown): FileValueWire | null {
   if (typeof value !== 'object' || value === null) return null;
   const obj = value as Record<string, unknown>;
@@ -2809,7 +2832,11 @@ export function parseFileValue(value: unknown): FileValueWire | null {
     sizeBytes: typeof p.sizeBytes === 'number' ? p.sizeBytes : 0,
     filename: typeof p.filename === 'string' ? p.filename : '',
   };
-  if (typeof p.key === 'string' && p.key !== '') return { key: p.key, ...meta };
+  if (typeof p.key === 'string' && p.key !== '') {
+    if (p.linkSecs === undefined || p.linkSecs === null) return { key: p.key, ...meta };
+    if (typeof p.linkSecs !== 'number' || !Number.isInteger(p.linkSecs) || p.linkSecs < 0) return null;
+    return { key: p.key, linkSecs: p.linkSecs, ...meta };
+  }
   if (typeof p.url === 'string' && p.url !== '') return { url: p.url, ...meta };
   return null;
 }

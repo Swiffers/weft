@@ -141,8 +141,11 @@ fn the_isolation_files_sit_beside_the_crate() {
     assert!(slack["nodeTypes"].as_array().unwrap().iter().any(|t| t == "SlackSendMessage"));
 
     assert_eq!(read(out.path(), "left-out.json"), r#"{"packages":[]}"#);
+    // Dated by its content, in 2020 to 2024, like every staged package file:
+    // never the wall clock, which would recompile the worker crate each build.
     let dated = std::fs::metadata(out.path().join("left-out.json")).unwrap().modified().unwrap();
-    assert_eq!(dated, std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800));
+    let since_epoch = dated.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert!((1_577_836_800..1_577_836_800 + 5 * 365 * 24 * 3600).contains(&since_epoch), "{dated:?}");
 
     let helper = out.path().join(weft_compiler::codegen::isolate_dir_name());
     let manifest: toml::Value = read(&helper, "Cargo.toml").parse().expect("helper manifest parses");

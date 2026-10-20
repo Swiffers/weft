@@ -591,6 +591,7 @@ mod tests {
             size_bytes: 10,
             filename: "chat.jsonl".into(),
             version,
+            link_secs: None,
         }
     }
 

@@ -2831,12 +2831,31 @@ impl ContextHandle for RunnerHandle {
         self.clients.storage.keep(self.run_id, key, ttl).await
     }
 
-    async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
-        self.clients.storage.presign(self.run_id, key, ttl_secs).await
+    async fn storage_link(
+        &self,
+        key: &str,
+        ttl_secs: Option<u64>,
+        reach: weft_core::storage::LinkReach,
+    ) -> WeftResult<weft_core::storage::LinkAnswer> {
+        self.clients.storage.link(self.run_id, key, ttl_secs, reach).await
     }
 
-    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
-        self.clients.storage.public_link(self.run_id, key, ttl_secs, reach).await
+    async fn storage_copy(
+        &self,
+        scope: &weft_core::storage::StorageScope,
+        identity: Option<&str>,
+        key: &str,
+        keep: Option<weft_core::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.clients.storage.copy(self.run_id, key, scope, identity, keep).await
+    }
+
+    async fn storage_upload_slot(&self, request: &weft_core::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        self.clients.storage.upload_slot(self.run_id, request).await
+    }
+
+    async fn storage_claim_uploads(&self, claims: &[(&str, &weft_core::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
+        self.clients.storage.claim_uploads(self.run_id, claims).await
     }
 
     fn own_infra(
@@ -3719,6 +3738,7 @@ mod type_check_tests {
             size_bytes: 10,
             filename: "x.png".into(),
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         }
         .to_value()
     }
@@ -3730,6 +3750,7 @@ mod type_check_tests {
             size_bytes: 10,
             filename: "x.mp4".into(),
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         }
         .to_value()
     }
@@ -4223,9 +4244,13 @@ mod replay_tests {
         handle.storage_keep(&stored.key, KeepTtl::Default).await.expect("keep");
         assert!(handle.storage_get(&stored.key, None).await.is_ok(), "kept file still readable");
 
-        // Presign mints a (bucket) URL for an owned file.
-        let url = handle.storage_presign(&stored.key, Some(60)).await.expect("presign");
-        assert!(url.starts_with("http") && url.contains(&stored.key), "{url}");
+        // A link to an owned file, for node code and for the outside.
+        let inside = handle.storage_link(&stored.key, Some(60), weft_core::storage::LinkReach::Internal).await.expect("link");
+        assert!(inside.link.url.starts_with("http") && inside.link.url.contains(&stored.key), "{}", inside.link.url);
+        let outside = handle.storage_link(&stored.key, None, weft_core::storage::LinkReach::External).await.expect("link");
+        assert!(!outside.link.public, "the fake install is reached by nobody outside");
+        // The link comes with the file's record.
+        assert_eq!(outside.file.filename, "clip.ogg");
     }
 
     /// An identified put is idempotent within its scope: the second put
@@ -4266,7 +4291,7 @@ mod replay_tests {
     }
 
     /// A url-backed file value routes by its handle in every storage
-    /// verb: presign hands the URL back as-is (it already IS a URL an
+    /// verb: a link to it is the URL as-is (it already IS a URL an
     /// external service can fetch); delete/keep are bucket-only and
     /// error loud naming the URL.
     #[tokio::test]
@@ -4278,7 +4303,8 @@ mod replay_tests {
         let url_file = weft_core::storage::FileHandle::from_value(&url_value).unwrap();
         let storage = ctx.storage(StorageScope::Run);
 
-        assert_eq!(storage.presign(&url_file, None).await.unwrap(), "https://x/pic.png");
+        assert_eq!(storage.external_link(&url_file).await.unwrap().url, "https://x/pic.png");
+        assert_eq!(storage.internal_link(&url_file).await.unwrap().url, "https://x/pic.png");
 
         let err = storage.keep(&url_file, KeepTtl::Default).await.unwrap_err();
         assert!(err.to_string().contains("external URL"), "{err}");
@@ -4286,11 +4312,11 @@ mod replay_tests {
         assert!(err.to_string().contains("external URL"), "{err}");
     }
 
-    /// `copy` streams a run's file into the handle's scope: the copy is
-    /// a NEW key under the project prefix, carries the source's bytes,
+    /// `copy` puts a run's file into the handle's scope: the copy is a
+    /// NEW key under the project prefix, carries the source's bytes,
     /// mime, filename and size, and the source stays where it was.
     #[tokio::test]
-    async fn copy_streams_an_run_file_into_the_project_scope() {
+    async fn a_copy_puts_a_run_file_into_the_project_scope() {
         use weft_core::storage::{FileHandle, StorageScope, StoredFile};
         let ctx = ctx_over(handle_with_sequence(vec![]));
         let original = ctx
@@ -4310,7 +4336,7 @@ mod replay_tests {
         assert_eq!(copied.filename, "upload.png");
         assert_eq!(copied.size_bytes, 4);
 
-        let (meta, bytes) = project.get_bytes(&FileHandle::Key(copied.key.clone())).await.expect("read the copy");
+        let (meta, bytes) = project.get_bytes(&FileHandle::key(copied.key.clone())).await.expect("read the copy");
         assert_eq!(&bytes[..], b"PNG!");
         assert!(!meta.keep, "a project file carries no keep flag");
         let (_, still_there) = project.get_bytes(&source).await.expect("the source is untouched");

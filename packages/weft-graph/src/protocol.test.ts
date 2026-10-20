@@ -73,6 +73,14 @@ describe('parseFileValue', () => {
 		expect(parsed?.url).toBeUndefined();
 	});
 
+	it('carries a key-backed value\'s link lifetime, and refuses one that is not whole seconds', () => {
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: 7200, ...meta } })).toEqual({ key: 'k', linkSecs: 7200, ...meta });
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: null, ...meta } })).toEqual({ key: 'k', ...meta });
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: 1.5, ...meta } })).toBeNull();
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: '60', ...meta } })).toBeNull();
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: -1, ...meta } })).toBeNull();
+	});
+
 	it('returns null for data-backed markers and non-file values', () => {
 		expect(parseFileValue({ __weft_image__: { data: 'aGk=', ...meta } })).toBeNull();
 		expect(parseFileValue({ __weft_image__: { key: '', ...meta } })).toBeNull();

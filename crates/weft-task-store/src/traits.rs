@@ -10,7 +10,7 @@
 //! `InfraReader` is the exception: its only implementation is the
 //! broker client, because the worker names a run and the broker
 //! decides whose copy that run may reach. The broker reads the row
-//! through `PostgresInfraReader::endpoint_address` after that check.
+//! through `PostgresInfraReader::endpoint` after that check.
 //!
 //! The engine takes `TaskStoreClient` and `InfraReader`; the listener
 //! takes only `TaskStoreClient`.
@@ -120,16 +120,22 @@ pub trait InfraReader: Send + Sync {
 
 pub struct PostgresInfraReader {
     pool: PgPool,
-    /// The install's public base URL, which a public endpoint's stored
-    /// path hangs off; `None` on an install that has none, and then no
-    /// endpoint has a public URL.
-    front_door: Option<String>,
 }
 
 impl PostgresInfraReader {
-    pub fn new(pool: PgPool, front_door: Option<String>) -> Self {
-        Self { pool, front_door }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
+}
+
+/// One endpoint of a running infra node's copy, as stored: its address,
+/// and, for a public endpoint, the path it hangs off the install's
+/// internet address at (the caller joins the two, with
+/// `weft_core::infra::public_url`, against the address as it is now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEndpoint {
+    pub url: String,
+    pub public_path: Option<String>,
 }
 
 impl PostgresInfraReader {
@@ -152,15 +158,16 @@ impl PostgresInfraReader {
         Ok(saved.map(|saved| saved.0).unwrap_or_default())
     }
 
-    /// [`InfraReader::endpoint_address`] once the broker has resolved
-    /// the run: `instance` is which copy (`None` for a shared node).
-    pub async fn endpoint_address(
+    /// The stored half of [`InfraReader::endpoint_address`], once the
+    /// broker has resolved the run: `instance` is which copy (`None` for
+    /// a shared node).
+    pub async fn endpoint(
         &self,
         project_id: Uuid,
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         endpoint_name: &str,
-    ) -> Result<Option<weft_core::infra::EndpointAddress>> {
+    ) -> Result<Option<StoredEndpoint>> {
         let row = sqlx::query(
             "SELECT endpoints_json, public_paths_json FROM infra_node \
              WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3 \
@@ -183,11 +190,8 @@ impl PostgresInfraReader {
             return Ok(None);
         };
         let public_paths: Value = row.try_get("public_paths_json")?;
-        let public_url = match (&self.front_door, entry_in(&public_paths, "public_paths_json", endpoint_name)?) {
-            (Some(base), Some(path)) => Some(weft_core::infra::public_url(base, &path)),
-            _ => None,
-        };
-        Ok(Some(weft_core::infra::EndpointAddress { url, public_url }))
+        let public_path = entry_in(&public_paths, "public_paths_json", endpoint_name)?;
+        Ok(Some(StoredEndpoint { url, public_path }))
     }
 }
 

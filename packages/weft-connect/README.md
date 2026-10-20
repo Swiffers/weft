@@ -54,18 +54,49 @@ export const fallback: RequestHandler = ({ request, params }) => pass(request, p
 It passes on the instance door (`/instance/...`), the signal doors
 (`/signal/...`), the token's listings, displays and files
 (`/signal-token/...`), the program's own routes
-(`/connect/<tenant>/<project id>/<path>`), the picture links in their answers
-(`/public/files/<token>`) and a field's file chooser
-(`/access/picker/<state>` and the result it posts back), and answers 404 for
-anything else. It carries the caller's `Authorization`, `Weft-Instance-Token`,
-body and content type, and hands back the dispatcher's status and the
-`Weft-Run-Id` header a route's answer carries. It also tells the dispatcher
+(`/connect/<tenant>/<project id>/<path>`), a field's file chooser
+(`/access/picker/<state>` and the result it posts back), and the files door:
+links to stored files (`/files/runtime/...`) and the steps of a visitor's
+upload (`/files/upload/<step>`). It answers 404 for anything else. It
+carries the caller's `Authorization`, `Weft-Instance-Token`, body and
+content type, plus the `Range` and `If-*` headers a file read sends, and
+hands back the dispatcher's status, the `Weft-Run-Id` header a route's
+answer carries, and the headers a file read needs (`Content-Range`, `ETag`
+and the like). It also tells the dispatcher
 which address the browser used (your site's host and the `/weft` mount), so a
 link the dispatcher hands back, like a chooser page, points at your site and
 not at the address your server reaches weft on.
 
-Every door streams its body through as it arrives, and hands a redirect
-back to the browser as it is.
+Every door streams its body through as it arrives, except a part of an
+upload: its length is signed into its link, so the pass-through reads it
+whole and sends it with that exact length. A redirect goes back to the
+browser as it is.
+
+If your project's visitor address is your site (`https://shop.example/weft`),
+the links to its files point at your site too, and come back through this
+route. The signature in a link is what lets it in, so it needs no token.
+
+## Uploading a visitor's file
+
+If you want a visitor to send a file, however big, have the program hand
+the page an upload slot (a string starting `weft-upload:`), then send the
+file through it:
+
+```ts
+import { uploadFile } from '@weft/connect';
+
+const sent = await uploadFile(slot, file, (done, total) => (progress = done / total));
+// Send `sent` to your route in the field it declares as a file.
+```
+
+It hashes the file, sends it in parts through `/weft/files/upload/...`, and
+answers the slot, which the route then receives as the stored file. If the
+install already holds the same content, no byte is sent. A part that does
+not land is sent again after asking the install what is missing, a few
+times, and then the upload fails naming what went wrong. If the install
+refuses the file (too big, or a type the slot does not take), the error's
+message is its own sentence, ready to show. Pass `{ base }` if the page
+reaches weft somewhere other than `/weft`.
 
 When a route's run fails, your page gets this, and never the reason, which is
 yours to read:

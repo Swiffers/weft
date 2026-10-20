@@ -2427,8 +2427,8 @@
 			<!-- The declared file display (`features.display`): inline
 			     media (MediaDisplay, the generators) or a download-link
 			     card (DownloadLink), showing the declared port of the
-			     latest firing. Key-backed files fetch through the
-			     authenticated download handshake; url-backed ones
+			     latest firing. Key-backed files load from the presigned
+			     store link the dispatcher answers; url-backed ones
 			     render/link their URL directly. -->
 			{#if typeConfig.display}
 				{#if displayedFileValue}

@@ -165,8 +165,10 @@ pub async fn run_stop_tagged(
     Ok(Json(RunStopTaggedResponse { stops_asker }))
 }
 
-/// Seconds since the unix epoch.
-fn unix_now_secs() -> u64 {
+/// Seconds since the unix epoch, read off the system clock: the one
+/// reading every broker handler makes. A clock before the epoch is a
+/// broken machine, and fails loudly.
+pub(crate) fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -587,11 +589,22 @@ pub async fn infra_endpoint_url(
         (StatusCode::NOT_FOUND, format!("{}: the run's project is no longer registered", req.infra))
     })?;
     require_declared_infra(&declared, &req.infra)?;
-    let address = state
+    let stored = state
         .infra
-        .endpoint_address(run.project, req.infra.place(), instance, req.infra.endpoint())
+        .endpoint(run.project, req.infra.place(), instance, req.infra.endpoint())
         .await
         .map_err(internal)?;
+    // A public endpoint hangs off the address the open internet reaches
+    // now (a quick tunnel's moves when it is opened again), read only for
+    // an endpoint that has one.
+    let address = match stored {
+        None => None,
+        Some(weft_task_store::StoredEndpoint { url, public_path: None }) => Some(weft_core::infra::EndpointAddress { url, public_url: None }),
+        Some(weft_task_store::StoredEndpoint { url, public_path: Some(path) }) => {
+            let base = state.front_door().await.map_err(internal)?;
+            Some(weft_core::infra::EndpointAddress { url, public_url: Some(weft_core::infra::public_url(&base, &path)) })
+        }
+    };
     Ok(Json(InfraEndpointUrlResponse { address }))
 }
 

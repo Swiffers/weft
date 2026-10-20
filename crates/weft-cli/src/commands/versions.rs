@@ -824,7 +824,7 @@ fn replace_stored(value: Value, hashes: &BTreeMap<String, String>) -> Value {
 /// The storage key a stored-file marker carries, if `value` is one.
 fn stored_key(value: &Value) -> Option<String> {
     if let Ok(weft_core::storage::media::MediaSlotContent::Stored {
-        handle: weft_core::storage::FileHandle::Key(key), ..
+        handle: weft_core::storage::FileHandle::Key { key, .. }, ..
     }) = weft_core::storage::media::classify_media_slot(value)
     {
         return Some(key);

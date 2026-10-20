@@ -59,7 +59,7 @@ fn key_of(marker: &str) -> String {
 }
 
 fn claimed(key: &str, mime: &str, size: u64) -> serde_json::Value {
-    weft_core::storage::StoredFile { key: key.into(), mime_type: mime.into(), size_bytes: size, filename: "lie.png".into(), version: weft_core::storage::FIRST_FILE_VERSION }
+    weft_core::storage::StoredFile { key: key.into(), mime_type: mime.into(), size_bytes: size, filename: "lie.png".into(), version: weft_core::storage::FIRST_FILE_VERSION, link_secs: None }
         .to_value()
 }
 

@@ -214,7 +214,7 @@ are running and stop.
 ## Storage
 
 `ctx.storage(scope)` gives you a handle. The scope decides where new files go
-and what `list` sees; `get`, `delete`, `keep` and `presign` act on whatever
+and what `list` sees; `get`, `delete`, `keep` and the links act on whatever
 scope the key itself belongs to, so a later node can read a file without
 knowing where it came from.
 
@@ -223,6 +223,7 @@ For every scope, go and read [Storage](storage.md).
 | Call | What it does |
 |---|---|
 | `identified(id)` | Names what the next put is a copy of, so storing it twice stores it once |
+| `link_lifetime(duration)` | Makes every link to the files this handle stores live that long instead of 15 minutes (at most seven days). The value carries it as `linkSecs` |
 | `put(bytes, mime, filename, keep)` | Stores bytes and gives back the stored-file value |
 | `put_stream(stream, mime, filename, keep)` | The same without holding the file in memory |
 | `put_response(resp, what, mime, filename, keep)` | Streams an HTTP response you already made into storage |
@@ -236,9 +237,11 @@ For every scope, go and read [Storage](storage.md).
 | `delete(&file)` | Deletes it. Stored files only, not URL-backed ones |
 | `list()` | Everything under this scope |
 | `keep(&file, ttl)` | Sets how long the file lives from now on, and saves a run-scoped one from the sweep (that part cannot be undone) |
-| `presign(&file, ttl)` | A temporary link. `None` means the default, about 15 minutes |
-| `public_link(&file, ttl)` | A link the open internet can fetch, or `None` if this install serves none |
-| `caller_link(&file, ttl)` | A link the caller of this run can fetch, on the address its request came in on |
+| `internal_link(&file)` | A `FileLink { url, public }` for code inside the install (a script your node runs), straight to storage |
+| `external_link(&file)` | A `FileLink { url, public }` for anything outside the install. `public: false` means only this machine (or its network) opens it, so an internet service needs the bytes instead |
+| `external_file(&file)` | The external link when it is public, else a `data:` URL of the bytes, with the file's mime type and filename |
+| `upload_slot(max_bytes, accepts, minutes, keep)` | A `weft-upload:...` string a page's visitor uploads one file through, with `uploadFile` from `@weft/connect` |
+| `claim_upload(slot, &ty)`, `claim_uploads(&[(slot, &ty)])` | The file uploaded through each slot, received once into a place of type `ty`. Several slots are received together or not at all, which is what a Route does for the file fields of one call |
 | `externalize(&value, &ty, policy)` | Turns every file inside a typed value into a link or inline bytes, for handing out |
 | `internalize(&value, &ty, keep)` | The reverse: pulls URLs and inline data into stored files |
 

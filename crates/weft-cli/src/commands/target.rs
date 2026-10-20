@@ -911,6 +911,7 @@ mod tests {
             repo: repo.map(|r| weft_core::frontend::Repository { name: r.into(), id: if r == "me/shop" { 1 } else { 2 } }),
             service: Some(format!("fe-{name}")),
             url: None,
+            visitor_address: None,
             token_id: Some(uuid::Uuid::nil()),
             pending_token_ids: Vec::new(),
         };

@@ -55,7 +55,7 @@ so on the page.
 **Start where the reader is**, including the wrong belief they arrived with.
 Taking that apart is usually the first job, before any syntax.
 
-**Reference pages list things.** A person looking up what `ctx.presign`
+**Reference pages list things.** A person looking up what `ctx.storage(scope).external_link`
 returns wants the signature and one line, not an essay. The pages somebody
 reads front to back are the ones that walk.
 

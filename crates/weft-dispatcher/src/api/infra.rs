@@ -1536,28 +1536,31 @@ async fn read_infra_entries(
         })
         .collect();
     let progress: Vec<_> = copies.rows.iter().map(|row| copies.progress_of(&row.node_id, row.instance.as_ref())).collect();
-    Ok(copies
-        .rows
-        .into_iter()
-        .zip(progress)
-        .map(|(row, progress)| row_to_entry(row, progress, state.external_base_url()))
-        .chain(starting)
-        .collect())
+    // Read only once a copy has a public endpoint, so the status of
+    // infra with none answers while the tunnel is down.
+    let front_door = state.external_base();
+    let mut entries = Vec::with_capacity(copies.rows.len() + starting.len());
+    for (row, progress) in copies.rows.into_iter().zip(progress) {
+        let mut public_urls = std::collections::BTreeMap::new();
+        for (name, path) in &row.public_paths {
+            let url = front_door.url(path).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+            public_urls.insert(name.clone(), url);
+        }
+        entries.push(row_to_entry(row, progress, public_urls));
+    }
+    entries.extend(starting);
+    Ok(entries)
 }
 
 /// One row as an entry, with the progress [`infra_node::ObservedCopies::progress_of`]
-/// gives its copy.
+/// gives its copy and the outside address of each of its public endpoints.
 fn row_to_entry(
     row: InfraNodeRow,
     progress: Option<weft_core::infra::wire::ChangeProgress>,
-    front_door: &str,
+    public_urls: std::collections::BTreeMap<String, String>,
 ) -> InfraStatusEntry {
     InfraStatusEntry {
-        public_urls: row
-            .public_paths
-            .iter()
-            .map(|(name, path)| (name.clone(), weft_core::infra::public_url(front_door, path)))
-            .collect(),
+        public_urls,
         node: row.node_id,
         instance: row.instance,
         status: row.status.as_str().to_string(),

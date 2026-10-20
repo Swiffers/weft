@@ -1267,9 +1267,15 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
         for_instance: None,
         signal_token: "sig-1".into(),
         params: [("target".to_string(), "file-9".to_string())].into_iter().collect(),
-        receiver_url: Some("https://public.example/events/fakeoauth/things".into()),
     };
-    let ensured = weft_access_store::ensure_subscription(&pool, &pool, &req).await.unwrap();
+    // The address is read only right before a subscribe call.
+    let address_reads = std::sync::atomic::AtomicUsize::new(0);
+    let receiver = || async {
+        address_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::Ok(Some("https://public.example/events/fakeoauth/things".to_string()))
+    };
+    let ensured = weft_access_store::ensure_subscription(&pool, &pool, &req, receiver).await.unwrap();
+    assert_eq!(address_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(ensured.expires_at.is_some(), "the recipe declares an expiring channel");
 
     // The provider saw ONE subscribe, at the templated target, with
@@ -1309,11 +1315,13 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
     assert_eq!(sub.captures.get("resourceId").map(String::as_str), Some("res-file-9"));
     assert!(watch_calls[0].contains(&sub.token), "the minted token traveled to the provider");
 
-    // A healthy subscription is idempotent: no second provider call.
-    weft_access_store::ensure_subscription(&pool, &pool, &req).await.unwrap();
+    // A healthy subscription is idempotent: no second provider call, and
+    // the address is not even read.
+    weft_access_store::ensure_subscription(&pool, &pool, &req, receiver).await.unwrap();
     let watch_count =
         fake.calls.lock().unwrap().iter().filter(|c| c.starts_with("/watch/")).count();
     assert_eq!(watch_count, 1, "far from expiry, ensure re-subscribes nothing");
+    assert_eq!(address_reads.load(std::sync::atomic::Ordering::SeqCst), 1, "no subscribe, no address read");
 
     // Dropping stops the channel at the provider (with the captured
     // resource id) and forgets the row.
@@ -1361,8 +1369,8 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool
             for_instance: None,
             signal_token: "sig-x".into(),
             params: [("target".to_string(), "f".to_string())].into_iter().collect(),
-            receiver_url: None,
         },
+        || async { anyhow::Ok(None) },
     )
     .await
     .unwrap_err();

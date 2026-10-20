@@ -18,7 +18,7 @@ import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, StoredFileDownload, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { lifecycleCommand } from '../../packages/weft-graph/src/lifecycle-cli';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
@@ -31,6 +31,7 @@ import * as nodePath from 'node:path';
 import { readProjectIdFromToml, readProjectNameFromToml, findProjectRoot } from './sidebar/projects';
 import { NODE_GLOBS } from './diagnostics';
 import { includeRelativeToFile } from './includePath';
+import { storedFilePickerRows, type StoredFileRow } from './storedFilePicker';
 
 /// What a parse answers for a project the dispatcher has never seen.
 const NIL_PROJECT_ID = '00000000-0000-0000-0000-000000000000';
@@ -67,20 +68,12 @@ function unrenderableItem(item: unknown): LiveDataItem {
 export class GraphViewController {
   private panel: vscode.WebviewPanel | undefined;
   /// Set while `open` is between deciding to create the panel and holding
-  /// it (the storage-origin lookup awaits in between). A second `open`
+  /// it. A second `open`
   /// landing in that window waits for this instead of creating a second
   /// panel: the panel is a singleton and the loser would leak.
   private creating: Promise<void> | undefined;
   private watchedDoc: vscode.TextDocument | undefined;
   private watchedProjectId: string | undefined;
-  /// The OBJECT STORE's browser-facing origin (scheme://host:port),
-  /// fetched once from the dispatcher at panel boot. The webview CSP
-  /// allows it in img-src/media-src so an <img>/<video> streams file
-  /// bytes directly from the box (range requests, seeking). Empty if
-  /// the fetch failed (older dispatcher / offline): previews then
-  /// can't load, which surfaces as the node's fallback rather than a
-  /// silent break.
-  private storageOrigin = '';
   /// Include-navigation back-stack. Each frame records the doc the user came
   /// from and the include alias they clicked to descend (used to build the
   /// run-id prefix so sub-graph journal values render). `openInclude`
@@ -350,11 +343,10 @@ export class GraphViewController {
 
   /// Show `doc` as the project's graph on the install `remote` (a copy of
   /// the program it holds, read-only) or, with none, on the local one
-  /// again. The page is rebuilt so its media policy allows the install's
-  /// address.
+  /// again. The page is rebuilt so nothing the webview kept from the
+  /// previous install (its cached connection lists) carries over.
   async showInstall(doc: vscode.TextDocument, projectId: string, remote: RemoteInstall | undefined): Promise<void> {
     this.remoteInstall = remote;
-    this.loadStorageOrigin();
     await this.open(doc, projectId, vscode.ViewColumn.Beside);
     if (this.panel) {
       if (this.panel.title !== this.panelTitle(doc)) this.panel.title = this.panelTitle(doc);
@@ -367,7 +359,6 @@ export class GraphViewController {
   leaveInstall(): void {
     if (!this.remoteInstall) return;
     this.remoteInstall = undefined;
-    this.loadStorageOrigin();
     if (this.panel) this.panel.webview.html = this.renderHtml();
   }
 
@@ -488,10 +479,6 @@ export class GraphViewController {
   }
 
   private async createPanel(doc: vscode.TextDocument, column: vscode.ViewColumn): Promise<void> {
-    // Learn the media origin before rendering the CSP, so an
-    // <img>/<video> can stream the bytes a minted link points at.
-    this.loadStorageOrigin();
-
     this.panel = vscode.window.createWebviewPanel(
       'weft.graph',
       this.panelTitle(doc),
@@ -1453,25 +1440,15 @@ export class GraphViewController {
     await this.triggerParse();
   }
 
-  /// The origin the webview CSP must allow so inline media can load.
-  /// A file link is minted on whichever address the request went out
-  /// on, so that address IS the origin to allow, and reading it off
-  /// the client we are about to call cannot disagree with where the
-  /// link comes back pointing.
-  private loadStorageOrigin(): void {
-    this.storageOrigin = originOf(this.client.getBaseUrl() ?? '');
-  }
-
   /// Drive one storage-plane verb for the webview: POST the body to the
   /// dispatcher's `/storage/<path>` route (the client authenticates), reply
   /// with a correlated `storageResult`. The single brokered channel behind
-  /// every webview storage call (inline preview's download handshake, the
-  /// file-drop upload's begin/parts/part-done/complete/abort). Bytes never
-  /// pass here: the calls return presigned bucket URLs the webview uses.
+  /// every webview storage call (today the inline preview's download link).
+  /// Bytes never pass here: the call answers a presigned link straight to
+  /// the object store, which the webview's element loads.
   ///
   /// The host owns the project identity (the editor session's project), so it
-  /// stamps `project` into every body: the dispatcher scopes uploads +
-  /// downloads to it. A 404 becomes an `error` reply (a swept/expired file, or
+  /// stamps `project` into every body. A 404 becomes an `error` reply (a swept/expired file, or
   /// a download for a missing key) so the caller can show its own fallback.
   private async runStorageCall(requestId: number, path: string, body: unknown): Promise<void> {
     try {
@@ -1649,11 +1626,11 @@ export class GraphViewController {
     }
   }
 
-  /// The project's STORED runtime files for the picker: the same listing door
-  /// `weft files` uses (the dispatcher's tenant file list), filtered to THIS
-  /// project's `project/` scope plus the tenant's assets (content-addressed
-  /// `asset/<sha256>`, shared by every project of the tenant), keys handed
-  /// back TENANT-LESS (the short address a picked ref writes into source).
+  /// The STORED runtime files the picker offers: the same listing door
+  /// `weft files` uses (the dispatcher's tenant file list), narrowed to the
+  /// files this project's runs can read (see `storedFilePickerRows`), keys
+  /// handed back TENANT-LESS (the short address a picked ref writes into
+  /// source).
   private async runListRuntimeFiles(requestId: number): Promise<void> {
     const pid = this.watchedProjectId;
     if (!pid) {
@@ -1666,18 +1643,8 @@ export class GraphViewController {
       return;
     }
     try {
-      const resp = await this.client.get<{
-        files: { key: string; filename: string; mimeType: string; sizeBytes: number }[];
-      }>('/storage/files');
-      const files = (resp.files ?? []).flatMap((f) => {
-        const slash = f.key.indexOf('/');
-        if (slash < 0) return [];
-        const scopeKey = f.key.slice(slash + 1);
-        if (!scopeKey.startsWith(`project/${pid}/`) && !scopeKey.startsWith('asset/')) {
-          return [];
-        }
-        return [{ key: scopeKey, filename: f.filename, mimeType: f.mimeType, sizeBytes: f.sizeBytes }];
-      });
+      const resp = await this.client.get<{ files: StoredFileRow[] }>('/storage/files');
+      const files = storedFilePickerRows(resp.files ?? [], pid);
       this.post({ kind: 'runtimeFiles', requestId, files });
     } catch (e) {
       // A failed listing must never render as "this project has no stored
@@ -1691,13 +1658,13 @@ export class GraphViewController {
     }
   }
 
-  /// Stored-file download: handshake with the dispatcher (it
-  /// authenticates and asks the tenant's storage box to mint a
-  /// short-lived capability), then open the box's public URL in the
-  /// browser, which streams the bytes DIRECTLY from the box.
+  /// Stored-file download: the dispatcher authenticates and answers a
+  /// short-lived presigned link straight to the object store, which the
+  /// browser opens. The store answers it as an attachment under the
+  /// file's name, so the browser saves the file rather than showing it.
   private async runDownloadStoredFile(key: string): Promise<void> {
     try {
-      const resp = await this.client.post<{ url: string }>(
+      const resp = await this.client.post<StoredFileDownload>(
         '/storage/files/download',
         { key },
       );
@@ -2479,11 +2446,17 @@ export class GraphViewController {
     );
     const cspSource = panel.webview.cspSource;
     const nonce = randomNonce();
+    // Images and media load from any http(s) address: a stored file's
+    // link points straight at the object store (the local store's
+    // loopback port, or Cloud Storage), which no fixed origin names, and
+    // a url-backed file value points wherever its URL does. Nothing in
+    // the page fetches over the network (every call goes through the
+    // host), so connect-src stays on the webview's own resources.
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data: https: http: ${this.storageOrigin}; media-src ${cspSource} https: http: ${this.storageOrigin}; font-src ${cspSource}; connect-src ${cspSource} ${this.storageOrigin};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data: https: http:; media-src ${cspSource} https: http:; font-src ${cspSource}; connect-src ${cspSource};">
 <link rel="stylesheet" href="${bundleCss}">
 <title>Weft Graph</title>
 <style>html,body,#app{margin:0;padding:0;width:100%;height:100%;overflow:hidden}</style>
@@ -2493,17 +2466,6 @@ export class GraphViewController {
 <script nonce="${nonce}" src="${bundleJs}"></script>
 </body>
 </html>`;
-  }
-}
-
-/// The origin of a base URL, or '' when it is empty/unparseable. A
-/// missing origin narrows the webview's policy (the surface using it
-/// fails visibly at the point of use), never widens it.
-function originOf(baseUrl: string): string {
-  try {
-    return new URL(baseUrl).origin;
-  } catch {
-    return '';
   }
 }
 

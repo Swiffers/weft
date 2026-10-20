@@ -66,29 +66,6 @@ impl Platform {
         Ok(Self { pool, install })
     }
 
-    /// How many live PUBLIC RELAY file links point at one run's files: its
-    /// run's own (`<tenant>/run/<run_id>/...`) and its project's
-    /// (`<tenant>/project/<project>/...`, and the tenant's assets the project
-    /// references, `<tenant>/asset/<sha256>`).
-    /// A minted relay link (a media slot externalized as
-    /// `<base>/public/files/<token>`) leaves one row until it expires, so a
-    /// test that just externalized media can tell which path it took: rows
-    /// appeared = relay links; none = inline bytes (or the direct-bucket
-    /// path, which a local install never has). Only this run's, so a test
-    /// running beside it never changes the answer.
-    pub async fn public_file_link_count_for(&self, run_id: &Uuid, project: &Uuid) -> Result<i64> {
-        sqlx::query_scalar(
-            "SELECT count(*) FROM public_file_link \
-             WHERE key LIKE '%/' || $1 || '/%' OR key LIKE '%/' || $2 || '/%' \
-                OR key IN (SELECT key FROM asset_reference WHERE project_id = $2)",
-        )
-        .bind(run_id.to_string())
-        .bind(project.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .context("count public file links")
-    }
-
     /// The replica that wrote the last row of a run's record: for an ended
     /// run, the worker that ended it (`run.owner` is cleared once a run
     /// ends). None for a run nothing wrote yet.

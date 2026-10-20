@@ -31,7 +31,8 @@ These paths, and nothing else. Everything else on that address answers 404.
 | `GET /signal-token/displays/<project>/<node>` | That client reading one node's display |
 | `POST /signal-token/displays/<project>/<node>/action` | That client pressing a button on it |
 | `/instance/...` | Somebody holding an instance token for one of your programs: that instance's fields, its connections, its runs (a failed run shows only `Something went wrong`; the reason stays on the run's record, where `weft logs <run id>` shows it to you) |
-| `GET /public/files/<token>` | Somebody fetching a file link your program handed out |
+| `GET`, `HEAD` or `PUT /files/runtime/...` | Somebody opening a file link your program handed out, or a page sending a part of an upload. The link's own signature is what lets it in |
+| `POST /files/upload/<step>` | A page uploading a file through an upload slot your program handed it |
 | `/connect/<tenant>/<project id>/<path>` | A caller of one of your routes or sockets |
 | `/infra/<project>/<copy>/...` | A caller of an infrastructure endpoint your node opened to the public |
 | `GET /access/oauth/callback` | A provider sending you back after you approve a connection |

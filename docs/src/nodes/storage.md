@@ -21,7 +21,7 @@ The scope decides where new files go, and how long they live.
 | `Asset` | The project's `@asset` copies | Readable by your node, and the worker refuses writes to it |
 | `Instance { of }` | One instance's space in this project (`StorageScope::instance()` for the run's own instance, `instance_of(id)` for any) | Until removed. For what removes them and who reaches them, go and read [an instance's files](../running/instances.md#an-instances-files) |
 
-The scope governs **writes and lists**. Reading, deleting, keeping and signing
+The scope governs **writes and lists**. Reading, deleting, keeping and linking
 act on whatever scope the key itself belongs to, so a later node can `get` a
 file without knowing where it came from. `copy` is the one that does both,
 reading from the key's scope and writing into yours, which is how a file
@@ -140,6 +140,20 @@ all.
 
 Name the source, like `<service>:<id>`, not the content.
 
+### A file from a page's visitor
+
+If a visitor of your site needs to send the program a big file (a video, say),
+give the page an upload slot. `upload_slot(max_bytes, accepts, minutes, keep)`
+(or the `UploadSlot` node) answers a plain string, `weft-upload:...`, that is
+safe to hand to the page. The page sends the file straight to storage with
+`uploadFile(slot, file)` from `@weft/connect`, in parts that resume after a
+dropped connection. Then it calls a Route with the slot in a field typed as a
+file (`{ "video": "weft-upload:..." }`), and the Route receives the stored
+file. `accepts` is a weft type (`Video`, `Image | Video`, `File`), checked
+against the file's first bytes. The file lands in the handle's scope, a slot
+takes one file and is received once, and an upload nobody received within
+`minutes` goes.
+
 ## Reading
 
 | Call | Gives you |
@@ -152,24 +166,53 @@ Name the source, like `<service>:<id>`, not the content.
 
 ## Handing a file out
 
-| Call | The link reaches |
+A file value carries no link. If you want one, ask for it, and pick the call by
+who will open it:
+
+| Call | Use it when |
 |---|---|
-| `presign(&file, ttl)` | Whoever you give it to, for about 15 minutes by default |
-| `public_link(&file, ttl)` | The open internet, or `None` when this install serves no public address |
-| `caller_link(&file, ttl)` | The caller of this run, on the address its request came in on. This is what a route's answer carries in place of a file |
-| `external_url(&file)` | An outside service you are sending the file to: the public link when there is one, else a `data:` URL carrying the bytes |
-| `external_file(&file)` | The same, plus the file's mime type and filename, for an API that wants them beside the link |
+| `internal_link(&file)` | Code inside the install opens it: a script or a process your node runs on the worker. The link goes straight to storage, never out through a tunnel and back |
+| `external_link(&file)` | Anything outside the install opens it: a browser, an app, a provider's API. This is the link a `Reply` puts in its answer in place of a file |
+| `external_file(&file)` | You are sending the file to an outside service: its external link when the open internet can open it, else a `data:` URL carrying the bytes, with the file's mime type and filename beside it |
 
-`public_link` returning `None` is not a failure. It means the store is private
-and nothing is relaying it. If you are handing a file to a provider's API (an
-image to edit, a video to dub), call `external_url` instead of writing that
-fallback yourself.
+Both links come back as a `FileLink { url, public }`, where `public` says
+whether the open internet can open `url`. An external link goes the first of
+these ways that exists:
 
-If your install answers on more than one address (the loopback port, a tunnel,
-a domain), `caller_link` builds the link on the one the caller used, so a
-browser on `http://127.0.0.1:14111` gets a loopback link even while the tunnel
-is open. If no request started the run (`weft run --fire`), the link uses the
-install's internet address, or its own address when it has none.
+1. On a cloud install, the cloud store's own link. Public.
+2. Through the project's visitor address: the address a site's server passes
+   weft's doors on at, set with `weft frontend add <name> --visitor-address
+   https://shop.example/weft` or later with `weft frontend visitor-address
+   <name> <url>`. Public.
+3. Through weft's tunnel, when it is open (`./setup.sh --public-url`). Public.
+4. The install's own address, which only this machine opens (and the devices
+   on its network, if the install was started with `WEFT_NETWORK_ADDRESS`).
+   `public` is `false`.
+
+If you are handing a file to a provider's API (an image to edit, a video to
+dub) and the link says `public: false`, the provider cannot fetch it, so send
+the bytes in your request instead. `external_file` makes that choice for you.
+
+A link lives 15 minutes. If you want the links to a file you store to live
+longer (a video somebody will watch for an hour), set it on the handle:
+
+```rust
+ctx.storage(StorageScope::Project)
+    .link_lifetime(Duration::from_secs(2 * 3600))?
+    .put(bytes, "video/mp4", "clip.mp4", None)
+    .await?;
+```
+
+The value that comes back carries `linkSecs`, and every link any node makes
+from that value lives that long. For a file a program already has, the
+`LinkOptions` node sets it. A link lives at most seven days: a longer lifetime
+is refused right where you set it. Handing a link out also keeps the file
+stored at least as long as the link works.
+
+Every link is a download: opening it in a tab saves the file under its name,
+while an `<img>`, `<video>` or `<audio>` tag still shows or plays it. And the
+same file asked for twice within one link lifetime gets the same link, so a
+page that asks again keeps its video playing.
 
 ## Whole values full of files
 
@@ -185,11 +228,11 @@ exactly that.
 `data:` URLs and external links and stores them, giving you back something you
 can emit and that will still work tomorrow.
 
-The rule that makes it safe: **the link never leaves your node, and the marker
-never leaves weft.** Anything you emit, park on, or memoize is stripped back to
-the stored form for you. What `externalize` gives you is no longer a value of
-that type, because presigned links expire, so hand it to whoever asked and do
-not store it.
+The rule that makes it safe: **the marker never leaves weft, and a file value
+never holds a link.** So nothing you emit, park on or memoize carries one, and
+neither does the journal. What `externalize` gives you is no longer a value of
+that type, and its links expire, so hand it to whoever asked and do not store
+it.
 
 ## What a stored file looks like
 
@@ -203,7 +246,8 @@ was stored.
 | `Audio` | `audio/*` |
 | `Blob` | Everything else: a PDF, a zip |
 
-Inside is the key, the mime type, the size and the filename. **No URL**, which
+Inside is the key, the mime type, the size, the filename, the `version`, and
+`linkSecs` when somebody set a link lifetime. **No URL**, which
 is deliberate: a link expires and a marker does not, so the marker is what goes
 on wires and into the journal.
 

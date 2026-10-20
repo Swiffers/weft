@@ -4,7 +4,7 @@
 //! way the CLI / web app does:
 //!   - list:     `GET /storage/files` -> `{ files: [meta...] }`
 //!   - download: `POST /storage/files/download { key }` -> `{ url }`,
-//!               then GET the bytes from that (box-public) URL.
+//!               then GET the bytes from that link, straight from the store.
 //!
 //! File keys are scoped: `run/<run_id>/<id>` (run scratch, swept on
 //! terminate unless kept), `project/<project_id>/<id>`, `shared/<name>/<id>`.

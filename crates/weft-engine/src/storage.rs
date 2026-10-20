@@ -17,7 +17,8 @@
 //! the quota reservation) and surfaces loud. A get is simpler: `download-url`
 //! returns the metadata + a presigned GET URL, and the worker reads the bytes
 //! DIRECTLY from the bucket. Presigned URLs are signed for the worker's internal
-//! endpoint.
+//! endpoint. A copy is the broker's own (`copy`): the bucket copies the object,
+//! so nothing passes through the worker.
 //!
 //! There is no "ensure the storage exists" handshake and no retry-on-
 //! unreachable dance: the broker is a long-lived install service, always up
@@ -31,11 +32,11 @@ use futures::TryStreamExt;
 use serde_json::Value;
 
 use weft_core::storage::{
-    ByteRange, ByteStream, DownloadUrlResponse, KeepTtl, ListFilesResponse, PresignResponse,
-    PresignedPart, StorageScope, StoredFile, StoredFileMeta, UploadBeginResponse,
-    UploadPartsResponse, UploadResumeResponse,
+    ByteRange, ByteStream, DownloadUrlResponse, KeepTtl, LinkAnswer, LinkReach, ListFilesResponse, PresignedPart,
+    StorageScope, StoredFile, StoredFileMeta, UploadBeginResponse, UploadPartsResponse, UploadResumeResponse,
 };
 use weft_core::error::{WeftError, WeftResult};
+use weft_core::weft_type::WeftType;
 use weft_core::RunId;
 
 /// The run claim header the worker stamps on every storage call.
@@ -82,13 +83,24 @@ pub trait WorkerStorageOps: Send + Sync {
     /// The file already stored under `identity` in `scope`, if any.
     async fn find(&self, run_id: RunId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>>;
     async fn keep(&self, run_id: RunId, key: &str, ttl: KeepTtl) -> WeftResult<()>;
-    /// A temporary link to `key`: internet-reachable when the install
-    /// serves one, else signed for the install's own address.
-    async fn presign(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
-    /// A temporary URL for `key` that `reach` can open, or `None` when
-    /// the deployment cannot serve one (an internet asker falls back to
-    /// inline bytes).
-    async fn public_link(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>>;
+    /// A link to `key` for `reach`, living `ttl_secs` (`None`: the
+    /// default), with the file's record.
+    async fn link(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>, reach: LinkReach) -> WeftResult<LinkAnswer>;
+    /// A copy of `key` into `scope`, made inside the store.
+    async fn copy(
+        &self,
+        run_id: RunId,
+        key: &str,
+        scope: &StorageScope,
+        identity: Option<&str>,
+        keep: Option<KeepTtl>,
+    ) -> WeftResult<Value>;
+    /// A slot a page uploads one file through.
+    async fn upload_slot(&self, run_id: RunId, request: &weft_core::storage::slot::UploadSlotRequest) -> WeftResult<String>;
+    /// The files uploaded through each claim's slot, received by `run_id`
+    /// each for a place of its type, in the claims' order: all of them or
+    /// none.
+    async fn claim_uploads(&self, run_id: RunId, claims: &[(&str, &WeftType)]) -> WeftResult<Vec<Value>>;
 }
 
 /// Map a broker HTTP failure to a node-facing error. A transport failure
@@ -101,13 +113,34 @@ fn http_err(context: &str, e: reqwest::Error) -> WeftError {
 
 async fn status_err(context: &str, resp: reqwest::Response) -> WeftError {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = match body_text(context, resp).await {
+        Ok(body) => body,
+        Err(e) => return e,
+    };
     match status.as_u16() {
         404 => WeftError::NodeFailed(format!("storage file not found: {body}")),
         401 | 403 => WeftError::NodeFailed(format!("storage denied: {body}")),
         413 => WeftError::NodeFailed(format!("storage quota exceeded: {body}")),
         _ => WeftError::NodeFailed(format!("storage: {context}: {status}: {body}")),
     }
+}
+
+/// The body of a broker answer. A body that cannot be read is a failure
+/// of its own, never an empty message.
+async fn body_text(context: &str, resp: reqwest::Response) -> WeftResult<String> {
+    let status = resp.status();
+    resp.text()
+        .await
+        .map_err(|e| WeftError::NodeFailed(format!("storage: {context}: {status}, and its body could not be read: {e}")))
+}
+
+/// The statuses a claim answers when the slot is no good for this call
+/// (malformed, unknown, already received by another run, ended, too big,
+/// or not of the type asked). Every other 4xx (the worker's own
+/// credentials refused, a timeout, a rate limit) is not the caller's to
+/// fix.
+fn is_slot_refusal(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 404 | 409 | 410 | 413 | 422)
 }
 
 /// How many times a completion is asked before giving up: with the 1s
@@ -360,7 +393,13 @@ impl WorkerStorage {
                     CompleteStep::Landed => {
                         return resp.json().await.map_err(|e| http_err("upload complete", e));
                     }
-                    CompleteStep::Retry => last = format!("{}: {}", resp.status(), resp.text().await.unwrap_or_default()),
+                    CompleteStep::Retry => {
+                        let status = resp.status();
+                        last = match body_text("upload complete", resp).await {
+                            Ok(body) => format!("{status}: {body}"),
+                            Err(e) => e.to_string(),
+                        };
+                    }
                     CompleteStep::Ended => {
                         let e = status_err("upload complete", resp).await;
                         return Err(WeftError::NodeFailed(format!("storage: upload '{key}' was ended by the broker: {e}")));
@@ -485,7 +524,7 @@ impl WorkerStorage {
             .map_err(|e| format!("PUT part to bucket: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.map_err(|e| format!("bucket rejected part: {status}, and its body could not be read: {e}"))?;
             return Err(format!("bucket rejected part: {status}: {body}"));
         }
         resp.headers()
@@ -690,41 +729,78 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(())
     }
 
-    async fn presign(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
-        let resp = self
-            .authed(self.http.post(self.url("/v1/storage/presign")), run_id)
-            .await?
-            .json(&weft_core::storage::PresignRequest {
+    async fn link(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>, reach: LinkReach) -> WeftResult<LinkAnswer> {
+        self.post_json(
+            "/v1/storage/link",
+            run_id,
+            &weft_core::storage::LinkRequest { key: key.to_string(), ttl_secs, reach },
+            "link",
+        )
+        .await
+    }
+
+    async fn copy(
+        &self,
+        run_id: RunId,
+        key: &str,
+        scope: &StorageScope,
+        identity: Option<&str>,
+        keep: Option<KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.post_json(
+            "/v1/storage/copy",
+            run_id,
+            &weft_core::storage::CopyRequest {
                 key: key.to_string(),
-                ttl_secs,
-                reach: weft_core::storage::LinkReach::Internet,
-            })
-            .send()
-            .await
-            .map_err(|e| http_err("presign", e))?;
-        if !resp.status().is_success() {
-            return Err(status_err("presign", resp).await);
-        }
-        let out: PresignResponse = resp.json().await.map_err(|e| http_err("presign response", e))?;
-        Ok(out.url)
+                scope: scope.clone(),
+                identity: identity.map(str::to_string),
+                keep,
+            },
+            "copy",
+        )
+        .await
     }
 
-    async fn public_link(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
+    async fn upload_slot(&self, run_id: RunId, request: &weft_core::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        let out: weft_core::storage::slot::UploadSlotResponse =
+            self.post_json("/v1/storage/upload-slot", run_id, request, "upload slot").await?;
+        Ok(out.slot)
+    }
+
+    /// A refusal of any slot (no good, ended, another project's, already
+    /// received, too big, not of the type its place takes, or nothing
+    /// finished uploading through it) receives none of them, is the
+    /// caller's to fix and comes back as an input error in the store's
+    /// words. Anything else, the broker refusing the worker's own
+    /// credentials included, is the node's failure.
+    async fn claim_uploads(&self, run_id: RunId, claims: &[(&str, &WeftType)]) -> WeftResult<Vec<Value>> {
+        use weft_core::storage::slot::{ClaimUploadRequest, ClaimUploadResponse, SlotClaim};
+        let request = ClaimUploadRequest {
+            claims: claims.iter().map(|(slot, fits)| SlotClaim { slot: slot.to_string(), fits: fits.wire_string() }).collect(),
+        };
         let resp = self
-            .authed(self.http.post(self.url("/v1/storage/public-link")), run_id)
+            .authed(self.http.post(self.url("/v1/storage/upload/claim")), run_id)
             .await?
-            .json(&weft_core::storage::PresignRequest { key: key.to_string(), ttl_secs, reach })
+            .json(&request)
             .send()
             .await
-            .map_err(|e| http_err("public-link", e))?;
-        if !resp.status().is_success() {
-            return Err(status_err("public-link", resp).await);
+            .map_err(|e| http_err("receive uploads", e))?;
+        if is_slot_refusal(resp.status()) {
+            return Err(WeftError::Input(body_text("receive uploads", resp).await?));
         }
-        let out: weft_core::storage::PublicLinkResponse =
-            resp.json().await.map_err(|e| http_err("public-link response", e))?;
-        Ok(out.url)
+        if !resp.status().is_success() {
+            return Err(status_err("receive uploads", resp).await);
+        }
+        let answer: ClaimUploadResponse = resp.json().await.map_err(|e| http_err("receive uploads", e))?;
+        if answer.files.len() != claims.len() {
+            return Err(WeftError::NodeFailed(format!(
+                "storage: receive uploads: asked for {} files, the broker answered {}",
+                claims.len(),
+                answer.files.len()
+            )));
+        }
+        Ok(answer.files)
     }
-
 }
 
 // ---------- fake (tests) ----------
@@ -742,6 +818,7 @@ mod fake {
     use std::collections::BTreeMap;
 
     use weft_core::storage::key::{self, CallerAuth};
+    use weft_core::storage::FileLink;
 
     pub struct FakeWorkerStorage {
         /// The seeded caller identity the wall checks against (tenant t1,
@@ -937,29 +1014,52 @@ mod fake {
             Ok(())
         }
 
-        async fn presign(&self, _run_id: RunId, key: &str, _ttl_secs: Option<u64>) -> WeftResult<String> {
+        async fn link(&self, _run_id: RunId, key: &str, ttl_secs: Option<u64>, reach: LinkReach) -> WeftResult<LinkAnswer> {
             self.enforce_wall(key)?;
-            if !self.files.lock().contains_key(key) {
-                return Err(WeftError::NodeFailed(format!("storage file not found: {key}")));
-            }
-            Ok(format!("https://fake-bucket/runtime/{key}?sig=fake"))
+            let file = self
+                .files
+                .lock()
+                .get(key)
+                .map(|(meta, _)| meta.clone())
+                .ok_or_else(|| WeftError::NodeFailed(format!("storage file not found: {key}")))?;
+            let ttl = ttl_secs.unwrap_or(weft_core::storage::DEFAULT_LINK_SECS);
+            // The fake install is reached by nobody outside: its outside
+            // link is the install's own address, which the internet does
+            // not open.
+            let link = match reach {
+                LinkReach::Internal => FileLink { url: format!("http://fake-bucket/runtime/{key}?ttl={ttl}"), public: false },
+                LinkReach::External => FileLink { url: format!("http://fake-install/files/runtime/{key}?ttl={ttl}"), public: false },
+            };
+            Ok(LinkAnswer { link, file })
         }
 
-        async fn public_link(&self, _run_id: RunId, key: &str, _ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
+        async fn copy(
+            &self,
+            run_id: RunId,
+            key: &str,
+            scope: &StorageScope,
+            identity: Option<&str>,
+            keep: Option<KeepTtl>,
+        ) -> WeftResult<Value> {
             self.enforce_wall(key)?;
-            if !self.files.lock().contains_key(key) {
-                return Err(WeftError::NodeFailed(format!("storage file not found: {key}")));
-            }
-            // The fake deployment serves no internet links (callers
-            // exercise the inline fallback); a caller of the fake install
-            // gets a stable address.
-            Ok(match reach {
-                weft_core::storage::LinkReach::Internet => None,
-                weft_core::storage::LinkReach::Caller { base } => Some(format!(
-                    "{}/public/files/{key}",
-                    base.as_deref().unwrap_or("http://fake-install")
-                )),
-            })
+            let (meta, bytes) = self
+                .files
+                .lock()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| WeftError::NodeFailed(format!("storage file not found: {key}")))?;
+            self.put(run_id, scope, identity, &meta.mime_type, &meta.filename, keep, Some(meta.size_bytes), weft_core::storage::bytes_stream(bytes))
+                .await
+        }
+
+        async fn upload_slot(&self, _run_id: RunId, request: &weft_core::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+            request.validate().map_err(WeftError::Input)?;
+            Ok(format!("{}fake-slot", weft_core::storage::slot::SLOT_PREFIX))
+        }
+
+        async fn claim_uploads(&self, _run_id: RunId, claims: &[(&str, &WeftType)]) -> WeftResult<Vec<Value>> {
+            let slots: Vec<&str> = claims.iter().map(|(slot, _)| *slot).collect();
+            Err(WeftError::Input(format!("nothing was uploaded through '{}' (the fake storage takes no page's upload)", slots.join("', '"))))
         }
     }
 }
@@ -978,5 +1078,62 @@ mod complete_tests {
         // An unmarked conflict is some other refusal, never "still landing".
         assert_eq!(complete_step(StatusCode::CONFLICT, false), CompleteStep::Refused);
         assert_eq!(complete_step(StatusCode::BAD_REQUEST, false), CompleteStep::Refused);
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use weft_core::storage::slot::{ClaimUploadRequest, ClaimUploadResponse};
+
+    /// A broker answering `upload/claim`: a claim for an `Audio` place is
+    /// refused naming its slot (409), a slot named `short` gets an answer
+    /// missing a file, a slot named `locked` is the worker's own
+    /// credentials refused (401), and anything else is answered with one
+    /// file per claim, keyed by its slot.
+    async fn broker() -> Arc<WorkerStorage> {
+        async fn claim(axum::Json(req): axum::Json<ClaimUploadRequest>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if let Some(refused) = req.claims.iter().find(|c| c.fits == "Audio") {
+                return (StatusCode::CONFLICT, format!("the file uploaded through '{}' does not fit here", refused.slot)).into_response();
+            }
+            if req.claims.iter().any(|c| c.slot == "locked") {
+                return (StatusCode::UNAUTHORIZED, "who are you").into_response();
+            }
+            let files = req.claims.iter().filter(|c| c.slot != "short").map(|c| serde_json::json!({"key": c.slot, "fits": c.fits})).collect();
+            axum::Json(ClaimUploadResponse { files }).into_response()
+        }
+        let app = axum::Router::new().route("/v1/storage/upload/claim", axum::routing::post(claim));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = weft_broker_client::TokenSource::worker(Arc::new(weft_platform_traits::identity::FixedToken("t".into())), "r1");
+        WorkerStorage::new(format!("http://{addr}"), token)
+    }
+
+    /// Every slot of one claim goes to the broker in ONE request and the
+    /// files come back in the claims' order; a refusal of any slot is the
+    /// caller's input error in the broker's words, and an answer missing a
+    /// file or the worker's credentials refused is the node's failure.
+    #[tokio::test]
+    async fn uploads_are_claimed_in_one_request_all_or_none() {
+        let storage = broker().await;
+        let ty = |t: &str| WeftType::parse(t).unwrap();
+        let (image, video, audio) = (ty("Image"), ty("Video | Null"), ty("Audio"));
+        let files = storage.claim_uploads(RunId::nil(), &[("weft-upload:a", &image), ("weft-upload:b", &video)]).await.unwrap();
+        assert_eq!(
+            files,
+            [serde_json::json!({"key": "weft-upload:a", "fits": "Image"}), serde_json::json!({"key": "weft-upload:b", "fits": "Video | Null"})]
+        );
+
+        let refused = storage.claim_uploads(RunId::nil(), &[("weft-upload:a", &image), ("weft-upload:b", &audio)]).await.unwrap_err();
+        assert!(matches!(&refused, WeftError::Input(why) if why.contains("'weft-upload:b' does not fit")), "{refused:?}");
+
+        let short = storage.claim_uploads(RunId::nil(), &[("weft-upload:a", &image), ("short", &image)]).await.unwrap_err();
+        assert!(matches!(&short, WeftError::NodeFailed(why) if why.contains("asked for 2 files, the broker answered 1")), "{short:?}");
+
+        let locked = storage.claim_uploads(RunId::nil(), &[("locked", &image)]).await.unwrap_err();
+        assert!(matches!(locked, WeftError::NodeFailed(_)), "{locked:?}");
     }
 }

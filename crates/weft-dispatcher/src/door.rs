@@ -9,10 +9,6 @@
 //! its root; the install's own domains and any other name reach the
 //! public API itself.
 //!
-//! A project's API answers one path of the install's besides its routes:
-//! the file links its callers are handed (`/public/files/{token}`), which
-//! are built on the address the caller used (`crate::storage::LinkBase`).
-//!
 //! The domains are held in memory and read again when one comes or goes
 //! (`crate::held`), so routing a request costs no trip to the database.
 
@@ -92,11 +88,6 @@ fn without_port(host: &str) -> &str {
     }
 }
 
-/// The install's file links (`/public/files/{token}`), which a project's
-/// API answers too: they are built on the address a caller used, a
-/// project's own among them.
-const FILE_LINKS: &str = "/public/files/";
-
 /// Where the path of an API domain's request goes on the install: one of
 /// the project's routes, passed on through the relay under its tenant and
 /// project.
@@ -159,9 +150,6 @@ async fn route(State(door): State<Door>, mut request: Request) -> Response {
             let path_and_query = request.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
             let upstream = crate::proxy::Upstream { what: "the frontend", base_url: upstream, auth: None, hold: None };
             crate::proxy::forward(&door.state.http, upstream, path_and_query, request, crate::proxy::Forwarding::Proxied).await
-        }
-        Destination::Api { .. } if request.uri().path().starts_with(FILE_LINKS) => {
-            door.inner.oneshot(request).await.unwrap_or_else(|never| match never {})
         }
         Destination::Api { project } => {
             let tenant = match door.state.projects.tenant_for(project).await {

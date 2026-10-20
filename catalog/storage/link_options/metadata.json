@@ -1,0 +1,48 @@
+{
+  "type": "LinkOptions",
+  "label": "Link Options",
+  "description": "Set how long the links handed out for a stored file live: every link made from the file this emits (a Reply's answer, a provider's input, a script's link) works for `minutes`. Stores nothing and changes no file: it emits the same file with the new setting. A link to a stored file is always a download (opening it saves the file), and an image, a video or an audio element shows or plays it as usual.",
+  "tags": [
+    "storage",
+    "link",
+    "url",
+    "share",
+    "lifetime",
+    "file"
+  ],
+  "icon": "Link",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "file",
+      "type": "T",
+      "required": true,
+      "description": "A stored file, of any kind."
+    },
+    {
+      "name": "minutes",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 10080,
+        "step": 1
+      },
+      "label": "Links live (minutes)",
+      "description": "How long each link made from this file works, 1 minute to 7 days (10080). Empty: the default, 15 minutes."
+    }
+  ],
+  "typeParams": {
+    "T": "File"
+  },
+  "outputs": [
+    {
+      "name": "file",
+      "type": "T",
+      "description": "The same file, its links living `minutes`. The same kind that came in: a Video stays a Video."
+    }
+  ],
+  "features": {
+    "pure": true
+  }
+}

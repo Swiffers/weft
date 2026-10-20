@@ -213,7 +213,7 @@ fn enforce_scope(
     Ok(())
 }
 
-async fn lookup_project_tenant(
+pub(crate) async fn lookup_project_tenant(
     cache: &ScopeCache,
     pool: &PgPool,
     project_id: uuid::Uuid,
@@ -238,7 +238,7 @@ async fn lookup_project_tenant(
     Ok(tenant)
 }
 
-async fn lookup_run_id_scope(
+pub(crate) async fn lookup_run_id_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     run_id: weft_core::RunId,

@@ -252,7 +252,13 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         tenant_router,
         project_reclaimer,
         public_base_url: config.public_url.trim_end_matches('/').to_string(),
-        internet_url: config.internet_url.clone(),
+        internet: config.internet_address(),
+        files: match &config.object_store {
+            weft_platform_traits::config::ObjectStoreSettings::S3(store) if !store.public_internet => {
+                Some(crate::files_door::FilesTarget { endpoint: store.endpoint.clone(), bucket: store.bucket.clone() })
+            }
+            _ => None,
+        },
         edge: config.edge,
         broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens.clone(), http.clone()),
         broker_line: weft_broker_client::BrokerLink::new(

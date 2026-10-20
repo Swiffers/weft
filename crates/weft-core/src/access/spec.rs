@@ -1900,6 +1900,7 @@ impl AccessSpec {
 /// Hand-rolled because the pure type layer carries no url crate;
 /// public so callers with the same need (a provider building a query
 /// path) do not grow their own copy.
+// SYNC: percent_encode <-> packages/weft-connect/src/server/passthrough.ts encodeSegment
 pub fn percent_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());

@@ -4606,15 +4606,18 @@ async fn collect_listener_urls(
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<Vec<ActivationUrl>> {
     let signals = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, keys).await?;
+    // Read only once a signal has an outside address, so a project
+    // with none (cron only) activates while the tunnel is down.
+    let base = state.external_base();
     let mut out = Vec::new();
     for meta in signals {
         if meta.is_resume {
             continue;
         }
-        if let Some(url) = meta.public_url(state.external_base_url()) {
+        if let Some(path) = meta.public_path() {
             out.push(ActivationUrl {
                 node_id: meta.node_id.clone(),
-                url,
+                url: base.url(&path).await?,
             });
         }
     }

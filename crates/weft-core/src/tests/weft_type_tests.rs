@@ -623,10 +623,11 @@ fn file_url(mime: &str) -> serde_json::Value {
   }
 
   #[test]
-  fn runtime_check_media_with_data_field() {
-      // The handle may be `data` (inline) instead of `url`/`key`.
+  fn runtime_check_refuses_a_marker_with_only_a_data_field() {
+      // Nothing in weft reads a file through inline `data`, so a marker
+      // whose only handle it is is no file value.
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &file_val("image/png", "data", "base64...")));
+      assert!(!check(&img, &file_val("image/png", "data", "base64...")));
   }
 
   // ── Runtime check: unions ───────────────────────────────────────────

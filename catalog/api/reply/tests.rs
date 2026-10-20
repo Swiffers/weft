@@ -19,6 +19,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_bytes_route_sends_a_stored_file", bytes_shape),
         NodeTest::fake("answer_as_bytes_answers_a_picture_from_a_json_route", answer_as_bytes),
         NodeTest::fake("a_stored_file_in_a_json_answer_goes_out_as_a_link", file_link),
+        NodeTest::fake("a_redirect_sends_the_caller_to_the_files_link", redirect),
         NodeTest::basic("a_head_carries_status_and_string_headers", head_shape),
     ]
 }
@@ -106,7 +107,7 @@ async fn answer_as_bytes(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "bytes", "headers": headers })).await.ok()?;
     assert_eq!(set.heads()[0].header("content-type"), Some("image/x"), "the program's header wins");
     let err = rig.run(&ReplyNode, json!({ "body": file, "answerAs": "xml" })).await.failure()?;
-    assert!(err.contains("answerAs must be json, text or bytes"), "{err}");
+    assert!(err.contains("answerAs must be json, text, bytes or redirect"), "{err}");
     Ok(())
 }
 
@@ -115,19 +116,59 @@ async fn file_link(rig: FakeRig) -> WeftResult<()> {
     rig.attach_caller(conn.clone());
     let file = rig.store_file("cat.png", "image/png", vec![1, 2, 3]);
     let key = weft::storage::StoredFile::from_value(&file)?.key;
-    let body = json!({ "card": { "photo": file, "caption": "a cat" }, "more": [file] });
+    let away = json!({ "__weft_image__": { "url": "https://example.com/dog.png", "mimeType": "image/png", "filename": "dog.png", "sizeBytes": 9 } });
+    let body = json!({ "card": { "photo": file, "caption": "a cat" }, "more": [file], "away": away });
     rig.run(&ReplyNode, json!({ "body": body })).await.ok()?;
     let link = json!({
-        "url": format!("{}/public/files/{key}", weft::node_test::FAKE_CALLER_LINK_BASE),
+        "url": format!("{}/files/{key}?ttl={}", weft::node_test::FAKE_LINK_BASE, weft::storage::DEFAULT_LINK_SECS),
         "mimeType": "image/png",
         "filename": "cat.png",
         "sizeBytes": 3,
     });
     assert_eq!(
         conn.chunks(),
-        vec![OutboundChunk::Json(json!({ "card": { "photo": link, "caption": "a cat" }, "more": [link] }))],
-        "every stored file, however nested, is a link; nothing else moves"
+        vec![OutboundChunk::Json(json!({
+            "card": { "photo": link, "caption": "a cat" },
+            "more": [link],
+            "away": { "url": "https://example.com/dog.png", "mimeType": "image/png", "filename": "dog.png", "sizeBytes": 9 },
+        }))],
+        "every file, however nested, is a link in the one shape (a url file its own url); nothing else moves"
     );
+    Ok(())
+}
+
+/// `answerAs: redirect` answers the file's link as `location`, under
+/// 302 or the redirect status the program set, with the value's own link
+/// lifetime (a url file: its own url); anything but a file, a status no
+/// redirect has, or a socket is refused.
+async fn redirect(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(conn.clone());
+    let mut file = rig.store_file("clip.mp4", "video/mp4", vec![1, 2, 3]);
+    file["__weft_video__"]["linkSecs"] = json!(7200);
+    let key = weft::storage::StoredFile::from_value(&file)?.key;
+    rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "redirect" })).await.ok()?;
+    let head = &conn.heads()[0];
+    assert_eq!(head.status, 302);
+    assert_eq!(head.header("location"), Some(format!("{}/files/{key}?ttl=7200", weft::node_test::FAKE_LINK_BASE).as_str()));
+    assert_eq!(conn.chunks(), vec![OutboundChunk::Bytes(Vec::new())], "a redirect carries no body");
+    let moved = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(moved.clone());
+    rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "redirect", "status": 307 })).await.ok()?;
+    assert_eq!(moved.heads()[0].status, 307);
+    let err = rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "redirect", "status": 404 })).await.failure()?;
+    assert!(err.contains("301, 302, 303, 307 or 308"), "{err}");
+    let err = rig.run(&ReplyNode, json!({ "body": "not a file", "answerAs": "redirect" })).await.failure()?;
+    assert!(err.contains("redirect answers a file"), "{err}");
+    // A url file is a link already, and the redirect goes to it.
+    let away = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(away.clone());
+    let url_file = json!({ "__weft_image__": { "url": "https://example.com/cat.png", "mimeType": "image/png" } });
+    rig.run(&ReplyNode, json!({ "body": url_file, "answerAs": "redirect" })).await.ok()?;
+    assert_eq!(away.heads()[0].header("location"), Some("https://example.com/cat.png"));
+    rig.attach_caller(ws_caller(DataType::Json, LiveRequest::default(), vec![]));
+    let err = rig.run(&ReplyNode, json!({ "body": file, "answerAs": "redirect" })).await.failure()?;
+    assert!(err.contains("redirect is an HTTP answer"), "{err}");
     Ok(())
 }
 

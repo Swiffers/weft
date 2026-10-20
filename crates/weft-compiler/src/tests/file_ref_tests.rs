@@ -858,6 +858,7 @@ mod run_values {
             size_bytes: 3,
             filename: "hello.ogg".into(),
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         };
         let audio = weft_core::storage::typed_file_value(&file, &WeftType::Primitive(WeftPrimitive::Audio));
         let takes_file = WeftType::parse("File").unwrap();

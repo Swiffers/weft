@@ -4928,6 +4928,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
@@ -5181,6 +5182,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "url",
  "uuid",
  "weft-core",
 ]

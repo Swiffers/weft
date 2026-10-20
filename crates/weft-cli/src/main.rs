@@ -2037,7 +2037,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         }
         Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
-        Cmd::ParseServer => commands::parse::serve(ctx).await,
+        Cmd::ParseServer => commands::parse::serve(),
         Cmd::Catalog { action } => match action {
             CatalogAction::Update => commands::catalog::update(ctx).await,
             CatalogAction::Preload { key_stdin } => commands::catalog::preload(ctx, key_stdin).await,

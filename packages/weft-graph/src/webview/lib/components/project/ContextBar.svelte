@@ -1,11 +1,13 @@
 <script lang="ts">
-	// The contextual bar: what the editor can do with the selected nodes.
-	// Run runs them as targets. Then each lifecycle action once, with how
-	// many selected nodes it applies to, triggers and infra apart. The
-	// options answer how triggers go down, prefilled with each command's
-	// defaults, and the instance picker says whose copies are acted on.
-	// Acting on everything is selecting everything (Ctrl+A).
-	import { Play, ChevronDown, Search } from '@lucide/svelte';
+	// The contextual bar: what the editor can do with the selected nodes,
+	// drawn inside the bottom bar. Run runs the selected nodes that are
+	// neither triggers nor infra, as targets. Then each lifecycle action
+	// once, triggers and infra apart, with how many selected nodes it
+	// applies to when that is more than one. The options answer how triggers go down, prefilled
+	// with each command's defaults, and the instance picker says whose
+	// copies are acted on. Acting on everything is selecting everything
+	// (Ctrl+A).
+	import { Play, ChevronDown, ChevronUp, Search, Zap, Square, Database, RefreshCw, Trash2 } from '@lucide/svelte';
 	import type {
 		ActionAvailability,
 		InstanceTarget,
@@ -14,12 +16,13 @@
 		TakeDownChoice,
 	} from '../../../../protocol';
 	import { INSTANCE_ID_PATTERN } from '../../../../run-spec';
-	import { actionUnavailable, contextActions, takenDownWith, type InfraVerb, type SelectedNode, type TriggerVerb } from '../../lifecycle';
+	import { actionUnavailable, contextActions, optionsFor, takenDownWith, type InfraVerb, type SelectedNode, type TriggerVerb } from '../../lifecycle';
 	import { sessionInstanceTargets } from '../../instance-target';
 	import TakeDownOptions from './TakeDownOptions.svelte';
 
 	let {
 		selected,
+		runTargets,
 		status,
 		project,
 		blocked,
@@ -30,6 +33,8 @@
 	}: {
 		/// Every selected node, by its place.
 		selected: SelectedNode[];
+		/// The places Run runs (`runTargetsOf`): no Run when empty.
+		runTargets: string[];
 		/// The latest status answer (the empty one before any arrived).
 		status: ActionAvailability;
 		/// Whose instances the picker remembers its pick for.
@@ -84,10 +89,8 @@
 	let triggerChoice = $state<TakeDownChoice>({});
 	let infraChoice = $state<TakeDownChoice>({});
 	let releaseHeld = $state<ReleaseHeld | undefined>(undefined);
-	const takesTriggersDown = $derived(actions.triggers.some((a) => a.verb !== 'activate'));
-	const turnsTriggersOn = $derived(actions.triggers.some((a) => a.verb === 'activate'));
-	const infraGoingDown = $derived(actions.infra.filter((a) => a.verb !== 'infra_start'));
-	const infraTakesDown = $derived(takenDownWith([...new Set(infraGoingDown.flatMap((a) => a.places))], status));
+	const options = $derived(optionsFor(actions));
+	const infraTakesDown = $derived(takenDownWith([...new Set(options.infraGoingDown.flatMap((a) => a.places))], status));
 
 	const TRIGGER_LABELS: Record<TriggerVerb, string> = { deactivate: 'Turn off', activate: 'Turn on', resync: 'Resync' };
 	const INFRA_LABELS: Record<InfraVerb, string> = {
@@ -113,23 +116,35 @@
 	}
 	const why = (verb: TriggerVerb | InfraVerb) => actionUnavailable({ blocked, offered: offered(verb) });
 
-	// ─── Run ──────────────────────────────────────────────────────
-	const targets = $derived(selected.map((n) => n.place));
-
-	const btn = 'flex items-center gap-1.5 px-2.5 py-1 rounded-lg transition-colors text-[11px] font-medium';
+	// The bottom bar's look: big buttons, uppercase labels.
+	const btn = 'flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors';
 	const btnDisabled = 'disabled:opacity-50 disabled:cursor-not-allowed';
+	const labelCss = 'font-medium text-[11px] uppercase tracking-wider';
+	const counted = (places: string[]) => (places.length > 1 ? ` (${places.length})` : '');
+	const INFRA_CSS: Record<InfraVerb, string> = {
+		infra_start: 'bg-blue-50 text-blue-600 border border-blue-200 hover:bg-blue-100',
+		infra_stop: 'bg-zinc-100 text-zinc-700 border border-zinc-200 hover:bg-zinc-200',
+		infra_terminate: 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100',
+		infra_upgrade: 'bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100',
+	};
+	const TRIGGER_CSS: Record<TriggerVerb, string> = {
+		activate: 'bg-zinc-900 text-white hover:bg-zinc-800',
+		deactivate: 'bg-emerald-600 text-white hover:bg-emerald-700',
+		resync: 'bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100',
+	};
+	const divider = 'w-px h-6 bg-zinc-200 mx-1';
 </script>
 
-<div class="relative flex flex-col items-center gap-1">
-	{#if optionsOpen}
-		<div class="absolute bottom-full mb-1 w-[520px] max-w-[90vw] bg-white border border-zinc-200 rounded-xl shadow-xl p-3 grid grid-cols-2 gap-4 text-zinc-800">
-			{#if takesTriggersDown}
+<div class="relative flex flex-wrap items-center justify-center gap-1.5">
+	{#if optionsOpen && options.any}
+		<div class="absolute bottom-full mb-3 left-1/2 -translate-x-1/2 w-[520px] max-w-[90vw] bg-white border border-zinc-200 rounded-xl shadow-xl p-3 grid grid-cols-2 gap-4 text-zinc-800">
+			{#if options.takesTriggersDown}
 				<TakeDownOptions title="Turning triggers off or resyncing" bind:choice={triggerChoice} />
 			{/if}
-			{#if infraGoingDown.length > 0}
+			{#if options.infraGoingDown.length > 0}
 				<TakeDownOptions title="Stopping, terminating or upgrading infra" bind:choice={infraChoice} takesDown={infraTakesDown} />
 			{/if}
-			{#if turnsTriggersOn}
+			{#if options.turnsTriggersOn}
 				<fieldset class="space-y-1">
 					<legend class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Turning triggers on</legend>
 					<div class="text-[11px] text-zinc-600">What they held while they were down</div>
@@ -143,110 +158,126 @@
 					</label>
 				</fieldset>
 			{/if}
-			{#if !takesTriggersDown && infraGoingDown.length === 0 && !turnsTriggersOn}
-				<div class="col-span-2 text-xs text-zinc-500">Nothing selected takes options.</div>
+		</div>
+	{/if}
+
+	{#if runTargets.length > 0}
+		<button
+			class="{btn} {btnDisabled} px-6 bg-zinc-900 text-white shadow hover:bg-zinc-800"
+			onclick={onRun}
+			disabled={runWhy !== undefined}
+			title={runWhy ?? `Run ${runTargets.join(', ')} and what they need`}
+		>
+			<Play class="w-3.5 h-3.5" />
+			<span class={labelCss}>{runTargets.length === 1 ? 'Run 1 target' : `Run ${runTargets.length} targets`}</span>
+		</button>
+	{/if}
+
+	{#if actions.triggers.length > 0}
+		{#if runTargets.length > 0}
+			<div class={divider}></div>
+		{/if}
+		{#each actions.triggers as action (action.verb)}
+			<button
+				class="{btn} {btnDisabled} {TRIGGER_CSS[action.verb]}"
+				onclick={() => actOnTriggers(action.verb, action.places)}
+				disabled={why(action.verb) !== undefined}
+				title={why(action.verb) ?? action.places.join(', ')}
+			>
+				{#if action.verb === 'activate'}
+					<Zap class="w-3.5 h-3.5" />
+				{:else if action.verb === 'deactivate'}
+					<Square class="w-3.5 h-3.5" />
+				{:else}
+					<RefreshCw class="w-3.5 h-3.5" />
+				{/if}
+				<span class={labelCss}>{TRIGGER_LABELS[action.verb]}{counted(action.places)}</span>
+			</button>
+		{/each}
+	{/if}
+
+	{#if actions.infra.length > 0}
+		{#if runTargets.length > 0 || actions.triggers.length > 0}
+			<div class={divider}></div>
+		{/if}
+		{#each actions.infra as action (action.verb)}
+			<button
+				class="{btn} {btnDisabled} {INFRA_CSS[action.verb]}"
+				onclick={() => actOnInfra(action.verb, action.places)}
+				disabled={why(action.verb) !== undefined}
+				title={why(action.verb) ?? action.places.join(', ')}
+			>
+				{#if action.verb === 'infra_start'}
+					<Database class="w-3.5 h-3.5" />
+				{:else if action.verb === 'infra_stop'}
+					<Square class="w-3.5 h-3.5" />
+				{:else if action.verb === 'infra_upgrade'}
+					<RefreshCw class="w-3.5 h-3.5" />
+				{:else}
+					<Trash2 class="w-3.5 h-3.5" />
+				{/if}
+				<span class={labelCss}>{INFRA_LABELS[action.verb]}{counted(action.places)}</span>
+			</button>
+		{/each}
+	{/if}
+
+	{#if options.any}
+		<button
+			class="{btn} px-2 bg-white text-zinc-600 border border-zinc-200 hover:bg-zinc-50"
+			onclick={() => (optionsOpen = !optionsOpen)}
+			title="How triggers go down and come back"
+		>
+			<span class={labelCss}>Options</span>
+			<ChevronUp class="w-3.5 h-3.5 transition-transform {optionsOpen ? 'rotate-180' : ''}" />
+		</button>
+	{/if}
+
+	{#if showPicker}
+		<div class={divider}></div>
+		<div class="relative">
+			<button
+				class="{btn} px-2 bg-white text-zinc-700 border border-zinc-200 hover:bg-zinc-50"
+				onclick={() => (pickerOpen = !pickerOpen)}
+				title="Whose copies the actions act on"
+			>
+				<span class={labelCss}>Instance: <span class="normal-case tracking-normal">{targetLabel}</span></span>
+				<ChevronDown class="w-3.5 h-3.5" />
+			</button>
+			{#if pickerOpen}
+				<div class="absolute bottom-full mb-3 right-0 z-50 w-60 bg-white border rounded-lg shadow-lg p-1 text-xs">
+					<div class="flex items-center gap-1 px-2 py-1 border-b mb-1">
+						<Search class="w-3 h-3 text-zinc-400" />
+						<!-- svelte-ignore a11y_autofocus -->
+						<input class="w-full outline-none" placeholder="Find or type an instance id" bind:value={search} autofocus />
+					</div>
+					<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => pick(undefined)}>
+						shared <span class="text-zinc-400">(the program's own)</span>
+					</button>
+					<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => pick('all_instances')}>
+						all instances <span class="text-zinc-400">({known.length})</span>
+					</button>
+					<div class="max-h-48 overflow-y-auto">
+						{#each matching as id (id)}
+							<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-mono" onclick={() => pick([id])}>{id}</button>
+						{/each}
+					</div>
+					{#if typedNew}
+						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => pick([typedNew!])}>
+							use <span class="font-mono">{typedNew}</span>
+						</button>
+					{/if}
+				</div>
 			{/if}
 		</div>
 	{/if}
 
-	<div class="flex flex-wrap items-center justify-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-lg max-w-[90vw]">
-		<button
-			class="{btn} {btnDisabled} bg-zinc-900 text-white hover:bg-zinc-800"
-			onclick={onRun}
-			disabled={runWhy !== undefined}
-			title={runWhy ?? `Run ${targets.join(', ')} and what they need`}
-		>
-			<Play class="w-3 h-3" />
-			Run ({targets.length})
-		</button>
-
-		{#if actions.triggers.length > 0}
-			<div class="w-px h-5 bg-zinc-200 mx-0.5"></div>
-			<span class="text-[10px] uppercase tracking-wider text-zinc-400">Triggers</span>
-			{#each actions.triggers as action (action.verb)}
-				<button
-					class="{btn} {btnDisabled} bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100"
-					onclick={() => actOnTriggers(action.verb, action.places)}
-					disabled={why(action.verb) !== undefined}
-					title={why(action.verb) ?? action.places.join(', ')}
-				>
-					{TRIGGER_LABELS[action.verb]} ({action.places.length})
-				</button>
-			{/each}
-		{/if}
-
-		{#if actions.infra.length > 0}
-			<div class="w-px h-5 bg-zinc-200 mx-0.5"></div>
-			<span class="text-[10px] uppercase tracking-wider text-zinc-400">Infra</span>
-			{#each actions.infra as action (action.verb)}
-				<button
-					class="{btn} {btnDisabled} {action.verb === 'infra_terminate' ? 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100' : 'bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100'}"
-					onclick={() => actOnInfra(action.verb, action.places)}
-					disabled={why(action.verb) !== undefined}
-					title={why(action.verb) ?? action.places.join(', ')}
-				>
-					{INFRA_LABELS[action.verb]} ({action.places.length})
-				</button>
-			{/each}
-		{/if}
-
-		{#if actions.triggers.length > 0 || actions.infra.length > 0}
-			<button
-				class="{btn} text-zinc-500 hover:bg-zinc-100"
-				onclick={() => (optionsOpen = !optionsOpen)}
-				title="How triggers go down and come back"
-			>
-				options...
-			</button>
-		{/if}
-
-		{#if showPicker}
-			<div class="w-px h-5 bg-zinc-200 mx-0.5"></div>
-			<div class="relative">
-				<button
-					class="{btn} bg-white border border-zinc-200 text-zinc-700 hover:bg-zinc-50"
-					onclick={() => (pickerOpen = !pickerOpen)}
-					title="Whose copies the actions act on"
-				>
-					instance: {targetLabel}
-					<ChevronDown class="w-3 h-3" />
-				</button>
-				{#if pickerOpen}
-					<div class="absolute bottom-full mb-1 right-0 z-50 w-60 bg-white border rounded-lg shadow-lg p-1 text-xs">
-						<div class="flex items-center gap-1 px-2 py-1 border-b mb-1">
-							<Search class="w-3 h-3 text-zinc-400" />
-							<!-- svelte-ignore a11y_autofocus -->
-							<input class="w-full outline-none" placeholder="Find or type an instance id" bind:value={search} autofocus />
-						</div>
-						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => pick(undefined)}>
-							shared <span class="text-zinc-400">(the program's own)</span>
-						</button>
-						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => pick('all_instances')}>
-							all instances <span class="text-zinc-400">({known.length})</span>
-						</button>
-						<div class="max-h-48 overflow-y-auto">
-							{#each matching as id (id)}
-								<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-mono" onclick={() => pick([id])}>{id}</button>
-							{/each}
-						</div>
-						{#if typedNew}
-							<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => pick([typedNew!])}>
-								use <span class="font-mono">{typedNew}</span>
-							</button>
-						{/if}
-					</div>
-				{/if}
-			</div>
-		{/if}
-	</div>
-
 	{#if actions.needInstance.length > 0}
-		<div class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">
+		<span class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">
 			Pick an instance (or all) to act on {actions.needInstance.join(', ')}: each instance has its own.
-		</div>
+		</span>
 	{:else if actions.sharedLeftOut.length > 0}
-		<div class="text-[11px] text-zinc-600 bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1">
+		<span class="text-[11px] text-zinc-600 bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1">
 			{actions.sharedLeftOut.join(', ')} {actions.sharedLeftOut.length === 1 ? 'is' : 'are'} shared: pick "shared" to act on {actions.sharedLeftOut.length === 1 ? 'it' : 'them'}.
-		</div>
+		</span>
 	{/if}
 </div>

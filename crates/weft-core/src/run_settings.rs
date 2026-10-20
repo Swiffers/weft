@@ -77,7 +77,6 @@ fn yes() -> bool {
 pub const DEFAULT_HOLD_SECS: u32 = 60;
 
 /// The longest hold a run may ask for: a hold is never unbounded.
-// SYNC: MAX_HOLD_SECS <-> packages/weft-graph/src/run-spec.ts MAX_HOLD_SECS
 pub const MAX_HOLD_SECS: u32 = 30 * 24 * 3600;
 
 fn is_default_hold(secs: &u32) -> bool {
@@ -217,7 +216,7 @@ impl<'de> Deserialize<'de> for KeepFor {
 /// A run started by hand is always recorded, whatever its trigger's
 /// `recorded` says: it starts as a queued row, and a row must end, so its
 /// record is written whole however it ends.
-// SYNC: SettingsChoice <-> packages/weft-graph/src/run-spec.ts (RunSettings, its validator, and the flags it maps to)
+// SYNC: SettingsChoice <-> packages/weft-graph/src/run-spec.ts RunSettings
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SettingsChoice {

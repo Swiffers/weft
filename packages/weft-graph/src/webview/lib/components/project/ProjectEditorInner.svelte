@@ -12,7 +12,7 @@
 	import ContextBar from "./ContextBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
-	import { runCheckKey, runInfraIds, runProgress } from "../../run-targets";
+	import { runCheckKey, runProgress, runTargetsOf, whyNothingToRun } from "../../run-targets";
 	import { infraBadge, runUnavailable, triggerBadge, type SelectedNode } from "../../lifecycle";
 	import { isVerbOffered, type VerbInputs } from "../../verb-gates";
 	import { emptyActionAvailability } from "../../../../status";
@@ -28,10 +28,9 @@
 	import { locatedKey, type Frame } from "../../../../protocol";
 	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isScopeBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, typeVarBoundRefuses, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
-	import RunSpecDialog from './RunSpecDialog.svelte';
 	import InstallSwitch from './InstallSwitch.svelte';
-	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
-	import type { EditOp, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
+	import { addressOf } from '../../../../run-spec';
+	import type { EditOp, RunCheck, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
 	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -60,12 +59,6 @@
 		onApplyTextEdit,
 		onResyncSource,
 		onRun,
-		specs = [],
-		resolveSpec,
-		onRunSpec,
-		onSaveSpec,
-		onRunSpecFile,
-		onListSpecs,
 		onBranchTo,
 		onStop,
 		onDismissError,
@@ -135,12 +128,6 @@
 		/// Run the selected nodes, each by its place. Never empty: the
 		/// graph has no gesture that runs the whole program.
 		onRun?: (targets: [string, ...string[]]) => void;
-		specs?: RunSpec[];
-		resolveSpec?: (spec: RunSpec, seeded: boolean) => Promise<ResolveSpecResponse>;
-		onRunSpec?: (spec: RunSpec, seeded?: boolean) => void;
-		onSaveSpec?: (spec: RunSpec) => void;
-		onRunSpecFile?: (name: string) => void;
-		onListSpecs?: () => void;
 		onBranchTo?: (reference: string) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
@@ -154,7 +141,7 @@
 		onLifecycle?: (action: import('../../../../protocol').LifecycleAction) => void;
 		/// The walk's refusal for a run of these targets, or `null` when
 		/// it resolves (`weft run --check`).
-		checkRun?: (targets: [string, ...string[]]) => Promise<string | null>;
+		checkRun?: (targets: [string, ...string[]]) => Promise<RunCheck>;
 		// Action-bar state machine (host-owned single source of truth).
 		// Passed straight through to the ActionBar; nothing here decides.
 		actionBarState: import('../../../../protocol').ActionBarState;
@@ -2422,39 +2409,22 @@
 	/// on), in the order the canvas holds them.
 	const selectedIds = $derived(nodes.filter((n) => n.selected && n.type !== 'annotation').map((n) => n.id));
 	/// The same nodes as the contextual bar reads them, each by its place.
-	const selectedForBar = $derived<SelectedNode[]>(
+	const selectedForBar = $derived<Array<SelectedNode & { id: string }>>(
 		selectedIds.flatMap((id) => {
 			const node = fold.project.nodes.find((n) => n.id === id);
 			return node
-				? [{ place: addressOf(callPath, id), isTrigger: nodeIsTrigger(node), isInfra: nodeRequiresInfra(node), perInstance: !!node.perInstance }]
+				? [{ id, place: addressOf(callPath, id), isTrigger: nodeIsTrigger(node), isInfra: nodeRequiresInfra(node), perInstance: !!node.perInstance }]
 				: [];
 		}),
 	);
+	/// The selected nodes Run runs: all but the triggers and the infra.
+	const runnable = $derived(runTargetsOf(selectedForBar));
 
-	/// The infra a run of the selection reaches that is not running,
-	/// read off the PROJECTION, not the rendered graph: a collapsed
-	/// ancestor re-parents (or hides) what it holds for drawing, and the
-	/// facts of a run are about the program, not the picture.
-	const selectionInfraDown = $derived(
-		runInfraIds(
-			selectedIds,
-			fold.project.nodes.map((n) => ({
-				id: n.id,
-				isTrigger: nodeIsTrigger(n),
-				isInfra: nodeRequiresInfra(n),
-				parentId: n.parentId,
-			})),
-			fold.project.edges,
-		).filter((id) => infraStatusOf(id)?.status !== 'running'),
-	);
-
-	/// What stops a run of the selection whatever the walk says.
+	/// What stops a run of the selection whatever weft says.
 	const runBlocked = $derived(
 		!interactive
 			? 'This file was opened on its own, so there is nothing to run here. Open src/main.weft and run from there.'
-			: selectionInfraDown.length > 0
-				? `Start ${selectionInfraDown.map((id) => addressOf(callPath, id)).join(', ')} first: this run reaches it.`
-				: null,
+			: null,
 	);
 
 	const verbInputs = $derived<VerbInputs>({
@@ -2476,7 +2446,7 @@
 	);
 
 	/// The selection as a run names it: each node by its place.
-	const runTargets = $derived(selectedIds.map((id) => addressOf(callPath, id)));
+	const runTargets = $derived(runnable.map((n) => n.place));
 	/// What the walk's answer depends on, by value: the targets and the
 	/// source the engine holds now. Every change of the program advances
 	/// that source (the text tab or an outside writer through
@@ -2485,22 +2455,22 @@
 	/// array replaced around an unchanged selection and source (a run
 	/// event, a status refresh) keeps the key, so the walk is not asked.
 	const runKey = $derived(runCheckKey(runTargets, engine.truth.weftCode));
-	/// The walk's answer for the selection on screen (`weft run
-	/// --check`): `undefined` while it is asked, `null` when it
-	/// resolves, else its refusal.
-	let runRefusal = $state<string | null | undefined>(undefined);
+	/// weft's answer for the selection on screen (`weft run --check`):
+	/// its refusal, or the infra the run reads; `undefined` while it is
+	/// asked.
+	let runCheck = $state<RunCheck | undefined>(undefined);
 	$effect(() => {
 		void runKey;
 		const asked = untrack(() => runTargets);
-		runRefusal = undefined;
+		runCheck = undefined;
 		if (!checkRun || runBlocked || asked.length === 0) return;
 		let current = true;
 		// A selection dragged across the canvas changes on every node it
 		// passes: ask once it settles.
 		const timer = setTimeout(() => {
 			checkRun(asked as [string, ...string[]]).then(
-				(answer) => { if (current) runRefusal = answer; },
-				(err) => { if (current) runRefusal = err instanceof Error ? err.message : String(err); },
+				(answer) => { if (current) runCheck = answer; },
+				(err) => { if (current) runCheck = { ok: false, refusal: err instanceof Error ? err.message : String(err) }; },
 			);
 		}, 300);
 		return () => {
@@ -2511,7 +2481,7 @@
 	/// Whether Run may go, and why not: the one rule the bar's Run
 	/// button and every run gesture read, or `undefined` when it may.
 	const runWhy = $derived(
-		runUnavailable({ blocked: verbsBlocked, offered: isVerbOffered('run', verbInputs), runBlocked, refusal: runRefusal }),
+		runUnavailable({ blocked: verbsBlocked, offered: isVerbOffered('run', verbInputs), runBlocked, check: runCheck, status: statusNow }),
 	);
 
 	/// The one funnel every "run" gesture goes through (the contextual
@@ -2521,7 +2491,7 @@
 		if (!onRun || !checkRun) return;
 		const [first, ...rest] = runTargets;
 		if (first === undefined) {
-			toast.info('Select the nodes to run first: the run takes them and what they need.');
+			toast.info(whyNothingToRun(selectedForBar));
 			return;
 		}
 		if (runWhy) {
@@ -2538,27 +2508,6 @@
 			: undefined,
 	);
 
-	/// The run spec dialog: `null` closed, else the spec it opened with.
-	let specDialogInitial = $state<RunSpec | null>(null);
-	let specDialogOpen = $state(false);
-	/// The group the user stands in (an include's alias chain), so the
-	/// dialog and the Run menu put it first.
-	const focusedGroup = $derived(groupOfCallPath(callPath));
-	const menuSpecs = $derived(orderSpecsForMenu(specs, focusedGroup));
-	function openSpecDialog(initial: RunSpec): void {
-		specDialogInitial = initial;
-		specDialogOpen = true;
-	}
-	$effect(() => {
-		if (!specDialogOpen) specDialogInitial = null;
-	});
-	// The dialog runs a spec spelled for the view it opened in. A view
-	// that stops being a place (another file picked in the explorer
-	// while it is open) has no run to start, and the spec's addresses
-	// belong to the file that is gone, so the dialog closes with it.
-	$effect(() => {
-		if (!interactive) specDialogOpen = false;
-	});
 	/// The followed run's version differs from the files on disk.
 	const versionMismatch = $derived.by(() => {
 		const v = runState?.version;
@@ -3999,12 +3948,11 @@
 		}
 	}
 
-	/** Whether a node's context menu has anything to show. Simplified view
-	 *  hides the structural items (Duplicate/Delete), leaving the run items,
-	 *  which only a view that is a place in the program offers. The one
+	/** Whether a node's context menu has anything to show: every item in
+	 *  it is a structural edit, which simplified view hides. The one
 	 *  predicate for opening the menu, keeping it open, and rendering it. */
 	function nodeMenuHasItems(): boolean {
-		return !simplified || interactive;
+		return !simplified;
 	}
 
 	function onContextMenu(event: MouseEvent) {
@@ -4471,11 +4419,11 @@
 		     the program (a run, the project's lifecycle): a file opened on
 		     its own has none, so none of it is drawn (see `interactive`). -->
 		{#if interactive}
-		<!-- The bars at the bottom: the contextual bar for the selected
-		     nodes (only with a selection), and under it the bottom bar,
-		     which shows what is going on right now. Their state comes from
-		     the host's ActionBarStore and the status answer; nothing here
-		     decides a state, only which nodes are selected. -->
+		<!-- The bar at the bottom: what is going on right now, and in the
+		     same bar what the selected nodes offer (only with a selection).
+		     Its state comes from the host's ActionBarStore and the status
+		     answer; nothing here decides a state, only which nodes are
+		     selected. -->
 		<div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 z-20">
 			{#if versionMismatch && runState?.seed !== undefined}
 				<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg">
@@ -4485,28 +4433,24 @@
 					{/if}
 				</div>
 			{/if}
-			{#if selectedForBar.length > 0 && onRun && onLifecycle && checkRun}
+			{#snippet contextBar()}
 				<ContextBar
 					selected={selectedForBar}
+					{runTargets}
 					status={statusNow}
 					project={project.id}
 					blocked={verbsBlocked}
 					offered={(verb) => isVerbOffered(verb, verbInputs)}
 					{runWhy}
 					onRun={runSelection}
-					{onLifecycle}
+					onLifecycle={(action) => onLifecycle?.(action)}
 				/>
-			{/if}
+			{/snippet}
 			<ActionBar
 				state={actionBarState}
 				{status}
 				runProgress={followedProgress}
-				specs={menuSpecs}
-				{focusedGroup}
-				specsEnabled={!verbsBlocked}
-				onRunSpec={onRunSpecFile}
-				onOpenSpecDialog={(initial) => openSpecDialog(initial ?? { name: 'one-off' })}
-				onOpenSpecMenu={onListSpecs}
+				selection={selectedForBar.length > 0 && onRun && onLifecycle && checkRun ? contextBar : undefined}
 				{onStop}
 				{onDismissError}
 				{onOpenLocation}
@@ -4524,15 +4468,6 @@
 		</div>
 		{/if}
 	</div>
-	{#if specDialogInitial && resolveSpec && onRunSpec}
-		<RunSpecDialog
-			bind:open={specDialogOpen}
-			initial={specDialogInitial}
-			{resolveSpec}
-			onRun={(spec, seeded) => onRunSpec?.(spec, seeded)}
-			onSave={(spec) => onSaveSpec?.(spec)}
-		/>
-	{/if}
 
 	<!-- Wire menu: read a key off the value a wire carries -->
 	{#if edgeMenu}
@@ -4592,78 +4527,54 @@
 			onclick={(e) => e.stopPropagation()}
 		>
 			{#if contextMenu.nodeId}
+				<!-- These consts are derived from `contextMenu`, so they are read
+				     again on use: a handler reads what it needs from them BEFORE
+				     it sets `contextMenu = null`, or the read throws on null. -->
 				{@const targetNodeId = contextMenu.nodeId}
 				{@const nodeToEdit = nodes.find(n => n.id === targetNodeId)}
 				{@const nodeConfig = nodeToEdit ? NODE_TYPE_CONFIG[nodeToEdit.data.nodeType as NodeType] : null}
-				<!-- In simplified view the only node-menu items are the run items
-				     (structural Duplicate/Delete are hidden), so render the menu only when
-				     there's something to show, never an empty popover. -->
+				<!-- Every item here is a STRUCTURAL edit, hidden in simplified view
+				     (read-only for structure), the same gate STRUCTURAL_ACTIONS applies
+				     to the palette and the keyboard; there the menu does not open. -->
 				{#if nodeToEdit && nodeConfig && nodeMenuHasItems()}
 					<div class="px-1">
-						<!-- Duplicate/Delete are STRUCTURAL edits: hidden in simplified view
-						     (read-only for structure). This is the same gate STRUCTURAL_ACTIONS
-						     applies to the palette/keyboard; the context menu is the other entry
-						     point and must gate too. -->
-						{#if !simplified}
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => duplicateNode(contextMenu!.nodeId!)}
-							>
-								<span class="text-muted-foreground text-xs">Ctrl+D</span>
-								<span>Duplicate</span>
-							</button>
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
-								onclick={() => deleteNode(contextMenu!.nodeId!)}
-							>
-								<span class="text-xs">Del</span>
-								<span>Delete</span>
-							</button>
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { const id = contextMenu!.nodeId!; const x = contextMenu!.x; const y = contextMenu!.y; contextMenu = null; tagEditor = { nodeId: id, x, y }; }}
-							>
-								<span class="text-muted-foreground text-xs">#</span>
-								<span>Tags…</span>
-							</button>
-							<!-- `@per_instance`: only on a node that owns something per
-							     instance (an infra container, a connection). A node the
-							     compiler reached from a marked one follows it and has
-							     nothing of its own to toggle. -->
-							{#if canBePerInstance({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
-								{@const marked = nodeToEdit.data.perInstance === 'marked'}
-								<button
-									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-									title={marked
-										? 'Make this node one shared node again: every instance uses the same one.'
-										: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'set_per_instance', node: id, perInstance: !marked }]); }}
-								>
-									<span class="text-muted-foreground text-xs">@</span>
-									<span>{marked ? 'Share across instances' : 'One per instance'}</span>
-								</button>
-							{/if}
-						{/if}
-						<!-- A run names a PLACE (`addressOf` spells the node under
-						     this view's calls), so a view that is no place offers
-						     none of it. -->
-						{#if interactive}
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', addressOf(callPath, targetNodeId))); }}
+							onclick={() => duplicateNode(contextMenu!.nodeId!)}
 						>
-							<span class="text-muted-foreground text-xs">▶</span>
-							<span>Run from here…</span>
+							<span class="text-muted-foreground text-xs">Ctrl+D</span>
+							<span>Duplicate</span>
 						</button>
-						{#if isContainerNodeType(nodeToEdit.data.nodeType) || nodeToEdit.data.includePath}
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
+							onclick={() => deleteNode(contextMenu!.nodeId!)}
+						>
+							<span class="text-xs">Del</span>
+							<span>Delete</span>
+						</button>
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => { const id = contextMenu!.nodeId!; const x = contextMenu!.x; const y = contextMenu!.y; contextMenu = null; tagEditor = { nodeId: id, x, y }; }}
+						>
+							<span class="text-muted-foreground text-xs">#</span>
+							<span>Tags…</span>
+						</button>
+						<!-- `@per_instance`: only on a node that owns something per
+						     instance (an infra container, a connection). A node the
+						     compiler reached from a marked one follows it and has
+						     nothing of its own to toggle. -->
+						{#if canBePerInstance({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
+							{@const marked = nodeToEdit.data.perInstance === 'marked'}
 							<button
 								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', addressOf(callPath, targetNodeId))); }}
+								title={marked
+									? 'Make this node one shared node again: every instance uses the same one.'
+									: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
+								onclick={() => { const id = contextMenu!.nodeId!; const perInstance = !marked; contextMenu = null; recordEdit([{ op: 'set_per_instance', node: id, perInstance }]); }}
 							>
-								<span class="text-muted-foreground text-xs">▶</span>
-								<span>Run this group…</span>
+								<span class="text-muted-foreground text-xs">@</span>
+								<span>{marked ? 'Share across instances' : 'One per instance'}</span>
 							</button>
-						{/if}
 						{/if}
 					</div>
 				{/if}

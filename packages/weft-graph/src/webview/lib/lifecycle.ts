@@ -7,10 +7,13 @@
 import type {
 	ActionAvailability,
 	HeldWork,
+	InfraCopyRead,
 	InfraPlacementStatus,
 	InstanceInfraEntry,
 	InstanceTarget,
 	OwnerTriggers,
+	RunCheck,
+	TargetCheck,
 	TriggerCopy,
 	TriggerEntry,
 	TriggerState,
@@ -313,6 +316,23 @@ export function contextActions(
 	};
 }
 
+/// Which choices the bar's options hold for `actions`: how triggers go
+/// down (turning off or resyncing), how infra goes down (stopping,
+/// terminating, upgrading), and what triggers turned on do with what they
+/// held. `any` is whether there is one at all: the panel shows a section
+/// per choice, and the Options button shows only when `any` holds.
+export function optionsFor(actions: ContextActions): {
+	takesTriggersDown: boolean;
+	turnsTriggersOn: boolean;
+	infraGoingDown: BarAction<InfraVerb>[];
+	any: boolean;
+} {
+	const takesTriggersDown = actions.triggers.some((a) => a.verb !== 'activate');
+	const turnsTriggersOn = actions.triggers.some((a) => a.verb === 'activate');
+	const infraGoingDown = actions.infra.filter((a) => a.verb !== 'infra_start');
+	return { takesTriggersDown, turnsTriggersOn, infraGoingDown, any: takesTriggersDown || turnsTriggersOn || infraGoingDown.length > 0 };
+}
+
 /// The triggers taking `places` down takes down with them (each infra
 /// entry's `takesDown`), each owner once with each of its triggers once:
 /// what the infra options name.
@@ -336,20 +356,72 @@ export function actionUnavailable(gates: { blocked: boolean; offered: boolean })
 	return undefined;
 }
 
+/// The infra copies of `read` that are not running in `status`, spelled
+/// for a person: `db`, or `db (instance 'acme')` for an instance's copy.
+export function infraNotRunning(
+	read: readonly InfraCopyRead[],
+	status: Pick<ActionAvailability, 'infraNodes' | 'instanceInfra'>,
+): string[] {
+	return read
+		.filter((copy) => {
+			const state = copy.instance === undefined
+				? status.infraNodes.find((place) => place.node === copy.node)?.status
+				: status.instanceInfra.find((entry) => entry.node === copy.node && entry.instance === copy.instance)?.status;
+			return state !== 'running';
+		})
+		.map((copy) => (copy.instance === undefined ? copy.node : `${copy.node} (instance '${copy.instance}')`));
+}
+
 /// Why the contextual bar's Run cannot go, or `undefined` when it can.
-/// `runBlocked` is what stops it whatever the walk says (this view is no
-/// place in the program, infra the run reaches is down); `refusal` is
-/// the walk's answer for the selection (`weft run --check`): `undefined`
-/// while it is asked, `null` when it resolves, else its refusal text.
+/// `runBlocked` is what stops it whatever weft says (this view is no
+/// place in the program); `check` is weft's answer for the selection
+/// (`weft run --check`), `undefined` while it is asked: its refusal, or
+/// else the infra it says the run reads that `status` does not show
+/// running, which the install would refuse the run for. A run of several
+/// targets is one run, refused whole: when the check says each target
+/// alone, the reason names each target that stops it.
 export function runUnavailable(gates: {
 	blocked: boolean;
 	offered: boolean;
 	runBlocked: string | null;
-	refusal: string | null | undefined;
+	check: RunCheck | undefined;
+	status: Pick<ActionAvailability, 'infraNodes' | 'instanceInfra'>;
 }): string | undefined {
 	const action = actionUnavailable(gates);
 	if (action) return action;
 	if (gates.runBlocked) return gates.runBlocked;
-	if (gates.refusal === undefined) return 'Checking what this run needs...';
-	return gates.refusal ?? undefined;
+	const check = gates.check;
+	if (check === undefined) return 'Checking what this run needs...';
+	const down = check.ok ? infraNotRunning(check.infraRead ?? [], gates.status) : [];
+	if (check.ok && down.length === 0) return undefined;
+	const each = check.targets && check.targets.length > 1 ? eachTargetBlocked(check.targets, gates.status) : undefined;
+	if (each) return each;
+	if (!check.ok) return check.refusal;
+	return `Start ${down.join(', ')} first: this run reads ${down.length === 1 ? 'it' : 'them'}, and ${down.length === 1 ? 'it is' : 'they are'} not running.`;
+}
+
+/// A run of several targets, said target by target: each one that could
+/// not run alone with its reasons, then the ones that could. `undefined`
+/// when none of them is blocked alone, so the run's own refusal speaks.
+function eachTargetBlocked(targets: readonly TargetCheck[], status: Pick<ActionAvailability, 'infraNodes' | 'instanceInfra'>): string | undefined {
+	const blocked: string[] = [];
+	const free: string[] = [];
+	for (const target of targets) {
+		const reasons: string[] = [];
+		const down = infraNotRunning(target.infraRead ?? [], status);
+		if (down.length > 0) reasons.push(`needs ${down.join(', ')} started`);
+		const triggers = target.unfiredTriggers ?? [];
+		if (triggers.length > 0) {
+			reasons.push(`only gets its input from the ${triggers.length === 1 ? 'trigger' : 'triggers'} ${triggers.join(', ')}, and Run does not fire triggers`);
+		}
+		if (target.refusal) reasons.push(`cannot start: ${target.refusal}`);
+		if (reasons.length > 0) blocked.push(`${target.target} ${reasons.join(', and ')}`);
+		else free.push(target.target);
+	}
+	if (blocked.length === 0) return undefined;
+	const head = `These run together as one run, which cannot start: ${blocked.join('; ')}.`;
+	if (free.length === 0) return head;
+	return free.length === 1
+		? `${head} ${free[0]} could run on its own: select it without the others.`
+		: `${head} ${free.join(', ')} could each run on their own: select them without the others.`;
 }

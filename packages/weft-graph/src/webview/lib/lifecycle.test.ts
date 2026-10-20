@@ -5,7 +5,7 @@
 import { describe, it, expect } from 'vitest';
 import type { ActionAvailability, InfraPlacementStatus, TriggerEntry, TriggerState } from '../../protocol';
 import { emptyActionAvailability } from '../../status';
-import { contextActions, describeHeld, infraBadge, runUnavailable, takenDownWith, triggerBadge, type SelectedNode } from './lifecycle';
+import { contextActions, describeHeld, infraBadge, optionsFor, runUnavailable, takenDownWith, triggerBadge, type SelectedNode } from './lifecycle';
 
 function status(over: Partial<ActionAvailability> = {}): ActionAvailability {
 	return { ...emptyActionAvailability(), ...over };
@@ -227,23 +227,115 @@ describe('the badges', () => {
 });
 
 describe('the contextual bar\'s Run', () => {
-	const open = { blocked: false, offered: true, runBlocked: null };
+	const open = { blocked: false, offered: true, runBlocked: null, status: status() };
 
-	it('is disabled with the walk\'s refusal as its text', () => {
+	it('is disabled with the check\'s refusal as its text', () => {
 		const refusal = "needs `door`, which only fires from outside; use the CLI with --fire or --from";
-		expect(runUnavailable({ ...open, refusal })).toBe(refusal);
+		expect(runUnavailable({ ...open, check: { ok: false, refusal } })).toBe(refusal);
 	});
 
-	it('goes once the walk resolves', () => {
-		expect(runUnavailable({ ...open, refusal: null })).toBeUndefined();
+	it('goes once the check resolves and reads no infra', () => {
+		expect(runUnavailable({ ...open, check: { ok: true } })).toBeUndefined();
 	});
 
-	it('waits for the walk\'s answer', () => {
-		expect(runUnavailable({ ...open, refusal: undefined })).toMatch(/Checking/);
+	it('waits for the check\'s answer', () => {
+		expect(runUnavailable({ ...open, check: undefined })).toMatch(/Checking/);
 	});
 
-	it('says what stops it before asking the walk', () => {
-		expect(runUnavailable({ ...open, runBlocked: 'Start db first: this run reaches it.', refusal: null })).toBe('Start db first: this run reaches it.');
-		expect(runUnavailable({ ...open, blocked: true, refusal: null })).toMatch(/under way/);
+	it('names the infra the check says the run reads that is not running', () => {
+		const check = { ok: true as const, infraRead: [{ node: 'one.db' }, { node: 'cache' }, { node: 'bridge', instance: 'acme' }] };
+		const shown = status({
+			infraNodes: [place('one.db', 'stopped'), place('cache', 'running')],
+			instanceInfra: [{ node: 'bridge', instance: 'acme', status: 'running' }],
+		});
+		expect(runUnavailable({ ...open, status: shown, check })).toBe('Start one.db first: this run reads it, and it is not running.');
+		const allUp = status({
+			infraNodes: [place('one.db', 'running'), place('cache', 'running')],
+			instanceInfra: [{ node: 'bridge', instance: 'acme', status: 'stopped' }],
+		});
+		expect(runUnavailable({ ...open, status: allUp, check })).toBe("Start bridge (instance 'acme') first: this run reads it, and it is not running.");
+		expect(runUnavailable({ ...open, status: status(), check: { ok: true, infraRead: [{ node: 'a' }, { node: 'b' }] } }))
+			.toBe('Start a, b first: this run reads them, and they are not running.');
+	});
+
+	it('counts infra with no status entry (never created) as not running, and running infra as running', () => {
+		const check = { ok: true as const, infraRead: [{ node: 'postgres_database_1' }] };
+		expect(runUnavailable({ ...open, status: status(), check }))
+			.toBe('Start postgres_database_1 first: this run reads it, and it is not running.');
+		expect(runUnavailable({ ...open, status: status({ infraNodes: [place('postgres_database_1', 'not_started')] }), check }))
+			.toMatch(/^Start postgres_database_1 first/);
+		expect(runUnavailable({ ...open, status: status({ infraNodes: [place('postgres_database_1', 'running')] }), check })).toBeUndefined();
+	});
+
+	it('names each blocked target of a mixed selection with its own reason, and the ones that could run alone', () => {
+		const targets = [
+			{ target: 'debug', infraRead: [{ node: 'pg' }] },
+			{ target: 'reply', unfiredTriggers: ['door'] },
+			{ target: 'lone' },
+		];
+		const refused = { ok: false as const, refusal: 'the run cannot start:\nreply.p gets nothing in this run', targets };
+		expect(runUnavailable({ ...open, check: refused })).toBe(
+			'These run together as one run, which cannot start: debug needs pg started; '
+				+ 'reply only gets its input from the trigger door, and Run does not fire triggers. '
+				+ 'lone could run on its own: select it without the others.',
+		);
+		// pg running: only the trigger's side stops the run.
+		const pgUp = status({ infraNodes: [place('pg', 'running')] });
+		expect(runUnavailable({ ...open, status: pgUp, check: refused })).toBe(
+			'These run together as one run, which cannot start: '
+				+ 'reply only gets its input from the trigger door, and Run does not fire triggers. '
+				+ 'debug, lone could each run on their own: select them without the others.',
+		);
+	});
+
+	it('names the infra a mixed selection reads when weft takes the run but the infra is down', () => {
+		const check = {
+			ok: true as const,
+			infraRead: [{ node: 's.db' }],
+			targets: [{ target: 's.show', infraRead: [{ node: 's.db' }] }, { target: 'lone' }],
+		};
+		expect(runUnavailable({ ...open, check })).toBe(
+			'These run together as one run, which cannot start: s.show needs s.db started. lone could run on its own: select it without the others.',
+		);
+		expect(runUnavailable({ ...open, status: status({ infraNodes: [place('s.db', 'running')] }), check })).toBeUndefined();
+	});
+
+	it('names every reason one target has, and keeps the run\'s own refusal when no target is blocked alone', () => {
+		const targets = [
+			{ target: 'a', infraRead: [{ node: 'pg', instance: 'acme' }], unfiredTriggers: ['door', 'tick'], refusal: 'a.x gets nothing' },
+			{ target: 'b', refusal: 'b.y gets nothing' },
+		];
+		expect(runUnavailable({ ...open, check: { ok: false, refusal: 'whole', targets } })).toBe(
+			"These run together as one run, which cannot start: a needs pg (instance 'acme') started, and only gets its input from the triggers door, tick, "
+				+ 'and Run does not fire triggers, and cannot start: a.x gets nothing; b cannot start: b.y gets nothing.',
+		);
+		expect(runUnavailable({ ...open, check: { ok: false, refusal: 'whole', targets: [{ target: 'a' }, { target: 'b' }] } })).toBe('whole');
+	});
+
+	it('says what stops it before asking the check', () => {
+		expect(runUnavailable({ ...open, runBlocked: 'This file was opened on its own.', check: { ok: true } })).toBe('This file was opened on its own.');
+		expect(runUnavailable({ ...open, blocked: true, check: { ok: true } })).toMatch(/under way/);
+	});
+});
+
+describe('the contextual bar\'s options', () => {
+	it('has none for infra that can only start, so no Options button', () => {
+		const actions = contextActions([infra('pg')], status(), undefined);
+		expect(actions.infra.map((a) => a.verb)).toEqual(['infra_start']);
+		expect(optionsFor(actions).any).toBe(false);
+	});
+
+	it('has the infra choice once infra can go down, and the trigger choices by verb', () => {
+		const running = optionsFor(contextActions([infra('pg')], status({ infraNodes: [place('pg', 'running')] }), undefined));
+		expect(running.any).toBe(true);
+		expect(running.infraGoingDown.map((a) => a.verb)).toEqual(['infra_stop', 'infra_terminate']);
+		const off = optionsFor(contextActions([trigger('door')], status(), undefined));
+		expect(off).toMatchObject({ any: true, turnsTriggersOn: true, takesTriggersDown: false });
+		const on = optionsFor(contextActions([trigger('door')], status({ triggers: [shared('door', 'on')] }), undefined));
+		expect(on).toMatchObject({ any: true, turnsTriggersOn: false, takesTriggersDown: true });
+	});
+
+	it('has none for plain nodes', () => {
+		expect(optionsFor(contextActions([plain('a')], status(), undefined)).any).toBe(false);
 	});
 });

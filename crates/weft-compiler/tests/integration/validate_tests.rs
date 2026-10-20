@@ -1511,33 +1511,6 @@ out.data = c.value
     );
 }
 
-/// The build/hash entry (`compile_enriched_with_diagnostics`) resolves
-/// catalog-declared type names on inline port signatures by itself: the
-/// registry activation lives in the shared compile front half, not in
-/// each public entry. Regression: this path once skipped the registry,
-/// so a custom type parsed fine in the editor but died at build time.
-#[test]
-fn build_entry_resolves_declared_types() {
-    let source = r#"
-src = Text { value: "{}" }
-c = Cast() -> (value: ChatMessage)
-c.value = src.value
-out = Debug
-out.data = c.value
-"#;
-    let result = weft_compiler::compile_enriched_with_diagnostics(
-        source,
-        uuid::Uuid::new_v4(),
-        CompileFs::none(),
-        &catalog(),
-    );
-    assert!(
-        result.is_ok(),
-        "ChatMessage (declared by the history package) must resolve on the build path: {:?}",
-        result.err()
-    );
-}
-
 /// A NESTED typevar port (`List[T]`) wired to a concrete list on both
 /// sides resolves cleanly (a bare-`T`-only binder left nested vars
 /// unresolved forever, which the validator then rejected on a perfectly

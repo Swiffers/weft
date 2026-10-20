@@ -80,8 +80,7 @@ That same right-click menu makes an input required or optional, removes it, or
 puts a catalog port back the way it was.
 
 Double-click a box's name to rename it. Right-click a box for **Duplicate**,
-**Delete**, **Tags…** and **Run from here…**, plus **Run this group…** on a
-group or an included file.
+**Delete** and **Tags…**.
 
 On an infra node, the same menu has **One per instance**: each instance of
 your program then gets its own copy of it, and it shows a **per instance**
@@ -106,10 +105,10 @@ what all of this means, go and read
 ## Run part of the graph
 
 Select the boxes whose answers you want (click one, or hold **Shift** and drag
-around several). The selection bar appears at the bottom of the canvas, with a
-**Run (2)** button: 2 is how many boxes you picked.
-Click it, or press **Ctrl+Enter**, and those boxes run together with
-everything they need. That is the same run as:
+around several). The selection bar appears at the bottom center of the canvas
+with a big **RUN 2 TARGETS** button (**RUN 1 TARGET** if you picked one box).
+Click it, or press **Ctrl+Enter**, and those boxes run together with everything
+they need. That is the same run as:
 
 ```bash
 weft run --target dailyReport --target weeklyReport
@@ -117,38 +116,48 @@ weft run --target dailyReport --target weeklyReport
 
 To work out what a box needs, weft follows the wires back up from it and
 stops at any trigger. That trigger does not fire in this run, so a box only a
-trigger feeds is skipped; if you want it to run, fire the trigger with a
-made-up event from **Run from a spec…** (below). A box that two branches share
+trigger feeds is skipped. If you want that box to run, fire the trigger with a
+made-up event from the CLI (`weft run --fire`). A box that two branches share
 does not drag the other branch in. If the box sits inside a group, only the
 boxes of that group it needs run, plus whatever feeds the switch that decides
 whether the group runs at all (its `_should_flow` or `_should_not_flow`). If weft reaches a loop on the way, the whole loop comes along, and a
 box inside a loop cannot be picked on its own: Run stays grey and tells you to
 select the whole loop.
 
+Triggers and infra have no Run button: select one and the bar offers its own
+buttons instead (**Turn on**, **Turn off**, **Resync** for a trigger; **Start**,
+**Stop**, **Upgrade**, **Terminate** for infra; covered
+[below](#turn-triggers-and-infra-on-and-off)). If you select them together
+with other boxes, **RUN N TARGETS** counts and runs the other boxes. Pressing
+**Ctrl+Enter** with only triggers or infra selected tells you Run leaves them
+out.
+
 While weft works out what the selection needs, the button is greyed out and
-says `Checking what this run needs...` on hover. If the run cannot start
-(say it needs a trigger nobody fired), the button stays grey and its
-tooltip gives weft's reason, the same one `weft run --check` prints.
+says `Checking what this run needs...` on hover. If the run cannot start,
+the button stays grey and its tooltip gives weft's reason: the refusal
+`weft run --check` prints, or the infra the run reads that is not running
+(`Start db first: this run reads it, and it is not running.`). Several boxes
+selected are one run, so one blocked box blocks it: the tooltip names each
+blocked box with its reason, and the boxes that could run on their own.
 
 If you want the whole program, open the **Weft** icon in the side strip and
 click **Run Project** on the project's row. That is a plain `weft run`.
 
-For anything more specific, the **Specs** button on the status bar (below)
-lists your saved examples (`examples/*.json`), and clicking one runs it. The
-same list has **Run from a spec…**, a dialog where you can start partway in
-with values you supply, exclude an endpoint, run one group on its own, fire a
-single trigger with a made-up event, or reuse what did not change since the
-last run. If you have opened an included file (the **Open** button on its
-box, below), the list starts with **Run this group (&lt;name&gt;)…**, which opens
-that dialog set to run just that file. Right-clicking a box and choosing
-**Run from here…** opens the same dialog already filled in. Everything in that
-dialog also has a flag on [the CLI](../running/cli.md). For the rules behind
-it, go and read [versions, seeds and frozen examples](../running/versions.md).
+The editor has no button for starting partway in with values you supply,
+running one group on its own, firing a trigger with a made-up event, running a
+saved example (`examples/*.json`) or reusing what did not change since the last
+run. For those, use [the CLI](../running/cli.md#run-something): `--from`,
+`--group`, `--fire`, `--seed`, or an example's name after `weft run`. For the
+rules behind them, go and read
+[versions, seeds and frozen examples](../running/versions.md).
 
 ## Watch it go
 
-The status bar, at the very bottom of the canvas, shows what is happening right
-now. While the run on the graph is going, it shows **Stop** and how far the run
+The status bar, at the very bottom of the canvas, is the same bar as the
+selection bar above: what is happening now comes first, then what the
+selected boxes offer. With nothing selected and nothing going
+on, it is not drawn (the eye buttons that show only the trigger or the infra
+subgraph stay). While the run on the graph is going, it shows **Stop** and how far the run
 got (`run 3f2a... 4/9 nodes`). Which run that is depends on the toggle in
 [look at an older run](#look-at-an-older-run). The bar also shows work started
 elsewhere: an
@@ -222,12 +231,14 @@ the graph as that install runs it. For how it works, go and read
 
 Select a trigger or an infra node, or several (with the graph focused,
 **Ctrl+P** opens its list, and **Select All Triggers** there picks every
-trigger). The selection bar then offers what each can do right now, with how many of the selected nodes it applies to:
+trigger). The selection bar then offers what each can do right now, with a
+count when a button covers more than one of the selected nodes:
 **Turn on**, **Turn off** and **Resync** for triggers, **Start**, **Stop**,
 **Terminate** and **Upgrade** for infra. These are `weft activate`,
 `weft deactivate`, `weft resync` and the `weft infra` commands.
 
-If you want to choose how triggers go down, **options...** asks you three
+If you want to choose how triggers go down, **options...** (shown when a
+selected box has something to choose) asks you three
 things. What happens to work that arrives while they are down: **Hold it**,
 **Hold it, hidden** (held, but not listed for the people who answer your
 program's questions), or **Refuse it**. If you hold it, you can also say "then

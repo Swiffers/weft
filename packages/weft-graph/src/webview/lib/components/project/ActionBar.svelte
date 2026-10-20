@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { Square, Loader2, ChevronUp, Terminal } from '@lucide/svelte';
-	import { specSummary, specForAction, type RunSpec } from '../../../../run-spec';
+	import type { Snippet } from 'svelte';
+	import { Square, Loader2, Terminal } from '@lucide/svelte';
 	import type {
 		ActionBarState,
 		ActionAvailability,
@@ -11,23 +11,18 @@
 	import ActionDetailsModal from './ActionDetailsModal.svelte';
 	import { resyncStopped, type VerbInputs } from '../../verb-gates';
 
-	// The bottom bar: what is going on right now, and nothing else. The
-	// run you follow with its Stop, a build, a verb working, a setup or an
-	// infra change under way with its cancel. Every lifecycle verb lives
-	// on the contextual bar, which acts on the selected nodes.
-
-	let specMenuOpen = $state(false);
+	// The bottom bar: what is going on right now (the run you follow with
+	// its Stop, a build, a verb working, a setup or an infra change under
+	// way with its cancel), and in the same bar what the selected nodes
+	// offer (`selection`). Every lifecycle verb lives there, acting on the
+	// selected nodes. With nothing going on, nothing selected and no
+	// subgraph to show, no bar is drawn.
 
 	let {
 		state: barState,
 		status,
 		runProgress,
-		specs = [],
-		focusedGroup = null,
-		specsEnabled = true,
-		onRunSpec,
-		onOpenSpecDialog,
-		onOpenSpecMenu,
+		selection,
 		onCancelActivate,
 		onCancelBuild,
 		onCancelInfra,
@@ -49,21 +44,9 @@
 		status: ActionAvailability | undefined;
 		/// How far the followed run got, when one is followed.
 		runProgress?: { done: number; total: number | null };
-		/// The project's specs (`examples/*.json`), already ordered with
-		/// the ones scoped to `focusedGroup` first, for the spec menu.
-		specs?: RunSpec[];
-		/// The group the user stands in (inside an include), if any: the
-		/// menu offers "Run this group" for it first.
-		focusedGroup?: string | null;
-		/// False on a view that is no place in the program, or while
-		/// something else is in flight.
-		specsEnabled?: boolean;
-		/// Run a saved spec by name (`weft run <name>`).
-		onRunSpec?: (name: string) => void;
-		/// Open the spec dialog, with a spec filled in or blank.
-		onOpenSpecDialog?: (initial?: RunSpec) => void;
-		/// The menu is opening: refresh the spec list.
-		onOpenSpecMenu?: () => void;
+		/// What the selected nodes offer (the contextual bar), drawn in
+		/// this bar after what is going on; absent with nothing selected.
+		selection?: Snippet;
 		/// A trigger setup under way: stop it, the triggers it has not
 		/// turned on yet stay off.
 		onCancelActivate?: () => void;
@@ -214,8 +197,12 @@
 	});
 
 	const btn = 'flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors';
-	const btnDisabled = 'disabled:opacity-50 disabled:cursor-not-allowed';
 	const labelCss = 'font-medium text-[11px] uppercase tracking-wider';
+
+	const showInfraToggle = $derived(hasInfra && !!onToggleInfraSubgraph);
+	const showTriggerToggle = $derived(hasTriggers && !!onToggleTriggerSubgraph);
+	/// Anything before the selection's part: an eye, or what is going on.
+	const anyStatus = $derived(showInfraToggle || showTriggerToggle || slot.kind !== 'idle');
 
 	const errorMessage = $derived(barState.error?.message);
 	const errorVerb = $derived(barState.error?.verb);
@@ -296,8 +283,9 @@
 		{onOpenLocation}
 	/>
 
-	<div class="flex items-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-xl backdrop-blur-md">
-		{#if hasInfra && onToggleInfraSubgraph}
+	{#if anyStatus || selection}
+	<div class="flex flex-wrap items-center justify-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-xl backdrop-blur-md max-w-[90vw]">
+		{#if showInfraToggle}
 			<button
 				class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showInfraSubgraph ? 'bg-blue-100 text-blue-600 border border-blue-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
 				onclick={onToggleInfraSubgraph}
@@ -306,7 +294,7 @@
 				{@render eyeIcon(showInfraSubgraph)}
 			</button>
 		{/if}
-		{#if hasTriggers && onToggleTriggerSubgraph}
+		{#if showTriggerToggle}
 			<button
 				class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showTriggerSubgraph ? 'bg-emerald-100 text-emerald-600 border border-emerald-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
 				onclick={onToggleTriggerSubgraph}
@@ -351,12 +339,14 @@
 			</span>
 		{/if}
 
-		{#if slot.kind === 'idle' || slot.kind === 'run'}
-			<div class="relative flex items-stretch">
-				{@render specMenu()}
-			</div>
+		{#if selection}
+			{#if anyStatus}
+				<div class="w-px h-6 bg-zinc-200 mx-1"></div>
+			{/if}
+			{@render selection()}
 		{/if}
 	</div>
+	{/if}
 </div>
 
 {#snippet eyeIcon(open: boolean)}
@@ -386,41 +376,4 @@
 		<Loader2 class="w-3.5 h-3.5 animate-spin" />
 		<span class={labelCss}>{text}{onCancel ? ' (Cancel)' : ''}</span>
 	</button>
-{/snippet}
-
-<!-- The spec menu: the project's saved examples, "Run this group" when
-     the user stands inside one, and the dialog for a one-off. The bar
-     sits at the bottom of the screen, so the menu opens UPWARD. -->
-{#snippet specMenu()}
-	<button
-		class="{btn} {btnDisabled} px-2 bg-white text-zinc-600 border border-zinc-200 hover:bg-zinc-50"
-		onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
-		disabled={!specsEnabled}
-		title={specMenuOpen ? 'Close' : 'Run a saved example, this group, or a one-off'}
-	>
-		<span class={labelCss}>Specs</span>
-		<ChevronUp class="w-3.5 h-3.5 transition-transform {specMenuOpen ? 'rotate-180' : ''}" />
-	</button>
-	{#if specMenuOpen}
-		<div class="absolute right-0 bottom-full mb-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
-			{#if focusedGroup}
-				<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-medium" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(specForAction('group', focusedGroup)); }}>
-					Run this group ({focusedGroup})…
-				</button>
-			{/if}
-			{#each specs as spec (spec.name)}
-				<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted flex justify-between gap-3" onclick={() => { specMenuOpen = false; onRunSpec?.(spec.name); }}>
-					<span class="font-mono">{spec.name}</span>
-					<span class="text-zinc-400">{specSummary(spec)}</span>
-				</button>
-			{/each}
-			{#if specs.length === 0}
-				<div class="px-2 py-1.5 text-zinc-400">no specs in examples/</div>
-			{/if}
-			<div class="my-1 border-t"></div>
-			<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(); }}>
-				Run from a spec…
-			</button>
-		</div>
-	{/if}
 {/snippet}

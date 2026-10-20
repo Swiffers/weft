@@ -194,24 +194,22 @@ impl Ctx {
     /// given, the walk never happens.
     fn install(&self) -> anyhow::Result<&Install> {
         self.install
-            .get_or_init(|| self.resolve_install(|| Ok(self.project_here()?.cloned())))
+            .get_or_init(|| self.resolve_install())
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
-    /// Resolve the install from the flags, the given project lookup and
-    /// the disk, uncached. A one-shot command goes through
-    /// [`Ctx::install`] (the cwd project); a long-lived one goes through
-    /// [`Ctx::fresh_client`] (the project of the request at hand).
-    fn resolve_install(&self, project: impl FnOnce() -> anyhow::Result<Option<Project>>) -> anyhow::Result<Install> {
+    /// [`Ctx::install`]'s work: the install from the flags, the cwd
+    /// project and the disk, uncached.
+    fn resolve_install(&self) -> anyhow::Result<Install> {
         let on = self.on.as_deref();
         let url = resolve_dispatcher_url(self.dispatcher.as_ref().and_then(|d| d.beside(on)).map(str::to_owned), on, || {
             // A broken weft.toml only matters when the project's
             // targets are read: outside the default target it is
             // the answer's error; for the local default the verb
             // that needs the project reports it.
-            match project() {
-                Ok(found) => Ok(found),
+            match self.project_here() {
+                Ok(found) => Ok(found.cloned()),
                 Err(e) if on.is_some() => Err(e),
                 Err(_) => Ok(None),
             }
@@ -282,19 +280,6 @@ impl Ctx {
     pub fn client(&self) -> anyhow::Result<crate::client::DispatcherClient> {
         let install = self.install()?;
         Ok(crate::client::DispatcherClient::new(install.url.clone(), install.operator_key.clone()).for_target(self.on()))
-    }
-
-    /// A client resolved afresh on every call, never cached: a long-lived
-    /// process (the editor's parse server) outlives any one state of the
-    /// install, so an install that starts, or credentials that get fixed,
-    /// after it launched are picked up by the next request, and a failure
-    /// is that request's error rather than the process's. The project is
-    /// the REQUEST's (a parse server serves files from many projects, and
-    /// its own cwd names none of them), re-read each time so a weft.toml
-    /// edit is seen.
-    pub fn fresh_client(&self, project: Option<&Project>) -> anyhow::Result<crate::client::DispatcherClient> {
-        let install = self.resolve_install(|| Ok(project.cloned()))?;
-        Ok(crate::client::DispatcherClient::new(install.url, install.operator_key).for_target(self.on()))
     }
 
     /// The cwd-discovered project, lazy-loaded and cached, keeping
@@ -626,13 +611,6 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains(&format!("install '{name}' has no ports yet")), "{error}");
         assert!(ctx.install_access().is_err(), "the cached error answers every later use");
-        // The install starts after this process did: a fresh resolution
-        // sees it, the cached one keeps its answer.
-        let dir = weft_core::infra::Install::from_env().unwrap().dir();
-        weft_core::ports::InstallPorts::DEFAULT.save(&dir).expect("save ports");
-        assert!(ctx.fresh_client(None).is_ok(), "a fresh resolution picks up the started install");
-        assert!(ctx.client().is_err(), "the cached error is kept for a one-shot command");
-        std::fs::remove_dir_all(&dir).unwrap();
         std::env::remove_var(weft_core::infra::INSTALL_ENV);
     }
 

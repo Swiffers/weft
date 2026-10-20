@@ -422,7 +422,6 @@ pub fn read_spec_if_present_from(
 /// `examples/<name>.json`. Letting a path reach the writer produced
 /// `examples/examples/chain.json.json`, so the rule lives on the writer
 /// where both `weft freeze` and `weft run --save` pass through it.
-// SYNC: validate_example_name <-> packages/weft-graph/src/run-spec.ts exampleNameProblem
 pub fn validate_example_name(name: &str) -> Result<()> {
     // A leading dash is refused because the name is typed back as an
     // argument (`weft run <name>`, `weft freeze <name>`), where the

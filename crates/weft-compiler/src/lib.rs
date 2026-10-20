@@ -265,28 +265,6 @@ pub fn compile_checked(
     Ok(project)
 }
 
-/// Compile + strict enrich, no validation, returning the full
-/// diagnostic list on failure. For callers that need the enriched
-/// topology (infra-closure walk, hashing) but not the full validation
-/// gate (which the build path owns) and want to surface structured
-/// per-error info to the user.
-pub fn compile_enriched_with_diagnostics(
-    source: &str,
-    project_id: Uuid,
-    fs: CompileFs,
-    catalog: &dyn MetadataCatalog,
-) -> Result<ProjectDefinition, Vec<Diagnostic>> {
-    let (project, diagnostics) = compile_and_enrich(source, project_id, fs, catalog, None);
-    let any_errors = diagnostics
-        .iter()
-        .any(|d| matches!(d.severity, Severity::Error));
-    if any_errors {
-        Err(diagnostics)
-    } else {
-        Ok(project)
-    }
-}
-
 /// The shared front half of every strict pipeline: lex + parse +
 /// flatten, then strict enrich, collecting failures as `Error`
 /// diagnostics rather than aborting. The single home for the
@@ -303,8 +281,8 @@ fn compile_and_enrich(
     // Parsing and enrichment both resolve declared type names, so the
     // catalog's registry is activated HERE, at the shared front half,
     // rather than trusting every public entry to remember the wrap
-    // (`compile_enriched_with_diagnostics`, the build/hash path, once
-    // forgot it and custom types failed only at build time). The scope
+    // (an entry that once forgot it failed custom types only at build
+    // time). The scope
     // is a re-entrant stack, so `compile_strict`'s outer scope (which
     // also covers validation) nests harmlessly.
     catalog.type_registry().scoped(|| compile_and_enrich_inner(source, project_id, fs, catalog, source_name))

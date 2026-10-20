@@ -36,7 +36,6 @@ pub type SourceHash = String;
 
 /// Immutable graph and production-code identity captured with a run.
 /// Definition storage remains keyed by its graph hash alone.
-// SYNC: ProgramIdentity <-> packages/weft-graph/src/run-spec.ts ProgramIdentity
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramIdentity {

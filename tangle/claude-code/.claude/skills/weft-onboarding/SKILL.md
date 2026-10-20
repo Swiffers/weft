@@ -76,8 +76,8 @@ project has the thing to show, or they ask.
    is the on/off switch. The label on a box is its name; the small text is
    its type.
 3. **Run it once.** Select the boxes to run (Ctrl+A for all of them) and
-   press "Run (2)" (the number is how many are selected) on the bar that
-   appears, or Ctrl+Enter. Boxes glow amber as
+   press "RUN 2 TARGETS" (2 is how many are selected) on the bar that
+   appears at the bottom center, or Ctrl+Enter. Boxes glow amber as
    they work, green as they land. Click one: the inspector shows
    what went in and what came out. The value is always one click away.
 4. **Three things that are alive, on three clocks.** This is the one
@@ -107,9 +107,9 @@ project has the thing to show, or they ask.
    palette and arrives with the wire already drawn. Double-click a name to
    rename. The header arrow opens a box's fields. Scrolling moves the
    canvas and does not zoom; zoom is the buttons at the bottom left.
-7. **Aim a run.** Select one box and press "Run (1)": only that box and
-   what it needs run. Right-click a box for "Run from here...", which
-   starts the run at that box with the inputs they type in.
+7. **Aim a run.** Select one box and press "RUN 1 TARGET": only that box and
+   what it needs run. Starting a run partway in, at a box, with inputs they
+   type in, is not in the editor: that is `weft run --from` on the CLI.
 8. **Groups and loops.** Collapse a group: the wiring outside it does not
    change. Open it again with its expand button. Groups nest. A loop runs its inside
    once per item; its iteration number is on its rail.

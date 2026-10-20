@@ -1608,11 +1608,37 @@ export interface InstanceHoldings {
   lastRunUnix?: number;
 }
 
-/// What `weft run --check --json` prints: whether the walk for the
-/// targets resolves, and when it does not, the walk's own refusal. It
+/// What `weft run --check --json` prints: whether the run of the
+/// targets could start, and when not, the refusal the run itself would
+/// give. When it could, `infraRead` lists the infra copies it reads (the
+/// ones the install refuses it for while one is not running); held
+/// against the infra status, they say whether Run can go. With more
+/// than one target, `targets` says each target as a run of it alone
+/// would stand, so a refused run can name which target stops it. It
 /// exits 0 either way.
 // SYNC: RunCheck <-> crates/weft-cli/src/commands/run.rs RunCheck
-export type RunCheck = { ok: true } | { ok: false; refusal: string };
+export type RunCheck =
+  | { ok: true; infraRead?: InfraCopyRead[]; targets?: TargetCheck[] }
+  | { ok: false; refusal: string; targets?: TargetCheck[] };
+
+/// One target of a checked run, as a run of it alone would stand: the
+/// triggers an input it needs only comes from (a run does not fire
+/// them), any other refusal, and the infra copies it reads.
+// SYNC: TargetCheck <-> crates/weft-cli/src/commands/run.rs TargetCheck
+export interface TargetCheck {
+  target: string;
+  unfiredTriggers?: string[];
+  refusal?: string;
+  infraRead?: InfraCopyRead[];
+}
+
+/// One infra copy a run reads: the node spelled the way the program
+/// reads it (`one.db`), and whose copy (absent for the shared one).
+// SYNC: InfraCopyRead <-> crates/weft-cli/src/commands/run.rs InfraCopyRead
+export interface InfraCopyRead {
+  node: string;
+  instance?: string;
+}
 
 /// The parent run and the original run supplying each reused result,
 /// per place (a `locatedKey`).
@@ -1624,9 +1650,6 @@ export interface Seed {
   /// got in `parent`.
   answers?: string[];
 }
-
-import type { RunSpec, ResolveSpecResponse } from './run-spec';
-export type { RunSpec, ResolveSpecResponse } from './run-spec';
 
 export interface NodeFiringEvent {
   nodeId: string;
@@ -2419,13 +2442,9 @@ export type HostMessage =
   /// painted (statuses, values, scope dimming, the version banner)
   /// goes, and the canvas waits for the next run to start.
   | { kind: 'runCleared' }
-  /// The answer to a `resolveSpec` request.
-  | { kind: 'specResolved'; requestId: number; result: ResolveSpecResponse }
-  /// Reply to `checkRun`: the walk's refusal for those targets, or
-  /// `null` when it resolves and Run can go.
-  | { kind: 'runChecked'; requestId: number; refusal: string | null }
-  /// The project's `examples/*.json`, for the Run menu.
-  | { kind: 'specsListed'; specs: RunSpec[] }
+  /// Reply to `checkRun`: weft's answer for those targets
+  /// (`weft run --check`).
+  | { kind: 'runChecked'; requestId: number; check: RunCheck }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   /// The node catalog (full set, from `weft describe-nodes`) failed to
   /// load, or loaded with soft warnings. Distinct from `parseError`:
@@ -2624,21 +2643,6 @@ export type WebviewMessage =
   /// Ask whether a run of these targets would start, without starting
   /// it (`weft run --check`). Answered by `runChecked`.
   | { kind: 'checkRun'; requestId: number; targets: [string, ...string[]] }
-  /// Resolve a spec against the current program through the parse server
-  /// (the dispatcher's own resolver), so the dialog shows every missing
-  /// input before the run starts. Answered by `specResolved`.
-  | { kind: 'resolveSpec'; requestId: number; spec: RunSpec; seeded: boolean }
-  /// Run a spec as a one-off, as the flags it spells (`specToRunArgs`).
-  /// `seeded` is the dialog's seed checkbox, and it must travel: the
-  /// dialog resolves the spec WITH seeding to decide it is runnable.
-  | { kind: 'runSpec'; spec: RunSpec; seeded?: boolean }
-  /// Write a spec to `examples/<name>.json` and nothing else. Saving used
-  /// to run it too, so writing one down started a real run.
-  | { kind: 'saveSpec'; spec: RunSpec }
-  /// Run `examples/<name>.json` (`weft run <name>`).
-  | { kind: 'runSpecFile'; name: string }
-  /// List the project's specs (answered by `specsListed`).
-  | { kind: 'listSpecs' }
   /// Restore the version of a run or a version id (`weft branch <ref>`).
   | { kind: 'branchTo'; reference: string }
   /// A lifecycle verb on the selected triggers or infra, from the

@@ -104,7 +104,7 @@ Flags on `weft run`:
 | `--seed[=<run>]` | Reuse, from head's run or the run you name, everything whose slice of the program did not change (any finished run of the project, one a trigger started or one that failed included). A node that runs again and waited for an answer there gets that answer replayed, if its code did not change |
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing. Refused beside `--seed`, since a new tree has nothing before it to reuse |
-| `--check` | Only check that the run could start, building and running nothing: it prints `the run can start` and exits 0, or prints the refusal and exits 1 |
+| `--check` | Only check that the run could start, building and running nothing: it prints `the run can start` and the infra the run reads, and exits 0, or prints the refusal and exits 1. With `--json`, the infra is the `infraRead` list, and with several targets `targets` says what stops each one if it ran alone |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
 | `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `instance`, `keeping` (what `--durable` or `--fast` saved), `keep_for`, `hold_secs` |
 | `--durable` | If the run has to carry on after its worker dies: another worker picks it up where it stopped, and a node caught halfway is failed rather than run twice. For what that costs in speed, go and read [when a run waits for its writes](the-journal.md#when-a-run-waits-for-its-writes) |

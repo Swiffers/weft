@@ -12,7 +12,7 @@
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeFiring, RunState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, CatalogWarning, ActionAvailability, LifecycleAction, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
+  import type { ActionBarState, CatalogWarning, ActionAvailability, LifecycleAction, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, RunCheck, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
   import { credentialOwnerKind } from '../protocol';
@@ -486,10 +486,6 @@
             : { version: msg.version, diskVersion: msg.diskVersion };
         return;
       }
-      if (msg.kind === 'specsListed') {
-        specs = msg.specs;
-        return;
-      }
       if (msg.kind === 'runTerminal') {
         // The dispatcher reached RunCompleted / RunFailed.
         // Whatever the per-node tally says, the run is over: hide
@@ -938,37 +934,16 @@
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'runProject', targets });
   }
-  /// Whether a run of these targets would start: the walk's refusal, or
-  /// `null`. The contextual bar disables Run with the refusal as its text.
-  async function checkRun(targets: [string, ...string[]]): Promise<string | null> {
+  /// Whether a run of these targets would start (`weft run --check`):
+  /// its refusal, or the infra it reads, which the contextual bar holds
+  /// against the infra status to disable Run with a reason.
+  async function checkRun(targets: [string, ...string[]]): Promise<RunCheck> {
     editorRef?.flushAllPendingSaves?.();
     const reply = await hostRequest('runChecked', (requestId) => ({ kind: 'checkRun', requestId, targets }));
-    return reply.refusal;
+    return reply.check;
   }
 
-  // The run spec dialog's round trips: resolve through the host (the
-  // parse server runs the dispatcher's own resolver), list the specs
-  // in `examples/`, run or save one, branch to a run's version.
-  let specs = $state<import('../run-spec').RunSpec[]>([]);
-  async function resolveSpec(spec: import('../run-spec').RunSpec, seeded: boolean): Promise<import('../run-spec').ResolveSpecResponse> {
-    const reply = await hostRequest('specResolved', (requestId) => ({ kind: 'resolveSpec', requestId, spec, seeded }));
-    return reply.result;
-  }
-  function onRunSpec(spec: import('../run-spec').RunSpec, seeded = false) {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'runSpec', spec, seeded });
-  }
-  function onSaveSpec(spec: import('../run-spec').RunSpec) {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'saveSpec', spec });
-  }
-  function onRunSpecFile(name: string) {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'runSpecFile', name });
-  }
-  function onListSpecs() {
-    send({ kind: 'listSpecs' });
-  }
+  /// Put the files on disk onto a run's version (the version banner).
   function onBranchTo(reference: string) {
     send({ kind: 'branchTo', reference });
   }
@@ -1156,12 +1131,6 @@
       onSwitchInstall={(install) => send({ kind: 'switchInstall', install })}
       {autoOrganizeOnMount}
       {onRun}
-      {specs}
-      {resolveSpec}
-      {onRunSpec}
-      {onSaveSpec}
-      {onRunSpecFile}
-      {onListSpecs}
       {onBranchTo}
       {onStop}
       {onDismissError}

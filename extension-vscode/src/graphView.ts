@@ -18,11 +18,9 @@ import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, StoredFileDownload, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, RunCheck, SourceLocation, StoredFileDownload, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { lifecycleCommand } from '../../packages/weft-graph/src/lifecycle-cli';
-import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
-import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
-import * as nodeFs from 'node:fs';
+import { addressOf, groupOfCallPath } from '../../packages/weft-graph/src/run-spec';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem } from '../../packages/weft-graph/src/live-data';
 import type { LiveRun } from './runFollower';
@@ -109,7 +107,7 @@ export class GraphViewController {
   private runHandler: ((targets: [string, ...string[]]) => void) | undefined;
   /// Whether a run of these targets would start (`weft run --check`):
   /// the walk's refusal, or `null`.
-  private runCheckHandler: ((targets: [string, ...string[]]) => Promise<string | null>) | undefined;
+  private runCheckHandler: ((targets: [string, ...string[]]) => Promise<RunCheck>) | undefined;
   /// Told the group the user stands in (an include's alias chain, or
   /// null at the top level) on every navigation, so the Runs view
   /// marks the runs scoped to it.
@@ -220,7 +218,7 @@ export class GraphViewController {
   /** Called by extension.ts so sidebar-initiated runs and action-bar
    *  clicks route through the same business logic. */
   setRunHandler(fn: (targets: [string, ...string[]]) => void): void { this.runHandler = fn; }
-  setRunCheckHandler(fn: (targets: [string, ...string[]]) => Promise<string | null>): void { this.runCheckHandler = fn; }
+  setRunCheckHandler(fn: (targets: [string, ...string[]]) => Promise<RunCheck>): void { this.runCheckHandler = fn; }
   setNavHandler(fn: (focusedGroup: string | null) => void): void { this.navHandler = fn; }
 
   /** Tell the graph which version the followed run ran and which one
@@ -1197,17 +1195,17 @@ export class GraphViewController {
   /// Whether a run of `targets` would start, answering the contextual
   /// bar's `checkRun`.
   private async checkRun(requestId: number, targets: [string, ...string[]]): Promise<void> {
-    let refusal: string | null;
+    let check: RunCheck;
     if (!this.runCheckHandler) {
-      refusal = 'no project is pinned, so there is nothing to run';
+      check = { ok: false, refusal: 'no project is pinned, so there is nothing to run' };
     } else {
       try {
-        refusal = await this.runCheckHandler(targets);
+        check = await this.runCheckHandler(targets);
       } catch (err) {
-        refusal = err instanceof Error ? err.message : String(err);
+        check = { ok: false, refusal: err instanceof Error ? err.message : String(err) };
       }
     }
-    void this.panel?.webview.postMessage({ kind: 'runChecked', requestId, refusal } satisfies HostMessage);
+    void this.panel?.webview.postMessage({ kind: 'runChecked', requestId, check } satisfies HostMessage);
   }
 
   /// Cancel a trigger setup under way (or give up a resync that
@@ -1310,25 +1308,6 @@ export class GraphViewController {
         break;
       case 'checkRun':
         void this.checkRun(msg.requestId, msg.targets);
-        break;
-      case 'resolveSpec':
-        void this.resolveSpec(msg.requestId, msg.spec, msg.seeded);
-        break;
-      case 'listSpecs':
-        this.postSpecs();
-        break;
-      case 'runSpec':
-        void this.runSpec(msg.spec, msg.seeded);
-        break;
-      case 'saveSpec':
-        void this.saveSpec(msg.spec).catch((err) => {
-          void vscode.window.showErrorMessage(
-            `Weft: could not save the example: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-        break;
-      case 'runSpecFile':
-        void this.dispatchVerb('run', [msg.name]);
         break;
       case 'branchTo':
         void this.branchTo(msg.reference);
@@ -2142,164 +2121,6 @@ export class GraphViewController {
     // The column is moot: navigation always has the panel already up, so
     // `open` reveals it where the user put it.
     await this.open(target, undefined, vscode.ViewColumn.Beside, true);
-  }
-
-  /// The root of the project the watched document belongs to.
-  private projectRoot(): string | undefined {
-    const doc = this.watchedDoc;
-    if (!doc) return undefined;
-    return findProjectRoot(doc.uri.fsPath) ?? undefined;
-  }
-
-  /// Resolve a spec through the parse server (the dispatcher's own
-  /// resolver over the buffer as it is), answering the dialog; a server
-  /// failure is a refusal that names it, never a silent dialog.
-  private async resolveSpec(requestId: number, spec: RunSpec, seeded: boolean): Promise<void> {
-    const doc = this.watchedDoc;
-    let result: ResolveSpecResponse;
-    if (!doc) {
-      result = { refusal: { errors: ['no .weft file is open'] } };
-    } else {
-      try {
-        const bakes = spec.fire && this.watchedProjectId
-          ? await this.client.get<BakeSummary[]>(`/projects/${this.watchedProjectId}/trigger-bakes`)
-          : [];
-        result = await this.parseServer.request<ResolveSpecResponse>({
-          kind: 'resolve_spec',
-          source: doc.getText(),
-          file: doc.uri.fsPath,
-          spec,
-          seeded,
-          bakes,
-        });
-      } catch (err) {
-        result = { refusal: { errors: [err instanceof Error ? err.message : String(err)] } };
-      }
-    }
-    void this.panel?.webview.postMessage({ kind: 'specResolved', requestId, result } satisfies HostMessage);
-  }
-
-  /// The project's `examples/*.json`, read off the disk (they are checked
-  /// in, and the CLI reads the same files).
-  private postSpecs(): void {
-    const root = this.projectRoot();
-    const specs: RunSpec[] = [];
-    if (root) {
-      const dir = nodePath.join(root, 'examples');
-      let names: string[] = [];
-      try {
-        names = nodeFs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort();
-      } catch (err) {
-        // An `examples/` that cannot be read is not "no examples". The
-        // menu would have said so and the person would have gone looking
-        // for a missing file that is sitting right there.
-        const code = (err as { code?: string }).code;
-        if (code !== 'ENOENT') {
-          void vscode.window.showWarningMessage(
-            `Weft: could not read examples/ (${err instanceof Error ? err.message : String(err)}), so the Run menu is empty.`,
-          );
-        }
-        names = [];
-      }
-      const broken: string[] = [];
-      for (const file of names) {
-        try {
-          const spec = parseRunSpec(parseSuppliedJson(nodeFs.readFileSync(nodePath.join(dir, file), 'utf8')));
-          // Named by its FILE, always. `weft run <name>` resolves
-          // `examples/<name>.json`, so the name written inside the file
-          // is not what runs it: a file whose two names differed ran a
-          // different example or none, and two files sharing an inner
-          // name collided on the menu's key, which takes the graph down
-          // with a duplicate-key error.
-          specs.push({ ...spec, name: file.replace(/\.json$/, '') });
-        } catch (err) {
-          broken.push(`${file} (${err instanceof Error ? err.message : String(err)})`);
-        }
-      }
-      if (broken.length > 0) {
-        void vscode.window.showWarningMessage(
-          `Weft: ${broken.length} file(s) in examples/ do not parse and are not listed: ${broken.join(', ')}`,
-        );
-      }
-    }
-    void this.panel?.webview.postMessage({ kind: 'specsListed', specs } satisfies HostMessage);
-  }
-
-  /// Run a spec from the dialog as a one-off: the flags it spells, the
-  /// seed checkbox included (the dialog resolved it WITH seeding to
-  /// decide it was runnable, so dropping the flag refuses an input the
-  /// person was just told is covered).
-  private async runSpec(spec: RunSpec, seeded?: boolean): Promise<void> {
-    await this.dispatchVerb('run', specToRunArgs(spec, seeded === true));
-  }
-
-  /// Write a spec to `examples/<name>.json`. It does NOT run: saving used
-  /// to run it too, so writing down a spec you were not ready for started
-  /// a real run.
-  ///
-  /// The name becomes a file name and `weft run <name>` resolves it by
-  /// file name, so it is checked here rather than joined blindly: a name
-  /// carrying a separator or a `..` wrote outside `examples/`, and one
-  /// carrying anything else the CLI does not resolve saved a file the Run
-  /// menu could never run.
-  private async saveSpec(spec: RunSpec): Promise<void> {
-    if (this.refusedOnInstall('Saving an example')) return;
-    spec = parseRunSpec(spec);
-    // The spec's OWN name. It used to travel twice, as `spec.name` and
-    // as a second field copied from it, and the host then wrote the
-    // second one INTO the spec, so the message did not say which won.
-    const clean = spec.name.trim();
-    // The SAME rule the CLI applies, shared as one function, and checked
-    // here as well as in the dialog: a spec can arrive from any sender
-    // on this channel, and this is where the file name is joined.
-    const problem = exampleNameProblem(clean);
-    if (problem) {
-      void vscode.window.showErrorMessage(`Weft: '${spec.name}' cannot name an example: ${problem}.`);
-      return;
-    }
-    const root = this.projectRoot();
-    if (!root) {
-      void vscode.window.showErrorMessage('Weft: no project to save the spec into.');
-      return;
-    }
-    const dir = nodePath.join(root, 'examples');
-    const path = nodePath.join(dir, `${clean}.json`);
-    // Ordinary saved parameters can be replaced after confirmation.
-    // Frozen evidence is replaced only by explicitly freezing a new run.
-    let existed = false;
-    try {
-      await vscode.workspace.fs.stat(vscode.Uri.file(path));
-      existed = true;
-    } catch (err) {
-      // Only "it is not there" means it is not there. A permissions or
-      // unavailable answer swallowed as "nothing there" skips the
-      // question below and destroys whatever is in the file.
-      if ((err as vscode.FileSystemError)?.code !== 'FileNotFound') throw err;
-    }
-    if (existed) {
-      const saved = parseRunSpec(parseSuppliedJson(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path))).toString('utf8')));
-      if (saved.expected || saved.frozenFrom) {
-        void vscode.window.showErrorMessage(`Weft: examples/${clean}.json is frozen. Save under another name, or use weft freeze after accepting a new run.`);
-        return;
-      }
-      const replace = await vscode.window.showWarningMessage(
-        `examples/${clean}.json already exists. Replace its saved run parameters?`,
-        { modal: true },
-        'Replace',
-      );
-      if (replace !== 'Replace') return;
-    }
-    const text = `${JSON.stringify({ ...spec, name: clean }, null, 2)}\n`;
-    // The directory after the question, so declining leaves nothing
-    // behind that was not there before.
-    await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));
-    await vscode.workspace.fs.writeFile(vscode.Uri.file(path), Buffer.from(text, 'utf8'));
-    void vscode.window.showInformationMessage(
-      existed
-        ? `Weft: replaced examples/${clean}.json. The Run menu lists it.`
-        : `Weft: saved examples/${clean}.json. The Run menu lists it.`,
-    );
-    this.postSpecs();
   }
 
   /// Pop the include back-stack (Return button): reopen the previous file.

@@ -43,7 +43,6 @@ pub type PortValues = BTreeMap<String, BTreeMap<String, Value>>;
 /// A group's simulated outputs: the group id and one value per output port.
 pub type GroupOutputs = (String, BTreeMap<String, Value>);
 
-// SYNC: BakeSummary <-> packages/weft-graph/src/run-spec.ts BakeSummary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BakeSummary {
@@ -117,7 +116,6 @@ pub struct RunSpec {
 /// now: `(where, old, new)`, `where` the path of the object holding the
 /// key (`[]` for any list item). The old spelling is refused, never read
 /// as an alias; this only lets the refusal name the new one.
-// SYNC: RENAMED_SPEC_KEYS <-> packages/weft-graph/src/run-spec.ts RENAMED_SPEC_KEYS (the table and the refusal parseRunSpec builds from it)
 const RENAMED_SPEC_KEYS: &[(&[&str], &str, &str)] = &[
     (&[], "frozen_from", "frozenFrom"),
     (&["frozenFrom"], "execution_id", "runId"),
@@ -135,7 +133,6 @@ impl RunSpec {
     /// key an older weft spelled differently, the refusal names every
     /// such key and its spelling now instead of serde's bare "unknown
     /// field".
-    // SYNC: RunSpec::parse_file <-> packages/weft-graph/src/run-spec.ts parseRunSpec (the RENAMED_SPEC_KEYS refusal)
     pub fn parse_file(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|error| {
             let renamed = serde_json::from_str::<Value>(text).map(|value| renamed_spec_keys(&value)).unwrap_or_default();
@@ -323,7 +320,6 @@ fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<V
 impl TryFrom<AnswerFile> for Answer {
     type Error = String;
 
-    // SYNC: answer refusals <-> packages/weft-graph/src/run-spec.ts parseRunSpec answers
     fn try_from(f: AnswerFile) -> Result<Self, String> {
         let ended = match (f.payload, f.skipped, f.gave_up) {
             (Some(value), false, None) => AwaitEnd::Answered { value },
@@ -754,23 +750,16 @@ fn baked_stand_ins(baked: &crate::infra::bake::Saved) -> BTreeMap<Located, Stand
     }).collect()
 }
 
-/// What a resolved spec runs and what the caller should explain. Only
-/// ever sent (to the editor's preview), never read back: the program
-/// itself stays here.
-// SYNC: Resolved <-> packages/weft-graph/src/run-spec.ts Resolved
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// What a resolved spec runs and what the caller should explain.
+#[derive(Debug, Clone)]
 pub struct Resolved {
     /// The program the run runs: the spec's cut of the program (for a spec
     /// with no bound, every place of it, less the wires nothing carries).
-    #[serde(skip)]
     pub program: ProjectDefinition,
     /// What the run is given at the places `program` says
     /// ([`crate::project::Given`]): its birth carries it.
-    #[serde(skip)]
     pub given: Given,
     /// What the walk kept (every place, for the program as written).
-    #[serde(skip)]
     pub walk: cut::Walk,
     /// Every place `program` runs (`crate::project::places::running_places`).
     pub runs: BTreeSet<Located>,
@@ -785,7 +774,6 @@ pub struct Resolved {
 
 /// A selected input whose wire's source carries nothing in this run: it
 /// does not run, or it is a trigger the run does not fire.
-// SYNC: CrossingPort <-> packages/weft-graph/src/run-spec.ts CrossingPort
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrossingPort {
@@ -814,14 +802,12 @@ pub struct CrossingPort {
 }
 
 /// One input port of a run's start.
-// SYNC: StartPort <-> packages/weft-graph/src/run-spec.ts StartPort
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartPort {
     pub node: String,
     pub port: String,
 }
 
-// SYNC: Refusal <-> packages/weft-graph/src/run-spec.ts Refusal
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refusal {
     pub errors: Vec<String>,
@@ -1237,17 +1223,34 @@ fn gets_value(project: &ProjectDefinition, g: &ProjectGraph, walked: &cut::Walk,
             && (walked.kept().contains(&source) || g.group(&source.id).is_some()))
 }
 
-/// Refuse a run in which an input something needs gets nothing: its
+/// One input something in a run needs that gets nothing ([`unfed`]): the
+/// sentence that names it, and the trigger it only comes from when that is
+/// why (a trigger the run does not fire), spelled the way the program
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfed {
+    pub message: String,
+    pub trigger: Option<String>,
+}
+
+/// Refuse a run in which an input something needs gets nothing
+/// ([`unfed`]).
+pub fn refuse_unfed(project: &ProjectDefinition, resolved: &Resolved, spec: &RunSpec) -> Result<(), Refusal> {
+    let errors: Vec<String> = unfed(project, resolved, spec).into_iter().map(|unfed| unfed.message).collect();
+    if errors.is_empty() { Ok(()) } else { Err(Refusal { errors }) }
+}
+
+/// Every input in a run that something needs and that gets nothing: its
 /// wire's source does not run (or is a trigger the run does not fire), no
 /// value is handed in its place, and an input its node cannot run without
 /// would close. Checked against the run as it will run, after a seed has
 /// had its say, since history can feed it. Each is named where the person
 /// can act on it, once: one port of a start wired to several inputs inside
 /// is one value to hand.
-pub fn refuse_unfed(project: &ProjectDefinition, resolved: &Resolved, spec: &RunSpec) -> Result<(), Refusal> {
+pub fn unfed(project: &ProjectDefinition, resolved: &Resolved, spec: &RunSpec) -> Vec<Unfed> {
     let flag = start_flag(project, spec);
     let mut named = BTreeSet::new();
-    let errors: Vec<String> = resolved.crossings.iter()
+    resolved.crossings.iter()
         .filter(|c| !c.supplied)
         .filter_map(|c| c.needed_by.clone().map(|needed_by| (c, needed_by)))
         // Named where the person can act: the start the value would pass,
@@ -1265,11 +1268,12 @@ pub fn refuse_unfed(project: &ProjectDefinition, resolved: &Resolved, spec: &Run
                 else { format!(", and {needed_by} cannot run without it") };
             let (src, src_port) = (&c.source_node, &c.source_port);
             if c.unfired_trigger {
-                return format!(
+                let message = format!(
                     "{node}.{port} gets nothing in this run: it only comes from the trigger {src}, which this run does \
                      not fire{inside}. Fire it (--fire {src}='<event>'), or hand the value at a start ({} {node}='{{\"{port}\": ...}}').",
                     flag(&node),
                 );
+                return Unfed { message, trigger: Some(src.clone()) };
             }
             let fix = match &c.hand_at {
                 Some(_) => format!(
@@ -1282,10 +1286,9 @@ pub fn refuse_unfed(project: &ProjectDefinition, resolved: &Resolved, spec: &Run
                      up so {src} runs too."
                 ),
             };
-            format!("{node}.{port} gets nothing in this run: {src}.{src_port} is outside it{inside}. {fix}")
+            Unfed { message: format!("{node}.{port} gets nothing in this run: {src}.{src_port} is outside it{inside}. {fix}"), trigger: None }
         })
-        .collect();
-    if errors.is_empty() { Ok(()) } else { Err(Refusal { errors }) }
+        .collect()
 }
 
 /// Everything that makes a run pointless before it starts, checked

@@ -576,19 +576,19 @@ export function activate(context: vscode.ExtensionContext) {
     await runCliVerb('run', targets.flatMap((t) => ['--target', t]));
   }
 
-  /// Whether a run of `targets` would start, without starting it: the
-  /// walk's refusal (`weft run --check`), or `null` when it resolves. The
-  /// graph disables its Run with the refusal as the reason. It reads the
-  /// files on disk, so the graph's last edit is saved first.
-  async function checkRun(targets: [string, ...string[]]): Promise<string | null> {
-    if (!pinnedProject) return 'no project is pinned, so there is nothing to run';
+  /// Whether a run of `targets` would start, without starting it
+  /// (`weft run --check`): its refusal, or the infra it reads. The graph
+  /// disables its Run with the refusal, or with the infra it reads that
+  /// is not running. It reads the files on disk, so the graph's last
+  /// edit is saved first.
+  async function checkRun(targets: [string, ...string[]]): Promise<RunCheck> {
+    if (!pinnedProject) return { ok: false, refusal: 'no project is pinned, so there is nothing to run' };
     const project = pinnedProject;
     await graphView.waitForPendingSave();
-    const answer = await runWeftJson<RunCheck>(
+    return runWeftJson<RunCheck>(
       [...onArgs(installOf(project.id)), 'run', '--check', ...targets.flatMap((t) => ['--target', t]), '--json'],
       project.rootPath,
     );
-    return answer.ok ? null : answer.refusal;
   }
 
   /// Spawn a CLI verb and pump its NDJSON event stream into the

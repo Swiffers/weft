@@ -2,7 +2,7 @@
 	import { SvelteFlowProvider } from "@xyflow/svelte";
 	import ProjectEditorInner from "./ProjectEditorInner.svelte";
 	import type { ProjectDefinition } from "../../types";
-	import type { SourceLocation } from "../../../../protocol";
+	import type { RunCheck, SourceLocation } from "../../../../protocol";
 
 	// The bound inner instance's public API this wrapper forwards. Typed (not
 	// `any`) so a signature drift between wrapper and inner is a compile error,
@@ -45,12 +45,6 @@
 		onApplyTextEdit,
 		onResyncSource,
 		onRun,
-		specs = [],
-		resolveSpec,
-		onRunSpec,
-		onSaveSpec,
-		onRunSpecFile,
-		onListSpecs,
 		onBranchTo,
 		onStop,
 		onDismissError,
@@ -88,12 +82,6 @@
 		installView?: import('../../../../protocol').InstallView;
 		onSwitchInstall?: (install: string) => void;
 		onRun?: (targets: [string, ...string[]]) => void;
-		specs?: import('../../../../run-spec').RunSpec[];
-		resolveSpec?: (spec: import('../../../../run-spec').RunSpec, seeded: boolean) => Promise<import('../../../../run-spec').ResolveSpecResponse>;
-		onRunSpec?: (spec: import('../../../../run-spec').RunSpec, seeded?: boolean) => void;
-		onSaveSpec?: (spec: import('../../../../run-spec').RunSpec) => void;
-		onRunSpecFile?: (name: string) => void;
-		onListSpecs?: () => void;
 		onBranchTo?: (reference: string) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
@@ -106,7 +94,7 @@
 		/// triggers or infra; the host runs it through the CLI.
 		onLifecycle?: (action: import('../../../../protocol').LifecycleAction) => void;
 		/// The walk's refusal for a run of these targets, or `null`.
-		checkRun?: (targets: [string, ...string[]]) => Promise<string | null>;
+		checkRun?: (targets: [string, ...string[]]) => Promise<RunCheck>;
 		actionBarState: import('../../../../protocol').ActionBarState;
 		status: import('../../../../protocol').ActionAvailability | undefined;
 		hasInfraInGraph?: boolean;
@@ -130,12 +118,6 @@
 		{onApplyTextEdit}
 		{onResyncSource}
 		{onRun}
-		{specs}
-		{resolveSpec}
-		{onRunSpec}
-		{onSaveSpec}
-		{onRunSpecFile}
-		{onListSpecs}
 		{onBranchTo}
 		{onStop}
 		{onDismissError}

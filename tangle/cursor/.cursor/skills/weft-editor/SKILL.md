@@ -95,22 +95,27 @@ reading and showing. Builder and simplified keep separate saved positions.
 
 **Everything you act on starts with a selection.** Select nodes (Ctrl+A
 selects all; the palette's "Select All Triggers" takes just the triggers)
-and a small bar appears showing only what that selection allows, each with
-how many selected nodes it acts on: "Run (N)", then under Triggers "Turn off
-(N)", "Turn on (N)", "Resync (N)", then under Infra "Start (N)", "Stop
-(N)", "Terminate (N)", "Upgrade (N)", and "options...". [the pre-flight] runs
+and a bar appears at the bottom center showing only what that selection
+allows, in big buttons: "RUN 1 TARGET" or "RUN N TARGETS", then under
+Triggers "Turn off", "Turn on", "Resync", then under Infra "Start", "Stop",
+"Terminate", "Upgrade", and "Options". A count, "(N)", follows a label only
+when that button covers more than one selected node. [the pre-flight] runs
 before a run or a lifecycle verb is sent: a runtime validation through the
 warm parse-server, where an unpicked connection and cousins land on the
 bar's error banner (the complete list, each entry clickable to its file and
 line) and the verb is not sent.
 
-- **Run (N)** runs the selected nodes and what they need. Disabled, its
-  tooltip says why, usually the refusal `weft run --check` gives (a value
-  only a trigger brings, say), or "Start <places> first: this run reaches
-  it." Ctrl+Enter with nothing selected says "Select the nodes to run
-  first: the run takes them and what they need." The sidebar's "Run
-  Project" runs every root of the program.
-- **"options..."** ("How triggers go down and come back") holds the same
+- **RUN N TARGETS** runs the selected nodes as targets (`weft run
+  --target`) with what they need. A selected trigger or infra node offers no Run, only its
+  own buttons; in a mixed selection Run runs the other nodes. Greyed,
+  its tooltip gives weft's reason: the refusal `weft run --check`
+  gives, or the infra the run reads that is not running (start it first); with
+  several nodes selected it names each blocked node and its reason. Ctrl+Enter with nothing selected says "Select the nodes to run
+  first: the run takes them and what they need."; with triggers or infra alone it
+  says Run leaves them out. The sidebar's "Run Project" runs every root
+  of the program. The editor has no gesture for `--from`, `--group`,
+  `--fire` or a saved example: those are CLI.
+- **"Options"** ("How triggers go down and come back") holds the same
   three questions as the CLI, prefilled with the defaults: "What arrives
   while it is down" (**Hold it**, **Hold it, hidden**, **Refuse it**, then
   refuse after some minutes), "What already waits" (**Keep it**, **Drop
@@ -134,15 +139,15 @@ why: "Taken down with its infra: it comes back once that infra runs
 again.", "Taken down by the health check: ...", "Held back: <reason>", and
 for infra what taking it down takes with it.
 
-The bottom-center action bar shows only what is happening now: the run you
+The bottom-center bar is the status bar and the selection bar in one. With
+nothing selected it shows only what is happening now (and the eye toggles,
+which show only the trigger or the infrastructure subgraph): the run you
 are following with its "Stop" button and node count, or the verb at work
 ("Building...", "Resyncing...", "Turning triggers on...", "Waiting for the
 runs still going..."), with "(Cancel)" when it can be called off. A resync
 that stopped with triggers down shows "Resync stopped" with "Resync" (take
 it up again where it stopped) and "Give up" (leave the triggers it took
-down off). Its "Specs" menu runs a saved example ("Run from a spec…", and
-"Run this group (<group>)…" when a group is in view), and its eye toggles
-show only the trigger or the infrastructure subgraph.
+down off). Select nodes and their buttons join it, after a divider.
 
 A verb that failed leaves a red banner above the bar; clicking it opens the
 full diagnostics.
@@ -191,9 +196,8 @@ read-only (you can still move, expand, and collapse).".
   required", "Type: <type>" (editable), "Remove port". On loop ports the
   right-click also shows and changes the role (broadcast, iter, gather,
   carry).
-- **Nodes**: right-click for "Duplicate (Ctrl+D)", "Delete (Del)", "Tags…",
-  "Run from here…" (a run starting at that node, with its inputs to fill
-  in) and, on a group, "Run this group…". On a node each instance can
+- **Nodes**: right-click for "Duplicate (Ctrl+D)", "Delete (Del)" and
+  "Tags…". On a node each instance can
   have its own copy of (an infra node's container, an access node's
   connection), "One per instance" or "Share across instances". Stopping or
   terminating infra is done by selecting the node (above).

@@ -63,13 +63,19 @@ fn every_stdlib_node_test_passes() {
         "no stdlib package declares node tests; the sweep should never be vacuous"
     );
 
-    // The whole build (emitted crates AND the cargo cache) lives in
-    // cargo's per-crate integration-test scratch dir: outside the
-    // workspace artifact dir (so nothing pollutes target/debug), but
-    // persistent across runs, so the engine compiles once and every
-    // later sweep reuses the cache.
-    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node-test-sweep");
-    let dirs = weft_compiler::build::TestBuildDirs::under(&work);
+    // The emitted crates live in cargo's per-crate integration-test
+    // scratch dir, but they build into the workspace's OWN target dir
+    // (the scratch dir's parent), so everything the workspace build just
+    // compiled with the same features is reused instead of compiled a
+    // second time. Only what the packages change is compiled: their own
+    // crates and dependencies, the weft crates (this graph turns on fewer
+    // of their features than the whole workspace does), and the
+    // third-party crates whose features the packages widen.
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let dirs = weft_compiler::build::TestBuildDirs {
+        crates_root: scratch.join("node-test-sweep"),
+        target_dir: scratch.parent().expect("the scratch dir sits in the target dir").to_path_buf(),
+    };
     // Every package emitted before any builds, so cargo unifies
     // features across them: the same shape `weft test-node` uses.
     let workspace = weft_compiler::build::prepare_test_workspace(&catalog, &packages, &dirs)

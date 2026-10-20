@@ -991,14 +991,6 @@ pub struct TestBuildDirs {
 }
 
 impl TestBuildDirs {
-    /// The layout under one root: `crates/` beside a SIBLING `target/`,
-    /// so no package name (not even "target") can land on top of the
-    /// cache. Used by callers that deliberately want a self-contained
-    /// tree, such as the workspace's own node-test sweep.
-    pub fn under(root: &Path) -> Self {
-        Self { crates_root: root.join("crates"), target_dir: root.join("target") }
-    }
-
     /// The layout a project's `weft test-node` uses: this project's own
     /// emitted crates, and the cargo cache SHARED by every project on
     /// the machine.

@@ -21,8 +21,8 @@
 //! - a project's work whose holder went away and that the dispatcher's
 //!   look at lapsed holds could not repair, until a look repairs it
 //!   ([`still_failing`]);
-//! - a project's signals the listener kept serving once their
-//!   hibernation ended, until it lets go of them ([`still_failing`]);
+//! - a project's signals the listener kept serving once their trigger's
+//!   door stopped taking work, until it lets go of them ([`still_failing`]);
 //! - what the host still holds of removed projects that the supervisor
 //!   could not delete, until a listing of the host that goes through
 //!   holds none of those projects any more;
@@ -107,8 +107,8 @@ pub enum Callee<'a> {
     /// A project's work whose holder went away, which the dispatcher's
     /// look at lapsed holds could not repair.
     Repairs(uuid::Uuid),
-    /// A project's signals the listener kept serving once their
-    /// hibernation ended.
+    /// A project's signals the listener kept serving once their trigger's
+    /// door stopped taking work.
     LetGo(uuid::Uuid),
     /// What the host still holds of removed projects, which the
     /// supervisor could not delete (written by the broker's ownership
@@ -272,7 +272,7 @@ impl Failed {
             Failed::Commands => "weft's supervisor gave up infra commands of this project it could never finish".to_string(),
             Failed::Repairs => "weft could not repair work of this project whose holder went away".to_string(),
             Failed::LetGo => {
-                "the listener still serves triggers of this project whose hibernation ended, and what they pick up is refused".to_string()
+                "the listener still serves triggers of this project whose door stopped taking work, and what they pick up is refused".to_string()
             }
             Failed::GoneCopies => {
                 "weft's supervisor could not delete what the infra host still holds of removed projects (their disks included)".to_string()
@@ -666,7 +666,7 @@ pub async fn unanswered_roles(pool: &PgPool) -> Result<Vec<String>> {
 /// stored files the bucket would not remove, the install's news refusing),
 /// and every one that holds up this project ([`Callee::project`]): its
 /// workers while their stretch is not over, its infra, infra commands,
-/// repairs and signals kept past their hibernation.
+/// repairs and signals kept past their door's window.
 pub async fn failing_for(pool: &PgPool, project: uuid::Uuid) -> Result<Vec<Failing>> {
     let rows: Vec<(String, Option<String>, String, i64, i64, i64)> = sqlx::query_as(&format!(
         "SELECT u.callee, u.label, u.error, u.since_ms, u.last_ms, {DB_NOW_MS} FROM unanswered_call u \

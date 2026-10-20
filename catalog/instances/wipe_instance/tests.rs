@@ -42,6 +42,12 @@ async fn order(rig: FakeRig) -> WeftResult<()> {
     );
     let selves: Vec<StopSelf> = calls.iter().map(|(_, s)| *s).collect();
     assert_eq!(selves, vec![StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Include]);
+    match &calls[0].0 {
+        ProgramCall::TriggerDeactivate { take_down, .. } => {
+            assert_eq!(*take_down, weft::TakeDown::REMOVE.choice(), "nothing of the instance's triggers is kept");
+        }
+        other => panic!("unexpected call {other:?}"),
+    }
     match &calls[1].0 {
         ProgramCall::InfraTerminate { node, disks, .. } => {
             assert_eq!(node, "bridge");

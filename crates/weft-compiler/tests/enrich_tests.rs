@@ -1049,3 +1049,15 @@ fn enrich_refuses_making_a_required_input_optional() {
     let instance = project.nodes[0].inputs.iter().find(|p| p.name == "instance").unwrap();
     assert!(!instance.required && !instance.optional, "unwritten: required once wired");
 }
+
+/// An enrich error names the node it is about, so a cut without that node
+/// goes on.
+#[test]
+fn enrich_errors_name_the_node_they_are_about() {
+    let source = "\nok = Text { value: \"x\" }\nbad = NoSuchNodeType\n";
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    let errors = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict);
+    assert_eq!(errors.len(), 1, "{:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+    assert_eq!(errors[0].subjects, vec!["bad".to_string()]);
+    assert_eq!(errors[0].diagnostic().subjects, vec!["bad".to_string()]);
+}

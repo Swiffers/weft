@@ -16,7 +16,7 @@ use weft_broker_client::protocol::InfraNodeStatus as Status;
 use weft_infra_supervisor::broker_ops::{BrokerCall, BrokerSupervisorOps};
 use weft_infra_supervisor::testing::SupervisorTestRig;
 use weft_platform_traits::clock::Clock;
-use weft_platform_traits::{HostCall, UnitRunState};
+use weft_platform_traits::UnitRunState;
 
 /// A one-unit roster (unit named `unit`, at `status`, default windows).
 fn unit_map(
@@ -75,9 +75,15 @@ fn observe(rig: &SupervisorTestRig, project: uuid::Uuid, units: &[(&str, &str, &
     }
 }
 
-/// How many unit restarts reached the host.
-fn restarts(rig: &SupervisorTestRig) -> usize {
-    rig.host.calls().iter().filter(|c| matches!(c, HostCall::Restart { .. })).count()
+/// How many take-downs the health loop asked the broker to enqueue.
+fn take_down_calls(rig: &SupervisorTestRig) -> usize {
+    rig.broker
+        .calls()
+        .iter()
+        .filter(|c| {
+            matches!(c, BrokerCall::EnqueueLifecycle { spec: weft_broker_client::protocol::LifecycleSpec::Deactivate(_), .. })
+        })
+        .count()
 }
 
 // ---------- the window lives on the row ----------
@@ -269,10 +275,10 @@ async fn full_lifecycle_emits_flaky_then_recovered() {
     assert!(!event_kinds.contains(&"flaky".to_string()));
 
     // Advance past flaky window. Tick 3: emits flaky + sets status.
-    // The default `park-while-infra-broken` protocol ALSO fires here,
+    // The built-in `take-down-while-flaky` rule ALSO fires here,
     // enqueueing a `deactivate` lifecycle command via
     // `enqueue_lifecycle`. We filter for `flaky` event_record entries
-    // specifically; protocol firing is observed via
+    // specifically; a rule firing is observed via
     // `BrokerCall::EnqueueLifecycle` counts (see the
     // `fired_set_rearms_when_the_copy_heals` test).
     rig.advance(Duration::from_secs(35));
@@ -402,12 +408,12 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
 
 #[tokio::test]
 async fn fired_set_rearms_when_the_copy_heals() {
-    // After a protocol fires (the default park enqueues a `deactivate`
+    // After a rule fires (the built-in take-down enqueues a `deactivate`
     // lifecycle command aimed at the broken copy), the supervisor
     // remembers the copy in `fired` so it doesn't fire again on the
     // same degradation. Once that copy is no longer broken, it must
     // re-arm (`health_engine::rearm`) so its next degradation triggers
-    // the protocol again.
+    // the rule again.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
@@ -424,7 +430,7 @@ async fn fired_set_rearms_when_the_copy_heals() {
         .iter()
         .filter(|c| matches!(c, BrokerCall::EnqueueLifecycle { .. }))
         .count();
-    assert_eq!(enqueue_count_1, 1, "default protocol should fire once");
+    assert_eq!(enqueue_count_1, 1, "the built-in take-down should fire once");
 
     // Recover: ready for the whole recovery window.
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
@@ -446,7 +452,7 @@ async fn fired_set_rearms_when_the_copy_heals() {
         .count();
     assert_eq!(
         enqueue_count_2, 2,
-        "default protocol should re-fire after recovery"
+        "the built-in take-down should re-fire after recovery"
     );
 }
 
@@ -496,54 +502,34 @@ async fn project_with_no_nodes_no_events() {
     assert_eq!(rig.broker.events().len(), 0);
 }
 
-// ---------- restart_unit ----------
+// ---------- a rule's action ----------
 
-#[tokio::test]
-async fn restart_unit_restarts_only_the_named_unit() {
-    let rig = rig_with_restart_protocol();
-    rig.advance(Duration::from_secs(35));
-    rig.tick_health().await.unwrap();
+/// The built-in take-down's name.
+const TAKE_DOWN: &str = "take-down-while-flaky";
 
-    let calls = rig.host.calls();
-    let restarted: Vec<(String, String)> = calls
-        .iter()
-        .filter_map(|c| match c {
-            HostCall::Restart { copy_id, unit, .. } => Some((copy_id.clone(), unit.clone())),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(restarted, vec![("inst1".to_string(), "bridge".to_string())]);
-    assert!(
-        !calls.iter().any(|c| matches!(c, HostCall::Terminate { .. } | HostCall::Remove { .. })),
-        "a restart never removes anything"
-    );
-}
-
-/// Build a project + a RestartUnit protocol with `timeout_seconds=5`
-/// on a not-ready unit, so a single tick (past the flaky window)
-/// fires the action.
-fn rig_with_restart_protocol() -> SupervisorTestRig {
+/// An Active project whose one unit is seen not ready: its flaky window
+/// is running, so a look past the window (35 s on) latches it flaky and
+/// the default take-down fires.
+async fn rig_with_a_breaking_unit() -> SupervisorTestRig {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    let protocols_json = serde_json::json!({
-        "protocols": [{
-            "name": "restart-when-down",
-            "when": { "kind": "node_not_ready", "node_id": NODE },
-            "action": { "kind": "restart_unit", "node_id": NODE, "unit": "bridge" },
-            "timeout_seconds": 5
-        }]
-    });
-    rig.broker.set_health_protocols(PROJECT, protocols_json);
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
+    rig.tick_health().await.unwrap();
+    assert_eq!(take_down_calls(&rig), 0, "inside the window nothing fires");
     rig
 }
 
+/// Longer than the default action timeout, so a tick that hangs on the
+/// action is cut by that timeout first. Under `start_paused` tokio skips
+/// ahead to it, so nothing really waits.
+const PAST_THE_ACTION_TIMEOUT: Duration = Duration::from_secs(3600);
+
 #[tokio::test(start_paused = true)]
 async fn hung_action_times_out_frees_inflight_and_unlatches_fired() {
-    // The wedge this prevents: a HealthProtocol action's host call
-    // hangs (a wedged Docker daemon, a cloud API that never answers). Without the timeout it pins
+    // The wedge this prevents: a health rule's action's broker call
+    // hangs (a broker that never answers). Without the timeout it pins
     // `in_flight` forever and stops all future health ticks. Worse,
-    // even with the timeout, if the protocol stayed latched in
+    // even with the timeout, if the rule stayed latched in
     // `fired` it would never retry (the project can't go healthy
     // because recovery is what would make it healthy). This drives
     // the FULL production path (`tick` -> `tick_project` -> the
@@ -551,88 +537,85 @@ async fn hung_action_times_out_frees_inflight_and_unlatches_fired() {
     // mechanical free (`in_flight` cleared) AND the retryability
     // (`fired` un-latched).
     //
-    // Under start_paused, when the tick parks on the hung
-    // restart (a never-waking `pending()`), the only live timer
-    // is the 5s action timeout, so tokio auto-advances to it and
-    // fires it deterministically: no real wait. The outer bound is a
-    // safety net so a regression (timeout not firing) fails fast
-    // instead of hanging the suite.
-    let rig = rig_with_restart_protocol();
-    rig.host.hang_restarts();
+    // Under start_paused, when the tick parks on the hung enqueue (a
+    // never-waking `pending()`), the only live timer is the action
+    // timeout, so tokio auto-advances to it and fires it
+    // deterministically: no real wait. The outer bound is a safety net
+    // so a regression (timeout not firing) fails fast instead of
+    // hanging the suite.
+    let rig = rig_with_a_breaking_unit().await;
+    rig.broker.hang_lifecycle_enqueues();
     rig.advance(Duration::from_secs(35)); // FakeClock past the flaky window
 
-    tokio::time::timeout(Duration::from_secs(120), rig.tick_health())
+    tokio::time::timeout(PAST_THE_ACTION_TIMEOUT, rig.tick_health())
         .await
         .expect("tick_health hung: the action timeout did not fire")
         .unwrap();
 
-    // The action started (the restart recorded) then hung; the
+    // The action started (the enqueue recorded) then hung; the
     // timeout mapped it to a failed action.
-    assert_eq!(restarts(&rig), 1, "the action should have started before hanging");
+    assert_eq!(take_down_calls(&rig), 1, "the action should have started before hanging");
 
     // Mechanical free: slot released so the next tick can evaluate.
     assert!(!rig.state.health.lock().await.is_in_flight(PROJECT), "timed-out action must free in_flight");
-    let row = protocol_state(&rig).expect("the failure is kept");
-    // Retryability: the failed protocol is NOT latched as fired, so
+    let row = rule_state(&rig).expect("the failure is kept");
+    // Retryability: the failed rule is NOT latched as fired, so
     // a later tick fires it again (the wedge fix).
-    assert_eq!(row.acted, None, "timed-out action must not count as fired");
+    assert!(!row.fired, "timed-out action must not count as fired");
     // Backoff armed: one failure recorded, so the immediate next tick
     // is skipped (no re-fire storm) until the backoff window elapses.
     assert_eq!(row.consecutive_failures, 1, "a failed action must arm the backoff");
     assert_eq!(row.next_retry_at_unix, Some(rig.clock.now_unix() + 5));
 }
 
-/// What the restart protocol did, as the broker keeps it.
-fn protocol_state(rig: &SupervisorTestRig) -> Option<weft_broker_client::protocol::HealthProtocolState> {
-    rig.broker.health_state(PROJECT).into_iter().find(|s| s.protocol == "restart-when-down")
+/// Where the built-in take-down stands on the shared copy, as the broker
+/// keeps it.
+fn rule_state(rig: &SupervisorTestRig) -> Option<weft_broker_client::protocol::HealthRuleState> {
+    let copy = weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: None };
+    rig.broker.health_state_rows(PROJECT).into_iter().find(|s| s.rule == TAKE_DOWN && s.copy == copy)
 }
 
 #[tokio::test(start_paused = true)]
 async fn failed_action_backs_off_then_retries_after_window() {
-    // After a failed action, the protocol is un-latched from `fired`
+    // After a failed action, the rule is un-latched from `fired`
     // (so it WILL retry) but gated by exponential backoff so it does
-    // NOT re-fire on every poll tick. Walk: fail once (restart
+    // NOT re-fire on every poll tick. Walk: fail once (enqueue
     // call #1, backoff=1, ~5s window) -> immediate tick is skipped
     // (no call #2) -> advance the clock past the window -> next tick
     // re-fires (call #2, backoff=2).
-    let rig = rig_with_restart_protocol();
-    rig.host.hang_restarts();
+    let rig = rig_with_a_breaking_unit().await;
+    rig.broker.hang_lifecycle_enqueues();
     rig.advance(Duration::from_secs(35));
 
     // Tick 1: fires, hangs, times out -> failure -> backoff=1.
-    tokio::time::timeout(Duration::from_secs(120), rig.tick_health())
+    tokio::time::timeout(PAST_THE_ACTION_TIMEOUT, rig.tick_health())
         .await
         .expect("tick 1 hung")
         .unwrap();
-    let calls_after_1 = restarts(&rig);
-    assert_eq!(calls_after_1, 1, "first tick fires the action");
-    assert_eq!(protocol_state(&rig).unwrap().consecutive_failures, 1);
+    assert_eq!(take_down_calls(&rig), 1, "first tick fires the action");
+    assert_eq!(rule_state(&rig).unwrap().consecutive_failures, 1);
 
     // Tick 2 immediately (no clock advance): inside the backoff
     // window -> skipped, no new action.
     rig.tick_health().await.unwrap();
-    assert_eq!(
-        restarts(&rig),
-        1,
-        "tick inside backoff window must NOT re-fire"
-    );
+    assert_eq!(take_down_calls(&rig), 1, "tick inside backoff window must NOT re-fire");
 
     // Advance past the first backoff window (5s). Tick 3 re-fires.
     rig.advance(Duration::from_secs(6));
-    tokio::time::timeout(Duration::from_secs(120), rig.tick_health())
+    tokio::time::timeout(PAST_THE_ACTION_TIMEOUT, rig.tick_health())
         .await
         .expect("tick 3 hung")
         .unwrap();
-    assert_eq!(restarts(&rig), 2, "tick past backoff window re-fires");
-    assert_eq!(protocol_state(&rig).unwrap().consecutive_failures, 2, "second failure grows the backoff count");
+    assert_eq!(take_down_calls(&rig), 2, "tick past backoff window re-fires");
+    assert_eq!(rule_state(&rig).unwrap().consecutive_failures, 2, "second failure grows the backoff count");
 
     // The third failure gives up, reported once by the next ownership
     // sync (and never as a failure tried again on a clock), and no later
     // look fires it again while what it saw stays the same.
     rig.advance(Duration::from_secs(11));
-    tokio::time::timeout(Duration::from_secs(120), rig.tick_health()).await.expect("tick 4 hung").unwrap();
-    assert_eq!(restarts(&rig), 3);
-    let row = protocol_state(&rig).unwrap();
+    tokio::time::timeout(PAST_THE_ACTION_TIMEOUT, rig.tick_health()).await.expect("tick 4 hung").unwrap();
+    assert_eq!(take_down_calls(&rig), 3);
+    let row = rule_state(&rig).unwrap();
     assert!(row.gave_up_at_unix.is_some() && row.next_retry_at_unix.is_none(), "given up: {row:?}");
     rig.tick_ownership().await.unwrap();
     rig.tick_ownership().await.unwrap();
@@ -640,22 +623,31 @@ async fn failed_action_backs_off_then_retries_after_window() {
     assert!(rig.broker.failed().is_empty());
     rig.advance(Duration::from_secs(5));
     rig.tick_health().await.unwrap();
-    assert_eq!(restarts(&rig), 3, "given up: no retry while what it saw stays the same");
+    assert_eq!(take_down_calls(&rig), 3, "given up: no retry while what it saw stays the same");
 
-    // Every unit healthy re-arms it.
+    // What it saw changing re-arms it: the unit reads ready again while
+    // still latched flaky, and the take-down tries afresh.
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
+    tokio::time::timeout(PAST_THE_ACTION_TIMEOUT, rig.tick_health()).await.expect("tick 5 hung").unwrap();
+    assert_eq!(take_down_calls(&rig), 4, "re-armed by what it saw changing");
+    let row = rule_state(&rig).unwrap();
+    assert!(row.gave_up_at_unix.is_none() && row.consecutive_failures == 1, "a fresh start: {row:?}");
+
+    // Every unit healthy (ready for its whole recovery window) clears
+    // what failed.
+    rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
-    assert_eq!(protocol_state(&rig), None, "healthy: nothing failed is kept");
+    assert_eq!(rule_state(&rig), None, "healthy: nothing failed is kept");
 }
 
 #[tokio::test]
 async fn completed_action_frees_in_flight() {
     // The success side, through the FULL tick: the action does NOT
     // hang, the timeout wrapper is transparent, the action runs
-    // (the restart called) and the in_flight slot frees. Together
+    // (the take-down enqueued) and the in_flight slot frees. Together
     // with `hung_action_times_out_frees_inflight_and_unlatches_fired`
     // this covers both arms of the timeout match in `tick_project`.
-    let rig = rig_with_restart_protocol();
+    let rig = rig_with_a_breaking_unit().await;
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
 
@@ -664,7 +656,7 @@ async fn completed_action_frees_in_flight() {
         reg.is_in_flight(PROJECT)
     };
     assert!(!in_flight, "completed action must free the in_flight slot");
-    assert_eq!(restarts(&rig), 1, "the action should have run");
+    assert_eq!(take_down_calls(&rig), 1, "the action should have run");
 }
 
 // ---------- regression: set_applied lands mid-flaky ----------
@@ -711,7 +703,7 @@ async fn frozen_flaky_unit_is_not_rewritten_running_after_latch_reset() {
     assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Running);
 }
 
-// ---------- regression: two-stage default protocols ----------
+// ---------- regression: the built-in rules ----------
 
 /// The take-downs the rig's broker was asked to enqueue for `project`.
 fn take_downs(rig: &SupervisorTestRig, project: uuid::Uuid) -> Vec<weft_broker_client::protocol::TakeDownReaders> {
@@ -730,8 +722,8 @@ fn take_downs(rig: &SupervisorTestRig, project: uuid::Uuid) -> Vec<weft_broker_c
 }
 
 #[tokio::test]
-async fn default_protocol_parks_what_reads_the_broken_copy() {
-    // Stage 1 of the default pair: an Active project whose unit stays
+async fn the_built_in_take_down_aims_at_the_broken_copy() {
+    // The built-in take-down: an Active project whose unit stays
     // not ready for the whole flaky window (after having been ready)
     // enqueues a park aimed at that copy, and only at it: the
     // dispatcher then parks only the triggers reading it.
@@ -744,19 +736,13 @@ async fn default_protocol_parks_what_reads_the_broken_copy() {
     rig.tick_health().await.unwrap();
     observe(&rig, PROJ_ACTIVE, &[(NODE, "inst1", "bridge", false)]);
     rig.tick_health().await.unwrap();
-    assert!(take_downs(&rig, PROJ_ACTIVE).is_empty(), "one bad reading parks nothing");
+    assert!(take_downs(&rig, PROJ_ACTIVE).is_empty(), "one bad reading takes nothing down");
 
     rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
     let parks = take_downs(&rig, PROJ_ACTIVE);
-    assert_eq!(parks.len(), 1, "the latched breakage parks once");
-    assert_eq!(parks[0].spec.mode, weft_broker_client::protocol::DeactivationMode::Park);
-    assert_eq!(
-        parks[0].reach,
-        weft_broker_client::protocol::TakeDownReach::ReadersOf {
-            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: None }]
-        }
-    );
+    assert_eq!(parks.len(), 1, "the latched breakage takes its triggers down once");
+    assert_eq!(parks[0].broken, vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: None }]);
 }
 
 /// The incident: an instance's copy was just applied (its row says
@@ -787,24 +773,79 @@ async fn a_copy_the_host_has_not_reported_never_parks_and_a_broken_one_parks_alo
     let parks = take_downs(&rig, PROJECT);
     assert_eq!(parks.len(), 1);
     assert_eq!(
-        parks[0].reach,
-        weft_broker_client::protocol::TakeDownReach::ReadersOf {
-            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: Some(ada) }]
-        },
+        parks[0].broken,
+        vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: Some(ada) }],
         "only ada's copy is broken; the shared one is healthy"
     );
 }
 
+/// Each copy runs the rules its own node wrote, stamped on its row: of
+/// three nodes breaking at once, the one on the built-in rules is taken
+/// down, the one that wrote no rules at all is left alone, and the one
+/// whose rule reads only its `primary` unit is left alone while only its
+/// `sidecar` is flaky. Two copies firing a rule of one name keep two
+/// states.
 #[tokio::test]
-async fn default_protocol_auto_recovers_what_it_parked_on_infra_healthy() {
-    // Stage 2 of the two-stage protocol: with every seen unit healthy
+async fn each_copy_runs_the_rules_its_node_wrote() {
+    use weft_core::infra::health::{HealthAction, HealthCondition, HealthRule, DEFAULT_RULE_TIMEOUT_SECONDS};
+    let rig = rig();
+    let ada = weft_core::instance::InstanceId::new("ada").unwrap();
+    rig.broker.add_infra_node(PROJECT, "plain", "c-plain", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, "plain", &ada, "c-plain-ada", Status::Running);
+    rig.broker.add_infra_node(PROJECT, "silent", "c-silent", Status::Running);
+    rig.broker.set_health_rules(PROJECT, "silent", None, Some(Vec::new()));
+    rig.broker.add_infra_node_units(PROJECT, "picky", "c-picky", &[("primary", Status::Running), ("sidecar", Status::Running)]);
+    rig.broker.set_health_rules(
+        PROJECT,
+        "picky",
+        None,
+        Some(vec![HealthRule {
+            name: TAKE_DOWN.into(),
+            when: HealthCondition::UnitFlaky { unit: Some("primary".into()) },
+            action: HealthAction::TakeDownTriggers,
+            timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS,
+        }]),
+    );
+    let units = |ready: bool| {
+        [
+            ("plain", "c-plain", "plain", ready),
+            ("plain", "c-plain-ada", "plain", ready),
+            ("silent", "c-silent", "silent", ready),
+            ("picky", "c-picky", "primary", true),
+            ("picky", "c-picky", "sidecar", ready),
+        ]
+    };
+    observe(&rig, PROJECT, &units(true));
+    rig.tick_health().await.unwrap();
+    observe(&rig, PROJECT, &units(false));
+    rig.tick_health().await.unwrap();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+
+    let copy = |node: &str, instance: Option<&weft_core::instance::InstanceId>| weft_broker_client::protocol::InfraCopy {
+        node_id: node.into(),
+        instance: instance.cloned(),
+    };
+    let downs = take_downs(&rig, PROJECT);
+    assert_eq!(downs.len(), 1, "one action for every copy that broke in the same look");
+    assert_eq!(downs[0].broken, vec![copy("plain", None), copy("plain", Some(&ada))]);
+    let states: Vec<_> = rig.broker.health_state_rows(PROJECT).into_iter().map(|s| (s.copy, s.rule, s.fired)).collect();
+    assert_eq!(
+        states,
+        vec![(copy("plain", None), TAKE_DOWN.to_string(), true), (copy("plain", Some(&ada)), TAKE_DOWN.to_string(), true)]
+    );
+}
+
+#[tokio::test]
+async fn the_built_in_bring_back_fires_once_infra_is_healthy() {
+    // The built-in bring-back: with every seen unit healthy
     // and something the health loop parked still down, reactivate.
     let rig = rig();
     rig.broker.add_project_with_status(PROJ_INACTIVE,
         weft_broker_client::protocol::ProjectStatus::Inactive,
     );
     // The health loop parked it: auto-recover is allowed to undo it.
-    rig.broker.set_health_parked(PROJ_INACTIVE, true);
+    rig.broker.set_health_down(PROJ_INACTIVE, true);
     rig.broker.add_infra_node(PROJ_INACTIVE, NODE, "inst1", Status::Running);
     observe(&rig, PROJ_INACTIVE, &[(NODE, "inst1", "bridge", true)]);
 
@@ -819,17 +860,17 @@ async fn default_protocol_auto_recovers_what_it_parked_on_infra_healthy() {
     ));
     assert!(
         reactivated,
-        "default protocol auto-recover-when-infra-healthy must enqueue a reactivate when infra is up and it parked something"
+        "the built-in bring-back must enqueue a reactivate when infra is up and the health check took something down"
     );
 }
 
 #[tokio::test]
-async fn default_protocol_does_not_reactivate_user_deactivated_project() {
+async fn the_built_in_bring_back_never_undoes_a_person() {
     // Regression: the user clicked Stop infra (or Deactivate / Upgrade)
     // on a running+active project. The infra processes are still up for a
     // moment (or being brought back up by a later Start). A health tick
     // that lands then must NOT auto-reactivate, because the USER
-    // deactivated (nothing is `health_parked`), not the health loop.
+    // deactivated (nothing is `health_down`), not the health loop.
     // Before the gate, this raced into a reactivate and left the user
     // with active triggers but no/just-stopped infra.
     let rig = rig();
@@ -856,7 +897,7 @@ async fn default_protocol_does_not_reactivate_user_deactivated_project() {
 }
 
 #[tokio::test]
-async fn default_protocol_does_not_fire_when_status_mismatches() {
+async fn the_built_in_rules_do_not_fire_when_the_listening_mismatches() {
     // Cross-check: an Active project with HEALTHY infra and nothing
     // health-parked must NOT enqueue a reactivate. And an Inactive
     // project with BROKEN infra must NOT enqueue a park (the
@@ -889,149 +930,48 @@ async fn default_protocol_does_not_fire_when_status_mismatches() {
     let any_lifecycle = calls.iter().any(|c| matches!(c, BrokerCall::EnqueueLifecycle { .. }));
     assert!(
         !any_lifecycle,
-        "neither (Active+healthy) nor (Inactive+broken) should fire the default two-stage protocol"
+        "neither (Active+healthy) nor (Inactive+broken) should fire a built-in rule"
     );
-}
-// ---------- autonomous 3-stage recovery: deactivate -> restart -> reactivate ----------
-
-#[tokio::test]
-async fn three_stage_recovery_deactivate_restart_reactivate() {
-    // A node author wires an autonomous flaky-recovery protocol set:
-    //   1. flaky + Active   -> ParkTriggers   (deactivate the triggers)
-    //   2. flaky + Inactive -> RestartUnit     (restart the wedged unit)
-    //   3. healthy+ Inactive-> AutoRecover    (reactivate the triggers)
-    // No human in the loop. This proves the framework can express + run
-    // the full cycle. The supervisor enqueues the deactivate/reactivate
-    // (the dispatcher's claimer would run them + flip project status);
-    // here we flip status manually to simulate the claimer, since the
-    // rig runs only the health loop. The flaky window is 30s; each
-    // protocol gets timeout 5s. The `unit` selector targets "bridge".
-    let rig = rig();
-    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    let protocols = serde_json::json!({
-        "protocols": [
-            {
-                "name": "park",
-                "when": { "kind": "all", "conds": [
-                    { "kind": "node_not_ready", "node_id": NODE, "unit": "bridge" },
-                    { "kind": "project_status_eq", "status": "active" }
-                ]},
-                "action": { "kind": "park_triggers" },
-                "timeout_seconds": 5
-            },
-            {
-                "name": "restart",
-                "when": { "kind": "all", "conds": [
-                    { "kind": "node_not_ready", "node_id": NODE, "unit": "bridge" },
-                    { "kind": "project_status_eq", "status": "inactive" }
-                ]},
-                "action": { "kind": "restart_unit", "node_id": NODE, "unit": "bridge" },
-                "timeout_seconds": 5
-            },
-            {
-                "name": "recover",
-                "when": { "kind": "all", "conds": [
-                    { "kind": "not", "cond": [
-                        { "kind": "node_not_ready", "node_id": NODE, "unit": "bridge" }
-                    ]},
-                    { "kind": "project_status_eq", "status": "inactive" }
-                ]},
-                "action": { "kind": "auto_recover" },
-                "timeout_seconds": 5
-            }
-        ]
-    });
-    rig.broker.set_health_protocols(PROJECT, protocols);
-
-    // The unit goes flaky (0 of 1 ready). Project starts Active.
-    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
-
-    // --- Stage 1: flaky + Active -> ParkTriggers (Deactivate enqueued) ---
-    rig.advance(Duration::from_secs(35)); // past the flaky window
-    rig.tick_health().await.unwrap();
-    let last_lifecycle = |rig: &SupervisorTestRig| {
-        rig.broker.calls().into_iter().rev().find_map(|c| match c {
-            BrokerCall::EnqueueLifecycle { spec, .. } => Some(spec),
-            _ => None,
-        })
-    };
-    use weft_broker_client::protocol::LifecycleSpec;
-    assert!(
-        matches!(last_lifecycle(&rig), Some(LifecycleSpec::Deactivate(_))),
-        "stage 1 must enqueue a Deactivate (park)"
-    );
-    // Simulate the claimer running the deactivate: project -> Inactive.
-    rig.broker.add_project_with_status(PROJECT,
-        weft_broker_client::protocol::ProjectStatus::Inactive,
-    );
-
-    // --- Stage 2: flaky + Inactive -> RestartUnit ---
-    rig.advance(Duration::from_secs(35));
-    rig.tick_health().await.unwrap();
-    assert_eq!(restarts(&rig), 1, "stage 2 must restart the unit");
-
-    // The restart worked: the unit is ready again.
-    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
-
-    // --- Stage 3: healthy + Inactive -> AutoRecover (Reactivate enqueued) ---
-    rig.advance(Duration::from_secs(35));
-    rig.tick_health().await.unwrap();
-    assert!(
-        matches!(last_lifecycle(&rig), Some(LifecycleSpec::Reactivate(_))),
-        "stage 3 must enqueue a Reactivate (auto-recover)"
-    );
-
-    // Exactly one of each lifecycle verb fired across the whole cycle:
-    // park (deactivate) once, recover (reactivate) once. The fired-set
-    // prevents re-firing within the episode.
-    let calls = rig.broker.calls();
-    let deactivates = calls.iter().filter(|c| {
-        matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Deactivate(_), .. })
-    }).count();
-    let reactivates = calls.iter().filter(|c| {
-        matches!(c, BrokerCall::EnqueueLifecycle { spec: LifecycleSpec::Reactivate(_), .. })
-    }).count();
-    assert_eq!(deactivates, 1, "exactly one deactivate across the cycle");
-    assert_eq!(reactivates, 1, "exactly one reactivate across the cycle");
 }
 
 // ---------- ownership ----------
 
 /// A claimed project is looked at at once, without waiting for the
-/// tick. What its protocols did lives with the project, not in this
-/// process: a restart already made is not made again.
+/// tick. Where its rules stand lives with the project, not in this
+/// process: a take-down already made is not made again.
 #[tokio::test]
 async fn ownership_changes_reach_the_health_loop_at_once() {
     use weft_infra_supervisor::ownership::OwnershipChange;
-    let rig = rig_with_restart_protocol();
+    let rig = rig_with_a_breaking_unit().await;
+    rig.advance(Duration::from_secs(35));
     rig.tick_health().await.unwrap();
-    assert_eq!(restarts(&rig), 1);
+    assert_eq!(take_down_calls(&rig), 1);
     let looks = |rig: &SupervisorTestRig| rig.broker.calls().iter().filter(|c| matches!(c, BrokerCall::OwnedProjects { .. })).count();
     let before = looks(&rig);
 
     rig.health_ownership_change(&OwnershipChange { claimed: vec![PROJECT], lost: vec![] }).await.unwrap();
     assert_eq!(looks(&rig), before + 1, "a claimed project is looked at without waiting for the tick");
-    assert_eq!(restarts(&rig), 1, "the restart it made is kept with the project");
+    assert_eq!(take_down_calls(&rig), 1, "the take-down it made is kept with the project");
 }
 
 weft_core::stress_test!(
-    name: a_pass_keeps_renewing_its_leases_while_a_protocol_acts,
+    name: a_pass_keeps_renewing_its_leases_while_a_rule_acts,
     runs: 8,
     worker_threads: 4,
     async fn body() {
-        // A protocol's restart can take the cloud minutes, longer than a
-        // lease: the pass renews while it acts, so no sibling takes the
-        // project over and restarts the unit a second time.
+        // A rule's action can take longer than a lease (a broker
+        // slow to answer): the pass renews while it acts, so no sibling
+        // takes the project over and fires the action a second time.
         let syncs = |rig: &SupervisorTestRig| rig.broker.calls().iter().filter(|c| matches!(c, BrokerCall::SyncOwnership { .. })).count();
-        let rig = rig_with_restart_protocol();
-        rig.host.hang_restarts();
+        let rig = rig_with_a_breaking_unit().await;
+        rig.broker.hang_lifecycle_enqueues();
         rig.advance(Duration::from_secs(35));
         let pass = tokio::spawn({
             let state = rig.state.clone();
             async move { weft_infra_supervisor::tick(&state).await }
         });
         let bounded = tokio::time::timeout(Duration::from_secs(4), async {
-            while restarts(&rig) == 0 {
+            while take_down_calls(&rig) == 0 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             let acting = syncs(&rig);
@@ -1039,7 +979,7 @@ weft_core::stress_test!(
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
-        bounded.await.expect("the leases were not renewed while the restart hangs");
+        bounded.await.expect("the leases were not renewed while the action hangs");
         pass.abort();
     }
 );

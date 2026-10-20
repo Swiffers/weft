@@ -988,6 +988,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
             }
         }
     });
+    let left_out = catalog.left_out();
     Worker {
         holds,
         under_way_changed,
@@ -998,7 +999,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         replica: config.replica.clone(),
         tenant_id: config.tenant_id.clone(),
         cancels,
-        plans: Arc::new(crate::plan::Plans::new(config.project_id)),
+        plans: Arc::new(crate::plan::Plans::new(config.project_id, left_out)),
         background: weft_core::in_flight::InFlight::new("worker run"),
         stopping,
         stopping_overdue: tokio_util::sync::CancellationToken::new(),
@@ -1535,7 +1536,11 @@ impl Worker {
         let Ok(permit) = self.door.take_permit().await else {
             return park("this copy of the program takes all the runs it may".into(), WaitsOn::Room).await.map(|fired| (fired, None));
         };
-        let slot = match self.door.admit_event(permit, &fire.token, fire.caller.as_deref(), &entry.spec.limits.resolve()) {
+        let limits = match fire.released {
+            true => entry.spec.limits.resolve().for_held(),
+            false => entry.spec.limits.resolve(),
+        };
+        let slot = match self.door.admit_event(permit, &fire.token, fire.caller.as_deref(), &limits) {
             Ok(slot) => slot,
             Err(refused) => {
                 let reason = format!("{} is reached", refused.reason.describe());
@@ -1790,6 +1795,7 @@ mod tests {
             caller: None,
             held_by: None,
             attempts: 0,
+            released: false,
         }
     }
 
@@ -1861,6 +1867,26 @@ mod tests {
         let _slot = worker.door.admit_event(worker.door.take_permit().await.unwrap(), "t1", None, &limits.resolve()).unwrap();
         assert!(matches!(fired(&worker, a_fire("t1")).await, weft_core::door_fire::Fired::Parked { .. }));
         assert_eq!(broker.parked.lock().unwrap().len(), 1);
+    }
+
+    /// Work released from its trigger's queue takes half of the trigger's
+    /// runs at once, and waits in its queue past that, while a new arrival
+    /// still gets the other half.
+    #[tokio::test]
+    async fn released_work_takes_half_of_its_triggers_room() {
+        let limits = weft_core::signal::EntryLimits { at_once: Some(4), ..Default::default() };
+        let (worker, broker) = worker_firing(|_, trigger| entry(trigger).spec.limits = limits);
+        let mut going = Vec::new();
+        for _ in 0..2 {
+            going.push(worker.door.admit_event(worker.door.take_permit().await.unwrap(), "t1", None, &limits.resolve().for_held()).unwrap());
+        }
+        let released = weft_core::door_fire::DoorFire { released: true, fire_id: uuid::Uuid::from_u128(8), ..a_fire("t1") };
+        assert!(matches!(fired(&worker, released).await, weft_core::door_fire::Fired::Parked { .. }), "past half, released work waits");
+        assert_eq!(broker.parked.lock().unwrap().len(), 1);
+        assert!(
+            worker.door.admit_event(worker.door.take_permit().await.unwrap(), "t1", None, &limits.resolve()).is_ok(),
+            "a new arrival still has room"
+        );
     }
 
     fn cancel_heard(run_id: RunId) -> weft_task_store::pg_signal::Heard {

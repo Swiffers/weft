@@ -69,7 +69,6 @@ pub mod rules;
 pub mod run;
 pub mod run_settings;
 pub mod run_spec;
-pub mod running_policy;
 #[cfg(feature = "runtime")]
 pub mod seeding;
 // The predicate submodule is wire-pure and always available (the
@@ -92,6 +91,7 @@ pub mod storage;
 #[cfg(feature = "runtime")]
 pub mod stream_journal;
 pub mod tag;
+pub mod take_down;
 pub mod task;
 pub mod time_scale;
 pub mod versions;
@@ -243,10 +243,7 @@ pub use project::{
     InputDefinition, NodeDefinition, PortDefinition, Position, ProjectDefinition,
 };
 pub use pulse::Pulse;
-pub use running_policy::{
-    default_drain_timeout_secs, trigger_choice_required, DeactivateSpec, DeactivationMode, RunningChoice,
-    RunningPolicy, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_GRACE_MINUTES, TRIGGER_CHOICE_REQUIRED_HEADER,
-};
+pub use take_down::{Door, Held, ReleaseHeld, Running, TakeDown, TakeDownChoice};
 pub use run::CancelCause;
 pub use tag::StopSelf;
 #[cfg(feature = "runtime")]

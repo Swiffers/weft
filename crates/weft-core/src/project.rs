@@ -52,6 +52,54 @@ pub struct ProjectDefinition {
     /// run as written under another.
     #[serde(default, skip_serializing_if = "GivenPlaces::is_empty")]
     pub given: GivenPlaces,
+    /// The parts of the program that do not compile: an included file that
+    /// does not parse, a node whose type did not load, a wire between two
+    /// ports that cannot meet. The program around them still compiles, and
+    /// everything that does not need them runs; a cut that keeps one is
+    /// refused ([`cut::cut`]), naming what is wrong. Empty in a program
+    /// that compiles whole, and in every cut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broken: Vec<Broken>,
+}
+
+impl ProjectDefinition {
+    /// Whether a broken part may hide nodes ([`Broken::hides`]), so a
+    /// trigger or an infra copy this program does not declare is not
+    /// proven gone: every decision that takes something down for being
+    /// absent from the program (an orphan's reap, an orphan entry row,
+    /// a gone copy's disks) asks this first, and leaves it alone.
+    pub fn hides_nodes(&self) -> bool {
+        self.broken.iter().any(|part| part.hides)
+    }
+}
+
+/// One part of a program that does not compile
+/// ([`ProjectDefinition::broken`]).
+// SYNC: Broken <-> packages/weft-graph/src/protocol.ts Broken
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Broken {
+    /// The nodes and groups the problem is about, by id. A cut that keeps
+    /// every one of them needs the broken part: one id for a node or a
+    /// group, the two ends for a wire (a cut that keeps only one end does
+    /// not carry the wire).
+    pub parts: Vec<String>,
+    /// What is wrong, as the compiler says it, with the file and line.
+    pub why: String,
+    /// The part may stand for nodes the program cannot see: an included
+    /// file that does not compile (its placeholder holds none of its
+    /// nodes), a node whose type did not load (nothing says whether it is
+    /// a trigger or infra). While a program has one, what is missing from
+    /// it may only be hidden ([`ProjectDefinition::hides_nodes`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hides: bool,
+}
+
+impl Broken {
+    /// Whether a cut whose nodes and groups are `kept` needs this part.
+    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>) -> bool {
+        !self.parts.is_empty() && self.parts.iter().all(|part| kept.contains(part.as_str()))
+    }
 }
 
 /// See [`ProjectDefinition::given`].
@@ -245,6 +293,29 @@ pub mod boundary_types {
     /// Any boundary type at all.
     pub fn is_boundary(node_type: &str) -> bool {
         matches!(node_type, LOOP_IN | LOOP_OUT)
+    }
+}
+
+/// The node type of an `@include` the compiler does not open up: the
+/// editor's opaque block, and in a build the placeholder an included file
+/// that does not compile leaves at its site ([`own_types`]).
+// SYNC: INCLUDED_GROUP_TYPE <-> packages/weft-graph/src/webview/lib/types/index.ts INCLUDE_NODE_TYPE
+pub const INCLUDED_GROUP_TYPE: &str = "IncludedGroup";
+
+/// The type names weft gives its own nodes and scopes: the language's
+/// `Group` and `Loop`, a loop's two boundaries, and the opaque include.
+/// No catalog may declare one (`weft_catalog` refuses it, naming the
+/// file), so nothing a project wrote is ever mistaken for the
+/// compiler's.
+pub mod own_types {
+    pub const GROUP: &str = "Group";
+    pub const LOOP: &str = "Loop";
+
+    /// Every one of them.
+    pub const ALL: &[&str] = &[GROUP, LOOP, super::boundary_types::LOOP_IN, super::boundary_types::LOOP_OUT, super::INCLUDED_GROUP_TYPE];
+
+    pub fn is_own(node_type: &str) -> bool {
+        ALL.contains(&node_type)
     }
 }
 
@@ -693,10 +764,14 @@ fn default_config() -> Value {
 }
 
 impl NodeDefinition {
-    /// The node's header span, or a default (zero) span when it has none
-    /// (synthetic nodes carry no header). The single home for "point a
-    /// diagnostic at this node's header line", so every diagnostic site uses
-    /// the same fallback rather than repeating `header_span.unwrap_or_default()`.
+    /// The part of the program this node is, as a finding about it names
+    /// it ([`Broken::parts`]): its own id, or for a loop's boundary node its
+    /// loop's, since a cut keeps a loop whole or not at all and the
+    /// boundary is the loop's own business.
+    pub fn part(&self) -> &str {
+        self.group_boundary.as_ref().map(|b| b.group_id.as_str()).unwrap_or(&self.id)
+    }
+
     /// This node's port types at the place `path` reaches (an include
     /// call path, outermost site first; empty at the top).
     pub fn types_at<S: AsRef<str>>(&self, path: &[S]) -> TypesAt<'_> {
@@ -711,6 +786,10 @@ impl NodeDefinition {
         })
     }
 
+    /// The node's header span, or a default (zero) span when it has none
+    /// (synthetic nodes carry no header). The single home for "point a
+    /// diagnostic at this node's header line", so every diagnostic site uses
+    /// the same fallback rather than repeating `header_span.unwrap_or_default()`.
     pub fn header_span_or_default(&self) -> Span {
         self.header_span.unwrap_or_default()
     }
@@ -1419,51 +1498,6 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
     project.nodes.iter().any(|n| n.requires_infra)
 }
 
-/// What an ARMED trigger keeps depending on: for every infra PLACE,
-/// every trigger place whose data path runs through it. Returns
-/// `(infra, trigger)` pairs, each spelled the way a person writes the
-/// place (`svc`, or `one.svc` inside the file the site `one` includes),
-/// sorted by `(infra, trigger)`.
-///
-/// Per place, because that is what runs: a file included twice holds
-/// two infra placements and two registered triggers, and the trigger
-/// under `one` reads its address off the placement under `one` alone.
-/// The spelling is the key every infra row and signal row is stored
-/// under, so a reader compares this against those directly.
-///
-/// This is the STAY-RUNNING question, and it is not the same as
-/// [`infra_triggers_depend_on`], which answers the BEFORE-ARMING one.
-/// A registered trigger holds an address it read off the node feeding
-/// it, so stopping that node breaks a signal that is live right now.
-/// Infra that only fed the GATE deciding whether the trigger's group
-/// flows was read once, during activation, and the armed registration
-/// does not touch it again: stopping it later breaks nothing, and
-/// refusing that stop would trap the user into deactivating first.
-/// Hence the plain data walk here (`places::upstream_by_wires`),
-/// and the run-shaped one there.
-///
-/// Read by:
-///   - the dispatcher's per-node infra stop/terminate guard;
-///   - the broker's `supervisor_trigger_deps` endpoint, so the
-///     supervisor decides the same way when infra goes flaky.
-///
-/// Pure walk over `ProjectDefinition`; no I/O.
-pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
-    let is_infra = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra);
-    let graph = graph::ProjectGraph::new(project);
-    let mut out: Vec<(String, String)> = Vec::new();
-    for trigger in trigger_places(project) {
-        let spelled_trigger = address_of(project, &trigger.id, &trigger.path);
-        for place in places::upstream_by_wires(&graph, std::slice::from_ref(&trigger)) {
-            if is_infra(&place) {
-                out.push((address_of(project, &place.id, &place.path), spelled_trigger.clone()));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 #[cfg(test)]
 mod address_tests {
     use super::*;
@@ -1483,6 +1517,7 @@ mod address_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let (node, path) = resolve_address(&project, "");
         assert_eq!(node, "");
@@ -1701,6 +1736,18 @@ pub fn infra_places(project: &ProjectDefinition) -> Vec<Located> {
     places::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
 }
 
+/// The infra places a program runs, spelled (`db`, `one.db`): its infra
+/// places, less the ones it is given instead of running (a stand-in: an
+/// infra node read only through its baked outputs, a seed's saved result).
+/// For a run's cut, the infra the run reaches.
+pub fn infra_reached(program: &ProjectDefinition) -> std::collections::BTreeSet<String> {
+    infra_places(program)
+        .into_iter()
+        .filter(|place| !program.given.outputs.contains(place))
+        .map(|place| address_of(program, &place.id, &place.path))
+        .collect()
+}
+
 /// Whether the node `id` exists once per instance (`@per_instance`): every
 /// copy of it (its infra, its trigger's activation) is an instance's, and
 /// none is shared. Asked of a place by its `id`, of a spelled place
@@ -1760,6 +1807,10 @@ pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::B
 pub struct DeclaredInfra {
     /// Place -> whether it is per instance.
     places: std::collections::BTreeMap<String, bool>,
+    /// The program hides nodes behind a part that does not compile
+    /// ([`ProjectDefinition::hides_nodes`]), so a copy it does not
+    /// declare may only be hidden.
+    hides: bool,
 }
 
 impl DeclaredInfra {
@@ -1772,18 +1823,25 @@ impl DeclaredInfra {
                 (spelled, per_instance)
             })
             .collect();
-        Self { places }
+        Self { places, hides: project.hides_nodes() }
     }
 
-    /// Whether the program has a copy of `spelled` of this kind: a
-    /// an instance's (`instance_copy`) or the shared one.
+    /// Whether the program has a copy of `spelled` of this kind: an
+    /// instance's (`instance_copy`) or the shared one.
     pub fn declares(&self, spelled: &str, instance_copy: bool) -> bool {
         self.places.get(spelled) == Some(&instance_copy)
     }
 
-    /// Whether the program still declares the copy a host names.
-    pub fn declares_copy(&self, copy: &crate::infra::NodeRef) -> bool {
-        self.declares(&copy.node, copy.is_instance_copy())
+    /// Whether the copy `spelled` of this kind is gone from the program
+    /// for good, so its units and disks may go: it does not declare it,
+    /// and no part that does not compile could be hiding it.
+    pub fn gone(&self, spelled: &str, instance_copy: bool) -> bool {
+        !self.hides && !self.declares(spelled, instance_copy)
+    }
+
+    /// [`Self::gone`] for the copy a host names.
+    pub fn gone_copy(&self, copy: &crate::infra::NodeRef) -> bool {
+        self.gone(&copy.node, copy.is_instance_copy())
     }
 }
 
@@ -1823,54 +1881,8 @@ pub fn upstream_closure(g: &impl graph::GraphView, seeds: &[String]) -> std::col
     seen
 }
 
-/// The infra a trigger DEPENDS ON, each PLACE named once, spelled the
-/// way a person writes it (`svc`, `one.svc`): the key its infra row is
-/// stored under, so a reader compares this against the rows directly.
-///
-/// Infra and triggers are independent lifetimes, joined by one rule: a
-/// trigger needs the infra feeding it to be RUNNING. A WhatsApp receive
-/// node takes the bridge's address off the bridge node feeding it, so
-/// arming it before the bridge is up would register a signal against an
-/// address that does not answer. Infra DOWNSTREAM of a trigger belongs
-/// to the run a fire starts and is gated there instead, so the project
-/// arms either way. Nothing here ever starts infra: that is the user's
-/// own verb.
-///
-/// What must be RUNNING before this project's triggers can be armed.
-///
-/// Arming them is a run: the TriggerSetup pass evaluates everything the
-/// registration needs, including the gate deciding whether a trigger's
-/// group flows at all. So this walks the way that run walks
-/// (`cut::Bounds::setup`), and the answer covers every infra node that
-/// run touches: the bridge whose address a trigger reads, and the node
-/// feeding a gate the setup has to evaluate.
-///
-/// Wires that run straight from producer to reader, and call frames, are
-/// what keep it honest in the other direction: infra wired into a group
-/// port no trigger reads is not in it, and does not hold an activation
-/// back.
-///
-/// The STAY-RUNNING question is [`compute_trigger_deps`], and it is a
-/// different set on purpose: once a trigger is armed, the gate's infra
-/// has already done its job. Changing one of these two to match the
-/// other is how the system starts contradicting itself; they answer
-/// different questions about different moments.
-///
-/// Empty when the project has no trigger.
-pub fn infra_triggers_depend_on(
-    project: &ProjectDefinition,
-) -> std::collections::BTreeSet<String> {
-    let graph = graph::ProjectGraph::new(project);
-    cut::walk_bounds(&graph, &cut::Bounds::setup(&trigger_places(project)))
-        .runs
-        .iter()
-        .filter(|place| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra))
-        .map(|place| address_of(project, &place.id, &place.path))
-        .collect()
-}
-
 #[cfg(test)]
-mod infra_triggers_depend_on_tests {
+mod trigger_dependency_tests {
     use super::*;
     use crate::NodeFeatures;
 
@@ -1932,6 +1944,7 @@ mod infra_triggers_depend_on_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         }
     }
 
@@ -1944,8 +1957,9 @@ mod infra_triggers_depend_on_tests {
         })
     }
 
-    fn ids(set: std::collections::BTreeSet<String>) -> Vec<String> {
-        set.into_iter().collect()
+    /// What the trigger at `trigger` depends on (`crate::run_spec::trigger_cut`).
+    fn deps(p: &ProjectDefinition, trigger: &str) -> Vec<String> {
+        crate::run_spec::trigger_cut(p, trigger).expect("its cut walks").depends_on
     }
 
     #[test]
@@ -1959,7 +1973,7 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("bridge", "receive"), wire("receive", "reply")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
     #[test]
@@ -1974,18 +1988,18 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("bridge", "conf"), wire("conf", "receive")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
+    /// The database a fire writes to is in its cut: taking it down takes
+    /// the trigger down with it, since its fires cannot run without it.
     #[test]
-    fn an_infra_node_downstream_of_a_trigger_stays_out() {
-        // The database the fired run writes to belongs to the run, not
-        // to arming the trigger; the run is what waits on it.
+    fn an_infra_node_downstream_of_a_trigger_counts() {
         let p = project(
             vec![node("receive", true, false), node("db", false, true)],
             vec![wire("receive", "db")],
         );
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert_eq!(deps(&p, "receive"), vec!["db".to_string()]);
     }
 
     #[test]
@@ -1999,21 +2013,19 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("receive", "reply"), wire("svc", "svc_out")],
         );
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert!(deps(&p, "receive").is_empty());
     }
 
     #[test]
-    fn a_project_with_no_trigger_reaches_nothing() {
+    fn a_project_with_no_trigger_has_no_cut() {
         let p = project(vec![node("svc", false, true)], vec![]);
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert!(crate::run_spec::trigger_cuts(&p).is_empty());
     }
 
     /// A group's port is where the walk's port-precision earns its
     /// keep: the trigger sits inside the group and reads the group's `x`,
-    /// so infra feeding the group's `y` never reaches it and must not
-    /// hold the activation back. A cruder walk (every wire into the
-    /// group) would name `svc` here and grey out Activate over infra the
-    /// triggers never touch.
+    /// so infra feeding the group's `y` never reaches it, and stopping it
+    /// leaves the trigger alone.
     #[test]
     fn infra_feeding_a_group_port_the_trigger_does_not_read_stays_out() {
         let node = |id: &str, scope: &[&str], infra: bool| serde_json::json!({
@@ -2036,18 +2048,14 @@ mod infra_triggers_depend_on_tests {
             ],
             "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive", "other"] }]
         })).expect("the fixture deserializes");
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
-        // The stay-running walk is port-precise at the group too.
-        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
-    /// The two questions part company at the GATE: infra deciding
-    /// whether the trigger's group flows is evaluated by the arming run
-    /// and holds the activation back, but the armed trigger never reads
-    /// it again, so stopping it later breaks nothing and the stay-running
-    /// walk leaves it out.
+    /// Infra deciding whether the trigger's group flows is read by the
+    /// arming run once, and the armed trigger never reads it again, so
+    /// stopping it later breaks nothing: it is no dependency.
     #[test]
-    fn gate_infra_holds_the_activation_back_and_nothing_after() {
+    fn gate_infra_is_no_dependency() {
         let node = |id: &str, scope: &[&str], infra: bool| serde_json::json!({
             "id": id, "nodeType": "T", "label": null, "config": {},
             "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": [],
@@ -2067,8 +2075,7 @@ mod infra_triggers_depend_on_tests {
             ],
             "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive"] }]
         })).expect("the fixture deserializes");
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string(), "gate".to_string()]);
-        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
 
@@ -2082,7 +2089,7 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("db", "loopy"), wire("loopy", "db"), wire("db", "receive")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["db".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["db".to_string()]);
     }
 
     /// The shape an include compiles to: one body (`Bridge`) holding an
@@ -2117,26 +2124,15 @@ mod infra_triggers_depend_on_tests {
         })).expect("the fixture deserializes")
     }
 
-    /// Both questions are answered per PLACE, spelled: the trigger under
-    /// `one` depends on the placement under `one` and on the top-level
-    /// node wired into `one`'s door; the trigger under `two` depends on
-    /// its own placement alone, because the top-level node feeds only
-    /// `one`.
+    /// Answered per PLACE, spelled: the trigger under `one` depends on
+    /// the placement under `one` and on the top-level node wired into
+    /// `one`'s door; the trigger under `two` depends on its own placement
+    /// alone, because the top-level node feeds only `one`.
     #[test]
     fn a_file_included_twice_depends_per_call() {
         let p = program_with_two_sites();
-        assert_eq!(
-            compute_trigger_deps(&p),
-            vec![
-                ("one.svc".to_string(), "one.door".to_string()),
-                ("top_db".to_string(), "one.door".to_string()),
-                ("two.svc".to_string(), "two.door".to_string()),
-            ]
-        );
-        assert_eq!(
-            ids(infra_triggers_depend_on(&p)),
-            vec!["one.svc".to_string(), "top_db".to_string(), "two.svc".to_string()]
-        );
+        assert_eq!(deps(&p, "one.door"), vec!["one.svc".to_string(), "top_db".to_string()]);
+        assert_eq!(deps(&p, "two.door"), vec!["two.svc".to_string()]);
     }
 }
 
@@ -2160,6 +2156,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert!(v.get("name").is_none(), "name must not serialize: {v}");
@@ -2270,6 +2267,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["groups"][0]["portLiterals"]["_should_flow"], false, "portLiterals key: {v}");
@@ -2354,6 +2352,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
             defaults: Default::default(),
             given: Default::default(),
+            broken: Vec::new(),
         }
     }
 
@@ -2394,10 +2393,27 @@ mod project_wire_tests {
             node: node.into(),
             copy_id: crate::infra::NodeRef::copy_id(project.id, node, of),
         };
-        assert!(declared.declares_copy(&copy("db", None)));
-        assert!(!declared.declares_copy(&copy("db", Some(&alice))));
-        assert!(declared.declares_copy(&copy("mine", Some(&alice))));
-        assert!(!declared.declares_copy(&copy("mine", None)));
+        assert!(!declared.gone_copy(&copy("db", None)));
+        assert!(declared.gone_copy(&copy("db", Some(&alice))));
+        assert!(!declared.gone_copy(&copy("mine", Some(&alice))));
+        assert!(declared.gone_copy(&copy("mine", None)));
+        assert!(declared.gone("gone", false));
+    }
+
+    /// A program with a part that may hide nodes proves nothing gone: a
+    /// copy it does not declare may sit inside the included file that
+    /// does not compile. A broken part that hides nothing proves as much
+    /// as a whole program.
+    #[test]
+    fn a_program_hiding_nodes_proves_no_copy_gone() {
+        let mut project = project_with_nodes(vec![node_with_infra("db", true)]);
+        project.broken = vec![Broken { parts: vec!["db".into()], why: "a wire".into(), hides: false }];
+        assert!(DeclaredInfra::of(&project).gone("other", false), "a wire hides no node");
+        project.broken.push(Broken { parts: vec!["lib".into()], why: "lib.weft does not parse".into(), hides: true });
+        let declared = DeclaredInfra::of(&project);
+        assert!(project.hides_nodes());
+        assert!(!declared.gone("other", false), "it may be inside lib.weft");
+        assert!(declared.declares("db", false), "what it declares, it still declares");
     }
 }
 
@@ -2545,6 +2561,46 @@ mod setup_cut_tests {
         assert_eq!(kicked(&kicks), vec![("text".to_string(), false)]);
         let none = project(&[("a", false, false, &[]), ("b", false, false, &[])], &[], &[("a", &[], "b")]);
         assert!(setup_cut(&none, &infra_places(&none)).is_err(), "nothing to set up is never the whole program");
+    }
+
+    /// A broken part stops only the cuts that need it: a node every one
+    /// of whose places the cut drops, and a wire whose other end it drops,
+    /// are not its business. The refusal names every part it needs.
+    #[test]
+    fn a_cut_is_refused_only_when_it_needs_a_broken_part() {
+        // a ──► b      g.c (inside g)      trig ──► out
+        let mut p = project(
+            &[("a", false, false, &[]), ("b", false, false, &[]), ("g.c", false, false, &["g"]), ("trig", true, false, &[]), ("out", false, false, &[])],
+            &[("g", None)],
+            &[("a", &[], "b"), ("trig", &[], "out")],
+        );
+        p.broken = vec![
+            Broken { parts: vec!["a".into(), "b".into()], why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
+            Broken { parts: vec!["g".into()], why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
+        ];
+        assert!(setup_cut(&p, &places(&["a"])).is_ok(), "a alone does not carry the wire");
+        let refused = setup_cut(&p, &places(&["b"])).unwrap_err();
+        assert!(refused.contains("a.v cannot feed b.v"), "{refused}");
+        assert!(!refused.contains("the group g"), "{refused}");
+        let refused = setup_cut(&p, &places(&["g.c"])).unwrap_err();
+        assert!(refused.contains("the group g is broken\n    second line"), "a reason keeps its lines under it: {refused}");
+        // Fed from outside, g.c needs nothing of g as a scope, so the cut
+        // dissolves g; its member and the wire through its port still run,
+        // and so g's broken part is still needed.
+        let mut fed = project(
+            &[("f", false, false, &[]), ("g.c", false, false, &["g"])],
+            &[("g", None)],
+            &[("f", &[("g", "in")], "g.c")],
+        );
+        let (dissolved, _) = setup_cut(&fed, &places(&["g.c"])).unwrap();
+        assert!(dissolved.groups.is_empty(), "the cut keeps no scope for g: {:?}", dissolved.groups);
+        fed.broken = vec![Broken { parts: vec!["g".into()], why: "a stream through g's port".into(), hides: false }];
+        assert!(setup_cut(&fed, &places(&["g.c"])).unwrap_err().contains("a stream through g's port"));
+        let fire = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
+        assert!(fire.program.broken.is_empty(), "a cut carries nothing broken");
+        p.broken.push(Broken { parts: vec!["out".into()], why: "out did not load".into(), hides: true });
+        let refused = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap_err();
+        assert!(refused.starts_with("a fire of 'trig' cannot run") && refused.contains("out did not load"), "{refused}");
     }
 
     /// A trigger is kicked at the top wherever it sits; the copies around

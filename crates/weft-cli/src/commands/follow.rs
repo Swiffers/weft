@@ -197,6 +197,40 @@ fn short(v: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// How long to wait before looking again at a task when the install could
+/// not be reached, or answered that it cannot serve right now.
+const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Follow task `task` of project `project_id` (a resync, a deactivate's
+/// wait for its runs) until it ends, and answer what it ended with: one
+/// short look after another (`GET /projects/{id}/follow/{task}`, each
+/// waiting at most half a minute on the install), so following never rests
+/// on one long request a gateway would cut, and never ends on its own. A
+/// look the install could not answer (unreachable, restarting, its
+/// gateway cutting it) is said and tried again; a refusal is the task's
+/// own ending, raised. Ctrl+C stops following, never the task.
+pub async fn follow_task(
+    client: &crate::client::DispatcherClient,
+    progress: &crate::progress::Progress,
+    project_id: &str,
+    task: uuid::Uuid,
+) -> anyhow::Result<Value> {
+    let path = format!("/projects/{project_id}/follow/{task}?waitSecs=25");
+    loop {
+        match client.get_json(&path).await {
+            Ok(answer) => match serde_json::from_value(answer).context("read the task's state")? {
+                weft_core::deactivation::Following::Going => {}
+                weft_core::deactivation::Following::Done(value) => return Ok(value),
+            },
+            Err(e) => {
+                let why = super::ensure::look_again_after(e)?;
+                progress.warn(&format!("could not look at it just now ({why}); looking again"));
+                tokio::time::sleep(TASK_LOOK_AGAIN_AFTER).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +390,41 @@ mod tests {
     #[test]
     fn shortened_identifiers_do_not_split_characters() {
         assert_eq!(short(Some(&json!("ééééééééé"))), "éééééééé");
+    }
+
+    /// A task is followed look after look until it ends, a look the
+    /// install could not answer (its gateway cutting it) is tried again,
+    /// and what it ended with is the answer.
+    #[tokio::test]
+    async fn a_task_is_followed_in_short_looks_until_it_ends() {
+        let looks = Arc::new(Mutex::new(0u32));
+        let seen = looks.clone();
+        let app = Router::new().route(
+            "/projects/{id}/follow/{task}",
+            get(move || {
+                let seen = seen.clone();
+                async move {
+                    let look = {
+                        let mut looks = seen.lock().unwrap();
+                        *looks += 1;
+                        *looks
+                    };
+                    match look {
+                        1 => (axum::http::StatusCode::OK, Json(json!("going"))),
+                        2 => (axum::http::StatusCode::GATEWAY_TIMEOUT, Json(json!({ "error": "cut" }))),
+                        _ => (axum::http::StatusCode::OK, Json(json!({ "done": { "moved": 2 } }))),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DispatcherClient::new(format!("http://{addr}"), None);
+        let progress = crate::progress::Progress::new(crate::progress::ActionVerb::Resync, true);
+        let task = uuid::Uuid::new_v4();
+        let done = tokio::time::timeout(Duration::from_secs(30), follow_task(&client, &progress, "p", task)).await.unwrap().unwrap();
+        assert_eq!(done, json!({ "moved": 2 }));
+        assert_eq!(*looks.lock().unwrap(), 3, "going, cut and looked at again, done");
     }
 }

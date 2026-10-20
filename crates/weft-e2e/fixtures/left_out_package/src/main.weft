@@ -1,0 +1,25 @@
+# Two routes. `front` answers on its own; `back` answers through Shout, a
+# node of this project whose code does not compile (nodes/shout/mod.rs).
+# The worker is built without Shout's package: `front` activates and
+# answers, and `back` is refused, naming the package.
+#
+#   POST front   answers {"heard": <text>}
+#   POST back    would answer through Shout
+
+front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST" }
+front_body = ExecPython(text: String) -> (body: JsonDict) {
+  code: "return {'body': {'heard': text}}"
+}
+front_body.text = front.body.text
+front_answer = Reply
+front_answer.body = front_body.body
+
+back = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/back", method: "POST" }
+loud = Shout
+loud.text = back.body.text
+back_body = ExecPython(text: String) -> (body: JsonDict) {
+  code: "return {'body': {'heard': text}}"
+}
+back_body.text = loud.text
+back_answer = Reply
+back_answer.body = back_body.body

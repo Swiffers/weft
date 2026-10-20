@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{run_id_of, fire_until_run, graph_trigger_hold, spawn_weft, tree_of, HOLD};
+use common::{run_id_of, fire_until_run, graph_trigger_hold, tree_of, HOLD};
 use serde_json::Value;
 use weft_e2e::fakes::{PollFake, SseFake};
 use weft_e2e::status::{self, STATUS_DEADLINE};
@@ -266,12 +266,10 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
 /// and answered success, so a cancel reported that it had cancelled and
 /// nothing had been cancelled.
 ///
-/// `cancel-running` only acts while a deactivate is draining the runs
-/// a trigger fired (the drain watcher fires from that state), so the
-/// test fires the trigger and drives the project into that window
-/// exactly as `lifecycle_transitions` does, and then cancels with the id
-/// spelled the way a hand-written script or an id copied out of a UI
-/// often is.
+/// A deactivate with `running: cancel` cancels the runs its triggers
+/// fired that are going, so the test fires the trigger, holds the run
+/// open, and takes the trigger down with the id spelled the way a
+/// hand-written script or an id copied out of a UI often is.
 #[tokio::test]
 async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -286,42 +284,23 @@ async fn a_cancel_on_an_uppercase_project_id_really_cancels() -> anyhow::Result<
     let run_id = fire_until_run(&feed, &disp, &pid, "go", &before).await?;
     run::wait_for_status(&disp, run_id, "running").await?;
 
-    // Deactivate with a Wait drain: it holds open while the run holds.
-    let deact = spawn_weft(
-        &project,
-        vec![
-            "deactivate".into(),
-            "--mode".into(),
-            "park".into(),
-            "--running-policy".into(),
-            "wait".into(),
-            "--drain-timeout".into(),
-            "300".into(),
-        ],
-    );
-    status::wait_until(&disp, &pid, "the drain window", STATUS_DEADLINE, |s| {
-        s.status() == "deactivating"
-    })
-    .await?;
-
     let shouted = pid.to_string().to_uppercase();
     let (code, body) = disp
-        .post_raw(&format!("/projects/{shouted}/cancel-running"), &serde_json::json!({}))
+        .post_raw(&format!("/projects/{shouted}/deactivate"), &serde_json::json!({ "running": "cancel" }))
         .await?;
-    anyhow::ensure!(code.is_success(), "cancel-running answered HTTP {code}: {body}");
+    anyhow::ensure!(code.is_success(), "deactivate answered HTTP {code}: {body}");
+    let answer: weft_core::deactivation::DeactivateResponse = serde_json::from_str(&body)?;
+    anyhow::ensure!(answer.report.runs == 1, "the deactivate reached the run going: {body}");
 
     // The claim it just made has to be true: it used to answer success
-    // having matched no rows at all, and the drain would then hang until
-    // its timeout.
+    // having matched no rows at all.
     let settled = SettledRun::observe(&disp, run_id).await?;
     anyhow::ensure!(
         settled.status == "cancelled",
-        "cancel-running answered success, so the run must actually be cancelled; got {}",
+        "deactivate answered that it cancelled a run, so the run must actually be cancelled; got {}",
         settled.status
     );
     status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
-    let deact_out = deact.await??;
-    anyhow::ensure!(deact_out.success, "the drain finishes once the cancel lands: {}", deact_out.stderr);
 
     project.finish().await
 }

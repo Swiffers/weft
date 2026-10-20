@@ -119,7 +119,7 @@ async fn a_per_instance_infra_node_runs_one_copy_per_instance() -> anyhow::Resul
     project.weft(&["clean", "--project", &pid.to_string(), "--instance", "ada", "--yes"]).await?;
     anyhow::ensure!(runs_in(&disp, pid, "ada").await?.is_empty(), "clean took ada's runs");
 
-    project.weft(&["infra", "node-terminate", "svc", "--instance", "ada", "--yes"]).await?;
+    project.weft(&["infra", "terminate", "--infra", "svc", "--instance", "ada", "--yes"]).await?;
     wait_copy(&disp, pid, "svc", "ada", None).await?;
     project.finish().await
 }
@@ -151,7 +151,7 @@ async fn one_trigger_is_turned_on_and_off_alone() -> anyhow::Result<()> {
 
     project.weft(&["activate", "--trigger", "b"]).await?;
     anyhow::ensure!(call("b").await? == 200);
-    project.weft(&["deactivate", "--trigger", "a", "--mode", "wipe", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--trigger", "a", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     anyhow::ensure!(call("a").await? != 200, "a is down");
     anyhow::ensure!(call("b").await? == 200, "b kept listening");
     project.finish().await
@@ -273,7 +273,7 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     // A connection written as an instance's fallback is the old way: its
     // id means nothing on another install, so the compiler refuses it.
     project.set_node_config("theirs", "account", &format!("@instance_filled({})", keys.handle()))?;
-    let refused = project.weft_refused(&["resync", "--mode", "wipe"]).await?;
+    let refused = project.weft_refused(&["resync"]).await?;
     anyhow::ensure!(refused.contains("falls back to a connection written in the source"), "{refused}");
 
     keys.finish().await?;
@@ -416,5 +416,35 @@ async fn an_instances_value_reaches_its_live_trigger() -> anyhow::Result<()> {
     project.weft(&["instance-values", "--instance", "bob", "--set", "tick.cron=0 30 9 * * *"]).await?;
     let listed = project.weft(&["instance-values", "--instance", "bob", "--json"]).await?;
     anyhow::ensure!(listed.contains("0 30 9 * * *"), "{listed}");
+    project.finish().await
+}
+
+/// `weft resync` brings up to date the triggers of the owners it names:
+/// plain, the shared ones, so an instance's trigger that is on and behind
+/// the build is left as it is (and still reads behind); `--all-instances`
+/// reaches it and brings it onto the build.
+#[tokio::test]
+async fn resync_reaches_an_instances_trigger_only_when_told_to() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let project = Project::prepare("instances", disp.clone()).await?;
+    let pid = project.id();
+    let program = "tick = Cron { cron: @instance_filled(\"0 0 3 * * *\") }\nlog = Debug\nlog.data = tick.scheduledTime\n";
+    project.set_main(program)?;
+    project.weft(&["activate", "--trigger", "tick", "--instance", "ada"]).await?;
+    let state = |s: &weft_e2e::status::ProjectStatus| s.trigger_state("tick", Some("ada")).to_string();
+    weft_e2e::status::wait_until(&disp, &pid, "ada's trigger on", weft_e2e::status::STATUS_DEADLINE, |s| state(s) == "on").await?;
+
+    // One more node reads each fire, so the trigger's cut moves.
+    project.set_main(&format!("{program}also = Debug\nalso.data = tick.scheduledTime\n"))?;
+    project.weft(&["resync"]).await?;
+    let s = weft_e2e::status::fetch(&disp, &pid).await?;
+    anyhow::ensure!(state(&s) == "behind", "a plain resync leaves ada's trigger as it was: {:?}", s.trigger("tick"));
+
+    project.weft(&["resync", "--all-instances"]).await?;
+    let s = weft_e2e::status::wait_until(&disp, &pid, "ada's trigger on the new build", weft_e2e::status::STATUS_DEADLINE, |s| {
+        state(s) == "on"
+    })
+    .await?;
+    anyhow::ensure!(!s.offers("resync"), "nothing is behind any more: {:?}", s.available_actions());
     project.finish().await
 }

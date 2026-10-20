@@ -24,6 +24,7 @@ pub mod build;
 pub mod delivery;
 pub mod domains;
 pub mod drain;
+pub mod infra_reach;
 pub mod door;
 pub mod frontends;
 pub mod held;

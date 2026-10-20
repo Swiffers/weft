@@ -443,12 +443,15 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
 /// just hands off the spec and waits.
 #[async_trait]
 pub trait InfraStateClient: Send + Sync {
+    /// Issue the apply of `spec_json` for the copy at `node_id` that the
+    /// infra setup `run_id` makes; the command's id.
     async fn enqueue_apply(
         &self,
         project_id: uuid::Uuid,
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         spec_json: serde_json::Value,
+        run_id: RunId,
     ) -> anyhow::Result<i64>;
 
     /// The command's state, once it completed or `wait` passed.
@@ -481,8 +484,9 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         spec_json: serde_json::Value,
+        run_id: RunId,
     ) -> anyhow::Result<i64> {
-        self.enqueue_apply(project_id, node_id, instance, spec_json).await
+        self.enqueue_apply(project_id, node_id, instance, spec_json, run_id).await
     }
     async fn wait_apply(
         &self,
@@ -4624,6 +4628,7 @@ pub async fn apply_via_supervisor(
     place: &str,
     instance: Option<&weft_core::instance::InstanceId>,
     spec: &weft_core::infra::InfraSpec,
+    run_id: RunId,
 ) -> anyhow::Result<()> {
     // `place` is the node spelled the way a person writes it (`one.db`
     // inside the file the site `one` includes), which is what the
@@ -4631,7 +4636,7 @@ pub async fn apply_via_supervisor(
     // are keyed by: a file included twice is provisioned twice.
     let spec_json = serde_json::to_value(spec)?;
     let cmd_id = infra_state
-        .enqueue_apply(project_id, place, instance, spec_json)
+        .enqueue_apply(project_id, place, instance, spec_json, run_id)
         .await?;
     let started = clock.now();
     loop {
@@ -4698,6 +4703,7 @@ mod infra_apply_tests {
             _: &str,
             _: Option<&weft_core::instance::InstanceId>,
             _: Value,
+            _: RunId,
         ) -> anyhow::Result<i64> {
             Ok(42)
         }
@@ -4726,7 +4732,7 @@ mod infra_apply_tests {
             InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Succeeded), outcome_message: None },
         ])) };
-        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default()).await.unwrap();
+        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default(), RunId::nil()).await.unwrap();
         assert!(clock.elapsed() >= Duration::from_secs(3 * 3600));
         assert!(state.responses.lock().unwrap().is_empty());
     }
@@ -4737,7 +4743,7 @@ mod infra_apply_tests {
         let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Failed), outcome_message: Some("image cannot start".into()) },
         ])) };
-        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default()).await.unwrap_err();
+        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default(), RunId::nil()).await.unwrap_err();
         assert!(error.to_string().contains("image cannot start"));
     }
 }

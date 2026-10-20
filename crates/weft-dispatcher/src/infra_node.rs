@@ -91,6 +91,11 @@ pub struct InfraNodeRow {
     /// When the apply under way began; cleared when it leaves
     /// provisioning.
     pub provisioning_since_unix: Option<i64>,
+    /// The hash of its place's infra in the build its last apply came
+    /// from (`weft_core::builds::BuiltProgram::infra_places`): a copy whose
+    /// place hashes otherwise in the source now is behind it. `None` for a
+    /// copy no apply of a build that named them has landed on.
+    pub source_hash: Option<String>,
 }
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
@@ -139,7 +144,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- to value: what its infra setup sent out on them, or the
             -- infra pushed since. A run that reads only these does not
             -- run the node.
-            baked_json          JSONB NOT NULL DEFAULT '{}'::jsonb
+            baked_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- The hash of its place's infra in the build its last apply
+            -- came from (`BuiltProgram::infra_places`), copied from the
+            -- apply command as it lands: what tells whether it is behind
+            -- the source.
+            source_hash         TEXT,
+            -- The health rules its node wrote (`InfraSpec::health_rules`,
+            -- a JSON array), which the supervisor's health loop runs on
+            -- the copy. NULL: the node wrote none, so it runs the
+            -- built-in ones. Stamped at apply.
+            health_rules_json   JSONB
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
@@ -181,7 +196,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 const ROW_COLUMNS: &str = "project_id, node_id, instance_id, copy_id, status, \
      failure_stage, failure_message, applied_spec_hash, \
      applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, notes_json, \
-     waiting_on, provisioning_since_unix";
+     waiting_on, provisioning_since_unix, source_hash";
 
 /// Read one copy's row. Returns None when the row doesn't exist (no
 /// infra was ever applied for this copy).
@@ -667,6 +682,7 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         notes,
         waiting: row.try_get("waiting_on")?,
         provisioning_since_unix: row.try_get("provisioning_since_unix")?,
+        source_hash: row.try_get("source_hash")?,
     })
 }
 
@@ -841,6 +857,7 @@ mod tests {
             notes: Vec::new(),
             waiting: waiting.map(str::to_string),
             provisioning_since_unix: since,
+            source_hash: None,
         }
     }
 

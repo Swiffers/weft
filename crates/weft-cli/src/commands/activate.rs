@@ -2,48 +2,31 @@
 //! ensure registered, activate. With arg: treat it as a project id
 //! and activate directly (assume already registered).
 //!
-//! When the triggers being turned on kept work while they were off
-//! (events that arrived meanwhile, or runs waiting on a person: either
-//! count non-zero), the user is prompted to pick one of three reactivate
-//! choices. The choice is sent in the activate body (`reactivateChoice`);
-//! the dispatcher's activate handler decides whether to run, drop or keep
-//! the kept work based on it. Only this command asks: a resync carries
-//! the kept work over.
-//!
-//! A worker built from an older image is replaced on the way:
-//! `--running-policy` says whether its running runs are
-//! cancelled now (the default) or waited for, up to `--drain-timeout`.
+//! It turns on every trigger it names that is off, new ones included, and
+//! leaves the ones on alone: with nothing off it succeeds, saying so, so a
+//! script can always run it. What the triggers held while they were down
+//! is released (`--held run`, the default, paced at half each trigger's
+//! own limits so new arrivals still get through) or dropped (`--held
+//! drop`). It never touches a run going right now.
 
 use anyhow::Context;
 
-use weft_core::activation::{ActivateRequest, ActivateResponse, ActivationTarget, ReactivateChoice};
+use weft_core::activation::{ActivateRequest, ActivateResponse};
+use weft_core::ReleaseHeld;
 
-use super::ensure::{parse_running_choice, running_choice};
 use super::Ctx;
 use crate::progress::ActionVerb;
 
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
-    reactivate_choice_flag: Option<ReactivateChoice>,
+    held: ReleaseHeld,
     port: Option<u16>,
-    running_policy: Option<String>,
-    drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Activate, |progress| async move {
-        run_inner(
-            &ctx_inner,
-            &progress,
-            project,
-            reactivate_choice_flag,
-            port,
-            running_policy,
-            drain_timeout,
-            scope,
-        )
-        .await
+        run_inner(&ctx_inner, &progress, project, held, port, scope).await
     })
     .await
 }
@@ -52,56 +35,26 @@ async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
     project: Option<String>,
-    reactivate_choice_flag: Option<ReactivateChoice>,
+    held: ReleaseHeld,
     port: Option<u16>,
-    running_policy: Option<String>,
-    drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
-    // Parsed before anything is built: a misspelt policy, or a cap with
-    // nothing to bound, is refused here, not after a build that took a
-    // minute.
-    let (running_policy, drain_timeout) =
-        parse_running_choice(running_policy.as_deref(), drain_timeout)?;
     // The hashes of the build just made, which the dispatcher checks is
     // still the registered one. The "activate by id" path builds nothing
     // and sends none: it activates whatever is registered.
-    let (client, id, name, target) = match project {
-        // Activate-by-id skips the build/discover step entirely.
-        Some(id) => (ctx.client()?, id.clone(), id, ActivationTarget::default()),
+    let (client, id, name, build) = match project {
+        Some(id) => (ctx.client()?, id.clone(), id, Default::default()),
         None => {
             // The build makes every place's images, an instance's copies
             // included, so a program starting an instance's copy later finds
             // its images there.
             let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
-            let target = handle.activation_target();
-            (handle.client, handle.id, handle.name, target)
+            let build = handle.built.named();
+            (handle.client, handle.id, handle.name, build)
         }
     };
-
-    // --reactivate-choice always wins. Otherwise a terminal is asked when
-    // the triggers being turned on kept work while they were off. With
-    // nobody to ask (JSON mode), no choice is sent, and the dispatcher
-    // refuses an activate over kept work that names none: never a silent
-    // default.
-    let reactivate_choice = if reactivate_choice_flag.is_some() {
-        reactivate_choice_flag
-    } else if ctx.json() {
-        None
-    } else {
-        prompt_reactivate_choice(&client, &id, &scope).await?
-    };
-
     let path = format!("/projects/{id}/activate");
-    let body = ActivateRequest {
-        target: ActivationTarget { reactivate_choice, ..target },
-        running: running_choice(running_policy, drain_timeout),
-        scope,
-        port,
-    };
-    // The one line that says the call may now sit for a while (only
-    // under a wait), so a quiet terminal is a wait and not a hang.
-    progress.drain_wait(running_policy, drain_timeout);
+    let body = ActivateRequest { build, scope, held, port };
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
     let answer: ActivateResponse = serde_json::from_value(client.post_json(&path, &serde_json::to_value(&body)?).await?)
@@ -111,26 +64,45 @@ async fn run_inner(
     if let Some(note) = &answer.infra_not_running {
         progress.warn(note);
     }
-    let left_out = answer.per_instance_left_out;
-    if let Some(note) = left_out_note(&left_out, ctx.on()) {
+    let left_out = &answer.per_instance_left_out;
+    if let Some(note) = left_out_note(left_out, ctx.on()) {
         progress.warn(&note);
     }
+    let did = what_it_did(&answer);
     let summary = match &answer.address {
-        Some(weft_core::projects::ProjectAddress::Serving { url }) => format!("activated {name} ({id}); its routes answer at {url}"),
+        Some(weft_core::projects::ProjectAddress::Serving { url }) => format!("{name} ({id}): {did}; its routes answer at {url}"),
         // A port the person asked for, checked free before activating,
         // that another program took as the project activated fails the
         // command, like any server refused its port.
         Some(weft_core::projects::ProjectAddress::Unavailable { why }) if port.is_some() => {
-            anyhow::bail!("activated {name} ({id}), and its own address could not open: {why}")
+            anyhow::bail!("{name} ({id}): {did}, and its own address could not open: {why}")
         }
         Some(weft_core::projects::ProjectAddress::Unavailable { why }) => {
             progress.warn(&format!("the project's own address is unavailable: {why}"));
-            format!("activated {name} ({id})")
+            format!("{name} ({id}): {did}")
         }
-        None => format!("activated {name} ({id})"),
+        None => format!("{name} ({id}): {did}"),
     };
-    progress.complete_with(&summary, serde_json::json!({ "perInstanceLeftOut": left_out, "address": answer.address }));
+    super::ensure::warn_broken(progress, &answer.broken);
+    progress.complete_with(&summary, serde_json::to_value(&answer)?);
     Ok(())
+}
+
+/// What an activate did, as a person reads it: which triggers it turned
+/// on (or that every one was on already), and what became of what they
+/// held.
+fn what_it_did(answer: &ActivateResponse) -> String {
+    if answer.turned_on.is_empty() {
+        return "every trigger it names is on already; nothing to turn on".into();
+    }
+    let held = match &answer.held {
+        Some(released) if !released.held.is_empty() => match released.release {
+            ReleaseHeld::Run => format!("; {} released, at half each trigger's limits", released.held.describe()),
+            ReleaseHeld::Drop => format!("; {} dropped", released.held.describe()),
+        },
+        _ => String::new(),
+    };
+    format!("turned on {}{held}", weft_core::activation::OwnerTriggers::list_words(&answer.turned_on))
 }
 
 /// What a person is told about the per-instance triggers a plain activate
@@ -148,61 +120,28 @@ fn left_out_note(left_out: &[String], on: Option<&str>) -> Option<String> {
     ))
 }
 
-/// What the triggers `scope` names kept while they were off, as the
-/// dispatcher counts it for that scope (`/status` asked about it): the
-/// parked fires and the runs waiting on a person that a reactivate's choice
-/// decides about. `None` when they kept nothing. A status that cannot be
-/// read is an error: guessing "nothing kept" would skip the question.
-async fn fetch_preserved_state(
-    client: &crate::client::DispatcherClient,
-    id: &str,
-    scope: &weft_core::activation::ActivationScope,
-) -> anyhow::Result<Option<(usize, usize)>> {
-    let query = weft_core::projects::StatusQuery::for_scope(scope).to_query_string();
-    let path = format!("/projects/{id}/status{query}");
-    let resp: weft_core::projects::ProjectStatusResponse = serde_json::from_value(
-        client
-            .get_json(&path)
-            .await
-            .context("read the project's status to see what the triggers kept while they were off")?,
-    )
-    .with_context(|| {
-        format!(
-            "the dispatcher's status for {id} does not read as this CLI expects; upgrade the \
-             dispatcher or this CLI so the versions match"
-        )
-    })?;
-    let weft_core::projects::PreservationCounts { parked, suspended } = resp.preservation;
-    if parked == 0 && suspended == 0 {
-        return Ok(None);
-    }
-    Ok(Some((parked, suspended)))
-}
+#[cfg(test)]
+mod tests {
+    use weft_core::activation::{ActivateResponse, HeldReleased, OwnerTriggers};
+    use weft_core::instance::{InstanceId, Owner};
+    use weft_core::projects::HeldWork;
+    use weft_core::ReleaseHeld;
 
-/// TTY mode: when the triggers being turned on kept work while they were
-/// off, ask what to do with it; `None` when they kept nothing.
-async fn prompt_reactivate_choice(
-    client: &crate::client::DispatcherClient,
-    id: &str,
-    scope: &weft_core::activation::ActivationScope,
-) -> anyhow::Result<Option<ReactivateChoice>> {
-    let Some((parked, suspended)) = fetch_preserved_state(client, id, scope).await? else {
-        return Ok(None);
-    };
-    println!("Kept while these triggers were off:");
-    println!("  - {parked} event(s) that arrived meanwhile, answers people sent to waiting runs included");
-    println!("  - {suspended} run(s) waiting on a person");
-    println!();
-    println!("Choose:");
-    println!("  1) execute_parked_keep_suspended  run the kept events and answers; waiting runs keep waiting");
-    println!("  2) keep_suspended_only            drop the kept events, answers people sent included; waiting runs keep waiting");
-    println!("  3) wipe_all                       drop everything and cancel the runs these triggers started: a fresh start");
-    let line = crate::prompt::prompt_line("> ", "--reactivate-choice <choice>")?;
-    let choice = match line.as_str() {
-        "1" => ReactivateChoice::ExecuteParkedKeepSuspended,
-        "2" => ReactivateChoice::KeepSuspendedOnly,
-        "3" => ReactivateChoice::WipeAll,
-        named => named.parse().map_err(|_| anyhow::anyhow!("invalid reactivate choice '{line}'; expected 1, 2, or 3"))?,
-    };
-    Ok(Some(choice))
+    /// An activate says what it turned on, whose, and what became of what
+    /// they held; with nothing off it says so, which is no error.
+    #[test]
+    fn an_activate_says_what_it_turned_on_and_what_it_released() {
+        assert_eq!(super::what_it_did(&ActivateResponse::default()), "every trigger it names is on already; nothing to turn on");
+        let answer = ActivateResponse {
+            turned_on: vec![
+                OwnerTriggers { owner: Owner::Shared, triggers: vec!["door".into()] },
+                OwnerTriggers { owner: Owner::Instance(InstanceId::new("ada").unwrap()), triggers: vec!["inbox".into()] },
+            ],
+            held: Some(HeldReleased { held: HeldWork { arrivals: 3, paused: 0 }, release: ReleaseHeld::Run }),
+            ..Default::default()
+        };
+        let said = super::what_it_did(&answer);
+        assert!(said.starts_with("turned on 'door'; 'inbox' of instance 'ada'; "), "{said}");
+        assert!(said.ends_with("released, at half each trigger's limits"), "{said}");
+    }
 }

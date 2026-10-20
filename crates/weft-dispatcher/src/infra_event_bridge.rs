@@ -57,15 +57,12 @@ async fn publish(state: &DispatcherState, payload: &str) -> anyhow::Result<()> {
 }
 
 /// Pure mapping from a fetched `infra_event` row to the
-/// `DispatcherEvent` variant the SSE bus carries. Some kinds
-/// (Notify) don't translate into a typed dispatcher event today;
-/// the bridge drops those.
+/// `DispatcherEvent` variant the SSE bus carries.
 pub(crate) fn to_dispatcher_event(
     ev: &crate::infra_event::InfraEventRow,
 ) -> Option<DispatcherEvent> {
     let pid = ev.project_id;
-    // Status-change kinds all need a node_id. Project-wide kinds
-    // (ProtocolConfigError) don't. The pattern-match drives both.
+    // Every kind is about one node, so each needs a node_id.
     match &ev.event {
         InfraEvent::Flaky(p) => Some(DispatcherEvent::InfraFlaky {
             project_id: pid,
@@ -95,14 +92,6 @@ pub(crate) fn to_dispatcher_event(
         InfraEvent::Terminated => Some(DispatcherEvent::InfraTerminated {
             project_id: pid,
             node_id: require_node_id(ev)?,
-        }),
-        InfraEvent::Notify(_) => None,
-        InfraEvent::ProtocolConfigError(p) => Some(DispatcherEvent::InfraConfigError {
-            project_id: pid,
-            // User-string field: cap before NOTIFY fan-out so a
-            // multi-kB serde error from a deeply-nested protocol
-            // config can't blow the 7800-byte channel cap.
-            error: weft_core::truncate_user_string(&p.error, 4096),
         }),
     }
 }
@@ -135,9 +124,7 @@ fn require_node_id(ev: &crate::infra_event::InfraEventRow) -> Option<String> {
 mod tests {
     use super::*;
     use crate::infra_event::InfraEventRow;
-    use weft_broker_client::protocol::{
-        FailedPayload, FlakyPayload, NotifyPayload, ProtocolConfigErrorPayload, StartedPayload,
-    };
+    use weft_broker_client::protocol::{FailedPayload, FlakyPayload, StartedPayload};
 
     fn row(event: InfraEvent, node_id: Option<&str>) -> InfraEventRow {
         InfraEventRow {
@@ -225,36 +212,8 @@ mod tests {
     }
 
     #[test]
-    fn notify_does_not_map() {
-        let r = row(
-            InfraEvent::Notify(NotifyPayload {
-                protocol: "p".into(),
-                channel: "ops".into(),
-            }),
-            Some("n1"),
-        );
-        assert!(to_dispatcher_event(&r).is_none());
-    }
-
-    #[test]
     fn missing_node_id_skips_publish() {
         let r = row(InfraEvent::Stopped, None);
         assert!(to_dispatcher_event(&r).is_none());
-    }
-
-    #[test]
-    fn protocol_config_error_maps_to_config_error_event() {
-        let r = row(
-            InfraEvent::ProtocolConfigError(ProtocolConfigErrorPayload {
-                error: "bad json: expected ',' at line 4".into(),
-            }),
-            None,
-        );
-        match to_dispatcher_event(&r).unwrap() {
-            DispatcherEvent::InfraConfigError { error, .. } => {
-                assert!(error.contains("expected ','"));
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
     }
 }

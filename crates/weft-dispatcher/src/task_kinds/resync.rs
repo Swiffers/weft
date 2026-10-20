@@ -1,8 +1,12 @@
 //! `resync` task: one resync's take-down and bring-back, carried out
 //! apart from the request that asked for it.
 //!
-//! `weft resync` takes a project's triggers that are on down with the
-//! person's choice and brings them back on the registered build. Between
+//! `weft resync` takes a project's triggers that are on and behind the
+//! registered build down with the person's answers, lets the runs going
+//! on the old version finish (or cancels them, `--running cancel`), and
+//! only then brings them back on the new one, so nothing on the old
+//! version is cut off when the new one takes over (locally, takes the
+//! project's port from the old worker). Between
 //! the two halves those triggers are off, so the work must not stop
 //! halfway whatever happens to the request (its caller goes away, a
 //! process restarts) or to one step (a database blip, a worker that could
@@ -13,10 +17,14 @@
 //! task in one transaction, and follows the task to its end
 //! (`crate::api::project::resync`).
 //!
-//! The task drives the resync owner by owner
-//! (`crate::api::project::resync_owner`). It writes down which triggers
-//! it takes down before it takes them down, brings back exactly those, and
-//! writes each owner it brought back into the plan, so a task run again
+//! The task takes every owner's triggers down
+//! (`crate::api::project::resync_take_down_owner`), waits for the old
+//! version ([`let_the_old_version_finish`]), then brings them back owner
+//! by owner (`crate::api::project::resync_bring_back_owner`). It writes
+//! down which triggers it takes down, and the builds they fired, before it
+//! takes them down, brings back exactly those, writes down that the old
+//! version is done (`switching`), and writes each owner it brought back
+//! into the plan, so a task run again
 //! (its process died, the claim lapsed and another claimed it) carries on
 //! where the last stopped, and a trigger that was off, or that went down
 //! some other way meanwhile, is never turned on by it. While a
@@ -68,9 +76,8 @@ pub struct ResyncPlan {
     pub driver: uuid::Uuid,
     /// Whose triggers, one owner each, in the order they are resynced.
     pub owners: Vec<ResyncOwner>,
-    /// The person's answer for taking them down, whose running-work part
-    /// also governs the worker replacement as they come back.
-    pub spec: weft_broker_client::protocol::DeactivateSpec,
+    /// How they go down for the swap.
+    pub take_down: weft_core::take_down::TakeDown,
     /// The build it brings live, as the person named it.
     pub build: weft_core::builds::BuildHashes,
     /// The owners brought back so far, the first of `owners` in order.
@@ -79,6 +86,36 @@ pub struct ResyncPlan {
     /// The addresses their reactivations answer on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<weft_core::activation::ActivationUrl>,
+    /// What its take-downs found held on the triggers, kept or dropped.
+    #[serde(default)]
+    pub held: weft_core::projects::HeldWork,
+    /// The builds the triggers it takes down fired, other than the new
+    /// one: the old version, whose runs going it waits for (or cancels)
+    /// before the new one takes over. Written with the triggers, before
+    /// they come down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub old_builds: Vec<String>,
+    /// The entry tokens of the triggers it takes down, read before they
+    /// come down: what the wait for the runs they fired counts at the
+    /// workers' door (`crate::drain::Reaching::Fired`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub old_tokens: Vec<String>,
+    /// Every owner is down and the old version has nothing left running:
+    /// what is left is bringing them back.
+    #[serde(default)]
+    pub switching: bool,
+    /// Runs going on the old version when every owner was down (fired by
+    /// the triggers it took down, or on `old_builds`): waited for, or
+    /// cancelled.
+    #[serde(default)]
+    pub runs: u64,
+    /// The paused runs it moved onto the new build.
+    #[serde(default)]
+    pub moved_runs: u64,
+    /// The triggers it was asked about that were off, which it never
+    /// turns on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off: Vec<OwnerTriggers>,
     /// Why it stopped, once its tries ran out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
@@ -121,11 +158,7 @@ impl GivenUp {
                 let kept: Vec<String> = owner
                     .triggers
                     .iter()
-                    .filter(|trigger| {
-                        ActivationScope { triggers: vec![(*trigger).clone()], instance: owner.owner.instance().cloned() }
-                            .resolve(project)
-                            .is_ok()
-                    })
+                    .filter(|trigger| ActivationScope::of_owner(vec![(*trigger).clone()], &owner.owner).resolve(project, &[]).is_ok())
                     .cloned()
                     .collect();
                 (!kept.is_empty()).then(|| OwnerTriggers { owner: owner.owner.clone(), triggers: kept })
@@ -138,8 +171,8 @@ impl GivenUp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResyncOwner {
     pub owner: Owner,
-    /// Its triggers that were on when the resync began: the only ones it
-    /// takes down.
+    /// Its triggers that were on and behind when the resync began: the
+    /// only ones it takes down.
     pub on: Vec<String>,
     /// The ones of `on` it took down, written down before it takes them
     /// down: the ones it brings back.
@@ -155,7 +188,7 @@ impl ResyncOwner {
 
     /// The scope naming `triggers` of this owner.
     pub fn scope(&self, triggers: &[String]) -> ActivationScope {
-        ActivationScope { triggers: triggers.to_vec(), instance: self.owner.instance().cloned() }
+        ActivationScope::of_owner(triggers.to_vec(), &self.owner)
     }
 }
 
@@ -166,8 +199,10 @@ impl ResyncPlan {
     }
 
     /// What its task answers once every owner is back.
-    fn answer(self) -> weft_core::activation::ResyncResponse {
-        weft_core::activation::ResyncResponse { urls: self.urls, resynced: self.resynced }
+    fn answer(self) -> weft_core::deactivation::ResyncResponse {
+        let keys: Vec<ActivationKey> = self.owners.iter().flat_map(|owner| owner.keys(&owner.down)).collect();
+        let report = crate::take_down::Taken { keys, held: self.held, runs: self.runs, commands: Vec::new(), tokens: Vec::new() }.report(self.take_down);
+        weft_core::deactivation::ResyncResponse { report, urls: self.urls, resynced: self.resynced, moved_runs: self.moved_runs, off: self.off }
     }
 }
 
@@ -265,7 +300,7 @@ impl TaskExecutor<DispatcherState> for ResyncExecutor {
 }
 
 /// Why a resync did not finish ([`advance`], one owner's
-/// `crate::api::project::resync_owner`).
+/// `crate::api::project::resync_take_down_owner`, `resync_bring_back_owner`).
 pub(crate) enum Halt {
     /// A person gave it up, or took it up again under another drive: this
     /// drive's plan is gone.
@@ -306,29 +341,45 @@ fn internal(what: &'static str) -> impl Fn(anyhow::Error) -> Halt {
 /// into the plan as it comes back, then end the resync, which lands the
 /// transition at rest. A drive that ended already (its task is run again
 /// after its end) answers as it ended.
-async fn advance(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) -> Result<weft_core::activation::ResyncResponse, Halt> {
+async fn advance(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) -> Result<weft_core::deactivation::ResyncResponse, Halt> {
     let (mut plan, under_way) = state.projects.drive(id, driver).await.map_err(internal("read the resync"))?.ok_or(Halt::Given)?;
     if !under_way {
         return Ok(plan.answer());
     }
     let several = plan.owners.len() > 1;
-    while plan.resynced.len() < plan.owners.len() {
-        let owner = plan.owners[plan.resynced.len()].owner.clone();
-        let back = crate::api::project::resync_owner(state, id, &mut plan).await.map_err(|halt| match halt {
-            Halt::Failed(failure) if several => {
-                let done = if plan.resynced.is_empty() {
-                    "none resynced before it".to_string()
-                } else {
-                    let whose: Vec<String> = plan.resynced.iter().map(weft_core::deactivation::whose_triggers).collect();
-                    format!("already resynced: {}", whose.join(", "))
-                };
-                let error = format!("resyncing {}: {} ({done})", weft_core::deactivation::whose_triggers(&owner), failure.error);
-                Halt::Failed(Failure { error, ..failure })
+    let in_context = |plan: &ResyncPlan, at: usize, halt: Halt| match halt {
+        Halt::Failed(failure) if several => {
+            let done = if plan.resynced.is_empty() {
+                "none resynced before it".to_string()
+            } else {
+                let whose: Vec<String> = plan.resynced.iter().map(weft_core::deactivation::whose_triggers).collect();
+                format!("already resynced: {}", whose.join(", "))
+            };
+            let error = format!("resyncing {}: {} ({done})", weft_core::deactivation::whose_triggers(&plan.owners[at].owner), failure.error);
+            Halt::Failed(Failure { error, ..failure })
+        }
+        halt => halt,
+    };
+    if !plan.switching {
+        for at in plan.resynced.len()..plan.owners.len() {
+            if let Err(halt) = crate::api::project::resync_take_down_owner(state, id, &mut plan, at).await {
+                return Err(in_context(&plan, at, halt));
             }
-            halt => halt,
-        })?;
+        }
+        let_the_old_version_finish(state, id, &mut plan).await?;
+        plan.switching = true;
+        if !state.projects.write_resync(id, &plan).await.map_err(internal("write down that the old version is done"))? {
+            return Err(Halt::Given);
+        }
+    }
+    while plan.resynced.len() < plan.owners.len() {
+        let at = plan.resynced.len();
+        let back = match crate::api::project::resync_bring_back_owner(state, id, &plan, at).await {
+            Ok(back) => back,
+            Err(halt) => return Err(in_context(&plan, at, halt)),
+        };
         plan.urls.extend(back);
-        plan.resynced.push(owner);
+        plan.resynced.push(plan.owners[at].owner.clone());
         if !state.projects.write_resync(id, &plan).await.map_err(internal("write down the owners resynced"))? {
             return Err(Halt::Given);
         }
@@ -349,7 +400,103 @@ async fn advance(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) ->
              the next change of a copy tries again, or `weft activate` switches them on"
         );
     }
+    // Triggers the health check took down may have been held back from
+    // coming on by the routes' one binary (`TriggerCopy::held_back`), which
+    // this resync just made one again: the supervisor looks once more, so
+    // their health rules bring them back now rather than after their
+    // backoff, or after a person asks.
+    if let Err(e) = look_again_for_health_downs(state, id).await {
+        tracing::error!(
+            target: "weft_dispatcher::resync",
+            project_id = %id,
+            error = %format!("{e:#}"),
+            "the resync ended, but asking the supervisor to look again at the triggers the health check took down failed; \
+             `weft infra look` asks again"
+        );
+    }
     Ok(plan.answer())
+}
+
+/// Ask the supervisor to look at project `id` again when a trigger the
+/// health check took down is still down.
+async fn look_again_for_health_downs(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
+    let health_down = state.activations.list(id).await?.iter().any(|a| {
+        a.lifecycle.status == crate::activation_store::ProjectStatus::Inactive
+            && a.lifecycle.went_down == Some(weft_broker_client::activation::WentDown::Health)
+    });
+    if health_down {
+        crate::infra_lifecycle_command::person_asks_for_look(&state.pg_pool, id).await?;
+    }
+    Ok(())
+}
+
+/// The runs going on the old version, once every owner is down so nothing
+/// new is born on it: the ones the triggers it took down fired (their cut
+/// moved, maybe their code too), and every one on the builds those
+/// triggers fired (`plan.old_builds`: the workers the new version takes
+/// over from, locally the one holding the project's port). Cancelled
+/// under `running: cancel`, then waited for, however long that takes, so
+/// the new version takes over only once the old one has nothing left
+/// running (`crate::drain`). A run paused on a wait is not going; one that
+/// resumes meanwhile is waited for too. `weft stop <run>` ends one now;
+/// `weft cancel-activate` gives the resync up, which ends this wait at
+/// once ([`given_up`]).
+async fn let_the_old_version_finish(state: &DispatcherState, id: uuid::Uuid, plan: &mut ResyncPlan) -> Result<(), Halt> {
+    let keys: Vec<ActivationKey> = plan.owners.iter().flat_map(|owner| owner.keys(&owner.down)).collect();
+    let target = crate::take_down::TakeDownTarget::Activations(keys.clone());
+    let live = crate::take_down::live_runs(state, id).await.map_err(internal("the runs going"))?;
+    let mut going: Vec<weft_core::RunId> =
+        crate::take_down::affected_runs(&target, &live, None).into_iter().filter(|run| !run.suspended).map(|run| run.run_id).collect();
+    if !plan.old_builds.is_empty() {
+        going.extend(crate::drain::going_on_builds(state, id, &plan.old_builds).await.map_err(internal("the runs on the old version"))?);
+    }
+    going.sort();
+    going.dedup();
+    plan.runs = plan.runs.max(going.len() as u64);
+    if !state.projects.write_resync(id, plan).await.map_err(internal("write down the runs on the old version"))? {
+        return Err(Halt::Given);
+    }
+    if plan.take_down.running == weft_core::take_down::Running::Cancel {
+        let user = weft_core::run::CancelCause::User;
+        let cancelled: Vec<(weft_core::RunId, &weft_core::run::CancelCause)> = going.iter().map(|run| (*run, &user)).collect();
+        crate::api::run::cancel_run_ids(state, &cancelled).await.map_err(internal("cancel the runs on the old version"))?;
+    }
+    let fired = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::Fired { keys: &keys, tokens: &plan.old_tokens } };
+    let builds = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::Builds(&plan.old_builds) };
+    let finished = async {
+        crate::drain::drain(state, &fired, None).await?;
+        if !plan.old_builds.is_empty() {
+            crate::drain::drain(state, &builds, None).await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        finished = finished => finished.map_err(internal("wait for the runs on the old version")),
+        given = given_up(state, id, plan.driver) => match given {
+            Ok(()) => Err(Halt::Given),
+            Err(e) => Err(internal("follow the resync while it waits")(e)),
+        },
+    }
+}
+
+/// Where a resync given up is announced (`weft cancel-activate`,
+/// `crate::project_store::ProjectStoreOps::give_up_resync`), the project's
+/// id as payload: what ends the wait of the drive it gave up, on whichever
+/// dispatcher it runs.
+pub const RESYNC_GIVEN_UP_CHANNEL: &str = "weft_resync_given_up";
+
+/// Return once `driver`'s drive of `id`'s resync is over (given up, or
+/// taken up again under another drive): looked at now, and again each
+/// time a resync of the project is given up.
+async fn given_up(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) -> Result<()> {
+    let mut heard = state.signals.subscribe();
+    let project = id.to_string();
+    loop {
+        if !matches!(state.projects.drive(id, driver).await?, Some((_, true))) {
+            return Ok(());
+        }
+        heard.woken(|channel, payload| channel == RESYNC_GIVEN_UP_CHANNEL && payload == project).await?;
+    }
 }
 
 /// Write down why the resync stopped, for `weft status` and the request
@@ -455,10 +602,17 @@ mod tests {
                 ResyncOwner { owner: Owner::Shared, on: vec!["feed".into(), "door".into()], down: vec!["feed".into(), "door".into()] },
                 ResyncOwner { owner: ada, on: vec!["feed".into()], down: Vec::new() },
             ],
-            spec: serde_json::from_value(serde_json::json!({ "mode": "park", "runningPolicy": "cancel" })).unwrap(),
+            take_down: weft_core::take_down::TakeDown::DEFAULT,
             build: Default::default(),
             resynced: Vec::new(),
             urls: Vec::new(),
+            held: Default::default(),
+            old_builds: Vec::new(),
+            old_tokens: Vec::new(),
+            switching: false,
+            runs: 0,
+            moved_runs: 0,
+            off: Vec::new(),
             stopped: None,
             given_up: None,
         }
@@ -497,8 +651,9 @@ mod tests {
             lifecycle,
             program: None,
             source_version: None,
+            cut: None,
         };
-        let rows = [row("feed", ActivationLifecycle::active()), row("door", ActivationLifecycle::parked())];
+        let rows = [row("feed", ActivationLifecycle::active()), row("door", ActivationLifecycle::holding())];
         assert_eq!(left_down(&plan, &rows), [OwnerTriggers { owner: Owner::Shared, triggers: vec!["door".into()] }]);
         let rows = [row("feed", ActivationLifecycle::active()), row("door", ActivationLifecycle::active())];
         assert!(left_down(&plan, &rows).is_empty(), "ada's feed was never taken down");

@@ -1,0 +1,27 @@
+# Two routes through Echo, a node of this project (nodes/echo/). The test
+# turns `front` on, changes Echo's code, and turns `back` on: one binary
+# answers a project's routes, so that is refused until `weft resync --all`
+# moves `front` to the new build.
+#
+#   POST front   answers {"heard": <text, as Echo says it>}
+#   POST back    the same
+
+front = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/front", method: "POST" }
+front_echo = Echo
+front_echo.text = front.body.text
+front_body = ExecPython(text: String) -> (body: JsonDict) {
+  code: "return {'body': {'heard': text}}"
+}
+front_body.text = front_echo.text
+front_answer = Reply
+front_answer.body = front_body.body
+
+back = Route -> (body: { text?: String, .. }) { path: "__E2E_PATH__/back", method: "POST" }
+back_echo = Echo
+back_echo.text = back.body.text
+back_body = ExecPython(text: String) -> (body: JsonDict) {
+  code: "return {'body': {'heard': text}}"
+}
+back_body.text = back_echo.text
+back_answer = Reply
+back_answer.body = back_body.body

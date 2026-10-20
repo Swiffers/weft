@@ -27,7 +27,7 @@
 //!
 //! The hash-diff-upload core is [`publish_hashed`], and it is not only
 //! the asset sync's: a version snapshot (`weft checkpoint`, every `weft
-//! run`) publishes the project's files through [`publish_files`] into
+//! run`) publishes the project's files through it into
 //! the same content-addressed plane, so a file identical to one any
 //! version of any of the tenant's projects held costs nothing to record
 //! again, and neither does the standard library the install preloads.
@@ -173,6 +173,14 @@ pub struct Published {
     pub key: String,
 }
 
+/// The media type the store records for a file at `path` whose first
+/// bytes are `head` ([`hash_reader_peeking`]): named from the bytes, the
+/// filename when they carry no signature. The one rule every publisher of
+/// a project's files names a type by.
+pub fn media_type(head: &[u8], path: &str) -> String {
+    weft_core::storage::sniff_mime(head).unwrap_or_else(|| weft_core::storage::mime_from_filename(path)).to_string()
+}
+
 /// Hash every file in `paths` through `source`, naming each one's media
 /// type from its first bytes (the filename when the bytes carry no
 /// signature). Every path that cannot be read is collected and reported
@@ -184,9 +192,7 @@ pub fn hash_files(paths: &[String], source: &dyn AssetSource) -> Result<Vec<Hash
     for path in paths {
         match source.open(path).and_then(hash_reader_peeking) {
             Ok((hash, size, head)) => {
-                let mime = weft_core::storage::sniff_mime(&head)
-                    .unwrap_or_else(|| weft_core::storage::mime_from_filename(path));
-                hashed.push(HashedFile { path: path.clone(), hash, size, mime: mime.to_string() });
+                hashed.push(HashedFile { path: path.clone(), hash, size, mime: media_type(&head, path) });
             }
             Err(e) => broken.push(format!("  {path}: {e:#}")),
         }
@@ -332,8 +338,7 @@ pub async fn sync_assets(
                         use weft_core::weft_type::FileKind;
                         let mime = match weft_core::storage::sniff_mime(&head) {
                             Some(sniffed) if kind != FileKind::Blob && FileKind::from_mime(sniffed) != kind => received,
-                            Some(sniffed) => sniffed.to_string(),
-                            None => weft_core::storage::mime_from_filename(&r.path).to_string(),
+                            _ => media_type(&head, &r.path),
                         };
                         hashed.push((
                             r,

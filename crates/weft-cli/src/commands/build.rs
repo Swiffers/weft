@@ -29,6 +29,7 @@ pub async fn run(ctx: Ctx, node_set: weft_core::builds::NodeSet) -> Result<()> {
         // point in a folder's history rather than something a build has
         // an opinion about.
         let handle = super::ensure::ensure_registered(&inner, &progress, node_set).await?;
+        handle.warn_broken(&progress);
         progress.complete(&format!(
             "{} ({}) on worker image {}",
             handle.name,

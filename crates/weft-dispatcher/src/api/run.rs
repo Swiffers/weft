@@ -756,7 +756,7 @@ pub async fn clean(
 
 /// Delete every run `filter` reaches, in `project` (or every project of
 /// `tenant`). A run still going is never deleted from under itself:
-/// `cancel` stops it (its rows go with the next clean), `wait` leaves it
+/// `cancel` stops it (its rows go with the next clean), `leave` leaves it
 /// running. `asked_by` is never touched: a program cleaning runs is not
 /// among them. Each deleted project's bare versions are swept as its runs
 /// go, the way `weft clean <run_id>` sweeps them.
@@ -765,10 +765,11 @@ pub(crate) async fn clean_runs(
     tenant: &crate::tenant::TenantId,
     project: Option<uuid::Uuid>,
     filter: &weft_core::program::RunFilter,
-    running: weft_core::running_policy::RunningPolicy,
+    running: weft_core::program::StillGoing,
     asked_by: Option<RunId>,
 ) -> Result<weft_core::program::CleanOutcome, (StatusCode, String)> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
+    let cancel_going = running == weft_core::program::StillGoing::Cancel;
     let query = run_query(project, filter, MAX_PAGE, crate::lease::now_unix() as u64);
     let mut outcome = weft_core::program::CleanOutcome::default();
     // The pages walk back in time from a bound fixed now (a run that
@@ -796,14 +797,13 @@ pub(crate) async fn clean_runs(
                 continue;
             }
             if run.status == weft_core::program::RunStatus::Running {
-                match running {
-                    weft_core::running_policy::RunningPolicy::Cancel => {
-                        cancel_run_id(state, run.run_id, &weft_core::run::CancelCause::User)
-                            .await
-                            .map_err(|e| internal("cancel", e))?;
-                        outcome.cancelled += 1;
-                    }
-                    weft_core::running_policy::RunningPolicy::Wait => outcome.left_running += 1,
+                if cancel_going {
+                    cancel_run_id(state, run.run_id, &weft_core::run::CancelCause::User)
+                        .await
+                        .map_err(|e| internal("cancel", e))?;
+                    outcome.cancelled += 1;
+                } else {
+                    outcome.left_running += 1;
                 }
                 continue;
             }

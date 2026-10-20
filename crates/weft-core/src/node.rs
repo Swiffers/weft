@@ -27,7 +27,8 @@ mod node_trait {
     use crate::infra::{InfraProvisionContext, InfraSpec};
 
     /// The core trait every node implements. Stdlib nodes in `catalog/`
-    /// and user-defined nodes under `myproject/nodes/` both implement this.
+    /// and a project's own nodes (under its `nodes/`, or beside its code
+    /// under `src/`) all implement this.
     /// The identity/surface layer comes from the [`NodeManifest`]
     /// supertrait (usually `#[derive(NodeManifest)]` on the node struct,
     /// which picks up the co-located `metadata.json`).
@@ -127,6 +128,13 @@ pub struct Diagnostic {
     /// source itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// The nodes and groups the finding is about, by id: one for a node or
+    /// a group, the two ends for a wire. An error with subjects breaks only
+    /// those parts of the program ([`crate::project::Broken`]), and a
+    /// command whose cut does not need them goes on; an error with none is
+    /// about the program as a whole and stops every command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
 }
 
 impl Diagnostic {
@@ -143,11 +151,18 @@ impl Diagnostic {
             message: message.into(),
             code: Some(code.into()),
             file: None,
+            subjects: Vec::new(),
         }
     }
 
     pub fn in_file(mut self, file: Option<&str>) -> Self {
         self.file = file.map(str::to_string);
+        self
+    }
+
+    /// The parts this finding is about ([`Self::subjects`]).
+    pub fn about<S: Into<String>>(mut self, subjects: impl IntoIterator<Item = S>) -> Self {
+        self.subjects = subjects.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -3106,6 +3121,14 @@ pub trait NodeCatalog: Send + Sync {
     /// reference.
     fn lookup(&self, node_type: &str) -> Option<&'static dyn Node>;
     fn all(&self) -> Vec<&'static str>;
+    /// The node packages this binary's build left out because they did
+    /// not compile (`crate::builds::LeftOut`, the build's own record): a
+    /// program naming one of their types has no implementation here, and
+    /// a run whose cut uses one is refused. Empty for a binary built whole.
+    fn left_out(&self) -> &'static crate::builds::LeftOut {
+        static NOTHING: crate::builds::LeftOut = crate::builds::LeftOut { packages: Vec::new() };
+        &NOTHING
+    }
 }
 
 // NAMING CONVENTION (the three stages a graph concept lives through):

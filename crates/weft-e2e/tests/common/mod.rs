@@ -174,6 +174,54 @@ pub async fn fire_until_run(
     Err(last_err.unwrap().context("no run started after repeated trigger pushes"))
 }
 
+/// The project's runs a trigger's fire (or a run by hand) started, setup
+/// runs left out: an activate starts a setup run of its own, so a test
+/// that activates between its snapshot and its check compares these.
+pub async fn fire_runs(disp: &Dispatcher, pid: &Uuid) -> anyhow::Result<std::collections::HashSet<Uuid>> {
+    let page: weft_core::program::RunPage = disp.get_json(&format!("/runs?project_id={pid}&limit=200")).await?;
+    Ok(page.runs.into_iter().filter(|run| run.phase == weft_core::primitive::Phase::Fire).map(|run| run.run_id).collect())
+}
+
+/// Wait for exactly one fire run not in `before` ([`fire_runs`]), and
+/// return it. A second one is a run nothing asked for, and fails.
+pub async fn wait_for_one_new_fire(
+    disp: &Dispatcher,
+    pid: &Uuid,
+    before: &std::collections::HashSet<Uuid>,
+) -> anyhow::Result<Uuid> {
+    weft_e2e::poll_until("one new fire run", run::RUN_SETTLE_DEADLINE, Duration::from_millis(500), || async {
+        let new: Vec<Uuid> = fire_runs(disp, pid).await?.difference(before).copied().collect();
+        anyhow::ensure!(new.len() <= 1, "one event, one run; found {}: {new:?}", new.len());
+        Ok(new.first().copied())
+    })
+    .await
+}
+
+/// Push `event` on the SSE feed while `trigger` (a shared one) is down
+/// with a door that holds, and wait until its activation holds it as one
+/// arrival. Pushed again only when the first push held nothing in a whole
+/// minute (lost on a reconnect), the way [`fire_until_run`] does.
+pub async fn push_until_held(feed: &SseFake, disp: &Dispatcher, pid: &Uuid, event: &str, trigger: &str) -> anyhow::Result<()> {
+    let mut last_err = None;
+    for _ in 0..2 {
+        feed.wait_for_subscriber(Duration::from_secs(60)).await?;
+        feed.push_event(event, &json!({ "value": "go" }).to_string());
+        match weft_e2e::status::wait_until(disp, pid, "the event to be held", Duration::from_secs(60), |s| {
+            s.trigger_held(trigger, None).0 >= 1
+        })
+        .await
+        {
+            Ok(s) => {
+                let held = s.trigger_held(trigger, None).0;
+                anyhow::ensure!(held == 1, "one event pushed, {held} held");
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap().context("the trigger held nothing after repeated pushes"))
+}
+
 // ----- reading a `--json` command's NDJSON --------------------------------
 //
 // One definition of each, used by every version-tree suite. They were a

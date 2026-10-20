@@ -86,7 +86,7 @@ fn a_cut_from_one_call_to_the_next_holds_the_path_between_them() {
         at("@lib:clean.strip", &["one"]), at("@lib:clean.loud", &["one"]), at("@lib:clean.strip", &["two"]),
     ].into();
     assert_eq!(walked.runs, expected, "{:?}", walked.runs);
-    let program = cut::cut(&project, &walked, &mut Default::default());
+    let program = cut::cut(&project, &walked, &mut Default::default()).expect("a cut");
     let index = ProgramIndex::build(&program);
     assert!(index.admits("@lib:clean.loud", &call("one")) && !index.admits("@lib:clean.loud", &call("two")));
     assert!(index.admits("@lib:clean.strip", &call("two")));
@@ -100,7 +100,7 @@ fn a_cut_from_one_call_to_the_next_holds_the_path_between_them() {
     // Up to a node in the second call: everything the top feeds it through.
     let to = walk(&project, SelectionBounds { target: vec!["two.strip".into()], ..Default::default() }).unwrap();
     assert!(to.runs.contains(&at("src", &[])) && to.runs.contains(&at("@lib:clean.loud", &["one"])) && !to.runs.iter().any(|p| p.id == "@lib:clean.loud" && p.path == ["two"]));
-    let kicks = KickPlan::for_program(&cut::cut(&project, &to, &mut Default::default()), None, None);
+    let kicks = KickPlan::for_program(&cut::cut(&project, &to, &mut Default::default()).expect("a cut"), None, None);
     assert_eq!(kicks.iter().map(|kick| kick.node.as_str()).collect::<Vec<_>>(), vec!["src"]);
     // `--group one` runs the first call whole, spelled from main; the
     // loop `each` inside the file goes in with it.

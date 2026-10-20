@@ -530,7 +530,7 @@ fn require_declared_infra(
 /// machine's token names the copy it runs, so it asks only about that
 /// copy's project; a worker asks about its own, weft's own roles about
 /// any. Unlike a person's look (the dispatcher's `infra::look`), it
-/// records nothing: a health protocol that gave up is armed again by what
+/// records nothing: a health rule that gave up is armed again by what
 /// the look sees changing, never by the asking.
 pub async fn infra_look(
     State(state): State<Arc<BrokerState>>,
@@ -953,7 +953,7 @@ pub async fn supervisor_sync_ownership(
     Ok(Json(synced))
 }
 
-/// Replace a project's health protocol state, for the supervisor holding
+/// Replace a project's health rules' state, for the supervisor holding
 /// its lease (410 otherwise).
 pub async fn supervisor_set_health_state(
     State(state): State<Arc<BrokerState>>,
@@ -1031,7 +1031,7 @@ pub async fn supervisor_gone_copies(
                     .collect();
             req.copies
                 .iter()
-                .filter(|c| !rows.contains(&c.copy_id) && !declared.declares_copy(c))
+                .filter(|c| !rows.contains(&c.copy_id) && declared.gone_copy(c))
                 .map(|c| c.copy_id.clone())
                 .collect()
         }
@@ -1050,7 +1050,8 @@ pub async fn supervisor_infra_nodes(
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT node_id, instance_id, copy_id, status, applied_spec_hash, applied_at_unix, \
-                endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json \
+                endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, \
+                health_rules_json \
          FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
     )
     .bind(req.project_id)
@@ -1108,6 +1109,14 @@ pub async fn supervisor_infra_nodes(
             doors: column(&r, "doors_json", &node_id)?,
         };
         let keep_disks: Vec<String> = column(&r, "keep_disks_json", &node_id)?;
+        // NULL: the node wrote no rules (it runs the built-in ones).
+        let health_rules: Option<serde_json::Value> = r
+            .try_get("health_rules_json")
+            .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json: {e}")))?;
+        let health_rules = health_rules
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| internal(anyhow::anyhow!("infra_node.health_rules_json for node='{node_id}' does not decode: {e}")))?;
         let units_json: serde_json::Value = r
             .try_get("units_json")
             .map_err(|e| internal(anyhow::anyhow!("decode units_json: {e}")))?;
@@ -1127,34 +1136,23 @@ pub async fn supervisor_infra_nodes(
             addresses,
             keep_disks,
             units,
+            health_rules,
         });
     }
     Ok(Json(SupervisorInfraNodesResponse { nodes }))
 }
 
-pub async fn supervisor_health_protocols(
+/// Where each health rule of the project's copies stands.
+pub async fn supervisor_health_state(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorHealthProtocolsRequest>,
-) -> Resp<SupervisorHealthProtocolsResponse> {
+    Json(req): Json<SupervisorHealthStateRequest>,
+) -> Resp<SupervisorHealthStateResponse> {
     require_supervisor(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let id = req.project_id;
-    use sqlx::Row;
-    let row = sqlx::query("SELECT health_protocols_json FROM project WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let protocols = match row {
-        None => None,
-        Some(r) => r
-            .try_get::<Option<serde_json::Value>, _>("health_protocols_json")
-            .map_err(|e| internal(anyhow::anyhow!("decode health_protocols_json: {e}")))?,
-    };
-    let state = crate::lifecycle_writes::health_state(&state.pool, id).await.map_err(internal)?;
-    Ok(Json(SupervisorHealthProtocolsResponse { protocols, state }))
+    let rules = crate::lifecycle_writes::health_state(&state.pool, req.project_id).await.map_err(internal)?;
+    Ok(Json(SupervisorHealthStateResponse { rules }))
 }
 
 pub async fn supervisor_claim_command(
@@ -1359,6 +1357,7 @@ async fn write_apply_row(
     instance: Option<&weft_core::instance::InstanceId>,
     copy_id: &str,
     keep_disks: &[String],
+    health_rules: Option<&[weft_core::infra::health::HealthRule]>,
     units_json: serde_json::Value,
     command_id: i64,
     owner: &str,
@@ -1368,6 +1367,7 @@ async fn write_apply_row(
         v.map_err(|e| internal(anyhow::anyhow!("{what} serialize: {e}")))
     };
     let keep_disks_json = json("keep_disks", serde_json::to_value(keep_disks))?;
+    let health_rules_json = health_rules.map(|rules| json("health_rules", serde_json::to_value(rules))).transpose()?;
     let endpoints_json = json("endpoints", serde_json::to_value(&row.addresses.urls))?;
     let public_paths_json = json("public_paths", serde_json::to_value(&row.addresses.public_paths))?;
     let doors_json = json("doors", serde_json::to_value(&row.addresses.doors))?;
@@ -1388,11 +1388,11 @@ async fn write_apply_row(
          (project_id, node_id, instance_id, copy_id, status, \
           failure_stage, failure_message, applied_spec_hash, \
           applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, \
-          install_endpoints_json, notes_json, waiting_on, provisioning_since_unix) \
+          install_endpoints_json, notes_json, waiting_on, provisioning_since_unix, health_rules_json) \
          SELECT $1, $2, $13, $3, $4, NULL, NULL, $5, \
                 CASE WHEN $6 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
                 $7, $12, $14, $8, $9, $15, $16, NULL, \
-                CASE WHEN $6 THEN NULL ELSE EXTRACT(EPOCH FROM NOW())::BIGINT END \
+                CASE WHEN $6 THEN NULL ELSE EXTRACT(EPOCH FROM NOW())::BIGINT END, $17 \
          FROM infra_lifecycle_command \
          WHERE id = $10 \
            AND project_id = $1 \
@@ -1417,6 +1417,7 @@ async fn write_apply_row(
             notes_json         = EXCLUDED.notes_json, \
             keep_disks_json = EXCLUDED.keep_disks_json, \
             units_json         = EXCLUDED.units_json, \
+            health_rules_json  = EXCLUDED.health_rules_json, \
             waiting_on         = NULL, \
             provisioning_since_unix = EXCLUDED.provisioning_since_unix",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$11", "$1"),
@@ -1438,6 +1439,7 @@ async fn write_apply_row(
     .bind(doors_json)
     .bind(install_endpoints_json)
     .bind(notes_json)
+    .bind(health_rules_json)
     .execute(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1469,6 +1471,7 @@ pub async fn supervisor_set_applied(
         req.instance.as_ref(),
         &req.copy_id,
         &req.keep_disks,
+        req.health_rules.as_deref(),
         units_json,
         req.command_id,
         &req.replica,
@@ -1517,6 +1520,7 @@ pub async fn supervisor_set_provisioning(
         req.instance.as_ref(),
         &req.copy_id,
         &req.keep_disks,
+        req.health_rules.as_deref(),
         units_json,
         req.command_id,
         &req.replica,
@@ -1535,9 +1539,9 @@ pub async fn supervisor_set_provisioning(
 }
 
 /// Supervisor-callable: enqueue a dispatcher-targeted lifecycle
-/// command (`deactivate` | `reactivate`). Used by HealthProtocol
-/// actions when the supervisor decides the project should be
-/// parked / hibernated / wiped or re-activated. Side-channel
+/// command (`deactivate` | `reactivate`). Used by the health rules'
+/// actions when the supervisor decides the triggers reading broken infra
+/// go down, or come back once it is healthy. Side-channel
 /// `event_record(notify, payload.action=...)` is GONE; lifecycle
 /// commands are the single channel, with retries via the claim
 /// loop.
@@ -1579,6 +1583,7 @@ pub async fn supervisor_enqueue_lifecycle(
             copies: &weft_core::instance::Copies::Shared,
             verb,
             spec_json: spec_json.as_ref(),
+            source_hash: None,
             issued_by_replica,
         },
     )
@@ -1687,6 +1692,9 @@ pub async fn infra_enqueue_apply(
             "worker token missing replica claim".to_string(),
         )
     })?;
+    let source_hash = crate::lifecycle_writes::place_hash_of_run(&state.pool, req.project_id, req.run_id, &req.node_id)
+        .await
+        .map_err(internal)?;
     let command_id = crate::lifecycle_writes::issue_command(
         &state.pool,
         &crate::lifecycle_writes::IssuedCommand {
@@ -1696,6 +1704,7 @@ pub async fn infra_enqueue_apply(
             copies: &weft_core::instance::Copies::of(req.instance.clone()),
             verb: weft_broker_client::protocol::InfraLifecycleVerb::Apply,
             spec_json: Some(&req.spec_json),
+            source_hash: source_hash.as_deref(),
             issued_by_replica,
         },
     )
@@ -1920,37 +1929,6 @@ pub async fn supervisor_remove_node(
     Ok(Json(SupervisorRemoveNodeResponse {
         removed: res.rows_affected() > 0,
     }))
-}
-
-pub async fn supervisor_trigger_deps(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorTriggerDepsRequest>,
-) -> Resp<SupervisorTriggerDepsResponse> {
-    require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
-        .await?;
-    let id = req.project_id;
-    use sqlx::Row;
-    let row = sqlx::query("SELECT project_json FROM project WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let Some(r) = row else {
-        return Ok(Json(SupervisorTriggerDepsResponse { deps: Vec::new() }));
-    };
-    let project_json: String = r.try_get("project_json").map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let project: weft_core::project::ProjectDefinition =
-        serde_json::from_str(&project_json).map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let deps = weft_core::project::compute_trigger_deps(&project)
-        .into_iter()
-        .map(|(infra_node_id, trigger_node_id)| SupervisorTriggerDep {
-            infra_node_id,
-            trigger_node_id,
-        })
-        .collect();
-    Ok(Json(SupervisorTriggerDepsResponse { deps }))
 }
 
 /// The project's uncompleted supervisor commands (apply / stop /

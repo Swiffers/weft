@@ -9,7 +9,7 @@
 //!
 //! Three loops: ownership (claim and renew), lifecycle (run the
 //! `infra_lifecycle_command` rows: apply, stop, terminate) and health
-//! (flaky / recovered, and the project's health protocols). On the
+//! (flaky / recovered, and the health rules of each copy). On the
 //! machine they run for as long as the process does ([`run_loops`]); a
 //! supervisor that scales to zero runs one pass of each per tick
 //! ([`tick`]). Everything here is library code, so integration tests wire
@@ -27,7 +27,6 @@ pub mod health;
 pub mod health_engine;
 pub mod lifecycle;
 pub mod ownership;
-pub mod protocol;
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod testing;
@@ -146,9 +145,9 @@ pub struct Pass {
 /// to its end inside the pass, side by side with the others the way
 /// [`run_loops`] runs them. The leases are renewed for as long as the pass
 /// acts on the host, the sweep and the health look included: deleting a
-/// copy's disks, a start, a stop or a protocol's restart takes the cloud a
-/// minute or more, and a lease left to lapse meanwhile hands the project to
-/// a sibling, which would act on it at the same time. The pass runs inside
+/// copy's disks, a start or a stop takes the cloud a minute or more, and a
+/// lease left to lapse meanwhile hands the project to a sibling, which
+/// would act on it at the same time. The pass runs inside
 /// the request that woke it, which is what keeps its CPU on.
 ///
 /// Nothing here books the next look: the broker books it each time the
@@ -264,12 +263,12 @@ pub(crate) async fn failed(state: &SupervisorState, project: uuid::Uuid, step: h
     state.health.lock().await.troubled(project, step, error);
 }
 
-/// A health protocol of `project` gave up: log `error`, and the next
+/// A health rule of `project` gave up: log `error`, and the next
 /// ownership sync writes it down for `weft status` until a pass reports
 /// the project settled. Nothing tries it again on a clock: a person's
 /// look or command, or what the machines report changing, does
 /// (`SupervisorSyncOwnershipRequest::gave_up`).
 pub(crate) async fn give_up(state: &SupervisorState, project: uuid::Uuid, error: &str) {
-    tracing::error!(project_id = %project, error, "a health protocol gave up on the project's infra; a look asked for it, or its next change, tries again");
-    state.health.lock().await.troubled(project, health::Step::Protocol, error);
+    tracing::error!(project_id = %project, error, "a health rule gave up on the project's infra; a look asked for it, or its next change, tries again");
+    state.health.lock().await.troubled(project, health::Step::Rule, error);
 }

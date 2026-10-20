@@ -63,6 +63,7 @@ impl Node for BaileyBridgeNode {
                 expose: Expose::Project,
             }],
             keep_on_terminate: Vec::new(),
+            health_rules: None,
         })
     }
 

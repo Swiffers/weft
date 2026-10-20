@@ -448,7 +448,7 @@ pub async fn run(
     Json(body): Json<VersionRunRequest>,
 ) -> Result<Json<RunStarted>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    require_action(&state, id, None, &["run"]).await?;
+    require_action(&state, id, &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed && body.seed_run.is_none() {
         return Err((StatusCode::BAD_REQUEST, "`--seed-until` and `--seed-before` need `--seed`".into()));
     }

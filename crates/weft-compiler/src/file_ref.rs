@@ -552,6 +552,7 @@ pub(crate) fn resolve_project_file_refs(
 ) {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for node in &mut project.nodes {
+      let part = node.part().to_string();
       let config_spans = &node.config_spans;
       let literal_spans = &node.port_literal_spans;
       for (key, value, field) in node.config.as_object_mut().into_iter().flat_map(|map| map.iter_mut())
@@ -571,7 +572,9 @@ pub(crate) fn resolve_project_file_refs(
                 node.file_refs.insert(key.clone(), file_ref);
             }
             Ok(_) => {}
-            Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
+            // A file that is not there breaks the node that reads it, and
+            // only that node.
+            Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file).about(&part)),
         });
       }
     }
@@ -591,7 +594,7 @@ pub(crate) fn resolve_project_file_refs(
                     group.file_refs.insert(key.clone(), file_ref);
                 }
                 Ok(_) => {}
-                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
+                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file).about(&group.id)),
             });
         }
     }

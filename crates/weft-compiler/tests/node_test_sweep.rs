@@ -54,7 +54,7 @@ fn every_stdlib_node_test_passes() {
     // predicate, so this sweep and `weft test-node` select identically.
     let mut packages: Vec<String> = catalog
         .packages()
-        .filter(|pkg| catalog.package_declares_tests(pkg))
+        .filter(|pkg| catalog.package_declares_tests(pkg).expect("a tests.rs it can look at"))
         .map(|pkg| pkg.name.clone())
         .collect();
     packages.sort();

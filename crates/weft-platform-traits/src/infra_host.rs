@@ -81,11 +81,6 @@ pub trait InfraHost: Send + Sync {
     /// is not an error.
     async fn stop_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()>;
 
-    /// Restart `unit`'s containers as they are (a health protocol's
-    /// "kick the process"), keeping its disks. A unit that is not running
-    /// is started.
-    async fn restart_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()>;
-
     /// Remove `unit` (a unit the spec no longer declares), keeping every
     /// disk. Idempotent.
     async fn remove_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()>;
@@ -140,7 +135,6 @@ pub mod fake {
     pub enum HostCall {
         Apply { copy_id: String, unit: String, hash: String },
         Stop { copy_id: String, unit: String },
-        Restart { copy_id: String, unit: String },
         Remove { copy_id: String, unit: String },
         Terminate { copy_id: String, keep: Vec<String> },
     }
@@ -163,7 +157,6 @@ pub mod fake {
         notes: Mutex<Vec<String>>,
         /// Copies whose terminate fails (recorded, nothing removed).
         fail_terminate: Mutex<std::collections::BTreeSet<String>>,
-        hang_restarts: Mutex<bool>,
     }
 
     impl FakeInfraHost {
@@ -193,10 +186,6 @@ pub mod fake {
         /// The disks a terminate left the copy `copy_id` holding.
         pub fn kept_disks(&self, copy_id: &str) -> Vec<String> {
             self.kept.lock().get(copy_id).cloned().unwrap_or_default()
-        }
-        /// Make every restart record its call and then never return.
-        pub fn hang_restarts(&self) {
-            *self.hang_restarts.lock() = true;
         }
         /// Make the next applies fail with `why`.
         pub fn fail_applies_with(&self, why: Option<&str>) {
@@ -241,13 +230,6 @@ pub mod fake {
             self.calls.lock().push(HostCall::Stop { copy_id:node.copy_id.clone(), unit: unit.into() });
             if let Some(o) = self.units.lock().get_mut(&(node.project, node.copy_id.clone(), unit.to_string())) {
                 o.state = UnitRunState::Stopped;
-            }
-            Ok(())
-        }
-        async fn restart_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
-            self.calls.lock().push(HostCall::Restart { copy_id:node.copy_id.clone(), unit: unit.into() });
-            if *self.hang_restarts.lock() {
-                std::future::pending::<()>().await;
             }
             Ok(())
         }

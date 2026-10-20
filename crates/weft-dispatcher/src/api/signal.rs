@@ -263,6 +263,7 @@ pub(crate) async fn take_event(
                 // (`/v1/door/park_fire`), and none other names one.
                 held_by: None,
                 attempts: 0,
+                released: false,
             };
             match fire_entry(state, routing, fire)
                 .await
@@ -708,8 +709,9 @@ fn file_belongs_to_signal(
 /// Scoped enumeration. Filters by
 /// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
-/// active and parked projects show up; hibernate-mode projects do
-/// not. Wiped projects have no rows. The dispatcher never asks the
+/// triggers on and triggers down with their door taking show up; one
+/// whose door hides does not. One taken down with nothing kept has no
+/// rows. The dispatcher never asks the
 /// listener for the signal token: the SQL pre-filter is the only
 /// scope check.
 ///

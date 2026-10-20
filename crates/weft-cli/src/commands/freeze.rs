@@ -73,7 +73,7 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
         definition_hash: run.definition_hash.clone(),
     });
     spec.expected = Some(expected);
-    let path = write_spec(project, &spec)?;
+    let (path, _) = write_spec(project, &spec)?;
     // The run remembers what it was frozen as.
     client
         .put_with_body(

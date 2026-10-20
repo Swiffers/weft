@@ -277,6 +277,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
+        .route("/projects/{id}/instances", get(project::instances))
         .route("/projects/{id}/builds/{build}", get(project::version_build))
         // The connections the program's own access nodes use on this
         // install, never written in the source.
@@ -303,9 +304,9 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // journal-bridge drain-watcher then CASes status to
         // `inactive` (the lifecycle target the original deactivate
         // already wrote to the row stays in place).
-        .route("/projects/{id}/cancel-running", post(project::cancel_running))
         .route("/projects/{id}/resync", post(project::resync))
         .route("/projects/{id}/resync/resume", post(project::resume_resync))
+        .route("/projects/{id}/follow/{task}", get(project::follow))
         // Unified subworkflow endpoint for Start / Restart / Upgrade.
         // All three CLI verbs POST here; the dispatcher uses the
         // resolved-spec-hash to decide skip-vs-apply per node.
@@ -323,8 +324,6 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // `{node}` on every per-node infra route is the node's
         // PLACEMENT as a person spells it (`one.db`): an infra node inside
         // a file included twice is two placements with two names.
-        .route("/projects/{id}/infra/nodes/{node}/stop", post(infra::stop_node))
-        .route("/projects/{id}/infra/nodes/{node}/terminate", post(infra::terminate_node))
         .route("/projects/{id}/infra/status", get(infra::status))
         .route("/projects/{id}/infra/doors", get(infra::doors))
         .route("/projects/{id}/infra/logs", get(infra::logs))

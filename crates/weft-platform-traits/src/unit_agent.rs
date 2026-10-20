@@ -60,8 +60,6 @@ pub struct UnitAssignment {
 
 /// Read the assignment again and bring the unit to it.
 pub const HOST_APPLY: &str = "/host/apply";
-/// Restart the unit's containers as they are.
-pub const HOST_RESTART: &str = "/host/restart";
 /// How the unit is doing: a list of `UnitObservation`.
 pub const HOST_OBSERVE: &str = "/host/observe";
 /// The unit's output: `?from=<LogsFrom as JSON>`, answered as a JSON

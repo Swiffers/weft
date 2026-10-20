@@ -2,17 +2,20 @@
 //!
 //! `compute_available_actions` (crates/weft-dispatcher/src/api/project.rs)
 //! defines the reconciliation table: every stable state
-//! offers exactly its legal verbs, every transitional state offers ONLY its
-//! cancel, and every disruptive verb drains running work per the caller's
-//! running-policy. These tests drive ONE evolving project per test through
-//! real verbs (CLI + HTTP, as a user would) and assert the table's answer
-//! (`available_actions`), the rejections (REJ cells must 4xx), and the drain
-//! semantics (a Wait drain holds the verb open, admits nothing new, and lets
-//! the running run finish).
+//! offers exactly its legal verbs, and every transitional state offers ONLY
+//! its cancel. Every verb that takes triggers down answers the same three
+//! questions (`weft_core::take_down`: the door, what is held, what is
+//! running). These tests drive ONE evolving project per test through real
+//! verbs (CLI + HTTP, as a user would) and assert the table's answer
+//! (`available_actions`), each trigger's state (`triggers`), the rejections
+//! (REJ cells must 4xx), and what becomes of the runs (`--running wait`
+//! lets them finish on their own version and the command goes on only once
+//! they have: a deactivate answers, a resync brings its triggers back on
+//! the new build, an infra stop lets the infra go; `cancel` stops them).
 //!
 //! The lever for "a real run is running" is the `lifecycle` fixture's
 //! HoldGate node: it polls a rig-owned fake URL until the rig releases it, so
-//! the rig can hold a run open across a drain and finish it on cue.
+//! the rig can hold a run open across a take-down and finish it on cue.
 //! Source-shape transitions (no-infra -> infra -> orphan, plain -> trigger)
 //! are real `main.weft` rewrites followed by the next verb, exactly as a user
 //! editing source.
@@ -22,9 +25,9 @@
 //!     local CLI builds before the verb, so there is no `building` window to
 //!     cancel against this rig.
 //!   - `cancel_activate`: trigger setup on this rig completes in milliseconds
-//!     (no deterministic `activating` window to race); the deactivating-side
-//!     verbs (`cancel_running`, `resume_active`) ARE covered below via the
-//!     drain-held window, which exercises the same master rule.
+//!     (no deterministic `activating` window to race); the same master rule
+//!     is covered below through the window an infra stop's `--running wait`
+//!     holds open.
 #![cfg(feature = "e2e")]
 
 mod common;
@@ -32,7 +35,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::json;
 use weft_e2e::client::cli;
 use weft_e2e::fakes::{PollFake, SseFake};
 use weft_e2e::status::{self, STATUS_DEADLINE};
@@ -95,11 +98,12 @@ async fn source_flips_infra_and_orphan_lifecycle() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// The infra concern's REJ cells, the drain-held stop, and infra cancel:
-/// resting infra gates run; a stop with a running run drains (master
-/// rule: only `infra_cancel` offered, run rejected, the run keeps
-/// running); `weft infra cancel` halts the stop WITHOUT killing the
-/// run; the released run then completes untouched.
+/// The infra concern's REJ cells, the stop that waits for its runs, and
+/// infra cancel: resting infra gates run; a stop with `--running wait`
+/// over a running run holds the infra up (master rule: only
+/// `infra_cancel` offered, run rejected, the run keeps running); `weft
+/// infra cancel` calls the stop off WITHOUT killing the run; the released
+/// run then completes untouched.
 #[tokio::test]
 async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -134,22 +138,11 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     })
     .await?;
 
-    // Stop with the Wait policy: the supervisor drains. While the stop is in
-    // flight the master rule collapses the table to its cancel, and nothing
+    // Stop with `--running wait` (an infra stop's default, spelled out):
+    // the infra stays up until the run reaching it ends. While the stop
+    // waits the master rule collapses the table to its cancel, and nothing
     // new is admitted.
-    let stop = spawn_weft(
-        &project,
-        vec![
-            "infra".into(),
-            "stop".into(),
-            "--mode".into(),
-            "park".into(),
-            "--running-policy".into(),
-            "wait".into(),
-            "--drain-timeout".into(),
-            "300".into(),
-        ],
-    );
+    let stop = spawn_weft(&project, vec!["infra".into(), "stop".into(), "--running".into(), "wait".into()]);
     status::wait_until(&disp, &pid, "stop drain to gate the table", STATUS_DEADLINE, |s| {
         s.available_actions() == vec!["infra_cancel"]
     })
@@ -157,7 +150,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     assert_run_rejected(&project, "infra stop draining", LIFECYCLE_GATE).await?;
     anyhow::ensure!(
         run_status(&disp, run_id).await? == "running",
-        "the Wait drain must not kill the running run"
+        "the waiting stop must not kill the running run"
     );
 
     // Cancel the stop: HALT, not rollback. The infra stays running, the
@@ -193,12 +186,16 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// The trigger axis: activate/deactivate, the deactivating window's two
-/// verbs (resume_active rolls forward, cancel_running gives up the wait),
-/// and resync re-registering an edited source. All against a REAL running
-/// Fire run held open by the gate.
+/// The trigger axis: activate (again, with nothing off: no error);
+/// deactivate with `--running wait` (the default), which takes the trigger
+/// down at once and answers only once the run it fired has ended;
+/// deactivate with `--running cancel`, which cancels it; resync under
+/// `wait`, which lets the run going on the old version finish there and
+/// only then brings the trigger back on the new build; and resync under
+/// `cancel`, which cancels that run and switches. All against REAL Fire
+/// runs held open by the gate.
 #[tokio::test]
-async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
+async fn deactivate_and_resync_wait_for_or_cancel_the_running_run() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
@@ -210,95 +207,180 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
 
     project.activate().await?;
     let s = status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
-    s.assert_actions_exactly(&["run", "deactivate"])?;
-    assert_verb_rejected(&disp, &format!("/projects/{pid}/activate"), "already active").await?;
+    s.assert_actions_exactly(&["run", "activate", "deactivate"])?;
+    anyhow::ensure!(s.trigger_state("start", None) == "on", "the trigger is on: {:?}", s.trigger("start"));
+    // Activating with nothing off turns nothing on, and says so: a script
+    // can always run it.
+    let again = summary_of(&project.weft(&["activate", "--json"]).await?);
+    anyhow::ensure!(again.contains("nothing to turn on"), "{again}");
 
-    // Fire: the run holds.
-    let before = run::runs(&disp, &pid).await?;
-    let run_id = fire_until_run(&feed, &disp, &pid, "go", &before).await?;
-
-    // Deactivate with Wait: the drain holds the verb open. The window offers
-    // exactly give-up (cancel_running) and change-your-mind (resume_active).
-    let deact = spawn_weft(
-        &project,
-        vec![
-            "deactivate".into(),
-            "--mode".into(),
-            "park".into(),
-            "--running-policy".into(),
-            "wait".into(),
-            "--drain-timeout".into(),
-            "300".into(),
-        ],
-    );
-    status::wait_until(&disp, &pid, "deactivating window", STATUS_DEADLINE, |s| {
-        s.status() == "deactivating"
-    })
-    .await?
-    .assert_actions_exactly(&["cancel_running", "resume_active"])?;
-    assert_run_rejected(&project, "deactivating", LIFECYCLE_GATE).await?;
-
-    // Change your mind: POST /activate rolls Deactivating -> Active. The
-    // held run is untouched.
-    let _: Value = disp.post_json(&format!("/projects/{pid}/activate"), &json!({})).await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
-    let _ = deact.await??; // the resumed deactivate returns; its exit is the CLI's report of the resume
-    anyhow::ensure!(
-        run_status(&disp, run_id).await? == "running",
-        "resume_active must leave the running run alone"
-    );
-
-    // Second deactivate, same window, but this time GIVE UP the wait:
-    // cancel_running finishes the drain immediately by cancelling.
-    let deact = spawn_weft(
-        &project,
-        vec![
-            "deactivate".into(),
-            "--mode".into(),
-            "park".into(),
-            "--running-policy".into(),
-            "wait".into(),
-            "--drain-timeout".into(),
-            "300".into(),
-        ],
-    );
-    status::wait_until(&disp, &pid, "second deactivating window", STATUS_DEADLINE, |s| {
-        s.status() == "deactivating"
-    })
-    .await?;
-    disp.post_empty(&format!("/projects/{pid}/cancel-running"), &json!({}))
-        .await?;
-    status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
-    let deact_out = deact.await??;
-    anyhow::ensure!(
-        deact_out.success,
-        "deactivate must complete once the drain is cancelled; stderr: {}",
-        deact_out.stderr
-    );
-    let settled = SettledRun::observe(&disp, run_id).await?;
-    anyhow::ensure!(
-        settled.status == "cancelled",
-        "cancel_running must cancel the held run; got {}",
-        settled.status
-    );
-
-    // Resync: reactivate, edit the source (new event name), resync with an
-    // explicit deactivation spec, and prove the NEW registration fires.
-    project.activate().await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
-    project.set_main(&graph_trigger_hold(&feed.url(), "go2", &gate.url()))?;
-    project
-        .weft(&["resync", "--mode", "wipe", "--running-policy", "cancel"])
-        .await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
-
+    // Deactivate with the defaults: the trigger is down at once, and the
+    // command answers only once the run it fired has finished. The gate
+    // holds the run, so the deactivate cannot have answered before the
+    // release.
+    let run_id = fire_and_hold(&feed, &disp, &pid, "go").await?;
+    let deactivate = spawn_weft(&project, words(&["deactivate", "--json"]));
+    let s = status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
+    anyhow::ensure!(s.trigger_state("start", None) == "off", "the trigger is down: {:?}", s.trigger("start"));
+    anyhow::ensure!(!deactivate.is_finished(), "the deactivate answered while the run it fired was still going");
+    anyhow::ensure!(run_status(&disp, run_id).await? == "running", "`--running wait` must leave the running run alone");
     gate.set_body(RELEASE).await;
-    let before = run::runs(&disp, &pid).await?;
-    let run_id = fire_until_run(&feed, &disp, &pid, "go2", &before).await?;
     SettledRun::observe(&disp, run_id)
         .await?
         .completed()?
         .assert_input("out", "data", &json!("released"))?;
+    let said = summary_of(&answered(deactivate).await?);
+    anyhow::ensure!(
+        said.contains("took down 'start'") && said.contains("1 run waited for, finishing on their own version"),
+        "{said}"
+    );
+    status::fetch(&disp, &pid).await?.assert_actions_exactly(&["run", "activate"])?;
+
+    // Back on, a new run held, and `--running cancel` stops it.
+    gate.set_body(HOLD).await;
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    let run_id = fire_and_hold(&feed, &disp, &pid, "go").await?;
+    let said = summary_of(&project.weft(&["deactivate", "--running", "cancel", "--json"]).await?);
+    anyhow::ensure!(said.contains("1 run cancelled"), "{said}");
+    let settled = SettledRun::observe(&disp, run_id).await?;
+    anyhow::ensure!(settled.status == "cancelled", "`--running cancel` must cancel the held run; got {}", settled.status);
+
+    // Resync under `wait`: back on, a run held, then the source edited
+    // (a new event name), so the trigger is behind the build. The resync
+    // takes it down, and it stays down while the run on the old version
+    // goes; once that run finishes there, the trigger comes back on the
+    // new build.
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    let run_id = fire_and_hold(&feed, &disp, &pid, "go").await?;
+    project.set_main(&graph_trigger_hold(&feed.url(), "go2", &gate.url()))?;
+    let resync = spawn_weft(&project, words(&["resync", "--running", "wait", "--json"]));
+    status::wait_until(&disp, &pid, "the resync to take the trigger down", STATUS_DEADLINE, |s| {
+        s.transition() == "resyncing" && s.trigger_state("start", None) == "off"
+    })
+    .await?;
+    anyhow::ensure!(!resync.is_finished(), "the resync answered while the old version still had a run going");
+    anyhow::ensure!(run_status(&disp, run_id).await? == "running", "the resync must leave the old version's run going");
+    let s = status::fetch(&disp, &pid).await?;
+    anyhow::ensure!(
+        s.trigger_state("start", None) == "off",
+        "the trigger stays down until the old version has nothing left running: {:?}",
+        s.trigger("start")
+    );
+    gate.set_body(RELEASE).await;
+    SettledRun::observe(&disp, run_id)
+        .await?
+        .completed()?
+        .assert_input("out", "data", &json!("released"))?;
+    let said = summary_of(&answered(resync).await?);
+    anyhow::ensure!(said.contains("1 run waited for, finishing on their own version"), "{said}");
+    let s = status::wait_until(&disp, &pid, "the trigger back on the new build", STATUS_DEADLINE, |s| {
+        s.trigger_state("start", None) == "on"
+    })
+    .await?;
+    anyhow::ensure!(s.status() == "active" && !s.offers("resync"), "nothing is behind any more: {:?}", s.available_actions());
+
+    // Resync under `cancel`: the NEW registration fires (a run held on
+    // it), the source moves again, and the resync cancels that run and
+    // switches at once.
+    gate.set_body(HOLD).await;
+    let run_id = fire_and_hold(&feed, &disp, &pid, "go2").await?;
+    project.set_main(&graph_trigger_hold(&feed.url(), "go3", &gate.url()))?;
+    let said = summary_of(&project.weft(&["resync", "--running", "cancel", "--json"]).await?);
+    anyhow::ensure!(said.contains("1 run cancelled"), "{said}");
+    let settled = SettledRun::observe(&disp, run_id).await?;
+    anyhow::ensure!(settled.status == "cancelled", "a resync under `cancel` must cancel the old version's run; got {}", settled.status);
+    let s = status::wait_until(&disp, &pid, "the trigger back on the newer build", STATUS_DEADLINE, |s| {
+        s.trigger_state("start", None) == "on"
+    })
+    .await?;
+    anyhow::ensure!(s.status() == "active" && !s.offers("resync"), "nothing is behind any more: {:?}", s.available_actions());
+
+    gate.set_body(RELEASE).await;
+    let before = run::runs(&disp, &pid).await?;
+    let run_id = fire_until_run(&feed, &disp, &pid, "go3", &before).await?;
+    SettledRun::observe(&disp, run_id)
+        .await?
+        .completed()?
+        .assert_input("out", "data", &json!("released"))?;
+
+    project.finish().await
+}
+
+/// Push `event` and wait until the run it fires is running (held by the
+/// gate, which the caller set to hold).
+async fn fire_and_hold(feed: &SseFake, disp: &weft_e2e::Dispatcher, pid: &uuid::Uuid, event: &str) -> anyhow::Result<uuid::Uuid> {
+    let before = run::runs(disp, pid).await?;
+    let run_id = fire_until_run(feed, disp, pid, event, &before).await?;
+    run::wait_for_status(disp, run_id, "running").await?;
+    Ok(run_id)
+}
+
+/// A command line for [`spawn_weft`].
+fn words(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| arg.to_string()).collect()
+}
+
+/// What a command [`spawn_weft`] started printed, once it has answered;
+/// an error when it failed.
+async fn answered(command: tokio::task::JoinHandle<anyhow::Result<weft_e2e::client::CliOutput>>) -> anyhow::Result<String> {
+    let out = command.await??;
+    anyhow::ensure!(out.success, "`{}` failed:\n{}\n{}", out.invocation, out.stdout, out.stderr);
+    Ok(out.stdout)
+}
+
+/// A trigger taken down with `--door hide` keeps listening and holds what
+/// arrives instead of running it; `weft activate` releases what it held,
+/// and it runs. On a second round `weft activate --held drop` drops what
+/// was held instead, and nothing runs from it.
+#[tokio::test]
+async fn a_held_event_runs_when_activate_releases_it_or_is_dropped() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("lifecycle", disp.clone()).await?;
+    let pid = project.id();
+
+    let gate = PollFake::start(RELEASE).await?;
+    let feed = SseFake::start().await?;
+    project.add_node_from_fixture("human_form", "test_sse_trigger")?;
+    project.set_main(&graph_trigger_hold(&feed.url(), "go", &gate.url()))?;
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+
+    project.weft(&["deactivate", "--door", "hide"]).await?;
+    let s = status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
+    let copy = s.trigger_copy("start", None).cloned().unwrap_or_default();
+    anyhow::ensure!(copy["state"] == "off" && copy["mode"] == "hide", "down, its door hiding: {copy}");
+
+    // The event is held, and nothing runs from it while the trigger is down.
+    let before = fire_runs(&disp, &pid).await?;
+    push_until_held(&feed, &disp, &pid, "go", "start").await?;
+    anyhow::ensure!(fire_runs(&disp, &pid).await? == before, "a held event starts no run");
+
+    // Activate releases it: it runs, on the version the trigger is back on.
+    let said = summary_of(&project.weft(&["activate", "--json"]).await?);
+    anyhow::ensure!(said.contains("1 arrival released"), "{said}");
+    let run_id = wait_for_one_new_fire(&disp, &pid, &before).await?;
+    SettledRun::observe(&disp, run_id)
+        .await?
+        .completed()?
+        .assert_input("out", "data", &json!("released"))?;
+    let s = status::fetch(&disp, &pid).await?;
+    anyhow::ensure!(s.trigger_held("start", None) == (0, 0), "nothing is held once it is back: {:?}", s.trigger("start"));
+
+    // Second round: what is held is dropped instead.
+    project.weft(&["deactivate", "--door", "hide"]).await?;
+    status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
+    let before = fire_runs(&disp, &pid).await?;
+    push_until_held(&feed, &disp, &pid, "go", "start").await?;
+    let said = summary_of(&project.weft(&["activate", "--held", "drop", "--json"]).await?);
+    anyhow::ensure!(said.contains("1 arrival dropped"), "{said}");
+    let s = status::wait_until(&disp, &pid, "the trigger back on", STATUS_DEADLINE, |s| s.trigger_state("start", None) == "on").await?;
+    anyhow::ensure!(s.trigger_held("start", None) == (0, 0), "the dropped event is gone: {:?}", s.trigger("start"));
+    // What an activate releases is handed over before it answers (each
+    // event's run is born as it is handed over), so a run released by
+    // mistake would be on record by now.
+    anyhow::ensure!(fire_runs(&disp, &pid).await? == before, "a dropped event never runs");
 
     project.finish().await
 }
@@ -324,29 +406,30 @@ async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::R
     project.activate().await?;
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
         .await?
-        .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
+        .assert_actions_exactly(&["run", "activate", "deactivate", "infra_stop", "infra_terminate"])?;
 
-    // Stop while ACTIVE: the stop takes down the triggers reading this
-    // service with the caller's spec, and this service sits on its own
-    // branch (`svc -> svc_out`, nothing to do with the trigger), so the
-    // trigger keeps listening while the service stops.
-    project
-        .weft(&["infra", "stop", "--mode", "park", "--running-policy", "cancel"])
-        .await?;
+    // Stop while ACTIVE: the stop takes down the triggers whose cut
+    // contains this service, and this service sits on its own branch
+    // (`svc -> svc_out`, nothing to do with the trigger), so the trigger
+    // keeps listening while the service stops.
+    project.weft(&["infra", "stop", "--running", "cancel"]).await?;
     let s = status::wait_until(&disp, &pid, "stopped infra under a live trigger", STATUS_DEADLINE, |s| {
         s.status() == "active" && s.infra_rollup() == "stopped"
     })
     .await?;
+    anyhow::ensure!(s.trigger_state("start", None) == "on", "the trigger keeps listening: {:?}", s.trigger("start"));
     // `run` is the other half: a run waits on the infra IT touches, and
     // a whole-graph run touches this service, so it is refused by the
     // run's own pre-flight (a run aimed away from it would go).
     // What the TABLE reports; the doors re-check the same rules after
-    // their build, in `require_trigger_infra` and `versions::run`.
-    s.assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
+    // their build, in `require_trigger_infra` and `versions::run`. The
+    // trigger's setup reads nothing of the service, so `activate` stays
+    // offered.
+    s.assert_actions_exactly(&["activate", "deactivate", "infra_start", "infra_terminate"])?;
     assert_run_rejected(&project, "infra stopped", INFRA_GATE).await?;
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?
-        .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
+        .assert_actions_exactly(&["run", "activate", "deactivate", "infra_stop", "infra_terminate"])?;
 
     // The revived deployment actually fires end to end.
     let before = run::runs(&disp, &pid).await?;
@@ -357,9 +440,7 @@ async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::R
         .assert_input("out", "data", &json!("released"))?;
 
     // Wind down: deactivate, terminate, resting row.
-    project
-        .weft(&["deactivate", "--mode", "park", "--running-policy", "cancel"])
-        .await?;
+    project.weft(&["deactivate", "--running", "cancel"]).await?;
     status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
     infra::terminate_and_wait_gone(&project, INFRA_NODE).await?;
     status::fetch(&disp, &pid).await?.assert_actions_exactly(&["activate", "infra_start"])?;
@@ -367,10 +448,11 @@ async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::R
     project.finish().await
 }
 
-/// An infra stop takes down only the triggers reading that infra, so the
-/// project is left partly on; once the infra runs again, the trigger it took
-/// down comes back on by itself and fires. One a person switched off
-/// themselves stays off through the next stop and start.
+/// An infra stop takes down only the triggers whose cut contains that
+/// infra, so the project is left partly on: status shows the one reading
+/// it off and the other still on. Once the infra runs again, the trigger
+/// it took down comes back on by itself and fires. One a person switched
+/// off themselves stays off through the next stop and start.
 #[tokio::test]
 async fn an_infra_start_brings_back_the_triggers_its_stop_took_down() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -399,26 +481,39 @@ async fn an_infra_start_brings_back_the_triggers_its_stop_took_down() -> anyhow:
 
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
     project.activate().await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    let s = status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    // Both sides of the cut, as status reads them before anything stops.
+    anyhow::ensure!(s.trigger_depends_on("reads") == vec![INFRA_NODE], "{:?}", s.trigger("reads"));
+    anyhow::ensure!(s.trigger_depends_on("plain").is_empty(), "{:?}", s.trigger("plain"));
+    let takes_down = s.infra_takes_down(INFRA_NODE);
+    anyhow::ensure!(
+        takes_down == vec!["reads"],
+        "stopping the service takes `reads` down and nothing else: {takes_down:?}"
+    );
 
-    project
-        .weft(&["infra", "stop", "--mode", "park", "--running-policy", "cancel"])
-        .await?;
+    let said = summary_of(&project.weft(&["infra", "stop", "--infra", INFRA_NODE, "--running", "cancel", "--json"]).await?);
+    anyhow::ensure!(said.contains("'reads'") && !said.contains("'plain'"), "the stop names what it took down: {said}");
     // `plain` still listens, so the project reads active; `reads` is down,
     // and turning it on waits for its infra.
-    status::wait_until(&disp, &pid, "the stop took down the trigger reading it", STATUS_DEADLINE, |s| {
+    let s = status::wait_until(&disp, &pid, "the stop took down the trigger reading it", STATUS_DEADLINE, |s| {
         s.status() == "active" && s.infra_rollup() == "stopped"
     })
-    .await?
-    .assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
+    .await?;
+    s.assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
+    anyhow::ensure!(
+        s.trigger_state("reads", None) == "off" && s.trigger_state("plain", None) == "on",
+        "only the trigger reading the infra goes down: reads {:?}, plain {:?}",
+        s.trigger("reads"),
+        s.trigger("plain")
+    );
 
     // The start brings `reads` back with its infra: nothing is left off.
-    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
+    project.weft(&["infra", "start"]).await?;
     status::wait_until(&disp, &pid, "the start brought the trigger back", STATUS_DEADLINE, |s| {
-        s.status() == "active" && !s.available_actions().contains(&"activate")
+        s.infra_rollup() == "running" && s.trigger_state("reads", None) == "on" && s.trigger_state("plain", None) == "on"
     })
     .await?
-    .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
+    .assert_actions_exactly(&["run", "activate", "deactivate", "infra_stop", "infra_terminate"])?;
 
     // `plain` never let go of the feed, so one subscriber says nothing about
     // `reads`: wait until both are listening before pushing.
@@ -432,30 +527,158 @@ async fn an_infra_start_brings_back_the_triggers_its_stop_took_down() -> anyhow:
 
     // Switched off by a person, `reads` stays off through a stop and a
     // start: only what the stop itself took down comes back.
-    project
-        .weft(&["deactivate", "--trigger", "reads", "--mode", "park", "--running-policy", "cancel"])
-        .await?;
-    project
-        .weft(&["infra", "stop", "--mode", "park", "--running-policy", "cancel"])
-        .await?;
+    project.weft(&["deactivate", "--trigger", "reads", "--running", "cancel"]).await?;
+    project.weft(&["infra", "stop", "--running", "cancel"]).await?;
     status::wait_until(&disp, &pid, "the infra stopped", STATUS_DEADLINE, |s| s.infra_rollup() == "stopped").await?;
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
-        .await?
-        .assert_actions_exactly(&["run", "deactivate", "activate", "infra_stop", "infra_terminate"])?;
+    let s = status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    s.assert_actions_exactly(&["run", "deactivate", "activate", "infra_stop", "infra_terminate"])?;
+    anyhow::ensure!(s.trigger_state("reads", None) == "off", "a trigger a person took down stays down: {:?}", s.trigger("reads"));
 
-    project
-        .weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"])
-        .await?;
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
     infra::terminate_and_wait_gone(&project, INFRA_NODE).await?;
     project.finish().await
 }
 
-/// A SUSPENDED run (HumanQuery) survives deactivate + reactivate: the
-/// inactive row offers `reactivate` (preserved state exists, not a bare
-/// activate), and the form is still answerable after the round trip, resuming
-/// the original run to completion.
+/// What a deploy does: the commands the deploy workflow runs on every
+/// push (`weft new`'s `ci/gcp.yml`), in its order and with its
+/// `--running wait`, bring up to date only what a person left on and
+/// running. On a project never deployed they succeed and turn nothing on
+/// and start nothing. Then, with trigger `a` on and `b` switched off by
+/// hand, and infra `svc` running and `db` stopped by hand, a code change
+/// that moves all four followed by the same commands brings `a` onto the
+/// new build and replaces `svc`, while `b` stays off and `db` stays
+/// stopped (and behind, for the person who starts it).
+#[tokio::test]
+async fn a_deploy_brings_up_to_date_only_what_is_on_and_running() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("lifecycle", disp.clone()).await?;
+    let pid = project.id();
+
+    // One feed per trigger, so a push reaches only the trigger it is for.
+    let feed_a = SseFake::start().await?;
+    let feed_b = SseFake::start().await?;
+    project.add_node_from_fixture("infra_min", "mini_service")?;
+    project.add_node_from_fixture("human_form", "test_sse_trigger")?;
+    project.set_main(&graph_two_of_each(&feed_a, &feed_b, false))?;
+
+    // Never deployed: every command succeeds and touches nothing.
+    let said = deploy(&project).await?;
+    anyhow::ensure!(
+        said[1].contains("nothing to resync"),
+        "a resync with nothing on resyncs nothing: {said:?}"
+    );
+    let s = status::fetch(&disp, &pid).await?;
+    for trigger in ["a", "b"] {
+        anyhow::ensure!(s.trigger_state(trigger, None) != "on", "a deploy turns no trigger on: {:?}", s.trigger(trigger));
+    }
+    for place in [INFRA_NODE, "db"] {
+        anyhow::ensure!(
+            s.infra_state(place) == weft_core::infra::wire::INFRA_NOT_STARTED,
+            "a deploy starts no infra: {:?}",
+            s.infra_place(place)
+        );
+    }
+    s.assert_actions_exactly(&["activate", "infra_start"])?;
+
+    // Everything on and running, then `b` and `db` taken down by hand.
+    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
+    infra::wait_running(&project, "db").await?;
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    project.weft(&["deactivate", "--trigger", "b", "--running", "wait"]).await?;
+    project.weft(&["infra", "stop", "--infra", "db", "--running", "wait"]).await?;
+    status::wait_until(&disp, &pid, "`b` off and `db` stopped", STATUS_DEADLINE, |s| {
+        s.trigger_state("a", None) == "on"
+            && s.trigger_state("b", None) == "off"
+            && s.infra_state(INFRA_NODE) == "running"
+            && s.infra_state("db") == "stopped"
+    })
+    .await?;
+
+    // The change moves both triggers (new event names) and both services
+    // (made public), so all four are behind the build.
+    project.set_main(&graph_two_of_each(&feed_a, &feed_b, true))?;
+    let said = deploy(&project).await?;
+    anyhow::ensure!(said[1].contains("resynced") && said[1].contains("'a'") && !said[1].contains("'b'"), "{said:?}");
+    let s = status::wait_until(&disp, &pid, "the deploy to settle", STATUS_DEADLINE, |s| {
+        s.transition() == "none" && s.infra_state(INFRA_NODE) == "running" && s.trigger_state("a", None) == "on"
+    })
+    .await?;
+    anyhow::ensure!(s.trigger_state("b", None) == "off", "a trigger switched off by hand stays off: {:?}", s.trigger("b"));
+    anyhow::ensure!(!s.offers("resync"), "no trigger that is on is behind any more: {:?}", s.available_actions());
+    anyhow::ensure!(!s.infra_behind(INFRA_NODE), "the running service is on the new build: {:?}", s.infra_place(INFRA_NODE));
+    anyhow::ensure!(
+        s.infra_state("db") == "stopped" && s.infra_behind("db"),
+        "a service stopped by hand stays stopped, and behind: {:?}",
+        s.infra_place("db")
+    );
+    // The replaced copy runs the new source: it is public now.
+    let copies = infra::status(&disp, &pid).await?;
+    let svc = copies.iter().find(|c| c.node == INFRA_NODE && c.instance.is_none());
+    anyhow::ensure!(svc.is_some_and(|c| c.public_urls.contains_key("api")), "the replaced service is public: {svc:?}");
+
+    // `a` fires on its new event name.
+    let before = run::runs(&disp, &pid).await?;
+    let run_id = fire_until_run(&feed_a, &disp, &pid, "a2", &before).await?;
+    SettledRun::observe(&disp, run_id)
+        .await?
+        .completed()?
+        .assert_input("a_out", "data", &json!("go"))?;
+
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
+    infra::terminate_and_wait_gone(&project, INFRA_NODE).await?;
+    infra::wait_gone(&project, "db").await?;
+    project.finish().await
+}
+
+/// Graph: triggers `a` and `b`, each on its own feed into a Debug, and
+/// two MiniServices `svc` and `db`, each into a Debug, every branch apart
+/// from the others. `changed` renames both events and makes both services
+/// public, which puts all four behind the build that had them unchanged.
+fn graph_two_of_each(feed_a: &SseFake, feed_b: &SseFake, changed: bool) -> String {
+    let (suffix, service) = if changed { ("2", "MiniService { public: true }") } else { ("", "MiniService") };
+    format!(
+        "a = TestSseTrigger -> (value: String) {{\n\
+         \x20 url: \"{url_a}\"\n\
+         \x20 event_name: \"a{suffix}\"\n\
+         }}\n\
+         a_out = Debug\n\
+         a_out.data = a.value\n\
+         b = TestSseTrigger -> (value: String) {{\n\
+         \x20 url: \"{url_b}\"\n\
+         \x20 event_name: \"b{suffix}\"\n\
+         }}\n\
+         b_out = Debug\n\
+         b_out.data = b.value\n\
+         svc = {service}\n\
+         svc_out = Debug\n\
+         svc_out.data = svc.status\n\
+         db = {service}\n\
+         db_out = Debug\n\
+         db_out.data = db.status\n",
+        url_a = feed_a.url(),
+        url_b = feed_b.url(),
+    )
+}
+
+/// What the deploy workflow runs on every push, in its order, each with
+/// `--running wait` (its default): the summary each answered.
+async fn deploy(project: &Project) -> anyhow::Result<Vec<String>> {
+    let mut said = Vec::new();
+    for command in [&["infra", "upgrade", "--all"][..], &["resync", "--all"]] {
+        let mut args = command.to_vec();
+        args.extend(["--running", "wait", "--json"]);
+        said.push(summary_of(&project.weft(&args).await?));
+    }
+    Ok(said)
+}
+
+/// A run paused on a person (HumanQuery) survives deactivate + activate:
+/// the trigger, down, holds it as a paused run, `weft activate` brings
+/// the trigger back without touching it, and the form is still
+/// answerable afterwards, resuming the original run to completion.
 #[tokio::test]
 async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -474,18 +697,12 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
         run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
 
-    // Deactivate: no RUNNING work (the run is suspended, holding no
-    // worker), so the Wait drain lands immediately; the suspension is
-    // PRESERVED, which is exactly why the inactive row offers `reactivate`.
-    project
-        .weft(&["deactivate", "--mode", "park", "--running-policy", "wait"])
-        .await?;
+    // Deactivate with the defaults: what the trigger fired that is paused
+    // is kept, and the trigger reads as holding it.
+    project.weft(&["deactivate"]).await?;
     let s = status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
-    anyhow::ensure!(
-        s.offers("reactivate"),
-        "preserved suspension must offer reactivate, got {:?}",
-        s.available_actions()
-    );
+    anyhow::ensure!(s.offers("activate"), "a trigger that is down can be turned on, got {:?}", s.available_actions());
+    anyhow::ensure!(s.trigger_held("start", None) == (0, 1), "the paused run is held: {:?}", s.trigger("start"));
     let status = run_status(&disp, run_id).await?;
     anyhow::ensure!(
         status == "waiting_for_input",
@@ -493,14 +710,12 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
          (and the list must report it honestly); got '{status}'"
     );
 
-    // Reactivate with the explicit keep-the-suspension choice (preserved
-    // state makes `weft activate` demand a choice; the rig is
-    // non-interactive by construction), answer the form, and the ORIGINAL
-    // run resumes to completion.
-    project
-        .weft(&["activate", "--reactivate-choice", "execute_parked_keep_suspended"])
-        .await?;
+    // Activate (nothing is ever asked: `--held run`, the default, keeps
+    // the paused run waiting on its person), answer the form, and the
+    // ORIGINAL run resumes to completion.
+    project.weft(&["activate"]).await?;
     status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    anyhow::ensure!(run_status(&disp, run_id).await? == "waiting_for_input", "activate leaves the paused run waiting");
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
     SettledRun::observe(&disp, run_id)
         .await?
@@ -510,12 +725,12 @@ async fn suspension_survives_deactivate_reactivate() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// A resync that parks its triggers over a run waiting on a person brings
-/// them straight back on without asking what to do with what they kept
-/// (only `weft activate` asks): the run keeps waiting, and the form is
-/// still answerable afterwards, resuming the ORIGINAL run.
+/// A resync over a run waiting on a person keeps it (`--held keep`, the
+/// default) and moves it onto the new build: the trigger comes straight
+/// back on, the run keeps waiting, and once the form is answered the
+/// ORIGINAL run resumes on the new build, reaching the node the edit added.
 #[tokio::test]
-async fn a_park_resync_keeps_a_run_waiting_on_a_person() -> anyhow::Result<()> {
+async fn a_resync_moves_a_run_waiting_on_a_person_onto_the_new_build() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("human_form", disp.clone()).await?;
     let pid = project.id();
@@ -531,19 +746,70 @@ async fn a_park_resync_keeps_a_run_waiting_on_a_person() -> anyhow::Result<()> {
         run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
 
-    // The rig is non-interactive, so a resync that asked would fail here.
-    project
-        .weft(&["resync", "--mode", "park", "--running-policy", "wait"])
-        .await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    // One more node reads the answer, so the trigger's cut moves and it is
+    // behind the build the resync makes.
+    let main = project.read_file("src/main.weft")?;
+    project.write_file("src/main.weft", &format!("{main}\nalso = Debug\nalso.data = review.decisionApproved\n"))?;
+    project.weft(&["resync"]).await?;
+    let s = status::wait_until(&disp, &pid, "the trigger back on the new build", STATUS_DEADLINE, |s| {
+        s.trigger_state("start", None) == "on"
+    })
+    .await?;
+    anyhow::ensure!(s.status() == "active", "the resync brings its trigger straight back: {}", s.status());
     let status = run_status(&disp, run_id).await?;
     anyhow::ensure!(status == "waiting_for_input", "the resync must leave the waiting run waiting; got '{status}'");
 
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
-    SettledRun::observe(&disp, run_id)
-        .await?
-        .completed()?
-        .assert_input("out", "data", &json!(true))?;
+    let settled = SettledRun::observe(&disp, run_id).await?;
+    settled.completed()?.assert_input("out", "data", &json!(true))?;
+    settled.assert_input("also", "data", &json!(true))?;
 
+    project.finish().await
+}
+
+/// One binary answers a project's routes. With `front` on, a change to
+/// the code of a node of the project gives it a new build, and turning
+/// `back` on there is refused, naming `front` and the way through; `weft
+/// resync --all` moves `front` to the new build (its answers say the new
+/// code ran), and `back` then comes on. `weft rm --journal` takes the
+/// project away, history and all, waiting in short looks for every run.
+#[tokio::test]
+async fn a_trigger_on_a_new_build_waits_for_a_resync_of_the_others() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let project = Project::prepare("one_binary", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    let heard = |route: &'static str, text: &'static str| {
+        let (disp, url) = (disp.clone(), format!("{base}/{route}"));
+        async move {
+            let (status, _, body) =
+                weft_e2e::live::http_json(&disp, reqwest::Method::POST, &url, &[], &json!({ "text": text })).await?;
+            anyhow::ensure!(status == 200, "{route} answered {status}: {}", String::from_utf8_lossy(&body));
+            Ok::<_, anyhow::Error>(serde_json::from_slice::<serde_json::Value>(&body)?)
+        }
+    };
+
+    project.weft(&["activate", "--trigger", "front"]).await?;
+    assert_eq!(heard("front", "hi").await?, json!({ "heard": "hi" }));
+
+    let code = project.dir().join("nodes/echo/mod.rs");
+    let before = std::fs::read_to_string(&code)?;
+    let after = before.replace("let said = text;", "let said = format!(\"again: {text}\");");
+    anyhow::ensure!(after != before, "the fixture's marked line moved: {}", code.display());
+    std::fs::write(&code, after)?;
+
+    let refused = project.weft_refused(&["activate", "--trigger", "back"]).await?;
+    anyhow::ensure!(
+        refused.contains("one binary answers a project's routes") && refused.contains("'front'") && refused.contains("`weft resync --all`"),
+        "the refusal names the trigger on the old build and the way through:\n{refused}"
+    );
+    assert_eq!(heard("front", "hi").await?, json!({ "heard": "hi" }), "the refusal moved nothing");
+
+    project.weft(&["resync", "--all"]).await?;
+    assert_eq!(heard("front", "hi").await?, json!({ "heard": "again: hi" }), "front runs the new code");
+    project.weft(&["activate", "--trigger", "back"]).await?;
+    assert_eq!(heard("back", "yo").await?, json!({ "heard": "again: yo" }));
+
+    let id = project.id().to_string();
+    project.weft(&["rm", &id, "--journal", "--yes"]).await?;
     project.finish().await
 }

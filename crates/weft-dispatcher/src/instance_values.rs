@@ -211,7 +211,7 @@ async fn apply(
         let request = weft_core::activation::ActivateRequest {
             scope: weft_core::activation::ActivationScope {
                 triggers: keys.iter().map(|k| k.trigger.clone()).collect(),
-                instance: Some(instance.clone()),
+                instances: weft_core::instance::InstanceTarget::of(Some(instance.clone())),
             },
             ..Default::default()
         };

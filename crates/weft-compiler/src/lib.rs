@@ -1,5 +1,5 @@
 //! The weft compiler. Turns a project directory (`weft.toml`,
-//! `src/main.weft`, `nodes/`) into a flat `ProjectDefinition` and the
+//! `src/main.weft`, the nodes under `nodes/` and `src/`) into a flat `ProjectDefinition` and the
 //! docker build contexts of the images that run it.
 //!
 //! Pipeline, as `weft run` / `weft build` drive it:
@@ -37,7 +37,9 @@
 //!    Dockerfile; `image_set` lists each infra node's own images.
 //! 6. The CLI builds every planned image not already present with
 //!    docker. The worker's `cargo build` runs inside its docker build,
-//!    never on the host.
+//!    never on the host, through `weft-isolate` (`worker_isolate`): a
+//!    node package that does not compile is left out of the worker and
+//!    named in a record the image keeps, instead of failing the image.
 
 pub mod project;
 pub mod source_name;
@@ -63,6 +65,13 @@ pub mod hash;
 pub mod codegen;
 #[cfg(feature = "build")]
 pub mod worker_image;
+// The `weft-isolate` program a worker image build runs (codegen emits its
+// source as a package of its own). Compiled here for the candidate type
+// codegen writes and for its tests; its `main` and the logic only `main`
+// reaches run in the image, never in this crate.
+#[cfg(feature = "build")]
+#[allow(dead_code)]
+pub(crate) mod worker_isolate;
 #[cfg(feature = "build")]
 pub mod build;
 // The infra-image set a project needs (worker + per-node infra images). Reads the
@@ -152,8 +161,7 @@ fn parse_only_inner(
         source_name,
     );
     for e in parse_errors {
-        diagnostics
-            .push(Diagnostic::at(e.span, Severity::Error, "parse", e.message).in_file(e.file.as_deref()));
+        diagnostics.push(e.diagnostic("parse"));
     }
 
     // Stage 3: enrich (lenient). Unknown types / catalog misses become
@@ -162,7 +170,7 @@ fn parse_only_inner(
     // authoring errors the build would reject, so surface each as an ERROR
     // diagnostic at the offending node's line, not a single span-less warning.
     for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Lenient) {
-        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message).in_file(e.file.as_deref()));
+        diagnostics.push(e.diagnostic());
     }
 
     // Surface unknown node types as warnings so the IDE can paint a
@@ -320,8 +328,7 @@ fn compile_and_enrich_inner(
         Ok(p) => p,
         Err(errors) => {
             for e in errors {
-                diagnostics
-                    .push(Diagnostic::at(e.span, Severity::Error, "parse", e.message).in_file(e.file.as_deref()));
+                diagnostics.push(e.diagnostic("parse"));
             }
             return (empty_project(project_id), diagnostics);
         }
@@ -329,9 +336,132 @@ fn compile_and_enrich_inner(
     // Strict enrich: one Error diagnostic PER failure, at the offending node's
     // span (so the editor squiggles the exact line), not a single span-less blob.
     for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict) {
-        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message).in_file(e.file.as_deref()));
+        diagnostics.push(e.diagnostic());
     }
     (project, diagnostics)
+}
+
+/// The program a command builds and runs from: the whole pipeline (lex +
+/// parse + flatten with every `@include` inlined, strict enrich,
+/// `Structural` validation), where an error about some parts of the
+/// program breaks only those parts (`ProjectDefinition::broken`) instead
+/// of the program. An included file that does not compile is a
+/// placeholder (`weft_compiler::broken_include`), a node whose type did
+/// not load is broken where it stands, a wire between two ports that
+/// cannot meet breaks its two ends. Every command cuts what it touches,
+/// and the cut refuses a broken part it needs (`weft_core::project::cut::cut`),
+/// so another person's broken include stops nobody who does not run it.
+///
+/// `Err` holds every diagnostic when one is about the program as a whole
+/// (the entry file does not parse, a check no cut can avoid): nothing can
+/// be cut from a program that does not stand.
+pub fn compile_program(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    catalog: &dyn MetadataCatalog,
+) -> Result<ProjectDefinition, Vec<Diagnostic>> {
+    // A broken part names its file from the project root: the install
+    // compiles in a directory of its own, whose path means nothing to
+    // whoever reads the refusal.
+    let root = fs.root.and_then(|root| fs.reader.identity(root).ok());
+    catalog.type_registry().scoped(|| {
+        let (mut project, parse_errors) =
+            weft_compiler::compile_lenient(source, project_id, fs, weft_compiler::IncludeMode::Full, None);
+        let mut diagnostics: Vec<Diagnostic> = parse_errors.iter().map(|e| e.diagnostic("parse")).collect();
+        // An entry file that does not parse leaves a partial program, and
+        // the later stages would only add findings about the gap.
+        if diagnostics.iter().any(is_whole_program_error) {
+            return Err(diagnostics);
+        }
+        for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict) {
+            diagnostics.push(e.diagnostic());
+        }
+        diagnostics.extend(validate::validate_with_mode(&project, catalog, validate::ValidationMode::Structural));
+        settle(&mut project, catalog, diagnostics, root.as_deref())?;
+        Ok(project)
+    })
+}
+
+/// The errors `project` has that it does not already carry as broken
+/// parts: none for a program [`compile_program`] settled, as long as
+/// nothing changed it in a way that breaks something new. The build's own
+/// gate, so a definition changed after its check can never build with an
+/// error nobody recorded. `root` is the project's, which
+/// [`compile_program`] spelled the files of broken parts from.
+pub fn unsettled(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, root: Option<&std::path::Path>) -> Vec<Diagnostic> {
+    let hiding = hiding_nodes(project, catalog);
+    validate::validate_with_mode(project, catalog, validate::ValidationMode::Structural)
+        .into_iter()
+        .filter(|d| matches!(d.severity, Severity::Error))
+        .filter(|d| d.subjects.is_empty() || !project.broken.contains(&broken_part(d, root, &hiding)))
+        .collect()
+}
+
+/// Fold `diagnostics` into `project`: each error about some parts of the
+/// program becomes a broken part (once, however many passes found it);
+/// `Err` with every diagnostic when one is about the program as a whole.
+fn settle(
+    project: &mut ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    diagnostics: Vec<Diagnostic>,
+    root: Option<&std::path::Path>,
+) -> Result<(), Vec<Diagnostic>> {
+    if diagnostics.iter().any(is_whole_program_error) {
+        return Err(diagnostics);
+    }
+    let hiding = hiding_nodes(project, catalog);
+    for d in diagnostics.iter().filter(|d| matches!(d.severity, Severity::Error)) {
+        let part = broken_part(d, root, &hiding);
+        if !project.broken.contains(&part) {
+            project.broken.push(part);
+        }
+    }
+    Ok(())
+}
+
+/// An error no cut can avoid: it names no part of the program.
+fn is_whole_program_error(d: &Diagnostic) -> bool {
+    matches!(d.severity, Severity::Error) && d.subjects.is_empty()
+}
+
+/// The nodes that may stand for others the program cannot see
+/// (`weft_core::project::Broken::hides`): an included file's placeholder,
+/// which holds none of its nodes, and a node whose type the catalog does
+/// not serve, so nothing says whether it is a trigger or infra.
+fn hiding_nodes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog) -> std::collections::BTreeSet<String> {
+    project
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.include_path.is_some()
+                || (!weft_compiler::is_reserved_type_keyword(&node.node_type) && catalog.lookup(&node.node_type).is_none())
+        })
+        .map(|node| node.id.clone())
+        .collect()
+}
+
+/// The broken part an error with subjects is: its parts, the error as one
+/// rendered line, its file spelled from `root` (a finding in the entry
+/// file names none, and reads as `src/main.weft`'s), and whether one of
+/// its parts is among the `hiding` nodes ([`hiding_nodes`]).
+fn broken_part(
+    d: &Diagnostic,
+    root: Option<&std::path::Path>,
+    hiding: &std::collections::BTreeSet<String>,
+) -> weft_core::project::Broken {
+    let file = match d.file.as_deref() {
+        Some(file) => root
+            .and_then(|root| std::path::Path::new(file).strip_prefix(root).ok())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| file.to_string()),
+        None => format!("{}/{}", project::SRC_DIR, project::ENTRY_FILE),
+    };
+    weft_core::project::Broken {
+        parts: d.subjects.clone(),
+        why: format!("{file}:{}:{} {}", d.line, d.column, d.message),
+        hides: d.subjects.iter().any(|part| hiding.contains(part)),
+    }
 }
 
 /// Render a diagnostic list as one `line:column message` per line.
@@ -345,17 +475,20 @@ pub fn render_diagnostics(diagnostics: &[Diagnostic]) -> String {
         diagnostics
             .iter()
             .filter(|d| !only_errors || matches!(d.severity, Severity::Error))
-            // A finding in an @include's file names that file; without
-            // the prefix its line number reads as the compiled source's.
-            .map(|d| {
-                let file = d.file.as_deref().map(|f| format!("{f}:")).unwrap_or_default();
-                format!("{file}{}:{} {}", d.line, d.column, d.message)
-            })
+            .map(render_diagnostic)
             .collect::<Vec<_>>()
             .join("\n")
     };
     let errors = render(true);
     if errors.is_empty() { render(false) } else { errors }
+}
+
+/// One diagnostic as one `[file:]line:column message` line. A finding in
+/// an @include's file names that file; without the prefix its line number
+/// reads as the compiled source's.
+pub fn render_diagnostic(d: &Diagnostic) -> String {
+    let file = d.file.as_deref().map(|f| format!("{f}:")).unwrap_or_default();
+    format!("{file}{}:{} {}", d.line, d.column, d.message)
 }
 
 /// Turn an `Error`-severity diagnostic set into a single loud
@@ -379,5 +512,6 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         updated_at: chrono::Utc::now(),
         defaults: Default::default(),
         given: Default::default(),
+        broken: Vec::new(),
     }
 }

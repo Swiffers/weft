@@ -18,9 +18,10 @@ use weft_broker_client::protocol::{
 
 /// The signal rows a booting or rehydrating listener must hold: every row
 /// whose governing activation listens ([`ACTIVATION_LISTENS`], or that
-/// none governs). A wiped activation's rows are gone; a hibernation past
-/// its grace window keeps its rows (a reactivate restores them from here)
-/// but no longer listens, so they never come out of this query. Mixed
+/// none governs). A trigger taken down refusing with nothing kept has no
+/// rows left; one whose door refuses with work kept, or whose window is
+/// over, keeps its rows (its next activation starts from them) but no
+/// longer listens, so they never come out of this query. Mixed
 /// tenants: each row carries its own. `project` narrows it to one
 /// project's rows.
 pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<SignalRowWire>> {

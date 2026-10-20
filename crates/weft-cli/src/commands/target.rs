@@ -406,7 +406,7 @@ async fn export(
 /// compile, or an install that cannot answer, come back as one line saying
 /// so.
 async fn unpicked_connections(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project) -> Vec<String> {
-    let definition = match weft_compiler::hash::load_enriched_project_with_diagnostics(project) {
+    let definition = match weft_compiler::hash::load_program_with_diagnostics(project) {
         Ok((definition, _)) => definition,
         Err(_) => return vec!["the program does not compile here, so its connections were not checked".into()],
     };

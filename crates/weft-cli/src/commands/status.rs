@@ -15,9 +15,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     let project_id = project.id().to_string();
 
     // Compute desired hashes from current source. The dispatcher
-    // compares against project.running_binary_hash,
-    // project.running_definition_hash, and project.running_infra_hash
-    // to decide which drift bits to set.
+    // compares them against the build each trigger and infra copy runs:
+    // the code (binary hash), each trigger's cut and each infra place's
+    // own infra, to say which are behind.
     let weft_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     // Both hashes are scoped to the compiled project's referenced /
@@ -41,8 +41,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // Whether the program runs infra of its own, for the first deploy's
     // order (its infra first, then its triggers).
     let mut declares_infra = false;
-    let (desired_binary_hash, desired_full_binary_hash, desired_definition_hash, desired_infra_hash) =
-        match weft_compiler::hash::load_enriched_project(project) {
+    let (desired_binary_hash, desired_full_binary_hash, desired_definition_hash, desired_trigger_cuts, desired_infra_places) =
+        match weft_compiler::hash::load_program(project) {
             Ok((mut def, catalog)) => {
                 declares_infra = weft_core::project::has_infra(&def);
                 let resolved = crate::commands::assets::resolve_project_assets(
@@ -67,9 +67,11 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                             weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full),
                         ),
                         or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
+                        Some(weft_core::projects::NamedHashes(weft_core::run_spec::trigger_fingerprints(&def)).encode()),
                         or_warn(
-                            "the infra's hash",
-                            weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog),
+                            "each infra place's hash",
+                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog)
+                                .map(|places| weft_core::projects::NamedHashes(places).encode()),
                         ),
                     ),
                     // An asset that cannot resolve is what a build will
@@ -77,13 +79,13 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     // desired hashes rather than a made-up drift.
                     Err(e) => {
                         warn_no_drift("its assets do not resolve", &e);
-                        (None, None, None, None)
+                        (None, None, None, None, None)
                     }
                 }
             }
             Err(e) => {
                 warn_no_drift("the project does not compile", &e);
-                (None, None, None, None)
+                (None, None, None, None, None)
             }
         };
 
@@ -91,8 +93,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         desired_binary_hash,
         desired_full_binary_hash,
         desired_definition_hash,
-        desired_infra_hash,
-        ..Default::default()
+        desired_trigger_cuts,
+        desired_infra_places,
     };
     let path = format!("/projects/{project_id}/status{}", query.to_query_string());
 
@@ -140,11 +142,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // The transition axis: only worth a line while in flight.
     match data.transition {
         ProjectTransition::None => {}
-        ProjectTransition::Resyncing => println!(
-            "  resync: under way (`{}` ends its wait on running work, `{}` stops it as the triggers come back)",
-            ctx.weft("cancel-running"),
-            ctx.weft("cancel-activate")
-        ),
+        ProjectTransition::Resyncing => {
+            println!("  resync: under way (`{}` stops it as the triggers come back)", ctx.weft("cancel-activate"))
+        }
         building => println!("  build: {building} (cancel with `{}`)", ctx.weft("cancel-build")),
     }
     for build in &data.builds {
@@ -157,8 +157,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // Orphaned live infra: never silent (the never-lose-track rule).
     if data.orphaned_infra {
         println!(
-            "  WARNING: live infra exists whose node was removed from the source; \
-             it keeps running (and consuming resources) until stopped/terminated via the infra verbs"
+            "  WARNING: live infra exists whose node the source does not declare (removed from it, \
+             or inside a part that does not compile); it keeps running (and consuming resources) \
+             until stopped/terminated via the infra verbs"
         );
     }
 
@@ -184,42 +185,28 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     println!("    {node}: one copy per instance ({counted}, listed under instance infra)");
                 }
                 st => {
-                    println!("    {node}: {st} ({})", entry.endpoint_url.as_deref().unwrap_or("-"));
+                    let behind = if entry.behind { ", behind the source" } else { "" };
+                    println!("    {node}: {st}{behind} ({})", entry.endpoint_url.as_deref().unwrap_or("-"));
                     if let Some(progress) = &entry.progress {
                         println!("      {}", progress.describe(progress.as_of_unix));
                     }
                 }
             }
+            // What stopping it takes down with it: the triggers whose cut
+            // contains it.
+            if !entry.takes_down.is_empty() {
+                println!("      taking it down takes down {}", weft_core::activation::OwnerTriggers::list_words(&entry.takes_down));
+            }
         }
     }
 
-    // Each trigger's own activation: the shared ones make up the
-    // registration line above, and an instance's appear only here.
-    if !data.activations.is_empty() {
+    // Every trigger of the program, whether it is on and behind, and every
+    // instance's copy of one that exists once per instance.
+    if !data.triggers.is_empty() {
         println!("  triggers:");
-        for entry in &data.activations {
-            let (trigger, mode) = (&entry.trigger, entry.mode.as_str());
-            // Which version of the source its fires run, as `weft tree`
-            // names it.
-            let version = entry.version.as_deref().map(|v| format!(", version {}", super::versions::short(v))).unwrap_or_default();
-            match &entry.instance {
-                Some(instance) => println!("    {trigger} (instance {instance}): {mode}{version}"),
-                None => println!("    {trigger}: {mode}{version}"),
-            }
-            // Fires waiting on something no clock brings: what they wait
-            // on hands them over again.
-            if let Some(waiting) = &entry.waiting {
-                use weft_core::door_fire::UnclockedWait;
-                let (fires, wait) = if waiting.fires == 1 { ("1 fire".to_string(), "waits") } else { (format!("{} fires", waiting.fires), "wait") };
-                let until = match waiting.on {
-                    UnclockedWait::Instance => format!("{wait} until the instance's values change"),
-                    UnclockedWait::Infra => format!("{wait} until the infra the runs read is running again"),
-                    UnclockedWait::Picks => format!("{wait} until the install picks the connections the runs need"),
-                    UnclockedWait::Failure => "stopped after failing to start a run, and holds the trigger's queue; `weft activate`, a new \
-                                               build or a change of the worker settings tries again"
-                        .to_string(),
-                };
-                println!("      {fires} {until}: {}", waiting.reason);
+        for entry in &data.triggers {
+            for line in trigger_lines(entry) {
+                println!("    {line}");
             }
         }
     }
@@ -227,7 +214,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     if !data.instance_infra.is_empty() {
         println!("  instance infra:");
         for entry in &data.instance_infra {
-            println!("    {} (instance {}): {}", entry.node, entry.instance, entry.status);
+            let behind = if entry.behind { ", behind the source" } else { "" };
+            println!("    {} (instance {}): {}{behind}", entry.node, entry.instance, entry.status);
             if let Some(progress) = &entry.progress {
                 println!("      {}", progress.describe(progress.as_of_unix));
             }
@@ -301,14 +289,84 @@ fn or_warn(what: &str, hash: Result<String>) -> Option<String> {
     hash.map_err(|e| warn_no_drift(&format!("{what} cannot be worked out"), &e)).ok()
 }
 
+
+/// One trigger as `weft status` lists it: the shared one on one line, one
+/// that exists once per instance as how many instances have it on, then
+/// each instance's copy.
+fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
+    use weft_core::projects::{TriggerCopy, TriggerState};
+    let gone = if entry.gone { " (the program has it no more; `weft deactivate --trigger` takes it down)" } else { "" };
+    let reads = match entry.depends_on.as_slice() {
+        [] => String::new(),
+        infra => format!("; reads {}", infra.join(", ")),
+    };
+    let copy_words = |copy: &TriggerCopy| -> String {
+        let state = match copy.state {
+            TriggerState::Off => {
+                let door = match copy.mode {
+                    weft_core::activation::ActivationMode::Down(door) => format!("off, its door set to {}", door.as_str()),
+                    _ => "off".to_string(),
+                };
+                match copy.down_with {
+                    None => door,
+                    Some(weft_core::projects::DownWith::Health) => format!(
+                        "{door}, taken down by the health check (its infra's health rules bring it back once that infra is \
+                         healthy; with rules that do not, `weft activate` does)"
+                    ),
+                    Some(weft_core::projects::DownWith::Infra) => {
+                        format!("{door}, taken down with its infra (it comes back once that infra runs again)")
+                    }
+                }
+            }
+            TriggerState::TurningOn => "turning on".to_string(),
+            TriggerState::On => "on".to_string(),
+            TriggerState::Behind => "on, behind the source (`weft resync` brings it up to date)".to_string(),
+        };
+        let held_back = copy.held_back.as_deref().map(|why| format!(", held back: {why}")).unwrap_or_default();
+        let held = if copy.held.is_empty() { String::new() } else { format!(", holding {}", copy.held.describe()) };
+        let version = copy.version.as_deref().map(|v| format!(", version {}", super::versions::short(v))).unwrap_or_default();
+        let waiting = copy.waiting.as_ref().map(waiting_words).unwrap_or_default();
+        format!("{state}{held_back}{held}{version}{waiting}")
+    };
+    let mut lines = Vec::new();
+    match &entry.shared {
+        Some(copy) => lines.push(format!("{}: {}{reads}{gone}", entry.node, copy_words(copy))),
+        None => {
+            let on = entry.copies.iter().filter(|c| matches!(c.state, TriggerState::On | TriggerState::Behind)).count();
+            lines.push(format!("{}: once per instance, {on} of {} on{reads}{gone}", entry.node, entry.copies.len()));
+        }
+    }
+    for copy in &entry.copies {
+        let instance = copy.instance.as_ref().map(|i| i.as_str()).unwrap_or("-");
+        lines.push(format!("  instance {instance}: {}", copy_words(copy)));
+    }
+    lines
+}
+
+/// "; 2 fires wait until ...", for fires waiting on something no clock
+/// brings: what they wait on hands them over again.
+fn waiting_words(waiting: &weft_core::program::WaitingFires) -> String {
+    use weft_core::door_fire::UnclockedWait;
+    let (fires, wait) = if waiting.fires == 1 { ("1 fire".to_string(), "waits") } else { (format!("{} fires", waiting.fires), "wait") };
+    let until = match waiting.on {
+        UnclockedWait::Instance => format!("{wait} until the instance's values change"),
+        UnclockedWait::Infra => format!("{wait} until the infra the runs read is running again"),
+        UnclockedWait::Picks => format!("{wait} until the install picks the connections the runs need"),
+        UnclockedWait::Failure => "stopped after failing to start a run, and holds the trigger's queue; `weft activate`, a new \
+                                   build or a change of the worker settings tries again"
+            .to_string(),
+    };
+    format!("; {fires} {until}: {}", waiting.reason)
+}
+
 /// Every drift bit the dispatcher set, each with the verb that clears
-/// it. Silent when nothing drifted.
+/// it. Silent when nothing drifted. A trigger behind is listed with the
+/// trigger.
 fn print_drift(ctx: &Ctx, drift: &ProjectDrift) {
     let lines = [
-        (drift.infra_drift, format!("infra: source has changed; `{}` rebuilds it", ctx.weft("infra upgrade"))),
+        (drift.infra_drift, format!("infra: a copy is behind the source; `{}` puts the change live", ctx.weft("infra upgrade"))),
         (drift.binary_drift, format!("binary: worker code has changed; the next run or `{}` rebuilds the image", ctx.weft("build"))),
         (drift.definition_drift, "definition: project shape has changed; the next run picks it up".to_string()),
-        (drift.activation_drift, format!("activation: the listeners fire an older program; `{}` re-registers them against this one", ctx.weft("resync"))),
     ];
     if lines.iter().all(|(set, _)| !set) {
         return;
@@ -319,3 +377,64 @@ fn print_drift(ctx: &Ctx, drift: &ProjectDrift) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use weft_core::activation::ActivationMode;
+    use weft_core::instance::InstanceId;
+    use weft_core::projects::{HeldWork, TriggerCopy, TriggerEntry, TriggerState};
+
+    fn copy(instance: Option<&str>, state: TriggerState, mode: ActivationMode) -> TriggerCopy {
+        TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None }
+    }
+
+    /// A shared trigger is one line with what it reads; one that exists
+    /// once per instance says how many are on, then each instance's.
+    #[test]
+    fn a_trigger_reads_as_whether_it_is_on_and_behind() {
+        let door = TriggerEntry {
+            node: "door".into(),
+            per_instance: false,
+            gone: false,
+            shared: Some(TriggerCopy { held: HeldWork { arrivals: 2, paused: 0 }, ..copy(None, TriggerState::Off, ActivationMode::Down(weft_core::Door::Hide)) }),
+            copies: Vec::new(),
+            depends_on: vec!["db".into()],
+        };
+        let lines = super::trigger_lines(&door);
+        assert!(lines[0].starts_with("door: off, its door set to hide, holding 2 ") && lines[0].ends_with("; reads db"), "{lines:?}");
+        let inbox = TriggerEntry {
+            node: "inbox".into(),
+            per_instance: true,
+            gone: false,
+            shared: None,
+            copies: vec![copy(Some("ada"), TriggerState::Behind, ActivationMode::Active), copy(Some("bob"), TriggerState::Off, ActivationMode::Registered)],
+            depends_on: Vec::new(),
+        };
+        let lines = super::trigger_lines(&inbox);
+        assert_eq!(lines[0], "inbox: once per instance, 1 of 2 on");
+        assert!(lines[1].starts_with("  instance ada: on, behind the source"), "{lines:?}");
+        assert_eq!(lines[2], "  instance bob: off");
+    }
+
+    /// A trigger the health check took down says so, and what brings it
+    /// back; one taken down with its infra says what brings it back too.
+    #[test]
+    fn a_trigger_down_by_the_health_check_says_so() {
+        let entry = |down_with| TriggerEntry {
+            node: "door".into(),
+            per_instance: false,
+            gone: false,
+            shared: Some(TriggerCopy { down_with, ..copy(None, TriggerState::Off, ActivationMode::Down(weft_core::Door::Take)) }),
+            copies: Vec::new(),
+            depends_on: vec!["db".into()],
+        };
+        let health = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Health)));
+        assert!(health[0].contains("taken down by the health check") && health[0].contains("`weft activate`"), "{health:?}");
+        let infra = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Infra)));
+        assert!(infra[0].contains("taken down with its infra"), "{infra:?}");
+        assert!(!super::trigger_lines(&entry(None))[0].contains("taken down"));
+        let mut held_back = entry(Some(weft_core::projects::DownWith::Health));
+        held_back.shared.as_mut().unwrap().held_back = Some("triggers on another build. `weft resync --all` moves them".into());
+        let lines = super::trigger_lines(&held_back);
+        assert!(lines[0].contains("held back: triggers on another build") && lines[0].contains("`weft resync --all`"), "{lines:?}");
+    }
+}

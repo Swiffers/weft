@@ -1,16 +1,19 @@
-//! `weft infra start | restart | upgrade | stop | terminate | status`.
+//! `weft infra start | upgrade | stop | terminate | status | ...`.
 //!
-//! Start / Restart map to `/projects/{id}/infra/sync`, which answers
-//! once the infra is up. Upgrade maps to `/projects/{id}/infra/upgrade`,
-//! which issues a command the dispatcher runs on its own (stop leg, then
-//! the start) and answers with its id at once; the CLI follows the
-//! command to its outcome. The dispatcher decides per-node
-//! skip-vs-apply via the resolved spec hash.
+//! Start maps to `/projects/{id}/infra/sync`, which answers once the
+//! infra is up. Upgrade maps to `/projects/{id}/infra/upgrade`, which
+//! issues a command per owner the dispatcher runs on its own (stop leg,
+//! then the start) and answers with their ids at once; the CLI follows
+//! each to its outcome. Stop and terminate issue a command per owner the
+//! supervisor runs.
 //!
-//! Stop / Terminate are direct: they enqueue an
-//! `infra_lifecycle_command` row that the supervisor owning the project
-//! claims and executes.
-
+//! Every one of them may name infra nodes (`--infra`, repeatable: every
+//! one of the owners' kind when none is) and whose copies (`--instance`,
+//! repeatable, or `--all-instances`; the shared ones when neither is).
+//! Stop, terminate and upgrade first take down the triggers whose cut
+//! contains the copies, as `--door`, `--held` and `--running` say
+//! (`weft_core::take_down`); they come back on by themselves once the
+//! copies run again.
 
 use anyhow::Result;
 
@@ -18,8 +21,10 @@ use super::Ctx;
 use weft_core::infra::InfraNodeStatus;
 use weft_core::infra::wire::{
     CommandOutcome, CommandStatus, CopyRef, DoorsResponse, InfraLogs, InfraStatus, LifecycleCommandIssued, LogBlock,
-    PerNodeRequest, StopRequest, SyncRequest, UpgradeRequest,
+    StopRequest, SyncRequest, UpgradeRequest,
 };
+use weft_core::instance::InstanceTarget;
+use weft_core::TakeDownChoice;
 use anyhow::Context;
 
 use crate::progress::{ActionVerb, Progress};
@@ -28,7 +33,8 @@ use crate::progress::{ActionVerb, Progress};
 pub enum InfraAction {
     Start,
     Upgrade,
-    Stop,
+    /// `force`: every unit scaled to zero, its `on_stop` ignored.
+    Stop { force: bool },
     /// `yes`: the confirmation, answered up front (`--yes`).
     Terminate { yes: bool },
     Status,
@@ -36,70 +42,57 @@ pub enum InfraAction {
     /// is part of what a node IS (its endpoint declares it), so there
     /// is nothing here to open or close.
     ListDoors,
-    /// Cancel in-flight infra work (claimed lifecycle commands halt
-    /// between platform calls; unclaimed ones cancel outright; the
-    /// provisioning run is interrupted). HALT, not rollback.
-    Cancel,
+    /// Cancel in-flight infra work of one owner's copies (claimed
+    /// lifecycle commands halt between platform calls; unclaimed ones
+    /// cancel outright; the provisioning run is interrupted). HALT, not
+    /// rollback.
+    Cancel { instance: Option<weft_core::instance::InstanceId> },
     /// Ask the supervisor to look at the infra again.
     Look,
-    /// Per-node verbs. `node` is the node's PLACE as a person spells it
-    /// (`one.db`), checked and written canonical by `place_named`
-    /// before the daemon sees it.
-    NodeStop { node: String, force: bool },
-    /// `yes`: the confirmation, answered up front (`--yes`).
-    NodeTerminate { node: String, yes: bool },
     /// What the infra containers wrote, read straight off the processes.
     Logs { node: Option<String>, tail: usize, follow: bool },
 }
 
-/// Trigger-deactivation choices for the infra verbs that take triggers
-/// down (Stop, Terminate, Upgrade). Mirrors the shared
-/// `prompt_trigger_deactivation` argument shape.
-///
-/// All fields are optional at the CLI surface. A choice given with
-/// `--mode` or `--grace` is always sent; without one, the dispatcher
-/// says when it needs one (a trigger reading this infra is on), and
-/// then a TTY is asked and `--json` or a script fails naming the flags
-/// (see `post_with_trigger_choice`). The triggers a stop, terminate or
-/// upgrade takes down come back on by themselves once their infra is up
-/// again (a start, the upgrade's own start leg); a trigger the person
-/// switched off themselves stays off.
+/// What a lifecycle verb acts on, and how the triggers whose cut contains
+/// it go down.
 #[derive(Default, Clone)]
 pub struct InfraOpts {
-    pub trigger: super::deactivate::TriggerChoiceFlags,
-    /// An instance's copies (`--instance`); the shared infra when absent.
-    pub instance: Option<weft_core::instance::InstanceId>,
+    /// The infra nodes as a person spells them (`--infra`); every one of
+    /// the owners' kind when empty.
+    pub nodes: Vec<String>,
+    /// Whose copies (`--instance`, `--all-instances`).
+    pub instances: InstanceTarget,
+    /// How the triggers whose cut contains the copies go down (stop,
+    /// terminate and upgrade).
+    pub take_down: TakeDownChoice,
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
-    if matches!(action, InfraAction::ListDoors) {
-        return list_doors(&ctx).await;
+    match action {
+        InfraAction::ListDoors => return list_doors(&ctx).await,
+        InfraAction::Status => return infra_status(&ctx).await,
+        InfraAction::Look => return infra_look(&ctx).await,
+        InfraAction::Logs { node, tail, follow } => {
+            let node = match node {
+                Some(node) => Some(place_named(&ctx, &node).await?),
+                None => None,
+            };
+            return infra_logs(&ctx, node.as_deref(), tail, follow).await;
+        }
+        _ => {}
     }
-    if matches!(action, InfraAction::Status) {
-        return infra_status(&ctx).await;
-    }
-    if matches!(action, InfraAction::Look) {
-        return infra_look(&ctx).await;
-    }
-    if let InfraAction::Logs { node, tail, follow } = action {
-        let node = match node {
-            Some(node) => Some(place_named(&ctx, &node).await?),
-            None => None,
-        };
-        return infra_logs(&ctx, node.as_deref(), tail, follow).await;
+    // Refused before anything is asked or built: a contradiction in the
+    // answers, or answers on a verb that takes nothing down.
+    if matches!(action, InfraAction::Stop { .. } | InfraAction::Terminate { .. } | InfraAction::Upgrade) {
+        opts.take_down.resolve().map_err(|why| anyhow::anyhow!("{why}"))?;
+    } else if opts.take_down != TakeDownChoice::default() {
+        anyhow::bail!("--door, --door-for, --held and --running say how triggers go down, and this verb takes none down");
     }
     // Terminating deletes resources, stored data included unless a node
     // keeps it, so it never runs on a bare command: a terminal is asked,
     // and a script says `--yes`.
-    let unconfirmed = match (&action, &opts.instance) {
-        (InfraAction::Terminate { yes: false }, None) => Some("the program's shared infra".to_string()),
-        (InfraAction::Terminate { yes: false }, Some(instance)) => Some(format!("the infra of instance '{instance}'")),
-        (InfraAction::NodeTerminate { node, yes: false }, None) => Some(format!("infra node '{node}'")),
-        (InfraAction::NodeTerminate { node, yes: false }, Some(instance)) => Some(format!("infra node '{node}' of instance '{instance}'")),
-        _ => None,
-    };
-    if let Some(whose) = unconfirmed {
-        if !confirm_terminate(&ctx, &whose)? {
+    if let InfraAction::Terminate { yes: false } = &action {
+        if !confirm_terminate(&ctx, &whose_infra(&opts))? {
             println!("aborted");
             return Ok(());
         }
@@ -107,11 +100,9 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
         InfraAction::Upgrade => ActionVerb::InfraUpgrade,
-        InfraAction::Stop => ActionVerb::InfraStop,
+        InfraAction::Stop { .. } => ActionVerb::InfraStop,
         InfraAction::Terminate { .. } => ActionVerb::InfraTerminate,
-        InfraAction::Cancel => ActionVerb::InfraCancel,
-        InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
-        InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
+        InfraAction::Cancel { .. } => ActionVerb::InfraCancel,
         InfraAction::Status | InfraAction::ListDoors | InfraAction::Look | InfraAction::Logs { .. } => unreachable!(),
     };
     let ctx_inner = ctx.clone();
@@ -121,12 +112,37 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     .await
 }
 
+/// The infra a terminate would delete, in the confirmation's words.
+fn whose_infra(opts: &InfraOpts) -> String {
+    let what = match opts.nodes.as_slice() {
+        [] => "the infra".to_string(),
+        [one] => format!("infra node '{one}'"),
+        many => format!("infra nodes {}", many.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")),
+    };
+    match &opts.instances {
+        InstanceTarget::Shared => format!("{what} the program shares"),
+        InstanceTarget::Named(ids) => {
+            format!("{what} of instance {}", ids.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", "))
+        }
+        InstanceTarget::EveryInstance => format!("{what} of every instance"),
+        InstanceTarget::Everything => format!("{what} the program shares and every instance's"),
+    }
+}
+
 async fn run_inner(
     ctx: &Ctx,
     progress: &Progress,
     action: InfraAction,
-    opts: InfraOpts,
+    mut opts: InfraOpts,
 ) -> Result<()> {
+    // The places are read here, inside the progress wrapper, so a refusal
+    // ("names no node") reaches the graph's action bar as this verb's
+    // error like every other failure of the verb.
+    let mut places = Vec::new();
+    for node in &opts.nodes {
+        places.push(place_named(ctx, node).await?);
+    }
+    opts.nodes = places;
     // Run the action's work. The command bodies emit phase progress
     // (dispatcher_call_start/done, provision phases) but NOT a terminal
     // `complete`: we emit exactly one `complete` here, after the whole
@@ -134,42 +150,21 @@ async fn run_inner(
     // for the FULL verb, including multi-phase Upgrade (stop + start);
     // a per-phase `complete` would clear the overlay mid-upgrade and
     // let the bar flicker through intermediate interactive states.
-    let summary = match &action {
-        InfraAction::Start => "infra started",
-        InfraAction::Upgrade => "infra upgraded",
-        InfraAction::Stop => "infra stopped",
-        InfraAction::Terminate { .. } => "infra terminated",
-        InfraAction::Cancel => "infra cancel issued",
-        InfraAction::NodeStop { .. } => "infra node stopped",
-        InfraAction::NodeTerminate { .. } => "infra node terminated",
+    let (done, report) = match action {
+        InfraAction::Start => ("infra started", infra_sync(ctx, progress, false, opts).await?),
+        InfraAction::Upgrade => ("infra upgraded", infra_sync(ctx, progress, true, opts).await?),
+        InfraAction::Stop { force } => ("infra stopped", infra_destroy(ctx, progress, opts, "stop", force).await?),
+        InfraAction::Terminate { .. } => ("infra terminated", infra_destroy(ctx, progress, opts, "terminate", false).await?),
+        InfraAction::Cancel { instance } => {
+            infra_cancel(ctx, progress, instance.as_ref()).await?;
+            ("infra cancel issued", None)
+        }
         InfraAction::Status | InfraAction::ListDoors | InfraAction::Look | InfraAction::Logs { .. } => unreachable!(),
     };
-    match action {
-        // Plain Start: just bring DOWN units up (apply skips up units).
-        InfraAction::Start => infra_sync(ctx, progress, action, opts).await?,
-        // Upgrade: ONE `/infra/upgrade` POST. The SERVER owns the
-        // decomposition (deactivate per the user's spec when active,
-        // stop leg, then apply) and runs it as a command this follows,
-        // so every client gets the same upgrade from a single request.
-        InfraAction::Upgrade => infra_sync(ctx, progress, action, opts).await?,
-        InfraAction::Stop => infra_stop(ctx, progress, opts).await?,
-        InfraAction::Terminate { .. } => infra_terminate(ctx, progress, opts).await?,
-        InfraAction::Cancel => infra_cancel(ctx, progress, opts.instance.as_ref()).await?,
-        // The place is read here, inside the progress wrapper, so a
-        // refusal ("names no node") reaches the graph's action bar as
-        // this verb's error like every other failure of the verb; the
-        // per-node menu is exactly the caller reading those events.
-        InfraAction::NodeStop { node, force } => {
-            let place = place_named(ctx, &node).await?;
-            infra_node_verb(ctx, progress, &place, "stop", force, &opts).await?
-        }
-        InfraAction::NodeTerminate { node, .. } => {
-            let place = place_named(ctx, &node).await?;
-            infra_node_verb(ctx, progress, &place, "terminate", false, &opts).await?
-        }
-        InfraAction::Status | InfraAction::ListDoors | InfraAction::Look | InfraAction::Logs { .. } => unreachable!(),
+    match report.filter(|report| !report.triggers.is_empty()) {
+        Some(report) => progress.complete(&format!("{done}; first {}", report.describe())),
+        None => progress.complete(done),
     }
-    progress.complete(summary);
     Ok(())
 }
 
@@ -230,130 +225,52 @@ pub(crate) async fn place_named(ctx: &Ctx, spelled: &str) -> Result<String> {
     Err(refusal)
 }
 
-async fn infra_node_verb(
-    ctx: &Ctx,
-    progress: &Progress,
-    place: &str,
-    verb: &str,
-    force: bool,
-    opts: &InfraOpts,
-) -> Result<()> {
-    let (client, project_id, name) = super::resolve_project(ctx)?;
-    let path = format!("/projects/{project_id}/infra/nodes/{place}/{verb}");
-    // The running-work answer, read the one way every verb reads it:
-    // a person who passes nothing gets cancel, and a cap beside cancel
-    // is refused here rather than sent to bound nothing.
-    let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
-        opts.trigger.running_policy.as_deref(),
-        opts.trigger.drain_timeout,
-    )?;
-    let body = PerNodeRequest {
-        running: super::ensure::running_choice(running_policy, drain_timeout),
-        force,
-        instance: opts.instance.clone(),
-    };
-    progress.drain_wait(running_policy, drain_timeout);
-    progress.dispatcher_call_start(&path);
-    // 202 Accepted with the command it runs as.
-    let issued = issued_command(client.post_json(&path, &serde_json::to_value(&body)?).await?, verb)?;
-    progress.dispatcher_call_done(serde_json::json!({ "projectId": project_id, "node": place }));
-    let command_id = issued.command_id;
-    // Wait on the command, not a per-node status: a NoOp unit staying
-    // up means the node never reaches "stopped", so the command
-    // outcome is the honest done signal (and a force-stop completing
-    // is what we actually want to wait for).
-    wait_for_command(progress, ctx.on(), &client, &project_id, command_id, verb).await?;
-    if !ctx.json() {
-        print_status(&name, &project_id, &infra_status_of(&client, &project_id).await?);
-    }
-    // Terminal event emitted once by `run_inner` (see infra_sync note).
-    Ok(())
-}
-
+/// Start (`upgrade` false) or upgrade the copies `opts` names. A start
+/// starts what is not running (with `--infra`, those nodes and what they
+/// need upstream), and the triggers a stop of it took down come back by
+/// themselves once it runs; an upgrade builds, then takes down the
+/// triggers whose cut contains what runs on another build, and cycles it
+/// onto this one, touching nothing else. What the upgrade's take-down did
+/// is answered for the summary.
 async fn infra_sync(
     ctx: &Ctx,
     progress: &Progress,
-    action: InfraAction,
+    upgrade: bool,
     opts: InfraOpts,
-) -> Result<()> {
+) -> Result<Option<weft_core::deactivation::TakeDownReport>> {
     // The build registers the infra images every place runs alongside the
     // program; the sync names that build and applies it.
     let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
-
-    // A START never deactivates: an active project's triggers stay
-    // live while infra comes up (only runs that actually touch
-    // the not-yet-running infra fail, loudly, at the node), so it asks
-    // no deactivation questions. An UPGRADE of an ACTIVE project takes
-    // live infra down (the server's stop leg), so it collects the
-    // user's deactivation choice (same picker as `weft deactivate`)
-    // and sends it to `/infra/upgrade`; the server decomposes.
-    // The running-work pair, read the one way every verb reads it (a
-    // misspelt policy is refused here with the CLI's own words, a cap
-    // beside cancel is refused rather than sent to bound nothing). It
-    // answers the worker replacement inside sync and an upgrade's stop
-    // leg; when the picker is shown its answer outranks these fields,
-    // and it is built from the same pair.
-    let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
-        opts.trigger.running_policy.as_deref(),
-        opts.trigger.drain_timeout,
-    )?;
-    // Only an upgrade carries the choice (the dispatcher refuses it on a
-    // plain start), and only the dispatcher knows whether a trigger
-    // reading this infra is on, the program's or an instance's: a given
-    // choice always goes, and otherwise `post_with_trigger_choice` asks
-    // or names the flags when the dispatcher says it needs one.
-    let upgrade = matches!(action, InfraAction::Upgrade);
-    let given = if upgrade {
-        super::deactivate::given_trigger_deactivation(
-            ctx.json(),
-            opts.trigger.mode.as_deref(),
-            opts.trigger.grace,
-            running_policy,
-            drain_timeout,
-        )?
-    } else {
-        None
-    };
-
-    let sync = SyncRequest {
-        build: handle.built.named(),
-        running: super::ensure::running_choice(running_policy, drain_timeout),
-        instance: opts.instance.clone(),
-        nodes: Vec::new(),
-    };
+    let sync = SyncRequest { build: handle.built.named(), instances: opts.instances.clone(), nodes: opts.nodes.clone() };
     let path = format!("/projects/{}/infra/{}", handle.id, if upgrade { "upgrade" } else { "sync" });
-    // The one line that says the call may now sit for a while (an
-    // upgrade's stop leg, or the worker replacement, draining up to the
-    // cap), so a quiet terminal is a wait and not a hang.
-    progress.drain_wait(running_policy, drain_timeout);
     // The places the build registered an infra image for: the ones the
     // sync provisions.
-    let node_ids: Vec<String> = handle.built.infra_images.keys().cloned().collect();
+    let node_ids: Vec<String> = match opts.nodes.is_empty() {
+        true => handle.built.infra_images.keys().cloned().collect(),
+        false => opts.nodes.clone(),
+    };
     progress.infra_provision_start(&node_ids);
-    progress.dispatcher_call_start(&path);
-    // An upgrade answers 202 with the command the dispatcher runs it
-    // as; its outcome is the upgrade's, and the infra status after it
-    // is what is shown. Only an upgrade carries the trigger choice. A
-    // sync answers with the status itself.
+    let mut report = None;
+    // An upgrade answers 202 with the commands the dispatcher runs it as;
+    // their outcomes are the upgrade's, and the infra status after them is
+    // what is shown. A sync answers with the status itself.
     let resp = if upgrade {
-        let body = UpgradeRequest { sync, trigger_deactivation: None };
-        let answer = super::deactivate::post_with_trigger_choice(
-            &handle.client,
-            &path,
-            body,
-            ctx.json(),
-            given,
-            running_policy,
-            drain_timeout,
-        )
-        .await?;
+        let body = UpgradeRequest { sync, take_down: opts.take_down };
+        if let Ok(take_down) = opts.take_down.resolve() {
+            progress.drain_wait(take_down.running, crate::progress::DrainOn::Infra);
+        }
+        progress.dispatcher_call_start(&path);
+        let issued = issued_command(handle.client.post_json(&path, &serde_json::to_value(&body)?).await?, "upgrade")?;
         progress.dispatcher_call_done(serde_json::json!({ "projectId": handle.id }));
-        let issued = issued_command(answer, "upgrade")?;
-        wait_for_command(progress, ctx.on(), &handle.client, &handle.id, issued.command_id, "upgrade").await?;
+        for command_id in &issued.command_ids {
+            wait_for_command(progress, ctx.on(), &handle.client, &handle.id, *command_id, "upgrade").await?;
+        }
+        report = Some(issued.report);
         infra_status_of(&handle.client, &handle.id).await?
     } else {
         // The sync answers once every copy is up, which on a cloud install
         // is minutes of a machine booting: say what each is doing meanwhile.
+        progress.dispatcher_call_start(&path);
         let body = serde_json::to_value(&sync)?;
         let answer = crate::progress::while_waiting(
             handle.client.post_json(&path, &body),
@@ -370,76 +287,45 @@ async fn infra_sync(
     for note in resp.host_notes() {
         progress.warn(note);
     }
+    handle.warn_broken(progress);
     if !ctx.json() {
         print_status(&handle.name, &handle.id, &resp);
     }
     // No `progress.complete` here: the terminal event is emitted ONCE
-    // by `run_inner` after the whole action. Upgrade chains stop+sync,
-    // and a `complete` from a sub-phase would clear the action-bar
-    // overlay mid-upgrade (the bar would flicker through intermediate
-    // interactive states). This stays a phase, not a terminus.
-    Ok(())
+    // by `run_inner` after the whole action.
+    Ok(report)
 }
 
-
-async fn infra_stop(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Result<()> {
-    infra_destroy(ctx, progress, opts, "stop").await
-}
-
-async fn infra_terminate(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Result<()> {
-    infra_destroy(ctx, progress, opts, "terminate").await
-}
-
-/// Stop / Terminate share this body. The trigger-deactivation choice
-/// goes along when it was given; otherwise the dispatcher, which knows
-/// whether a trigger reading this infra is on (the program's or a
-/// instance's), asks for it and `post_with_trigger_choice` prompts or
-/// names the flags. The running-work choice goes on the body either
-/// way, because with no trigger on there can still be runs
-/// running on this infra and `wait` is how they get to land first. Waits on the COMMAND's completion (not the
-/// rollup): a stop where a NoOp unit stays up never drives the rollup
-/// to "stopped", so the command outcome is the only honest done
-/// signal.
+/// Stop or terminate the copies `opts` names: the triggers whose cut
+/// contains them taken down first, as `opts.take_down` says. Waits on the
+/// COMMANDS' completion (not the rollup): a stop where a NoOp unit stays
+/// up never drives the rollup to "stopped", so the outcome is the only
+/// honest done signal.
 async fn infra_destroy(
     ctx: &Ctx,
     progress: &Progress,
     opts: InfraOpts,
     verb: &str,
-) -> Result<()> {
-    // Read the one way every verb reads it, before anything is asked
-    // or sent: a misspelt policy or a cap beside cancel is refused here.
-    let (running_policy, drain_timeout) = super::ensure::parse_running_choice(
-        opts.trigger.running_policy.as_deref(),
-        opts.trigger.drain_timeout,
-    )?;
-    let given = super::deactivate::given_trigger_deactivation(
-        ctx.json(),
-        opts.trigger.mode.as_deref(),
-        opts.trigger.grace,
-        running_policy,
-        drain_timeout,
-    )?;
+    force: bool,
+) -> Result<Option<weft_core::deactivation::TakeDownReport>> {
     let (client, id, name) = super::resolve_project(ctx)?;
     let path = format!("/projects/{id}/infra/{verb}");
-    let body = StopRequest {
-        trigger_deactivation: None,
-        running: super::ensure::running_choice(running_policy, drain_timeout),
-        instance: opts.instance.clone(),
-    };
-    progress.drain_wait(running_policy, drain_timeout);
+    let body = StopRequest { take_down: opts.take_down, instances: opts.instances, nodes: opts.nodes, force };
+    if let Ok(take_down) = opts.take_down.resolve() {
+        progress.drain_wait(take_down.running, crate::progress::DrainOn::Infra);
+    }
     progress.dispatcher_call_start(&path);
-    // 202 Accepted with the command it runs as.
-    let answer =
-        super::deactivate::post_with_trigger_choice(&client, &path, body, ctx.json(), given, running_policy, drain_timeout)
-            .await?;
+    // 202 Accepted with the commands it runs as.
+    let issued = issued_command(client.post_json(&path, &serde_json::to_value(&body)?).await?, verb)?;
     progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
-    let issued = issued_command(answer, verb)?;
-    wait_for_command(progress, ctx.on(), &client, &id, issued.command_id, verb).await?;
+    for command_id in &issued.command_ids {
+        wait_for_command(progress, ctx.on(), &client, &id, *command_id, verb).await?;
+    }
     if !ctx.json() {
         print_status(&name, &id, &infra_status_of(&client, &id).await?);
     }
-    // Terminal event emitted once by `run_inner` (see infra_sync note).
-    Ok(())
+    // Terminal event emitted once by `run_inner`.
+    Ok(Some(issued.report))
 }
 
 /// Poll the command-status endpoint until the supervisor marks the
@@ -740,6 +626,17 @@ mod tests {
         assert!(out.contains("db.pg  10.0.0.2:5432"), "{out}");
         assert!(out.contains("db.pg (instance ann)  10.0.0.3:5432"), "{out}");
         assert!(out.contains("cache  (still being applied"), "{out}");
+    }
+
+    /// A terminate's confirmation names the nodes and whose copies.
+    #[test]
+    fn a_terminate_asks_about_exactly_what_it_deletes() {
+        let opts = |nodes: &[&str], instances| InfraOpts { nodes: nodes.iter().map(|n| n.to_string()).collect(), instances, ..Default::default() };
+        assert_eq!(whose_infra(&opts(&[], InstanceTarget::Shared)), "the infra the program shares");
+        assert_eq!(whose_infra(&opts(&["db"], InstanceTarget::EveryInstance)), "infra node 'db' of every instance");
+        assert_eq!(whose_infra(&opts(&[], InstanceTarget::Everything)), "the infra the program shares and every instance's");
+        let named = InstanceTarget::named(vec![weft_core::instance::InstanceId::new("ann").unwrap()]);
+        assert_eq!(whose_infra(&opts(&["db", "cache"], named)), "infra nodes 'db', 'cache' of instance 'ann'");
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use weft_platform_traits::identity::Principal;
-use weft_platform_traits::{Clock, Patience, PortTaken, Runner, WorkerEndpoint, WorkerSettings, WorkerTarget, WORKER_AUTH_HEADER};
+use weft_platform_traits::{Clock, Patience, PortTaken, Runner, WorkerEndpoint, WorkerSettings, WorkerTarget, WorkerWontStart, WORKER_AUTH_HEADER};
 
 use crate::docker::{self, labels, roles, Docker};
 use crate::identity::LocalIdentity;
@@ -48,10 +48,11 @@ const WORKER_PORT: u16 = 8080;
 /// run), so a worker that does not answer by then is broken.
 const START_DEADLINE: Duration = Duration::from_secs(120);
 
-/// How long a worker being replaced (a front giving way to the next, one
-/// that stopped answering) gets to let its runs go (`weft_engine::worker`:
-/// five seconds for a firing to end, then its record written) before it is
-/// killed.
+/// How long a worker being stopped gets to exit before it is killed: one
+/// idle for its window, one that stopped answering, one an earlier life of
+/// the daemon left, and a front giving way to the next once it has nothing
+/// left running (`weft_engine::worker` lets a run go within five seconds
+/// of being asked, its record written).
 const WORKER_STOP_GRACE_SECS: u64 = 10;
 
 /// A local worker's broker token never expires on its own: the container
@@ -197,7 +198,8 @@ impl LocalRunner {
 
     /// Start the worker for `target`, publishing the project's `port` when
     /// it is the front, and wait until it answers. A port another program
-    /// holds is [`PortTaken`].
+    /// holds is [`PortTaken`]; a worker that exits as it starts, or whose
+    /// image is gone, is [`WorkerWontStart`].
     async fn start(&self, target: &WorkerTarget, name: &str, keep_warm: bool, port: Option<u16>) -> anyhow::Result<Arc<Running>> {
         docker::ensure_network(self.docker.as_ref()).await?;
         docker::remove_containers(self.docker.as_ref(), &[name.to_string()]).await?;
@@ -223,6 +225,13 @@ impl LocalRunner {
                 docker::remove_containers(self.docker.as_ref(), &[name.to_string()]).await?;
                 return Err(anyhow::Error::new(PortTaken { port }));
             }
+            // The build's image is gone (cleaned away): no worker of it
+            // can ever start again.
+            if said.contains("Unable to find image") || said.contains("No such image") {
+                return Err(anyhow::Error::new(WorkerWontStart {
+                    why: format!("its image {} is no longer on this machine", target.image),
+                }));
+            }
             return Err(e.context(format!("start the worker of project {}", target.project)));
         }
 
@@ -235,20 +244,31 @@ impl LocalRunner {
             if self.healthy(&base_url, &key).await {
                 break;
             }
-            let state = docker::run(
+            let printed = docker::run(
                 self.docker.as_ref(),
-                vec!["inspect".into(), "--format".into(), "{{.State.Status}}".into(), name.into()],
+                vec!["inspect".into(), "--format".into(), "{{.State.Status}} {{.State.OOMKilled}} {{.State.ExitCode}}".into(), name.into()],
             )
             .await?;
-            if state.trim() != "running" || started_at.elapsed() > START_DEADLINE {
+            let state = ContainerState::of(&printed)?;
+            if state != ContainerState::Running || started_at.elapsed() > START_DEADLINE {
                 let logs = self.docker.exec(&["logs".into(), "--tail".into(), "50".into(), name.into()]).await?;
-                anyhow::bail!(
+                let said = format!(
                     "the worker of project {} did not come up ({}); its last lines:\n{}{}",
                     target.project,
-                    if state.trim() == "running" { "no answer to its health check" } else { state.trim() },
+                    match &state {
+                        ContainerState::Running => "no answer to its health check".to_string(),
+                        ContainerState::Exited(how) | ContainerState::Killed(how) => how.clone(),
+                    },
                     logs.stdout,
                     logs.stderr
                 );
+                // A worker that exited of its own cannot run this build;
+                // one killed (out of memory, or stopped from outside) or
+                // still up and silent (slow under load) is tried again.
+                return Err(match state {
+                    ContainerState::Exited(_) => anyhow::Error::new(WorkerWontStart { why: said }),
+                    ContainerState::Running | ContainerState::Killed(_) => anyhow::anyhow!(said),
+                });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -317,6 +337,15 @@ impl LocalRunner {
 
     /// How many runs the worker at `base_url` drives, as its health check
     /// says; `None` when it does not answer.
+    /// How much `worker` still runs, when anything: calls handed to it and
+    /// not finished, or runs it says it drives. One that does not answer
+    /// runs nothing anyone can reach.
+    async fn still_running(&self, worker: &Running) -> Option<u64> {
+        let holds = worker.holds.load(Ordering::SeqCst) as u64;
+        let driving = self.driving(&worker.base_url, &worker.key).await.unwrap_or(0);
+        (holds + driving > 0).then_some(holds + driving)
+    }
+
     async fn driving(&self, base_url: &str, key: &str) -> Option<u64> {
         let answer = self
             .http
@@ -453,28 +482,34 @@ impl Runner for LocalRunner {
     async fn front(&self, target: &WorkerTarget, port: Option<u16>) -> anyhow::Result<weft_core::projects::ProjectAddress> {
         let port = port.ok_or_else(|| anyhow::anyhow!("a local project's front needs the project's port"))?;
         let name = self.name_of(target);
-        let wanted = Front { name: name.clone(), port, target: target.clone() };
-        self.fronts.lock().insert(target.project, wanted);
         // A container of this project's that holds the port (the front
-        // before, or a former one serving on until idle): it lets its runs
-        // go and stops, which frees the port. Under its start gate, so a
-        // call for its program meanwhile waits and then starts a worker of
-        // its own rather than one this stop would take down.
-        let holding: Vec<String> = self
-            .running
-            .lock()
-            .values()
-            .filter(|r| r.port == Some(port) && r.name != name)
-            .map(|r| r.name.clone())
-            .collect();
+        // before, or a former one serving on): it gives the port up only
+        // once it has nothing left running, so nothing on it is cut off.
+        // Until then it goes on answering at the port, and the next look
+        // (the reaper's, every half minute: `weft_dispatcher::front`)
+        // moves the port once it is idle. Stopped under its start gate, so
+        // a call for its program meanwhile waits and then starts a worker
+        // of its own rather than one this stop would take down.
+        let holding: Vec<Arc<Running>> = self.running.lock().values().filter(|r| r.port == Some(port) && r.name != name).cloned().collect();
         for held in holding {
-            let gate = self.starting.lock().await.entry(held.clone()).or_default().clone();
+            let gate = self.starting.lock().await.entry(held.name.clone()).or_default().clone();
             let _no_start = gate.lock().await;
-            if self.running.lock().remove(&held).is_some() {
-                docker::stop(self.docker.as_ref(), std::slice::from_ref(&held), WORKER_STOP_GRACE_SECS).await?;
-                docker::remove_containers(self.docker.as_ref(), std::slice::from_ref(&held)).await?;
+            if let Some(busy) = self.still_running(&held).await {
+                tracing::info!(
+                    target: "weft_platform_local::runner",
+                    project = %target.project, worker = %held.name, running = busy,
+                    "the project's port moves to its new version once the worker holding it has nothing left running"
+                );
+                return Ok(weft_core::projects::ProjectAddress::Serving { url: port_url(self.cfg.project_ip, port) });
+            }
+            if self.running.lock().remove(&held.name).is_some() {
+                docker::stop(self.docker.as_ref(), std::slice::from_ref(&held.name), WORKER_STOP_GRACE_SECS).await?;
+                docker::remove_containers(self.docker.as_ref(), std::slice::from_ref(&held.name)).await?;
             }
         }
+        // The port is free of this life's workers: the new front is the
+        // one wanting it from now on.
+        self.fronts.lock().insert(target.project, Front { name: name.clone(), port, target: target.clone() });
         // This project's workers an earlier life of the daemon left running
         // (`sweep_idle` tells them to stop, but only on its next pass): the
         // last front among them still publishes the project's port, and the
@@ -492,7 +527,7 @@ impl Runner for LocalRunner {
         docker::remove_containers(self.docker.as_ref(), &earlier).await?;
         let running = self.ensure(target).await?;
         let port = running.port.ok_or_else(|| anyhow::anyhow!("project {}'s front started without its port", target.project))?;
-        Ok(weft_core::projects::ProjectAddress::Serving { url: format!("http://{}", std::net::SocketAddr::new(loopback_if_any(self.cfg.project_ip), port)) })
+        Ok(weft_core::projects::ProjectAddress::Serving { url: port_url(self.cfg.project_ip, port) })
     }
 
     async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
@@ -556,6 +591,12 @@ fn is_program_container(c: &docker::ContainerRow) -> bool {
     c.label(labels::ROLE) == Some(roles::WORKER)
 }
 
+
+/// Where a caller on this machine reaches the project port `port` opened
+/// on `ip`.
+fn port_url(ip: std::net::IpAddr, port: u16) -> String {
+    format!("http://{}", std::net::SocketAddr::new(loopback_if_any(ip), port))
+}
 
 /// The address a caller on this machine reaches a port opened on `ip` at.
 fn loopback_if_any(ip: std::net::IpAddr) -> std::net::IpAddr {
@@ -664,6 +705,33 @@ fn run_args(
     args.extend(docker::label_args(&l));
     args.push(target.image.clone());
     args
+}
+
+/// How a starting worker's container stands, as `docker inspect` prints
+/// `{{.State.Status}} {{.State.OOMKilled}} {{.State.ExitCode}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContainerState {
+    Running,
+    /// It ended of its own (a crash, a panic, a bad build): how.
+    Exited(String),
+    /// It was killed: out of memory, or a SIGKILL/SIGTERM from outside
+    /// (exit 137 or 143). Nothing says the build is at fault.
+    Killed(String),
+}
+
+impl ContainerState {
+    fn of(printed: &str) -> anyhow::Result<Self> {
+        let mut words = printed.split_whitespace();
+        let (Some(status), Some(oom), Some(code)) = (words.next(), words.next(), words.next()) else {
+            anyhow::bail!("`docker inspect` printed {printed:?}, not a container's status, OOM flag and exit code");
+        };
+        Ok(match (status, oom, code) {
+            ("running", _, _) => ContainerState::Running,
+            (_, "true", _) => ContainerState::Killed(format!("{status}, out of memory")),
+            (_, _, "137" | "143") => ContainerState::Killed(format!("{status}, killed with exit code {code}")),
+            _ => ContainerState::Exited(format!("{status} with exit code {code}")),
+        })
+    }
 }
 
 /// `http://127.0.0.1:<port>` from what `docker port` printed (one line
@@ -798,6 +866,35 @@ mod tests {
         assert!(docker.calls_to("run")[1].windows(2).any(|w| w == ["--publish", "127.0.0.1:14200:8080"]));
     }
 
+    /// A front still running something keeps the project's port: the new
+    /// version takes it over at the first look once the old one has
+    /// nothing left running, and nothing on it is cut off meanwhile.
+    #[tokio::test]
+    async fn a_front_still_running_keeps_the_port_until_it_is_done() {
+        let (addr, _) = worker_answering().await;
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], &format!("{addr}\n"));
+        let r = runner(docker.clone(), FakeClock::new(), &scratch());
+        r.front(&target(0), Some(14200)).await.unwrap();
+        let call = r.endpoint(&target(0), Patience::Brief).await.unwrap();
+
+        let mut next = target(0);
+        next.image = "weft-worker:def".into();
+        let address = r.front(&next, Some(14200)).await.unwrap();
+        assert_eq!(address, weft_core::projects::ProjectAddress::Serving { url: "http://127.0.0.1:14200".into() });
+        assert!(docker.calls_to("stop").is_empty(), "nothing is stopped while a call is on it");
+        assert_eq!(docker.calls_to("run").len(), 1, "the new version waits for the port");
+        let unported = r.endpoint(&next, Patience::Brief).await.unwrap();
+        assert!(!docker.calls_to("run")[1].iter().any(|a| a.contains("14200")), "its runs go to a worker without the port");
+        drop(unported);
+
+        drop(call);
+        r.front(&next, Some(14200)).await.unwrap();
+        let old = r.name_of(&target(0));
+        assert!(docker.calls_to("stop").iter().any(|c| c.contains(&old)), "idle now, the old front stops");
+        assert!(docker.calls_to("run").last().unwrap().windows(2).any(|w| w == ["--publish", "127.0.0.1:14200:8080"]));
+    }
+
     /// The daemon restarted: the project's front from its earlier life
     /// still publishes the port, so it stops before the new front starts,
     /// and the project keeps its address.
@@ -854,6 +951,41 @@ mod tests {
         assert_eq!(PortTaken::of(&e), Some(14200), "{e:#}");
         let e = r.start(&target(0), &name, true, None).await.err().expect("refused");
         assert_eq!(PortTaken::of(&e), None, "without a port, it is another failure");
+    }
+
+    /// A worker that exits as it starts, and one whose image is gone, are
+    /// told apart as workers that cannot start: what runs on that build
+    /// ends rather than waits.
+    #[tokio::test]
+    async fn a_worker_that_cannot_start_is_told_apart() {
+        // A port nothing listens on: the health check is refused at once.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], &format!("{closed}\n"));
+        docker.answer(&["inspect"], "exited false 101\n");
+        docker.answer(&["logs"], "thread 'main' panicked\n");
+        let r = runner(docker.clone(), FakeClock::new(), &scratch());
+        let e = r.endpoint(&target(0), Patience::Brief).await.expect_err("exited");
+        assert!(WorkerWontStart::is(&e), "{e:#}");
+        assert!(format!("{e:#}").contains("exited") && format!("{e:#}").contains("panicked"), "{e:#}");
+
+        let gone = Arc::new(FakeDocker::new());
+        gone.fail(&["run"], "Unable to find image 'weft-worker:abc' locally");
+        let r = runner(gone, FakeClock::new(), &scratch());
+        let e = r.endpoint(&target(0), Patience::Brief).await.expect_err("no image");
+        assert!(WorkerWontStart::is(&e) && format!("{e:#}").contains("weft-worker:abc"), "{e:#}");
+    }
+
+    /// A container killed (out of memory, or stopped from outside) says
+    /// nothing of the build, and one still starting is running.
+    #[test]
+    fn a_killed_worker_is_no_build_that_cannot_start() {
+        assert_eq!(ContainerState::of("running false 0\n").unwrap(), ContainerState::Running);
+        assert!(matches!(ContainerState::of("exited true 137").unwrap(), ContainerState::Killed(_)));
+        assert!(matches!(ContainerState::of("exited false 143").unwrap(), ContainerState::Killed(_)));
+        assert!(matches!(ContainerState::of("exited false 137").unwrap(), ContainerState::Killed(_)));
+        assert_eq!(ContainerState::of("dead false 1").unwrap(), ContainerState::Exited("dead with exit code 1".into()));
+        assert!(ContainerState::of("exited").is_err());
     }
 
     #[tokio::test]

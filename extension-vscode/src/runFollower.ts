@@ -105,8 +105,8 @@ export type DispatcherEvent = { eventId: string } & (
   | { kind: 'project_registered'; projectId: string; name: string }
   | { kind: 'project_activated'; projectId: string }
   | { kind: 'project_deactivated'; projectId: string }
-  // A lifecycle axis flipped (entering/leaving activating /
-  // deactivating / building / cancelling_build / resyncing, or landing at rest).
+  // A lifecycle axis flipped (entering/leaving activating / building /
+  // cancelling_build / resyncing, or landing at rest).
   // Carries both axes; the host treats it as a status-refresh signal
   // like every other project_* event.
   | { kind: 'project_transition_changed'; projectId: string; status: string; transition: string }
@@ -124,10 +124,6 @@ export type DispatcherEvent = { eventId: string } & (
   // versions and a readable diff, for the inspector's "Files edited" card.
   // SYNC: file_edited <-> crates/weft-core/src/live_event.rs FileEdited, packages/weft-graph/src/protocol.ts execFileEdit
   | { kind: 'file_edited'; runId: string; inheritedFrom?: string; projectId: string; nodeId: string; frames: Frame[]; edit: FileEditWire; atUnix: number }
-  // Operator-visible banner: the supervisor couldn't parse the
-  // project's `health_protocols_json`. Surfaces as an action-bar
-  // banner; the user fixes the config and the next tick recovers.
-  | { kind: 'infra_config_error'; projectId: string; error: string }
   // Bus events: live + replay. The inspector renders one IRC-style
   // log per node per bus. `busId` is the channel's uuid (matches
   // the uuid embedded in the bus marker JSON that flows on pulses);
@@ -765,7 +761,6 @@ export class RunFollower implements vscode.Disposable {
       case 'project_deactivated':
       case 'project_transition_changed':
       case 'trigger_url_changed':
-      case 'infra_config_error':
         break;
       // How a wait ended is what `weft freeze` records; the graph paints
       // the firing's own lifecycle, which the node events already carry.

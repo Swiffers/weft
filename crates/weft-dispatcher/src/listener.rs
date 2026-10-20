@@ -210,8 +210,9 @@ impl ListenerClient {
 
     /// Tell the listener to forget each of `signals`, best effort. Does
     /// NOT touch the durable rows: what the caller does with them is its
-    /// choice (a delete, cancel or consume deletes them; a hibernate keeps
-    /// them so reactivate brings them back). A failure is logged: the
+    /// choice (a delete, cancel or consume deletes them; a door that
+    /// refuses with what is held kept keeps them, so the next activation
+    /// brings them back). A failure is logged: the
     /// durable row is the truth, and a listener that kept a stale entry
     /// finds the row gone the next time it is asked about the token.
     pub async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
@@ -263,7 +264,7 @@ const LET_GO_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const LET_GO_AT_ONCE: usize = 16;
 
 /// Have the listener let go of `signals`, whose activations took no work
-/// when the caller looked (a hibernation past its grace window), each
+/// when the caller looked (a door that refuses, or whose window ended), each
 /// answered once its teardown is over ([`ListenerClient::unregister_replaced`],
 /// which also passes a row no listener can ever read). Then any of them
 /// listening by now (a reactivation landed meanwhile, and its own bring-up

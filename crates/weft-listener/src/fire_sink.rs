@@ -159,7 +159,7 @@ impl FireSignalSink {
                 anyhow::bail!("signal {token} is a run's wait, and its kind made an entry's event of its answer")
             }
         };
-        let fire = DoorFire { token: token.to_string(), fire_id, payload, caller: None, held_by: held_by.map(str::to_string), attempts: 0 };
+        let fire = DoorFire { token: token.to_string(), fire_id, payload, caller: None, held_by: held_by.map(str::to_string), attempts: 0, released: false };
         let unreached = match target.address.as_deref() {
             None => "its project serves no address now".to_string(),
             Some(address) => match self.doors.fire(target.project_id, address, &fire).await {

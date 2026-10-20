@@ -755,7 +755,12 @@ async fn admin_assets_held(
 ) -> Result<Json<AssetsHeldResponse>, ApiError> {
     control_plane(&state, &headers).await?;
     let keys = state.runtime_store.held_assets(&req.tenant, &req.inner.hashes).await.map_err(map_err)?;
-    Ok(Json(AssetsHeldResponse { keys }))
+    let mut unheld = std::collections::BTreeMap::new();
+    for hash in req.inner.hashes.iter().filter(|hash| !keys.contains_key(*hash)) {
+        let parsed = key::ParsedKey::asset(&req.tenant, hash).map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, e)))?;
+        unheld.insert(hash.clone(), parsed.to_key());
+    }
+    Ok(Json(AssetsHeldResponse { keys, unheld }))
 }
 
 async fn admin_upload_parts(

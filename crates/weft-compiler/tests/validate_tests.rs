@@ -5320,3 +5320,97 @@ fn a_snake_case_input_made_by_a_body_key_warns() {
     let messages: Vec<&str> = casing_warnings(&d).iter().map(|x| x.message.as_str()).collect();
     assert_eq!(messages, vec!["port 'user_id' is not camelCase: write 'userId'"], "{d:?}");
 }
+
+/// The subjects of the one error with `code`, sorted (a cycle's order is
+/// the walk's, not the author's).
+fn subjects_of(d: &[Diagnostic], code: &str) -> Vec<String> {
+    let hits: Vec<&Diagnostic> = errors(d).into_iter().filter(|e| e.code.as_deref() == Some(code)).collect();
+    assert_eq!(hits.len(), 1, "one {code} expected: {d:?}");
+    let mut subjects = hits[0].subjects.clone();
+    subjects.sort();
+    subjects
+}
+
+/// Closes `from.value -> to.value` by hand (no syntax lowers to a back edge).
+fn wire_back(project: &mut weft_core::ProjectDefinition, from: &str, to: &str) {
+    project.edges.push(weft_core::project::Edge {
+        id: format!("{from}->{to}"),
+        source: from.into(),
+        target: to.into(),
+        source_handle: Some("value".into()),
+        target_handle: Some("value".into()),
+        path: Vec::new(),
+        via: Vec::new(),
+        span: None,
+        source_file: None,
+    });
+}
+
+/// Each finding names the parts a cut has to keep to hit it: the node for
+/// a value on a node, both ends for a wire, the loop (never its boundary
+/// node) for a loop's config, and every node on a cycle.
+#[test]
+fn every_error_names_the_parts_it_is_about() {
+    use weft_core::weft_type::{WeftPrimitive, WeftType};
+
+    // A node: a written gate that is not a Boolean.
+    let project = parse_enrich("\nt = Text { value: \"ok\", _should_flow: 3 }\n");
+    assert_eq!(subjects_of(&validate(&project, &catalog()), "gate-not-boolean"), vec!["t"]);
+
+    // A wire: a cut keeping only one end does not carry it.
+    let mut project = parse_enrich("\none = Text { value: \"x\" }\nout = Debug\nout.data = one.value\n");
+    project.nodes.iter_mut().find(|n| n.id == "one").unwrap().outputs[0].port_type = WeftType::primitive(WeftPrimitive::Number);
+    project.nodes.iter_mut().find(|n| n.id == "out").unwrap().inputs[0].port_type = WeftType::primitive(WeftPrimitive::String);
+    assert_eq!(subjects_of(&validate(&project, &catalog()), "type-mismatch"), vec!["one", "out"]);
+
+    // A loop: its config sits on its `LoopIn`, and the finding names the loop.
+    let (project, _) = parse_enrich_lenient("\nmy = Loop() -> () {\n    parallel: false\n    p = Text { value: \"x\" }\n}\n");
+    let loop_id = project
+        .groups
+        .iter()
+        .find(|g| matches!(g.kind, weft_core::project::GroupKind::Loop { .. }))
+        .expect("the loop")
+        .id
+        .clone();
+    assert_eq!(subjects_of(&validate(&project, &catalog()), "loop-unbounded-no-termination"), vec![loop_id]);
+
+    // A cycle: wrong only with every node on it kept, and `c`, which only
+    // reads from the cycle, is not on it.
+    let mut project = parse_enrich("\na = Text { value: \"x\" }\nb = Text\nb.value = a.value\nc = Debug\nc.data = b.value\n");
+    wire_back(&mut project, "b", "a");
+    assert_eq!(subjects_of(&validate(&project, &catalog()), "graph-cycle"), vec!["a", "b"]);
+}
+
+/// No validate check is about the program as a whole: in a program broken
+/// several ways at once, every error names the parts it is about.
+#[test]
+fn no_error_of_a_broken_program_is_about_the_whole_program() {
+    use weft_core::weft_type::{WeftPrimitive, WeftType};
+    let mut project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+b = Text
+b.value = a.value
+one = Text { value: "x" }
+out = Debug
+out.data = one.value
+t = Text { value: "ok", _should_flow: 3 }
+f = FetchToStorage { url: "https://x.com/b" }
+f.url = a.value
+sink = Debug
+sink.data = f.file
+"#,
+    );
+    wire_back(&mut project, "b", "a");
+    project.nodes.iter_mut().find(|n| n.id == "one").unwrap().outputs[0].port_type = WeftType::primitive(WeftPrimitive::Number);
+    project.nodes.iter_mut().find(|n| n.id == "out").unwrap().inputs[0].port_type = WeftType::primitive(WeftPrimitive::String);
+    let d = validate(&project, &catalog());
+    for code in ["graph-cycle", "type-mismatch", "gate-not-boolean", "double-driven-port"] {
+        assert!(codes(&d).contains(&code), "{code} expected: {d:?}");
+    }
+    let ids: Vec<&str> = project.nodes.iter().map(|n| n.id.as_str()).chain(project.groups.iter().map(|g| g.id.as_str())).collect();
+    for e in errors(&d) {
+        assert!(!e.subjects.is_empty(), "an error with no subjects: {e:?}");
+        assert!(e.subjects.iter().all(|s| ids.contains(&s.as_str())), "a subject that is no part: {e:?}");
+    }
+}

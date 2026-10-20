@@ -10,7 +10,7 @@ import {
   ACTIVITY_LINE_CAP,
   type ActionAvailability,
 } from '../../packages/weft-graph/src/protocol';
-import type { GoingRun } from '../../packages/weft-graph/src/status';
+import { emptyActionAvailability, type GoingRun } from '../../packages/weft-graph/src/status';
 
 /// The running entries a status fetch names, all runs of the graph.
 function runs(...runIds: string[]): GoingRun[] {
@@ -18,21 +18,7 @@ function runs(...runIds: string[]): GoingRun[] {
 }
 
 function snapshot(): ActionAvailability {
-  return {
-    availableActions: ['run'],
-    binaryDrift: false,
-    definitionDrift: false,
-    infraDrift: false,
-    projectStatus: 'active',
-    transition: 'none',
-    orphanedInfra: false,
-    mode: 'active',
-    runningCount: 0,
-    triggersOff: [],
-    infraRollup: 'none',
-    infraNodes: [],
-    preservation: { parked: 0, suspended: 0 },
-  };
+  return { ...emptyActionAvailability(), availableActions: ['run'], projectStatus: 'active' };
 }
 
 describe('the running set follows the status fetch', () => {

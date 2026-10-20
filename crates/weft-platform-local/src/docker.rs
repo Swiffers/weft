@@ -98,6 +98,10 @@ pub mod roles {
     pub const WORKER: &str = "worker";
     /// Part of an infra node's unit.
     pub const INFRA: &str = "infra";
+    /// Made from a built image only to copy its build's result out, never
+    /// started (`images::read_from_image`), and removed right after; one a
+    /// crash left behind goes with its image (`images::delete_image`).
+    pub const BUILD_RESULT: &str = "build-result";
 }
 
 /// `--label k=v` for each label.

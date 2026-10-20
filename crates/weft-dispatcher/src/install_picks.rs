@@ -286,7 +286,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         loop {
             let mut heard = state.signals.subscribe();
             let request = weft_core::activation::ActivateRequest {
-                scope: weft_core::activation::ActivationScope { triggers: triggers.clone(), instance: owner.instance().cloned() },
+                scope: weft_core::activation::ActivationScope::of_owner(triggers.clone(), &owner),
                 ..Default::default()
             };
             match crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::Rearm(&rearm)).await {
@@ -320,7 +320,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         StatusCode::CONFLICT,
         format!(
             "the pick is stored, but these triggers are still set up with the connection they had, \
-             and `weft resync --mode park` sets them up again (the work waiting on them stays):\n  {}",
+             and `weft resync` sets them up again (the work waiting on them stays):\n  {}",
             failed.join("\n  ")
         ),
     ))

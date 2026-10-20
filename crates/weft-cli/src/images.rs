@@ -527,7 +527,39 @@ async fn ensure_standard_worker(image: &str, base: &str, rebuild: bool, suffix: 
         )?;
         record_build_uses(&build.uses).await?;
         docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;
+        // Every install uses it as built, reading no record of it
+        // (`ledger::note_shared`), so it must leave nothing out: a stock
+        // node that does not compile fails it here, naming the package.
+        require_whole_worker(&target).await?;
     }
+    Ok(())
+}
+
+/// Refuse a worker image whose build left a node package out
+/// (`weft_core::builds::LeftOut`, read from the image without running it).
+async fn require_whole_worker(image: &str) -> Result<()> {
+    let created = docker().args(["create", image, "weft-never-run"]).output().await?;
+    anyhow::ensure!(created.status.success(), "docker create {image}: {}", String::from_utf8_lossy(&created.stderr).trim());
+    let id = String::from_utf8_lossy(&created.stdout).trim().to_string();
+    let copy = tempfile::NamedTempFile::new()?;
+    let copied = docker().args(["cp", &format!("{id}:{}", weft_core::builds::LEFT_OUT_RECORD_PATH)]).arg(copy.path()).output().await;
+    let removed = docker().args(["rm", "--force", &id]).output().await;
+    let copied = copied?;
+    anyhow::ensure!(
+        copied.status.success(),
+        "read {} from {image}: {}",
+        weft_core::builds::LEFT_OUT_RECORD_PATH,
+        String::from_utf8_lossy(&copied.stderr).trim()
+    );
+    if let Err(e) = removed {
+        tracing::warn!(container = %id, error = %e, "could not remove the container the worker's record was read from");
+    }
+    let record = weft_core::builds::LeftOut::parse(&std::fs::read(copy.path())?).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        record.is_empty(),
+        "the standard worker left packages out because they did not compile:\n  {}",
+        record.packages.iter().map(|p| p.reason(None)).collect::<Vec<_>>().join("\n  ")
+    );
     Ok(())
 }
 

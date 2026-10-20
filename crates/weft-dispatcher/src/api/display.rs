@@ -113,8 +113,8 @@ pub async fn list_displays(
     //
     // It does NOT filter on `fires_visible_to_consumers` the way the
     // signals door does, and that difference is the right one. That
-    // flag hides what would START A RUN: a hibernating project
-    // must not be fired into. A display starts nothing. Infra can be
+    // flag hides what would START A RUN: a trigger down with its door
+    // hiding what arrives must not be fired into from a listing. A display starts nothing. Infra can be
     // up while the program sleeps, so its panel is worth reading the
     // whole time, and hiding it would say the node is gone when it is
     // running.

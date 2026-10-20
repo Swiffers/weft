@@ -1402,13 +1402,15 @@ impl WeftType {
     /// re-derived by guessing from the mime string. There is NO
     /// `__weft_media__` umbrella on the wire: `Media`/`File` are
     /// type-system unions a value matches, never a tag a value carries.
-    /// Each payload has a handle (`url`|`data`|`key`) + `mimeType`.
+    /// Each payload has a handle (`key` for a stored file, `url` for an
+    /// outside one) + `mimeType`: the two handles weft can read the
+    /// bytes through ([`crate::storage::FileHandle::from_value`]), so a
+    /// marker carrying anything else is no file value.
+    // SYNC: detect_file_type <-> packages/weft-graph/src/webview/lib/types/index.ts FILE_HANDLE_KEYS
     fn detect_file_type(obj: &serde_json::Map<String, serde_json::Value>) -> Option<WeftType> {
         let kind = FileKind::from_marker_obj(obj)?;
         let payload = obj.get(kind.marker_key())?.as_object()?;
-        let has_handle = payload.contains_key("url")
-            || payload.contains_key("data")
-            || payload.contains_key("key");
+        let has_handle = payload.contains_key("url") || payload.contains_key("key");
         if !has_handle {
             return None;
         }

@@ -52,11 +52,6 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- not picked, or a hand-over that kept failing. Not retried on
             -- a timer: what it waits on hands it over.
             waits_for TEXT,
-            -- Read by nothing: the instance refusal the previous release
-            -- wrote where `waits_for` is now (its migration carries each
-            -- into `waits_for`), which its replicas still write while an
-            -- upgrade rolls out. The release after this one drops it.
-            instance_gap JSONB,
             -- How many hand-overs in a row failed (`Turn::next`).
             failures INTEGER NOT NULL DEFAULT 0,
             -- An answer to a waiting run, rather than an event of an entry.
@@ -212,11 +207,7 @@ impl Turn {
 }
 
 /// An event as it waits in its trigger's queue: what [`park`] writes.
-/// Read through [`WaitingWire`], so a park from a worker built by the
-/// previous release (whose program keeps running until it is built again)
-/// is taken too.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(from = "WaitingWire")]
 pub struct Waiting {
     /// The event's identity: the run it starts is
     /// `weft_core::door_fire::run_of_fire(fire_id)`, so an event handed
@@ -242,33 +233,6 @@ pub struct Waiting {
     /// value: `payload` is then null and unread. Always false for an
     /// entry's event.
     pub skipped: bool,
-}
-
-/// [`Waiting`] as a worker sends it. A worker of the previous release
-/// sends neither `waits_for` nor `failures`, and says an event waits on
-/// its instance with `instance_gap` (the refusal, naming each field).
-#[derive(Deserialize)]
-struct WaitingWire {
-    fire_id: uuid::Uuid,
-    payload: Value,
-    caller: Option<String>,
-    attempts: u32,
-    not_before: i64,
-    #[serde(default)]
-    waits_for: Option<WaitsFor>,
-    #[serde(default)]
-    instance_gap: Option<String>,
-    #[serde(default)]
-    failures: u32,
-    skipped: bool,
-}
-
-impl From<WaitingWire> for Waiting {
-    fn from(wire: WaitingWire) -> Self {
-        let WaitingWire { fire_id, payload, caller, attempts, not_before, waits_for, instance_gap, failures, skipped } = wire;
-        let waits_for = waits_for.or_else(|| instance_gap.and_then(|gap| WaitsFor::new(WaitsOn::Instance, &gap)));
-        Waiting { fire_id, payload, caller, attempts, not_before, waits_for, failures, skipped }
-    }
 }
 
 impl Waiting {
@@ -653,22 +617,5 @@ mod park_backoff_tests {
         let wire = serde_json::to_value(&now).unwrap();
         assert_eq!(wire["waits_for"], serde_json::json!("picks: pick a connection"));
         assert_eq!(serde_json::from_value::<Waiting>(wire).unwrap(), now);
-    }
-
-    /// A worker of the previous release parks without `waits_for` and
-    /// `failures`, and says an event waits on its instance with
-    /// `instance_gap`: its park is taken, waiting on that instance.
-    #[test]
-    fn a_park_from_the_previous_release_is_taken() {
-        let old = serde_json::json!({
-            "fire_id": uuid::Uuid::nil(), "payload": null, "caller": null, "attempts": 2, "not_before": 7,
-            "instance_gap": "instance 'ada' at 'answer': 'key' is not filled", "skipped": false,
-        });
-        let read = serde_json::from_value::<Waiting>(old.clone()).unwrap();
-        assert_eq!((read.attempts, read.not_before, read.failures), (2, 7, 0));
-        assert_eq!(read.waits_for, WaitsFor::new(WaitsOn::Instance, "instance 'ada' at 'answer': 'key' is not filled"));
-        let mut clocked = old;
-        clocked["instance_gap"] = Value::Null;
-        assert_eq!(serde_json::from_value::<Waiting>(clocked).unwrap().waits_for, None);
     }
 }

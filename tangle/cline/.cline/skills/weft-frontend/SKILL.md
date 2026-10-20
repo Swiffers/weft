@@ -538,17 +538,23 @@ The shape, unless the user asks for another:
   `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
   forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
-  own routes (`/connect/<tenant>/<project id>/<path>`) and the picture links in their answers
-  (`/public/files/<token>`), carries the caller's token and body, and keeps the
+  own routes (`/connect/<tenant>/<project id>/<path>`) and the file links in
+  their answers and a slot's uploads (`/files/...`), carries the caller's token and body, and keeps the
   site's cookies and the `Weft-Instance` header back. On the way back it
 passes the `Weft-Run-Id` header, so a page can log or show the run id
 beside a `Something went wrong`. A page fetches
   `/weft/signal-token/displays` with the instance token as bearer, calls a
   program route as `/weft/connect/<tenant>/<project id>/<path>` with the instance token in
   `Weft-Instance-Token`, and `new InstanceDoor(instanceToken)` already calls
-  `/weft/instance/...`. A route called through the pass-through builds the
-  picture links in its answer on the site's own address, so those pictures
-  load through the same pass-through, and you write no proxy route for them.
+  `/weft/instance/...`. On a local install, for the pictures in a route's
+  answers to load through the same pass-through, give the frontend the site's
+  `/weft` address as its visitor address: `weft frontend add <name>
+  --visitor-address https://<site>/weft`, or `weft frontend visitor-address
+  <name> https://<site>/weft` for one that already exists. Every file link the
+  project hands out then goes through the site, and you write no proxy route
+  for them. Without it, the links go through weft's tunnel when it is open,
+  else to the install's own address, which only this machine opens. On a cloud
+  install, file links go straight to the cloud store either way.
   If you catch yourself putting the dispatcher's
   address in a page, stop and write: "Wait. The browser talks to its own
   site." Then call `/weft/...`. If the site sends everyone not signed in to

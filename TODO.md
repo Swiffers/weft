@@ -674,3 +674,53 @@ work around it.
 
 [Update Notice Warning] If we touch `catalog/basic/exec_python/mod.rs`'s
 process pool, revisit this entry.
+
+## On-demand infra: units that scale with requests, to zero
+
+**What.** Today every infra unit is a machine kept up while its infra is
+started (locally a container, on GCP a Compute Engine VM). Add a second
+way for a unit to run, chosen by the NODE'S AUTHOR in the infra
+description `provision_infra` returns (`Unit`,
+`crates/weft-core/src/infra/types.rs`): on demand, with a maximum number
+of copies and how many requests one copy takes. Copies start when
+requests arrive and stop when idle, down to zero. A node's users never
+see it unless the author exposes it as an ordinary input of the node.
+
+**Settled (2026-10-19):**
+- It is for any kind of infra, not a GPU feature, and it is the author's
+  call: no refusal for on-demand with a disk or a non-HTTP port. The
+  author is choosing Cloud Run-style running and its limits (no
+  persistent disk, HTTP only, a request capped at 60 minutes on GCP); the
+  node-authoring docs and the option's own description say so.
+- Sizing uses the machine choice that exists: the unit says the CPU,
+  memory and GPU it needs, and the platform picks what fits; `type` (or a
+  GPU name) names one exactly. A GPU is asked for by the GPU memory it
+  needs, or by name. A name the provider does not offer, or a GPU that
+  cannot be had (quota, permission, region), is a loud error: never
+  another card, never a fallback to CPU.
+- Per platform: GCP runs an on-demand unit as a Cloud Run service sized
+  from those numbers (raised to Cloud Run's minimums: an L4 needs 4 CPU
+  and 16 GiB); locally it stays one container; other providers map it to
+  their own scaling service later (Azure Container Apps has scale-to-zero
+  GPUs; AWS has no serverless GPU container today).
+- Big files a unit needs at start (model weights) come from weft's own
+  storage, which on a cloud is that cloud's object store in the same
+  region (Google's recommended fast path): `FetchToStorage` keeps the
+  file, the file goes to the infra node as a setting, the container
+  downloads it at start through a direct link. Nothing new in weft for
+  that; check the infra's start-up code can mint the link.
+
+**What the GCP side needs:** the supervisor managing Cloud Run services
+(create, update, delete; weft already does this for its own workers),
+`ctx.endpoint` handing out the service's address and its callers sending
+an identity token (or ingress limited to the project's network), a
+health reading where zero copies is healthy and stop means delete or cap
+at zero, sidecars for a unit's extra containers, in-memory volumes for
+scratch, an equivalent for init containers, `@per_instance` copies as one
+service each, and the Cloud Run rights in Terraform. Do it after the
+`lifecycle` branch lands (it edits the supervisor too).
+
+Facts from Google's docs (2026-10): Cloud Run GPUs are GA (L4 24 GB,
+RTX PRO 6000 96 GB, one per copy, a few regions), scale to zero, start in
+about 5 seconds plus model load, stay warm up to 10 minutes idle, and are
+billed per second of a copy's life with a 1 minute minimum.

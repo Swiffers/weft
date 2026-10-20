@@ -1,0 +1,12 @@
+{
+  "type": "Echo",
+  "label": "Echo",
+  "description": "Says its text back. The e2e rig changes its code to give the project a new binary.",
+  "inputs": [
+    { "name": "text", "type": "String", "required": true }
+  ],
+  "outputs": [
+    { "name": "text", "type": "String" }
+  ],
+  "requiresInfra": false
+}

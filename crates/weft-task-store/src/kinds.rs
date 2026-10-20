@@ -58,6 +58,19 @@ weft_core::wire_enum! {
         /// Producer = the dispatcher's own resync request, in the transaction
         /// that writes the plan down; no caller of the broker may enqueue it.
         Resync = "resync",
+        /// Wait for the runs a person's deactivate left going to end
+        /// (`TakeDownWaitPayload`), apart from the request, which a
+        /// person follows in short looks however long it takes. Producer
+        /// = the dispatcher's own deactivate; no caller of the broker may
+        /// enqueue it.
+        TakeDownWait = "take_down_wait",
+        /// Wait for what `weft rm` cancelled to be over
+        /// (`RemovalWaitPayload`): the last calls of its cancelled runs
+        /// gone out, and, before its history is erased, every run ended.
+        /// Apart from the request, which a person follows in short looks.
+        /// Producer = the dispatcher's own quiesce; no caller of the broker
+        /// may enqueue it.
+        RemovalWait = "removal_wait",
     }
 }
 
@@ -126,6 +139,24 @@ pub struct RunNodeTestPayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResyncPayload {
     pub driver: uuid::Uuid,
+}
+
+/// Payload for `TaskKind::TakeDownWait`: the activations a deactivate
+/// took down, by owner, and their entry tokens as they stood before it (it
+/// may have deleted their signals): what the wait counts at the workers'
+/// door.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeDownWaitPayload {
+    pub triggers: Vec<weft_core::activation::OwnerTriggers>,
+    pub tokens: Vec<String>,
+}
+
+/// Payload for `TaskKind::RemovalWait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalWaitPayload {
+    /// Wait for every run of the project to end too, not only for their
+    /// last calls: what erasing its history needs.
+    pub every_run: bool,
 }
 
 /// Payload for `TaskKind::StopTagged`: "stop every live run of

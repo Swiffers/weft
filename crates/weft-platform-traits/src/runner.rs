@@ -442,6 +442,33 @@ impl PlatformRefused {
     }
 }
 
+/// The answer [`Runner::endpoint`] gives when the workers of the build
+/// asked for cannot run at all: started, they exit (a local container, a
+/// Cloud Run revision that failed), or the build's image is gone. A definite answer about that build, which no
+/// retry changes: what runs on it ends at once and says so, rather than
+/// waiting for a worker that will never come. [`WorkerWontStart::is`]
+/// recognizes it.
+#[derive(Debug)]
+pub struct WorkerWontStart {
+    /// Why, in the platform's words (its last lines, its reason).
+    pub why: String,
+}
+
+impl std::fmt::Display for WorkerWontStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the worker of this build cannot start: {}", self.why)
+    }
+}
+
+impl std::error::Error for WorkerWontStart {}
+
+impl WorkerWontStart {
+    /// Whether `e` is (or wraps) this answer.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<WorkerWontStart>().is_some()
+    }
+}
+
 /// The port [`Runner::front`] was asked to publish is held by another
 /// program on the machine. [`PortTaken::of`] recognizes it.
 #[derive(Debug)]

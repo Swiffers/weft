@@ -24,11 +24,13 @@
 //!      matched AND no default.
 //!
 //! 3. **Union across nodes, emit the Dockerfile.** Builder stage
-//!    installs build-time packages, fetches rust via rustup,
-//!    runs `cargo build --release` against a build context that
-//!    contains the generated crate + the referenced catalog
-//!    subfolders. Runtime stage installs runtime-only packages
-//!    and copies the compiled binary from the builder.
+//!    installs build-time packages, fetches rust via rustup (or
+//!    starts from the prebuilt builder base), and builds the
+//!    generated crate with `weft-isolate` (`crate::worker_isolate`):
+//!    a `cargo build --release` that leaves out every node package
+//!    that does not compile and records which it left out. Runtime
+//!    stage installs runtime-only packages and copies the compiled
+//!    binary and that record from the builder.
 //!
 //! The template is a simple `{{token}}` substitution. Built-in
 //! template lives in `default_template()`. Users can override by
@@ -67,6 +69,11 @@ pub struct WorkerDockerfile {
     /// mounts (`{{worker_cache_key}}`), `None` for a custom template that
     /// mounts none.
     pub worker_cache_key: Option<String>,
+    /// Whether the image keeps the record of the node packages its build
+    /// left out at `weft_core::builds::LEFT_OUT_RECORD_PATH`: true for
+    /// both built-in templates, false for a custom template, which builds
+    /// the crate its own way and leaves nothing out.
+    pub writes_left_out_record: bool,
 }
 
 impl WorkerDockerfile {
@@ -144,7 +151,8 @@ pub struct BaseImages {
 /// `../weft/crates/*` path dependencies. No node code lives here.
 pub const WEFT_MOUNT: &str = "/weft";
 
-/// In-container path to the project's `nodes/` directory. The build
+/// In-container path to the project's node source (each package at its
+/// path in the project, under `nodes/` or `src/`). The build
 /// context stages `project-nodes/` here; every node's `#[path]` shim
 /// and every `{{catalog_path}}` substitution resolves under it (e.g.
 /// `/weft/project-nodes/nodes/base_catalog/basic/exec_python/mod.rs`). This is the only
@@ -272,6 +280,10 @@ pub fn emit(
         .replace("{{base_image}}", &base.raw)
         .replace("{{builder_base_image}}", builder_base_ref)
         .replace("{{worker_cache_key}}", &worker_cache_key)
+        .replace("{{isolate_dir}}", &crate::codegen::isolate_dir_name())
+        .replace("{{isolate_candidates}}", crate::codegen::ISOLATE_CANDIDATES_FILE)
+        .replace("{{left_out_record}}", crate::codegen::LEFT_OUT_RECORD_FILE)
+        .replace("{{left_out_record_path}}", weft_core::builds::LEFT_OUT_RECORD_PATH)
         .replace("{{cache_gc_script}}", CACHE_GC_SCRIPT_NAME)
         .replace("{{cache_retention_days}}", &WORKER_CACHE_RETENTION_DAYS.to_string())
         .replace("{{cache_versions_kept}}", &WORKER_CACHE_VERSIONS_KEPT.to_string())
@@ -304,6 +316,7 @@ pub fn emit(
         build_env,
         builder_base: builder_base_out,
         worker_cache_key: template.contains("{{worker_cache_key}}").then_some(worker_cache_key),
+        writes_left_out_record: build.dockerfile_template.is_none(),
     })
 }
 
@@ -689,8 +702,9 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 ///   `codegen::write_package_crates`: same sources, same slot, shared
 ///   rlib; an edited copy of a stock node gets a slot of its own and can
 ///   never be mistaken for the stock one) and on every staged package
-///   file carrying one fixed date (`build::package_source_mtime`), so a
-///   package compiled from another checkout still counts. Every distinct
+///   file carrying the date its content gives it
+///   (`build::package_source_mtime`), so a package compiled from another
+///   checkout still counts. Every distinct
 ///   content compiled keeps its slot's artifacts until no build has
 ///   linked them for [`WORKER_CACHE_RETENTION_DAYS`] ([`CACHE_GC_SCRIPT`]
 ///   runs after every build); `weft clean --images` reports the mount's
@@ -728,6 +742,18 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// workspace lock, so cargo must be allowed to EXTEND the lock with
 /// those. Seeding the lock pins the shared set; cargo appends the rest.
 ///
+/// The build itself is `weft-isolate` (`crate::worker_isolate`), compiled
+/// first from the package codegen put at `/work/{{isolate_dir}}` with the
+/// same seeded lock (so its serde resolves to the version already
+/// compiled, and nothing fetches the index): it runs `cargo build
+/// --release --keep-going` in `/work`, and when package crates fail it
+/// leaves them out (each package is an optional dependency behind its own
+/// feature), writes their record to `/work/{{left_out_record}}`, and
+/// builds the worker again with only the healthy features. The record is
+/// what the runtime stage copies into the image. The helper is one fixed
+/// package for every project, so after a lane's first build it is a
+/// cache hit; a failure no package explains still fails the build.
+///
 /// A builder that keeps nothing between builds (a cloud's, where every
 /// build runs on a fresh machine) says so with [`COMPILE_CACHE_ARG`]
 /// `=none`: its cache mount starts empty every time, so seeding it would
@@ -745,7 +771,9 @@ const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "    elif ! [ -f /cache/target/.weft-seeded ] && [ -d /weft/target ]; then \\\n",
     "      cp -a /weft/target/. /cache/target/ && touch /cache/target/.weft-seeded; fi \\\n",
     "    && cp {{seed_lock}} /work/Cargo.lock \\\n",
-    "    && cargo build --release \\\n",
+    "    && cp {{seed_lock}} /work/{{isolate_dir}}/Cargo.lock \\\n",
+    "    && cargo build --release --manifest-path /work/{{isolate_dir}}/Cargo.toml \\\n",
+    "    && \"$CARGO_TARGET_DIR\"/release/weft-isolate /work/{{isolate_candidates}} /work/{{left_out_record}} \\\n",
     "    && cp \"$CARGO_TARGET_DIR\"/release/{{binary_name}} /worker \\\n",
     "    && ( [ \"$CARGO_TARGET_DIR\" != /cache/target ] \\\n",
     "         || sh /work/{{cache_gc_script}} /cache/target/release {{cache_retention_days}} /work {{binary_name}} {{cache_versions_kept}} \\\n",
@@ -813,7 +841,11 @@ pub const CACHE_GC_SCRIPT_NAME: &str = "weft-cache-gc.sh";
 /// are per project and expire: the `pkg_` package crates, and the top
 /// worker crate (its build-script units included), whose metadata hash
 /// folds in its package deps so every distinct project leaves its own
-/// copy. The engine and the shared dependencies are never touched.
+/// copy. The engine and the shared dependencies are never touched. The
+/// `weft-isolate` helper is compiled again by each weft that changes its
+/// source, as a package named by that source
+/// (`codegen::isolate_dir_name`), so its compiled versions are bounded
+/// like a package's.
 pub const CACHE_GC_SCRIPT: &str = r#"#!/bin/sh
 # Emitted by weft codegen. Do not edit by hand.
 # usage: weft-cache-gc.sh <target/release> <retention days> <crate root> <worker binary name> [versions kept]
@@ -838,12 +870,13 @@ if [ -s "$slots" ]; then
 fi
 rm -f "$slots"
 # Bound: of each package's compiled versions (every stem of one crate
-# name) and of the worker crate's, only the newest few by last link stay.
+# name), of the worker crate's and of the weft-isolate helper's, only the
+# newest few stay.
 drop_stem() {
   rm -f "$deps/$1" "$deps/$1".* "$deps/lib$1".*
   rm -rf "$fingerprints/$1"
 }
-for name in $(for d in "$deps"/pkg_*.d "$deps"/"$worker"-*.d; do [ -e "$d" ] && basename "$d" .d; done | sed 's/-[^-]*$//' | sort -u); do
+for name in $(for d in "$deps"/pkg_*.d "$deps"/"$worker"-*.d "$deps"/weft_isolate-*.d; do [ -e "$d" ] && basename "$d" .d; done | sed 's/-[^-]*$//' | sort -u); do
   n=0
   for d in $(ls -t "$deps"/"$name"-*.d 2>/dev/null); do
     n=$((n + 1))
@@ -876,7 +909,9 @@ exit 0
 
 /// The runtime stage shared by both built-in templates: install
 /// runtime-only packages onto the user's base image, copy the
-/// compiled binary from the builder.
+/// compiled binary from the builder, and the record of the packages its
+/// build left out, where the install reads it from the image.
+// SYNC: the record's COPY line <-> crates/weft-core/src/builds.rs LEFT_OUT_RECORD_PATH
 const RUNTIME_STAGE_FRAGMENT: &str = concat!(
     "FROM {{base_image}}\n",
     "\n",
@@ -884,6 +919,7 @@ const RUNTIME_STAGE_FRAGMENT: &str = concat!(
     "{{install_runtime_system_packages}}",
     "\n",
     "COPY --from=builder /worker /usr/local/bin/worker\n",
+    "COPY --from=builder /work/{{left_out_record}} {{left_out_record_path}}\n",
     "ENTRYPOINT [\"/usr/local/bin/worker\"]\n",
 );
 
@@ -893,8 +929,8 @@ const RUNTIME_STAGE_FRAGMENT: &str = concat!(
 ///
 /// Stage 1 (`builder`): installs build-time packages + rust via
 /// rustup, copies the generated crate + referenced catalog
-/// subfolders, runs `cargo build --release`, writes the binary
-/// to `/worker`.
+/// subfolders, builds it with `weft-isolate`
+/// ([`CARGO_BUILD_RUN_FRAGMENT`]), writes the binary to `/worker`.
 ///
 /// Stage 2 (runtime): `RUNTIME_STAGE_FRAGMENT`.
 fn default_template() -> String {
@@ -938,7 +974,7 @@ fn default_template() -> String {
 /// whole workspace COMPILED `--release` into `/weft/target`. The
 /// builder stage here adds only what's project-specific: per-node
 /// system build packages, the generated worker crate, and the
-/// project's `nodes/` source tree. The base's `/weft/` directory
+/// project's node source (`nodes/` and `src/`). The base's `/weft/` directory
 /// provides the engine workspace via path deps AND its precompiled
 /// rlibs; no per-project COPY or recompile of the workspace. Target
 /// dir + Cargo.lock mechanics are documented on
@@ -1259,6 +1295,7 @@ mod tests {
             "custom template using the token must report the tag for the CLI ensure step"
         );
         assert!(out.body.contains("FROM weft-builder-base:cafebabe AS builder"));
+        assert!(!out.writes_left_out_record, "a custom template builds its own way and keeps no record");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1341,6 +1378,27 @@ mod tests {
             "a builder that keeps no cache compiles in the baked target: {}",
             out.body
         );
+        // The crate is built by `weft-isolate`, compiled first from its
+        // own package on the same seeded lock, and the image keeps the
+        // record of what it left out where the install reads it.
+        let isolate = crate::codegen::isolate_dir_name();
+        let steps = [
+            "cp /weft/worker.Cargo.lock /work/Cargo.lock".to_string(),
+            format!("cp /weft/worker.Cargo.lock /work/{isolate}/Cargo.lock"),
+            format!("cargo build --release --manifest-path /work/{isolate}/Cargo.toml"),
+            "\"$CARGO_TARGET_DIR\"/release/weft-isolate /work/isolate.json /work/left-out.json".to_string(),
+            "cp \"$CARGO_TARGET_DIR\"/release/worker_test /worker".to_string(),
+        ];
+        let at: Vec<usize> = steps.iter().map(|step| out.body.find(step.as_str()).unwrap_or_else(|| panic!("{step}: {}", out.body))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "the steps run in order: {}", out.body);
+        assert!(!out.body.contains("cargo build --release \\"), "no plain worker build is left: {}", out.body);
+        assert!(
+            out.body.contains(&format!("COPY --from=builder /work/left-out.json {}\n", weft_core::builds::LEFT_OUT_RECORD_PATH)),
+            "the runtime stage keeps the record: {}",
+            out.body
+        );
+        assert!(out.writes_left_out_record);
+        assert!(!out.body.contains("{{"), "every token is substituted: {}", out.body);
         let sweep = format!("sh /work/{CACHE_GC_SCRIPT_NAME} /cache/target/release {WORKER_CACHE_RETENTION_DAYS} /work worker_test");
         assert!(out.body.contains(&sweep), "every build expires unused per-project crates from the shared cache: {}", out.body);
         assert!(
@@ -1430,7 +1488,8 @@ mod tests {
 
     /// Of one package's compiled versions, only the newest few by last
     /// link stay, however recent the others are; another package counts
-    /// on its own.
+    /// on its own, and the `weft-isolate` helper's versions are bounded
+    /// the same way.
     #[test]
     fn the_cache_sweep_keeps_only_the_newest_versions_of_a_package() {
         let root = tempfile::tempdir().unwrap();
@@ -1453,6 +1512,9 @@ mod tests {
             version(stem, i as i64 + 1); // a is the newest
         }
         version("pkg_other-z", 10);
+        for (i, stem) in ["weft_isolate-a", "weft_isolate-b", "weft_isolate-c", "weft_isolate-d"].into_iter().enumerate() {
+            version(stem, i as i64 + 1);
+        }
         let script = root.path().join(CACHE_GC_SCRIPT_NAME);
         std::fs::write(&script, CACHE_GC_SCRIPT).unwrap();
         let status = std::process::Command::new("sh")
@@ -1463,7 +1525,8 @@ mod tests {
         for kept in ["pkg_mine-a", "pkg_mine-b", "pkg_mine-c", "pkg_other-z"] {
             assert!(deps.join(format!("lib{kept}.rlib")).exists(), "{kept} stays");
         }
-        for gone in ["pkg_mine-d", "pkg_mine-e"] {
+        assert!(deps.join("libweft_isolate-c.rlib").exists(), "the newest helpers stay");
+        for gone in ["pkg_mine-d", "pkg_mine-e", "weft_isolate-d"] {
             assert!(!deps.join(format!("lib{gone}.rlib")).exists() && !fingerprints.join(gone).exists(), "{gone} goes");
         }
     }

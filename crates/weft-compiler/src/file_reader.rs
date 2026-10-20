@@ -213,6 +213,45 @@ impl FileReader for MapFileReader {
     }
 }
 
+/// A backing over a [`weft_catalog::SourceTree`]: the disk, or the snapshot
+/// a command took of its project's files when it started, so the program
+/// it compiles is the one those bytes say whatever is written to disk
+/// meanwhile. The tree's own identity names a file (on disk, canonical,
+/// like [`DiskFileReader`]), and it may not leave the root either.
+#[cfg(feature = "build")]
+pub struct TreeFileReader<'a> {
+    tree: &'a dyn weft_catalog::SourceTree,
+}
+
+#[cfg(feature = "build")]
+impl<'a> TreeFileReader<'a> {
+    pub fn new(tree: &'a dyn weft_catalog::SourceTree) -> Self {
+        Self { tree }
+    }
+}
+
+#[cfg(feature = "build")]
+impl FileReader for TreeFileReader<'_> {
+    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String> {
+        let identity = self
+            .tree
+            .canonicalize(&spelled.path)
+            .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
+        if !identity.starts_with(&spelled.root) {
+            return Err(escapes_root(relative));
+        }
+        let content = self
+            .tree
+            .read_to_string(&identity)
+            .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
+        Ok(ResolvedFile { identity, content })
+    }
+
+    fn identity(&self, path: &Path) -> Result<PathBuf, String> {
+        self.tree.canonicalize(path).map_err(|e| format!("project root {path:?} is unreadable: {e}"))
+    }
+}
+
 /// Lexically normalize a path: collapse `.` and resolve `..` against the
 /// preceding component, WITHOUT touching the filesystem. Returns `None` if a
 /// `..` would climb above the path's root (the lexical equivalent of escaping

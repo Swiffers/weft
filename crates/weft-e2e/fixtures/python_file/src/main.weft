@@ -1,5 +1,5 @@
 # A picture posted to a route reaches a Python snippet as a plain dict
-# carrying a download link minted for that firing. The snippet fetches
+# carrying the links made for it in that firing. The snippet fetches
 # the link, so the reply proves the link works end to end, and hands the
 # picture back on a file port, so the marker round-trips too.
 #

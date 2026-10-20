@@ -756,7 +756,7 @@ pub async fn clean(
 
 /// Delete every run `filter` reaches, in `project` (or every project of
 /// `tenant`). A run still going is never deleted from under itself:
-/// `cancel` stops it (its rows go with the next clean), `wait` leaves it
+/// `cancel` stops it (its rows go with the next clean), `leave` leaves it
 /// running. `asked_by` is never touched: a program cleaning runs is not
 /// among them. Each deleted project's bare versions are swept as its runs
 /// go, the way `weft clean <run_id>` sweeps them.
@@ -765,10 +765,11 @@ pub(crate) async fn clean_runs(
     tenant: &crate::tenant::TenantId,
     project: Option<uuid::Uuid>,
     filter: &weft_core::program::RunFilter,
-    running: weft_core::running_policy::RunningPolicy,
+    running: weft_core::program::StillGoing,
     asked_by: Option<RunId>,
 ) -> Result<weft_core::program::CleanOutcome, (StatusCode, String)> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
+    let cancel_going = running == weft_core::program::StillGoing::Cancel;
     let query = run_query(project, filter, MAX_PAGE, crate::lease::now_unix() as u64);
     let mut outcome = weft_core::program::CleanOutcome::default();
     // The pages walk back in time from a bound fixed now (a run that
@@ -796,14 +797,13 @@ pub(crate) async fn clean_runs(
                 continue;
             }
             if run.status == weft_core::program::RunStatus::Running {
-                match running {
-                    weft_core::running_policy::RunningPolicy::Cancel => {
-                        cancel_run_id(state, run.run_id, &weft_core::run::CancelCause::User)
-                            .await
-                            .map_err(|e| internal("cancel", e))?;
-                        outcome.cancelled += 1;
-                    }
-                    weft_core::running_policy::RunningPolicy::Wait => outcome.left_running += 1,
+                if cancel_going {
+                    cancel_run_id(state, run.run_id, &weft_core::run::CancelCause::User)
+                        .await
+                        .map_err(|e| internal("cancel", e))?;
+                    outcome.cancelled += 1;
+                } else {
+                    outcome.left_running += 1;
                 }
                 continue;
             }
@@ -812,7 +812,7 @@ pub(crate) async fn clean_runs(
             }
             let project_id = clean_run(state, tenant, run.run_id)
                 .await
-                .map_err(|status| (status, format!("delete run {}", run.run_id)))?;
+                .map_err(|e| (e.status(), format!("delete run {}: {}", run.run_id, e.message())))?;
             swept_projects.insert(project_id);
             outcome.deleted += 1;
         }
@@ -911,8 +911,8 @@ pub async fn delete_run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(run_id_str): Path<String>,
-) -> Result<axum::Json<DeletedRun>, StatusCode> {
-    let run_id: RunId = run_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<axum::Json<DeletedRun>, crate::api::storage::ApiError> {
+    let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id")))?;
     let project_id = clean_run(&state, &caller.0, run_id).await?;
     // The run IS deleted, which is what was asked for, so a sweep that
     // cannot run is said out loud and does not fail the delete: the
@@ -936,19 +936,20 @@ pub(crate) async fn clean_run(
     state: &DispatcherState,
     caller: &crate::tenant::TenantId,
     run_id: RunId,
-) -> Result<uuid::Uuid, StatusCode> {
+) -> Result<uuid::Uuid, crate::api::storage::ApiError> {
     // The gate already read the owning row; keep it rather than asking
     // again. Its tenant is the one the storage prefix was WRITTEN
     // under, so the wipe below addresses the same bytes the run
     // created even for a project that has since been removed (asking
     // the project store for the tenant would fail exactly there).
-    let owner = authorize_run(&*state.journal, caller, run_id).await.map_err(|(s, _)| s)?;
+    let owner = authorize_run(&*state.journal, caller, run_id).await?;
     // Wipe the run's storage folder (kept survivors included:
     // `weft clean <run_id>` IS the explicit removal verb for them)
     // BEFORE the journal rows go, while the run's row still exists.
     // A spent run's storage address dies with its journal history;
     // every failure below aborts so a retry can still wipe, never
-    // orphaning the prefix.
+    // orphaning the prefix. The store's own answer goes back as it is:
+    // what it left and why, and whether waiting is enough.
     crate::storage::wipe_prefix(state, &format!("{}/run/{run_id}/", owner.tenant))
         .await
         .map_err(|e| {
@@ -957,7 +958,7 @@ pub(crate) async fn clean_run(
                 %run_id, error = %e,
                 "could not wipe run storage; aborting clean so a retry can"
             );
-            StatusCode::SERVICE_UNAVAILABLE
+            crate::api::storage::storage_err(e)
         })?;
     // Head stops pointing at the run first: a failure after it leaves
     // the run whole and reachable, and the same command retries.
@@ -967,13 +968,13 @@ pub(crate) async fn clean_run(
             %run_id, error = %e,
             "could not move head off this run; nothing was deleted, retry"
         );
-        StatusCode::INTERNAL_SERVER_ERROR
+        (StatusCode::INTERNAL_SERVER_ERROR, "could not move head off this run; nothing was deleted, retry".to_string())
     })?;
     let removed = state
         .journal
         .delete_run(run_id)
         .await
-        .map_err(failed("delete the run"))?;
+        .map_err(|e| (failed("delete the run")(e), "could not delete the run's journal; retry".to_string()))?;
     // The questions the run was parked on went with its rows, and the
     // listener holding each one still serves it until told: a
     // client with a signal token could list and answer a form

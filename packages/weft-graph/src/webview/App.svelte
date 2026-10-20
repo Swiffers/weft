@@ -6,14 +6,13 @@
   import { MessagesSquare } from '@lucide/svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import CallerPanel from './lib/components/project/CallerPanel.svelte';
-  import DeactivationPicker from './lib/components/project/DeactivationPicker.svelte';
   import { send, onMessage, teardownTransport, hostRequest, cancelPendingHostRequests, HostRequestCancelled } from './host';
   import { registerCatalog, setCatalog } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeFiring, RunState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, CatalogWarning, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
+  import type { ActionBarState, CatalogWarning, ActionAvailability, LifecycleAction, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
   import { credentialOwnerKind } from '../protocol';
@@ -330,10 +329,10 @@
   // layer, `error` sticky banner.
   let actionBarState = $state<ActionBarState>(idleActionBarState());
 
-  // Latest /status snapshot. Drives the action bar's drift
-  // indicators (Resync/Upgrade lights) AND the graph's per-node
-  // infra badges. Stays current across cli_running so the lights
-  // don't blink mid-verb.
+  // Latest /status snapshot: every trigger's, infra copy's and
+  // instance's state. Drives the node badges, the contextual bar's
+  // counts and the bottom bar's in-flight states. Stays current across
+  // cli_running so the badges don't blink mid-verb.
   let statusSnapshot = $state<ActionAvailability | undefined>(undefined);
 
   onMount(() => {
@@ -373,10 +372,6 @@
       // editApplied and sourceResynced replies are consumed by the shared
       // hostRequest correlator (see requestEdit/requestResync above), not
       // handled here.
-      if (msg.kind === 'needsTriggerChoice') {
-        deactivationIntent = msg.intent;
-        return;
-      }
       if (msg.kind === 'codeEditTouched') {
         // An external change landed on the watched doc: slide the editor's
         // auto-lock forward (source-mutating graph gestures pause for 1s).
@@ -939,9 +934,16 @@
   // a worker, and forwards the message to the host. The host's
   // CLI runner emits progress events that drive every UI
   // transition; the webview never sets transitional flags itself.
-  function onRun(targets: string[] = []) {
+  function onRun(targets: [string, ...string[]]) {
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'runProject', targets });
+  }
+  /// Whether a run of these targets would start: the walk's refusal, or
+  /// `null`. The contextual bar disables Run with the refusal as its text.
+  async function checkRun(targets: [string, ...string[]]): Promise<string | null> {
+    editorRef?.flushAllPendingSaves?.();
+    const reply = await hostRequest('runChecked', (requestId) => ({ kind: 'checkRun', requestId, targets }));
+    return reply.refusal;
   }
 
   // The run spec dialog's round trips: resolve through the host (the
@@ -976,87 +978,19 @@
   // (run_running). One verb, state-aware behavior.
   function onStop() { send({ kind: 'stopAction' }); }
   function onDismissError() { send({ kind: 'dismissError' }); }
-  function onActivate() {
+  /// A lifecycle verb on the selected triggers or infra. Turning on,
+  /// resyncing, starting and upgrading build from the source, so the
+  /// pending edits are flushed first.
+  function onLifecycle(action: LifecycleAction) {
     editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'activateProject' });
+    send({ kind: 'lifecycle', action });
   }
-  // ─── The shared deactivation picker ─────────────────────────
-  // One picker for every verb that takes live triggers down: the
-  // standalone Deactivate, and the infra verbs on an ACTIVE project
-  // (stop / terminate / upgrade auto-deactivate first, per the state
-  // model). The picker lives HERE (shared webview) so both hosts get
-  // the exact same UX; the chosen spec rides on the verb message and
-  // the host just forwards it.
-  type DeactivationIntent = 'deactivate' | TriggerChoiceIntent;
-  let deactivationIntent = $state<DeactivationIntent | undefined>(undefined);
-  const PICKER_TITLES: Record<DeactivationIntent, string> = {
-    deactivate: 'Deactivate',
-    resync: 'Resync',
-    infraStop: 'Stop infra',
-    infraTerminate: 'Terminate infra',
-    infraUpgrade: 'Upgrade infra',
-  };
-  function onDeactivationSpecChosen(spec: DeactivationSpec) {
-    const intent = deactivationIntent;
-    deactivationIntent = undefined;
-    if (!intent) return;
-    editorRef?.flushAllPendingSaves?.();
-    switch (intent) {
-      case 'deactivate': send({ kind: 'deactivateProject', spec }); break;
-      case 'resync': send({ kind: 'resyncProject', spec }); break;
-      case 'infraStop': send({ kind: 'infraStop', deactivation: spec }); break;
-      case 'infraTerminate': send({ kind: 'infraTerminate', deactivation: spec }); break;
-      case 'infraUpgrade': send({ kind: 'infraUpgrade', deactivation: spec }); break;
-    }
-  }
-
-  function onDeactivate() { deactivationIntent = 'deactivate'; }
   function onCancelActivate() { send({ kind: 'cancelActivate' }); }
   function onCancelBuild() { send({ kind: 'cancelBuild' }); }
   function onCancelInfra() { send({ kind: 'infraCancel' }); }
-  function onReactivate() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'reactivateProject' });
-  }
-  function onCancelRunning() { send({ kind: 'cancelRunning' }); }
-  function onResumeActive() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'resumeActive' });
-  }
-  function onResync() {
-    // Resync deactivates first, and the user picks how (same shared
-    // picker as Deactivate). The dispatcher offers it only while some
-    // trigger is on, the program's or an instance's (an instance's can be on
-    // while the program's own are off, so the project status is no
-    // guide here), which means the choice is always needed.
-    deactivationIntent = 'resync';
-  }
   // A resync that stopped is taken up again with the take-down choice it
-  // was started with, so no picker opens, and never as a new resync.
+  // was started with, and never as a new resync.
   function onResumeResync() { send({ kind: 'resumeResync' }); }
-  function onStartInfra() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'infraStart' });
-  }
-  // The infra verbs go without a choice: only the dispatcher knows
-  // whether a trigger is on (the program's or an instance's), and when one
-  // is, the host answers `needsTriggerChoice` and the picker opens.
-  function onStopInfra() {
-    send({ kind: 'infraStop' });
-  }
-  function onTerminateInfra() {
-    send({ kind: 'infraTerminate' });
-  }
-  function onInfraNodeStop(node: string) {
-    send({ kind: 'infraNodeStop', node });
-  }
-  function onInfraNodeTerminate(node: string) {
-    send({ kind: 'infraNodeTerminate', node });
-  }
-  function onUpgradeInfra() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'infraUpgrade' });
-  }
 
   // The context handed to the panel slots. Getters (not a snapshot) so each read
   // is reactive: a slot consumer that reads `ctx.activeSource` / `ctx.runState`
@@ -1232,44 +1166,20 @@
       {onStop}
       {onDismissError}
       onOpenLocation={(location) => send({ kind: 'openSource', location })}
-      {onActivate}
       {onCancelActivate}
       {onCancelBuild}
       {onCancelInfra}
-      {onDeactivate}
-      {onReactivate}
-      {onCancelRunning}
-      {onResumeActive}
-      {onResync}
       {onResumeResync}
-      {onStartInfra}
-      {onStopInfra}
-      {onTerminateInfra}
-      {onInfraNodeStop}
-      {onInfraNodeTerminate}
-      {onUpgradeInfra}
+      {onLifecycle}
+      {checkRun}
       {actionBarState}
-      drift={statusSnapshot}
-      infraNodes={statusSnapshot?.infraNodes}
+      status={statusSnapshot}
       {hasInfraInGraph}
       {hasTriggersInGraph}
       runState={shownRunState}
       {displayByNode}
     />
     </svelte:boundary>
-    {/key}
-    <!-- Keyed on the intent so each OPEN remounts the picker fresh at its
-         defaults. Without this, the picker is mounted once and only toggled open,
-         so a previously-chosen destructive selection (e.g. Wipe, which cancels
-         runs and drops signals) would persist into the next, unrelated open and a
-         trusting Confirm would wipe when the user meant a gentle stop. -->
-    {#key deactivationIntent}
-      <DeactivationPicker
-        open={deactivationIntent !== undefined}
-        title={deactivationIntent ? PICKER_TITLES[deactivationIntent] : ''}
-        onConfirm={onDeactivationSpecChosen}
-        onCancel={() => (deactivationIntent = undefined)}
-      />
     {/key}
         </div>
         {#if rightPanel}{@render rightPanel(editorContext)}{/if}

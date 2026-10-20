@@ -26,8 +26,8 @@ const STATUS_POLL: Duration = Duration::from_millis(300);
 pub struct ProjectStatus(pub Value);
 
 impl ProjectStatus {
-    /// The stored trigger-lifecycle status (`registered` / `activating` /
-    /// `active` / `deactivating` / `inactive`).
+    /// The aggregate over the shared triggers (`registered` /
+    /// `activating` / `active` / `inactive`).
     pub fn status(&self) -> &str {
         self.0.get("status").and_then(Value::as_str).unwrap_or("")
     }
@@ -54,9 +54,102 @@ impl ProjectStatus {
         self.0.get("orphanedInfra").and_then(Value::as_bool).unwrap_or(false)
     }
 
-    /// Running (non-suspended, non-terminal) runs.
-    pub fn running_count(&self) -> u64 {
-        self.0.get("runningCount").and_then(Value::as_u64).unwrap_or(0)
+    /// The program's own runs going right now (`runs.running`, a fire's
+    /// phase only: the setup an infra start or an activation runs is
+    /// left out), paused ones excluded.
+    pub fn running_count(&self) -> usize {
+        self.0
+            .pointer("/runs/running")
+            .and_then(Value::as_array)
+            .map(|going| going.iter().filter(|run| run.get("phase").and_then(Value::as_str) == Some("fire")).count())
+            .unwrap_or(0)
+    }
+
+    /// The entry of the trigger the program spells `node` (`triggers[]`).
+    pub fn trigger(&self, node: &str) -> Option<&Value> {
+        self.0
+            .get("triggers")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|t| t.get("node").and_then(Value::as_str) == Some(node))
+    }
+
+    /// One owner's activation of `node`: the shared one when `instance`
+    /// is `None`, that instance's otherwise.
+    pub fn trigger_copy(&self, node: &str, instance: Option<&str>) -> Option<&Value> {
+        let entry = self.trigger(node)?;
+        match instance {
+            None => entry.get("shared"),
+            Some(instance) => entry
+                .get("copies")
+                .and_then(Value::as_array)?
+                .iter()
+                .find(|c| c.get("instance").and_then(Value::as_str) == Some(instance)),
+        }
+    }
+
+    /// Where that activation stands (`off` / `turning_on` / `on` /
+    /// `behind`), `""` when it has none.
+    pub fn trigger_state(&self, node: &str, instance: Option<&str>) -> &str {
+        self.trigger_copy(node, instance).and_then(|c| c.get("state")).and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// What that activation holds while it is down: the arrivals its door
+    /// held, and the runs it fired that are paused.
+    pub fn trigger_held(&self, node: &str, instance: Option<&str>) -> (u64, u64) {
+        let held = self.trigger_copy(node, instance).and_then(|c| c.get("held"));
+        let count = |key: &str| held.and_then(|h| h.get(key)).and_then(Value::as_u64).unwrap_or(0);
+        (count("arrivals"), count("paused"))
+    }
+
+    /// The infra places `node`'s cut contains (`dependsOn`): what taking
+    /// one of them down takes the trigger down with.
+    pub fn trigger_depends_on(&self, node: &str) -> Vec<&str> {
+        self.trigger(node)
+            .and_then(|t| t.get("dependsOn"))
+            .and_then(Value::as_array)
+            .map(|places| places.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// The triggers taking the infra place `node` down takes down with it
+    /// (`infra[].takesDown`, each owner's triggers), every owner's together.
+    pub fn infra_takes_down(&self, node: &str) -> Vec<&str> {
+        self.infra_place(node)
+            .and_then(|p| p.get("takesDown"))
+            .and_then(Value::as_array)
+            .map(|owners| {
+                owners
+                    .iter()
+                    .filter_map(|owned| owned.get("triggers").and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The entry of the infra place the program spells `node` (`infra[]`).
+    pub fn infra_place(&self, node: &str) -> Option<&Value> {
+        self.0
+            .get("infra")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|p| p.get("node").and_then(Value::as_str) == Some(node))
+    }
+
+    /// Where the shared copy of the infra place `node` stands (`running`,
+    /// `stopped`, `not_started`, ...), `""` when the program has no such
+    /// place.
+    pub fn infra_state(&self, node: &str) -> &str {
+        self.infra_place(node).and_then(|p| p.get("status")).and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// Whether the shared copy of `node` was applied from other infra than
+    /// the registered build holds (`behind`): what `weft infra upgrade`
+    /// replaces once it runs.
+    pub fn infra_behind(&self, node: &str) -> bool {
+        self.infra_place(node).and_then(|p| p.get("behind")).and_then(Value::as_bool).unwrap_or(false)
     }
 
     /// The reconciliation table's answer: the verbs the dispatcher will

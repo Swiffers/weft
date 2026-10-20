@@ -514,7 +514,7 @@ async fn a_hand_fired_trigger_replays_what_activation_registered() -> anyhow::Re
     settled.assert_input("beat", "data", &json!("2026-03-03T00:00:00Z"))?;
     settled.assert_untouched("sched")?;
 
-    project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     let stdout = project.weft(&["run", "--json", "--fire", fire]).await?;
     SettledRun::observe(project.dispatcher(), run_id_of(&stdout)?).await?.completed()?.assert_completed("wired")?;
     project.finish().await
@@ -537,7 +537,7 @@ async fn activation_pins_a_version_in_the_tree() -> anyhow::Result<()> {
     anyhow::ensure!(tree["versions"].as_array().unwrap().iter().any(|v| v["id"] == json!(active)), "the version is in the tree: {tree}");
     let refused = project.weft_refused(&["prune", active.as_deref().unwrap(), "--yes"]).await?;
     anyhow::ensure!(refused.contains("is activated and inside the subtree"), "{refused}");
-    project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     let tree = tree_of(&project).await?;
     anyhow::ensure!(tree["head"]["activatedVersions"] == json!([]), "deactivate clears it: {tree}");
 

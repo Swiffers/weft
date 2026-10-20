@@ -354,7 +354,7 @@ pub async fn picker(
         ));
     };
     let weft_core::instance::WiredConnection { id: access_id, service, .. } = own_signing(&connection, &req.node, &req.field)?;
-    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let base = crate::api::request_base(&headers)?;
     let picker_state = weft_access_store::begin_picker(
         &state.pg_pool,
         &caller.tenant,
@@ -362,7 +362,7 @@ pub async fn picker(
     )
     .await
     .map_err(access_err)?;
-    let url = format!("{}/access/picker/{picker_state}", base.as_str());
+    let url = format!("{base}/access/picker/{picker_state}");
     Ok(Json(serde_json::json!({ "state": picker_state, "url": url })))
 }
 

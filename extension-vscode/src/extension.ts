@@ -37,10 +37,9 @@ import { RunFollower } from './runFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
 import { Presence } from './presence';
-import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation, TriggerChoiceIntent } from '../../packages/weft-graph/src/protocol';
+import type { ActionVerb, ActionErrorDetails, CliEvent, RunCheck, SourceLocation } from '../../packages/weft-graph/src/protocol';
 import { LOCAL_INSTALL } from '../../packages/weft-graph/src/protocol';
 import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint, whichCli, type WhichCli } from './localInstall';
-import { isTriggerChoiceRefusal, triggerChoiceIntent } from './triggerChoice';
 import {
   emptyActionAvailability,
   parseRunning,
@@ -280,6 +279,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   graphView.setRunHandler((targets) => runPinned(targets));
+  graphView.setRunCheckHandler((targets) => checkRun(targets));
   graphView.setNavHandler((group) => runsProvider.setFocusedGroup(group));
   graphView.setFollowModeHandler((mode) => {
     autoFollow.setMode(mode);
@@ -567,14 +567,28 @@ export function activate(context: vscode.ExtensionContext) {
     await graphView.open(doc, project.id, vscode.ViewColumn.Beside);
   }
 
-  /// User clicked Run. Run is just a CLI verb like the others now;
-  /// runPinned exists separately only so the keybinding (Ctrl+Enter)
-  /// has a stable target name.
-  /// `targets` narrows the run to those nodes and what they need; empty
-  /// kicks every root of the graph, which is what the plain Run button
-  /// does.
+  /// Run the pinned project. Run is just a CLI verb like the others;
+  /// runPinned exists separately so the sidebar's Run Project and the
+  /// graph's Run share one name. `targets` narrows the run to those nodes
+  /// and what they need (the graph always names some, its selection);
+  /// empty kicks every root, which only the sidebar's Run Project does.
   async function runPinned(targets: string[] = []): Promise<void> {
     await runCliVerb('run', targets.flatMap((t) => ['--target', t]));
+  }
+
+  /// Whether a run of `targets` would start, without starting it: the
+  /// walk's refusal (`weft run --check`), or `null` when it resolves. The
+  /// graph disables its Run with the refusal as the reason. It reads the
+  /// files on disk, so the graph's last edit is saved first.
+  async function checkRun(targets: [string, ...string[]]): Promise<string | null> {
+    if (!pinnedProject) return 'no project is pinned, so there is nothing to run';
+    const project = pinnedProject;
+    await graphView.waitForPendingSave();
+    const answer = await runWeftJson<RunCheck>(
+      [...onArgs(installOf(project.id)), 'run', '--check', ...targets.flatMap((t) => ['--target', t]), '--json'],
+      project.rootPath,
+    );
+    return answer.ok ? null : answer.refusal;
   }
 
   /// Spawn a CLI verb and pump its NDJSON event stream into the
@@ -592,16 +606,13 @@ export function activate(context: vscode.ExtensionContext) {
   ///
   /// On success we fire a status refetch to reconcile the bar with
   /// backend ground truth (run started → run_running).
-  /// Resolves to the picker intent when the dispatcher refused the verb
-  /// for want of a trigger-deactivation choice (the bar is cleared, the
-  /// caller opens the picker), and to `undefined` otherwise.
-  async function runCliVerb(verb: string, args: string[]): Promise<TriggerChoiceIntent | undefined> {
+  async function runCliVerb(verb: string, args: string[]): Promise<void> {
     if (!pinnedProject) {
       void vscode.window.showInformationMessage('Pin a Weft project first.');
-      return undefined;
+      return;
     }
     // Bind the WHOLE verb to the project pinned at click time. Every
-    // await below (pending save, pre-flight, the reactivate modal) is a
+    // await below (pending save, pre-flight) is a
     // window where the user can switch pins, and this verb's gate
     // results, errors, and CLI events all belong to the project they
     // clicked on, never the new pin.
@@ -613,11 +624,11 @@ export function activate(context: vscode.ExtensionContext) {
     // tracking slot).
     if (verbsInFlight.has(projectId)) {
       void vscode.window.showInformationMessage('Weft: an action is already running for this project.');
-      return undefined;
+      return;
     }
     verbsInFlight.add(projectId);
     try {
-      return await runCliVerbForProject(project, verb, args);
+      await runCliVerbForProject(project, verb, args);
     } finally {
       verbsInFlight.delete(projectId);
     }
@@ -629,7 +640,7 @@ export function activate(context: vscode.ExtensionContext) {
     project: WeftProject,
     verb: string,
     args: string[],
-  ): Promise<TriggerChoiceIntent | undefined> {
+  ): Promise<void> {
     const projectId = project.id;
     const projectRoot = project.rootPath;
     // The install the graph showed at the click, bound like the project.
@@ -694,22 +705,6 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
       }
-      // Reactivate-prompt for activate when project is hibernate/park.
-      // The CLI's --json mode skips its own terminal prompt, so the
-      // extension is responsible for showing the modal when there's
-      // preserved state to choose about.
-      if (verb === 'activate') {
-        const choice = await maybePromptReactivateChoice(project);
-        if (choice === undefined || stopHandled()) {
-          // User cancelled (the prompt or the bar); drop the in-flight
-          // bar state.
-          actionBar.cliKilled(projectId, verbTag);
-          return;
-        }
-        if (choice !== null) {
-          args = [...args, '--reactivate-choice', choice];
-        }
-      }
     } finally {
       // The pre-CLI window is over (spawned, refused, or stopped);
       // Stop now targets the CLI child, not this handle.
@@ -726,15 +721,8 @@ export function activate(context: vscode.ExtensionContext) {
       autoFollow.followStartedByUser(undefined);
     }
     actionBar.cliStart(projectId, verbTag);
-    // Set when the CLI's error is the dispatcher asking how triggers come
-    // down: that is a question for the picker, never an error banner.
-    let needsTriggerChoice = false;
     try {
       await runWeftCliJson(projectId, [...on, verb, ...args], projectRoot, (ev) => {
-        if (isTriggerChoiceRefusal(ev)) {
-          needsTriggerChoice = true;
-          return;
-        }
         // Stamp the verb this child was spawned for onto an event that
         // carries none (a failure that reached the CLI's main
         // unreported). This closure is the only place that knows which
@@ -760,7 +748,7 @@ export function activate(context: vscode.ExtensionContext) {
       }, (text) => actionBar.cliLog(projectId, verbTag, text));
     } catch (err) {
       const tracking = cliTracking.get(projectId);
-      if (tracking?.userKilled || needsTriggerChoice) {
+      if (tracking?.userKilled) {
         actionBar.cliKilled(projectId, verbTag);
       } else {
         const message = err instanceof Error ? err.message : String(err);
@@ -778,7 +766,6 @@ export function activate(context: vscode.ExtensionContext) {
         void runsProvider.refresh();
       }
     }
-    return needsTriggerChoice ? triggerChoiceIntent(verbTag) : undefined;
   }
 
   /// Map (verb, args) onto the CLI's ActionVerb tag. Compound
@@ -794,8 +781,6 @@ export function activate(context: vscode.ExtensionContext) {
         case 'terminate': return 'infra_terminate';
         case 'upgrade': return 'infra_upgrade';
         case 'cancel': return 'infra_cancel';
-        case 'node-stop': return 'infra_node_stop';
-        case 'node-terminate': return 'infra_node_terminate';
         default:
           throw new Error(`verbTagFor: unknown infra subverb '${sub}'`);
       }
@@ -806,65 +791,10 @@ export function activate(context: vscode.ExtensionContext) {
       case 'cancel-activate': return 'cancel_activate';
       case 'cancel-build': return 'cancel_build';
       case 'deactivate': return 'deactivate';
-      case 'cancel-running': return 'cancel_running';
       case 'resync': return 'resync';
       default:
         throw new Error(`verbTagFor: unknown CLI verb '${verb}'`);
     }
-  }
-
-  /// Returns:
-  ///   - `null` when the project is in `none` mode OR has no
-  ///     preserved state (no prompt shown, CLI activates with
-  ///     default behavior).
-  ///   - `string` when the user picked one of the three choices.
-  ///   - `undefined` when the user cancelled the modal (caller
-  ///     aborts the activate).
-  async function maybePromptReactivateChoice(
-    project: WeftProject,
-  ): Promise<string | null | undefined> {
-    // A status that cannot be read stops the activate: going on without
-    // it would send no choice, and the dispatcher refuses an activate over
-    // kept work that names none with a CLI flag the editor never shows.
-    // The read says why above the bar (`fetchActionAvailability`).
-    const status = await fetchActionAvailability(project.id, project.rootPath);
-    if (!status) return undefined;
-    // The prompt fires exactly when the triggers the bar turns on (the
-    // program's own) kept work while they were off, whether the project
-    // is inactive or partly on (an infra stop took down only the triggers
-    // reading it): the counts are the dispatcher's, for those triggers, and
-    // it refuses an activate over kept work that names no choice. The same
-    // rule as the CLI (`crates/weft-cli/src/commands/activate.rs
-    // fetch_preserved_state`).
-    const parked = status.snapshot.preservation.parked;
-    const suspended = status.snapshot.preservation.suspended;
-    if (parked === 0 && suspended === 0) return null;
-    const choice = await vscode.window.showQuickPick(
-      [
-        {
-          label: 'Run what was kept, keep the waiting runs',
-          description: `runs ${parked} kept event(s), answers people sent included; ${suspended} run(s) keep waiting on a person`,
-          value: 'execute_parked_keep_suspended',
-        },
-        {
-          label: 'Drop the kept events, keep the waiting runs',
-          description: `drops ${parked} kept event(s), answers people sent included; ${suspended} run(s) keep waiting on a person`,
-          value: 'keep_suspended_only',
-        },
-        {
-          label: 'Wipe all',
-          description: 'drops everything kept and cancels the runs these triggers started: a fresh start',
-          value: 'wipe_all',
-        },
-      ],
-      {
-        title: `Reactivating ${project.label}: work kept while the triggers were off`,
-        placeHolder: 'Pick a reactivate choice',
-        ignoreFocusOut: true,
-      },
-    );
-    if (!choice) return undefined;
-    return choice.value;
   }
 
   /// Stop button pressed on the pinned project's action bar.

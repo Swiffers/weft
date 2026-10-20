@@ -34,13 +34,18 @@
 //!   marker key on a `JsonDict` port stays exactly as it is). On a
 //!   wire a file is the marker
 //!   `{"__weft_image__": {key, filename, mimeType, sizeBytes}}` (one
-//!   sentinel per kind); the engine adds a `url` minted for this
-//!   firing before the node runs. The script gets the inside of the
-//!   marker as a plain dict, so `photo["url"]` is the download link
-//!   and `photo["filename"]` the name, with no sentinel to unwrap.
+//!   sentinel per kind). The script gets the inside of the marker as a
+//!   plain dict, with three links this node makes for it beside what the
+//!   file says of itself: `photo["internalUrl"]` to fetch the bytes from
+//!   the script (straight to storage, inside the install),
+//!   `photo["externalUrl"]` to hand to another service, and
+//!   `photo["public"]`, whether the open internet opens `externalUrl`
+//!   (when it does not, send that service the bytes instead). Both links
+//!   live as long as the file's value says (`linkSecs`), else fifteen
+//!   minutes. `photo["filename"]` is the name, with no sentinel to unwrap.
 //!   The kind is not lost: a file returned on a file-typed output is
-//!   wrapped back into its marker from its mime type, and the engine
-//!   strips the link on the way out as it does for every node.
+//!   wrapped back into its marker from its mime type, and the links stay
+//!   behind.
 //!
 //! - The return value must be a dict keyed by declared output port
 //!   name. A missing key means "no pulse on that port": the port is
@@ -122,16 +127,15 @@ impl Node for ExecPythonNode {
         // bind as variables, nor do the language's gate ports); a port
         // with nothing in the bag (a skipped upstream, an optional input
         // nobody wired) binds as `None`, so the script never meets an
-        // undefined name. Stored files bind unwrapped.
-        let inputs: Vec<(String, Value)> = ctx
-            .inputs
-            .created()
-            .map(|name| {
-                let ty = ctx.declared_inputs().get(name);
-                let value = ctx.inputs.raw(name).map(|v| unwrap_files(v, ty)).unwrap_or(Value::Null);
-                (name.clone(), value)
-            })
-            .collect();
+        // undefined name. Stored files bind unwrapped, with their links.
+        let mut inputs: Vec<(String, Value)> = Vec::new();
+        for name in ctx.inputs.created() {
+            let value = match ctx.inputs.raw(name) {
+                Some(value) => unwrap_files(&ctx, value, ctx.declared_inputs().get(name)).await?,
+                None => Value::Null,
+            };
+            inputs.push((name.clone(), value));
+        }
 
         let interpreters = ctx.shared("exec_python", |()| async { Ok(Interpreters::new()) }).await?;
         let result = run_python(&interpreters, &code, inputs, &ctx.cancellation()).await?;
@@ -189,26 +193,37 @@ fn answer_output(outputs: &HashMap<String, WeftType>, result: Vec<(String, Value
     Ok(out)
 }
 
+/// The links a file dict carries into the script, which never leave it:
+/// a file handed back drops them ([`wrap_files`]).
+const LINK_FIELDS: [&str; 3] = ["internalUrl", "externalUrl", "public"];
+
 /// The inside of every stored-file marker sitting where the port's
 /// DECLARED type says a file goes: `{"__weft_image__": {...}}` becomes
-/// `{...}`. The type is the question, exactly as on the way out
-/// ([`wrap_files`]), so a dict that merely happens to carry a marker
-/// key on a port declared `JsonDict` flows whole. A port with no file
-/// anywhere in its type is copied untouched.
-fn unwrap_files(value: &Value, ty: Option<&WeftType>) -> Value {
+/// `{...}`, with the file's links beside it ([`LINK_FIELDS`]: one for the
+/// script, one for another service and whether the internet opens it).
+/// The type is the question, exactly as on the way out ([`wrap_files`]),
+/// so a dict that merely happens to carry a marker key on a port
+/// declared `JsonDict` flows whole. A port with no file anywhere in its
+/// type is copied untouched.
+async fn unwrap_files(ctx: &RunContext, value: &Value, ty: Option<&WeftType>) -> WeftResult<Value> {
     let Some(ty) = ty.filter(|ty| ty.references_file()) else {
-        return value.clone();
+        return Ok(value.clone());
     };
-    let replacements = media_slots(value, ty)
-        .into_iter()
-        .filter_map(|slot| {
-            let obj = slot.as_object()?;
-            let kind = FileKind::from_marker_obj(obj)?;
-            let inner = obj.get(kind.marker_key())?.clone();
-            Some((slot.to_string(), inner))
-        })
-        .collect();
-    substitute_media(value, ty, &replacements)
+    let storage = ctx.storage(weft::storage::StorageScope::Run);
+    let mut replacements = HashMap::new();
+    for slot in media_slots(value, ty) {
+        let Some(obj) = slot.as_object() else { continue };
+        let Some(kind) = FileKind::from_marker_obj(obj) else { continue };
+        let Some(mut inner) = obj.get(kind.marker_key()).and_then(Value::as_object).cloned() else { continue };
+        let handle = weft::storage::FileHandle::from_value(&slot)?;
+        let internal = storage.internal_link(&handle).await?;
+        let external = storage.external_link(&handle).await?;
+        inner.insert("internalUrl".into(), Value::String(internal.url));
+        inner.insert("externalUrl".into(), Value::String(external.url));
+        inner.insert("public".into(), Value::Bool(external.public));
+        replacements.insert(slot.to_string(), Value::Object(inner));
+    }
+    Ok(substitute_media(value, ty, &replacements))
 }
 
 /// The inverse of [`unwrap_files`] on an output typed as a file: every
@@ -229,6 +244,11 @@ fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
         if FileKind::from_marker_obj(obj).is_some() {
             continue;
         }
+        let mut obj = obj.clone();
+        for field in LINK_FIELDS {
+            obj.remove(field);
+        }
+        let slot_value = Value::Object(obj.clone());
         // A file that lives at an external URL carries `url` where a
         // stored file carries `key` (see `FileHandle::Url`), so it is
         // not a `StoredFile` and never will be. The script was handed
@@ -242,11 +262,11 @@ fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
                 .unwrap_or("application/octet-stream");
             replacements.insert(
                 slot.to_string(),
-                WeftType::file_marker(FileKind::from_mime(mime), slot.clone()),
+                WeftType::file_marker(FileKind::from_mime(mime), slot_value),
             );
             continue;
         }
-        let file: StoredFile = serde_json::from_value(slot.clone()).map_err(|e| {
+        let file: StoredFile = serde_json::from_value(slot_value).map_err(|e| {
             WeftError::Type(format!("the script returned a dict on a file port that is not a stored file ({e}); return the dict the file arrived as"))
         })?;
         replacements.insert(slot.to_string(), file.to_value());

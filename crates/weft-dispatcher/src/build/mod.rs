@@ -232,6 +232,12 @@ impl VersionBuilder {
         let images: Vec<String> =
             plan.images.iter().map(|image| image.image_ref.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         let infra_images = infra_places(&definition, &plan.images)?;
+        let worker_image = plan
+            .images
+            .iter()
+            .find(|image| image.kind == weft_compiler::build_plan::ImageKind::Worker)
+            .map(|image| image.image_ref.clone())
+            .context("the build plan has no worker image")?;
         let version = Version {
             name: request.name.clone(),
             manifest: request.manifest.clone(),
@@ -243,6 +249,10 @@ impl VersionBuilder {
                 implementations: plan.implementations,
                 infra_images,
                 replaced_infra_images: Vec::new(),
+                infra_places: plan.infra_places,
+                worker_image,
+                left_out: Vec::new(),
+                worker_log: None,
             },
             images,
             ask,
@@ -287,7 +297,15 @@ impl VersionBuilder {
             if !seen.insert(image.image_ref.clone()) {
                 continue;
             }
-            if !self.images.image_exists(&image.image_ref).await? {
+            // A worker is only there once a build of it succeeded on the
+            // ledger, with the record of what it left out when its build
+            // reports one: one a failed read left in the registry, or one
+            // nothing here built, is built again, never run with its gaps
+            // unknown (registration reads that record, `ledger::left_out`).
+            let recorded = image.kind == weft_compiler::build_plan::ImageKind::Worker || image.result_file.is_some();
+            let there = self.images.image_exists(&image.image_ref).await?
+                && (!recorded || ledger::succeeded(&self.pool, &image.image_ref).await?);
+            if !there {
                 stale.push(image.clone());
             }
         }
@@ -471,6 +489,7 @@ impl VersionBuilder {
             image_ref: image.image_ref.clone(),
             build_args,
             uses: image.uses.clone(),
+            result_file: image.result_file.clone(),
         };
         let handle = match self.images.start(request).await {
             Ok(handle) => handle,

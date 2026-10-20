@@ -6,10 +6,11 @@
 //!   recalls turn one's fact at turn three, so the full conversation
 //!   really reached the provider each time;
 //! - a stored image attached via the `media` input reaches the model
-//!   (it names the square's color), i.e. externalize presigned the
-//!   stored bytes into a URL the provider could fetch;
+//!   (it names the square's color), i.e. externalize handed the
+//!   provider the image as a link it could fetch, or as inline bytes
+//!   on an install the internet does not reach;
 //! - the conversation file stays in stored form: the image slot holds
-//!   the stored-file value (never a presigned URL, never base64), so a
+//!   the stored-file value (never a link, never base64), so a
 //!   growing conversation holds references only;
 //! - each turn wrote the one file in place: turn one makes it at version
 //!   1, turns two and three edit it to 2 and 3, the same key throughout;
@@ -40,21 +41,6 @@ async fn a_conversation_file_carries_turns_and_media() -> anyhow::Result<()> {
 
     let mut settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
-
-    // Diagnostic, not an assertion: which path the attached image took
-    // to the provider. A relay link leaves a `public_file_link` row
-    // until it expires; none means the bytes went inline (no tunnel /
-    // public base on this install). Printed so a `--public-url` run
-    // shows the link path actually engaged.
-    let links = weft_e2e::platform::Platform::connect(&disp)
-        .await?
-        .public_file_link_count_for(&settled.run_id, &project.id())
-        .await?;
-    if links > 0 {
-        eprintln!("media path: PUBLIC RELAY LINK ({links} live link(s) minted)");
-    } else {
-        eprintln!("media path: INLINE BYTES (no public link served on this install)");
-    }
 
     // Turn two saw the attached square: the stored image really reached
     // the model in a form it could read.

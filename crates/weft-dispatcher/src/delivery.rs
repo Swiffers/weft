@@ -302,6 +302,19 @@ pub fn refused_cause(by: RefusedBy, error: &str) -> weft_core::run::CancelCause 
     weft_core::run::CancelCause::Runtime { detail: format!("{who} {REFUSALS_TO_END} times: {error}") }
 }
 
+/// What a run whose build's worker cannot start (`why`) is ended for: at
+/// once, never handed out again, its record kept like any ended run's, so
+/// once the program runs again it can be picked up from what it did.
+pub fn wont_start_cause(run_id: RunId, why: &str) -> weft_core::run::CancelCause {
+    weft_core::run::CancelCause::Runtime {
+        detail: format!(
+            "{why}. Nothing will run on that build again: fix the program and build again (`weft resync` puts \
+             triggers that are on onto the new build), then `weft run --seed {run_id}` picks this run up from \
+             what it did"
+        ),
+    }
+}
+
 /// End a queued run no worker can ever claim (a run of no program): until
 /// its ending lands it shows going and its waiters hang. It ends the way
 /// every run the dispatcher ends itself does, a runtime cancel naming why
@@ -494,6 +507,29 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
             weft_task_store::unanswered::gave_up(&state.pg_pool, workers, None, &error).await?.log();
             crate::api::run::cancel_run_id(state, run_id, &refused_cause(by, &error)).await
         }
+        GiveBack::WontStart => {
+            // Every run queued on that build ends with it: each would bring
+            // up the same worker and meet the same answer.
+            let queued: Vec<RunId> = sqlx::query_scalar(
+                "SELECT run_id FROM run WHERE project_id = $1 AND binary_hash IS NOT DISTINCT FROM $2 AND state = 'queued'",
+            )
+            .bind(delivery.project_id)
+            .bind(delivery.binary_hash.as_deref())
+            .fetch_all(&state.pg_pool)
+            .await?;
+            tracing::warn!(
+                target: "weft_dispatcher::delivery",
+                %run_id,
+                project = %delivery.project_id,
+                %error,
+                queued = queued.len(),
+                "the worker of the run's build cannot start: ending the runs queued on it"
+            );
+            let causes: Vec<(RunId, weft_core::run::CancelCause)> =
+                queued.into_iter().chain(std::iter::once(run_id)).map(|queued| (queued, wont_start_cause(queued, &error))).collect();
+            let targets: Vec<(RunId, &weft_core::run::CancelCause)> = causes.iter().map(|(queued, cause)| (*queued, cause)).collect();
+            crate::api::run::cancel_run_ids(state, &targets).await.map(drop)
+        }
         GiveBack::NotDelivered => {
             let Some(tries) = unreached(&state.pg_pool, run_id).await? else { return Ok(()) };
             tracing::warn!(
@@ -520,11 +556,15 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
 /// worker up and too busy to take it now ([`WorkerBusy`]), a definite no
 /// ([`Refusal`], or the platform refusing to bring the worker up:
 /// `weft_platform_traits::runner::PlatformRefused`), or no answer at all.
+/// Or why it never goes back: the worker of the run's build cannot start
+/// at all (`weft_platform_traits::WorkerWontStart`), which no retry
+/// changes, so the run ends at once ([`wont_start_cause`]).
 #[derive(Debug, PartialEq, Eq)]
 enum GiveBack {
     WorkerStarting,
     WorkerBusy,
     Refused(RefusedBy),
+    WontStart,
     NotDelivered,
 }
 
@@ -532,6 +572,8 @@ impl GiveBack {
     fn of(e: &anyhow::Error) -> Self {
         if weft_platform_traits::WorkerStarting::is(e) {
             GiveBack::WorkerStarting
+        } else if weft_platform_traits::WorkerWontStart::is(e) {
+            GiveBack::WontStart
         } else if e.downcast_ref::<WorkerBusy>().is_some() {
             GiveBack::WorkerBusy
         } else if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -679,12 +721,13 @@ async fn run_on_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{GiveBack, NotTaken, RefusedBy};
+    use super::{wont_start_cause, GiveBack, NotTaken, RefusedBy};
     use weft_platform_traits::WorkerCall;
 
     /// A worker still starting, a worker too busy, a no from the worker or
-    /// the platform, and a hand-off that got no answer are told apart:
-    /// only the no counts as a refusal, naming who said it.
+    /// the platform, a build whose worker cannot start, and a hand-off that
+    /// got no answer are told apart: only the no counts as a refusal,
+    /// naming who said it.
     #[test]
     fn a_refusal_is_told_apart_from_a_worker_starting_and_from_no_answer() {
         let starting = anyhow::Error::new(weft_platform_traits::WorkerStarting { what: "w".into() }).context("endpoint");
@@ -696,8 +739,22 @@ mod tests {
         let platform = anyhow::Error::new(weft_platform_traits::runner::PlatformRefused { why: "Google answered 403".into() })
             .context("the platform gave no address for the project's workers");
         assert_eq!(GiveBack::of(&platform), GiveBack::Refused(RefusedBy::Platform), "the platform refusing to bring a worker up is its no");
+        let wont = anyhow::Error::new(weft_platform_traits::WorkerWontStart { why: "it exited".into() }).context("endpoint");
+        assert_eq!(GiveBack::of(&wont), GiveBack::WontStart, "a build whose worker cannot start, found through a context");
         assert_eq!(GiveBack::of(&anyhow::anyhow!("call the worker at http://w: timed out")), GiveBack::NotDelivered);
         assert_eq!(GiveBack::of(&anyhow::anyhow!("pool timed out")), GiveBack::NotDelivered, "this side's own read failing");
+    }
+
+    /// A run whose build's worker cannot start ends saying why, what fixes
+    /// it, and how to pick the run back up.
+    #[test]
+    fn a_run_whose_worker_cannot_start_says_how_to_pick_it_up() {
+        let run_id = uuid::Uuid::from_u128(9);
+        let weft_core::run::CancelCause::Runtime { detail } = wont_start_cause(run_id, "the worker of this build cannot start: it exited") else {
+            panic!("a runtime cause");
+        };
+        assert!(detail.starts_with("the worker of this build cannot start: it exited."), "{detail}");
+        assert!(detail.contains("weft resync") && detail.contains(&format!("weft run --seed {run_id}")), "{detail}");
     }
 
     /// A busy answer is never a refusal: the worker's own busy `503` waits

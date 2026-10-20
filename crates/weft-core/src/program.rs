@@ -14,17 +14,18 @@
 //! instance limits are enforced at the outside doors (an instance token, the
 //! `Weft-Instance` header), not here.
 //!
-//! A call that takes something down carries a [`DeactivateSpec`] (what
-//! happens to parked and running work) and a [`StopSelf`]: the calling run
-//! is never among the runs a take-down reaches, and `StopSelf::Include`
-//! stops it too, after the take-down is queued.
+//! A call that takes something down carries a [`TakeDownChoice`] (what
+//! happens at the door, to what is held and to what is running; the rest
+//! is the command's default) and a [`StopSelf`]: the calling run is never
+//! among the runs a take-down reaches, and `StopSelf::Include` stops it
+//! too, after the take-down is queued.
 
 use serde::{Deserialize, Serialize};
 
 use crate::activation::ActivationScope;
 use crate::instance::InstanceId;
-use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::tag::StopSelf;
+use crate::take_down::{ReleaseHeld, TakeDownChoice};
 
 /// One call a program makes on its project.
 // SYNC: ProgramCall <-> crates/weft-dispatcher/src/task_kinds/program_call.rs (the executor's match)
@@ -36,11 +37,16 @@ pub enum ProgramCall {
     /// is queued; `ctx.infra(..).start()` then waits on
     /// [`ProgramCall::InfraStatus`] until it runs.
     InfraStart { node: String, instance: Option<InstanceId> },
-    /// Scale a copy down, keeping its disk.
-    InfraStop { node: String, instance: Option<InstanceId>, spec: DeactivateSpec },
+    /// Scale a copy down, keeping its disk, taking down the triggers whose
+    /// cut contains it as `take_down` says.
+    InfraStop { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice },
     /// Delete a copy and its disks, keeping the ones its node lists in
     /// `keepOnTerminate` unless `disks` says the owner is going for good.
-    InfraTerminate { node: String, instance: Option<InstanceId>, spec: DeactivateSpec, disks: crate::infra::TerminateDisks },
+    InfraTerminate { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice, disks: crate::infra::TerminateDisks },
+    /// Build nothing and cycle a running copy onto the registered build's
+    /// infra (a stop, then a start), taking down the triggers whose cut
+    /// contains it as `take_down` says; they come back with it.
+    InfraUpgrade { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice },
     /// One copy's state, or none when it was never started (or was
     /// terminated).
     InfraStatus { node: String, instance: Option<InstanceId> },
@@ -48,10 +54,10 @@ pub enum ProgramCall {
     /// instance's.
     InfraCopies { node: String },
     /// Activate triggers: the ones `scope` names, or every trigger of its
-    /// owner.
-    TriggerActivate { scope: ActivationScope },
+    /// owners, releasing or dropping what they held as `held` says.
+    TriggerActivate { scope: ActivationScope, held: ReleaseHeld },
     /// Take triggers down.
-    TriggerDeactivate { scope: ActivationScope, spec: DeactivateSpec },
+    TriggerDeactivate { scope: ActivationScope, take_down: TakeDownChoice },
     /// An instance's connections.
     ConnectionsList { instance: InstanceId },
     /// Forget every connection of an instance (the values naming them go
@@ -76,10 +82,9 @@ pub enum ProgramCall {
     InstancesList,
     /// What calls cost, filtered.
     CostsList { filter: CostFilter },
-    /// Delete runs matching `filter`. Runs still going follow `running`:
-    /// `cancel` stops them (their rows go with the next clean), `wait`
-    /// leaves them running.
-    RunsClean { filter: RunFilter, running: RunningPolicy },
+    /// Delete runs matching `filter`. Runs still going follow `running`
+    /// ([`StillGoing`]).
+    RunsClean { filter: RunFilter, running: StillGoing },
     /// The newest runs matching `filter`, at most `limit` of them
     /// (1 to [`MAX_RUNS_PAGE`]), with how many match in all
     /// ([`RunPage`]).
@@ -102,6 +107,7 @@ impl ProgramCall {
             self,
             ProgramCall::InfraStop { .. }
                 | ProgramCall::InfraTerminate { .. }
+                | ProgramCall::InfraUpgrade { .. }
                 | ProgramCall::TriggerDeactivate { .. }
                 | ProgramCall::RunsClean { .. }
         )
@@ -114,6 +120,7 @@ impl ProgramCall {
             ProgramCall::InfraStart { .. } => "weft.infra.start",
             ProgramCall::InfraStop { .. } => "weft.infra.stop",
             ProgramCall::InfraTerminate { .. } => "weft.infra.terminate",
+            ProgramCall::InfraUpgrade { .. } => "weft.infra.upgrade",
             ProgramCall::InfraStatus { .. } => "weft.infra.status",
             ProgramCall::InfraCopies { .. } => "weft.infra.copies",
             ProgramCall::TriggerActivate { .. } => "weft.triggers.activate",
@@ -156,6 +163,7 @@ pub struct ProgramCallOutcome {
 
 /// One copy of an infra node, as `ctx.infra(..).status()` and
 /// `.copies()` answer it.
+// SYNC: InfraCopy <-> packages/weft-graph/src/protocol.ts InfraCopy
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfraCopy {
     /// The node, spelled the way the program writes it.
@@ -184,7 +192,7 @@ impl InfraCopy {
 /// install has not picked, or a hand-over that kept failing, which holds
 /// the trigger's queue. What they wait on hands them over again, and so
 /// does activating the trigger.
-// SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts ActivationEntry.waiting
+// SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts WaitingFires
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingFires {
     pub fires: u32,
@@ -244,6 +252,7 @@ pub struct TokensRevoked {
 }
 
 /// One instance's activation of a trigger that exists once per instance.
+// SYNC: InstanceTrigger <-> packages/weft-graph/src/protocol.ts InstanceTrigger
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceTrigger {
     /// The trigger, spelled the way the program writes it.
@@ -254,9 +263,11 @@ pub struct InstanceTrigger {
 }
 
 /// Everything weft holds for one instance of the project, as
-/// `ctx.instances().list()` answers it: counts and states, never a value or
-/// a secret.
+/// `ctx.instances().list()`, `weft instances` and the editor's instance
+/// picker read it: counts and states, never a value or a secret.
+// SYNC: InstanceHoldings <-> packages/weft-graph/src/protocol.ts InstanceHoldings
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceHoldings {
     pub instance: InstanceId,
     /// Values the instance gave for `@instance_filled` fields.
@@ -269,11 +280,14 @@ pub struct InstanceHoldings {
     pub copies: Vec<InfraCopy>,
     /// Its activations of per-instance triggers.
     pub triggers: Vec<InstanceTrigger>,
+    /// When its latest run started (unix seconds); `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_unix: Option<i64>,
 }
 
 impl InstanceHoldings {
     fn empty(instance: InstanceId) -> Self {
-        Self { instance, values: 0, connections: 0, tokens: 0, copies: Vec::new(), triggers: Vec::new() }
+        Self { instance, values: 0, connections: 0, tokens: 0, copies: Vec::new(), triggers: Vec::new(), last_run_unix: None }
     }
 
     /// One entry per instance that appears in any of the sources, sorted by
@@ -285,6 +299,7 @@ impl InstanceHoldings {
         tokens: Vec<(InstanceId, u32)>,
         copies: Vec<InfraCopy>,
         triggers: Vec<(InstanceId, InstanceTrigger)>,
+        last_runs: Vec<(InstanceId, i64)>,
     ) -> Vec<InstanceHoldings> {
         let mut by_instance = std::collections::BTreeMap::<InstanceId, InstanceHoldings>::new();
         fn at(by_instance: &mut std::collections::BTreeMap<InstanceId, InstanceHoldings>, instance: InstanceId) -> &mut InstanceHoldings {
@@ -306,6 +321,10 @@ impl InstanceHoldings {
         }
         for (instance, trigger) in triggers {
             at(&mut by_instance, instance).triggers.push(trigger);
+        }
+        for (instance, at_unix) in last_runs {
+            let held = at(&mut by_instance, instance);
+            held.last_run_unix = held.last_run_unix.max(Some(at_unix));
         }
         by_instance.into_values().collect()
     }
@@ -460,8 +479,22 @@ pub struct CleanOutcome {
     /// Runs still going that were cancelled (`running: cancel`); their
     /// rows go with the next clean.
     pub cancelled: u64,
-    /// Runs still going that were left alone (`running: wait`).
+    /// Runs still going that were left alone (`running: leave`).
     pub left_running: u64,
+}
+
+crate::wire_enum! {
+    /// What a clean does with the runs it matches that are still going: a
+    /// run is never deleted from under itself.
+    #[derive(Default)]
+    pub enum StillGoing {
+        /// Leave them running: a clean never stops a run nobody asked it
+        /// to stop.
+        #[default]
+        Leave = "leave",
+        /// Cancel them; their rows go with the next clean.
+        Cancel = "cancel",
+    }
 }
 
 /// `POST /runs/clean`: delete every run the filter reaches. What
@@ -474,14 +507,9 @@ pub struct CleanRequest {
     pub project: Option<uuid::Uuid>,
     #[serde(default)]
     pub filter: RunFilter,
-    /// What happens to matching runs still going. Absent is `wait`: a
-    /// clean never stops a run nobody asked it to stop.
-    #[serde(default = "default_clean_running")]
-    pub running: RunningPolicy,
-}
-
-fn default_clean_running() -> RunningPolicy {
-    RunningPolicy::Wait
+    /// What happens to matching runs still going.
+    #[serde(default)]
+    pub running: StillGoing,
 }
 
 /// One run, as the runs listing shows it.
@@ -692,9 +720,9 @@ pub struct MintedInstanceToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::running_policy::DeactivationMode;
 
     crate::wire_enum_roundtrip_tests!(RunStatus);
+    crate::wire_enum_roundtrip_tests!(StillGoing);
     crate::wire_enum_roundtrip_tests!(NodeStatus);
     use crate::signal::listener_protocol::LastAnswer;
 
@@ -736,14 +764,6 @@ mod tests {
         assert!(RunStatus::Failed.reaches(RunStatus::Failed) && !RunStatus::Failed.reaches(RunStatus::Running));
     }
 
-    fn spec() -> DeactivateSpec {
-        DeactivateSpec {
-            mode: DeactivationMode::Wipe,
-            grace_minutes: 0,
-            running_policy: RunningPolicy::Cancel,
-            drain_timeout_secs: None,
-        }
-    }
 
     #[test]
     fn paid_by_covers_its_own_kind_of_credential() {
@@ -761,11 +781,12 @@ mod tests {
         let call = ProgramCall::InfraStop {
             node: "bridge".into(),
             instance: Some(InstanceId::new("ada").unwrap()),
-            spec: spec(),
+            take_down: TakeDownChoice { running: Some(crate::take_down::Running::Cancel), ..Default::default() },
         };
         let wire = serde_json::to_value(&call).unwrap();
         assert_eq!(wire["call"], "infra_stop");
         assert_eq!(wire["instance"], "ada");
+        assert_eq!(wire["take_down"], serde_json::json!({ "running": "cancel" }));
         let back: ProgramCall = serde_json::from_value(wire).unwrap();
         assert_eq!(back, call);
     }
@@ -807,8 +828,11 @@ mod tests {
             // The shared copy belongs to no instance in this listing.
             vec![copy(None, crate::infra::InfraNodeStatus::Running), copy(Some("bob"), crate::infra::InfraNodeStatus::Stopped)],
             vec![(instance("cyd"), waiting.clone())],
+            vec![(instance("ada"), 5), (instance("ada"), 9)],
         );
         let instances: Vec<&str> = merged.iter().map(|m| m.instance.as_str()).collect();
+        assert_eq!(merged[0].last_run_unix, Some(9), "the latest run counts");
+        assert_eq!(merged[1].last_run_unix, None);
         assert_eq!(instances, ["ada", "bob", "cyd"]);
         assert_eq!((merged[0].values, merged[0].connections, merged[0].tokens), (3, 0, 2));
         assert!(merged[0].copies.is_empty() && merged[0].triggers.is_empty());
@@ -820,7 +844,7 @@ mod tests {
 
     #[test]
     fn holdings_of_no_instance_merge_to_nothing() {
-        assert!(InstanceHoldings::merge(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_empty());
+        assert!(InstanceHoldings::merge(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_empty());
     }
 
     #[test]
@@ -828,7 +852,7 @@ mod tests {
         assert!(ProgramCall::InfraTerminate {
             node: "x".into(),
             instance: None,
-            spec: spec(),
+            take_down: TakeDownChoice::default(),
             disks: crate::infra::TerminateDisks::KeepListed,
         }.takes_down());
         assert!(!ProgramCall::InfraStart { node: "x".into(), instance: None }.takes_down());

@@ -57,8 +57,8 @@ async fn a_failure_is_shown_to_the_projects_it_holds_up_until_it_is_resolved(poo
 
 /// A repair that failed is shown to its own project only, and a look that
 /// repaired everything of a project clears it, leaving the projects still
-/// failing shown; a look of another kind (signals kept past their
-/// hibernation) clears only its own kind.
+/// failing shown; a look of another kind (signals kept past their door's
+/// window) clears only its own kind.
 #[sqlx::test]
 async fn a_failed_repair_is_shown_to_its_project_until_a_look_repairs_it(pool: PgPool) {
     use unanswered::PerProject;

@@ -1,4 +1,5 @@
-//! `weft frontend add|ls|rm|token`: the project's frontends, each a
+//! `weft frontend add|ls|rm|token|visitor-address`: the project's
+//! frontends, each a
 //! caller of the install with a token of its own, scoped to the project.
 //!
 //! With `--repo`, the install hosts it: it makes a Cloud Run service, and
@@ -6,17 +7,25 @@
 //! the repository the service and the token). Without, it runs wherever
 //! you run it, and needs only its token and the install's address.
 //!
+//! A frontend whose server passes weft's doors on to its visitors (its
+//! `weftPassThrough` mount) has a visitor address: links to the project's
+//! stored files then go through the site.
+//!
 //! A token is shown once, so it goes to a file only you can read, never
 //! to the terminal.
 
 use anyhow::{Context, Result};
-use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository};
+use weft_core::frontend::{
+    AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository, VisitorAddressRequest,
+};
 
 use super::Ctx;
 
 pub enum FrontendAction {
-    Add { name: String, repo: Option<String> },
+    Add { name: String, repo: Option<String>, visitor_address: Option<String> },
     List,
+    /// Set the frontend's visitor address; `None` clears it.
+    VisitorAddress { name: String, address: Option<String> },
     Rm { name: String, force: bool },
     Token { name: String, done: Option<uuid::Uuid> },
 }
@@ -47,10 +56,15 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
     let install_url = install_url.to_string();
     let base = format!("/projects/{id}/frontends");
     match action {
-        FrontendAction::Add { name, repo } => {
+        FrontendAction::Add { name, repo, visitor_address } => {
             let host = if repo.is_some() { FrontendHost::CloudRun } else { FrontendHost::External };
+            // Checked before `gh` is asked for the repository's id, so a
+            // mistyped address is named first.
+            if let Some(address) = &visitor_address {
+                weft_core::frontend::check_visitor_address(address).map_err(anyhow::Error::msg)?;
+            }
             let repo = repo.as_deref().map(repository).transpose()?;
-            let body = AddFrontendRequest { name, host, repo };
+            let body = AddFrontendRequest { name, host, repo, visitor_address };
             // Refused here, with the flag still in the person's hand.
             body.validate().map_err(anyhow::Error::msg)?;
             // A frontend is often the first thing a project gets on an
@@ -107,6 +121,17 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
                 println!("frontend '{name}' calls with token {id}; every other token of it no longer works");
             }
         }
+        FrontendAction::VisitorAddress { name, address } => {
+            if let Some(address) = &address {
+                weft_core::frontend::check_visitor_address(address).map_err(anyhow::Error::msg)?;
+            }
+            let body = serde_json::to_value(VisitorAddressRequest { visitor_address: address })?;
+            let frontend: Frontend = serde_json::from_value(client.put_json(&format!("{base}/{name}/visitor-address"), &body).await?)
+                .context("read the frontend the install answered")?;
+            if !ctx.json_out(&frontend)? {
+                println!("{}", visitor_address_line(&frontend));
+            }
+        }
         FrontendAction::List => {
             let frontends: Vec<Frontend> =
                 serde_json::from_value(client.get_json(&base).await?).context("read the project's frontends")?;
@@ -121,6 +146,9 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
                     (Some(repo), Some(url)) => println!("{:<20} on the install, deployed by {}, at {url}", f.name, repo.name),
                     (Some(repo), None) => println!("{:<20} on the install, deployed by {}", f.name, repo.name),
                     _ => println!("{:<20} runs elsewhere", f.name),
+                }
+                if let Some(address) = &f.visitor_address {
+                    println!("{:<20} visitors reach weft through {address}", "");
                 }
             }
         }
@@ -138,6 +166,18 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What `weft frontend visitor-address` says the frontend's visitor
+/// address now is.
+fn visitor_address_line(f: &Frontend) -> String {
+    match &f.visitor_address {
+        Some(address) => format!(
+            "frontend '{}' passes weft's doors on at {address}: links to the project's stored files now go through it",
+            f.name
+        ),
+        None => format!("frontend '{}' has no visitor address: links to the project's stored files go to the install", f.name),
+    }
 }
 
 /// Put a fresh `token` (with its id) where only this person can read it,

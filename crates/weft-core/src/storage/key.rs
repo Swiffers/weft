@@ -505,6 +505,7 @@ pub fn run_prefix(tenant: &str, run_id: &str) -> Result<String, String> {
 /// The TENANT segment is the outer wall (the shared bucket holds many
 /// tenants' keys under one prefix space), then the key's own scope
 /// decides. Deny reasons are specific.
+// SYNC: check_key_access <-> extension-vscode/src/storedFilePicker.ts storedFilePickerRows
 pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), String> {
     let (tenant, project_id, run_id) = match caller {
         CallerAuth::Worker { tenant, project_id, run_id, .. } => (tenant, project_id, run_id),

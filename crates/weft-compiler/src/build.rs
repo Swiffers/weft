@@ -15,7 +15,6 @@ use serde::Deserialize;
 use crate::codegen;
 use crate::error::{CompileError, CompileResult};
 use crate::project::Project;
-use crate::validate::ValidationMode;
 use crate::worker_image;
 use weft_catalog::FsCatalog;
 
@@ -40,6 +39,22 @@ pub struct StagedImageBuild {
     /// What the build uses of what an install keeps on the machine that
     /// runs it (`WorkerDockerfile::uses`).
     pub uses: weft_core::images::BuildUses,
+    /// Where the built image keeps the record of the node packages its
+    /// build left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`), for
+    /// whoever runs the build to read back; `None` when its Dockerfile
+    /// writes none (a custom template, `WorkerDockerfile::writes_left_out_record`).
+    pub result_file: Option<String>,
+}
+
+impl StagedImageBuild {
+    fn new(build_context: PathBuf, content_hash: String, dockerfile: &worker_image::WorkerDockerfile) -> Self {
+        Self {
+            build_context,
+            content_hash,
+            uses: dockerfile.uses(),
+            result_file: dockerfile.writes_left_out_record.then(|| weft_core::builds::LEFT_OUT_RECORD_PATH.to_string()),
+        }
+    }
 }
 
 /// The cargo crate name of every generated worker. One constant for every
@@ -95,7 +110,7 @@ impl StockProject {
         std::os::unix::fs::symlink(&stdlib, crate::project::base_catalog_dir(dir.path()))
             .map_err(CompileError::Io)?;
         let project = Project::load(dir.path())?;
-        let (definition, catalog) = crate::hash::load_enriched_project(&project)
+        let (definition, catalog) = crate::hash::load_program(&project)
             .map_err(|e| CompileError::Build(format!("compile the stock project: {e}")))?;
         Ok(Self { _dir: dir, project, definition, catalog })
     }
@@ -121,7 +136,8 @@ pub fn standard_worker_hash() -> CompileResult<String> {
 
 /// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
 ///
-/// 1. Validate the (resolved) definition, abort on any error.
+/// 1. Check the (resolved) definition was settled after its last change
+///    (`crate::unsettled`): every error in it is one of its broken parts.
 /// 2. Codegen the cargo crate at `.weft/target/build/`.
 /// 3. Emit the multi-stage Dockerfile at
 ///    `.weft/target/Dockerfile.worker`.
@@ -134,10 +150,8 @@ pub fn standard_worker_hash() -> CompileResult<String> {
 /// recompiling from source: the caller resolves `@asset` refs into the
 /// definition (deferred file markers become concrete file values) BEFORE
 /// this runs, and a fresh compile-from-source here would see the raw
-/// markers instead (a file-typed `@asset` reads as a `String` at parse and
-/// would fail validation against its `File` port). This is also the only
-/// validation gate on the build path, so it runs on the resolved
-/// definition, not the raw source. `Structural` (not `Runtime`): a project
+/// markers instead of the stored files the build resolved them to. The
+/// gate runs on the resolved definition, not the raw source. `Structural` (not `Runtime`): a project
 /// may build without every secret filled; runtime-rule gaps surface at run.
 ///
 /// `bases.builder` is the shared builder-base image ref the caller
@@ -152,11 +166,12 @@ pub fn build_project(
     node_set: weft_core::builds::NodeSet,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
-    crate::bail_on_errors(crate::validate::validate_with_mode(
-        definition,
-        catalog,
-        ValidationMode::Structural,
-    ))?;
+    // What does not compile is already in the definition as broken parts
+    // (`crate::compile_program`), and the build goes on around them: a
+    // part a run needs is refused when the run is cut. Anything else is a
+    // definition changed since its check.
+    let root = project_root.canonicalize().map_err(CompileError::Io)?;
+    crate::bail_on_errors(crate::unsettled(definition, catalog, Some(&root)))?;
     // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
 
@@ -202,7 +217,7 @@ pub fn build_project(
         crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
             .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
 
-    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
+    Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
 
 /// Stage the docker build context under
@@ -213,7 +228,7 @@ pub fn build_project(
 ///   Dockerfile           (copy of Dockerfile.worker)
 ///   build/               (the generated cargo crate)
 ///   weft/                (the weft workspace: crates, Cargo.toml, Cargo.lock)
-///   project-nodes/       (the project's nodes/ dir: every node's source)
+///   project-nodes/       (every node's source, at its path in the project)
 /// ```
 ///
 /// `weft/` carries only the language runtime (the workspace crates the
@@ -224,8 +239,9 @@ pub fn build_project(
 /// `node_modules/`).
 ///
 /// `project-nodes/` holds ONLY the package roots the project actually
-/// references, each copied to its path relative to `nodes/` so the
-/// `#[path]` shims resolve. Discovery already walked `nodes/` and
+/// references, each copied to its path relative to the project root
+/// (`nodes/...`, or `src/...` for a node beside the code) so the
+/// `#[path]` shims resolve. Discovery already walked both node roots and
 /// grouped nodes under package roots; staging copies those roots
 /// rather than re-walking the tree, so there is a single directory
 /// walker (discovery) and nothing for a second walker to disagree
@@ -295,15 +311,14 @@ fn stage_project_nodes(
         // over, `hash::hash_package_root`), so staging and hashing agree
         // on a node's byte-content: a file the build copies but the hash
         // skips (or vice versa) is how a stale worker image gets served.
-        let staged = dest.join(rel);
-        copy_dir_filtered(&root, &staged, &weft_catalog::is_left_out_of_package_build)?;
-        stamp_package_tree(&staged)?;
+        copy_dir_dated(&root, &dest.join(rel), &weft_catalog::is_left_out_of_package_build, FileDates::FromContent)?;
     }
     Ok(())
 }
 
-/// The modification time every staged package file carries, whatever the
-/// file had on disk.
+/// The modification time a staged package file with `content` carries,
+/// whatever the file had on disk: a date in 2020 to 2024, to the
+/// nanosecond, read off the content's sha256.
 ///
 /// Cargo reuses a compiled crate only while none of its sources is newer
 /// than the compile, and a package compiles in a crate whose directory is
@@ -313,20 +328,27 @@ fn stage_project_nodes(
 /// from one checkout and a cloud build stages the standard library from
 /// another (the runtime image's copy), and a fresh checkout dates every
 /// file at the moment it was made, so every precompiled package looked
-/// edited and every cloud build compiled the whole library again. One
-/// fixed date on both sides makes an unchanged package reused wherever it
-/// was compiled; a changed one lands in a new directory and compiles.
-pub(crate) fn package_source_mtime() -> std::time::SystemTime {
-    // 2020-01-01.
-    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)
-}
-
-/// Give every file under `dir` [`package_source_mtime`].
-fn stamp_package_tree(dir: &Path) -> CompileResult<()> {
-    for file in crate::hash::walk_dir(dir).map_err(|e| CompileError::Build(format!("walk {}: {e}", dir.display())))? {
-        stamp_mtime(&file, package_source_mtime());
-    }
-    Ok(())
+/// edited and every cloud build compiled the whole library again. A date
+/// read off the content is the same on both sides for the same file, so
+/// an unchanged package is reused wherever it was compiled. It is never
+/// one fixed date: Docker sends a build context's files again only when
+/// their size or date changed since the last build of that context, so a
+/// fixed date kept an edit that left a file's size alone (a letter's case)
+/// out of the build, which then compiled the old file. The seconds and
+/// the nanoseconds come from separate parts of the digest, so two
+/// contents of one size share a date about once in 10^17.
+pub(crate) fn package_source_mtime(content: &[u8]) -> std::time::SystemTime {
+    use sha2::Digest;
+    // 2020-01-01, and five years past it: always in the past, so a cached
+    // compile is never older than its sources.
+    const START: u64 = 1_577_836_800;
+    const SPAN: u64 = 5 * 365 * 24 * 3600;
+    let digest = sha2::Sha256::digest(content);
+    let word = |at: usize| u64::from_be_bytes(digest[at..at + 8].try_into().expect("a sha256 is 32 bytes"));
+    let secs = word(0) % SPAN;
+    // The low 30 bits of another word, folded under a second.
+    let nanos = (word(8) & ((1 << 30) - 1)) % 1_000_000_000;
+    std::time::UNIX_EPOCH + std::time::Duration::new(START + secs, nanos as u32)
 }
 
 /// The bare content-addressed node-test image tag,
@@ -409,7 +431,7 @@ pub fn build_test_artifact(
 
     let content_hash = node_test_content_hash(project, catalog, package_name)?;
 
-    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
+    Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
 
 /// The node-test image's Dockerfile: the worker recipe, started as the
@@ -787,19 +809,32 @@ pub fn install_of_cache_key(key: &str) -> Option<&str> {
 /// the immediate entry name. Skips symlinks to avoid infinite
 /// recursion and unexpected escapes from the staged context.
 ///
-/// Preserves mtime on every copied file. The staged build context
-/// feeds straight into docker, which preserves the host mtime on
-/// `COPY`. Cargo's fingerprint short-circuits a clean crate when
-/// every source file's mtime is older than the crate's rlib in the
-/// target dir; without mtime preservation a fresh stage gives every
-/// file a wall-clock mtime, every per-package crate looks dirty,
-/// and cargo recompiles all of them on every edit. Preserving the
-/// host mtime keeps unchanged sources looking unchanged inside the
-/// container, so cargo only rebuilds the package whose node source
-/// genuinely changed (plus the worker relink).
+/// Preserves mtime on every copied file. A staged build context feeds
+/// straight into docker, which preserves the host mtime on `COPY`, and
+/// cargo's fingerprint short-circuits a clean crate only while every
+/// source file's mtime is older than the crate's rlib in the target dir:
+/// with wall-clock mtimes every crate staged this way (the workspace
+/// slice a worker links) would look dirty on every build. A package's
+/// staged files are dated by their content instead
+/// ([`package_source_mtime`], through [`copy_dir_dated`]).
 /// `exclude` names the entries left out, at any depth.
 pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool) -> CompileResult<()> {
-    copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
+    copy_dir_dated(src, dst, exclude, FileDates::Mirrored)
+}
+
+/// What date a copied file carries.
+#[derive(Clone, Copy)]
+enum FileDates {
+    /// The source file's.
+    Mirrored,
+    /// The one its content gives it ([`package_source_mtime`]), read off
+    /// the bytes as they are copied.
+    FromContent,
+}
+
+/// [`copy_dir_filtered`], each file dated as `dates` says.
+fn copy_dir_dated(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool, dates: FileDates) -> CompileResult<()> {
+    copy_dir_filtered_inner(src, dst, exclude, dates, &mut Default::default())
 }
 
 /// Symlinks are followed and their TARGET bytes copied (`fs::copy`
@@ -810,11 +845,12 @@ fn copy_dir_filtered_inner(
     src: &Path,
     dst: &Path,
     exclude: &dyn Fn(&str) -> bool,
+    dates: FileDates,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(CompileError::Io)?;
     chain.push(canon);
-    let result = copy_dir_filtered_entries(src, dst, exclude, chain);
+    let result = copy_dir_filtered_entries(src, dst, exclude, dates, chain);
     chain.pop();
     result
 }
@@ -823,6 +859,7 @@ fn copy_dir_filtered_entries(
     src: &Path,
     dst: &Path,
     exclude: &dyn Fn(&str) -> bool,
+    dates: FileDates,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
@@ -837,10 +874,23 @@ fn copy_dir_filtered_entries(
         let to = dst.join(&name);
         let kind = weft_catalog::node_tree_entry_kind(&from).map_err(CompileError::Io)?;
         if kind == weft_catalog::NodeTreeEntryKind::Dir {
-            copy_dir_filtered_inner(&from, &to, exclude, chain)?;
+            copy_dir_filtered_inner(&from, &to, exclude, dates, chain)?;
         } else {
-            std::fs::copy(&from, &to).map_err(CompileError::Io)?;
-            mirror_mtime(&from, &to);
+            match dates {
+                FileDates::Mirrored => {
+                    std::fs::copy(&from, &to).map_err(CompileError::Io)?;
+                    mirror_mtime(&from, &to);
+                }
+                FileDates::FromContent => {
+                    // Read once, for the copy and its date alike; the
+                    // mode goes along as `fs::copy` would take it.
+                    let content = std::fs::read(&from).map_err(CompileError::Io)?;
+                    std::fs::write(&to, &content).map_err(CompileError::Io)?;
+                    let mode = std::fs::metadata(&from).map_err(CompileError::Io)?.permissions();
+                    std::fs::set_permissions(&to, mode).map_err(CompileError::Io)?;
+                    stamp_mtime(&to, package_source_mtime(&content));
+                }
+            }
         }
     }
     Ok(())
@@ -1146,7 +1196,8 @@ pub fn drop_built_binary(binary: &Path) {
 }
 
 /// Build the catalog for a project: discover every node under its
-/// `nodes/` directory. That is the single source of truth (the stdlib
+/// `nodes/` directory and beside its code under `src/`
+/// (`crate::project::node_roots`). That is the single source of truth (the stdlib
 /// is cloned in at `weft new`), so the project is self-contained and
 /// nothing reaches into the weft installation at build time. A node or
 /// package that fails to load is left out and recorded
@@ -1194,6 +1245,24 @@ mod tests {
         assert_eq!(super::test_server_dockerfile(&format!("{recipe}\n")), expected);
     }
 
+    /// A staged file's date is read off its content: the same everywhere
+    /// for the same file, and never the same across an edit, even one that
+    /// keeps the file's size (Docker resends a context's file only when its
+    /// size or date changed).
+    #[test]
+    fn a_package_files_date_is_its_contents() {
+        let date = super::package_source_mtime;
+        assert_eq!(date(b"FileHandle::key"), date(b"FileHandle::key"), "the same content, the same date, on every checkout");
+        assert_ne!(date(b"FileHandle::Key"), date(b"FileHandle::key"), "an edit of the same size changes the date");
+        let nanos = |content: &[u8]| date(content).duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        assert_ne!((nanos(b"FileHandle::Key"), nanos(b"FileHandle::key")), (0, 0), "dated to the nanosecond");
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        for content in [&b""[..], b"x", b"fn main() {}"] {
+            let at = date(content);
+            assert!(at >= start && at < std::time::SystemTime::now(), "a date in the past");
+        }
+    }
+
     /// The builder base compiles the STOCK WORKER: the staged context
     /// carries a package crate per stdlib package (so their rlibs, and the
     /// dependencies they pull in, are baked with the feature unification a
@@ -1208,13 +1277,14 @@ mod tests {
         let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx"), &weft_core::infra::Install::default_install()).expect("stage");
         let crate_root = ctx.join(crate::worker_image::WARMUP_CRATE_DIR);
         let manifest = std::fs::read_to_string(crate_root.join("Cargo.toml")).unwrap();
-        assert!(manifest.contains("pkg_format = { path = \"./pkg_format-"), "{manifest}");
+        assert!(manifest.contains("pkg_format = { optional = true, path = \"./pkg_format-"), "{manifest}");
         assert!(crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME).is_file());
         // Staged at its project-relative path: a node under `nodes/` and
         // one beside the code under `src/` land side by side under the mount.
         assert!(ctx.join("project-nodes/nodes/base_catalog/basic/format/mod.rs").is_file());
-        // Every package file, staged and generated, carries the one fixed
-        // date, so a package compiled from another checkout is reused.
+        // Every package file, staged and generated, carries the date its
+        // content gives it, so a package compiled from another checkout is
+        // reused.
         let pkg_dir = std::fs::read_dir(&crate_root)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1226,7 +1296,7 @@ mod tests {
             pkg_dir.join("src/lib.rs"),
         ] {
             let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
-            assert_eq!(modified, super::package_source_mtime(), "{}", file.display());
+            assert_eq!(modified, super::package_source_mtime(&std::fs::read(&file).unwrap()), "{}", file.display());
         }
         let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");

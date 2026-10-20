@@ -32,9 +32,9 @@
 
 	// The journal carries only the self-describing reference, so the
 	// metadata here is ALWAYS renderable, even for swept files. A
-	// key-backed file downloads at click time: the host runs the
-	// dispatcher handshake and surfaces "expired or deleted" on 404. A
-	// url-backed file just links to its external URL.
+	// key-backed file downloads at click time: the host asks the
+	// dispatcher for a link straight to the store and surfaces "expired
+	// or deleted" on 404. A url-backed file just links to its external URL.
 	function download() {
 		if (file.key) send({ kind: 'downloadStoredFile', key: file.key });
 	}
@@ -55,7 +55,7 @@
 		{#if file.key}
 			<button
 				class="flex items-center gap-1 rounded border border-zinc-300 bg-white px-2 py-0.5 text-[10px] text-zinc-600 hover:bg-zinc-100 transition-colors shrink-0"
-				title="Download (streams directly from the storage box; shows 'expired' if the file was swept)"
+				title="Download (saved straight from storage; shows 'expired' if the file was swept)"
 				onclick={download}
 			>
 				<Download class="w-3 h-3" />

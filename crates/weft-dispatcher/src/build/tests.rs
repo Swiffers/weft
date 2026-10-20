@@ -59,7 +59,7 @@ fn key_of(marker: &str) -> String {
 }
 
 fn claimed(key: &str, mime: &str, size: u64) -> serde_json::Value {
-    weft_core::storage::StoredFile { key: key.into(), mime_type: mime.into(), size_bytes: size, filename: "lie.png".into(), version: weft_core::storage::FIRST_FILE_VERSION }
+    weft_core::storage::StoredFile { key: key.into(), mime_type: mime.into(), size_bytes: size, filename: "lie.png".into(), version: weft_core::storage::FIRST_FILE_VERSION, link_secs: None }
         .to_value()
 }
 
@@ -180,7 +180,7 @@ async fn a_version_builds_a_program_that_includes_a_file_from_nodes() {
 }
 
 /// A version without `nodes/base_catalog/` has no standard library: the
-/// build fails on the node it lacks instead of borrowing this install's.
+/// node it lacks is broken, instead of borrowing this install's.
 #[tokio::test]
 async fn a_version_without_a_standard_library_gets_none() {
     let (storage, manifest) = storage_with("local", PROGRAM);
@@ -189,8 +189,8 @@ async fn a_version_without_a_standard_library_gets_none() {
     source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap();
     assert_eq!(std::fs::read(root.path().join("src/main.weft")).unwrap(), PROGRAM[1].1);
     assert!(!root.path().join("nodes/base_catalog").exists());
-    let err = source::compile(root.path()).expect_err("Text is not in the version").to_string();
-    assert!(err.contains("Text"), "{err}");
+    let (definition, _, _) = source::compile(root.path()).unwrap();
+    assert!(definition.broken.iter().any(|part| part.why.contains("Text")), "{:?}", definition.broken);
 }
 
 /// The files come from the building tenant's assets, whichever project

@@ -254,6 +254,7 @@ impl Node for PostgresDatabaseNode {
                 },
             ],
             keep_on_terminate: Vec::new(),
+            health_rules: None,
         })
     }
 

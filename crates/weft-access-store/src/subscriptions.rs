@@ -73,13 +73,6 @@ pub struct EnsureSubscription {
     /// subscription's `params`).
     #[serde(default)]
     pub params: BTreeMap<String, String>,
-    /// The public address the provider should post to, resolved by
-    /// the caller from its deployment configuration. `None` = this
-    /// weft has no address the internet can reach; a topic that must
-    /// TELL the provider where to send then refuses with the teaching
-    /// error, while a topic the provider pushes to an
-    /// operator-configured address needs nothing from us.
-    pub receiver_url: Option<String>,
 }
 
 /// The answer: when the provider will stop sending (`None` = never),
@@ -98,11 +91,22 @@ pub struct EnsuredSubscription {
 /// Idempotent per (signal, healthy subscription): the serving loop
 /// calls it at spawn and again at each renewal wake without tracking
 /// which case it is in.
-pub async fn ensure_subscription(
+///
+/// `receiver_url` reads the public address the provider should post to,
+/// from the caller's deployment configuration, and is called only right
+/// before a subscribe call. `None` = this weft has no address the
+/// internet can reach; a topic that must TELL the provider where to
+/// send then refuses with the teaching error.
+pub async fn ensure_subscription<F, Fut>(
     pool: &PgPool,
     locks: &PgPool,
     req: &EnsureSubscription,
-) -> anyhow::Result<EnsuredSubscription> {
+    receiver_url: F,
+) -> anyhow::Result<EnsuredSubscription>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
+{
     let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
     let Some(topic) = source.events.get(&req.topic) else {
         return Err(AccessError::Invalid(format!(
@@ -122,10 +126,6 @@ pub async fn ensure_subscription(
         // The provider pushes without being asked (an app-level
         // events URL); nothing to keep alive.
         return Ok(EnsuredSubscription { expires_at: None });
-    };
-
-    let Some(receiver_url) = req.receiver_url.as_deref() else {
-        return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
     };
 
     // One change to this signal's subscriptions at a time, held to the
@@ -149,12 +149,15 @@ pub async fn ensure_subscription(
         // is a NEW provider-side channel (the surveyed providers have no
         // extend verb), and reusing the token would make the old channel
         // and the new one indistinguishable.
+        let Some(receiver_url) = receiver_url().await? else {
+            return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
+        };
         let minted_id = uuid::Uuid::new_v4().to_string();
         let minted_token = mint_token();
         let mut values = call_values(&source.values, &source.recipe_values, &req.params)?;
         values.insert(MINTED_ID.to_string(), minted_id.clone());
         values.insert(MINTED_TOKEN.to_string(), minted_token.clone());
-        values.insert(RECEIVER_URL.to_string(), receiver_url.to_string());
+        values.insert(RECEIVER_URL.to_string(), receiver_url);
 
         let resp = run_connect_call(&req.service, &calls.subscribe, &values).await?;
         apply_captures(&calls.subscribe.captures, &resp, &mut values)?;

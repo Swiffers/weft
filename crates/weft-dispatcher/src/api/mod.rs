@@ -253,6 +253,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/install/domains/{name}", axum::routing::delete(domains::remove))
         .route("/projects/{id}/frontends", get(crate::frontends::list_route).post(crate::frontends::add))
         .route("/projects/{id}/frontends/{name}", axum::routing::delete(crate::frontends::remove))
+        .route("/projects/{id}/frontends/{name}/visitor-address", axum::routing::put(crate::frontends::set_visitor_address))
         .route("/projects/{id}/frontends/{name}/token", post(crate::frontends::new_token))
         .route("/projects/{id}/frontends/{name}/token/{token}/done", post(crate::frontends::token_done))
         .route("/projects/{id}/frontends/{name}/token/{token}", axum::routing::delete(crate::frontends::drop_token))
@@ -277,6 +278,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
+        .route("/projects/{id}/instances", get(project::instances))
         .route("/projects/{id}/builds/{build}", get(project::version_build))
         // The connections the program's own access nodes use on this
         // install, never written in the source.
@@ -303,9 +305,9 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // journal-bridge drain-watcher then CASes status to
         // `inactive` (the lifecycle target the original deactivate
         // already wrote to the row stays in place).
-        .route("/projects/{id}/cancel-running", post(project::cancel_running))
         .route("/projects/{id}/resync", post(project::resync))
         .route("/projects/{id}/resync/resume", post(project::resume_resync))
+        .route("/projects/{id}/follow/{task}", get(project::follow))
         // Unified subworkflow endpoint for Start / Restart / Upgrade.
         // All three CLI verbs POST here; the dispatcher uses the
         // resolved-spec-hash to decide skip-vs-apply per node.
@@ -323,8 +325,6 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // `{node}` on every per-node infra route is the node's
         // PLACEMENT as a person spells it (`one.db`): an infra node inside
         // a file included twice is two placements with two names.
-        .route("/projects/{id}/infra/nodes/{node}/stop", post(infra::stop_node))
-        .route("/projects/{id}/infra/nodes/{node}/terminate", post(infra::terminate_node))
         .route("/projects/{id}/infra/status", get(infra::status))
         .route("/projects/{id}/infra/doors", get(infra::doors))
         .route("/projects/{id}/infra/logs", get(infra::logs))
@@ -480,10 +480,19 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
             // open internet.
             post(display::press_display).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
-        // The public file relay: an external consumer fetches a minted
-        // media link here; the unguessable expiring token in the path
-        // is the credential (see api/storage.rs public_file).
-        .route("/public/files/{token}", get(storage::public_file))
+        // A page's upload through a slot, passed on to the broker, which
+        // holds each verb to the slot in its body (`files_door::upload`).
+        .route(
+            "/files/upload/{verb}",
+            post(crate::files_door::upload).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
+        )
+        // The files door: a link to a stored file that goes through the
+        // install, passed on to the store unchanged; the link's signature
+        // is the credential (`files_door::forward`). The bytes stream
+        // through, so the body limit is the door's own: a PUT says its
+        // length, at most what a store takes in one piece.
+        // SYNC: the files door <-> crates/weft-platform-traits/src/object_store.rs FILES_DOOR
+        .route("/files/{*path}", any(crate::files_door::forward).layer(DefaultBodyLimit::disable()))
         // The root page, so a person checking the address sees
         // something deliberate.
         .route("/", get(public_page::index))
@@ -585,6 +594,27 @@ pub fn outside_router(state: DispatcherState) -> Router {
     with_hops(outside_caller_routes(state.clone()), hops).with_state(state)
 }
 
+/// The same doors as [`outside_router`], for the listener on the machine's
+/// network address: its callers connect straight to it, so the caller is
+/// the peer and no `X-Forwarded-For` entry is believed.
+pub fn network_router(state: DispatcherState) -> Router {
+    with_hops(outside_caller_routes(state.clone()), TrustedHops(0)).with_state(state)
+}
+
+/// The address this request came in on (`weft_core::net::request_base_url`):
+/// the base of a chooser page's address, which the client that asked opens
+/// and the page itself posts back to. Refused when the request names no
+/// usable host.
+pub(crate) fn request_base(headers: &axum::http::HeaderMap) -> Result<String, (axum::http::StatusCode, String)> {
+    weft_core::net::request_base_url(headers).map(|base| base.trim_end_matches('/').to_string()).ok_or_else(|| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "the request has no valid Host (or X-Forwarded-Host / X-Forwarded-Prefix) header to build the page's address on"
+                .to_string(),
+        )
+    })
+}
+
 /// Whether `e` failed because the database is out of reach for now
 /// (`weft_task_store::db::unreachable`), anywhere in its chain.
 pub(crate) fn database_unreachable(e: &anyhow::Error) -> bool {
@@ -627,7 +657,7 @@ mod token_door_tests {
         }
         // A live call's refusals are counted at the worker's door, and its
         // 401 or 403 may be the program's own answer.
-        for other in ["/public/files/x", "/events/slack/message", "/local/hook", "/signals", "/connect/local/chat"] {
+        for other in ["/files/runtime/t/project/p/f", "/events/slack/message", "/local/hook", "/signals", "/connect/local/chat"] {
             assert!(!super::is_token_door(other), "{other}");
         }
     }

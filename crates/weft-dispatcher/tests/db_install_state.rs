@@ -18,7 +18,7 @@ async fn project(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     let definition = serde_json::from_value(serde_json::json!({ "id": id, "nodes": [], "edges": [] })).expect("a definition");
     store
-        .register_with_hashes(definition, "p", "", "tenant-1", Some("bin"), Some("def"), None, None, None, None, None)
+        .register_with_hashes(definition, "p", "", "tenant-1", Some("bin"), Some("def"), None, None, None, None, None, None)
         .await
         .expect("register");
     id
@@ -54,7 +54,23 @@ fn frontend(project: Uuid, name: &str, repo: Option<&str>) -> weft_core::fronten
         url: None,
         token_id: repo.is_none().then(Uuid::new_v4),
         pending_token_ids: Vec::new(),
+        visitor_address: None,
     }
+}
+
+/// A project's links to its stored files have one way to go: one frontend
+/// at most carries the project's visitor address, and another project's
+/// frontend may carry its own.
+#[sqlx::test]
+async fn a_project_has_one_visitor_address(pool: PgPool) {
+    use weft_dispatcher::frontends::{list, record};
+    let id = project(&pool).await;
+    let with = |name: &str, address: &str| weft_core::frontend::Frontend { visitor_address: Some(address.into()), ..frontend(id, name, None) };
+    assert!(record(&pool, &with("shop", "https://shop.example/weft"), 1).await.unwrap());
+    assert!(record(&pool, &with("admin", "https://admin.example/weft"), 2).await.is_err(), "a second visitor address is refused");
+    assert!(record(&pool, &frontend(id, "plain", None), 3).await.unwrap(), "a frontend without one is fine");
+    let shops: Vec<_> = list(&pool, id).await.unwrap().into_iter().filter_map(|f| f.visitor_address).collect();
+    assert_eq!(shops, ["https://shop.example/weft"]);
 }
 
 /// A frontend is stored once per name, its repository keeps its right to

@@ -1,0 +1,12 @@
+{
+  "type": "Shout",
+  "label": "Shout",
+  "description": "Upper-cases its text. Its code does not compile on purpose: the e2e rig proves the worker is built without it.",
+  "inputs": [
+    { "name": "text", "type": "String", "required": true }
+  ],
+  "outputs": [
+    { "name": "text", "type": "String" }
+  ],
+  "requiresInfra": false
+}

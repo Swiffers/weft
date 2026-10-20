@@ -193,6 +193,10 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     for key in ["id", "createdAt", "updatedAt"] {
         obj.remove(key);
     }
+    // What does not compile follows from the nodes and wires above (a
+    // placeholder, a port type), and its wording carries line numbers, so
+    // moving a broken line would otherwise read as a new program.
+    obj.remove("broken");
     strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
     strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
     strip_crossing_spans(obj.get_mut("edges"));

@@ -154,7 +154,7 @@ mod tests {
     fn snake_kebab_and_screaming_join_lower_or_upper_words() {
         assert!(Snake.holds("waiting_for_input") && Snake.holds("completed") && Snake.holds("keyframes_phase"));
         assert!(!Snake.holds("waitingForInput") && !Snake.holds("double__sep") && !Snake.holds("trailing_"));
-        assert!(Kebab.holds("running-policy") && Kebab.holds("which") && !Kebab.holds("running_policy"));
+        assert!(Kebab.holds("all-instances") && Kebab.holds("which") && !Kebab.holds("all_instances"));
         assert!(ScreamingSnake.holds("WEFT_INSTALL") && !ScreamingSnake.holds("Weft_Install"));
     }
 

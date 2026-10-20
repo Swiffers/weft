@@ -17,8 +17,8 @@
 	// the website's media views use), anything unplayable as the file
 	// card; a save button rides below whatever played. `mode='link'`
 	// renders the metadata + Download card only. A key-backed file
-	// resolves its bytes through the SAME authenticated handshake a
-	// user download uses; a url-backed file points at an external
+	// loads its bytes from the SAME presigned store link a user
+	// download asks the dispatcher for; a url-backed file points at an external
 	// resource and is rendered/linked directly (the browser fetches
 	// it, nothing goes through storage).
 	let { file, mode }: { file: FileValueWire; mode: 'media' | 'link' } = $props();
@@ -52,11 +52,11 @@
 			send({ kind: 'downloadStoredFile', key: file.key, filename: file.filename });
 	}
 
-	// Media mode. Key-backed: ask the host for the box's public URL (it
-	// runs the brokered handshake) and point the element straight at
-	// it; the bytes stream directly from the box (CSP admits its
-	// origin). Re-resolve once on load error (the short-lived
-	// capability may have lapsed before the element fetched).
+	// Media mode. Key-backed: ask the host for a presigned link to the
+	// object store and point the element straight at it; the bytes come
+	// from the store, which answers the `Range` requests a player seeks
+	// with. Re-resolve once on load error (the short-lived link may have
+	// lapsed before the element fetched).
 	// Url-backed: the URL IS the src, nothing to resolve; an error
 	// means the resource itself is unreachable. A second failure shows
 	// the metadata fallback.
@@ -190,8 +190,8 @@
 				<span>Media expired or unavailable ({displayName})</span>
 			</div>
 		{:else if mediaUrl}
-			<!-- src is the box's public URL (key-backed) or the external
-			     URL itself; the browser streams the bytes directly. -->
+			<!-- src is the store's presigned link (key-backed) or the
+			     external URL itself; the browser loads the bytes from it. -->
 			{#if media === 'image'}
 				<img
 					src={mediaUrl}
@@ -227,7 +227,7 @@
 			{#if file.key}
 				<button
 					class="flex items-center gap-1 rounded border border-zinc-300 bg-white px-2 py-0.5 text-[10px] text-zinc-600 hover:bg-zinc-100 transition-colors shrink-0"
-					title="Download (streams directly from the storage box; shows 'expired' if swept)"
+					title="Download (saved straight from storage; shows 'expired' if swept)"
 					onclick={download}
 				>
 					<Download class="w-3 h-3" />

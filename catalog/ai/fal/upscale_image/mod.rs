@@ -32,7 +32,7 @@ impl Node for FalUpscaleImageNode {
         let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
         let mut payload = json!({
-            "image_url": ctx.storage(StorageScope::Run).external_url(&image).await?,
+            "image_url": ctx.storage(StorageScope::Run).external_file(&image).await?.url,
             "scale": scale,
         });
         merge_params(&mut payload, params.as_ref());

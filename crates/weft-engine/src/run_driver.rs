@@ -842,8 +842,10 @@ fn checked_snapshot(run_id: RunId, live: &weft_journal::LiveFold) -> anyhow::Res
         .map(|c| format!("{:?}: {}", c.site, c.reason))
         .collect();
     anyhow::bail!(
-        "the journal of run {run_id} cannot be folded over its program ({} row(s) rejected: \
-         {}); the run cannot resume. `weft clean {run_id}` removes it.",
+        "the record of run {run_id} does not fit the program it runs now ({} row(s) rejected: \
+         {}), so the run cannot resume: a resync moved it, paused, onto a build it no longer \
+         fits, or its record is damaged. Its record is kept: `weft run --seed {run_id}` runs the \
+         program again from what it did, and `weft clean {run_id}` removes it.",
         reasons.len(),
         reasons.join("; "),
     )
@@ -2017,7 +2019,12 @@ async fn drive(
             let node_impl = match catalog.lookup(&node_def.node_type) {
                 Some(n) => n,
                 None => {
-                    let err = format!("unknown node type: {}", node_def.node_type);
+                    // A type whose package the build left out says so, and
+                    // where its errors are; any other is unknown.
+                    let err = match catalog.left_out().packages.iter().find(|p| p.node_types.contains(&node_def.node_type)) {
+                        Some(package) => package.reason(None),
+                        None => format!("unknown node type: {}", node_def.node_type),
+                    };
                     let mentioned = std::collections::HashSet::new();
                     handle_node_failure(
                         &node_id, &mentioned, group.run_id, &group.frames, &err, None, false,
@@ -2226,7 +2233,7 @@ async fn drive(
             // run-time dispatch built above, so provision bodies read
             // the same view a `run` body would.
             let provision_input = inputs.clone();
-            let mut ctx = RunContext::new(
+            let ctx = RunContext::new(
                 project.id,
                 node_id.clone(),
                 node_def.node_type.clone(),
@@ -2238,26 +2245,9 @@ async fn drive(
                 handle,
             )
             .marked_pure(node_def.features.pure);
-            // Every stored file among the inputs gets a link the body
-            // can fetch, minted for this firing (see
-            // `RunContext::link_file_inputs`). The journal row
-            // for this start was written from the delivered values
-            // above, so it never carries one. A link that cannot be
-            // minted fails the firing loudly, like a bag it cannot read.
-            // A pure body fetches nothing, so it gets none.
-            // The two reasons a firing cannot start, down one path: the
-            // links its body would read cannot be minted, or the payload
-            // that woke it is not what the trigger declared.
-            let linked = match node_def.features.pure {
-                true => Ok(()),
-                // Each input at its type where this firing runs.
-                false => ctx.link_file_inputs(node_ports.inputs.iter().map(|(name, ty)| (name.as_str(), ty))).await,
-            };
-            let cannot_start = match linked {
-                Err(err) => Some(err.to_string()),
-                Ok(()) => fire_payload_refusal,
-            };
-            if let Some(err) = cannot_start {
+            // A firing cannot start when the payload that woke it is not
+            // what the trigger declared.
+            if let Some(err) = fire_payload_refusal {
                 if !generator_ports.is_empty() {
                     let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
                     retire_consumer_streams(
@@ -2394,6 +2384,7 @@ async fn drive(
                         &provision_place,
                         provision_copy.as_ref(),
                         &spec,
+                        run_id_task,
                     )
                     .await
                     {

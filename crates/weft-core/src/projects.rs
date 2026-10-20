@@ -28,7 +28,7 @@ crate::wire_enum! {
     /// `project.status` (and each activation's row). The dispatcher
     /// writes it, the supervisor reads it through the broker, and the
     /// status answer carries it.
-    /// SYNC: ProjectStatus <-> packages/weft-graph/src/protocol.ts LifecycleStatus
+    /// SYNC: ProjectStatus <-> packages/weft-graph/src/protocol.ts LifecycleStatus, packages/weft-graph/src/status.ts VALID_STATUSES
     pub enum ProjectStatus {
         /// Fresh row, never activated.
         Registered = "registered",
@@ -36,10 +36,8 @@ crate::wire_enum! {
         Activating = "activating",
         /// Live; worker pool spawns on demand and fires execute.
         Active = "active",
-        /// Transient: user clicked deactivate with runningPolicy=wait;
-        /// running runs are draining.
-        Deactivating = "deactivating",
-        /// Idle; gate refuses / parks fires per the lifecycle axes.
+        /// Taken down; its door holds or refuses what arrives
+        /// (`weft_core::take_down::Door`).
         Inactive = "inactive",
     }
 }
@@ -78,8 +76,7 @@ impl ProjectTransition {
             Self::CancellingBuild => Some("the project's build is being cancelled; try again once it has stopped"),
             Self::Resyncing => Some(
                 "the project is resyncing; wait for it to finish (`weft resync --resume` takes one that stopped up again), \
-                 or give it up with `weft cancel-activate`, which leaves the triggers it has not brought back down \
-                 (`weft cancel-running` ends its wait on running work now)",
+                 or give it up with `weft cancel-activate`, which leaves the triggers it has not brought back down",
             ),
             Self::None => None,
         }
@@ -87,12 +84,13 @@ impl ProjectTransition {
 }
 
 /// `GET /projects/{id}/status`'s query: the hashes the client computed
-/// for its current source, each compared with what the project runs to
-/// set one drift bit. A hash left out leaves its bit unset.
+/// for its current source, each compared with what the project runs. A
+/// hash left out is compared with the registered build's instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusQuery {
     /// Compared against the running binary hash: "the worker image
-    /// needs rebuilding".
+    /// needs rebuilding", and, for a trigger that is on, whether its fires
+    /// run older code.
     #[serde(default, rename = "desiredBinaryHash", skip_serializing_if = "Option::is_none")]
     pub desired_binary_hash: Option<String>,
     /// The same build's binary hash with the whole catalog compiled in
@@ -101,51 +99,31 @@ pub struct StatusQuery {
     #[serde(default, rename = "desiredFullBinaryHash", skip_serializing_if = "Option::is_none")]
     pub desired_full_binary_hash: Option<String>,
     /// Compared against the running definition hash: "the project shape
-    /// has changed" (a config or topology edit not resynced yet).
+    /// has changed" (a config or topology edit not registered yet).
     #[serde(default, rename = "desiredDefinitionHash", skip_serializing_if = "Option::is_none")]
     pub desired_definition_hash: Option<String>,
-    /// Compared against the running infra hash: the upgrade signal.
-    #[serde(default, rename = "desiredInfraHash", skip_serializing_if = "Option::is_none")]
-    pub desired_infra_hash: Option<String>,
-    /// The triggers a verb is about to act on, comma-separated, as the
-    /// program spells them: `available_actions` and `preservation` are
-    /// then about those triggers (with `instance`, that instance's), the
-    /// way the verb itself is judged. Neither given: the program's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<crate::instance::InstanceId>,
+    /// Each trigger's cut fingerprint in the current source
+    /// (`weft_core::run_spec::trigger_fingerprints`), [`NamedHashes`]-encoded:
+    /// a trigger that is on whose recorded cut differs is behind. A trigger
+    /// it leaves out is compared with the registered build's.
+    #[serde(default, rename = "desiredTriggerCuts", skip_serializing_if = "Option::is_none")]
+    pub desired_trigger_cuts: Option<String>,
+    /// Each infra place's hash in the current source, [`NamedHashes`]-
+    /// encoded: a copy applied from another is behind. A place it leaves
+    /// out is compared with the registered build's.
+    #[serde(default, rename = "desiredInfraPlaces", skip_serializing_if = "Option::is_none")]
+    pub desired_infra_places: Option<String>,
 }
 
 impl StatusQuery {
-    /// The scope a verb is judged over, when the query names one.
-    pub fn scope(&self) -> Option<crate::activation::ActivationScope> {
-        if self.trigger.is_none() && self.instance.is_none() {
-            return None;
-        }
-        let triggers = self.trigger.iter().flat_map(|t| t.split(',')).filter(|t| !t.is_empty()).map(str::to_string).collect();
-        Some(crate::activation::ActivationScope { triggers, instance: self.instance.clone() })
-    }
-
-    /// The status asked about `scope`'s triggers.
-    pub fn for_scope(scope: &crate::activation::ActivationScope) -> Self {
-        Self {
-            trigger: (!scope.triggers.is_empty()).then(|| scope.triggers.join(",")),
-            instance: scope.instance.clone(),
-            ..Self::default()
-        }
-    }
-
     /// The query string, `?` included; empty when nothing is named.
     pub fn to_query_string(&self) -> String {
-        let instance = self.instance.as_ref().map(|i| i.as_str().to_string());
         let pairs = [
             ("desiredBinaryHash", &self.desired_binary_hash),
             ("desiredFullBinaryHash", &self.desired_full_binary_hash),
             ("desiredDefinitionHash", &self.desired_definition_hash),
-            ("desiredInfraHash", &self.desired_infra_hash),
-            ("trigger", &self.trigger),
-            ("instance", &instance),
+            ("desiredTriggerCuts", &self.desired_trigger_cuts),
+            ("desiredInfraPlaces", &self.desired_infra_places),
         ];
         let named: Vec<String> =
             pairs.iter().filter_map(|(key, value)| value.as_ref().map(|v| format!("{key}={v}"))).collect();
@@ -154,6 +132,33 @@ impl StatusQuery {
         } else {
             format!("?{}", named.join("&"))
         }
+    }
+}
+
+/// A hash per name (a trigger's address, an infra place), as one query
+/// value: `name:hash` pairs joined by `,`. A program's addresses are
+/// identifiers joined by `.`, and a hash is hex, so neither holds `:` or
+/// `,`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamedHashes(pub std::collections::BTreeMap<String, String>);
+
+impl NamedHashes {
+    pub fn encode(&self) -> String {
+        self.0.iter().map(|(name, hash)| format!("{name}:{hash}")).collect::<Vec<_>>().join(",")
+    }
+
+    /// Back from [`Self::encode`]; a pair that is not `name:hash` is
+    /// refused naming it.
+    pub fn decode(encoded: &str) -> Result<Self, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for pair in encoded.split(',').filter(|p| !p.is_empty()) {
+            let (name, hash) = pair.split_once(':').ok_or_else(|| format!("'{pair}' is not a `name:hash` pair"))?;
+            if name.is_empty() || hash.is_empty() {
+                return Err(format!("'{pair}' is not a `name:hash` pair"));
+            }
+            out.insert(name.to_string(), hash.to_string());
+        }
+        Ok(Self(out))
     }
 }
 
@@ -181,16 +186,6 @@ pub struct ProjectStatusResponse {
     pub status: ProjectStatus,
     /// The build transition axis, orthogonal to `status`.
     pub transition: ProjectTransition,
-    /// The person-facing mode derived from the lifecycle axes; the
-    /// action bar reads it verbatim.
-    pub mode: crate::activation::ActivationMode,
-    /// Unix-second deadline after which fires are refused (hibernate's
-    /// grace window). `None` outside hibernate. Surfaced so the action
-    /// bar can render a countdown.
-    pub fires_deadline_unix: Option<i64>,
-    /// Count of running, non-suspended runs right now. Drives the
-    /// deactivating-state UI: progress towards drain.
-    pub running_count: usize,
     pub listener_running: bool,
     /// True when the program has a shared trigger (one not marked
     /// `@per_instance`): what the action bar arms. Clients show the
@@ -216,7 +211,8 @@ pub struct ProjectStatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<ProjectAddress>,
     /// True when live `infra_node` rows exist whose node is NOT in the
-    /// current source (the node was deleted while deployed). Never gates
+    /// current source (the node was deleted while deployed, or it sits
+    /// behind a part that does not compile). Never gates
     /// run/activate; clients OR it into their infra-controls check so the
     /// controls for live infra never vanish.
     pub orphaned_infra: bool,
@@ -239,12 +235,16 @@ pub struct ProjectStatusResponse {
     /// Every instance's copy of a per-instance infra node, and its state.
     /// `infra` above lists the shared copies only.
     pub instance_infra: Vec<InstanceInfraEntry>,
-    /// Every trigger activation, shared and per instance: what is
-    /// listening, for whom, and how what stopped went down. `status` and
-    /// `mode` above are the aggregate over the shared ones.
-    pub activations: Vec<ActivationEntry>,
-    /// Counts of preserved state, for the reactivate-time prompt.
-    pub preservation: PreservationCounts,
+    /// Every trigger of the program, one entry per place, with its state
+    /// (and each instance's, for one that exists once per instance), plus
+    /// the activations of triggers the program no longer has: what the
+    /// editor stamps on each trigger node and `weft status` lists.
+    /// `status` above is the aggregate over the shared ones.
+    pub triggers: Vec<TriggerEntry>,
+    /// Every instance weft holds anything for, with what it holds: the
+    /// editor's instance picker, and what `weft instances` lists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<crate::program::InstanceHoldings>,
     /// The public entries whose limits refused calls in the last minute
     /// or two, so an author sees a limit acting. Empty when none did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -303,6 +303,26 @@ impl Unanswered {
             self.error,
         )
     }
+}
+
+/// What `POST /projects/{id}/quiesce` asks: `weft rm`'s first step.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuiesceRequest {
+    /// Wait for every run of the project to end, not only for the last
+    /// calls of the ones it cancels: `weft rm --journal`, before it erases
+    /// the project's history.
+    #[serde(default)]
+    pub every_run: bool,
+}
+
+/// What `POST /projects/{id}/quiesce` answers once the project is down:
+/// the task waiting for what it cancelled, which the person follows
+/// (`GET /projects/{id}/follow/{task}`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Quiesced {
+    pub waiting: uuid::Uuid,
 }
 
 /// What `DELETE /projects/{id}` answers: what a forced removal could not
@@ -393,20 +413,102 @@ pub struct InstanceInfraEntry {
     /// under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<crate::infra::wire::ChangeProgress>,
+    /// Applied from other infra than the source holds now
+    /// ([`ProjectInfraEntry::behind`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub behind: bool,
 }
 
-/// One trigger activation in the status answer.
-// SYNC: ActivationEntry <-> packages/weft-graph/src/protocol.ts ActivationEntry
+crate::wire_enum! {
+    /// Where one activation of a trigger stands, as its node's badge reads
+    /// it.
+    // SYNC: TriggerState <-> packages/weft-graph/src/protocol.ts TriggerState
+    pub enum TriggerState {
+        /// Never turned on, or taken down.
+        Off = "off",
+        /// Its setup is running.
+        TurningOn = "turning_on",
+        /// On, firing the program as it is.
+        On = "on",
+        /// On, firing an older program: its cut, or the code it runs,
+        /// changed since it was set up. `weft resync` brings it up to date.
+        Behind = "behind",
+    }
+}
+
+/// One trigger place of the program, as the editor stamps it on its node
+/// and `weft status` lists it.
+// SYNC: TriggerEntry <-> packages/weft-graph/src/protocol.ts TriggerEntry
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivationEntry {
-    pub trigger: String,
+#[serde(rename_all = "camelCase")]
+pub struct TriggerEntry {
+    /// The trigger, spelled the way the program writes it (`door`,
+    /// `one.door`).
+    pub node: String,
+    /// It exists once per instance: `copies` holds every instance's, and
+    /// it has no shared one.
+    pub per_instance: bool,
+    /// The program has it no more (an activation left from before the
+    /// source dropped it): nothing to stamp, and `weft deactivate
+    /// --trigger` takes it down.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool,
+    /// The shared trigger's own activation; `None` for one that exists
+    /// once per instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<TriggerCopy>,
+    /// Each instance's activation, for one that exists once per instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<TriggerCopy>,
+    /// The infra places its cut contains (`weft_core::run_spec::trigger_cut`):
+    /// what taking one of them down takes this trigger down with. From the
+    /// cut it was set up with while on, from the program otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+crate::wire_enum! {
+    /// What took a trigger down when it was not a person.
+    // SYNC: DownWith <-> trigger_activation.went_down_with (crates/weft-dispatcher/src/activation_store.rs), packages/weft-graph/src/protocol.ts DownWith
+    pub enum DownWith {
+        /// The health check: a copy of infra in its cut broke. Its node's
+        /// health rules bring it back once that copy is healthy (the
+        /// built-in ones do; rules a node wrote may not, and then a person
+        /// does, with `weft activate`).
+        Health = "health",
+        /// An infra verb took it down with the copies in its cut; it comes
+        /// back once they run again.
+        Infra = "infra",
+    }
+}
+
+/// One owner's activation of a trigger.
+// SYNC: TriggerCopy <-> packages/weft-graph/src/protocol.ts TriggerCopy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerCopy {
+    /// Whose: absent for the shared one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
-    pub status: ProjectStatus,
-    /// Where it stands as a person reads it: its status, or for an
-    /// inactive one the way it went down.
+    pub state: TriggerState,
+    /// Where it stands in detail: for one taken down, what its door does.
     pub mode: crate::activation::ActivationMode,
-    /// An instance's fires parked because the instance has not given (or
+    /// For one taken down by something other than a person, what: what
+    /// brings it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_with: Option<DownWith>,
+    /// For one taken down by something other than a person whose
+    /// bring-back is refused, why it stays down and the way through: it
+    /// would come on on the registered build while other triggers that are
+    /// on fire another, and one binary answers a project's routes, so
+    /// `weft resync --all` moves those first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_back: Option<String>,
+    /// What it holds while down: the arrivals its door held and the runs
+    /// it fired that are paused.
+    #[serde(default, skip_serializing_if = "HeldWork::is_empty")]
+    pub held: HeldWork,
+    /// An instance's fires held because the instance has not given (or
     /// gave an invalid) value they need: how many, and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<crate::program::WaitingFires>,
@@ -417,23 +519,47 @@ pub struct ActivationEntry {
     pub version: Option<String>,
 }
 
-/// What a deactivated project kept, for the reactivate-time choice.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreservationCounts {
-    /// Total fires queued across every signal in the project. Entry
-    /// triggers append one per fire; resume signals at most one. Drives
-    /// the "execute parked / drop parked / wipe" choice on reactivate.
-    pub parked: usize,
-    /// Resume signals with no submission yet: they stay across the
-    /// inactive window so their suspended run can resume later.
-    pub suspended: usize,
+/// The work held on triggers that are down: the arrivals their door held
+/// (events, calls) and the runs they fired that are paused on a wait (an
+/// answer queued for one is that run's). What a take-down keeps or drops,
+/// and what `weft activate` releases.
+// SYNC: HeldWork <-> packages/weft-graph/src/protocol.ts HeldWork
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldWork {
+    pub arrivals: u64,
+    pub paused: u64,
+}
+
+impl HeldWork {
+    pub fn is_empty(&self) -> bool {
+        self.arrivals == 0 && self.paused == 0
+    }
+
+    /// "3 arrivals and 1 paused run", naming only what there is.
+    pub fn describe(&self) -> String {
+        let counted = |n: u64, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+        match (self.arrivals, self.paused) {
+            (0, 0) => "nothing".into(),
+            (a, 0) => counted(a, "arrival", "arrivals"),
+            (0, p) => counted(p, "paused run", "paused runs"),
+            (a, p) => format!("{} and {}", counted(a, "arrival", "arrivals"), counted(p, "paused run", "paused runs")),
+        }
+    }
+}
+
+impl std::ops::AddAssign for HeldWork {
+    fn add_assign(&mut self, other: Self) {
+        self.arrivals += other.arrivals;
+        self.paused += other.paused;
+    }
 }
 
 /// Desired vs running drift, one bit per thing that can lag.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectDrift {
-    /// "Infra is stale relative to source." Drives the Upgrade button.
+    /// Some infra copy was applied from other infra than the source holds
+    /// now (`ProjectInfraEntry::behind`): `weft infra upgrade` is offered.
     pub infra_drift: bool,
     /// "Worker BINARY needs rebuilding." Flips on engine, node code,
     /// type-set or `weft.toml` edits; the dialog before running asks
@@ -443,11 +569,6 @@ pub struct ProjectDrift {
     /// without flipping `binary_drift`; the next run picks up the
     /// new definition.
     pub definition_drift: bool,
-    /// "The listeners fire an older program." The registrations pin the
-    /// code and graph they were made against, so a rebuild or a
-    /// definition edit leaves them firing the old one until `weft
-    /// resync`, which the verb list then offers.
-    pub activation_drift: bool,
 }
 
 /// One infra place in the status answer.
@@ -483,6 +604,14 @@ pub struct ProjectInfraEntry {
     /// under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<crate::infra::wire::ChangeProgress>,
+    /// Its copy was applied from other infra than the source holds now:
+    /// `weft infra upgrade --infra <node>` brings it up to date.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub behind: bool,
+    /// The triggers on whose cut contains it (each instance's too for a
+    /// shared one), by owner: what taking it down takes down with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub takes_down: Vec<crate::activation::OwnerTriggers>,
 }
 
 // SYNC: ProjectRunsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.runs
@@ -530,15 +659,28 @@ mod tests {
 
     crate::wire_enum_roundtrip_tests!(ProjectStatus, ProjectTransition);
 
+    /// Names and hashes read back as written, a program's addresses
+    /// included; a pair that is not `name:hash` is refused naming it.
+    #[test]
+    fn named_hashes_read_back_as_written() {
+        let named = NamedHashes([("door".to_string(), "ab12".to_string()), ("one.work.inbox".to_string(), "cd34".to_string())].into());
+        assert_eq!(named.encode(), "door:ab12,one.work.inbox:cd34");
+        assert_eq!(NamedHashes::decode(&named.encode()).unwrap(), named);
+        assert_eq!(NamedHashes::decode("").unwrap(), NamedHashes::default());
+        for broken in ["door", ":ab12", "door:", "door:ab12,inbox"] {
+            assert!(NamedHashes::decode(broken).unwrap_err().contains("is not a `name:hash` pair"), "{broken}");
+        }
+    }
+
     #[test]
     fn status_query_string_names_only_the_hashes_given() {
         assert_eq!(StatusQuery::default().to_query_string(), "");
         let q = StatusQuery {
             desired_binary_hash: Some("b".into()),
-            desired_infra_hash: Some("i".into()),
+            desired_infra_places: Some("db:i".into()),
             ..Default::default()
         };
-        assert_eq!(q.to_query_string(), "?desiredBinaryHash=b&desiredInfraHash=i");
+        assert_eq!(q.to_query_string(), "?desiredBinaryHash=b&desiredInfraPlaces=db:i");
     }
 }
 

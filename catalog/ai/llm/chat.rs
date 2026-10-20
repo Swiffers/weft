@@ -25,10 +25,6 @@ use weft::{RunContext, WeftError, WeftResult};
 /// marker's own kind. The slot keeps the stored-file value verbatim
 /// (the stored form of a history holds references, never bytes).
 pub fn media_part(media: &Value) -> WeftResult<Value> {
-    // A file input arrives with a link minted for this firing; the stored
-    // form keeps the file's key only, since the link expires and the
-    // conversation file outlives the firing.
-    let media = &weft::storage::media::strip_links(media);
     let kind = media
         .as_object()
         .and_then(FileKind::from_marker_obj)

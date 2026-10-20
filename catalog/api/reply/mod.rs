@@ -7,7 +7,10 @@
 //!
 //! The body travels per `answerAs`, else the trigger's declared data
 //! type, through the package's `wire::chunk_for`, so this node never
-//! re-decides how bytes or text ride the wire.
+//! re-decides how bytes or text ride the wire. `answerAs: "redirect"`
+//! answers a file (a stored one or a url file) as a redirect to its
+//! external link instead (HTTP only): the caller's browser fetches the
+//! file from there, with `Range` and all.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -15,7 +18,7 @@ use serde_json::Value;
 use weft::caller::CallerHandle;
 use weft::node::NodeOutput;
 use weft::signal::DataType;
-use weft::storage::StoredFile;
+use weft::storage::{StorageScope, StoredFile};
 use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::wire;
@@ -38,7 +41,22 @@ impl Node for ReplyNode {
         let status: u16 = ctx.inputs.get("status")?;
         let headers: Option<Value> = ctx.inputs.opt("headers")?;
         let caller = ctx.live_caller().await?;
-        let data_type = wire::answer_type(&ctx)?;
+        let data_type = match wire::answer(&ctx)? {
+            wire::Answer::Data(data_type) => data_type,
+            wire::Answer::Redirect => {
+                let CallerHandle::Http(http) = caller else {
+                    weft::node_bail!("Reply behind a Socket sends messages; a redirect is an HTTP answer. Put the Reply behind a Route");
+                };
+                let Some(file) = wire::file_value(&body) else {
+                    weft::node_bail!("a redirect answers a file, got {}", wire::kind_of(&body));
+                };
+                let file = file.map_err(|e| weft::node_error(format!("a redirect answers a file; {e}")))?;
+                let link = ctx.storage(StorageScope::Run).external_link(&file).await?;
+                let head = wire::head_for(wire::redirect_status(status)?, headers.as_ref())?.with_header("location", link.url);
+                http.respond_with(head, weft::caller::OutboundChunk::Bytes(Vec::new())).await?;
+                return ctx.pulse_downstream(NodeOutput::new().set("done", true)).await;
+            }
+        };
         // Read before the body is spent: a file sent as bytes names its
         // own type and filename on the response.
         let file = (data_type == DataType::Bytes).then(|| StoredFile::from_value(&body).ok()).flatten();

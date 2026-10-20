@@ -285,7 +285,7 @@ async fn firing_a_get_route_needs_no_body() -> anyhow::Result<()> {
 
 /// A caller reaches the project's own address straight, with nothing of
 /// weft's in between: its routes answer there at the root, and while the
-/// trigger is parked the worker itself refuses with a `503`.
+/// trigger is down the worker itself refuses with a `503`.
 #[tokio::test]
 async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -302,7 +302,7 @@ async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     let body: Value = answered.json().await?;
     assert_eq!(body["name"], "Ada", "{body}");
 
-    project.weft(&["deactivate", "--mode", "park", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--running", "cancel"]).await?;
     status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
     let refused = reqwest::get(format!("{url}/{path}/users/42")).await?;
     assert_eq!(refused.status(), 503);
@@ -311,18 +311,19 @@ async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// A caller is never held: while a route's trigger is parked, a call is
-/// refused at once with a `503` and a `Retry-After`, the way any server that
-/// is down answers, and the call made once it is back is answered. A wipe
-/// takes the route away with its trigger's signals.
+/// A caller is never held: while a route's trigger is down, even with a
+/// door that holds what arrives, a call is refused at once with a `503`
+/// and a `Retry-After`, the way any server that is down answers, and the
+/// call made once it is back is answered. A door that refuses with nothing
+/// kept takes the route away with its trigger's signals.
 #[tokio::test]
-async fn a_parked_route_refuses_its_caller_until_it_is_back() -> anyhow::Result<()> {
+async fn a_route_taken_down_refuses_its_caller_until_it_is_back() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("api_reply", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
 
-    project.weft(&["deactivate", "--mode", "park", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--running", "cancel"]).await?;
     status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
     let (status, headers, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
@@ -336,7 +337,7 @@ async fn a_parked_route_refuses_its_caller_until_it_is_back() -> anyhow::Result<
     let body: Value = serde_json::from_slice(&body)?;
     assert_eq!(body["name"], "Ada", "{body}");
 
-    project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
     let (status, _, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
@@ -345,41 +346,56 @@ async fn a_parked_route_refuses_its_caller_until_it_is_back() -> anyhow::Result<
     project.finish().await
 }
 
-/// Taking the triggers down with `--running-policy wait` lets a call that
-/// is running finish and answers it, while a call arriving meanwhile is
-/// refused like any other while the trigger is not on.
+/// Taking the triggers down lets a call that is running finish on its
+/// own version and answers only once it has (`--running wait`, the
+/// default), while a call arriving once they are down is refused like any
+/// other while the trigger is not on.
 #[tokio::test]
-async fn a_drain_lets_a_running_call_finish_and_refuses_new_ones() -> anyhow::Result<()> {
+async fn taking_down_waits_for_a_running_call_and_refuses_new_ones() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("api_reply", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
 
+    // Each side notes when it ended, so the order they ended in is read
+    // off the clock rather than off which one the test happened to join
+    // first.
     let running = {
         let disp = disp.clone();
         let path = format!("{base}/slow");
-        tokio::spawn(async move { live::http_request(&disp, Method::GET, &path, &[], None).await })
+        tokio::spawn(async move {
+            let answered = live::http_request(&disp, Method::GET, &path, &[], None).await;
+            (answered, std::time::Instant::now())
+        })
     };
     // The slow call is under way (it sleeps four seconds).
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let deactivate = project.weft(&["deactivate", "--mode", "park", "--running-policy", "wait", "--drain-timeout", "60"]);
-    let meanwhile = async {
-        status::wait_until_status(&disp, &project.id(), "deactivating", status::STATUS_DEADLINE).await?;
-        let (status, headers, body) =
-            live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
-        anyhow::ensure!(status == 503, "a call while the triggers go down: {status} {}", String::from_utf8_lossy(&body));
-        anyhow::ensure!(header(&headers, "retry-after").is_some(), "no Retry-After on the refusal");
-        anyhow::Ok(())
+    let deactivate = {
+        let deactivate = common::spawn_weft(&project, vec!["deactivate".into(), "--json".into()]);
+        tokio::spawn(async move { (deactivate.await, std::time::Instant::now()) })
     };
-    let (deactivated, meanwhile) = tokio::join!(deactivate, meanwhile);
-    deactivated?;
-    meanwhile?;
+    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
+    let (status, headers, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
+    anyhow::ensure!(status == 503, "a call once the triggers are down: {status} {}", String::from_utf8_lossy(&body));
+    anyhow::ensure!(header(&headers, "retry-after").is_some(), "no Retry-After on the refusal");
 
-    let (status, _, body) = running.await??;
+    let (answered, call_ended) = running.await?;
+    let (status, _, body) = answered?;
     assert_eq!(status, 200, "the running call is answered: {}", String::from_utf8_lossy(&body));
     let body: Value = serde_json::from_slice(&body)?;
     assert_eq!(body["slept"], true, "{body}");
-    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
+
+    let (out, deactivate_ended) = deactivate.await?;
+    let out = out??;
+    anyhow::ensure!(out.success, "the deactivate failed: {}\n{}", out.stdout, out.stderr);
+    let said = common::summary_of(&out.stdout);
+    anyhow::ensure!(said.contains("1 run waited for, finishing on their own version"), "{said}");
+    anyhow::ensure!(
+        deactivate_ended >= call_ended,
+        "the deactivate answered {:?} before the call it waits for was answered",
+        call_ended - deactivate_ended
+    );
 
     project.finish().await
 }

@@ -1249,13 +1249,12 @@ file reads), start the path with `__catalog/` and it is measured from
 `nodes/` is refused.
 
 A stored file travels a wire as a small reference (its key, name, mime type
-and size), never as bytes. Inside the node that receives it the reference
-also carries a `url`, a download link minted for that one firing; the link
-is stripped from everything that leaves the node and is never written to
-the journal, so `weft events` shows the reference without it, and that is
-expected. A node that runs your code may hand the reference over in its own
-shape (`ExecPython` passes a plain dict, `photo["url"]`), and its
-description says how.
+and size), never as bytes, and never with a link in it: a node that needs a
+link makes one while it runs, so the journal and `weft events` hold none. A
+node that runs your code may hand the reference over in its own shape
+(`ExecPython` passes a plain dict with `photo["internalUrl"]` to fetch the
+bytes from the script and `photo["externalUrl"]` to hand another service), and
+its description says how.
 
 A stored file lives as long as its scope says: a run's files are swept when
 the run ends, a project's stay. The storage nodes `TextToFile`,

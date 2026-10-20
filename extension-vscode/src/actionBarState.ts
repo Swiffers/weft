@@ -23,13 +23,11 @@
 // CLI in-flight + error overlay sit on top of all three.
 //
 // The reducer computes "watched-live run" by intersecting follow
-// state with running runs. When that intersection is non-empty,
-// the bar shows Stop and cancels that run; otherwise the bar
-// shows Run/Activate. Only runs of the graph count there: a setup is
-// never a run to stop. The trigger section reads the backend status
-// alone; the infra section also reads whether an infra setup is
-// running (`infraSetup`), so an `infra start` typed in a terminal shows
-// as that verb working.
+// state with running runs. When that intersection is non-empty, the
+// bottom bar shows Stop and cancels that run. Only runs of the graph
+// count there: a setup is never a run to stop. The bar also reads
+// whether an infra setup is running (`infraSetup`), so an `infra
+// start` typed in a terminal shows as that verb working.
 
 import type {
   ActionBarState,
@@ -63,7 +61,7 @@ interface Slot {
   backend: ActionAvailability | undefined;
   /// Running runs in start order (a Map iterates in insertion
   /// order), each with what it is for. Only `fire` ones are runs the
-  /// bar can stop; the setups drive the infra and trigger slots.
+  /// bar can stop; an infra setup shows as that verb working.
   running: Map<string, RunPhase>;
   follow: FollowState;
   cli: {
@@ -476,7 +474,7 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
 /// run (so the bar shows Run, not Stop), even if a different
 /// run is running on the same project.
 function computeWatchedRunningRunId(slot: Slot): string | undefined {
-  // Only runs: a setup is its verb working, shown in its own slot.
+  // Only runs: a setup is its verb working, never a run to stop.
   const runs = [...slot.running].filter(([, phase]) => phase === 'fire').map(([runId]) => runId);
   if (runs.length === 0) return undefined;
   if (slot.follow.mode === 'off') return undefined;

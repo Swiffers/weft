@@ -29,6 +29,10 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_capture_port_on_a_bytes_route_sits_beside_the_body", bytes_route_capture),
         NodeTest::fake("a_capture_called_params_is_its_text", capture_named_params),
         NodeTest::fake("a_picture_in_a_json_body_is_stored_and_its_file_flows", inline_picture),
+        NodeTest::fake("an_upload_slot_in_a_file_field_is_received_by_one_run", upload_slot),
+        NodeTest::fake("one_refused_upload_of_a_body_receives_none_of_them", one_refused_upload_receives_none),
+        NodeTest::fake("a_bad_picture_beside_an_upload_receives_nothing", bad_picture_receives_nothing),
+        NodeTest::fake("a_wrong_field_beside_an_upload_receives_nothing", wrong_field_receives_nothing),
         NodeTest::fake("bare_base64_is_typed_by_its_bytes_and_held_to_its_field", bare_base64),
         NodeTest::fake("an_optional_picture_is_held_to_its_kind_and_typed_by_its_bytes", optional_picture),
         NodeTest::fake("a_fired_body_of_the_wrong_shape_is_answered_400", fired_body_of_the_wrong_shape),
@@ -251,6 +255,131 @@ async fn inline_picture(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(status, 400);
     assert!(error.contains("photo") && error.contains("Image"), "{error}");
     assert!(outcome.outputs.is_empty());
+    Ok(())
+}
+
+/// A file field holding an upload slot (`weft-upload:<slot>`) receives
+/// the file the page uploaded through it, in the slot's scope. The same
+/// run naming the slot again gets the same file; another run naming it,
+/// or a slot nothing was uploaded through, is the caller's mistake,
+/// answered 400 in the store's words. A file that does not fit its field
+/// is refused the same way and the slot stays open, so a call naming it
+/// in a field it fits receives it.
+async fn upload_slot(rig: FakeRig) -> WeftResult<()> {
+    let video = b"\x00\x00\x00\x18ftypmp42".to_vec();
+    rig.uploaded("weft-upload:s1", weft::storage::StorageScope::Project, "clip.mp4", "video/mp4", video.clone());
+    call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:s1", "again": "weft-upload:s1", "title": "a clip" })));
+    rig.output_type("body", ty("{ video: Video, again: Video, title: String }"));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let file = weft::storage::StoredFile::from_value(&outcome.outputs["body"]["video"])?;
+    assert_eq!((file.filename.as_str(), file.mime_type.as_str()), ("clip.mp4", "video/mp4"));
+    assert_eq!(rig.stored_bytes(&file.key)?.as_ref(), video.as_slice());
+    assert_eq!(outcome.outputs["body"]["again"], outcome.outputs["body"]["video"], "the same run gets the same file");
+    assert_eq!(rig.stored_files(&weft::storage::StorageScope::Project)?.len(), 1, "it lands in the slot's scope, once");
+    assert_eq!(outcome.outputs["body"]["title"], json!("a clip"));
+
+    rig.output_type("body", ty("{ video: Video, title: String }"));
+    for slot in ["weft-upload:s1", "weft-upload:nothing"] {
+        let conn = call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": slot, "title": "again" })));
+        let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+        let (status, error) = refusal(&conn);
+        assert_eq!(status, 400, "{slot}");
+        assert!(error.contains("video") && error.contains("cannot be received"), "{slot}: {error}");
+        assert!(outcome.outputs.is_empty());
+    }
+
+    // A video named in an Image field: refused, nothing received.
+    rig.uploaded("weft-upload:s2", weft::storage::StorageScope::Project, "clip.mp4", "video/mp4", video.clone());
+    rig.output_type("body", ty("{ photo: Image }"));
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(json!({ "photo": "weft-upload:s2" })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let (status, error) = refusal(&conn);
+    assert_eq!(status, 400);
+    assert!(error.contains("photo") && error.contains("cannot be received"), "{error}");
+    assert!(outcome.outputs.is_empty());
+    assert_eq!(rig.stored_files(&weft::storage::StorageScope::Project)?.len(), 1, "the refused video was not received");
+    rig.output_type("body", ty("{ video: Video }"));
+    call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:s2" })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let file = weft::storage::StoredFile::from_value(&outcome.outputs["body"]["video"])?;
+    assert_eq!(rig.stored_bytes(&file.key)?.as_ref(), video.as_slice(), "the slot stayed open");
+    Ok(())
+}
+
+/// A body naming two uploads, the second of which does not fit its field
+/// (a video in an Image field), receives neither: the video that fit is
+/// left open too, so the corrected call (a new run) receives both.
+async fn one_refused_upload_receives_none(rig: FakeRig) -> WeftResult<()> {
+    let video = b"\x00\x00\x00\x18ftypmp42".to_vec();
+    let project = weft::storage::StorageScope::Project;
+    rig.uploaded("weft-upload:clip", project.clone(), "clip.mp4", "video/mp4", video.clone());
+    rig.uploaded("weft-upload:other", project.clone(), "other.mp4", "video/mp4", video.clone());
+    rig.uploaded("weft-upload:cover", project.clone(), "cover.png", "image/png", png_bytes());
+    rig.output_type("body", ty("{ video: Video, cover: Image }"));
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:clip", "cover": "weft-upload:other" })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let (status, error) = refusal(&conn);
+    assert_eq!(status, 400);
+    assert!(error.contains("video") && error.contains("cover") && error.contains("weft-upload:other"), "every place, and the slot refused: {error}");
+    assert!(outcome.outputs.is_empty());
+    assert!(rig.stored_files(&project)?.is_empty(), "the video that fit was not received either");
+
+    call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:clip", "cover": "weft-upload:cover" })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let clip = weft::storage::StoredFile::from_value(&outcome.outputs["body"]["video"])?;
+    let cover = weft::storage::StoredFile::from_value(&outcome.outputs["body"]["cover"])?;
+    assert_eq!(rig.stored_bytes(&clip.key)?.as_ref(), video.as_slice(), "the corrected call receives the video");
+    assert_eq!(rig.stored_bytes(&cover.key)?.as_ref(), png_bytes().as_slice(), "and the cover beside it");
+    assert_eq!(rig.stored_files(&project)?.len(), 2);
+    Ok(())
+}
+
+/// A bad inline picture beside an upload refuses the call before the
+/// upload is received, so the slot stays open for a call that gets it
+/// right.
+async fn bad_picture_receives_nothing(rig: FakeRig) -> WeftResult<()> {
+    let video = b"\x00\x00\x00\x18ftypmp42".to_vec();
+    rig.uploaded("weft-upload:s1", weft::storage::StorageScope::Project, "clip.mp4", "video/mp4", video.clone());
+    rig.output_type("body", ty("{ video: Video, photo: Image }"));
+    let conn = call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:s1", "photo": "not base64!!" })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let (status, error) = refusal(&conn);
+    assert_eq!(status, 400);
+    assert!(error.contains("not valid base64"), "{error}");
+    assert!(outcome.outputs.is_empty());
+    assert!(rig.stored_files(&weft::storage::StorageScope::Project)?.is_empty(), "the upload was not received");
+    let photo = weft::storage::media::data_url("image/png", &png_bytes());
+    call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:s1", "photo": photo })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    assert!(weft::storage::StoredFile::from_value(&outcome.outputs["body"]["video"]).is_ok());
+    Ok(())
+}
+
+/// A body whose other fields do not fit its type (a wrong field, a
+/// missing one) is refused before its upload is received or its picture
+/// stored, so the slot stays open for a call that gets it right.
+async fn wrong_field_receives_nothing(rig: FakeRig) -> WeftResult<()> {
+    let video = b"\x00\x00\x00\x18ftypmp42".to_vec();
+    rig.uploaded("weft-upload:s1", weft::storage::StorageScope::Project, "clip.mp4", "video/mp4", video.clone());
+    rig.output_type("body", ty("{ video: Video, photo: Image, title: String }"));
+    let photo = weft::storage::media::data_url("image/png", &png_bytes());
+    for body in [
+        json!({ "video": "weft-upload:s1", "photo": photo, "title": 42 }),
+        json!({ "video": "weft-upload:s1", "photo": photo }),
+    ] {
+        let conn = call(&rig, DataType::Json, InboundMessage::Json(body.clone()));
+        let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+        let (status, error) = refusal(&conn);
+        assert_eq!(status, 400, "{body}");
+        assert!(error.contains("title"), "{body}: {error}");
+        assert!(outcome.outputs.is_empty());
+        assert!(rig.stored_files(&weft::storage::StorageScope::Project)?.is_empty(), "the upload was not received");
+        assert!(rig.stored_files(&weft::storage::StorageScope::Run)?.is_empty(), "the picture was not stored");
+    }
+    call(&rig, DataType::Json, InboundMessage::Json(json!({ "video": "weft-upload:s1", "photo": photo, "title": "a clip" })));
+    let outcome = rig.run(&RouteNode, json!({ "path": "clips" })).await.ok()?;
+    let file = weft::storage::StoredFile::from_value(&outcome.outputs["body"]["video"])?;
+    assert_eq!(rig.stored_bytes(&file.key)?.as_ref(), video.as_slice(), "the slot stayed open");
     Ok(())
 }
 

@@ -882,6 +882,22 @@ export interface ProjectDefinition {
   /// are the run's own, never the program's). Absent in a program as
   /// written, which is every program the editor parses.
   given?: GivenPlaces;
+  /// The parts of the program that do not compile; a cut that needs one is
+  /// refused. Absent in a program that compiles whole, which is every
+  /// program the editor parses (its own parse reports diagnostics instead).
+  broken?: Broken[];
+}
+
+/// See `ProjectDefinition.broken`.
+// SYNC: Broken <-> crates/weft-core/src/project.rs Broken
+export interface Broken {
+  /// The node and group ids the problem is about; a cut keeping all of
+  /// them needs it.
+  parts: string[];
+  why: string;
+  /// The part may stand for nodes the program cannot see (an included
+  /// file that does not compile, a node whose type did not load).
+  hides?: boolean;
 }
 
 /// See `ProjectDefinition.given`: per place (`locatedKey`), the input
@@ -911,6 +927,10 @@ export interface Diagnostic {
   // was compiled (an @include splices other files' nodes in with their
   // own line numbers). Absent = the compiled source itself.
   file?: string;
+  // The node and group ids the finding is about (one for a node or a
+  // group, the two ends for a wire); absent when it is about the program
+  // as a whole.
+  subjects?: string[];
 }
 
 /// Derived from the Widget union (never a second hand-kept list).
@@ -1037,12 +1057,12 @@ export interface CatalogEntry {
 
 // The connection vocabulary (recipes, connections, doors) lives in the
 // connect library, which the editor's picker and an instance's connect page
-// both build on; the graph protocol names it from there.
+// both build on; the graph protocol names it from there. A connection's
+// door is not re-exported: here `Door` is a trigger's (`take_down.rs`).
 export type {
   AppRegistration,
   GrantCoexistence,
   CredentialFieldWire,
-  Door,
   Permission,
   VerificationRung,
   VerificationCost,
@@ -1353,40 +1373,192 @@ export function instanceFilledValue(fallback?: unknown): InstanceFilledValue {
   return { [INSTANCE_FILLED_KEY]: fallback === undefined ? {} : { fallback } };
 }
 
+/// Whose activations or infra copies a lifecycle verb acts on, as the
+/// wire carries it: the field absent is the program's shared ones, a list
+/// names instances, `"all_instances"` is every instance weft holds
+/// anything for, and `"all"` is the shared ones and every instance. The
+/// CLI spells the same four as no flag, `--instance <id>` (repeated),
+/// `--all-instances` and `--all`.
+// SYNC: InstanceTarget <-> crates/weft-core/src/instance.rs InstanceTarget (and its wire words)
+export type InstanceTarget = string[] | 'all_instances' | 'all';
+
 /// Which activations a lifecycle verb names: the triggers (every one of
-/// the owner's when empty), for an instance (the shared ones when absent).
+/// each owner's when absent), of the owners `instances` names (the shared
+/// ones when absent).
 // SYNC: ActivationScope <-> crates/weft-core/src/activation.rs ActivationScope
 export interface ActivationScope {
   triggers?: string[];
-  instance?: string;
+  instances?: InstanceTarget;
 }
 
-/// One trigger activation, as the project status lists it.
-/// Where a project or one activation stands in its lifecycle.
+/// The aggregate status over the program's shared activations.
 // SYNC: LifecycleStatus <-> crates/weft-core/src/projects.rs ProjectStatus
-export type LifecycleStatus = 'registered' | 'activating' | 'active' | 'deactivating' | 'inactive';
+export type LifecycleStatus = 'registered' | 'activating' | 'active' | 'inactive';
 
-/// Where one activation stands, as a person reads it: its status, or
-/// for one taken down, the way it went.
+/// What happens to work arriving while a trigger is down: `take` holds
+/// it (a question stays listed for the people who answer it), `hide`
+/// holds it out of sight, `refuse` takes nothing.
+// SYNC: Door <-> crates/weft-core/src/take_down.rs Door
+export type Door = 'take' | 'hide' | 'refuse';
+
+/// What happens to the work already waiting on a trigger as it goes
+/// down (the arrivals it held, the runs it fired that are paused):
+/// kept for when it is back, or dropped (arrivals deleted, paused runs
+/// cancelled).
+// SYNC: Held <-> crates/weft-core/src/take_down.rs Held
+export type Held = 'keep' | 'drop';
+
+/// What happens to the runs going right now: `wait` lets them finish on
+/// the version they started on, and the command goes on only once they
+/// have (an infra copy goes, a resync's new version takes over, a
+/// deactivate answers), with no time limit; `cancel` stops them at once.
+// SYNC: Running <-> crates/weft-core/src/take_down.rs Running
+export type Running = 'wait' | 'cancel';
+
+/// What `weft activate` does with the work its triggers held while they
+/// were down: run it (paced, so new arrivals still get through), or drop
+/// it.
+// SYNC: ReleaseHeld <-> crates/weft-core/src/take_down.rs ReleaseHeld
+export type ReleaseHeld = 'run' | 'drop';
+
+/// A take-down, every answer given.
+// SYNC: TakeDown <-> crates/weft-core/src/take_down.rs TakeDown
+export interface TakeDown {
+  door: Door;
+  /// With `take` or `hide`: the door refuses once this many minutes have
+  /// passed (1 or more). Absent: it stays as it is until the trigger is
+  /// back.
+  doorForMinutes?: number;
+  held: Held;
+  running: Running;
+}
+
+/// A take-down as a request says it: each answer it gives, the rest left
+/// to the defaults every command shares (`TAKE_DOWN_DEFAULT`). The
+/// CLI's `--door`, `--door-for`, `--held` and `--running`.
+// SYNC: TakeDownChoice <-> crates/weft-core/src/take_down.rs TakeDownChoice
+export interface TakeDownChoice {
+  door?: Door;
+  doorForMinutes?: number;
+  held?: Held;
+  running?: Running;
+}
+
+/// What every command that takes triggers down does when a request says
+/// nothing: nothing destructive. The door takes and keeps what it took,
+/// and the runs going finish on their own version before the command
+/// goes on.
+// SYNC: TAKE_DOWN_DEFAULT <-> crates/weft-core/src/take_down.rs TakeDown::DEFAULT
+export const TAKE_DOWN_DEFAULT: TakeDown = { door: 'take', held: 'keep', running: 'wait' };
+
+/// Whose a per-project resource is: the program's shared one, or one
+/// instance's.
+// SYNC: Owner <-> crates/weft-core/src/instance.rs Owner
+export type Owner = { kind: 'shared' } | { kind: 'instance'; instance: string };
+
+/// One owner's triggers, by name.
+// SYNC: OwnerTriggers <-> crates/weft-core/src/activation.rs OwnerTriggers
+export interface OwnerTriggers {
+  owner: Owner;
+  triggers: string[];
+}
+
+/// Owners' triggers as a person reads them, the way the CLI prints
+/// them: `'door', 'feed'` for the program's own, `'inbox' of instance
+/// 'ada'` for an instance's, owners apart with `; `.
+// SYNC: describeOwnerTriggers <-> crates/weft-core/src/activation.rs OwnerTriggers::words, crates/weft-core/src/activation.rs OwnerTriggers::list_words
+export function describeOwnerTriggers(owned: OwnerTriggers[]): string {
+  return owned
+    .map(({ owner, triggers }) => {
+      const names = triggers.map((t) => `'${t}'`).join(', ');
+      return owner.kind === 'shared' ? names : `${names} of instance '${owner.instance}'`;
+    })
+    .join('; ');
+}
+
+/// The work held on triggers that are down: the arrivals their door held
+/// and the runs they fired that are paused on a wait.
+// SYNC: HeldWork <-> crates/weft-core/src/projects.rs HeldWork
+export interface HeldWork {
+  arrivals: number;
+  paused: number;
+}
+
+/// What a take-down did: the answers it acted on, the triggers it took
+/// down, what is held on them, and how many runs going it reached.
+// SYNC: TakeDownReport <-> crates/weft-core/src/deactivation.rs TakeDownReport
+export interface TakeDownReport {
+  takeDown: TakeDown;
+  triggers: OwnerTriggers[];
+  held: HeldWork;
+  runs: number;
+}
+
+/// Where one activation stands in detail: never turned on, its setup
+/// running, on, or for one taken down, what its door does.
 // SYNC: ActivationMode <-> crates/weft-core/src/activation.rs ActivationMode
-export type ActivationMode = 'registered' | 'activating' | 'active' | 'deactivating' | DeactivationSpec['mode'];
+export type ActivationMode = 'registered' | 'activating' | 'active' | Door;
 
-// SYNC: ActivationEntry <-> crates/weft-core/src/projects.rs ActivationEntry
-export interface ActivationEntry {
-  trigger: string;
-  instance?: string;
-  // SYNC: status <-> crates/weft-core/src/projects.rs ProjectStatus
-  status: LifecycleStatus;
-  // SYNC: mode <-> crates/weft-core/src/activation.rs ActivationMode
-  mode: ActivationMode;
-  /// Fires waiting in the trigger's queue on something no clock brings
-  /// (a value the instance has not given, infra, the install's picks, or a
-  /// hand-over that kept failing): how many, on what, and why.
-  // SYNC: waiting <-> crates/weft-core/src/program.rs WaitingFires
+/// Fires waiting in a trigger's queue on something no clock brings (a
+/// value the instance has not given, infra, the install's picks, or a
+/// hand-over that kept failing): how many, on what, and why.
+// SYNC: WaitingFires <-> crates/weft-core/src/program.rs WaitingFires
+export interface WaitingFires {
+  fires: number;
   // SYNC: on <-> crates/weft-core/src/door_fire.rs UnclockedWait
-  waiting?: { fires: number; on: 'instance' | 'infra' | 'picks' | 'failure'; reason: string };
+  on: 'instance' | 'infra' | 'picks' | 'failure';
+  reason: string;
+}
+
+/// Where one activation of a trigger stands, as its node's badge reads
+/// it: `behind` is on and firing an older program (`weft resync` brings
+/// it up to date).
+// SYNC: TriggerState <-> crates/weft-core/src/projects.rs TriggerState
+export type TriggerState = 'off' | 'turning_on' | 'on' | 'behind';
+
+/// What took a trigger down when it was not a person: the health check
+/// (its infra's health rules bring it back once that infra is healthy), or
+/// an infra verb (it comes back once its infra runs again).
+// SYNC: DownWith <-> crates/weft-core/src/projects.rs DownWith
+export type DownWith = 'health' | 'infra';
+
+/// One owner's activation of a trigger.
+// SYNC: TriggerCopy <-> crates/weft-core/src/projects.rs TriggerCopy
+export interface TriggerCopy {
+  /// Whose: absent for the shared one.
+  instance?: string;
+  state: TriggerState;
+  mode: ActivationMode;
+  /// For one taken down by something other than a person, what.
+  downWith?: DownWith;
+  /// For one taken down by something other than a person whose bring-back
+  /// is refused: why it stays down, and the way through.
+  heldBack?: string;
+  /// What it holds while down. Absent when it holds nothing.
+  held?: HeldWork;
+  waiting?: WaitingFires;
   /// The version of the source its fires run, once its setup finished.
   version?: string;
+}
+
+/// One trigger place of the program, with its state and each instance's
+/// for one that exists once per instance. The dispatcher computes every
+/// state; the editor only draws it.
+// SYNC: TriggerEntry <-> crates/weft-core/src/projects.rs TriggerEntry
+export interface TriggerEntry {
+  /// The trigger, spelled the way the program writes it (`door`, `one.door`).
+  node: string;
+  perInstance: boolean;
+  /// The program has it no more (an activation left from before the
+  /// source dropped it).
+  gone?: boolean;
+  /// The shared activation; absent for one that exists once per instance.
+  shared?: TriggerCopy;
+  /// Each instance's activation, for one that exists once per instance.
+  copies?: TriggerCopy[];
+  /// The infra places its cut contains: taking one of them down takes
+  /// this trigger down with it.
+  dependsOn?: string[];
 }
 
 /// One instance's copy of an infra node, as the project status lists it.
@@ -1398,7 +1570,48 @@ export interface InstanceInfraEntry {
   /// While a start, stop or terminate of the copy is under way: since
   /// when, and what it waits on.
   progress?: ChangeProgress;
+  /// Applied from other infra than the source holds now.
+  behind?: boolean;
 }
+
+/// One copy of an infra node, as an instance's holdings list it.
+// SYNC: InfraCopy <-> crates/weft-core/src/program.rs InfraCopy
+export interface InfraCopy {
+  node: string;
+  instance?: string;
+  // SYNC: status <-> crates/weft-core/src/infra/status.rs InfraNodeStatus
+  status: 'provisioning' | 'running' | 'stopped' | 'flaky' | 'failed' | 'stopping' | 'terminating';
+  failure?: string;
+}
+
+/// One instance's activation of a per-instance trigger, as its holdings
+/// list it.
+// SYNC: InstanceTrigger <-> crates/weft-core/src/program.rs InstanceTrigger
+export interface InstanceTrigger {
+  trigger: string;
+  mode: ActivationMode;
+  waiting?: WaitingFires;
+}
+
+/// Everything weft holds for one instance of the project: what the
+/// editor's instance picker lists, and what `weft instances --json`
+/// prints.
+// SYNC: InstanceHoldings <-> crates/weft-core/src/program.rs InstanceHoldings
+export interface InstanceHoldings {
+  instance: string;
+  values: number;
+  connections: number;
+  tokens: number;
+  copies: InfraCopy[];
+  triggers: InstanceTrigger[];
+  lastRunUnix?: number;
+}
+
+/// What `weft run --check --json` prints: whether the walk for the
+/// targets resolves, and when it does not, the walk's own refusal. It
+/// exits 0 either way.
+// SYNC: RunCheck <-> crates/weft-cli/src/commands/run.rs RunCheck
+export type RunCheck = { ok: true } | { ok: false; refusal: string };
 
 /// The parent run and the original run supplying each reused result,
 /// per place (a `locatedKey`).
@@ -1729,17 +1942,12 @@ export type NodeFeedState =
 //     cli_running / run_running / error). Driven by status
 //     fetches + CLI NDJSON events.
 //   - statusSnapshot: the latest `weft status --json` payload
-//     (drift bits, available actions, per-node infra status). Used
-//     by the action bar AND graph decorations.
+//     (available actions, every trigger's, infra copy's and
+//     instance's state). Used by both bars AND graph decorations.
 //
 // Adding a new graph-decoration source means folding it into
 // statusSnapshot, not adding a new message type.
 
-/// Snapshot of backend state from `weft status --json`. Refreshed
-/// on graph open, after every CLI verb, on SSE-triggered events
-/// (debounced 500ms), on file-change debounce, and on the Refresh
-/// button. Drives both the action bar (state + drift) AND graph
-/// decorations (per-node infra status).
 /// The single-flight transition on the project row, orthogonal to
 /// `projectStatus`. While a build is in flight, the only offered action
 /// is cancel_build (the master transitional rule); while a resync is, only
@@ -1747,33 +1955,12 @@ export type NodeFeedState =
 // SYNC: ProjectTransition <-> crates/weft-core/src/projects.rs ProjectTransition, packages/weft-graph/src/status.ts VALID_TRANSITIONS
 export type ProjectTransition = 'none' | 'building' | 'cancelling_build' | 'resyncing';
 
-/// Trigger-deactivation spec the shared picker produces and the verbs
-/// that take triggers down consume (deactivate; infra stop/terminate/
-/// upgrade on an Active project). `wipe` forces `runningPolicy:
-/// 'cancel'` (waiting before wiping is contradictory); `graceMinutes`
-/// only applies to `hibernate`.
-// SYNC: DeactivationSpec <-> crates/weft-core/src/running_policy.rs DeactivateSpec
-export interface DeactivationSpec {
-  // SYNC: mode <-> crates/weft-core/src/running_policy.rs DeactivationMode
-  mode: 'wipe' | 'hibernate' | 'park';
-  // SYNC: runningPolicy <-> crates/weft-core/src/running_policy.rs RunningPolicy (its
-  // `#[default]`, cancel, is what DeactivationPicker.svelte opens on)
-  runningPolicy: 'wait' | 'cancel';
-  graceMinutes?: number;
-  /// Cap in seconds on a `wait` drain: "wait at most N, then proceed"
-  /// (the deactivation cancels the stragglers and lands; a worker
-  /// replacement kills them with the old workers). One cap for the
-  /// whole operation: it rides inside the DeactivateSpec wire object
-  /// AND at the request top level for the verbs whose supervisor/
-  /// worker drains read it there. Absent = the server default.
-  drainTimeoutSecs?: number;
-}
-
-/// The server's default `wait` drain cap, mirrored so the picker can
-/// prefill its input.
-// SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> crates/weft-core/src/running_policy.rs DEFAULT_DRAIN_TIMEOUT_SECS
-export const DEFAULT_DRAIN_TIMEOUT_SECS = 60;
-
+/// Snapshot of backend state from `weft status --json`. Refreshed
+/// on graph open, after every CLI verb, on SSE-triggered events
+/// (debounced 500ms), on file-change debounce, and on the Refresh
+/// button. Drives the bottom bar's in-flight states, the contextual
+/// bar's counts, and the badges on the trigger and infra nodes. The
+/// dispatcher computes every state in it; the editor only draws.
 // SYNC: ActionAvailability <-> crates/weft-core/src/projects.rs ProjectStatusResponse
 export interface ActionAvailability {
   /// `weft rm` marked the project and has not finished removing it: no
@@ -1781,76 +1968,36 @@ export interface ActionAvailability {
   removing: boolean;
   /// Verbs the dispatcher will currently accept.
   availableActions: ActionVerb[];
-  /// Drift bits. Lit independently; each resolved by its own verb.
-  /// - `binaryDrift`: worker binary inputs changed (engine, node
-  ///   implementations, node-type set, `weft.toml` build section).
-  ///   Resolved by Rebuild + a fresh worker spawn.
-  /// - `definitionDrift`: runtime project shape changed (topology,
-  ///   per-node configs). Resolved by Resync (a new project_definition
-  ///   row + pointer advance; the running worker keeps the old
-  ///   shape, the next run picks up the new).
-  /// - `infraDrift`: infra-closure changed. Resolved by Upgrade.
-  binaryDrift: boolean;
-  definitionDrift: boolean;
-  infraDrift: boolean;
-  /// Project lifecycle status: registered | activating | active |
-  /// deactivating | inactive. Drives action-bar primary slot
-  /// ("Activate" vs "Activating + Cancel" vs "Deactivate" vs
-  /// "Cancel running / Resume" while deactivating).
+  /// The aggregate status over the program's shared activations.
   // SYNC: projectStatus <-> crates/weft-core/src/projects.rs ProjectStatus
   projectStatus: LifecycleStatus | 'unknown';
-  /// The transition axis. 'building'/'cancelling_build' render
-  /// the unified transitional pattern (the launching button shows
-  /// "Building... (cancel)") and gate every other verb; 'resyncing'
-  /// leaves the triggers' own state on show, with what `availableActions`
-  /// still offers.
+  /// The transition axis. 'building'/'cancelling_build' show
+  /// "Building... (cancel)" on the bottom bar and gate every other verb;
+  /// 'resyncing' leaves only what `availableActions` still offers.
   transition: ProjectTransition;
   /// Live infra rows exist whose node the current source no longer
   /// declares (the user deleted the node while it was deployed).
-  /// Never gates run/activate; keeps the infra controls visible so
-  /// the user never loses track of live (billed) infra.
   orphanedInfra: boolean;
-  /// User-facing lifecycle label derived from accepting/visible/
-  /// deadline. Possible values: "registered" | "active" |
-  /// "deactivating" | "wipe" | "hibernate" | "park". Action bar
-  /// renders this verbatim under the project name.
-  mode: string;
-  /// Unix-second deadline after which fires flip from parked to
-  /// refused. Only set during hibernate's grace window.
-  firesDeadlineUnix?: number;
-  /// Count of running, non-suspended runs. Drives the
-  /// deactivating-state UI: shows "draining N runs...".
-  runningCount: number;
-  /// The program's own triggers that are off while the project is
-  /// active (an infra stop took down the ones reading it): what the
-  /// bar's second button turns back on, by name.
-  triggersOff: string[];
-  /// Infra rollup.
   infraRollup: InfraRollup;
   /// An infra operation is in flight that the rollup cannot see yet.
-  /// The dispatcher offers only `infra_cancel` in this window, so a
-  /// client deciding from the rollup alone would offer a button that
-  /// can only fail.
+  /// The dispatcher offers only `infra_cancel` in this window.
   infraBusy: boolean;
-  /// Per-placement infra status. Used by graph decorations (badges
-  /// under each infra node), independent of the rollup. One entry per
+  /// Per-placement infra status, the shared copies. One entry per
   /// PLACE: a file included twice provisions its infra twice.
   infraNodes: InfraPlacementStatus[];
-  /// Counts of preserved state, for the reactivate-time dialog.
-  preservation: {
-    /// Resume signals with parked_payload set (queued submissions).
-    parked: number;
-    /// Resume signals registered but with no parked submission yet.
-    suspended: number;
-  };
+  /// Every instance's copy of a per-instance infra node.
+  instanceInfra: InstanceInfraEntry[];
+  /// Every trigger place of the program, each with its state per owner.
+  triggers: TriggerEntry[];
+  /// Every instance weft holds anything for: the instance picker's list.
+  instances: InstanceHoldings[];
 }
 
-/// Every action-bar verb. Mirrors the dispatcher's
-/// `compute_available_actions` output union AND the CLI's
-/// `ActionVerb` enum (snake_case). Some verbs come from the
-/// dispatcher's `/status` (reactivate, resume_active) and some
-/// from the CLI's progress stream (build, rm); the bar consumes
-/// both, so the type is the superset.
+/// Every verb the editor shows working. Mirrors the dispatcher's
+/// `compute_available_actions` output union AND the CLI's `ActionVerb`
+/// enum (snake_case). Some verbs come only from the CLI's progress
+/// stream (bake, build, rm); the editor consumes both, so the type is
+/// the superset.
 // SYNC: ActionVerb <-> crates/weft-dispatcher/src/api/project.rs compute_available_actions, crates/weft-cli/src/progress.rs ActionVerb
 export type ActionVerb =
   | 'run'
@@ -1858,10 +2005,7 @@ export type ActionVerb =
   | 'bake'
   | 'cancel_activate'
   | 'cancel_build'
-  | 'reactivate'
   | 'deactivate'
-  | 'cancel_running'
-  | 'resume_active'
   | 'resync'
   | 'build'
   | 'rm'
@@ -1869,9 +2013,23 @@ export type ActionVerb =
   | 'infra_stop'
   | 'infra_terminate'
   | 'infra_upgrade'
-  | 'infra_cancel'
-  | 'infra_node_stop'
-  | 'infra_node_terminate';
+  | 'infra_cancel';
+
+/// A lifecycle verb the contextual bar sends for the selected nodes: the
+/// triggers or infra places it names (never empty: acting on everything
+/// is selecting everything), whose (`instances` absent is the shared
+/// ones), and the answers the options gave. The host turns it into the
+/// CLI's flags (`lifecycleCommand`).
+export type LifecycleAction =
+  | { verb: 'activate'; triggers: string[]; instances?: InstanceTarget; held?: ReleaseHeld }
+  | { verb: 'deactivate' | 'resync'; triggers: string[]; instances?: InstanceTarget; takeDown: TakeDownChoice }
+  | { verb: 'infra_start'; infra: string[]; instances?: InstanceTarget }
+  | {
+      verb: 'infra_stop' | 'infra_terminate' | 'infra_upgrade';
+      infra: string[];
+      instances?: InstanceTarget;
+      takeDown: TakeDownChoice;
+    };
 
 /// CLI progress phase. Closed set so the reducer's match is
 /// exhaustive at the type level.
@@ -1933,17 +2091,15 @@ export interface CliEvent {
 /// Action-bar state. Three orthogonal concerns:
 ///
 ///   1. `backend`: at-rest facts from `weft status --json`. Always
-///      present (defaults until the first fetch lands). Sections
-///      that reflect backend state (infra rollup, trigger lifecycle)
-///      read from here regardless of what the user is doing.
+///      present (defaults until the first fetch lands): the build
+///      transition, the infra rollup, the verbs weft takes now.
 ///
 ///   2. `overlay`: what user-action the bar is currently locked
 ///      into. `idle` when waiting for input, `cli_running` while a
 ///      CLI verb is in flight, `run_running` when the user is
 ///      following a live run, `pending` while an HTTP verb
-///      (Stop) awaits backend confirmation. Exactly one slot owns
-///      the spinner per overlay; sibling slots stay readable but
-///      may disable their actions to avoid conflicts.
+///      (Stop) awaits backend confirmation. While a verb is in flight
+///      the contextual bar's actions wait for it.
 ///
 ///   3. `error`: sticky banner shown above the bar. Independent of
 ///      both above. Cleared by user dismiss or by the next
@@ -1959,10 +2115,10 @@ export interface CliEvent {
 ///   - user clicks Stop         -> overlay = pending, until SSE confirms
 ///
 ///   4. `infraSetup`: an infra setup is running, whoever started it
-///      (this bar, a terminal, an assistant). The infra slot shows
-///      "Starting infra..." for it, and it is never a run the middle
-///      slot offers to stop. An activation needs no such flag: the
-///      project's own `activating` status already says it.
+///      (this editor, a terminal, an assistant). The bottom bar shows
+///      "Starting infra..." for it, and it is never a run it offers to
+///      stop. A trigger setup needs no such flag: the trigger's own
+///      `turning_on` state already says it.
 export type ActionBarState = {
   backend: BackendSnapshot;
   overlay: ActionBarOverlay;
@@ -2067,30 +2223,14 @@ export type BackendSnapshot = {
   /// to blank during overlays so disabled-state derivation works.
   available: ActionVerb[];
   /// Project lifecycle status.
-  status:
-    | 'registered'
-    | 'activating'
-    | 'active'
-    | 'deactivating'
-    | 'inactive'
-    | 'unknown';
+  status: LifecycleStatus | 'unknown';
   /// The build-transition axis (see `ActionAvailability.transition`).
   transition: ProjectTransition;
   /// Live orphaned infra exists (see `ActionAvailability.orphanedInfra`).
   orphanedInfra: boolean;
-  /// Mode label: "active" | "wipe" | "hibernate" | "park" |
-  /// "deactivating" | "registered". Rendered as a chip and used
-  /// by the trigger slot to pick the Reactivate / Activate variant.
-  mode: string;
   infraRollup: InfraRollup;
   /// See `ActionAvailability.infraBusy`.
   infraBusy: boolean;
-  /// Drain progress when status='deactivating'.
-  runningCount: number;
-  /// See `ActionAvailability.triggersOff`.
-  triggersOff: string[];
-  /// Hibernate-grace deadline, when present.
-  firesDeadlineUnix?: number;
 };
 
 /// One infra PLACEMENT's status, as `weft status` reports it.
@@ -2121,6 +2261,12 @@ export interface InfraPlacementStatus {
   /// While a start, stop or terminate of the copy is under way: since
   /// when, and what it waits on.
   progress?: ChangeProgress;
+  /// Its copy was applied from other infra than the source holds now:
+  /// `weft infra upgrade --infra <node>` brings it up to date.
+  behind?: boolean;
+  /// The triggers whose cut contains it (each instance's too, for a
+  /// shared one), by owner: what taking it down takes down with it.
+  takesDown?: OwnerTriggers[];
 }
 
 /// How far a start, stop or terminate of an infra copy got: since when
@@ -2157,12 +2303,6 @@ export type ActionBarOverlay =
   | { kind: 'run_running'; runId: string }
   | { kind: 'pending'; verb: ActionVerb; message: string };
 
-/// A verb whose trigger-deactivation choice the dispatcher may ask for.
-/// Only the dispatcher knows whether any trigger is on (the program's or
-/// an instance's), so the webview sends these without a choice and opens
-/// its picker when the host answers `needsTriggerChoice`.
-export type TriggerChoiceIntent = 'resync' | 'infraStop' | 'infraTerminate' | 'infraUpgrade';
-
 /// The install the graph shows the project on. The local install shows
 /// the files on disk, editable. Any other shows the program that install
 /// holds, read-only except its connections, and every read, run and verb
@@ -2189,11 +2329,6 @@ export interface InstallView {
 export const LOCAL_INSTALL = 'local';
 
 export type HostMessage =
-  /// The verb the webview sent without a trigger-deactivation choice was
-  /// refused because triggers are on: open the picker for `intent` and
-  /// send the verb again with the chosen spec.
-  // SYNC: needsTriggerChoice <-> crates/weft-cli/src/progress.rs error_detail
-  | { kind: 'needsTriggerChoice'; intent: TriggerChoiceIntent }
   | { kind: 'parseResult'; response: ParseResponse; source: string; layoutCode: string; freshMount?: boolean }
   | { kind: 'parseError'; error: string }
   /// Reply to `applyEdits` / `applyTextEdit`. Success carries the inverse text
@@ -2276,6 +2411,9 @@ export type HostMessage =
   | { kind: 'runCleared' }
   /// The answer to a `resolveSpec` request.
   | { kind: 'specResolved'; requestId: number; result: ResolveSpecResponse }
+  /// Reply to `checkRun`: the walk's refusal for those targets, or
+  /// `null` when it resolves and Run can go.
+  | { kind: 'runChecked'; requestId: number; refusal: string | null }
   /// The project's `examples/*.json`, for the Run menu.
   | { kind: 'specsListed'; specs: RunSpec[] }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
@@ -2361,11 +2499,10 @@ export type HostMessage =
   /// either status fetches (idle/run_running) or live CLI
   /// events (cli_running/error/complete).
   | { kind: 'actionBarState'; state: ActionBarState }
-  /// Latest `weft status --json` snapshot. Drives the action bar's
-  /// drift indicators (Resync/Upgrade lights) and the graph's
-  /// per-node infra badges. Stays current across cli_running so
-  /// the bar can show "Resync available" while a different verb
-  /// is in flight without flickering.
+  /// Latest `weft status --json` snapshot. Drives the badges on the
+  /// trigger and infra nodes and what the contextual bar offers. Stays
+  /// current across cli_running so the badges do not flicker while a
+  /// verb is in flight.
   | { kind: 'statusSnapshot'; snapshot: ActionAvailability }
   /// Reply to `storageCall`, correlated by requestId. `result` is the
   /// dispatcher route's JSON response on success; `error` is the failure
@@ -2383,11 +2520,12 @@ export type HostMessage =
   /// `assets/<name>` for stored bytes). Empty means the user cancelled;
   /// a single-file field takes the first. `error` on failure.
   | { kind: 'assetPicked'; requestId: number; paths?: string[]; error?: string }
-  /// Reply to `listRuntimeFiles`: the project's STORED runtime files (its
-  /// `project/` + `asset/` storage scopes), keys tenant-less (the short
-  /// address a picked ref writes into source). `error` is the failure
-  /// reason when the listing itself failed; an empty `files` with no
-  /// `error` genuinely means the project has no stored files.
+  /// Reply to `listRuntimeFiles`: the STORED runtime files this project's
+  /// runs can read (its own `project/` and `instance/` files, and the
+  /// tenant's `shared/` ones), keys tenant-less (the short address a
+  /// picked ref writes into source). `error` is the failure reason when
+  /// the listing itself failed; an empty `files` with no `error`
+  /// genuinely means there is no such file.
   | {
       kind: 'runtimeFiles';
       requestId: number;
@@ -2469,9 +2607,13 @@ export type WebviewMessage =
   /// file's graph in the panel.
   | { kind: 'navigateBack' }
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
-  /// Run the project. Any node can be a target: include it and its
-  /// upstream dependencies. Absent or empty targets select the whole graph.
-  | { kind: 'runProject'; targets?: string[] }
+  /// Run the selected nodes as targets (each spelled as its place): the
+  /// walk takes them and what they need. Never empty: the graph has no
+  /// gesture that runs the whole program, the CLI keeps that one.
+  | { kind: 'runProject'; targets: [string, ...string[]] }
+  /// Ask whether a run of these targets would start, without starting
+  /// it (`weft run --check`). Answered by `runChecked`.
+  | { kind: 'checkRun'; requestId: number; targets: [string, ...string[]] }
   /// Resolve a spec against the current program through the parse server
   /// (the dispatcher's own resolver), so the dialog shows every missing
   /// input before the run starts. Answered by `specResolved`.
@@ -2489,66 +2631,21 @@ export type WebviewMessage =
   | { kind: 'listSpecs' }
   /// Restore the version of a run or a version id (`weft branch <ref>`).
   | { kind: 'branchTo'; reference: string }
-  | { kind: 'infraStart' }
-  /// Project-level infra Stop / Terminate. `deactivation` is set once
-  /// the shared picker (in the webview) chose how triggers come down,
-  /// which it opens only after the host answered `needsTriggerChoice`
-  /// to a send without it; the host forwards it verbatim.
-  | { kind: 'infraStop'; deactivation?: DeactivationSpec }
-  | { kind: 'infraTerminate'; deactivation?: DeactivationSpec }
+  /// A lifecycle verb on the selected triggers or infra, from the
+  /// contextual bar. The host turns it into the CLI's verb and flags.
+  | { kind: 'lifecycle'; action: LifecycleAction }
   /// Cancel in-flight infra work (provisioning / stopping /
   /// terminating): HALT, per-node partial state stays visible.
   | { kind: 'infraCancel' }
   /// Cancel the in-flight build (transition=building).
   | { kind: 'cancelBuild' }
-  /// Per-node Stop (graph menu, partial-state recovery). `node` is the
-  /// node's PLACEMENT as a person spells it (`one.db`), the node under
-  /// the calls the view walked into: what `weft infra node-stop` takes.
-  | { kind: 'infraNodeStop'; node: string }
-  /// Per-node Terminate (graph menu, partial-state recovery); see above.
-  | { kind: 'infraNodeTerminate'; node: string }
-  | { kind: 'activateProject' }
-  /// Deactivate with the shared picker's spec (mode + runningPolicy +
-  /// grace). The picker lives in the SHARED webview so both hosts get
-  /// the exact same UX; hosts just forward the spec.
-  | { kind: 'deactivateProject'; spec: DeactivationSpec }
-  /// User clicked Reactivate (project is Inactive WITH preserved
-  /// state). Host opens the reactivate-choice dialog (3-option
-  /// VS Code QuickPick) and POSTs `/activate` with the chosen
-  /// `reactivateChoice`.
-  | { kind: 'reactivateProject' }
-  /// User clicked Cancel Running while the project is in the
-  /// `deactivating` state. Host shells out to `weft cancel-running`,
-  /// which POSTs the dispatcher's dedicated `/cancel-running`
-  /// endpoint. That cancels every running, non-suspended run;
-  /// the lifecycle target the original deactivate wrote stays in
-  /// place; the drain-watcher CASes status to inactive once the
-  /// running set empties.
-  | { kind: 'cancelRunning' }
-  /// User clicked Cancel during status=Activating. Host shells out
-  /// to `weft cancel-activate`, which POSTs the dispatcher's
-  /// `/cancel-activate` endpoint. That cancels the TriggerSetup
-  /// run, wipes every signal row registered so far, CAS-flips
-  /// status Activating → Inactive.
+  /// Cancel a trigger setup under way (`weft cancel-activate`): the
+  /// triggers it has not turned on yet stay off.
   | { kind: 'cancelActivate' }
-  /// User clicked Resume Active while in `deactivating`. Host POSTs
-  /// `/activate` (no choice prompt: rolling back to live with no
-  /// drain). The dispatcher's activate handler resets accepting/
-  /// visible to active values and runs the drain pass against
-  /// anything that parked during the transient.
-  | { kind: 'resumeActive' }
-  /// User clicked Resync. Deactivate + reactivate against the current
-  /// source. `spec` is the shared picker's choice of how triggers come
-  /// down, exactly like Deactivate.
-  | { kind: 'resyncProject'; spec: DeactivationSpec }
-  /// User clicked Resync on a resync that stopped with triggers down: take
-  /// that one up again where it stopped (`weft resync --resume`), with the
-  /// choice and the build it began with. Never starts a new resync.
+  /// Take up again a resync that stopped with triggers down, where it
+  /// stopped (`weft resync --resume`), with the choice and the build it
+  /// began with. Never starts a new resync.
   | { kind: 'resumeResync' }
-  /// User clicked Upgrade Infra. atomic infra stop + image
-  /// rebuild + start. `deactivation` follows the same shared-picker
-  /// contract as infraStop.
-  | { kind: 'infraUpgrade'; deactivation?: DeactivationSpec }
   /// User clicked the Refresh Status button on the graph header.
   /// Forces a `weft status --json` recheck without waiting for
   /// the file-change debounce. Useful after editing source
@@ -2591,18 +2688,18 @@ export type WebviewMessage =
   /// to read them.
   | { kind: 'dismissError' }
   /// User clicked Download on a stored-file value in the replay
-  /// inspector. The host runs the brokered handshake (POST
-  /// `/storage/files/download`; the dispatcher authenticates + asks
-  /// the tenant's storage box to mint a short-lived capability) and
-  /// opens the returned box URL externally: the BYTES stream
-  /// browser<->box directly, never through the dispatcher. A 404
+  /// inspector. The host POSTs `/storage/files/download` (the
+  /// dispatcher authenticates and answers a short-lived presigned link
+  /// straight to the object store) and opens that link in the browser,
+  /// which saves the file under its name: the store answers it as an
+  /// attachment, and the bytes never pass through the dispatcher. A 404
   /// surfaces as "expired or deleted" (the metadata in the value
   /// stays readable; the bytes are gone).
   | { kind: 'downloadStoredFile'; key: string; filename?: string }
   /// Drive one storage-plane verb through the host: the host POSTs `body`
   /// as JSON to the dispatcher's `/storage/<path>` route and replies with a
   /// correlated `storageResult`. This is the ONE channel for storage control
-  /// calls (the inline preview's download handshake); bytes never ride it.
+  /// calls (the inline preview's download link); bytes never ride it.
   | { kind: 'storageCall'; requestId: number; path: string; body: unknown }
   /// Drive one access-store verb through the host: the host sends
   /// `method` to the dispatcher's `/access/<path>` route (stamping the
@@ -2643,26 +2740,46 @@ export type WebviewMessage =
       /// Files dropped onto the field, in drop order, as base64 bytes.
       dropped?: { name: string; bytesBase64: string }[];
     }
-  /// The file-picker modal asks for the project's STORED runtime files
-  /// (reply: `runtimeFiles`): what the storage plane holds for this project,
-  /// listed through the same door `weft files` uses. Picking one writes
-  /// `@asset("<scope-key>", <Type>)` into config.
+  /// The file-picker modal asks for the STORED runtime files this project
+  /// can use (reply: `runtimeFiles`), listed through the same door
+  /// `weft files` uses. Picking one writes `@asset("<scope-key>", <Type>)`
+  /// into config.
   | { kind: 'listRuntimeFiles'; requestId: number };
 
 // SYNC: FileValueWire <-> crates/weft-core/src/storage/mod.rs StoredFile
 //       (`version` is backend-only: the editor never reads it)
 /// The payload INSIDE a concrete file marker: self-describing metadata
 /// plus exactly ONE handle saying where the bytes live. A bucket-backed
-/// file carries a `key` (bytes fetched via the authenticated handshake
-/// above); a file pointing at an external resource carries a `url`
-/// (rendered/fetched directly). `data` (inline base64) is deliberately
-/// NOT a handle here: the read paths don't resolve it, so it falls
-/// through to the raw-JSON rendering instead of a broken preview.
+/// file carries a `key` (its bytes load from the presigned store link
+/// `/storage/files/download` answers), and may carry `linkSecs`: how
+/// long, in seconds, a link handed out for this value lives, when
+/// whoever made the value chose. A file pointing at an external
+/// resource carries a `url` (rendered/fetched directly). `data` (inline
+/// base64) is deliberately NOT a handle here: the read paths don't
+/// resolve it, so it falls through to the raw-JSON rendering instead of
+/// a broken preview.
 export type FileValueWire = {
   mimeType: string;
   sizeBytes: number;
   filename: string;
-} & ({ key: string; url?: undefined } | { url: string; key?: undefined });
+} & (
+  | { key: string; linkSecs?: number; url?: undefined }
+  | { url: string; key?: undefined; linkSecs?: undefined }
+);
+
+// SYNC: StoredFileDownload <-> crates/weft-core/src/storage/mod.rs PresignResult
+/// What `/storage/files/download` answers: a link to a stored file's
+/// bytes (the store answers it as an attachment under `filename`), the
+/// file's size, the version it was when the link was made, and whether
+/// the open internet opens the link (`false`: only this install's own
+/// network does).
+export type StoredFileDownload = {
+  url: string;
+  filename: string;
+  sizeBytes: number;
+  version: number;
+  public: boolean;
+};
 
 // SYNC: FileEditWire <-> crates/weft-core/src/storage/mod.rs FileEdit
 /// One change a firing made to a stored file: which file, the version it
@@ -2697,8 +2814,10 @@ export const STORED_FILE_MARKER_TYPES: Map<string, WeftPrimitive> = new Map([
 /// external resource; `key` wins when both are somehow present, the
 /// bucket copy is authoritative), or null for anything that is not a
 /// resolvable file value (including data-backed markers, which no read
-/// path resolves). Every consumer (inspector card, node preview)
-/// routes through here so the shape is validated identically.
+/// path resolves, and a key-backed one whose `linkSecs` is not a whole
+/// number of seconds, which the runtime refuses too). Every consumer
+/// (inspector card, node preview) routes through here so the shape is
+/// validated identically.
 export function parseFileValue(value: unknown): FileValueWire | null {
   if (typeof value !== 'object' || value === null) return null;
   const obj = value as Record<string, unknown>;
@@ -2713,7 +2832,11 @@ export function parseFileValue(value: unknown): FileValueWire | null {
     sizeBytes: typeof p.sizeBytes === 'number' ? p.sizeBytes : 0,
     filename: typeof p.filename === 'string' ? p.filename : '',
   };
-  if (typeof p.key === 'string' && p.key !== '') return { key: p.key, ...meta };
+  if (typeof p.key === 'string' && p.key !== '') {
+    if (p.linkSecs === undefined || p.linkSecs === null) return { key: p.key, ...meta };
+    if (typeof p.linkSecs !== 'number' || !Number.isInteger(p.linkSecs) || p.linkSecs < 0) return null;
+    return { key: p.key, linkSecs: p.linkSecs, ...meta };
+  }
   if (typeof p.url === 'string' && p.url !== '') return { url: p.url, ...meta };
   return null;
 }

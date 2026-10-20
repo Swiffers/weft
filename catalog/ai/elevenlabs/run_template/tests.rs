@@ -100,7 +100,7 @@ fn values() -> WeftResult<()> {
     // asset named by the file's key.
     let mut reference = |file: FileHandle| -> WeftResult<Value> {
         match file {
-            FileHandle::Key(key) => Ok(json!({ "type": "asset", "asset_id": key })),
+            FileHandle::Key { key, .. } => Ok(json!({ "type": "asset", "asset_id": key })),
             other => panic!("a key-backed file: {other:?}"),
         }
     };

@@ -119,6 +119,7 @@ impl std::str::FromStr for InstanceId {
 /// infra copy, a trigger activation, a connection, a pick, a stored file),
 /// so every table spells it the same way: a nullable `instance_id` column,
 /// NULL for [`Owner::Shared`].
+// SYNC: Owner <-> packages/weft-graph/src/protocol.ts Owner
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", content = "instance", rename_all = "snake_case")]
 pub enum Owner {
@@ -212,6 +213,149 @@ impl Copies {
             (Some(m), false) => Ok(Copies::Instance(InstanceId::new(m)?)),
             (None, true) => Ok(Copies::Every),
             (Some(_), true) => Err("a command for every copy names no instance".into()),
+        }
+    }
+}
+
+/// Whose triggers, infra copies and runs a lifecycle command acts on: the
+/// program's shared ones (no flag), the instances named (`--instance <id>`,
+/// repeatable), every instance (`--all-instances`), or the shared ones and
+/// every instance (`--all`). No flag never reaches an instance's own
+/// things, with one exception the command carries out itself: shared infra
+/// going away takes down every trigger whose cut contains it, an
+/// instance's included, since they cannot run without it.
+///
+/// On the wire, a body's `instances` field: absent for the shared ones, a
+/// list of ids, `"all_instances"`, or `"all"`.
+// SYNC: InstanceTarget <-> packages/weft-graph/src/protocol.ts InstanceTarget
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum InstanceTarget {
+    #[default]
+    Shared,
+    /// These instances, each once, never empty.
+    Named(Vec<InstanceId>),
+    /// Every instance weft holds anything for.
+    EveryInstance,
+    /// The shared ones and every instance weft holds anything for.
+    Everything,
+}
+
+impl InstanceTarget {
+    /// What `--instance` (repeatable), `--all-instances` and `--all` say
+    /// together: more than one of them is refused, naming them.
+    pub fn from_flags(named: Vec<InstanceId>, every_instance: bool, everything: bool) -> Result<Self, String> {
+        match (named.is_empty(), every_instance, everything) {
+            (true, false, false) => Ok(Self::Shared),
+            (true, true, false) => Ok(Self::EveryInstance),
+            (true, false, true) => Ok(Self::Everything),
+            (false, false, false) => Ok(Self::named(named)),
+            _ => Err("--instance names some instances, --all-instances every instance, and --all the program's own and every \
+                      instance; pass one of them"
+                .into()),
+        }
+    }
+
+    /// These instances, each once, in id order; none named is the shared
+    /// ones.
+    pub fn named(mut ids: Vec<InstanceId>) -> Self {
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            Self::Shared
+        } else {
+            Self::Named(ids)
+        }
+    }
+
+    /// One instance, or the shared ones for `None`: what a program's call
+    /// on one owner names.
+    pub fn of(instance: Option<InstanceId>) -> Self {
+        Self::named(instance.into_iter().collect())
+    }
+
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared)
+    }
+
+    /// Whether it reaches some instance it does not name: every one weft
+    /// holds anything for, so `known` decides which.
+    pub fn every_instance(&self) -> bool {
+        matches!(self, Self::EveryInstance | Self::Everything)
+    }
+
+    /// The owners this names, each once, the program first: every
+    /// instance among `known` (the ones weft holds anything for) for
+    /// [`Self::EveryInstance`] and [`Self::Everything`].
+    pub fn owners<'a>(&self, known: impl IntoIterator<Item = &'a InstanceId>) -> Vec<Owner> {
+        let every = || {
+            let every: std::collections::BTreeSet<&InstanceId> = known.into_iter().collect();
+            every.into_iter().cloned().map(Owner::Instance).collect::<Vec<_>>()
+        };
+        match self {
+            Self::Shared => vec![Owner::Shared],
+            Self::Named(ids) => ids.iter().cloned().map(Owner::Instance).collect(),
+            Self::EveryInstance => every(),
+            Self::Everything => std::iter::once(Owner::Shared).chain(every()).collect(),
+        }
+    }
+
+    /// Whether `owner` is among what this names.
+    pub fn admits(&self, owner: &Owner) -> bool {
+        match (self, owner) {
+            (Self::Shared | Self::Everything, Owner::Shared) => true,
+            (Self::Named(ids), Owner::Instance(id)) => ids.contains(id),
+            (Self::EveryInstance | Self::Everything, Owner::Instance(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The flags that name this, for a message: `` (none), `--instance a
+    /// --instance b`, `--all-instances`, `--all`.
+    pub fn flags(&self) -> String {
+        match self {
+            Self::Shared => String::new(),
+            Self::Named(ids) => ids.iter().map(|id| format!("--instance {id}")).collect::<Vec<_>>().join(" "),
+            Self::EveryInstance => "--all-instances".into(),
+            Self::Everything => "--all".into(),
+        }
+    }
+}
+
+/// The words on the wire.
+// SYNC: the words <-> packages/weft-graph/src/protocol.ts InstanceTarget
+const EVERY_INSTANCE: &str = "all_instances";
+const EVERYTHING: &str = "all";
+
+impl Serialize for InstanceTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Shared => serializer.serialize_none(),
+            Self::Named(ids) => ids.serialize(serializer),
+            Self::EveryInstance => serializer.serialize_str(EVERY_INSTANCE),
+            Self::Everything => serializer.serialize_str(EVERYTHING),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InstanceTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Word(String),
+            Named(Vec<InstanceId>),
+        }
+        match Option::<Wire>::deserialize(deserializer)? {
+            None => Ok(Self::Shared),
+            Some(Wire::Word(word)) if word == EVERY_INSTANCE => Ok(Self::EveryInstance),
+            Some(Wire::Word(word)) if word == EVERYTHING => Ok(Self::Everything),
+            Some(Wire::Word(word)) => Err(serde::de::Error::custom(format!(
+                "instances: '{word}' is neither \"{EVERY_INSTANCE}\", \"{EVERYTHING}\" nor a list of instance ids"
+            ))),
+            Some(Wire::Named(ids)) if ids.is_empty() => {
+                Err(serde::de::Error::custom("instances: an empty list names no instance; leave the field out for the shared ones"))
+            }
+            Some(Wire::Named(ids)) => Ok(Self::named(ids)),
         }
     }
 }
@@ -729,6 +873,56 @@ mod tests {
         assert!(Copies::Shared.admits(None) && !Copies::Shared.admits(Some(&m)));
         assert!(Copies::Instance(m.clone()).admits(Some(&m)) && !Copies::Instance(m.clone()).admits(None));
         assert!(Copies::Every.admits(None) && Copies::Every.admits(Some(&m)));
+    }
+
+    /// The `instances` field: absent for the shared ones, a list,
+    /// "all_instances" or "all".
+    #[test]
+    fn an_instance_target_is_absent_a_list_or_all_on_the_wire() {
+        #[derive(Serialize, Deserialize)]
+        struct Body {
+            #[serde(default, skip_serializing_if = "InstanceTarget::is_shared")]
+            instances: InstanceTarget,
+        }
+        let id = |s: &str| InstanceId::new(s).unwrap();
+        let wire = |target: InstanceTarget| serde_json::to_value(Body { instances: target }).unwrap();
+        assert_eq!(wire(InstanceTarget::Shared), serde_json::json!({}));
+        assert_eq!(wire(InstanceTarget::EveryInstance), serde_json::json!({ "instances": "all_instances" }));
+        assert_eq!(wire(InstanceTarget::Everything), serde_json::json!({ "instances": "all" }));
+        let named = InstanceTarget::named(vec![id("b"), id("a"), id("b")]);
+        assert_eq!(wire(named.clone()), serde_json::json!({ "instances": ["a", "b"] }));
+        let read = |json: serde_json::Value| serde_json::from_value::<Body>(json).map(|b| b.instances);
+        assert_eq!(read(serde_json::json!({})).unwrap(), InstanceTarget::Shared);
+        assert_eq!(read(serde_json::json!({ "instances": null })).unwrap(), InstanceTarget::Shared);
+        assert_eq!(read(serde_json::json!({ "instances": "all_instances" })).unwrap(), InstanceTarget::EveryInstance);
+        assert_eq!(read(serde_json::json!({ "instances": "all" })).unwrap(), InstanceTarget::Everything);
+        assert_eq!(read(serde_json::json!({ "instances": ["b", "a"] })).unwrap(), named);
+        assert!(read(serde_json::json!({ "instances": [] })).is_err(), "an empty list names nothing");
+        assert!(read(serde_json::json!({ "instances": "every" })).is_err());
+        assert!(read(serde_json::json!({ "instances": ["../x"] })).is_err(), "each id is checked");
+    }
+
+    /// No flag is the shared ones; two flags at once are refused; `--all`
+    /// is the shared ones and every instance.
+    #[test]
+    fn the_instance_flags_name_one_target() {
+        let a = InstanceId::new("a").unwrap();
+        assert_eq!(InstanceTarget::from_flags(vec![], false, false).unwrap(), InstanceTarget::Shared);
+        assert_eq!(InstanceTarget::from_flags(vec![], true, false).unwrap(), InstanceTarget::EveryInstance);
+        assert_eq!(InstanceTarget::from_flags(vec![], false, true).unwrap(), InstanceTarget::Everything);
+        assert_eq!(InstanceTarget::from_flags(vec![a.clone()], false, false).unwrap(), InstanceTarget::Named(vec![a.clone()]));
+        assert!(InstanceTarget::from_flags(vec![a.clone()], true, false).is_err());
+        assert!(InstanceTarget::from_flags(vec![], true, true).is_err());
+        assert!(InstanceTarget::from_flags(vec![a.clone()], false, true).is_err());
+        let known = [InstanceId::new("b").unwrap(), a.clone()];
+        let every = vec![Owner::Instance(a.clone()), Owner::Instance(known[0].clone())];
+        assert_eq!(InstanceTarget::EveryInstance.owners(&known), every);
+        assert_eq!(InstanceTarget::Everything.owners(&known), [vec![Owner::Shared], every].concat());
+        assert_eq!(InstanceTarget::Shared.owners(&known), vec![Owner::Shared]);
+        assert!(InstanceTarget::EveryInstance.admits(&Owner::Instance(a.clone())) && !InstanceTarget::EveryInstance.admits(&Owner::Shared));
+        assert!(InstanceTarget::Everything.admits(&Owner::Instance(a.clone())) && InstanceTarget::Everything.admits(&Owner::Shared));
+        assert_eq!(InstanceTarget::Everything.flags(), "--all");
+        assert_eq!(InstanceTarget::named(vec![a]).flags(), "--instance a");
     }
 
     #[test]

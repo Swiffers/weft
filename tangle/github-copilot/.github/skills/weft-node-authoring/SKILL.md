@@ -343,9 +343,10 @@ answer is not JSON, `require_ok_flag` for a service that answers 200 and says
 `ok: false` in the body, `cursor_paged` with a `CursorPaging` (its
 `past_cap_hint` tells the user what to narrow when the list runs past the page
 cap) for a cursor-paged list, and `required_str` for a field you cannot do
-without. To hand a stored file to a provider, `ctx.storage(scope).external_url(&file)`
-gives its public link or a `data:` URL (`external_file` adds the mime type
-and filename); never write that fallback yourself. To emit a struct, use
+without. To hand a stored file to a provider,
+`ctx.storage(scope).external_file(&file)` gives its link when the open
+internet can open it, else a `data:` URL of its bytes, with its mime type and
+filename; never write that fallback yourself. To emit a struct, use
 `NodeOutput::new().set_serialized(port, &value)?`.
 
 **Waiting on a provider's job** (a render, a dub, a crawl) is
@@ -847,9 +848,8 @@ does not grow through use; it is still paged or capped like any other.
 
 **A file input**: the value on an `Image` / `Audio` / `Video` / `Blob` port
 is the stored-file marker (`__weft_image__`, `__weft_video__`,
-`__weft_audio__` or `__weft_blob__`, the kind taken from the mime type), and inside the running node it also carries a
-`url` minted for this firing (an hour), so a body that only speaks URLs (a
-Python snippet, a provider's API) reads it straight off. A Rust node takes
+`__weft_audio__` or `__weft_blob__`, the kind taken from the mime type), and
+it carries no link. A Rust node takes
 the input as a `FileHandle` (`let file: FileHandle =
 ctx.inputs.get("file")?;`) and reads it with
 `ctx.storage(StorageScope::Run).get_bytes(&file).await?`, which hands
@@ -857,14 +857,19 @@ back `(meta, bytes)`: `meta.filename` and `meta.mime_type` are the file's
 details. If you want the details without the bytes,
 `StoredFile::from_value(&value)?` reads the value into `.key`, `.mime_type`,
 `.filename` and `.size_bytes`. Never read `mimeType` off the raw JSON: it sits
-one level down, inside the kind marker. The link never leaves
-the node: everything you emit, park, or memoize is stripped back to the
-stored form, and the journal never holds one. The marker never leaves weft
+one level down, inside the kind marker. When something needs a link, make one:
+`ctx.storage(scope).internal_link(&file)` for code inside the install (a
+script or a process your node runs), `external_link(&file)` for anything
+outside it. Both give a `FileLink { url, public }`, `public` saying whether
+the open internet opens it, and the link lives the value's `linkSecs` (15
+minutes unless `link_lifetime` on the storage handle or a `LinkOptions` node
+set another, at most seven days). A file value never holds a link, so nothing
+you emit, park or memoize carries one, and the journal never holds one. The marker never leaves weft
 either: what goes to a provider, a bridge, a form a browser renders, or a
 live item is the plain thing that consumer reads (a URL string, a `data:`
 URL, a plain `{ url, mimeType, filename }`), through
-`ctx.storage(scope).externalize` for a typed value or `public_link` /
-`presign` for one file. A marker wrapped around a link in an outbound
+`ctx.storage(scope).externalize` for a typed value or `external_link` /
+`external_file` for one file. A marker wrapped around a link in an outbound
 payload renders as nothing.
 
 **A bus**: a live channel one node opens and others read, for anything that

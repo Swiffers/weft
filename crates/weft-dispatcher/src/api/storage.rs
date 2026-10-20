@@ -4,8 +4,8 @@
 //! the `local` tenant by default, or the request's authenticated tenant), and the
 //! dispatcher PROXIES each verb to the broker's runtime-file admin surface as the
 //! control plane (the broker owns the bucket + metadata).
-//! The dispatcher never touches file bytes: a download returns a presigned bucket
-//! URL the client streams from directly.
+//! The dispatcher never touches file bytes: a download returns a presigned link
+//! the client streams from the store directly, any `Range` of it.
 //!
 //! Tenant walling: a caller only ever reaches its own tenant's files. The CLI
 //! sends a bare scope key (`<scope>/<owner>/<id>`); the dispatcher prefixes the
@@ -37,6 +37,16 @@ impl From<(StatusCode, String)> for ApiError {
     }
 }
 
+impl ApiError {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if self.completing {
@@ -56,11 +66,16 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// prefix/scope, denied, over quota, conflict) surfaces with ITS OWN status, not
 /// the blanket 500 `internal` would give: `check` tags these as `StorageNotFound` /
 /// `BrokerRejected` in the error chain. A 4xx the broker chose is a client-actionable
-/// error, so the CLI user should see it, not an opaque 500. Everything else (a real
-/// dispatcher/transport fault) is a 500.
+/// error, so the CLI user should see it, not an opaque 500. Storage out of reach
+/// is a 503 the caller asks again on, as a database out of reach is
+/// ([`crate::api::unavailable_or_internal`]). Everything else is a 500.
 pub(crate) fn storage_err(e: anyhow::Error) -> ApiError {
     if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() {
         return (StatusCode::NOT_FOUND, format!("{e:#}")).into();
+    }
+    if crate::storage::storage_unreachable(&e) {
+        tracing::warn!(target: "weft_dispatcher::storage", error = %format!("{e:#}"), "storage is out of reach");
+        return (StatusCode::SERVICE_UNAVAILABLE, "the install could not reach its storage right now; try again shortly".to_string()).into();
     }
     if let Some(rejected) = e.downcast_ref::<crate::storage::BrokerRejected>() {
         // Re-map the broker's own 4xx onto our axum StatusCode. Fall back to 500 if
@@ -108,25 +123,20 @@ pub async fn usage(
 }
 
 /// POST /storage/files/download: resolve the acting tenant, prefix the key, and
-/// mint a relay download link (with the file's name + size for the client).
-/// The answer is a `/public/files/{token}` URL, NOT a presigned bucket URL:
-/// the download handshake serves browsers
-/// and CLIs on the user's side of any port forward, tunnel, or proxy, and a
-/// presigned URL's signature covers the exact host the client must send, so
-/// one rewritten hop turns it into a bucket signature error. The token URL
-/// comes back on the address THIS caller used, so it rides the same base
-/// every other call they make already reaches.
+/// answer a link to the file straight from the store, for the caller's own
+/// machine (the CLI, the editor), with the file's name and size: a client
+/// asks it for any `Range`, so a download resumes and a video seeks.
 pub async fn download(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    headers: axum::http::HeaderMap,
     Json(req): Json<weft_core::storage::DownloadRequest>,
 ) -> Result<Json<weft_core::storage::PresignResult>, ApiError> {
     let tenant = caller.0;
     let key = ensure_tenant_key(&tenant, &req.key)?;
-    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let p = crate::storage::download_link(&state, &base, &key, req.ttl_secs).await.map_err(storage_err)?;
-    Ok(Json(p))
+    let link = crate::storage::download_link(&state, &key, req.ttl_secs, weft_core::storage::LinkReader::Person)
+        .await
+        .map_err(storage_err)?;
+    Ok(Json(link))
 }
 
 /// Prefix a CLI-supplied key with the caller's tenant if it isn't already, and
@@ -146,48 +156,6 @@ fn ensure_tenant_key(tenant: &TenantId, key: &str) -> Result<String, ApiError> {
     } else {
         Err(ApiError::from((StatusCode::FORBIDDEN, "key does not belong to the caller's tenant".into())))
     }
-}
-
-/// GET /public/files/{token}: the PUBLIC RELAY for a minted file link.
-/// A pure pass-through to the broker's `/v1/storage/admin/relay`
-/// (authenticated with the dispatcher's identity): the broker, the one
-/// service holding the bucket's credentials, resolves the token and
-/// streams the bytes; this route only carries them out the public door. The
-/// token IS the credential (unguessable, expiring); the broker's 404
-/// for missing and expired links passes through unchanged, and broker
-/// transport failures answer 502 with the detail logged.
-pub async fn public_file(
-    State(state): State<DispatcherState>,
-    Path(token): Path<String>,
-) -> Result<Response, ApiError> {
-    let bad_gateway = |detail: String| {
-        tracing::error!(target: "weft_dispatcher::storage", "public file relay: {detail}");
-        (StatusCode::BAD_GATEWAY, "file fetch failed".to_string())
-    };
-    let upstream = state
-        .broker
-        .request(reqwest::Method::GET, &format!("/v1/storage/admin/relay/{token}"))
-        .await
-        .map_err(|e| bad_gateway(format!("{e:#}")))?
-        .send()
-        .await
-        .map_err(|e| bad_gateway(e.to_string()))?;
-    let status = upstream.status();
-    if !status.is_success() {
-        // The broker's own answer (404 unknown/expired) keeps its
-        // status; only its body text is echoed, never internals.
-        let msg = upstream.text().await.unwrap_or_default();
-        return Err(ApiError::from((status, msg)));
-    }
-    let mut builder = Response::builder();
-    for header in ["content-type", "content-length", "content-disposition"] {
-        if let Some(v) = upstream.headers().get(header) {
-            builder = builder.header(header, v);
-        }
-    }
-    builder
-        .body(axum::body::Body::from_stream(upstream.bytes_stream()))
-        .map_err(internal)
 }
 
 // ---------- asset upload (the pre-build sync) ----------
@@ -410,7 +378,7 @@ mod tests {
     #[test]
     fn storage_err_maps_broker_statuses() {
         // A broker 404 surfaces as 404, a broker 4xx refusal keeps ITS status,
-        // and anything else (transport fault) is a 500. This is the branch that
+        // storage out of reach is a 503, and anything else is a 500. This is the branch that
         // decides what the CLI user sees; pin it.
         let nf = anyhow::Error::new(crate::storage::StorageNotFound)
             .context("File expired or was deleted. Upload it again and start a new run.");
@@ -424,6 +392,9 @@ mod tests {
         .context("x");
         assert_eq!(storage_err(rejected).status, StatusCode::FORBIDDEN);
         assert_eq!(storage_err(anyhow::anyhow!("boom")).status, StatusCode::INTERNAL_SERVER_ERROR);
+        // Storage out of reach is asked again on, as a database out of reach is.
+        let down = anyhow::Error::new(crate::storage::StorageUnavailable).context("broker storage wipe returned 503");
+        assert_eq!(storage_err(down).status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// The broker's "still completing" marker reaches the caller, so a

@@ -36,10 +36,10 @@ impl Node for FalAnimateImageNode {
         let storage = ctx.storage(StorageScope::Run);
         let mut payload = json!({
             "prompt": prompt,
-            "image_url": storage.external_url(&image).await?,
+            "image_url": storage.external_file(&image).await?.url,
         });
         if let Some(tail) = &tail {
-            payload["tail_image_url"] = json!(storage.external_url(tail).await?);
+            payload["tail_image_url"] = json!(storage.external_file(tail).await?.url);
         }
         merge_params(&mut payload, params.as_ref());
 

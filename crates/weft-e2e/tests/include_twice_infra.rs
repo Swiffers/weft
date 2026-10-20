@@ -72,9 +72,9 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
 
     // The per-node verbs take the place. A bare `svc` names nothing, and
     // the refusal spells the name that works.
-    let refused = project.weft_refused(&["infra", "node-stop", "svc"]).await?;
+    let refused = project.weft_refused(&["infra", "stop", "--infra", "svc"]).await?;
     anyhow::ensure!(refused.contains("site.svc"), "it names the spelling that works: {refused}");
-    project.weft(&["infra", "node-stop", "one.svc", "--force"]).await?;
+    project.weft(&["infra", "stop", "--infra", "one.svc", "--force"]).await?;
     poll_until(
         "one.svc to be stopped while two.svc keeps running",
         Duration::from_secs(120),

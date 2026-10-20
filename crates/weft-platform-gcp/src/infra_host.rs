@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use weft_core::infra::wire::{LogStream, LogsFrom};
 use weft_core::infra::{Container, EndpointTarget, Expose, Limits, NodeRef, ResolvedNode, ResolvedUnit, VolumeKind};
 use weft_platform_traits::config::GcpPlatform;
-use weft_platform_traits::unit_agent::{UnitAssignment, HOST_APPLY, HOST_LOGS, HOST_OBSERVE, HOST_RESTART};
+use weft_platform_traits::unit_agent::{UnitAssignment, HOST_APPLY, HOST_LOGS, HOST_OBSERVE};
 use weft_core::ports::UNIT_AGENT;
 use weft_platform_traits::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
 
@@ -711,14 +711,6 @@ impl InfraHost for ComputeInfraHost {
             }
         }
         self.until_off(node, unit).await
-    }
-
-    async fn restart_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
-        let machine = self
-            .machine(node, unit)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("unit '{unit}' of '{}' has no machine", node.node))?;
-        self.agent(&machine, reqwest::Method::POST, HOST_RESTART).await.map(|_| ())
     }
 
     async fn remove_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {

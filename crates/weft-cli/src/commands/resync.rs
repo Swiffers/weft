@@ -1,24 +1,28 @@
-//! `weft resync`. Deactivate-then-activate against a fresh worker
-//! image, with the USER'S trigger-deactivation choice (mode + running
-//! policy + drain cap; same picker as `weft deactivate`). Used after
-//! editing the trigger or fire subgraph. Plain, it brings every trigger
-//! that is on up to date, the program's and each instance's; the
-//! dispatcher picks whose from its activation rows and answers with the
-//! list. Refuses on the dispatcher side if the infra those triggers read
-//! isn't running. Only the triggers that are on come down and back up.
+//! `weft resync`. Builds, then brings every trigger that is on and behind
+//! the build onto it: each taken down as `--door`, `--held` and
+//! `--running` say (`weft_core::take_down`), its paused runs moved onto the
+//! new build when what is held is kept, and back on once the old version
+//! is done. Plain, it is the program's own triggers; `--instance <id>`
+//! (repeatable) names instances', `--all-instances` every instance's,
+//! `--all` the program's own and every instance's, and `--trigger`
+//! narrows any of them. The resync runs apart from the request that asked
+//! for it, followed in short looks until it ends
+//! (`super::follow::follow_task`). A trigger that is off is never turned on: the answer names it
+//! with the `weft activate` that would.
 //!
 //! `weft resync --resume` takes up again a resync that stopped with
-//! triggers down, where it stopped, with the choice and the build it
+//! triggers down, where it stopped, with the answers and the build it
 //! began with ([`resume`]): it builds nothing and never starts a new one.
 
 use super::Ctx;
-use crate::commands::deactivate::TriggerChoiceFlags;
 use crate::progress::ActionVerb;
+use weft_core::deactivation::{ResyncAnswer, ResyncResponse};
+use weft_core::TakeDownChoice;
 
-pub async fn run(ctx: Ctx, scope: weft_core::activation::ActivationScope, opts: TriggerChoiceFlags) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx, scope: weft_core::activation::ActivationScope, choice: TakeDownChoice) -> anyhow::Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Resync, |progress| async move {
-        run_inner(&ctx_inner, &progress, scope, opts).await
+        run_inner(&ctx_inner, &progress, scope, choice).await
     })
     .await
 }
@@ -33,84 +37,120 @@ pub async fn resume(ctx: Ctx) -> anyhow::Result<()> {
         let path = format!("/projects/{id}/resync/resume");
         progress.trigger_register_start();
         progress.dispatcher_call_start(&path);
-        let answer = client.post_json(&path, &serde_json::json!({})).await?;
-        let resynced = resynced_of(answer)?;
-        progress.dispatcher_call_done(serde_json::json!({ "projectId": id, "resynced": resynced }));
+        let answer = answer_of(&client, &progress, &id, client.post_json(&path, &serde_json::json!({})).await?).await?;
+        progress.dispatcher_call_done(serde_json::to_value(&answer)?);
         progress.trigger_register_done();
-        let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");
-        progress.complete(&format!("took the resync up again and resynced {whom} in {id}"));
+        report(&ctx_inner, &progress, &answer, &format!("took the resync of {id} up again"));
         Ok(())
     })
     .await
 }
 
-/// Whose triggers a resync's answer says it brought up to date.
-fn resynced_of(answer: serde_json::Value) -> anyhow::Result<Vec<weft_core::instance::Owner>> {
-    Ok(serde_json::from_value::<weft_core::activation::ResyncResponse>(answer)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "resync: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher \
-                 or this CLI so the versions match"
-            )
-        })?
-        .resynced)
+/// What a resync request came to, followed to its end when it is under
+/// way.
+async fn answer_of(
+    client: &crate::client::DispatcherClient,
+    progress: &crate::progress::Progress,
+    project_id: &str,
+    answer: serde_json::Value,
+) -> anyhow::Result<ResyncResponse> {
+    let unreadable = |e: serde_json::Error| {
+        anyhow::anyhow!("resync: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher or this CLI so the versions match")
+    };
+    match serde_json::from_value(answer).map_err(unreadable)? {
+        ResyncAnswer::Done(done) => Ok(done),
+        ResyncAnswer::UnderWay { task } => {
+            serde_json::from_value(super::follow::follow_task(client, progress, project_id, task).await?).map_err(unreadable)
+        }
+    }
 }
 
 async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
     scope: weft_core::activation::ActivationScope,
-    opts: TriggerChoiceFlags,
+    choice: TakeDownChoice,
 ) -> anyhow::Result<()> {
-    // Resync only re-registers triggers that are on (the dispatcher
-    // refuses anything else with a 409: a parked trigger is brought back
-    // with `weft activate`, by choice, never as a side effect), and the
-    // dispatcher is the one that knows whose are on. So nothing is
-    // checked here: the choice of how they come down goes along when
-    // it was given, or off a terminal (where no `--mode` is `wipe`, see
-    // `prompt_trigger_deactivation`); a person at a terminal who gave
-    // none is asked once the dispatcher says triggers are on. The
-    // dispatcher refuses before it builds or takes anything down.
-    let (running_policy, drain_timeout) =
-        super::ensure::parse_running_choice(opts.running_policy.as_deref(), opts.drain_timeout)?;
-    let scripted = ctx.json() || !crate::prompt::is_interactive();
-    let given = if scripted {
-        Some(super::deactivate::prompt_trigger_deactivation(
-            ctx.json(),
-            opts.mode.as_deref(),
-            opts.grace,
-            running_policy,
-            drain_timeout,
-        )?)
-    } else {
-        super::deactivate::given_trigger_deactivation(
-            false,
-            opts.mode.as_deref(),
-            opts.grace,
-            running_policy,
-            drain_timeout,
-        )?
-    };
+    // Read before anything is built: a contradiction is refused now, not
+    // after a build that took a minute.
+    let take_down = choice.resolve().map_err(|why| anyhow::anyhow!("{why}"))?;
     let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
     let path = format!("/projects/{}/resync", handle.id);
-    let body = weft_core::deactivation::ResyncRequest { build: handle.built.named(), trigger_deactivation: None, scope };
-    progress.drain_wait(running_policy, drain_timeout);
+    let body = weft_core::deactivation::ResyncRequest { build: handle.built.named(), choice, scope };
+    progress.drain_wait(take_down.running, crate::progress::DrainOn::Resync);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
-    let answer = super::deactivate::post_with_trigger_choice(
-        &handle.client,
-        &path,
-        body,
-        ctx.json(),
-        given,
-        running_policy,
-        drain_timeout,
-    )
-    .await?;
-    let resynced = resynced_of(answer)?;
-    progress.dispatcher_call_done(serde_json::json!({ "projectId": handle.id, "resynced": resynced }));
+    let answer = answer_of(&handle.client, progress, &handle.id, handle.client.post_json(&path, &serde_json::to_value(&body)?).await?).await?;
+    progress.dispatcher_call_done(serde_json::to_value(&answer)?);
     progress.trigger_register_done();
-    let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");
-    progress.complete(&format!("resynced {whom} in {} ({})", handle.name, handle.id));
+    handle.warn_broken(progress);
+    report(ctx, progress, &answer, &format!("{} ({})", handle.name, handle.id));
     Ok(())
+}
+
+/// What a resync did, as a person reads it: the triggers it took down and
+/// brought back (`subject` names the project), the paused runs it moved,
+/// and the triggers it left off with the command that turns each on.
+fn report(ctx: &Ctx, progress: &crate::progress::Progress, answer: &ResyncResponse, subject: &str) {
+    for line in off_lines(&answer.off, ctx.on()) {
+        progress.warn(&line);
+    }
+    let whom = answer.resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>();
+    let summary = match whom.is_empty() {
+        true => format!("{subject}: no trigger that is on is behind this build; nothing to resync"),
+        false => format!(
+            "{subject}: resynced {}; {}{}",
+            whom.join(", "),
+            answer.report.describe(),
+            moved_words(answer.moved_runs)
+        ),
+    };
+    progress.complete(&summary);
+}
+
+/// "; 2 paused runs moved onto the new build", or nothing.
+fn moved_words(moved: u64) -> String {
+    match moved {
+        0 => String::new(),
+        1 => "; 1 paused run moved onto the new build".into(),
+        n => format!("; {n} paused runs moved onto the new build"),
+    }
+}
+
+/// One line per owner whose named triggers are off: a resync turns none
+/// on, and this says which command does.
+fn off_lines(off: &[weft_core::activation::OwnerTriggers], on: Option<&str>) -> Vec<String> {
+    off.iter()
+        .map(|owned| {
+            let flags: Vec<String> = owned.triggers.iter().map(|t| format!("--trigger {t}")).collect();
+            let instance = owned.owner.instance().map(|i| format!(" --instance {i}")).unwrap_or_default();
+            format!(
+                "{} {} off, and a resync turns nothing on: `{}` does",
+                owned.words(),
+                if owned.triggers.len() == 1 { "is" } else { "are" },
+                super::weft_on(on, &format!("activate {}{instance}", flags.join(" ")))
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use weft_core::activation::OwnerTriggers;
+    use weft_core::instance::{InstanceId, Owner};
+
+    /// A trigger left off is named with the activate that turns it on, for
+    /// its own owner.
+    #[test]
+    fn a_trigger_left_off_names_the_activate_that_turns_it_on() {
+        let off = [
+            OwnerTriggers { owner: Owner::Shared, triggers: vec!["door".into()] },
+            OwnerTriggers { owner: Owner::Instance(InstanceId::new("ada").unwrap()), triggers: vec!["inbox".into(), "feed".into()] },
+        ];
+        let lines = super::off_lines(&off, None);
+        assert_eq!(lines[0], "'door' is off, and a resync turns nothing on: `weft activate --trigger door` does");
+        assert!(lines[1].contains("`weft activate --trigger inbox --trigger feed --instance ada`") && lines[1].contains(" are off"), "{}", lines[1]);
+        assert_eq!(super::moved_words(0), "");
+        assert_eq!(super::moved_words(2), "; 2 paused runs moved onto the new build");
+    }
 }

@@ -1,7 +1,8 @@
 # Deploys this project onto its weft install on GCP: the program first
-# (`weft activate`, or `weft resync` when it is already on), then, when
-# the install hosts a frontend for this repository (`weft frontend add`),
-# the frontend in front/ to its Cloud Run service. It calls the install
+# (`weft infra upgrade`, then `weft resync`, which only bring up to date
+# what is running and on, and never turn anything on), then, when the
+# install hosts a frontend for this repository (`weft frontend add`), the
+# frontend in front/ to its Cloud Run service. It calls the install
 # at its public address with its token, and reaches the program's own
 # infrastructure (a database) privately through Direct VPC egress. Run it
 # by hand from the Actions tab.
@@ -35,6 +36,11 @@ jobs:
     # schedule, under a workflow that worked the day before.
     runs-on: ubuntu-24.04
     env:
+      # What happens to the runs going when the deploy replaces what they
+      # run on: `wait` (they finish on the version they started on, and the
+      # deploy waits for them, however long that takes) or `cancel` (they
+      # stop at once).
+      RUNNING: wait
       WEFT_OPERATOR_KEY: ${{ secrets.WEFT_OPERATOR_KEY }}
       WEFT_REPO_ROOT: ${{ github.workspace }}/.weft
       # Frontends push to the install's frontend repository
@@ -100,23 +106,20 @@ jobs:
           cargo build --release --locked -p weft-cli
           echo "$WEFT_REPO_ROOT/target/release" >> "$GITHUB_PATH"
 
-      # A program that is off is switched on; one whose triggers are on is
-      # brought up to date. `--mode park` keeps what arrives while its
-      # triggers come down and back up (webhook calls, answers, the
-      # triggers' own fires) and runs it once they are back; a caller on a
-      # live route is answered 503 meanwhile, told to retry in 5 seconds.
-      # Change it to `hibernate` or `wipe` if that suits this program.
-      # Switching on a program whose triggers were parked runs what they
-      # kept and leaves its runs waiting on a person waiting, as a resync
-      # does.
+      # The program's infra first, then its triggers, the program's own and
+      # every instance's (`--all`). The upgrade builds, then replaces with this build
+      # only the infra already running, the triggers reading it held down
+      # meanwhile. The resync registers this version and brings onto it
+      # only the triggers that are on and behind it: taken down with what
+      # arrives meanwhile held, their paused runs moved onto the new
+      # build, and back on once the old version is done. Neither turns
+      # anything on, so on a first deploy they leave the version ready for
+      # `weft infra start --on <target>` and `weft activate --on <target>`,
+      # run once by hand; a trigger or infra someone took down stays down.
       - name: deploy the program
         run: |
-          status=$(weft status --on ${{ vars.WEFT_TARGET }} --json | jq -r '.status // "registered"')
-          if [ "$status" = "active" ]; then
-            weft resync --on ${{ vars.WEFT_TARGET }} --mode park
-          else
-            weft activate --on ${{ vars.WEFT_TARGET }} --reactivate-choice execute_parked_keep_suspended
-          fi
+          weft infra upgrade --on ${{ vars.WEFT_TARGET }} --all --running "$RUNNING"
+          weft resync --on ${{ vars.WEFT_TARGET }} --all --running "$RUNNING"
 
       # Everything below is the frontend's, and runs only when the install
       # hosts one for this repository (`weft frontend add <name> --repo

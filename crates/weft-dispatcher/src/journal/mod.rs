@@ -585,15 +585,15 @@ impl SignalRegistration {
         }))
     }
 
-    /// Compute the public URL for this signal given a dispatcher base
-    /// URL. The route depends on the surface AND, for public entries,
+    /// The path, on the install's outside base, a caller reaches this
+    /// signal at ([`crate::state::ExternalBase::url`] puts it on the
+    /// base). The route depends on the surface AND, for public entries,
     /// whether it is a LIVE connection (served only at `/connect/...`,
     /// which starts a run and hands the caller to the gateway)
     /// or a plain public fire (served at the bare `/<mount_path>`
-    /// catch-all). TaskCallback → `<base>/signal/<token>`. Returns None
+    /// catch-all). TaskCallback → `/signal/<token>`. Returns None
     /// for surface kinds with no public URL.
-    pub fn public_url(&self, dispatcher_base: &str) -> Option<String> {
-        let base = dispatcher_base.trim_end_matches('/');
+    pub fn public_path(&self) -> Option<String> {
         match self.surface_kind.as_str() {
             "public_entry" => {
                 let path = self.mount_path.as_deref().unwrap_or("");
@@ -624,13 +624,9 @@ impl SignalRegistration {
                     }
                 };
                 let prefix = if is_live { "connect/" } else { "" };
-                if path.is_empty() {
-                    Some(format!("{base}/{prefix}"))
-                } else {
-                    Some(format!("{base}/{prefix}{path}"))
-                }
+                Some(format!("/{prefix}{path}"))
             }
-            "task_callback" => Some(format!("{base}/signal/{}", self.token)),
+            "task_callback" => Some(format!("/signal/{}", self.token)),
             _ => None,
         }
     }

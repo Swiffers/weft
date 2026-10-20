@@ -141,6 +141,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::held::INFRA_STATUS_CHANNEL,
     crate::held::ACCESS_CHANNEL,
     crate::build::follow::BUILD_CLAIMED_CHANNEL,
+    crate::task_kinds::resync::RESYNC_GIVEN_UP_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -251,7 +252,13 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         tenant_router,
         project_reclaimer,
         public_base_url: config.public_url.trim_end_matches('/').to_string(),
-        internet_url: config.internet_url.clone(),
+        internet: config.internet_address(),
+        files: match &config.object_store {
+            weft_platform_traits::config::ObjectStoreSettings::S3(store) if !store.public_internet => {
+                Some(crate::files_door::FilesTarget { endpoint: store.endpoint.clone(), bucket: store.bucket.clone() })
+            }
+            _ => None,
+        },
         edge: config.edge,
         broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens.clone(), http.clone()),
         broker_line: weft_broker_client::BrokerLink::new(
@@ -312,6 +319,8 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
         TaskKind::ProgramCall => Arc::new(crate::task_kinds::ProgramCallExecutor),
         TaskKind::RunNodeTest => Arc::new(crate::task_kinds::RunNodeTestExecutor),
         TaskKind::Resync => Arc::new(crate::task_kinds::ResyncExecutor),
+        TaskKind::TakeDownWait => Arc::new(crate::task_kinds::TakeDownWaitExecutor),
+        TaskKind::RemovalWait => Arc::new(crate::task_kinds::RemovalWaitExecutor),
     })
 }
 
@@ -334,7 +343,6 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
         crate::lifecycle_claimer::drain_loop(state.clone()),
         crate::lapses::drain_loop(state.clone()),
         crate::run_ends::drain_loop(state.clone()),
-        crate::drain::drain_loop(state.clone()),
         crate::retention::drain_loop(state.clone()),
         crate::build::follow::drain_loop(state),
         crate::holders::drain_loop(state),
@@ -372,11 +380,10 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("lifecycle_claimer", crate::lifecycle_claimer::WAKE_ON),
         (crate::lapses::LAPSES, crate::lapses::WAKE_ON),
         ("run_ends", crate::run_ends::WAKE_ON),
-        ("drains", crate::drain::WAKE_ON),
         ("retention", crate::retention::WAKE_ON),
         ("parked_fires", crate::reaper::ON_PARKED_FIRE),
         ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
-        ("hibernations", crate::reaper::ON_HIBERNATION),
+        (crate::reaper::DOOR_WINDOWS, crate::reaper::ON_DOOR_WINDOW),
         ("infra_returns", crate::reaper::ON_INFRA_RETURNS),
         ("holders", crate::holders::ON_HELD_SIGNALS),
         (crate::holders::HOLDER_ACCESS, crate::holders::ON_ACCESS),

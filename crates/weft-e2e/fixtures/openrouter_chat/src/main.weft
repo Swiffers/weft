@@ -16,7 +16,7 @@ openrouter = OpenRouterAccess
 prov = OpenRouterModel {
   access: openrouter.access
   # A cheap Gemini: strong vision for pennies. (gpt-4.1-nano reliably
-  # misnamed even a solid-color square; the relay link was verified
+  # misnamed even a solid-color square; the image it was sent was verified
   # byte-identical, so the failure was the model, not the pipeline.)
   model: "google/gemini-2.5-flash-lite"
 }

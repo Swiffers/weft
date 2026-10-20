@@ -172,9 +172,6 @@ impl weft_platform_traits::InfraHost for UnlistableHost {
     async fn stop_unit(&self, node: &weft_core::infra::NodeRef, unit: &str) -> anyhow::Result<()> {
         self.0.stop_unit(node, unit).await
     }
-    async fn restart_unit(&self, node: &weft_core::infra::NodeRef, unit: &str) -> anyhow::Result<()> {
-        self.0.restart_unit(node, unit).await
-    }
     async fn remove_unit(&self, node: &weft_core::infra::NodeRef, unit: &str) -> anyhow::Result<()> {
         self.0.remove_unit(node, unit).await
     }

@@ -171,8 +171,8 @@ fn api(state: Arc<BrokerState>) -> Router {
             post(handlers::supervisor_infra_nodes),
         )
         .route(
-            "/v1/supervisor/health_protocols",
-            post(handlers::supervisor_health_protocols),
+            "/v1/supervisor/health_state",
+            post(handlers::supervisor_health_state),
         )
         .route(
             "/v1/supervisor/claim_command",
@@ -202,10 +202,6 @@ fn api(state: Arc<BrokerState>) -> Router {
         .route(
             "/v1/supervisor/infra_command_in_flight",
             post(handlers::supervisor_infra_command_in_flight),
-        )
-        .route(
-            "/v1/supervisor/trigger_deps",
-            post(handlers::supervisor_trigger_deps),
         )
         .route(
             "/v1/supervisor/set_applied",

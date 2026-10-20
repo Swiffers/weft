@@ -263,6 +263,7 @@ pub(crate) async fn take_event(
                 // (`/v1/door/park_fire`), and none other names one.
                 held_by: None,
                 attempts: 0,
+                released: false,
             };
             match fire_entry(state, routing, fire)
                 .await
@@ -617,11 +618,11 @@ pub async fn signal_file_for_token(
     // The store's own message names the storage key, and this door
     // exists so a consumer never sees one. Say what happened in the
     // consumer's terms and keep the store's text for the operator log.
-    // The consumer holding this token is the one who will fetch the
-    // bytes (the browser extension showing a form), so the link comes
-    // back on the address they reached us at.
-    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let link = crate::storage::download_link(&state, &base, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS))
+    // The consumer holding this token (the browser extension showing a
+    // form) reaches the install as the signal's project's callers do, so
+    // the link goes the way the project's outside links go.
+    let reader = weft_core::storage::LinkReader::Outside { project: sig.project_id.to_string() };
+    let link = crate::storage::download_link(&state, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS), reader)
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -653,22 +654,27 @@ pub async fn signal_file_for_token(
     // The facts come from the signal's own value, not from the link:
     // they describe the file the form is showing, and the mime (which
     // the store's answer does not carry) has to come from there anyway,
-    // so taking all four from one source keeps them consistent.
+    // so taking all four from one source keeps them consistent. Only
+    // whether the link opens from the open internet is the link's own.
     Ok(Json(SignalFileLink {
         url: link.url,
+        public: link.public,
         mime_type: file.mime_type,
         size_bytes: file.size_bytes,
         filename: file.filename,
     }))
 }
 
-/// What the files door answers: a link that lives an hour, plus the
-/// facts a consumer needs to render the file without fetching it.
-// SYNC: SignalFileLink <-> extension-browser/src/lib/api.ts TaskFileLink, crates/weft-core/src/signal/form.rs consumer_file_value (the URL-backed arm publishes the same four keys)
+/// What the files door answers: a link that lives an hour, whether the
+/// open internet opens it (else only a device that reaches the install's
+/// own address does), plus the facts a consumer needs to render the file
+/// without fetching it.
+// SYNC: SignalFileLink <-> extension-browser/src/lib/api.ts TaskFileLink, crates/weft-core/src/signal/form.rs consumer_file_value (the URL-backed arm publishes the same keys)
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalFileLink {
     pub url: String,
+    pub public: bool,
     pub mime_type: String,
     pub size_bytes: u64,
     pub filename: String,
@@ -708,8 +714,9 @@ fn file_belongs_to_signal(
 /// Scoped enumeration. Filters by
 /// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
-/// active and parked projects show up; hibernate-mode projects do
-/// not. Wiped projects have no rows. The dispatcher never asks the
+/// triggers on and triggers down with their door taking show up; one
+/// whose door hides does not. One taken down with nothing kept has no
+/// rows. The dispatcher never asks the
 /// listener for the signal token: the SQL pre-filter is the only
 /// scope check.
 ///
@@ -1340,7 +1347,7 @@ pub(crate) async fn signal_live_at(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{node}'")))?;
     // Where a caller reaches this signal. The row is the authority (it
-    // holds the tenant-namespaced mount path) and `public_url` is the
+    // holds the tenant-namespaced mount path) and `public_path` is the
     // one place that knows a held-connection kind is served under
     // `/connect/`; the listener holds only the route pattern its kind
     // computed, so the finished address is sent to it rather than
@@ -1350,7 +1357,15 @@ pub(crate) async fn signal_live_at(
     // address is handed on to a third party (whoever will call the
     // trigger), and the reader's host says nothing about what that
     // party reaches.
-    let address = entry.public_url(state.external_base_url());
+    //
+    // A signal with no outside address reads no base, so its display
+    // answers while the tunnel is down or still connecting.
+    let address = match entry.public_path() {
+        Some(path) => Some(
+            state.external_base().url(&path).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?,
+        ),
+        None => None,
+    };
     Ok(SignalLiveAt { token: entry.token, address })
 }
 
@@ -1454,7 +1469,7 @@ mod route_lookup_tests {
 }
 
 #[cfg(test)]
-mod public_url_tests {
+mod public_path_tests {
     use crate::journal::SignalRegistration;
 
     fn fresh(surface: &str, mount: Option<&str>) -> SignalRegistration {
@@ -1495,10 +1510,7 @@ mod public_url_tests {
     #[test]
     fn public_entry_root_normalizes() {
         let s = fresh("public_entry", Some("/"));
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/".into())
-        );
+        assert_eq!(s.public_path(), Some("/".into()));
     }
 
     /// A row whose spec cannot be read gets NO address rather than the
@@ -1509,16 +1521,13 @@ mod public_url_tests {
     fn an_unreadable_spec_yields_no_address_rather_than_a_guess() {
         let mut s = fresh("public_entry", Some("/chat"));
         s.spec_json = "{".into();
-        assert_eq!(s.public_url("http://127.0.0.1:14111"), None);
+        assert_eq!(s.public_path(), None);
     }
 
     #[test]
     fn public_entry_with_path() {
         let s = fresh("public_entry", Some("/webhooks/stripe"));
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/webhooks/stripe".into())
-        );
+        assert_eq!(s.public_path(), Some("/webhooks/stripe".into()));
     }
 
     #[test]
@@ -1528,34 +1537,19 @@ mod public_url_tests {
         // plain public fire.
         let mut s = fresh("public_entry", Some("/alice/chat"));
         s.spec_json = r#"{"kind":"route","config":{},"consumer_kind":null}"#.into();
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/connect/alice/chat".into())
-        );
-    }
-
-    #[test]
-    fn public_entry_strips_trailing_slash_on_base() {
-        let s = fresh("public_entry", Some("/foo"));
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111/"),
-            Some("http://127.0.0.1:14111/foo".into())
-        );
+        assert_eq!(s.public_path(), Some("/connect/alice/chat".into()));
     }
 
     #[test]
     fn task_callback_uses_token() {
         let s = fresh("task_callback", None);
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/signal/tok-1".into())
-        );
+        assert_eq!(s.public_path(), Some("/signal/tok-1".into()));
     }
 
     #[test]
     fn unknown_surface_returns_none() {
         let s = fresh("future_kind", None);
-        assert!(s.public_url("http://127.0.0.1:14111").is_none());
+        assert!(s.public_path().is_none());
     }
 }
 

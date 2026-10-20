@@ -27,6 +27,10 @@ pub mod key;
 pub mod diff;
 #[cfg(feature = "runtime")]
 pub mod media;
+/// The upload slot: a page's visitor uploading a file straight to storage,
+/// and the route that receives it.
+#[cfg(feature = "runtime")]
+pub mod slot;
 
 /// The most one port value may weigh on a wire, as JSON. Bytes belong
 /// in storage (a stored-file value is a few hundred bytes whatever the
@@ -40,6 +44,7 @@ pub const MAX_WIRE_VALUE_BYTES: usize = 100 * 1024;
 /// file is about to land. The broker sets it on every such refusal and the
 /// dispatcher passes it through, so a client tells "ask again shortly"
 /// apart from a conflict that will not resolve on its own.
+// SYNC: COMPLETING_HEADER <-> packages/weft-connect/src/core/upload.ts COMPLETING_HEADER
 pub const COMPLETING_HEADER: &str = "x-weft-completing";
 
 /// What `value` weighs on a wire: its compact JSON, in bytes. The one
@@ -471,7 +476,8 @@ fn first_file_version() -> u64 {
 /// concrete `__weft_<kind>__` marker (see `to_value`). The ONLY thing
 /// that flows on edges / into the journal for a stored file. Carries
 /// NO url: byte access always goes through an authenticated fetch (or
-/// an explicit, expiring presigned URL a node deliberately mints). The
+/// an expiring link a node deliberately asks for, `internal_link` /
+/// `external_link`). The
 /// concrete kind (Image/Video/Audio/Blob) is derived from `mime_type`.
 // SYNC: StoredFile <-> packages/weft-graph/src/protocol.ts FileValueWire
 //       (per-kind markers __weft_image__/video/audio/blob, parseFileValue)
@@ -490,6 +496,49 @@ pub struct StoredFile {
     /// checks the file still holds.
     #[serde(default = "first_file_version")]
     pub version: u64,
+    /// How long a link handed out for this file lives, in seconds, when
+    /// whoever made the value chose (`StorageHandle::link_lifetime`, the
+    /// `LinkOptions` node); absent, [`DEFAULT_LINK_SECS`]. It rides the
+    /// value, not the stored file: two values of one file may hand out
+    /// links of different lives.
+    #[serde(
+        default,
+        rename = "linkSecs",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "link_secs_in_range"
+    )]
+    pub link_secs: Option<u64>,
+}
+
+/// A value's `linkSecs` read off the wire, refused when no link can live
+/// that long ([`checked_link_secs`]).
+fn link_secs_in_range<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    Option::<u64>::deserialize(deserializer)?
+        .map(checked_link_secs)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+/// How long a link to a stored file lives when its value names no
+/// lifetime ([`StoredFile::link_secs`]).
+pub const DEFAULT_LINK_SECS: u64 = 15 * 60;
+
+/// The longest a link to a stored file lives: seven days, the longest a
+/// storage signature allows.
+pub const MAX_LINK_SECS: u64 = 7 * 24 * 3600;
+
+/// `secs` when a link can live that long (one second to
+/// [`MAX_LINK_SECS`]), else the refusal naming the range. Checked
+/// wherever a lifetime enters a value, so a value never carries one
+/// that every link made from it would fail on. Zero reads "under a
+/// second": a lifetime handed in finer than whole seconds (a `Duration`
+/// of half a second) arrives here as 0.
+pub fn checked_link_secs(secs: u64) -> Result<u64, String> {
+    match secs {
+        0 => Err("a link lives 1 second to 7 days, not under a second".to_string()),
+        secs if secs <= MAX_LINK_SECS => Ok(secs),
+        secs => Err(format!("a link lives 1 second to 7 days, not {secs} seconds")),
+    }
 }
 
 impl From<&StoredFileMeta> for StoredFile {
@@ -500,6 +549,7 @@ impl From<&StoredFileMeta> for StoredFile {
             size_bytes: meta.size_bytes,
             filename: meta.filename.clone(),
             version: meta.version,
+            link_secs: None,
         }
     }
 }
@@ -592,7 +642,10 @@ pub fn stored_files_within(value: &Value) -> Vec<StoredFile> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileHandle {
     /// The bytes live in the storage bucket under this tenant-local key.
-    Key(String),
+    /// `link_secs` is the value's own link lifetime
+    /// ([`StoredFile::link_secs`]), which every link handed out for it
+    /// lives.
+    Key { key: String, link_secs: Option<u64> },
     /// The bytes live at this external URL, fetched directly by the worker.
     Url {
         url: String,
@@ -605,6 +658,12 @@ pub enum FileHandle {
 }
 
 impl FileHandle {
+    /// The handle of the stored file at `key`, handing out links of the
+    /// default lifetime.
+    pub fn key(key: impl Into<String>) -> Self {
+        FileHandle::Key { key: key.into(), link_secs: None }
+    }
+
     /// Parse a file value into its handle. Accepts a bare key string (a node
     /// held onto a key), a `key`-backed marker, or a `url`-backed marker.
     /// Errors loud on a value that is neither, or a marker whose only handle
@@ -615,7 +674,7 @@ impl FileHandle {
             if s.is_empty() {
                 return Err(WeftError::Input("empty storage key".into()));
             }
-            return Ok(FileHandle::Key(s.to_string()));
+            return Ok(FileHandle::key(s));
         }
         let obj = value.as_object().ok_or_else(|| {
             WeftError::Input(format!(
@@ -639,7 +698,16 @@ impl FileHandle {
             if key.is_empty() {
                 return Err(WeftError::Input("file marker has an empty key".into()));
             }
-            return Ok(FileHandle::Key(key.to_string()));
+            let link_secs = match payload.get("linkSecs") {
+                None | Some(Value::Null) => None,
+                Some(secs) => {
+                    let secs = secs.as_u64().ok_or_else(|| {
+                        WeftError::Input(format!("file marker's linkSecs is not a whole number of seconds: {secs}"))
+                    })?;
+                    Some(checked_link_secs(secs).map_err(WeftError::Input)?)
+                }
+            };
+            return Ok(FileHandle::Key { key: key.to_string(), link_secs });
         }
         if let Some(url) = payload.get("url").and_then(Value::as_str) {
             if url.is_empty() {
@@ -710,10 +778,111 @@ pub struct IdentityLookupResponse {
     pub file: Option<StoredFileMeta>,
 }
 
-/// `POST /v1/storage/presign`: a presigned GET URL for one file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresignResponse {
+/// A link to a stored file: where to fetch it, and whether the open
+/// internet can (a provider handed a link it cannot open gets the bytes
+/// in its request instead). What `StorageHandle::internal_link` and
+/// `external_link` answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLink {
     pub url: String,
+    pub public: bool,
+}
+
+/// The answer to a [`LinkRequest`]: the link, and the record of the file
+/// it opens (what a send beside the link names it by).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkAnswer {
+    pub link: FileLink,
+    pub file: StoredFileMeta,
+}
+
+/// Who opens a link to a stored file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkReach {
+    /// Node code inside the install: straight to storage, at the address
+    /// a worker reaches it by, never through a tunnel.
+    Internal,
+    /// Anything outside the install's containers (a browser, an app, an
+    /// outside service): the project's visitor address, else weft's
+    /// tunnel, else the install's own address (`public: false`); on a
+    /// cloud install, the store's own link.
+    External,
+}
+
+/// `POST /v1/storage/link`: a link to one file for `reach`, living
+/// `ttl_secs` (the value's `linkSecs`, else [`DEFAULT_LINK_SECS`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRequest {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    pub reach: LinkReach,
+}
+
+/// `POST /v1/storage/copy`: copy the stored file at `key` into `scope`
+/// inside storage. `identity` and `keep` as for an upload's begin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyRequest {
+    pub key: String,
+    pub scope: StorageScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<KeepTtl>,
+}
+
+/// Who a link the control plane asks for is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LinkReader {
+    /// A person's machine: the CLI, the editor, a browser beside them.
+    Person,
+    /// weft's own process (the dispatcher reading a version's file).
+    Runtime,
+    /// Somebody outside the install reaching it as `project`'s callers
+    /// do (a browser extension showing a form's file): the link a node's
+    /// `external_link` gives.
+    Outside { project: String },
+}
+
+/// `POST /v1/storage/admin/link`: a download link for one file, for
+/// `reader`, answered as a [`PresignResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminLinkRequest {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    pub reader: LinkReader,
+}
+
+/// The `Content-Disposition` every link weft hands out for a stored file
+/// answers with: a download, under the file's name. Opening a link in a
+/// tab never shows the file under the address it came from, whatever its
+/// type; an `<img>`, `<video>` or `<audio>` ignores it and still shows
+/// or plays the file. The quoted name is for old clients (ASCII only,
+/// quotes and backslashes dropped), the encoded one the exact name.
+pub fn download_disposition(filename: &str) -> String {
+    format!("attachment; {}", disposition_filename(filename))
+}
+
+/// `filename="..."; filename*=UTF-8''...` for `filename`, what a
+/// `Content-Disposition` names a file by.
+pub fn disposition_filename(filename: &str) -> String {
+    let plain: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' { c } else { '_' })
+        .collect();
+    let encoded: String = filename
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => (b as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect();
+    format!("filename=\"{plain}\"; filename*=UTF-8''{encoded}")
 }
 
 // The upload contract is multipart: `begin` mints the key and (for a known
@@ -805,6 +974,7 @@ pub enum ReplaceOutcome {
 /// answers `already_stored: true` with the existing key: there is nothing to
 /// transfer, the caller must not reserve parts, and `part_size` is a
 /// meaningless 0.
+// SYNC: UploadBeginResponse <-> packages/weft-connect/src/core/upload.ts UploadBeginAnswer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadBeginResponse {
@@ -838,6 +1008,7 @@ pub struct UploadBeginResponse {
 /// unfinishable until the hourly sweep removed it. Now they both ask for
 /// part 3, both write the same bytes to it, and whichever completes
 /// first is the answer for both.
+// SYNC: UploadPartsRequest <-> packages/weft-connect/src/core/upload.ts UploadPartsBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadPartsRequest {
     pub key: String,
@@ -846,6 +1017,7 @@ pub struct UploadPartsRequest {
 
 /// One part a caller is about to upload: which part of the file it is,
 /// and how many bytes it will PUT.
+// SYNC: PartAsk <-> packages/weft-connect/src/core/upload.ts PartAsk
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartAsk {
@@ -857,6 +1029,7 @@ pub struct PartAsk {
 
 /// One reserved part: its assigned number, its exact byte size, and the
 /// presigned URL to PUT exactly that many bytes to.
+// SYNC: PresignedPart <-> packages/weft-connect/src/core/upload.ts PresignedPart
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresignedPart {
@@ -878,6 +1051,7 @@ pub struct PresignedPart {
     pub url: String,
 }
 
+// SYNC: UploadPartsResponse <-> packages/weft-connect/src/core/upload.ts UploadPartsAnswer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadPartsResponse {
     pub parts: Vec<PresignedPart>,
@@ -886,6 +1060,7 @@ pub struct UploadPartsResponse {
 /// `POST /v1/storage/upload/part-done`: report a landed part. The etag is the
 /// bucket's response header VERBATIM (quotes included); the server records the
 /// part's size from its own reservation, never from the caller.
+// SYNC: PartDoneRequest <-> packages/weft-connect/src/core/upload.ts PartDoneBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartDoneRequest {
@@ -896,6 +1071,7 @@ pub struct PartDoneRequest {
 
 /// `POST /v1/storage/upload/complete`: finalize the upload (all reserved
 /// parts must have been reported done). Responds with the stored-file value.
+// SYNC: UploadCompleteRequest <-> packages/weft-connect/src/core/upload.ts UploadKeyBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadCompleteRequest {
     pub key: String,
@@ -903,11 +1079,13 @@ pub struct UploadCompleteRequest {
 
 /// `POST /v1/storage/upload/resume`: after an interruption, learn which
 /// reserved parts never landed and get fresh URLs for exactly those.
+// SYNC: UploadResumeRequest <-> packages/weft-connect/src/core/upload.ts UploadKeyBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadResumeRequest {
     pub key: String,
 }
 
+// SYNC: UploadResumeResponse <-> packages/weft-connect/src/core/upload.ts UploadResumeAnswer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadResumeResponse {
@@ -929,6 +1107,7 @@ pub struct UploadResumeResponse {
 
 /// `POST /v1/storage/upload/abort`: cancel an in-flight upload, freeing its
 /// quota reservation and discarding any landed parts.
+// SYNC: UploadAbortRequest <-> packages/weft-connect/src/core/upload.ts UploadKeyBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadAbortRequest {
     pub key: String,
@@ -948,57 +1127,6 @@ pub struct DownloadUrlResponse {
 pub struct KeepRequest {
     pub key: String,
     pub ttl: KeepTtl,
-}
-
-/// `POST /v1/storage/presign`: mint a temporary link to a stored file, scoped
-/// to the one key with a short TTL: the internet-reachable link when the
-/// install serves one, else one signed for the install's own address.
-/// `POST /v1/storage/public-link` takes the same shape plus `reach`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PresignRequest {
-    pub key: String,
-    pub ttl_secs: Option<u64>,
-    /// Who the link is for (public-link only; presign ignores it).
-    #[serde(default)]
-    pub reach: LinkReach,
-}
-
-/// Who has to be able to open a minted link. The two askers reach
-/// different addresses: a provider on the open internet cannot open a
-/// loopback link, while the browser that just called a local install's
-/// route reached it at that very loopback address.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LinkReach {
-    /// The open internet (a provider fetching media): only an address
-    /// the internet resolves counts; a local install answers `None`.
-    #[default]
-    Internet,
-    /// A caller of this install (the browser a route answers). `base` is
-    /// the address that caller's request came in on
-    /// ([`crate::caller::LiveRequest::base_url`]): the link is built on
-    /// it, so a browser on the loopback port gets a loopback link and one
-    /// on the tunnel gets a tunnel link. `None` (a run no request
-    /// started) falls back to the install's configured address: the
-    /// internet one when there is one, else its own stable base.
-    Caller {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base: Option<String>,
-    },
-}
-
-/// `POST /v1/storage/public-link`: mint a temporary URL for the file
-/// at whatever address the request's [`LinkReach`] asks for. Under
-/// `Internet` that is an address the internet resolves, and `url: None`
-/// means there is none (no publicly addressable store and no public
-/// relay), so the caller falls back to inline bytes. Under `Caller` it
-/// is that same address when there is one, else the install's own base,
-/// loopback included, so `None` there means the install has neither.
-/// Same request shape as presign.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublicLinkResponse {
-    pub url: Option<String>,
 }
 
 // The broker's control-plane admin envelopes (the dispatcher's CLI-verb proxy:
@@ -1022,32 +1150,23 @@ pub struct TenantUsage {
     pub file_count: u64,
 }
 
-/// `POST /v1/storage/admin/presign` response, returned verbatim as the
-/// dispatcher's `/storage/files/download` response (the presign result IS the
+/// `POST /v1/storage/admin/link` response, returned verbatim as the
+/// dispatcher's `/storage/files/download` response (the link IS the
 /// download handshake; no separate same-fields struct). Carries the file's
-/// friendly name and total size besides the URL: a presigned S3 GET has no
-/// `x-weft-meta`, so the CLI gets these from the handshake.
+/// friendly name and total size besides the link, so a client names the
+/// file and can resume it (`Range`) without a request of its own first.
+// SYNC: PresignResult <-> packages/weft-graph/src/protocol.ts StoredFileDownload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignResult {
     pub url: String,
     pub filename: String,
     #[serde(rename = "sizeBytes")]
     pub size_bytes: u64,
-}
-
-/// `POST /v1/storage/admin/download-link` response: a minted relay
-/// token (resolved at the dispatcher's `/public/files/{token}` route)
-/// plus the file's friendly name and size. The relay link is what a
-/// BROWSER download rides: unlike a presigned bucket URL, whose SigV4
-/// signature covers the exact host the browser must send, a token URL
-/// survives any port forward, tunnel, or proxy rewrite between the
-/// user and the dispatcher.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadLinkResult {
-    pub token: String,
-    pub filename: String,
-    #[serde(rename = "sizeBytes")]
-    pub size_bytes: u64,
+    /// The file's version when the link was made: a download that asks
+    /// for a fresh link to carry on holds it to the same content.
+    pub version: u64,
+    /// Whether the open internet opens the link (see [`FileLink`]).
+    pub public: bool,
 }
 
 /// `POST /v1/storage/admin/wipe-prefix`: wipe a whole scope/tenant prefix.
@@ -1147,10 +1266,12 @@ pub struct AssetsHeldRequest {
 
 /// The answer to [`AssetsHeldRequest`]: `content hash -> stored key` for
 /// every named content the tenant stores whole (an upload still in flight
-/// is not held).
+/// is not held), and for every other one the key its upload is stored
+/// under (`unheld`), which a check that uploads nothing stands in with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetsHeldResponse {
     pub keys: std::collections::BTreeMap<String, String>,
+    pub unheld: std::collections::BTreeMap<String, String>,
 }
 
 /// `POST /storage/files/download`: a download link for one of the
@@ -1364,14 +1485,8 @@ pub fn received_file(
             let (essence, params) = stated.split_once(';').map_or((stated, ""), |(e, p)| (e, p));
             let essence = essence.trim().to_ascii_lowercase();
             let essence = match sniffed.and_then(audio_or_video) {
-                Some((video, audio)) if [video, audio].contains(&essence.as_str()) => {
-                    let kind = FileKind::from_mime(&essence);
-                    let other = if kind == FileKind::Audio { (FileKind::Video, video) } else { (FileKind::Audio, audio) };
-                    if !admitted.is_empty() && !admitted.contains(&kind) && admitted.contains(&other.0) {
-                        other.1.to_string()
-                    } else {
-                        essence
-                    }
+                Some(container) if [container.0, container.1].contains(&essence.as_str()) => {
+                    container_half(essence, container, &admitted)
                 }
                 _ => essence,
             };
@@ -1400,11 +1515,73 @@ pub fn received_file(
 
 const OCTET_STREAM: &str = "application/octet-stream";
 
+/// The media type a stored file of type `mime` is handed over as to a
+/// place of type `declared`, or why it does not fit. The file's type is
+/// already settled (read off its bytes when it was stored,
+/// [`received_file`]), so this holds it to the place's file kinds: a place
+/// that takes `Blob` takes any file, a media place its own kinds, and a
+/// container that holds either video or audio (WebM, MP4) is handed over
+/// as the half the place takes. The media type comes back lower-cased as
+/// [`received_file`] stores it, its parameters as they were. A
+/// declaration that is not a file type is refused: a file has no place
+/// there. The refusal names both types and nothing about where the file
+/// came from; each caller frames it.
+pub fn fit_mime(mime: &str, declared: &crate::weft_type::WeftType) -> Result<String, String> {
+    use crate::weft_type::FileKind;
+    let admitted = declared.admitted_file_kinds();
+    if admitted.is_empty() {
+        return Err(format!("the place is declared {declared}, which takes no file"));
+    }
+    let (essence, params) = mime.split_once(';').map_or((mime, ""), |(e, p)| (e, p));
+    let essence = essence.trim().to_ascii_lowercase();
+    let essence = match audio_or_video(&essence) {
+        Some(container) => container_half(essence, container, &admitted),
+        None => essence,
+    };
+    let kind = FileKind::from_mime(&essence);
+    if !admitted.contains(&FileKind::Blob) && !admitted.contains(&kind) {
+        let expected = admitted.iter().map(|k| k.primitive().to_string()).collect::<Vec<_>>().join(" or ");
+        return Err(format!("{essence} is {}, not the {expected} that was declared", kind.primitive()));
+    }
+    Ok(if params.is_empty() { essence } else { format!("{essence};{params}") })
+}
+
+/// Does a file already handed over as `mime` ([`fit_mime`]'s answer for the
+/// place it first went to) fit a place of type `declared` as it is? A
+/// handed-over file is one type, so one that fits only as the other half
+/// of its container (an `audio/webm` sent on to a Video place) is refused
+/// with the type it would need, as a file that does not fit at all is.
+pub fn fits_as_handed_over(mime: &str, declared: &crate::weft_type::WeftType) -> Result<(), String> {
+    let fitted = fit_mime(mime, declared)?;
+    if fitted != mime {
+        return Err(format!("it was handed over as {mime}, and the {declared} here takes it only as {fitted}"));
+    }
+    Ok(())
+}
+
+/// The half of `container` (its video and audio types) a file stated as
+/// `essence`, one of the two, is held as by a place admitting `admitted`:
+/// the stated half, unless the place takes only the other.
+fn container_half(
+    essence: String,
+    (video, audio): (&'static str, &'static str),
+    admitted: &[crate::weft_type::FileKind],
+) -> String {
+    use crate::weft_type::FileKind;
+    let kind = FileKind::from_mime(&essence);
+    let other = if kind == FileKind::Audio { (FileKind::Video, video) } else { (FileKind::Audio, audio) };
+    if !admitted.is_empty() && !admitted.contains(&kind) && admitted.contains(&other.0) {
+        other.1.to_string()
+    } else {
+        essence
+    }
+}
+
 /// The (video, audio) media types of a container that holds either,
-/// read from its sniffed type.
-fn audio_or_video(sniffed: &str) -> Option<(&'static str, &'static str)> {
-    match sniffed {
-        "video/webm" => Some(("video/webm", "audio/webm")),
+/// read from its type.
+pub fn audio_or_video(mime: &str) -> Option<(&'static str, &'static str)> {
+    match mime {
+        "video/webm" | "audio/webm" => Some(("video/webm", "audio/webm")),
         "video/mp4" | "audio/mp4" => Some(("video/mp4", "audio/mp4")),
         _ => None,
     }
@@ -1542,7 +1719,16 @@ mod sniff_tests {
 
 #[cfg(test)]
 mod disposition_tests {
-    use super::filename_from_disposition;
+    use super::{download_disposition, filename_from_disposition};
+
+    /// A link is a download under the file's own name: plain for old
+    /// clients, exact in the encoded form, and read back to the name.
+    #[test]
+    fn a_link_downloads_under_the_files_name() {
+        let disposition = download_disposition("été a\"b.pdf");
+        assert_eq!(disposition, "attachment; filename=\"_t_ a_b.pdf\"; filename*=UTF-8''%C3%A9t%C3%A9%20a%22b.pdf");
+        assert_eq!(filename_from_disposition(&disposition), Some("été a\"b.pdf".to_string()));
+    }
 
     /// The name a server gives its own file, in the three shapes a
     /// server writes it, and never a path.
@@ -1767,6 +1953,7 @@ mod tests {
             size_bytes: 4_200_000,
             filename: "clip.ogg".into(),
             version: 3,
+            link_secs: None,
         };
         let v = m.to_value();
         // Exact wire shape: the CONCRETE marker (audio/ogg -> __weft_audio__),
@@ -1794,6 +1981,7 @@ mod tests {
             size_bytes: 10,
             filename: "x.pdf".into(),
             version: FIRST_FILE_VERSION,
+            link_secs: None,
         };
         assert!(pdf.to_value().get("__weft_blob__").is_some());
         assert_eq!(StoredFile::from_value(&pdf.to_value()).unwrap(), pdf);
@@ -1807,6 +1995,7 @@ mod tests {
             size_bytes: 1,
             filename: "a.ogg".into(),
             version: FIRST_FILE_VERSION,
+            link_secs: None,
         };
         let t = crate::weft_type::WeftType::infer(&m.to_value());
         assert_eq!(
@@ -1826,7 +2015,7 @@ mod tests {
         }});
         assert_eq!(
             serde_json::from_value::<FileHandle>(key_backed).unwrap(),
-            FileHandle::Key("k1".into())
+            FileHandle::key("k1")
         );
         let url_backed = json!({"__weft_image__": {
             "url": "https://x.com/a.png", "mimeType": "image/png", "sizeBytes": 3, "filename": "a.png"
@@ -1837,7 +2026,7 @@ mod tests {
         ));
         assert_eq!(
             serde_json::from_value::<FileHandle>(json!("bare-key")).unwrap(),
-            FileHandle::Key("bare-key".into())
+            FileHandle::key("bare-key")
         );
         let data_backed = json!({"__weft_image__": {
             "data": "aGk=", "mimeType": "image/png", "sizeBytes": 2, "filename": "a.png"
@@ -1858,12 +2047,113 @@ mod tests {
         assert!(StoredFile::from_value(&url_file).is_err());
     }
 
+    /// A link lives one second to seven days, and a value carrying a
+    /// lifetime outside that is refused when it is read, as a handle and
+    /// as a stored file alike.
+    #[test]
+    fn a_value_carries_only_a_link_lifetime_a_link_can_live() {
+        assert_eq!(checked_link_secs(1), Ok(1));
+        assert_eq!(checked_link_secs(MAX_LINK_SECS), Ok(MAX_LINK_SECS));
+        assert_eq!(checked_link_secs(0).unwrap_err(), "a link lives 1 second to 7 days, not under a second");
+        assert!(checked_link_secs(MAX_LINK_SECS + 1).is_err());
+        let file = |secs: u64| {
+            json!({"__weft_blob__": {"key": "project/p/1", "mimeType": "text/plain", "sizeBytes": 1, "filename": "a.txt", "linkSecs": secs}})
+        };
+        for secs in [1, MAX_LINK_SECS] {
+            assert_eq!(StoredFile::from_value(&file(secs)).unwrap().link_secs, Some(secs));
+            assert_eq!(
+                FileHandle::from_value(&file(secs)).unwrap(),
+                FileHandle::Key { key: "project/p/1".into(), link_secs: Some(secs) }
+            );
+        }
+        for secs in [0, MAX_LINK_SECS + 1, 10 * 365 * 24 * 3600] {
+            let refused = StoredFile::from_value(&file(secs)).unwrap_err().to_string();
+            assert!(refused.contains("a link lives 1 second to 7 days"), "{refused}");
+            let refused = FileHandle::from_value(&file(secs)).unwrap_err();
+            assert!(matches!(refused, WeftError::Input(_)), "{refused:?}");
+            assert!(refused.to_string().contains("a link lives 1 second to 7 days"), "{refused}");
+        }
+    }
+
+    /// A stored file fits a place by its type: a place taking `Blob` any
+    /// file, a media place its own kinds.
+    #[test]
+    fn fit_mime_holds_a_file_to_the_places_kinds() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(fit_mime("image/png", &ty("Image")).unwrap(), "image/png");
+        assert_eq!(fit_mime("image/png", &ty("Media")).unwrap(), "image/png");
+        assert_eq!(fit_mime("application/pdf", &ty("File")).unwrap(), "application/pdf");
+        assert_eq!(fit_mime("text/csv", &ty("File | Null")).unwrap(), "text/csv");
+        assert_eq!(fit_mime("video/mp4", &ty("Blob")).unwrap(), "video/mp4");
+        assert_eq!(
+            fit_mime("video/mp4", &ty("Image")).unwrap_err(),
+            "video/mp4 is Video, not the Image that was declared"
+        );
+        assert!(fit_mime("image/png", &ty("Video")).is_err());
+        assert!(fit_mime("audio/mpeg", &ty("Video")).is_err(), "an mp3 holds no video");
+        assert!(fit_mime("application/octet-stream", &ty("Media")).is_err());
+        assert!(fit_mime("application/octet-stream", &ty("Image | Null")).is_err());
+    }
+
+    /// The media type is lower-cased as `received_file` stores it; its
+    /// parameters stay as they were.
+    #[test]
+    fn fit_mime_lower_cases_the_media_type_and_keeps_its_parameters() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(fit_mime("Image/PNG; q=1", &ty("Image | Null")).unwrap(), "image/png; q=1");
+        assert_eq!(fit_mime("Video/MP4", &ty("Audio")).unwrap(), "audio/mp4");
+    }
+
+    /// A container that holds either video or audio is handed over as the
+    /// half the place takes, and as the half it was stored as when the
+    /// place takes that.
+    #[test]
+    fn fit_mime_hands_a_container_over_as_the_half_the_place_takes() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(fit_mime("video/webm", &ty("Audio")).unwrap(), "audio/webm");
+        assert_eq!(fit_mime("video/mp4", &ty("Audio")).unwrap(), "audio/mp4");
+        assert_eq!(fit_mime("audio/webm", &ty("Video")).unwrap(), "video/webm");
+        assert_eq!(fit_mime("audio/webm;codecs=opus", &ty("Video | Null")).unwrap(), "video/webm;codecs=opus");
+        assert_eq!(fit_mime("audio/webm", &ty("Media")).unwrap(), "audio/webm");
+        assert_eq!(fit_mime("video/webm", &ty("Video | Audio")).unwrap(), "video/webm");
+        assert_eq!(fit_mime("audio/mp4", &ty("File")).unwrap(), "audio/mp4");
+    }
+
+    /// A file already handed over fits again only as the type it went as.
+    #[test]
+    fn a_handed_over_file_fits_again_only_as_its_own_type() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert!(fits_as_handed_over("audio/webm", &ty("Audio")).is_ok());
+        assert!(fits_as_handed_over("audio/webm", &ty("Media")).is_ok());
+        assert!(fits_as_handed_over("image/png; q=1", &ty("File")).is_ok());
+        assert_eq!(
+            fits_as_handed_over("audio/webm", &ty("Video")).unwrap_err(),
+            "it was handed over as audio/webm, and the Video here takes it only as video/webm"
+        );
+        assert_eq!(
+            fits_as_handed_over("image/png", &ty("Audio")).unwrap_err(),
+            "image/png is Image, not the Audio that was declared"
+        );
+        assert!(fits_as_handed_over("image/png", &ty("String")).is_err());
+    }
+
+    /// A declaration that is not a file type takes no file.
+    #[test]
+    fn fit_mime_refuses_a_place_that_is_not_a_file_type() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(
+            fit_mime("application/pdf", &ty("String")).unwrap_err(),
+            "the place is declared String, which takes no file"
+        );
+        assert!(fit_mime("image/png", &ty("Number | Null")).is_err());
+    }
+
     #[test]
     fn file_handle_parses_key_and_url_forms() {
         // A bare key string is a Key handle.
         assert_eq!(
             FileHandle::from_value(&json!("project/p/1")).unwrap(),
-            FileHandle::Key("project/p/1".into())
+            FileHandle::key("project/p/1")
         );
         assert!(FileHandle::from_value(&json!("")).is_err());
 
@@ -1874,11 +2164,24 @@ mod tests {
             size_bytes: 9,
             filename: "d.pdf".into(),
             version: FIRST_FILE_VERSION,
+            link_secs: None,
         };
         assert_eq!(
             FileHandle::from_value(&key_file.to_value()).unwrap(),
-            FileHandle::Key("shared/team/2".into())
+            FileHandle::key("shared/team/2")
         );
+        // A value's own link lifetime rides on its handle, and on the wire
+        // only when it was set.
+        let lasting = StoredFile { link_secs: Some(7200), ..key_file.clone() };
+        assert_eq!(lasting.to_value()["__weft_blob__"]["linkSecs"], json!(7200));
+        assert!(key_file.to_value()["__weft_blob__"].get("linkSecs").is_none());
+        assert_eq!(
+            FileHandle::from_value(&lasting.to_value()).unwrap(),
+            FileHandle::Key { key: "shared/team/2".into(), link_secs: Some(7200) }
+        );
+        let mut torn = lasting.to_value();
+        torn["__weft_blob__"]["linkSecs"] = json!("soon");
+        assert!(FileHandle::from_value(&torn).is_err());
 
         // A url-backed marker is a Url handle, carrying the declared metadata.
         let url_file = json!({"__weft_image__": {
@@ -1920,7 +2223,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_and_presign_request_wire_shapes() {
+    fn keep_and_link_request_wire_shapes() {
         // Worker -> broker envelopes: exact wire, both directions.
         let keep = KeepRequest { key: "t/run/c/1".into(), ttl: KeepTtl::Secs { secs: 60 } };
         let v = serde_json::to_value(&keep).unwrap();
@@ -1929,21 +2232,22 @@ mod tests {
         assert_eq!(back.key, keep.key);
         assert_eq!(back.ttl, keep.ttl);
 
-        let reach = LinkReach::Caller { base: Some("http://127.0.0.1:14111".into()) };
-        let presign = PresignRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: reach.clone() };
-        let v = serde_json::to_value(&presign).unwrap();
+        let link = LinkRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: LinkReach::External };
+        let v = serde_json::to_value(&link).unwrap();
+        assert_eq!(v, json!({"key": "t/project/p/1", "ttlSecs": 900, "reach": "external"}));
+        let back: LinkRequest = serde_json::from_value(v).unwrap();
+        assert_eq!((back.key, back.ttl_secs, back.reach), (link.key, link.ttl_secs, link.reach));
+        // No lifetime named: the value's own default is asked for.
+        let bare: LinkRequest = serde_json::from_value(json!({"key": "k", "reach": "internal"})).unwrap();
+        assert_eq!((bare.ttl_secs, bare.reach), (None, LinkReach::Internal));
         assert_eq!(
-            v,
-            json!({"key": "t/project/p/1", "ttlSecs": 900, "reach": {"caller": {"base": "http://127.0.0.1:14111"}}})
+            serde_json::to_value(FileLink { url: "https://x/f".into(), public: false }).unwrap(),
+            json!({"url": "https://x/f", "public": false})
         );
-        let back: PresignRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.key, presign.key);
-        assert_eq!(back.ttl_secs, presign.ttl_secs);
-        assert_eq!(back.reach, reach);
-        // A caller no request stands behind names no base.
-        let unbased = serde_json::to_value(LinkReach::Caller { base: None }).unwrap();
-        assert_eq!(unbased, json!({"caller": {}}));
-        assert_eq!(serde_json::from_value::<LinkReach>(unbased).unwrap(), LinkReach::Caller { base: None });
+        let admin = AdminLinkRequest { key: "t/project/p/1".into(), ttl_secs: None, reader: LinkReader::Person };
+        assert_eq!(serde_json::to_value(&admin).unwrap(), json!({"key": "t/project/p/1", "reader": {"kind": "person"}}));
+        let outside = LinkReader::Outside { project: "p".into() };
+        assert_eq!(serde_json::to_value(&outside).unwrap(), json!({"kind": "outside", "project": "p"}));
 
         let replace = UploadReplaceRequest { key: "t/project/p/1".into(), declared_size: Some(12), expected_version: Some(4) };
         let v = serde_json::to_value(&replace).unwrap();
@@ -1956,20 +2260,17 @@ mod tests {
         // An overwrite names no version.
         let blind: UploadReplaceRequest = serde_json::from_value(json!({"key": "t/project/p/1"})).unwrap();
         assert_eq!(blind.expected_version, None);
-        // An older asker sends no reach: the internet, the strict one.
-        let bare: PresignRequest = serde_json::from_value(json!({"key": "t/project/p/1", "ttlSecs": null})).unwrap();
-        assert_eq!(bare.reach, LinkReach::Internet);
     }
 
     #[test]
     fn admin_envelope_wire_shapes() {
         // Dispatcher admin-proxy <-> broker envelopes: the camelCase renames are
         // the wire contract the CLI download handshake also reads verbatim.
-        let r = PresignResult { url: "https://b/x".into(), filename: "a.pdf".into(), size_bytes: 9 };
+        let r = PresignResult { url: "https://b/x".into(), filename: "a.pdf".into(), size_bytes: 9, version: 1, public: false };
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v, json!({"url": "https://b/x", "filename": "a.pdf", "sizeBytes": 9}));
+        assert_eq!(v, json!({"url": "https://b/x", "filename": "a.pdf", "sizeBytes": 9, "version": 1, "public": false}));
         let back: PresignResult = serde_json::from_value(v).unwrap();
-        assert_eq!(back.size_bytes, 9);
+        assert_eq!((back.size_bytes, back.version, back.public), (9, 1, false));
 
         let u = TenantUsage { stored_bytes: 42, file_count: 3 };
         let v = serde_json::to_value(&u).unwrap();

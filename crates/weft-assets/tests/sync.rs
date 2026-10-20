@@ -175,6 +175,7 @@ fn source_asset_references_include_nested_and_key_selected_files_but_not_generat
     let file = |key: String| StoredFile {
         key, mime_type: "image/png".into(), filename: "cat.png".into(), size_bytes: 3,
         version: weft_core::storage::FIRST_FILE_VERSION,
+        link_secs: None,
     }.to_value();
     let mut project: ProjectDefinition = serde_json::from_value(json!({
         "id": project_id,

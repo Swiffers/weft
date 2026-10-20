@@ -1,0 +1,4 @@
+[package]
+name = "e2e_one_binary"
+id = "00000000-0000-0000-0000-00000000b1d5"
+version = "0.1.0"

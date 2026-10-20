@@ -456,16 +456,19 @@ impl DisplayReader for StateReader {
 impl WaitReader for StateReader {
     async fn waits(&self, run: weft_core::RunId) -> Result<Vec<WaitAt>, String> {
         let signals = self.0.journal.signal_list_for_run_id(run).await.map_err(|e| format!("the run's waits: {e:#}"))?;
-        Ok(signals
-            .into_iter()
-            .filter(|s| s.is_resume && s.run_id == Some(run))
-            .map(|s| {
-                // The configured base, as for a trigger's display: the
-                // address is handed on to whoever answers the wait.
-                let address = s.public_url(self.0.external_base_url());
-                WaitAt { node: s.node_id, at: crate::api::signal::SignalLiveAt { token: s.token, address } }
-            })
-            .collect())
+        // The configured base, as for a trigger's display: the address is
+        // handed on to whoever answers the wait. Read only once a wait has
+        // an outside address.
+        let base = self.0.external_base();
+        let mut waits = Vec::new();
+        for s in signals.into_iter().filter(|s| s.is_resume && s.run_id == Some(run)) {
+            let address = match s.public_path() {
+                Some(path) => Some(base.url(&path).await.map_err(|e| format!("the run's waits: {e:#}"))?),
+                None => None,
+            };
+            waits.push(WaitAt { node: s.node_id, at: crate::api::signal::SignalLiveAt { token: s.token, address } });
+        }
+        Ok(waits)
     }
 
     async fn read(&self, at: &crate::api::signal::SignalLiveAt) -> NodeFeed {

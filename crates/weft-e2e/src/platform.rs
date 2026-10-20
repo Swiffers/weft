@@ -1,7 +1,7 @@
 //! The platform layer: a host-side, test-only window into what the SYSTEM does
 //! underneath a running program (which worker drives a run, what the
-//! runtime wrote in its log), plus the one lever a test needs to drive it:
-//! faking a worker crash.
+//! runtime wrote in its log), plus the levers a test needs to drive it:
+//! faking a worker crash, and deleting a build's image.
 //!
 //! ## Why this reaches behind the public API
 //!
@@ -64,29 +64,6 @@ impl Platform {
             .await
             .context("connect to the install's Postgres")?;
         Ok(Self { pool, install })
-    }
-
-    /// How many live PUBLIC RELAY file links point at one run's files: its
-    /// run's own (`<tenant>/run/<run_id>/...`) and its project's
-    /// (`<tenant>/project/<project>/...`, and the tenant's assets the project
-    /// references, `<tenant>/asset/<sha256>`).
-    /// A minted relay link (a media slot externalized as
-    /// `<base>/public/files/<token>`) leaves one row until it expires, so a
-    /// test that just externalized media can tell which path it took: rows
-    /// appeared = relay links; none = inline bytes (or the direct-bucket
-    /// path, which a local install never has). Only this run's, so a test
-    /// running beside it never changes the answer.
-    pub async fn public_file_link_count_for(&self, run_id: &Uuid, project: &Uuid) -> Result<i64> {
-        sqlx::query_scalar(
-            "SELECT count(*) FROM public_file_link \
-             WHERE key LIKE '%/' || $1 || '/%' OR key LIKE '%/' || $2 || '/%' \
-                OR key IN (SELECT key FROM asset_reference WHERE project_id = $2)",
-        )
-        .bind(run_id.to_string())
-        .bind(project.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .context("count public file links")
     }
 
     /// The replica that wrote the last row of a run's record: for an ended
@@ -167,6 +144,49 @@ impl Platform {
             .context("docker ps")?;
         anyhow::ensure!(out.status.success(), "docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
         Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+    }
+
+    /// The images the worker containers of `project_id` run, as the local
+    /// platform labelled them when it started each (the ref it ran).
+    pub async fn worker_images(&self, project_id: &Uuid) -> Result<Vec<String>> {
+        use weft_platform_local::docker::labels;
+        let mut images = Vec::new();
+        for name in self.workers_for_project(project_id).await? {
+            let out = tokio::process::Command::new("docker")
+                .args(["inspect", "--format", &format!("{{{{index .Config.Labels \"{}\"}}}}", labels::IMAGE), &name])
+                .output()
+                .await
+                .with_context(|| format!("docker inspect {name}"))?;
+            anyhow::ensure!(out.status.success(), "docker inspect {name} failed: {}", String::from_utf8_lossy(&out.stderr));
+            images.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+        images.sort();
+        images.dedup();
+        Ok(images)
+    }
+
+    /// The build a run runs on: the binary hash its worker image is
+    /// tagged with.
+    pub async fn run_binary_hash(&self, run_id: &Uuid) -> Result<String> {
+        let hash: Option<String> = sqlx::query_scalar("SELECT binary_hash FROM run WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("read the build a run runs on")?;
+        hash.ok_or_else(|| anyhow::anyhow!("run {run_id} names no build"))
+    }
+
+    /// Delete the image `image` from this machine, the way a cleanup
+    /// outside weft does (`docker rmi`), so no worker of it can start
+    /// again.
+    pub async fn remove_image(&self, image: &str) -> Result<()> {
+        let out = tokio::process::Command::new("docker")
+            .args(["rmi", "--force", image])
+            .output()
+            .await
+            .with_context(|| format!("docker rmi --force {image}"))?;
+        anyhow::ensure!(out.status.success(), "docker rmi --force {image} failed: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(())
     }
 
     /// Fake a worker crash: remove every worker container of `project_id`

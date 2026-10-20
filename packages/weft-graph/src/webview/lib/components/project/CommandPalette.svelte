@@ -62,6 +62,7 @@
 		{ id: "duplicate", label: "Duplicate Selected", icon: Copy, shortcut: "Ctrl+D" },
 		{ id: "delete", label: "Delete Selected", icon: Trash2, shortcut: "Del" },
 		{ id: "selectAll", label: "Select All Nodes", icon: CheckSquare, shortcut: "Ctrl+A" },
+		{ id: "selectTriggers", label: "Select All Triggers", icon: CheckSquare },
 		{ id: "fitView", label: "Fit View", icon: Maximize2 },
 		{ id: "autoOrganize", label: "Auto Organize Layout", icon: LayoutDashboard },
 	];

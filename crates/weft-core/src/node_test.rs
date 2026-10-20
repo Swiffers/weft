@@ -698,6 +698,17 @@ struct StoredEntry {
     bytes: bytes::Bytes,
 }
 
+/// A file a page uploaded through a slot ([`FakeRig::uploaded`]), and,
+/// once a run received it, that run and the key the file was stored
+/// under.
+struct UploadedEntry {
+    scope: crate::storage::StorageScope,
+    filename: String,
+    mime_type: String,
+    bytes: bytes::Bytes,
+    received: Option<(crate::RunId, String)>,
+}
+
 impl FakeState {
     /// `scope` with the run's own instance named: a `Instance { of: None }`
     /// in a run for no instance fails as it does in a real run.
@@ -738,6 +749,32 @@ impl FakeState {
             .collect();
         metas.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(metas)
+    }
+
+    /// Store `bytes` as a new file in `scope` (already resolved), with no
+    /// lifetime of its own.
+    fn insert_file(
+        &self,
+        scope: crate::storage::StorageScope,
+        filename: &str,
+        mime_type: &str,
+        bytes: bytes::Bytes,
+    ) -> crate::storage::StoredFile {
+        let key = self.mint_storage_key(&scope, filename);
+        let meta = crate::storage::StoredFileMeta {
+            key: key.clone(),
+            mime_type: mime_type.to_string(),
+            size_bytes: bytes.len() as u64,
+            filename: filename.to_string(),
+            keep: false,
+            expires_at_unix: None,
+            keep_ttl_secs: None,
+            created_at_unix: 0,
+            version: crate::storage::FIRST_FILE_VERSION,
+        };
+        let stored = crate::storage::StoredFile::from(&meta);
+        self.storage.lock().unwrap().insert(key, StoredEntry { scope, meta, bytes });
+        stored
     }
 
     /// A fresh key inside `scope` (already resolved).
@@ -824,6 +861,14 @@ struct FakeState {
     /// it minted: a second put of the same identity in the same scope
     /// answers that key and stores nothing, like the real service.
     identities: Mutex<Vec<((crate::storage::StorageScope, String), String)>>,
+    /// Whether the open internet opens the links the fake hands out
+    /// (`FakeRig::public_links`); off, as on a local install with no
+    /// tunnel, so a node shows what it does without one.
+    public_links: std::sync::atomic::AtomicBool,
+    /// Every upload slot the node asked for, in order.
+    slots: Mutex<Vec<crate::storage::slot::UploadSlotRequest>>,
+    /// The files pages uploaded, by slot ([`FakeRig::uploaded`]).
+    uploads: Mutex<HashMap<String, UploadedEntry>>,
     /// Every change a run made to a stored file (`ctx.storage().edit` /
     /// `replace`), in order: what production journals for the inspector.
     file_edits: Mutex<Vec<crate::storage::FileEdit>>,
@@ -955,6 +1000,9 @@ impl FakeState {
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
             identities: Mutex::new(Vec::new()),
+            public_links: std::sync::atomic::AtomicBool::new(false),
+            slots: Mutex::new(Vec::new()),
+            uploads: Mutex::new(HashMap::new()),
             file_edits: Mutex::new(Vec::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
@@ -1559,8 +1607,10 @@ impl FakeRig {
         let mut awaited_sequence =
             self.state.journal.lock().unwrap().get(&journal_key).cloned().unwrap_or_default();
         awaited_sequence.sort_by_key(|entry| entry.call_index);
+        let run_id = crate::RunId::new_v4();
         let handle = Arc::new(TestHandle {
             state: self.state.clone(),
+            run_id,
             capture: Capture::new(
                 outputs,
                 self.state.wired_outputs.lock().unwrap().clone(),
@@ -1574,7 +1624,7 @@ impl FakeRig {
             next_call_index: AtomicU32::new(0),
         });
         let instance = self.state.instance.lock().unwrap().clone();
-        let ctx = test_context(manifest, bag, instance, handle.clone());
+        let ctx = test_context(manifest, bag, instance, run_id, handle.clone());
         Ok((CaptureBox::Fake(handle), ctx, feeds))
     }
 
@@ -1598,27 +1648,8 @@ impl FakeRig {
         mime_type: &str,
         bytes: impl Into<Vec<u8>>,
     ) -> Value {
-        let bytes: Vec<u8> = bytes.into();
         let scope = self.state.resolve_scope(scope).expect("store_file_in: the scope names no instance");
-        let key = self.state.mint_storage_key(&scope, filename);
-        let meta = crate::storage::StoredFileMeta {
-            key: key.clone(),
-            mime_type: mime_type.to_string(),
-            size_bytes: bytes.len() as u64,
-            filename: filename.to_string(),
-            keep: false,
-            expires_at_unix: None,
-            keep_ttl_secs: None,
-            created_at_unix: 0,
-            version: crate::storage::FIRST_FILE_VERSION,
-        };
-        let stored = crate::storage::StoredFile::from(&meta);
-        self.state
-            .storage
-            .lock()
-            .unwrap()
-            .insert(key, StoredEntry { scope, meta, bytes: bytes::Bytes::from(bytes) });
-        stored.to_value()
+        self.state.insert_file(scope, filename, mime_type, bytes::Bytes::from(bytes.into())).to_value()
     }
 
     /// The metadata the run stored under `key` (from an emitted
@@ -1648,6 +1679,35 @@ impl FakeRig {
     /// inspector would show them (the file, the versions, the diff).
     pub fn file_edits(&self) -> Vec<crate::storage::FileEdit> {
         self.state.file_edits.lock().unwrap().clone()
+    }
+
+    /// Make the links the fake hands out ones the open internet opens
+    /// (`FileLink::public`), as on a cloud install or one with a tunnel.
+    /// Off by default.
+    pub fn public_links(&self) {
+        self.state.public_links.store(true, Ordering::SeqCst);
+    }
+
+    /// A page uploaded `bytes` through `slot` (any string written as a
+    /// slot, `weft-upload:<anything>`), landing in `scope` once a run
+    /// receives it: what `uploadFile` does before the page calls a route.
+    pub fn uploaded(&self, slot: &str, scope: crate::storage::StorageScope, filename: &str, mime_type: &str, bytes: impl Into<Vec<u8>>) {
+        assert!(crate::storage::slot::is_slot(slot), "'{slot}' is not written as an upload slot");
+        self.state.uploads.lock().unwrap().insert(
+            slot.to_string(),
+            UploadedEntry {
+                scope,
+                filename: filename.to_string(),
+                mime_type: mime_type.to_string(),
+                bytes: bytes::Bytes::from(bytes.into()),
+                received: None,
+            },
+        );
+    }
+
+    /// Every upload slot the node asked for, in order.
+    pub fn upload_slots(&self) -> Vec<crate::storage::slot::UploadSlotRequest> {
+        self.state.slots.lock().unwrap().clone()
     }
 
     /// The content stored under `key` (an emitted stored-file value's
@@ -1962,6 +2022,7 @@ fn test_context(
     manifest: &NodeMetadata,
     inputs: ValueBag,
     instance: Option<crate::instance::InstanceId>,
+    run_id: crate::RunId,
     handle: Arc<dyn ContextHandle>,
 ) -> RunContext {
     RunContext::new(
@@ -1969,7 +2030,7 @@ fn test_context(
         NODE_UNDER_TEST_ID.to_string(),
         manifest.node_type.clone(),
         None,
-        crate::RunId::new_v4(),
+        run_id,
         LoopFrames::default(),
         instance,
         inputs,
@@ -2239,6 +2300,9 @@ fn unsupported(what: &str) -> WeftError {
 /// binary is a real artifact.
 struct TestHandle {
     state: Arc<FakeState>,
+    /// The run this body belongs to (`ctx.run_id`): who receives an
+    /// upload.
+    run_id: crate::RunId,
     capture: Capture,
     declared_inputs: HashMap<String, WeftType>,
     wake: Option<Value>,
@@ -2893,29 +2957,121 @@ impl ContextHandle for TestHandle {
         }
     }
 
-    async fn storage_presign(&self, _key: &str, _ttl_secs: Option<u64>) -> WeftResult<String> {
-        Err(unsupported("presigned URLs (there is no real bucket behind the fake)"))
-    }
-
-    async fn storage_public_link(
+    /// A link to a file the fake stores: one straight to the fake
+    /// store for node code, one under [`FAKE_LINK_BASE`] for the outside,
+    /// public only once the test said so (`FakeRig::public_links`). A
+    /// lifetime past seven days is refused, as the real store refuses it.
+    async fn storage_link(
         &self,
         key: &str,
-        _ttl_secs: Option<u64>,
+        ttl_secs: Option<u64>,
         reach: crate::storage::LinkReach,
-    ) -> WeftResult<Option<String>> {
-        match reach {
-            // The honest answer for a store nobody on the internet can
-            // reach: no public link. Callers (externalize) fall back to
-            // inline bytes.
-            crate::storage::LinkReach::Internet => Ok(None),
-            // A caller of the fake install: on the address its request
-            // came in on (the attached caller's `base_url`), else a stable
-            // fake address, so a test can assert the link a door hands out.
-            crate::storage::LinkReach::Caller { base } => Ok(Some(format!(
-                "{}/public/files/{key}",
-                base.as_deref().unwrap_or(FAKE_CALLER_LINK_BASE)
-            ))),
+    ) -> WeftResult<crate::storage::LinkAnswer> {
+        let file = self
+            .state
+            .storage
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|entry| entry.meta.clone())
+            .ok_or_else(|| WeftError::NodeFailed(format!("fake storage holds no file at key '{key}'")))?;
+        let ttl = crate::storage::checked_link_secs(ttl_secs.unwrap_or(crate::storage::DEFAULT_LINK_SECS))
+            .map_err(WeftError::NodeFailed)?;
+        let link = match reach {
+            crate::storage::LinkReach::Internal => crate::storage::FileLink { url: format!("{FAKE_STORE_BASE}/{key}?ttl={ttl}"), public: false },
+            crate::storage::LinkReach::External => crate::storage::FileLink {
+                url: format!("{FAKE_LINK_BASE}/files/{key}?ttl={ttl}"),
+                public: self.state.public_links.load(Ordering::SeqCst),
+            },
+        };
+        Ok(crate::storage::LinkAnswer { link, file })
+    }
+
+    async fn storage_copy(
+        &self,
+        scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
+        key: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        let (meta, bytes) = {
+            let store = self.state.storage.lock().unwrap();
+            let entry = store.get(key).ok_or_else(|| WeftError::NodeFailed(format!("fake storage holds no file at key '{key}'")))?;
+            (entry.meta.clone(), entry.bytes.clone())
+        };
+        self.storage_put(scope, identity, crate::storage::bytes_stream(bytes), &meta.mime_type, &meta.filename, keep, None)
+            .await
+    }
+
+    async fn storage_upload_slot(&self, request: &crate::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        request.validate().map_err(WeftError::Input)?;
+        let mut slots = self.state.slots.lock().unwrap();
+        slots.push(request.clone());
+        Ok(format!("{}fake-{}", crate::storage::slot::SLOT_PREFIX, slots.len()))
+    }
+
+    /// The files pages uploaded through the claims' slots
+    /// (`FakeRig::uploaded`), each stored in its slot's scope the first
+    /// time as the type its `fits` takes it, as the real store answers:
+    /// the run that received a file asking again gets the same file when
+    /// it fits there as that same type; a file that does not fit, a slot
+    /// nothing was uploaded through, or one another run received is
+    /// refused. Every claim is checked before any file is received, so one
+    /// refusal leaves every file of the call unreceived.
+    async fn storage_claim_uploads(&self, claims: &[(&str, &crate::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
+        /// What one claim comes to, once every claim was checked.
+        enum Planned {
+            /// Received before, by this run: that file.
+            Again(Value),
+            /// Received now, stored in this scope as this type.
+            New { scope: crate::storage::StorageScope, mime: String },
+            /// A slot an earlier claim of this call receives.
+            Repeat,
         }
+        let does_not_fit = |slot: &str, why: String| WeftError::Input(format!("the file uploaded through '{slot}' does not fit here: {why}"));
+        let mut uploads = self.state.uploads.lock().unwrap();
+        let mut received_now: HashMap<&str, String> = HashMap::new();
+        let mut planned = Vec::with_capacity(claims.len());
+        for (slot, fits) in claims {
+            let upload = uploads
+                .get(*slot)
+                .ok_or_else(|| WeftError::Input(format!("nothing was uploaded through '{slot}'")))?;
+            if let Some((run, key)) = &upload.received {
+                if *run != self.run_id {
+                    return Err(WeftError::Input(format!("the file uploaded through '{slot}' was received by another run")));
+                }
+                let store = self.state.storage.lock().unwrap();
+                let entry = store.get(key).ok_or_else(|| WeftError::NodeFailed(format!("fake storage holds no file at key '{key}'")))?;
+                crate::storage::fits_as_handed_over(&entry.meta.mime_type, fits).map_err(|why| does_not_fit(slot, why))?;
+                planned.push(Planned::Again(crate::storage::StoredFile::from(&entry.meta).to_value()));
+            } else if let Some(mime) = received_now.get(*slot) {
+                crate::storage::fits_as_handed_over(mime, fits).map_err(|why| does_not_fit(slot, why))?;
+                planned.push(Planned::Repeat);
+            } else {
+                let mime = crate::storage::fit_mime(&upload.mime_type, fits).map_err(|why| does_not_fit(slot, why))?;
+                let scope = self.state.resolve_scope(&upload.scope)?;
+                received_now.insert(slot, mime.clone());
+                planned.push(Planned::New { scope, mime });
+            }
+        }
+        let mut files = Vec::with_capacity(claims.len());
+        for ((slot, _), plan) in claims.iter().zip(planned) {
+            let upload = uploads.get_mut(*slot).expect("checked above");
+            files.push(match plan {
+                Planned::Again(file) => file,
+                Planned::New { scope, mime } => {
+                    let stored = self.state.insert_file(scope, &upload.filename, &mime, upload.bytes.clone());
+                    upload.received = Some((self.run_id, stored.key.clone()));
+                    stored.to_value()
+                }
+                Planned::Repeat => {
+                    let (_, key) = upload.received.as_ref().expect("received by an earlier claim of this call");
+                    let store = self.state.storage.lock().unwrap();
+                    crate::storage::StoredFile::from(&store[key].meta).to_value()
+                }
+            });
+        }
+        Ok(files)
     }
 
     fn wake_payload(&self) -> Option<&Value> {
@@ -3073,9 +3229,14 @@ const SETUP_TRIGGER_BODY: &str = "setup_trigger";
 /// it, so a drifted copy would silently blind the watchdog.
 pub const NODE_UNDER_TEST_ID: &str = "node-under-test";
 
-/// The base the fake rig mints caller links under (`StorageHandle::
-/// caller_link`): a stable address a test asserts against.
-pub const FAKE_CALLER_LINK_BASE: &str = "https://fake-weft.test";
+/// The base the fake rig's external links go under
+/// (`StorageHandle::external_link`): a stable address a test asserts
+/// against.
+pub const FAKE_LINK_BASE: &str = "https://fake-weft.test";
+
+/// Where the fake rig's internal links point
+/// (`StorageHandle::internal_link`).
+pub const FAKE_STORE_BASE: &str = "http://fake-store.test";
 
 /// The firing id every [`HandleRole::Harness`] handle runs as, keeping
 /// the test code's own waits out of the watchdog's picture.
@@ -3319,7 +3480,7 @@ impl LiveRig {
             ),
             declared_inputs: declared_input_map(manifest, &custom),
         });
-        let ctx = test_context(manifest, bag, None, handle.clone());
+        let ctx = test_context(manifest, bag, None, crate::RunId::new_v4(), handle.clone());
         let run_id = ctx.run_id;
         let result = node.run(ctx).await;
         RigOutcome { run_id: Some(run_id), ..CaptureBox::Live(handle).into_outcome(result) }
@@ -3563,17 +3724,31 @@ impl ContextHandle for CapturingHandle {
         self.inner.storage_keep(key, ttl).await
     }
 
-    async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
-        self.inner.storage_presign(key, ttl_secs).await
-    }
-
-    async fn storage_public_link(
+    async fn storage_link(
         &self,
         key: &str,
         ttl_secs: Option<u64>,
         reach: crate::storage::LinkReach,
-    ) -> WeftResult<Option<String>> {
-        self.inner.storage_public_link(key, ttl_secs, reach).await
+    ) -> WeftResult<crate::storage::LinkAnswer> {
+        self.inner.storage_link(key, ttl_secs, reach).await
+    }
+
+    async fn storage_copy(
+        &self,
+        scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
+        key: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.inner.storage_copy(scope, identity, key, keep).await
+    }
+
+    async fn storage_upload_slot(&self, request: &crate::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        self.inner.storage_upload_slot(request).await
+    }
+
+    async fn storage_claim_uploads(&self, claims: &[(&str, &crate::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
+        self.inner.storage_claim_uploads(claims).await
     }
 
     fn wake_payload(&self) -> Option<&Value> {
@@ -3640,6 +3815,186 @@ mod tests {
             ctx.pulse_downstream(NodeOutput::new().set("reply", resp).set("done", true))
                 .await
         }
+    }
+
+    /// A node that receives the upload its `slot` input names into a
+    /// place of type `fits`, then again into one of type `fitsAgain`, in
+    /// one run.
+    struct ClaimTwiceNode;
+
+    impl crate::node::NodeManifest for ClaimTwiceNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "ClaimTwice",
+                    "label": "Claim twice",
+                    "description": "test-only node",
+                    "inputs": [
+                        {"name": "slot", "type": "String"},
+                        {"name": "fits", "type": "String"},
+                        {"name": "fitsAgain", "type": "String"}
+                    ],
+                    "outputs": [
+                        {"name": "key", "type": "String"},
+                        {"name": "same", "type": "Boolean"}
+                    ]
+                }))
+                .expect("claim manifest")
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Node for ClaimTwiceNode {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let slot: String = ctx.inputs.get("slot")?;
+            let fits: String = ctx.inputs.get("fits")?;
+            let fits_again: String = ctx.inputs.get("fitsAgain")?;
+            let fits = WeftType::parse(&fits).expect("a test type");
+            let fits_again = WeftType::parse(&fits_again).expect("a test type");
+            let storage = ctx.storage(crate::storage::StorageScope::Run);
+            let first = crate::storage::StoredFile::from_value(&storage.claim_upload(&slot, &fits).await?)?;
+            let again = crate::storage::StoredFile::from_value(&storage.claim_upload(&slot, &fits_again).await?)?;
+            ctx.pulse_downstream(NodeOutput::new().set("key", first.key.clone()).set("same", first == again)).await
+        }
+    }
+
+    /// The fake receives an upload as the real store does: a file that
+    /// does not fit is refused and stays unreceived, the run that received
+    /// it gets the same file again, and another run is refused.
+    #[tokio::test]
+    async fn fake_rig_receives_an_upload_once_per_run_where_it_fits() {
+        let rig = FakeRig::new();
+        let project = crate::storage::StorageScope::Project;
+        rig.uploaded("weft-upload:a", project.clone(), "clip.mp4", "video/mp4", b"clip".to_vec());
+        let claim = |fits: &str| json!({"slot": "weft-upload:a", "fits": fits, "fitsAgain": fits});
+
+        let refused = rig.run(&ClaimTwiceNode, claim("Image")).await.result.expect_err("a video is no image");
+        assert!(matches!(refused, WeftError::Input(_)), "{refused:?}");
+        assert!(refused.to_string().contains("not the Image"), "{refused}");
+        assert!(rig.stored_files(&project).unwrap().is_empty(), "the refused file was not received");
+
+        let outcome = rig.run(&ClaimTwiceNode, claim("Video")).await.ok().expect("received where it fits");
+        assert_eq!(outcome.outputs["same"], json!(true), "the same run gets the same file");
+        let key = outcome.outputs["key"].as_str().unwrap().to_string();
+        assert_eq!(rig.stored_bytes(&key).unwrap().as_ref(), b"clip");
+        assert_eq!(rig.stored_files(&project).unwrap().len(), 1, "received once");
+
+        let refused = rig.run(&ClaimTwiceNode, claim("Video")).await.result.expect_err("another run");
+        assert!(matches!(refused, WeftError::Input(_)), "{refused:?}");
+        assert!(refused.to_string().contains("another run"), "{refused}");
+    }
+
+    /// A node that receives every upload its `slots` input names, each
+    /// into a place of the type at the same position in `fits`, in one
+    /// claim.
+    struct ClaimAllNode;
+
+    impl crate::node::NodeManifest for ClaimAllNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "ClaimAll",
+                    "label": "Claim all",
+                    "description": "test-only node",
+                    "inputs": [
+                        {"name": "slots", "type": "List[String]"},
+                        {"name": "fits", "type": "List[String]"}
+                    ],
+                    "outputs": [
+                        {"name": "keys", "type": "List[String]"}
+                    ]
+                }))
+                .expect("claim-all manifest")
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Node for ClaimAllNode {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let slots: Vec<String> = ctx.inputs.get("slots")?;
+            let fits: Vec<String> = ctx.inputs.get("fits")?;
+            let fits: Vec<WeftType> = fits.iter().map(|t| WeftType::parse(t).expect("a test type")).collect();
+            let claims: Vec<(&str, &WeftType)> = slots.iter().map(String::as_str).zip(fits.iter()).collect();
+            let files = ctx.storage(crate::storage::StorageScope::Run).claim_uploads(&claims).await?;
+            let keys = files
+                .iter()
+                .map(|file| crate::storage::StoredFile::from_value(file).map(|f| f.key))
+                .collect::<WeftResult<Vec<_>>>()?;
+            ctx.pulse_downstream(NodeOutput::new().set("keys", keys)).await
+        }
+    }
+
+    /// One refused slot of a claim leaves every slot of it unreceived, so
+    /// a corrected call (another run) receives them all; a slot claimed
+    /// twice in one call is one file.
+    #[tokio::test]
+    async fn fake_rig_receives_the_uploads_of_one_claim_together_or_not_at_all() {
+        let rig = FakeRig::new();
+        let project = crate::storage::StorageScope::Project;
+        rig.uploaded("weft-upload:a", project.clone(), "clip.mp4", "video/mp4", b"clip".to_vec());
+        rig.uploaded("weft-upload:b", project.clone(), "photo.png", "image/png", b"photo".to_vec());
+
+        let refused = rig
+            .run(&ClaimAllNode, json!({"slots": ["weft-upload:a", "weft-upload:b"], "fits": ["Video", "Audio"]}))
+            .await
+            .result
+            .expect_err("a photo is no audio");
+        assert!(matches!(refused, WeftError::Input(_)), "{refused:?}");
+        assert!(refused.to_string().contains("weft-upload:b"), "the refusal names the slot: {refused}");
+        assert!(rig.stored_files(&project).unwrap().is_empty(), "the video that fit was not received either");
+
+        let outcome = rig
+            .run(&ClaimAllNode, json!({"slots": ["weft-upload:a", "weft-upload:b", "weft-upload:a"], "fits": ["Video", "Image", "Media"]}))
+            .await
+            .ok()
+            .expect("the corrected call receives both");
+        let keys = outcome.outputs["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], keys[2], "the same slot twice is the same file");
+        assert_eq!(rig.stored_bytes(keys[0].as_str().unwrap()).unwrap().as_ref(), b"clip");
+        assert_eq!(rig.stored_bytes(keys[1].as_str().unwrap()).unwrap().as_ref(), b"photo");
+        assert_eq!(rig.stored_files(&project).unwrap().len(), 2, "each received once");
+    }
+
+    /// The fake stores a received upload as the type its place takes it
+    /// (a WebM received for an Audio place is `audio/webm`), and the same
+    /// run asking again for a place it fits only as the other half of its
+    /// container is refused: one file is one type.
+    #[tokio::test]
+    async fn fake_rig_receives_a_container_as_the_half_its_place_takes() {
+        let rig = FakeRig::new();
+        let project = crate::storage::StorageScope::Project;
+        rig.uploaded("weft-upload:a", project.clone(), "voice.webm", "video/webm", b"voice".to_vec());
+        let outcome = rig
+            .run(&ClaimTwiceNode, json!({"slot": "weft-upload:a", "fits": "Audio", "fitsAgain": "Media"}))
+            .await
+            .ok()
+            .expect("an audio place, then a place taking audio");
+        assert_eq!(outcome.outputs["same"], json!(true));
+        let stored = rig.stored_files(&project).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].mime_type, "audio/webm", "stored as the half its place takes");
+
+        rig.uploaded("weft-upload:b", project.clone(), "voice.webm", "video/webm", b"voice".to_vec());
+        let refused = rig
+            .run(&ClaimTwiceNode, json!({"slot": "weft-upload:b", "fits": "Audio", "fitsAgain": "Video"}))
+            .await
+            .result
+            .expect_err("received as audio, then asked for as video");
+        assert!(matches!(refused, WeftError::Input(_)), "{refused:?}");
+        assert!(refused.to_string().contains("takes it only as video/webm"), "{refused}");
+
+        rig.uploaded("weft-upload:c", project.clone(), "clip.mp4", "video/mp4", b"clip".to_vec());
+        let refused = rig
+            .run(&ClaimTwiceNode, json!({"slot": "weft-upload:c", "fits": "Video", "fitsAgain": "Image"}))
+            .await
+            .result
+            .expect_err("a video, then asked for as an image");
+        assert!(refused.to_string().contains("not the Image"), "{refused}");
     }
 
     /// The happy path: canned route answers, request recorded with its
@@ -3813,7 +4168,7 @@ mod tests {
                 .await?;
             let handle = crate::storage::FileHandle::from_value(&put)?;
             let replaced = storage.replace(&handle, &b"version two"[..]).await?;
-            let link = storage.caller_link(&handle, None).await?;
+            let link = storage.external_link(&handle).await?.url;
             ctx.pulse_downstream(
                 NodeOutput::new().set("reply", json!({"put": put, "replaced": replaced, "link": link})),
             )
@@ -3822,7 +4177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_rig_replaces_in_place_expires_anywhere_and_links_on_the_callers_address() {
+    async fn fake_rig_replaces_in_place_expires_anywhere_and_links_under_its_base() {
         let rig = FakeRig::new();
         let conn = crate::caller::FakeCallerConnection::connected(crate::caller::CallerRuntimeConfig {
             protocol: crate::signal::Protocol::Http,
@@ -3855,8 +4210,8 @@ mod tests {
         assert_eq!(rig.stored_files(&crate::storage::StorageScope::Project).unwrap().len(), 1);
         assert_eq!(
             reply["link"],
-            json!(format!("http://127.0.0.1:14111/public/files/{}", put.key)),
-            "the link rides the address the caller came in on"
+            json!(format!("{FAKE_LINK_BASE}/files/{}?ttl={}", put.key, crate::storage::DEFAULT_LINK_SECS)),
+            "the link is the install's, whatever address the caller came in on"
         );
     }
 

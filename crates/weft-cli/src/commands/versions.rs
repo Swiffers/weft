@@ -2,8 +2,8 @@
 //! the run spec on disk, the tree as the dispatcher answers it, and the
 //! pure comparison of two runs' wires. The verbs themselves are one
 //! file each (`checkpoint`, `branch`, `tree`, `diff`, `freeze`,
-//! `examples`, `prune`, `wake`); `run` and `activate` snapshot
-//! through here too.
+//! `examples`, `prune`, `wake`); what a command reads and publishes as a
+//! version is `snapshot::Snapshot`, over the files [`covers`] names.
 //!
 //! A snapshot covers the files that make the program: every `*.weft`
 //! (an `@include`d file is program text), `weft.toml`, `src/**` (the
@@ -14,7 +14,8 @@
 //! `assets/**`, and `examples/**` (a branch back restores the examples
 //! that existed then). NOT `layouts/`: a canvas drag is not a version,
 //! for the same reason the definition hash ignores it. The blobs go
-//! through `weft_assets::publish_files` into the tenant's assets, so a
+//! through `weft_assets::publish_hashed` into the tenant's assets
+//! (`snapshot::Snapshot::publish`), so a
 //! file identical to one any version of any of the tenant's projects held
 //! (or the standard library the install preloads) costs nothing.
 
@@ -127,12 +128,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         if path.is_dir() && !is_symlink {
             // Prune whole trees the rule never covers, so a large
             // `.weft/target` is never walked.
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            // A `target/` directory is Cargo's output exactly when a
-            // `Cargo.toml` sits beside it. That is a fact about the
-            // disk, not about the path, which is why the pure `covers`
-            // rule cannot make this call and the walk does.
-            let cargo_output = name == "target" && dir.join("Cargo.toml").is_file();
+            let cargo_output = is_cargo_output(&path);
             // Pruning asks `covers` about the directory as a path, so
             // the two cannot disagree: spelled out again here, `.weft`
             // without its slash also pruned a folder called
@@ -174,6 +170,31 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the directory at `dir` is Cargo's build output: a `target/`
+/// with a `Cargo.toml` beside it. A fact about the disk, not the path,
+/// which is why the pure [`covers`] cannot make this call and the walk
+/// does.
+fn is_cargo_output(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name == "target") && dir.parent().is_some_and(|parent| parent.join("Cargo.toml").is_file())
+}
+
+/// Whether the walk takes the file at `rel` (project-relative, forward
+/// slashes) into a version: [`covers`] says so, and no folder on its way
+/// is Cargo's build output. The one answer to "is this a version's file"
+/// for a path the walk did not list itself.
+pub fn walk_takes(root: &Path, rel: &str) -> bool {
+    if !covers(rel) {
+        return false;
+    }
+    let mut dir = root.to_path_buf();
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    parts.into_iter().all(|part| {
+        dir.push(part);
+        !is_cargo_output(&dir)
+    })
+}
+
 /// Whether a DIRECTORY holds nothing a version covers, so the walk can
 /// skip it whole.
 ///
@@ -188,32 +209,33 @@ fn prunes_whole_tree(rel: &str) -> bool {
     !covers(&format!("{rel}/x.weft")) && !covers(&format!("{rel}/x"))
 }
 
-/// The manifest of the project as it is on disk, without publishing
-/// anything: what `branch` compares against head to see a dirty tree.
-pub fn local_manifest(project: &Project) -> Result<Manifest> {
-    let paths = covered_paths(&project.root)?;
-    let source = crate::commands::assets::DiskSource::new(project.root.clone());
+/// The manifest of the project at `root` as it is on disk, without
+/// publishing anything: what `branch` compares against head to see a dirty
+/// tree, and what a command's snapshot is compared against once it is done
+/// (`snapshot::Snapshot::changed_on_disk`).
+///
+/// A file deleted between the walk and its read is one the disk no
+/// longer has ([`open_covered`]), as it would be a moment later.
+pub fn local_manifest(root: &Path) -> Result<Manifest> {
     let mut manifest = Manifest::new();
-    for hashed in weft_assets::hash_files(&paths, &source)? {
-        manifest.insert(hashed.path, hashed.hash);
+    for rel in covered_paths(root)? {
+        let Some(file) = open_covered(root, &rel)? else { continue };
+        let (hash, _) = weft_assets::hash_reader(file).with_context(|| format!("read {}", root.join(&rel).display()))?;
+        manifest.insert(rel, hash);
     }
     Ok(manifest)
 }
 
-/// Snapshot the project: publish every covered file into the tenant's
-/// assets and answer the manifest a version records. `tell` says on
-/// stderr how far the uploads have got (never under `--json`, whose
-/// output is the program's).
-pub async fn snapshot(client: &DispatcherClient, project: &Project, tell: bool) -> Result<Manifest> {
-    let paths = covered_paths(&project.root)?;
-    let source = crate::commands::assets::DiskSource::new(project.root.clone());
-    let store = if tell {
-        crate::commands::assets::DispatcherStore::telling(client)
-    } else {
-        crate::commands::assets::DispatcherStore::new(client)
-    };
-    let published = weft_assets::publish_files(&paths, &source, &store).await.context("publish the version's files")?;
-    Ok(published.into_iter().map(|(path, p)| (path, p.hash)).collect())
+/// Open the covered file `rel` under `root` for one read, `None` when it
+/// was deleted since the walk named it ([`covered_paths`]): another person
+/// or agent removing a file mid-walk is the disk changing, not an error.
+pub fn open_covered(root: &Path, rel: &str) -> Result<Option<std::fs::File>> {
+    let path = root.join(rel);
+    match std::fs::File::open(&path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 // ----- the tree as the dispatcher answers it -----------------------------
@@ -318,8 +340,14 @@ pub fn spec_path(project: &Project, name: &str) -> PathBuf {
 /// file itself for anything ending in `.json` (a path, relative to the
 /// project root or absolute).
 pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
+    read_spec_from(project, name, &|path| std::fs::read_to_string(path))
+}
+
+/// [`read_spec`] with the file read by `read` (a command's snapshot, then
+/// the disk: the example a run uses is the one its version holds).
+pub fn read_spec_from(project: &Project, name: &str, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Result<RunSpec> {
     let path = spec_file_path(project, name);
-    read_spec_if_present(project, name)?
+    read_spec_if_present_from(project, name, read)?
         .with_context(|| format!("no spec at {}", path.display()))
 }
 
@@ -367,8 +395,17 @@ fn spec_file_path(project: &Project, name: &str) -> PathBuf {
 /// read or parse is an error: treating it as "nothing here" lets the
 /// caller write over a spec whose only problem was a typo in it.
 pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunSpec>> {
+    read_spec_if_present_from(project, name, &|path| std::fs::read_to_string(path))
+}
+
+/// [`read_spec_if_present`] with the file read by `read` ([`read_spec_from`]).
+pub fn read_spec_if_present_from(
+    project: &Project,
+    name: &str,
+    read: &dyn Fn(&Path) -> std::io::Result<String>,
+) -> Result<Option<RunSpec>> {
     let path = spec_file_path(project, name);
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
@@ -416,14 +453,17 @@ pub fn validate_example_name(name: &str) -> Result<()> {
     bail!("an example needs a name (a word, not a path or a directory): `weft freeze <name>`")
 }
 
-pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<PathBuf> {
+/// Write `spec` as `examples/<name>.json`, answering where and the text
+/// written (a command that wrote it keeps it in its snapshot,
+/// `snapshot::Snapshot::record`).
+pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<(PathBuf, String)> {
     validate_example_name(&spec.name)?;
     let path = spec_path(project, &spec.name);
     std::fs::create_dir_all(examples_dir(project))?;
     let mut text = serde_json::to_string_pretty(spec)?;
     text.push('\n');
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+    std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
+    Ok((path, text))
 }
 
 /// Every spec in `examples/`, by name, sorted, plus the files in there
@@ -784,7 +824,7 @@ fn replace_stored(value: Value, hashes: &BTreeMap<String, String>) -> Value {
 /// The storage key a stored-file marker carries, if `value` is one.
 fn stored_key(value: &Value) -> Option<String> {
     if let Ok(weft_core::storage::media::MediaSlotContent::Stored {
-        handle: weft_core::storage::FileHandle::Key(key), ..
+        handle: weft_core::storage::FileHandle::Key { key, .. }, ..
     }) = weft_core::storage::media::classify_media_slot(value)
     {
         return Some(key);

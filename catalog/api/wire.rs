@@ -13,9 +13,10 @@
 //!
 //! Bytes never travel a wire: a picture a caller sends inside a JSON
 //! body (a `data:` URL or bare base64 in a place declared as a file
-//! kind) is stored on the way in and the stored-file value is what
-//! flows ([`take_inbound`]); a stored file inside a JSON answer goes
-//! out as a link the caller can fetch ([`link_files`]).
+//! kind) is stored on the way in, a file the page uploaded through a
+//! slot (`weft-upload:<slot>`) is received, and the stored-file value is
+//! what flows ([`take_inbound`]); a file inside a JSON answer
+//! goes out as a link the caller can fetch ([`link_files`]).
 //!
 //! One place, so the four nodes agree and a fifth node an author writes
 //! can reuse it.
@@ -25,6 +26,7 @@ use serde_json::Value;
 use weft::caller::{InboundMessage, LiveRequest, OutboundChunk, ResponseHead};
 use weft::signal::DataType;
 use weft::storage::{FileHandle, StorageScope, StoredFile};
+use weft::weft_type::FileKind;
 use weft::{RunContext, WeftError, WeftResult, WeftType};
 
 /// The opening request the trigger woke on, out of the wake payload.
@@ -66,7 +68,7 @@ pub fn request_ports(trigger: &weft::NodeMetadata, request: &LiveRequest) -> Vec
 }
 
 /// A port value as the wire wants it for `data_type`. A JSON value's
-/// stored files go out as links (see [`link_files`]).
+/// files go out as links (see [`link_files`]).
 pub async fn chunk_for(
     ctx: &RunContext,
     data_type: DataType,
@@ -93,7 +95,7 @@ pub async fn chunk_for(
             })?;
             let (_, bytes) = ctx
                 .storage(StorageScope::Run)
-                .get_bytes(&FileHandle::Key(file.key))
+                .get_bytes(&FileHandle::key(file.key))
                 .await?;
             Ok(OutboundChunk::Bytes(bytes.to_vec()))
         }
@@ -151,7 +153,13 @@ pub async fn take_message(
 /// bytes are held to the kinds their place declares (base64 of a video
 /// in an `Image` or `Image | Null` field is refused), and stored under
 /// the type a `data:` link states, or the one the bytes announce when
-/// none was stated.
+/// none was stated. A file-typed place may instead hold an upload slot
+/// (`weft-upload:<slot>`) the page sent a file through
+/// (`uploadFile` in `@weft/connect`): this run receives that file in the
+/// scope the slot named, after the store checks it fits the place. Every
+/// upload of one value is received together or none is: a refusal of any
+/// of them (a file that does not fit its place, a slot that ended)
+/// receives none, so every slot stays open for a corrected call.
 ///
 /// A caller never hands over a stored-file value itself: a marker
 /// names a key or a URL, and taking one on the caller's word would let
@@ -172,7 +180,18 @@ pub async fn take_inbound(
             "{name} carries a stored-file object; send a file's bytes as a data: URL or base64 instead"
         )));
     }
-    let mut stored = std::collections::HashMap::new();
+    // Four steps, so a refusal leaves nothing behind: every inline
+    // picture is decoded and checked first, then the whole value is held
+    // to the type with a stand-in file in every file place (nothing
+    // written yet, so a wrong field or a missing key refuses the call
+    // with every slot still open), then every upload is received in ONE
+    // claim (the broker receives them all or none, so a refused one
+    // leaves the others open too), and only then are the decoded pictures
+    // stored. A bad picture never follows an upload this run already
+    // received.
+    let mut uploads = Vec::new();
+    let mut inline = Vec::new();
+    let mut stand_ins = std::collections::HashMap::new();
     for weft::storage::media::TypedSlot { at, value: slot, ty: slot_ty } in
         weft::storage::media::typed_media_slots(&value, declared)
     {
@@ -185,6 +204,14 @@ pub async fn take_inbound(
             // to the type with the rest of the value just below.
             _ => continue,
         };
+        if weft::storage::slot::is_slot(text) {
+            // The broker answers the kind the bytes are, among the ones
+            // the place admits; any of them stands in for it here.
+            let kind = *slot_ty.admitted_file_kinds().first().expect("a file place admits a file kind");
+            stand_ins.insert(slot.to_string(), stand_in(kind));
+            uploads.push((place, text.clone(), slot_ty));
+            continue;
+        }
         let (mime, bytes) = match decode_inline(text) {
             Ok(decoded) => decoded,
             Err(why) => {
@@ -201,11 +228,42 @@ pub async fn take_inbound(
                 )))
             }
         };
+        stand_ins.insert(slot.to_string(), stand_in(FileKind::from_mime(&mime)));
+        inline.push((text.clone(), mime, bytes));
+    }
+    if let Err(why) = declared.validate_value(&weft::storage::media::substitute_media(&value, declared, &stand_ins)) {
+        return Ok(Err(format!("{name} does not fit {declared}: {why}")));
+    }
+    let claims: Vec<(&str, &WeftType)> = uploads.iter().map(|(_, slot, slot_ty)| (slot.as_str(), slot_ty)).collect();
+    let received = match ctx.storage(StorageScope::Run).claim_uploads(&claims).await {
+        Ok(received) => received,
+        // A slot that is no good (forged, ended, another project's,
+        // received by another run, nothing uploaded, a file that does not
+        // fit its place) is the caller's to fix, said in the store's own
+        // words (they name the slot, never a key), beside every place
+        // that named an upload, since none of them was received.
+        Err(WeftError::Input(refused)) => {
+            let places: Vec<&str> = uploads.iter().map(|(place, _, _)| place.as_str()).collect();
+            return Ok(Err(format!("{}: the uploads named cannot be received, so none was: {refused}", places.join(", "))))
+        }
+        Err(failed) => return Err(failed),
+    };
+    let mut stored: std::collections::HashMap<String, Value> =
+        uploads.iter().map(|(_, slot, _)| Value::String(slot.clone()).to_string()).zip(received).collect();
+    for (text, mime, bytes) in inline {
         let file = ctx.storage(StorageScope::Run).put(bytes, &mime, name, None).await?;
-        stored.insert(slot.to_string(), file);
+        stored.insert(Value::String(text).to_string(), file);
     }
     let value = weft::storage::media::substitute_media(&value, declared, &stored);
     Ok(declared.conform_value(value).map_err(|why| format!("{name} does not fit {declared}: {why}")))
+}
+
+/// What stands in a file place while [`take_inbound`] holds the value to
+/// its type before anything is stored: a stored-file value of `kind`
+/// naming no file, which the type judges like the one that will take its
+/// place.
+fn stand_in(kind: FileKind) -> Value {
+    WeftType::file_marker(kind, serde_json::json!({ "key": "", "mimeType": "" }))
 }
 
 /// The bytes an inline picture carries, and the media type when it said
@@ -224,34 +282,38 @@ fn decode_inline(text: &str) -> Result<(Option<String>, Vec<u8>), String> {
     Ok((None, bytes))
 }
 
-/// Every stored file inside a JSON answer, replaced by what a caller can
-/// use: `{ "url", "mimeType", "filename", "sizeBytes" }`, the url being a
-/// link this install serves the caller (a browser follows it straight
-/// into an `<img>`). Walks lists and objects, so a file nested in a row
-/// is linked too. A file the install cannot mint a link for fails the
-/// node: an answer with no way to the bytes is not an answer.
+/// Every file inside a JSON answer, replaced by what a caller can use:
+/// `{ "url", "mimeType", "filename", "sizeBytes" }`, the url being the
+/// file's external link (a browser follows it straight into an `<img>`
+/// or a `<video>`, which can seek). A stored file answered again soon
+/// gets the same link, so a page that refreshes keeps playing; the link
+/// lives as long as the value says (`linkSecs`), else fifteen minutes. A
+/// url file goes out in the same shape, its url its own. Walks lists and
+/// objects, so a file nested in a row is linked too. A file the install
+/// cannot link fails the node: an answer with no way to the bytes is not
+/// an answer.
 pub async fn link_files(ctx: &RunContext, value: Value) -> WeftResult<Value> {
     match value {
         Value::Object(map) => {
-            if let Ok(file) = StoredFile::from_value(&Value::Object(map.clone())) {
-                let url = ctx
-                    .storage(StorageScope::Run)
-                    .caller_link(&FileHandle::Key(file.key.clone()), None)
-                    .await?
-                    .ok_or_else(|| {
-                        weft::node_error(format!(
-                            "the answer carries the stored file {} but this install has no address a \
-                             caller could fetch it from",
-                            file.filename
-                        ))
-                    })?;
+            let value = Value::Object(map);
+            if let Some(file) = file_value(&value) {
+                let file = file?;
+                let link = ctx.storage(StorageScope::Run).external_link(&file).await?;
+                let (mime_type, filename, size_bytes) = match file {
+                    FileHandle::Key { .. } => {
+                        let stored = StoredFile::from_value(&value)?;
+                        (stored.mime_type, stored.filename, stored.size_bytes)
+                    }
+                    FileHandle::Url { mime_type, filename, size_bytes, .. } => (mime_type, filename, size_bytes),
+                };
                 return Ok(serde_json::json!({
-                    "url": url,
-                    "mimeType": file.mime_type,
-                    "filename": file.filename,
-                    "sizeBytes": file.size_bytes,
+                    "url": link.url,
+                    "mimeType": mime_type,
+                    "filename": filename,
+                    "sizeBytes": size_bytes,
                 }));
             }
+            let Value::Object(map) = value else { unreachable!("an object was just matched") };
             let mut linked = serde_json::Map::with_capacity(map.len());
             for (key, inner) in map {
                 linked.insert(key, Box::pin(link_files(ctx, inner)).await?);
@@ -269,15 +331,45 @@ pub async fn link_files(ctx: &RunContext, value: Value) -> WeftResult<Value> {
     }
 }
 
-/// The shape an answer node (`Reply`, `Stream`) sends in: its own
-/// `answerAs` when set, else the shape the trigger's `dataType` declares.
-/// Apart because what comes in and what goes out differ often: a GET has
-/// no body at all and may still answer a picture as bytes.
-pub fn answer_type(ctx: &RunContext) -> WeftResult<DataType> {
-    match ctx.inputs.opt::<String>("answerAs")?.filter(|raw| !raw.is_empty()) {
-        Some(raw) => DataType::parse_field(&raw)
-            .map_err(|_| WeftError::Input(format!("answerAs must be json, text or bytes, got '{raw}'"))),
-        None => Ok(ctx.caller_data_type().unwrap_or_default()),
+/// The file a value is, when it is a file value (a stored file or a url
+/// file): its handle, or why its marker names no file weft can reach.
+/// `None` for a value that is no file value at all.
+pub fn file_value(value: &Value) -> Option<WeftResult<FileHandle>> {
+    weft::weft_type::FileKind::from_marker_obj(value.as_object()?)?;
+    Some(FileHandle::from_value(value))
+}
+
+/// What an answer node (`Reply`, `Stream`) sends: its own `answerAs`
+/// when set, else the shape the trigger's `dataType` declares. Apart
+/// because what comes in and what goes out differ often: a GET has no
+/// body at all and may still answer a picture as bytes. A message of one
+/// of the wire's shapes, or a redirect to a file's link
+/// (`answerAs: "redirect"`, which only a `Reply` sends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Data(DataType),
+    Redirect,
+}
+
+/// The answer the node's `answerAs` and the trigger's `dataType` ask for.
+pub fn answer(ctx: &RunContext) -> WeftResult<Answer> {
+    match ctx.inputs.opt::<String>("answerAs")?.as_deref() {
+        Some("redirect") => Ok(Answer::Redirect),
+        Some(raw) if !raw.is_empty() => DataType::parse_field(raw)
+            .map(Answer::Data)
+            .map_err(|_| WeftError::Input(format!("answerAs must be json, text, bytes or redirect, got '{raw}'"))),
+        _ => Ok(Answer::Data(ctx.caller_data_type().unwrap_or_default())),
+    }
+}
+
+/// The status a redirect answers with: `status` when it is one a redirect
+/// can be, 302 when the program left the default 200, a refusal naming
+/// the ones that work otherwise.
+pub fn redirect_status(status: u16) -> WeftResult<u16> {
+    match status {
+        200 => Ok(302),
+        301 | 302 | 303 | 307 | 308 => Ok(status),
+        other => weft::node_bail!("a redirect answers 301, 302, 303, 307 or 308, not {other}; leave status at 200 for 302"),
     }
 }
 
@@ -289,27 +381,12 @@ pub fn with_file_head(mut head: ResponseHead, file: &StoredFile) -> ResponseHead
         head = head.with_header("content-type", file.mime_type.clone());
     }
     if head.header("content-disposition").is_none() && !file.filename.is_empty() {
-        head = head.with_header("content-disposition", inline_disposition(&file.filename));
+        head = head.with_header(
+            "content-disposition",
+            format!("inline; {}", weft::storage::disposition_filename(&file.filename)),
+        );
     }
     head
-}
-
-/// `inline; filename="..."; filename*=UTF-8''...`: the quoted form for
-/// old clients (ASCII only, quotes and backslashes dropped), the encoded
-/// form for the exact name.
-fn inline_disposition(filename: &str) -> String {
-    let plain: String = filename
-        .chars()
-        .map(|c| if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' { c } else { '_' })
-        .collect();
-    let encoded: String = filename
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => (b as char).to_string(),
-            other => format!("%{other:02X}"),
-        })
-        .collect();
-    format!("inline; filename=\"{plain}\"; filename*=UTF-8''{encoded}")
 }
 
 /// The response head a node's `status` and `headers` inputs describe.

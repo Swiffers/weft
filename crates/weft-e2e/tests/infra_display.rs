@@ -96,7 +96,7 @@ async fn an_instances_display_says_where_its_copy_stands() -> anyhow::Result<()>
     })
     .await?;
 
-    project.weft(&["infra", "node-stop", "panel", "--force", "--instance", "ada"]).await?;
+    project.weft(&["infra", "stop", "--infra", "panel", "--force", "--instance", "ada"]).await?;
     poll_until("ada's copy to stop", Duration::from_secs(300), Duration::from_millis(750), || async {
         Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("stopped")).then_some(()))
     })
@@ -107,7 +107,7 @@ async fn an_instances_display_says_where_its_copy_stands() -> anyhow::Result<()>
         "a stopped copy's display is a 404 naming its state: {status} {body}"
     );
 
-    project.weft(&["infra", "node-terminate", "panel", "--instance", "ada", "--yes"]).await?;
+    project.weft(&["infra", "terminate", "--infra", "panel", "--instance", "ada", "--yes"]).await?;
     poll_until("ada's copy to go", Duration::from_secs(300), Duration::from_millis(750), || async {
         Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("none")).then_some(()))
     })

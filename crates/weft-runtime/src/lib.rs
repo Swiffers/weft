@@ -210,6 +210,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let mut internal = Router::new();
     let mut public = Router::new();
     let mut outside: Option<Router> = None;
+    let mut network: Option<Router> = None;
     let mut loops: Vec<(CoreRole, Loops)> = Vec::new();
     let mut after_bind: Vec<futures::future::BoxFuture<'static, anyhow::Result<()>>> = Vec::new();
     let mut holding: Option<weft_listener::ListenerState> = None;
@@ -237,8 +238,10 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 credentials: Arc::new(weft_broker::credential::FileCredentialSource::from_env()),
                 app_provider: Arc::new(weft_broker::app_provider::FileAppProvider::from_env()),
                 public_base_url: config.public_url.clone(),
-                internet_url: config.internet_url.clone(),
+                internet: config.internet_address(),
+                own_base_url: config.own_base_url().to_string(),
                 object_store_public_internet: config.object_store.public_internet(),
+                slot_key: weft_core::storage::slot::SlotKey::of(&install_secret()?),
                 line_max_age: platform::line_max_age(&config, serverless),
                 dispatcher_alarm: (config.roles.of(CoreRole::Dispatcher) == Placement::Serverless).then(|| parts.alarm.clone()),
                 // The broker books the supervisor's next pass when it
@@ -291,6 +294,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         if let PlatformConfig::Local(local) = &config.platform {
             if local.listen.outside.is_some() {
                 outside = Some(weft_dispatcher::api::outside_router(state.clone()));
+            }
+            if local.listen.network.is_some() {
+                network = Some(weft_dispatcher::api::network_router(state.clone()));
             }
         }
         let api = weft_dispatcher::api::router(state.clone(), weft_dispatcher::app::cors_for(config.auth));
@@ -551,6 +557,12 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let mut servers = vec![tokio::spawn(server::serve(internal_listener, internal)), tokio::spawn(server::serve(public_listener, front))];
             if let (Some(addr), Some(app)) = (local.listen.outside, outside) {
                 let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind the outside port {addr}"))?;
+                servers.push(tokio::spawn(server::serve(listener, app)));
+            }
+            if let (Some(addr), Some(app)) = (local.listen.network, network) {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("bind the outside doors on the network address {addr} (WEFT_NETWORK_ADDRESS: is it an address of this machine?)"))?;
                 servers.push(tokio::spawn(server::serve(listener, app)));
             }
             tokio::spawn(async move {

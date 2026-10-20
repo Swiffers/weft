@@ -536,20 +536,6 @@ impl InfraHost for LocalInfraHost {
         docker::run(self.docker.as_ref(), args).await.map(|_| ())
     }
 
-    async fn restart_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
-        let rows = self.unit_containers(node, unit).await?;
-        let agent_running = rows.iter().any(|c| c.label(PART) == Some(PART_AGENT) && c.state == "running");
-        anyhow::ensure!(
-            agent_running,
-            "unit '{unit}' of '{}' is not running; a restart restarts a running unit, and starting one is an apply",
-            node.node
-        );
-        let apps: Vec<String> = rows.iter().filter(|c| c.label(PART) == Some(PART_APP)).map(|c| c.name.clone()).collect();
-        let mut args = vec!["restart".to_string()];
-        args.extend(apps);
-        docker::run(self.docker.as_ref(), args).await.map(|_| ())
-    }
-
     async fn remove_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
         self.remove_unit_containers(node, unit).await?;
         let scratch: Vec<String> = self
@@ -1050,6 +1036,7 @@ mod tests {
                 expose: Expose::SameNetwork,
             }],
             keep_on_terminate: vec!["data".into()],
+            health_rules: None,
         }
     }
 

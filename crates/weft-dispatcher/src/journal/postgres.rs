@@ -561,7 +561,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- registration again (`LET_GO`) or by `set_holds`.
             held_failed TEXT,
             -- Why the listener did not let go of it once its trigger
-            -- stopped taking work (a hibernation's window ended), so it is
+            -- stopped taking work (its door refuses, or its window ended), so it is
             -- asked again (`crate::listener::note_let_go`); NULL once it
             -- let go. Cleared by a registration again (`LET_GO`).
             let_go_failed TEXT,
@@ -1874,14 +1874,6 @@ pub async fn remove_project_signals_except<'e>(
     rows.into_iter().map(row_to_signal).collect()
 }
 
-/// The keys as two parallel arrays for an `unnest` join, `''` standing
-/// for the shared owner (an instance id is never empty).
-fn activation_key_arrays(keys: &[weft_core::activation::ActivationKey]) -> (Vec<String>, Vec<String>) {
-    keys.iter()
-        .map(|k| (k.trigger.clone(), k.instance().map(|m| m.as_str().to_string()).unwrap_or_default()))
-        .unzip()
-}
-
 /// Every signal the activations `keys` govern: their entry signals and
 /// the waits of the runs their triggers fired.
 pub(crate) async fn activation_signals<'e>(
@@ -1889,7 +1881,7 @@ pub(crate) async fn activation_signals<'e>(
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<Vec<SignalRegistration>> {
-    let (triggers, instances) = activation_key_arrays(keys);
+    let (triggers, instances) = crate::activation_store::key_arrays(keys);
     let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_BY_ACTIVATIONS)
         .bind(project_id)
         .bind(&triggers)
@@ -1900,57 +1892,154 @@ pub(crate) async fn activation_signals<'e>(
     rows.into_iter().map(row_to_signal).collect()
 }
 
-/// What the activations `keys` kept while their triggers were off: the
-/// fires parked on their signals and the runs of theirs waiting on a
-/// person, which a reactivate's choice decides about
-/// (`crate::api::project::apply_reactivate_choice`).
-pub(crate) async fn activation_preservation<'e>(
+/// The entry tokens of `keys`' triggers (their resume signals left out):
+/// what their workers count at the door for them (`crate::drain`).
+pub(crate) async fn entry_tokens<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: uuid::Uuid,
+    keys: &[weft_core::activation::ActivationKey],
+) -> anyhow::Result<Vec<String>> {
+    Ok(activation_signals(executor, project_id, keys).await?.into_iter().filter(|signal| !signal.is_resume).map(|signal| signal.token).collect())
+}
+
+/// The work held on the activations `keys`: the arrivals queued on their
+/// entry signals (events, calls) and the runs their triggers fired that
+/// are paused on a wait (an answer queued for one goes with it). What a
+/// take-down keeps or drops, and what an activation releases.
+pub async fn held_on<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
-) -> anyhow::Result<weft_core::projects::PreservationCounts> {
-    let (triggers, instances) = activation_key_arrays(keys);
-    let (parked, suspended): (i64, i64) = sqlx::query_as(PRESERVED_BY_ACTIVATIONS)
+) -> anyhow::Result<weft_core::projects::HeldWork> {
+    let (triggers, instances) = crate::activation_store::key_arrays(keys);
+    let (arrivals, paused): (i64, i64) = sqlx::query_as(HELD_ON_ACTIVATIONS)
         .bind(project_id)
         .bind(&triggers)
         .bind(&instances)
         .fetch_one(executor)
         .await
-        .context("count what the activations kept")?;
-    Ok(weft_core::projects::PreservationCounts { parked: parked as usize, suspended: suspended as usize })
+        .context("count the work held on the activations")?;
+    Ok(weft_core::projects::HeldWork { arrivals: arrivals.max(0) as u64, paused: paused.max(0) as u64 })
 }
 
-/// Which of the signals an activation governs a removal takes.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Governed {
-    /// Its entry rows and the waits of the runs its triggers fired: for a
-    /// take-down that ends those runs too.
-    Every,
-    /// Its entry rows only: the waits stay with their runs, which nothing
-    /// here ends.
-    Entries,
+/// The work held on every activation of `project_id` that holds any, by
+/// activation: [`held_on`] for all of them at once, for the project's
+/// status.
+pub async fn held_by_activation(
+    pool: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+) -> anyhow::Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::HeldWork>> {
+    let arrivals: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT s.activation_trigger, s.instance_id, COUNT(*)::bigint FROM parked_fire p JOIN signal s ON s.token = p.token \
+         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND NOT s.is_resume GROUP BY s.activation_trigger, s.instance_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .context("count the arrivals held on the project's activations")?;
+    let paused: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT fired_by, instance_id, COUNT(*)::bigint FROM run \
+         WHERE project_id = $1 AND state = 'parked' AND fired_by IS NOT NULL GROUP BY fired_by, instance_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .context("count the paused runs of the project's activations")?;
+    let key = |trigger: String, instance: Option<String>| -> anyhow::Result<weft_core::activation::ActivationKey> {
+        let instance = instance.map(weft_core::instance::InstanceId::new).transpose().map_err(anyhow::Error::msg)?;
+        Ok(weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(instance)))
+    };
+    let mut held: std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::HeldWork> = Default::default();
+    for (trigger, instance, n) in arrivals {
+        held.entry(key(trigger, instance)?).or_default().arrivals += n.max(0) as u64;
+    }
+    for (trigger, instance, n) in paused {
+        held.entry(key(trigger, instance)?).or_default().paused += n.max(0) as u64;
+    }
+    Ok(held)
 }
 
-/// Delete the signals the activations `keys` govern (`which` of them),
-/// handed back for the listener cleanup.
-pub(crate) async fn remove_activation_signals<'e>(
+/// Move the runs `runs` that are still paused onto `program` of the build
+/// `binary_hash` (`source_version` its source): each resumes on that
+/// build's workers, running that program from its own record, which a
+/// resync keeping what its triggers held does. A run that resumed or
+/// ended meanwhile, or is on that build already (a resync's task run
+/// again), is left as it is. Answers how many moved.
+pub async fn move_paused_runs(
+    pool: &sqlx::PgPool,
+    runs: &[weft_core::RunId],
+    program: &weft_journal::record::RunsProgram,
+    binary_hash: &str,
+    source_version: &str,
+) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    if let Some(cut) = program.kept() {
+        sqlx::query(
+            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from) \
+             VALUES ($1, $2, $3, EXTRACT(EPOCH FROM NOW())::BIGINT, $4) ON CONFLICT (project_id, definition_hash) DO NOTHING",
+        )
+        .bind(cut.project_id)
+        .bind(&cut.definition_hash)
+        .bind(&cut.project_json)
+        .bind(program.cut_from())
+        .execute(&mut *tx)
+        .await
+        .context("keep the cut the moved runs run")?;
+    }
+    let moved = sqlx::query(
+        "UPDATE run SET binary_hash = $2, definition_hash = $3, cut_from = $4, source_version = $5 \
+         WHERE run_id = ANY($1) AND state = 'parked' \
+           AND (binary_hash IS DISTINCT FROM $2 OR definition_hash IS DISTINCT FROM $3)",
+    )
+    .bind(runs)
+    .bind(binary_hash)
+    .bind(program.definition_hash())
+    .bind(program.cut_from())
+    .bind(source_version)
+    .execute(&mut *tx)
+    .await
+    .context("move the paused runs onto the new build")?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(moved)
+}
+
+/// Delete the arrivals queued on the activations `keys`' entry signals: a
+/// take-down dropping what is held while its door goes on taking. The
+/// signals stay, and so do the answers queued for the waits of the runs
+/// their triggers fired (a paused one's go as it is cancelled).
+pub async fn drop_held_arrivals<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    project_id: uuid::Uuid,
+    keys: &[weft_core::activation::ActivationKey],
+) -> anyhow::Result<u64> {
+    let (triggers, instances) = crate::activation_store::key_arrays(keys);
+    Ok(sqlx::query(HELD_ARRIVALS_DELETE)
+        .bind(project_id)
+        .bind(&triggers)
+        .bind(&instances)
+        .execute(executor)
+        .await
+        .context("drop the arrivals held on the activations")?
+        .rows_affected())
+}
+
+/// Delete the entry signals of the activations `keys` (their arrivals
+/// go with them), handed back for the listener cleanup. The waits of the
+/// runs their triggers fired stay with those runs.
+pub(crate) async fn remove_entry_signals<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
-    which: Governed,
 ) -> anyhow::Result<Vec<SignalRegistration>> {
-    let (triggers, instances) = activation_key_arrays(keys);
-    let query = match which {
-        Governed::Every => SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING,
-        Governed::Entries => SIGNAL_DELETE_ENTRIES_BY_ACTIVATIONS_RETURNING,
-    };
-    let rows: Vec<SignalRow> = sqlx::query_as(query)
+    let (triggers, instances) = crate::activation_store::key_arrays(keys);
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_ENTRIES_BY_ACTIVATIONS_RETURNING)
         .bind(project_id)
         .bind(&triggers)
         .bind(&instances)
         .fetch_all(executor)
         .await
-        .context("remove activation signals: read a signal row")?;
+        .context("remove the activations' entry signals: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
 }
 
@@ -2112,7 +2201,7 @@ const SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING: &str = concat!(
 
 /// The signals a set of activations governs: project `$1`, the
 /// activations given as the parallel arrays `$2` (triggers) and `$3`
-/// (instances, `''` for the shared one), as [`activation_key_arrays`]
+/// (instances, `''` for the shared one), as [`crate::activation_store::key_arrays`]
 /// builds them.
 macro_rules! governed_by_activations {
     () => {
@@ -2177,17 +2266,18 @@ pub async fn access_taken_afresh(pool: &sqlx::PgPool, token: &str, generation: i
     Ok(())
 }
 
-const SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING: &str =
-    concat!("DELETE FROM signal WHERE ", governed_by_activations!(), " RETURNING ", signal_columns!(""));
-
 const SIGNAL_DELETE_ENTRIES_BY_ACTIVATIONS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE NOT is_resume AND ", governed_by_activations!(), " RETURNING ", signal_columns!(""));
 
-const PRESERVED_BY_ACTIVATIONS: &str = concat!(
-    "SELECT COALESCE(SUM(waiting.n), 0)::bigint, COUNT(*) FILTER (WHERE is_resume AND waiting.n = 0) \
-     FROM signal s CROSS JOIN LATERAL (SELECT COUNT(*) AS n FROM parked_fire pf WHERE pf.token = s.token) waiting \
-     WHERE ",
-    governed_by_activations!()
+const HELD_ARRIVALS_DELETE: &str =
+    concat!("DELETE FROM parked_fire WHERE token IN (SELECT token FROM signal WHERE NOT is_resume AND ", governed_by_activations!(), ")");
+
+const HELD_ON_ACTIVATIONS: &str = concat!(
+    "SELECT (SELECT COUNT(*) FROM parked_fire pf WHERE pf.token IN (SELECT token FROM signal WHERE NOT is_resume AND ",
+    governed_by_activations!(),
+    "))::bigint, \
+     (SELECT COUNT(*) FROM run r WHERE r.project_id = $1 AND r.state = 'parked' \
+        AND (r.fired_by, COALESCE(r.instance_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[])))::bigint"
 );
 
 const SIGNAL_DELETE_WAIT_OF_RUN_RETURNING: &str =

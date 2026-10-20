@@ -56,7 +56,7 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
             }
             Ok(status) => status,
             // Nobody called, so there is nobody to answer: a fire the
-            // trigger takes no work for (wiped, past its hibernation), one
+            // trigger takes no work for (its door refuses, or its window ended), one
             // its full parked queue cannot hold, or an answer a run already
             // has is dropped, and says why.
             Err((code @ (StatusCode::GONE | StatusCode::TOO_MANY_REQUESTS | StatusCode::CONFLICT), msg)) => {
@@ -86,7 +86,7 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
 async fn let_go_of_it(state: &DispatcherState, token: &str) -> Result<()> {
     if let Some(signal) = state.journal.signal_get(token).await? {
         // What it could not let go of is marked on its row, and the
-        // hibernations loop tells the listener again; so does its next fire.
+        // door-windows loop tells the listener again; so does its next fire.
         let signals = std::slice::from_ref(&signal);
         let noted = match crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, signals).await {
             Ok(kept) => crate::listener::note_let_go(&state.pg_pool, signals, &kept).await,

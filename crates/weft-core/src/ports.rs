@@ -1,11 +1,12 @@
 //! Every fixed port weft picks on a machine, in one place.
 //!
-//! They sit in 14111-14118, a block chosen from data: unassigned at IANA,
+//! They sit in 14111-14118 ([`BLOCK`]), a block chosen from data: unassigned at IANA,
 //! never seen open in nmap's frequency tables, and absent from the
 //! Prometheus port list and the default lists of the usual dev tools, so a
 //! fresh machine almost never has one of them taken. The default install
 //! starts on them; setting `WEFT_PUBLIC_PORT`, `WEFT_OUTSIDE_PORT`,
-//! `WEFT_INTERNAL_PORT` or `WEFT_POSTGRES_PORT` on a `weft daemon start`
+//! `WEFT_INTERNAL_PORT`, `WEFT_POSTGRES_PORT` or `WEFT_TUNNEL_METRICS_PORT`
+//! on a `weft daemon start`
 //! moves that port, and every install keeps the ports it runs on in its
 //! `ports.json` ([`InstallPorts`]), which is where the CLI looks for it.
 //! `WEFT_SEAWEED_PORT` moves the object store, which all installs share.
@@ -35,6 +36,16 @@ pub const OBJECT_STORE: u16 = 14115;
 /// container publishes its ports as is, so the agent must stay off any
 /// port a user's image is likely to use.
 pub const UNIT_AGENT: u16 = 14116;
+/// Where the default install's quick tunnel says its current address
+/// (cloudflared's metrics server, on loopback;
+/// `WEFT_TUNNEL_METRICS_PORT`).
+pub const TUNNEL_METRICS: u16 = 14117;
+
+/// The block weft keeps for its fixed ports, one spare after the last:
+/// what a Windows machine reserves for weft, and what a named install's
+/// free ports ([`free_ports`]) stay out of. The test below keeps every
+/// constant inside it.
+pub const BLOCK: std::ops::RangeInclusive<u16> = PUBLIC..=PUBLIC + 7;
 
 /// The block the default install gives its projects their own ports
 /// from, one each, both ends included (`projectPorts` in its config). An
@@ -48,7 +59,8 @@ pub const PROJECTS: (u16, u16) = (14200, 14399);
 pub const LOCAL_PUBLIC_URL: &str = "http://127.0.0.1:14111";
 
 /// The host ports one install listens on, saved in its `ports.json` by
-/// `weft daemon start` and read back by every command that talks to it.
+/// `weft daemon start` and read back ([`SavedPorts`]) by every command
+/// that talks to it.
 /// Saved for every install, the default one included, so a port moved
 /// once stays moved: the address is the file's, never whatever the
 /// environment of the latest command happens to say.
@@ -60,6 +72,69 @@ pub struct InstallPorts {
     pub internal: u16,
     pub outside: u16,
     pub postgres: u16,
+    /// [`TUNNEL_METRICS`] for this install.
+    #[serde(rename = "tunnelMetrics")]
+    pub tunnel_metrics: u16,
+}
+
+/// A `ports.json` as it is on disk, read and never written back: a file
+/// an older weft wrote, before the quick tunnel had a metrics port, has
+/// none until the next `weft daemon start` gives it one
+/// ([`SavedPorts::to_start_on`]). Every other reader needs only
+/// [`SavedPorts::public`], so none of them ever writes the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct SavedPorts {
+    pub public: u16,
+    internal: u16,
+    outside: u16,
+    postgres: u16,
+    #[serde(default, rename = "tunnelMetrics")]
+    tunnel_metrics: Option<u16>,
+}
+
+impl SavedPorts {
+    /// The ports `install` saved in `dir`, `None` when it was never
+    /// started. A file that exists and cannot be read is an error, never
+    /// a silent return to the defaults.
+    pub fn read(dir: &std::path::Path) -> Result<Option<Self>, String> {
+        let path = InstallPorts::path(dir);
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|e| format!("{} is not valid: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+
+    /// The ports a start of `install` runs on: the file's, with a metrics
+    /// port given to a file that has none (the block's for the default
+    /// install, a free one, [`free_ports`], for a named one). Only `weft
+    /// daemon start` calls this, and it saves what it runs on, so the
+    /// port picked here is the one its tunnel gets and every later read
+    /// finds.
+    pub fn to_start_on(self, install: &crate::infra::Install) -> Result<InstallPorts, String> {
+        let Self { public, internal, outside, postgres, tunnel_metrics } = self;
+        let tunnel_metrics = match (tunnel_metrics, install.name()) {
+            (Some(port), _) => port,
+            (None, None) => TUNNEL_METRICS,
+            (None, Some(_)) => {
+                let [port] = free_ports(&[public, internal, outside, postgres])?;
+                port
+            }
+        };
+        Ok(InstallPorts { public, internal, outside, postgres, tunnel_metrics })
+    }
+
+    /// Whether the file already says exactly `ports`, so a start on them
+    /// has nothing to save.
+    pub fn says(&self, ports: &InstallPorts) -> bool {
+        self.tunnel_metrics == Some(ports.tunnel_metrics)
+            && (self.public, self.internal, self.outside, self.postgres) == (ports.public, ports.internal, ports.outside, ports.postgres)
+    }
+
+    /// Every port the file names.
+    fn all(&self) -> impl Iterator<Item = u16> {
+        [self.public, self.internal, self.outside, self.postgres].into_iter().chain(self.tunnel_metrics)
+    }
 }
 
 /// The file an install keeps its ports in, in its dir.
@@ -67,23 +142,12 @@ const PORTS_FILE: &str = "ports.json";
 
 impl InstallPorts {
     /// The block's ports: what the default install starts on.
-    pub const DEFAULT: Self = Self { public: PUBLIC, internal: INTERNAL, outside: OUTSIDE, postgres: POSTGRES };
+    pub const DEFAULT: Self =
+        Self { public: PUBLIC, internal: INTERNAL, outside: OUTSIDE, postgres: POSTGRES, tunnel_metrics: TUNNEL_METRICS };
 
     /// Where an install whose files live in `dir` keeps its ports.
     pub fn path(dir: &std::path::Path) -> std::path::PathBuf {
         dir.join(PORTS_FILE)
-    }
-
-    /// The ports saved in `dir`, `None` when the install was never
-    /// started. A file that exists and cannot be read is an error, never
-    /// a silent return to the defaults.
-    pub fn load(dir: &std::path::Path) -> Result<Option<Self>, String> {
-        let path = Self::path(dir);
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|e| format!("{} is not valid: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-        }
     }
 
     /// Written whole ([`crate::infra::write_whole`]): the editor's watcher,
@@ -94,8 +158,64 @@ impl InstallPorts {
 
     /// The address the API and dashboard answer on.
     pub fn public_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.public)
+        public_url_on(self.public)
     }
+}
+
+/// The address the API and dashboard answer on when they listen on `port`.
+fn public_url_on(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+/// `N` free ports on loopback, all different, for an install beside the
+/// default one. None is in `besides`, in weft's block ([`BLOCK`], and
+/// [`PROJECTS`]), or saved in the `ports.json` of any install on this
+/// machine: a stopped install's ports are free right now only because its
+/// runtime is down, and two installs given the same one could never run
+/// at once. Each is held until every one is picked, since a port let go
+/// at once may be handed out again by the next ask (two of an install's
+/// ports once came back the same, and its runtime could not bind the
+/// second).
+pub fn free_ports<const N: usize>(besides: &[u16]) -> Result<[u16; N], String> {
+    let mut taken: std::collections::HashSet<u16> = saved_on_this_machine()?.into_iter().chain(besides.iter().copied()).collect();
+    let mut held = Vec::new();
+    let mut picked = Vec::with_capacity(N);
+    while picked.len() < N {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("find a free port: {e}"))?;
+        let port = listener.local_addr().map_err(|e| format!("find a free port: {e}"))?.port();
+        // A refused port stays held too, so the next ask cannot hand it
+        // back.
+        held.push(listener);
+        let in_block = BLOCK.contains(&port) || (PROJECTS.0..=PROJECTS.1).contains(&port);
+        if !in_block && taken.insert(port) {
+            picked.push(port);
+        }
+    }
+    Ok(picked.try_into().expect("N ports picked"))
+}
+
+/// Every port a `ports.json` on this machine saves: the default
+/// install's, in weft's data dir, and each named one's under `installs/`.
+fn saved_on_this_machine() -> Result<Vec<u16>, String> {
+    let data = crate::infra::data_dir();
+    let installs = data.join("installs");
+    let mut dirs = vec![data];
+    match std::fs::read_dir(&installs) {
+        Ok(entries) => {
+            for entry in entries {
+                dirs.push(entry.map_err(|e| format!("cannot read {}: {e}", installs.display()))?.path());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot read {}: {e}", installs.display())),
+    }
+    let mut ports = Vec::new();
+    for dir in dirs {
+        if let Some(saved) = SavedPorts::read(&dir)? {
+            ports.extend(saved.all());
+        }
+    }
+    Ok(ports)
 }
 
 /// Where the install this process acts on ([`Install::from_env`])
@@ -117,8 +237,8 @@ pub fn local_public_url_of(install: &crate::infra::Install) -> Result<String, St
 }
 
 fn local_public_url_in(install: &crate::infra::Install, dir: &std::path::Path) -> Result<String, String> {
-    match (InstallPorts::load(dir)?, install.name()) {
-        (Some(saved), _) => Ok(saved.public_url()),
+    match (SavedPorts::read(dir)?, install.name()) {
+        (Some(saved), _) => Ok(public_url_on(saved.public)),
         (None, None) => Ok(LOCAL_PUBLIC_URL.to_string()),
         (None, Some(name)) => Err(format!(
             "install '{name}' has no ports yet ({} does not exist); start it with `weft daemon start`",
@@ -147,21 +267,47 @@ mod tests {
         assert!(local_public_url_in(&named, &dir).unwrap_err().contains("weft daemon start"));
         let moved = InstallPorts { public: 15000, ..InstallPorts::DEFAULT };
         moved.save(&dir).unwrap();
-        assert_eq!(InstallPorts::load(&dir).unwrap(), Some(moved));
+        let saved = SavedPorts::read(&dir).unwrap().unwrap();
+        assert!(saved.says(&moved));
+        assert_eq!(saved.to_start_on(&default).unwrap(), moved, "a full file starts on what it says");
         // The partial file it wrote first was renamed over ports.json.
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(files, vec![std::ffi::OsString::from("ports.json")]);
         assert_eq!(local_public_url_in(&default, &dir).unwrap(), "http://127.0.0.1:15000");
         assert_eq!(local_public_url_in(&named, &dir).unwrap(), "http://127.0.0.1:15000");
+        // A file an older weft wrote, before the tunnel's metrics port, is
+        // read as it is: only a start gives it a port (the block's on the
+        // default install, a free one of its own on a named one), and the
+        // start saves it.
+        let old = r#"{"public":15000,"internal":15001,"outside":15002,"postgres":15003}"#;
+        std::fs::write(InstallPorts::path(&dir), old).unwrap();
+        assert_eq!(local_public_url_in(&named, &dir).unwrap(), "http://127.0.0.1:15000");
+        assert_eq!(std::fs::read_to_string(InstallPorts::path(&dir)).unwrap(), old, "a read writes nothing");
+        let saved = SavedPorts::read(&dir).unwrap().unwrap();
+        let filled = saved.to_start_on(&default).unwrap();
+        assert_eq!(filled, InstallPorts { public: 15000, internal: 15001, outside: 15002, postgres: 15003, tunnel_metrics: TUNNEL_METRICS });
+        assert!(!saved.says(&filled), "so the start saves it");
+        let port = saved.to_start_on(&named).unwrap().tunnel_metrics;
+        assert!(![15000, 15001, 15002, 15003].contains(&port) && !BLOCK.contains(&port));
         std::fs::write(InstallPorts::path(&dir), "{").unwrap();
-        assert!(InstallPorts::load(&dir).unwrap_err().contains("is not valid"));
+        assert!(SavedPorts::read(&dir).unwrap_err().contains("is not valid"));
+        assert!(local_public_url_in(&default, &dir).unwrap_err().contains("is not valid"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
+    fn free_ports_are_distinct_and_outside_the_block() {
+        let [a, b, c] = free_ports(&[]).unwrap();
+        assert!(a != b && b != c && a != c);
+        assert!([a, b, c].iter().all(|p| !BLOCK.contains(p) && !(PROJECTS.0..=PROJECTS.1).contains(p)));
+        let [d] = free_ports(&[a, b, c]).unwrap();
+        assert!(![a, b, c].contains(&d));
+    }
+
+    #[test]
     fn every_port_is_in_the_block_and_distinct() {
-        let all = [PUBLIC, OUTSIDE, INTERNAL, POSTGRES, OBJECT_STORE, UNIT_AGENT];
-        assert!(all.iter().all(|p| (14111..=14118).contains(p)));
+        let all = [PUBLIC, OUTSIDE, INTERNAL, POSTGRES, OBJECT_STORE, UNIT_AGENT, TUNNEL_METRICS];
+        assert!(all.iter().all(|p| BLOCK.contains(p)));
         let mut sorted = all.to_vec();
         sorted.sort();
         sorted.dedup();

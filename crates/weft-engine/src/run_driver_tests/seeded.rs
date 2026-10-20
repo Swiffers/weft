@@ -150,7 +150,7 @@
             starts: top(starts),
             ..Default::default()
         };
-        let cut = weft_core::project::cut::cut(program, &walk, &mut given);
+        let cut = weft_core::project::cut::cut(program, &walk, &mut given).expect("a cut");
         (cut, given)
     }
 

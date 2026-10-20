@@ -188,8 +188,7 @@ test may only touch and count what it made itself. In practice:
 
 - Assert on your own project, your own run, your own workers. A query over a whole
   table ("how many links exist", "how many workers run") counts your
-  neighbours too; scope it to your run id or your project, the way
-  `Platform::public_file_link_count_for` does.
+  neighbours too; scope it to your run id or your project.
 - Never delete anything you did not create, and never clean up at the start of
   a test. A failed test's leftovers are evidence, and the next run removes them.
 - End a passing test with `project.finish()` (and `cell.finish()` if it made a

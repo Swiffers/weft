@@ -13,7 +13,7 @@
 //! - **Stop**: stop the containers, keep their disks. Issued here.
 //! - **Terminate**: delete the copies and their disks, keeping the ones
 //!   the node lists in `keepOnTerminate` unless the command's
-//!   [`TakeDown::Terminate`] says every disk goes (an instance's wipe).
+//!   [`Teardown::Terminate`] says every disk goes (an instance's wipe).
 //!   Issued here.
 //!
 //! The supervisor claims through the broker's held
@@ -25,7 +25,7 @@
 //! talk to Postgres, the supervisor through the broker.
 //!
 //! - **Upgrade**: a person's `weft infra upgrade`, once its gates passed.
-//!   Issued here ([`issue_upgrade`]) and run by a dispatcher
+//!   Issued here ([`TakeDownCommands`]) and run by a dispatcher
 //!   (`api::infra::run_upgrade`): the triggers reading the infra come
 //!   down, the stop leg, then the start. The row
 //!   is what the person follows, and what another process takes over when
@@ -34,16 +34,15 @@
 use anyhow::Result;
 use sqlx::postgres::PgPool;
 
-// `InfraLifecycleVerb` is the wire contract for the `verb` column, and
-// `RunningPolicy` the answer a take-down carries. They live in
-// `weft-broker-client::protocol` so the supervisor + dispatcher +
-// broker share one source of truth. Re-export here so the rest of
-// the dispatcher keeps the short module-relative path.
-pub use weft_broker_client::protocol::{InfraLifecycleVerb, RunningPolicy};
+// `InfraLifecycleVerb` is the wire contract for the `verb` column. It
+// lives in `weft-broker-client::protocol` so the supervisor + dispatcher
+// + broker share one source of truth. Re-export here so the rest of the
+// dispatcher keeps the short module-relative path.
+pub use weft_broker_client::protocol::InfraLifecycleVerb;
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "infra_lifecycle_command",
-    tables: &["infra_lifecycle_command", "infra_health_protocol", "infra_health_look"],
+    tables: &["infra_lifecycle_command", "infra_health_rule", "infra_health_look"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_lifecycle_command (
             id                BIGSERIAL PRIMARY KEY,
@@ -87,17 +86,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Pending unclaimed rows are cancelled outright (outcome =
             -- 'cancelled') instead of flagged.
             cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
-            -- A stop or terminate that first waits for the running work
-            -- its copies reach (`--running-policy wait`): until when
-            -- (unix seconds), past which what is left is cancelled. The
-            -- dispatcher's claimer waits it out (`crate::drain`), clears
-            -- it, and only then does a supervisor take the command. NULL
-            -- for every other command.
-            drain_by_unix     BIGINT,
-            -- The run that asked for the take-down (a program's own
-            -- `ctx.infra(..).stop(..)`): waited for like any other, never
-            -- cancelled by its drain; its own `StopSelf` decides.
-            asked_by          UUID,
+            -- A stop or terminate that first waits for the runs reaching
+            -- its copies to end (`--running wait`), however long that
+            -- takes: the dispatcher's claimer waits it out
+            -- (`crate::drain`), clears it, and only then does a supervisor
+            -- take the command. FALSE for every other command.
+            drains            BOOLEAN NOT NULL DEFAULT FALSE,
             -- Which copies of the infra the command acts on
             -- (`weft_core::instance::Copies`): the shared ones (instance_id
             -- NULL, every_copy FALSE), one instance's (instance_id set), or
@@ -110,7 +104,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- of its ending keeps failing, or its supervisor keeps dying
             -- on it), so the claim gives it up once this reaches
             -- `SUPERVISOR_GIVE_UP_AFTER` (`weft_broker::lifecycle_writes::claim_next`).
-            runs              INT NOT NULL DEFAULT 0
+            runs              INT NOT NULL DEFAULT 0,
+            -- An apply's: the hash of its place's infra in the build its
+            -- setup ran (`BuiltProgram::infra_places`), copied onto the
+            -- copy's `infra_node.source_hash` as it succeeds. NULL for
+            -- every other verb.
+            source_hash       TEXT,
+            -- A stop's or terminate's: the entry tokens of the triggers
+            -- taken down with it, read before that take-down (one that
+            -- refuses with nothing kept deletes their signals): what its
+            -- wait for the runs reaching its copies counts at the
+            -- workers' door (`crate::drain`).
+            waits_on_tokens   TEXT[] NOT NULL DEFAULT '{}'
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
               ON infra_lifecycle_command(tenant_id)
@@ -140,7 +145,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
               ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
                 AND claimed_by_replica IS NULL
-                AND (drain_by_unix IS NOT NULL OR verb IN ("#,
+                AND (drains OR verb IN ("#,
             weft_broker_client::dispatcher_verbs_sql!(),
             "))",
         ),
@@ -151,15 +156,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
               ON infra_lifecycle_command(project_id, node_id, instance_id) NULLS NOT DISTINCT
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
-        r#"CREATE TABLE IF NOT EXISTS infra_health_protocol (
-            -- What one health protocol of a project did, kept across the
-            -- supervisor's processes
-            -- (weft_broker_client::protocol::HealthProtocolState).
+        r#"CREATE TABLE IF NOT EXISTS infra_health_rule (
+            -- Where one health rule stands on one infra copy, kept across
+            -- the supervisor's processes
+            -- (weft_broker_client::protocol::HealthRuleState).
             project_id           UUID NOT NULL,
-            protocol             TEXT NOT NULL,
-            -- The copies its action acted on since it was last armed (a
-            -- JSON array of {node_id, instance}); NULL: it has not fired.
-            acted_json           JSONB,
+            -- The copy: its node, and whose (NULL for the shared one).
+            node_id              TEXT NOT NULL,
+            instance_id          TEXT,
+            -- The rule's name, unique among its node's rules.
+            rule                 TEXT NOT NULL,
+            -- Its action ran for the copy and the rule has held since.
+            fired                BOOLEAN NOT NULL DEFAULT false,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             -- When its failed action is tried again (unix seconds).
             next_retry_at_unix   BIGINT,
@@ -167,21 +175,22 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- armed again when the units it saw then change, a command
             -- touches the project, or every unit is healthy.
             gave_up_at_unix      BIGINT,
-            -- The units the health loop saw when it gave up.
+            -- The copy's units the health loop saw when it gave up.
             gave_up_seen         JSONB,
-            last_error           TEXT,
-            PRIMARY KEY (project_id, protocol)
+            last_error           TEXT
         )"#,
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_health_rule_key
+              ON infra_health_rule(project_id, node_id, instance_id, rule) NULLS NOT DISTINCT"#,
         // The broker's look for the supervisor's next due retry.
-        r#"CREATE INDEX IF NOT EXISTS idx_infra_health_protocol_retry
-              ON infra_health_protocol(next_retry_at_unix)
+        r#"CREATE INDEX IF NOT EXISTS idx_infra_health_rule_retry
+              ON infra_health_rule(next_retry_at_unix)
               WHERE gave_up_at_unix IS NULL AND next_retry_at_unix IS NOT NULL"#,
         r#"CREATE TABLE IF NOT EXISTS infra_health_look (
             -- How the supervisor's passes over one project stand, kept
             -- across its processes (weft_broker::lifecycle_writes::sync_ownership).
             project_id      UUID PRIMARY KEY,
             -- When a person last asked for a look (`weft infra look`, unix
-            -- seconds): a health protocol that gave up at or before it is
+            -- seconds): a health rule that gave up at or before it is
             -- armed again.
             asked_at_unix   BIGINT,
             -- Passes over the project that failed in a row since one went
@@ -202,7 +211,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // SYNC: the payloads <-> weft_broker_client::lifecycle_command::InfraCommandSignal
         r#"CREATE OR REPLACE FUNCTION infra_command_notify() RETURNS trigger AS $$
             BEGIN
-                IF TG_OP = 'INSERT' OR (NEW.completed_at_unix IS NULL AND NEW.drain_by_unix IS NULL) THEN
+                IF TG_OP = 'INSERT' OR (NEW.completed_at_unix IS NULL AND NOT NEW.drains) THEN
                     PERFORM pg_notify('weft_infra_command', 'issued:' || NEW.project_id::text);
                 ELSE
                     PERFORM pg_notify('weft_infra_command', 'done:' || NEW.id::text);
@@ -217,9 +226,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION infra_command_notify()"#,
         r#"DROP TRIGGER IF EXISTS infra_command_notify_on_drained ON infra_lifecycle_command"#,
         r#"CREATE TRIGGER infra_command_notify_on_drained
-            AFTER UPDATE OF drain_by_unix ON infra_lifecycle_command
+            AFTER UPDATE OF drains ON infra_lifecycle_command
             FOR EACH ROW
-            WHEN (NEW.drain_by_unix IS NULL AND OLD.drain_by_unix IS NOT NULL)
+            WHEN (OLD.drains AND NOT NEW.drains)
             EXECUTE FUNCTION infra_command_notify()"#,
         r#"DROP TRIGGER IF EXISTS infra_command_notify_on_done ON infra_lifecycle_command"#,
         r#"CREATE TRIGGER infra_command_notify_on_done
@@ -251,7 +260,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// verb has, so a force never rides a terminate and every terminate says
 /// what becomes of its kept disks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TakeDown {
+pub enum Teardown {
     /// Scale to zero, keeping the disks. `force` brings down the units
     /// whose `on_stop` would keep them up.
     Stop { force: bool },
@@ -259,22 +268,22 @@ pub enum TakeDown {
     Terminate { disks: weft_core::infra::TerminateDisks },
 }
 
-impl TakeDown {
+impl Teardown {
     /// A person's terminate: the disks the node lists stay.
-    pub const TERMINATE: TakeDown = TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::KeepListed };
+    pub const TERMINATE: Teardown = Teardown::Terminate { disks: weft_core::infra::TerminateDisks::KeepListed };
 
     pub fn verb(self) -> InfraLifecycleVerb {
         match self {
-            TakeDown::Stop { .. } => InfraLifecycleVerb::Stop,
-            TakeDown::Terminate { .. } => InfraLifecycleVerb::Terminate,
+            Teardown::Stop { .. } => InfraLifecycleVerb::Stop,
+            Teardown::Terminate { .. } => InfraLifecycleVerb::Terminate,
         }
     }
 
     /// The `(force, spec_json)` columns the command row carries.
     fn columns(self) -> (bool, Option<serde_json::Value>) {
         match self {
-            TakeDown::Stop { force } => (force, None),
-            TakeDown::Terminate { disks } => {
+            Teardown::Stop { force } => (force, None),
+            Teardown::Terminate { disks } => {
                 let work = weft_broker_client::protocol::TerminateWork { disks };
                 (false, Some(serde_json::to_value(work).expect("TerminateWork serializes")))
             }
@@ -282,51 +291,42 @@ impl TakeDown {
     }
 }
 
-/// A take-down that first waits for the running work its copies reach
-/// (`--running-policy wait`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DrainFirst {
-    /// Until when (unix seconds); what is left then is cancelled.
-    pub by_unix: i64,
-    /// The run that asked, never cancelled by the wait.
-    pub asked_by: Option<weft_core::RunId>,
-}
-
-/// Enqueue a Stop or Terminate command. Returns its id. With `drain`, the
-/// dispatcher's claimer first waits for the running work its copies reach
-/// (`crate::lifecycle_claimer`); the owning supervisor claims it once that
-/// wait is over, or at once without.
-pub async fn issue_lifecycle(
-    pool: &PgPool,
+/// Enqueue a Stop or Terminate command. Returns its id. With `waits`, the
+/// dispatcher's claimer first waits for the runs reaching its copies to
+/// end (`crate::lifecycle_claimer`); the owning supervisor claims it once
+/// that wait is over, or at once without.
+pub async fn issue_lifecycle<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
     copies: &weft_core::instance::Copies,
-    take_down: TakeDown,
-    drain: Option<DrainFirst>,
+    teardown: Teardown,
+    waits: bool,
+    waits_on_tokens: &[String],
     issued_by_replica: &str,
 ) -> Result<i64> {
     let (instance_id, every_copy) = copies.columns();
-    let (force, spec_json) = take_down.columns();
+    let (force, spec_json) = teardown.columns();
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, force, spec_json, drain_by_unix, asked_by, \
-          issued_by_replica, issued_at_unix, instance_id, every_copy) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, EXTRACT(EPOCH FROM NOW())::BIGINT, $10, $11) \
+         (tenant_id, project_id, node_id, verb, force, spec_json, drains, \
+          issued_by_replica, issued_at_unix, instance_id, every_copy, waits_on_tokens) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT, $9, $10, $11) \
          RETURNING id",
     )
     .bind(tenant_id)
     .bind(project_id)
     .bind(node_id)
-    .bind(take_down.verb().as_str())
+    .bind(teardown.verb().as_str())
     .bind(force)
     .bind(spec_json)
-    .bind(drain.map(|drain| drain.by_unix))
-    .bind(drain.and_then(|drain| drain.asked_by))
+    .bind(waits)
     .bind(issued_by_replica)
     .bind(instance_id)
     .bind(every_copy)
-    .fetch_one(pool)
+    .bind(waits_on_tokens)
+    .fetch_one(executor)
     .await?;
     Ok(row.0)
 }
@@ -336,20 +336,27 @@ pub async fn issue_lifecycle(
 /// owner's infra work finds it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UpgradeWork {
-    /// The places to cycle, every one of the owner's kind when empty.
+    /// The places it was asked for, every one of the owner's kind when
+    /// empty.
     pub nodes: Vec<String>,
-    /// The running runs' answer, resolved when the upgrade was
-    /// asked for (the picker's, else the request's, else the default).
-    pub running_policy: RunningPolicy,
-    pub drain_timeout_secs: u64,
-    /// The person's answer for the triggers reading this infra, which
-    /// the run takes down before the stop leg. `None` when none was on
-    /// as the upgrade was asked for.
-    pub trigger_deactivation: Option<weft_broker_client::protocol::DeactivateSpec>,
+    /// Of those, the ones running on another build when it was asked for:
+    /// the ones it cycles (a stop, then a start), and the only ones it
+    /// touches.
+    pub running: Vec<String>,
+    /// How the triggers whose cut contains them go down before the stop
+    /// leg (they come back with the start), and what becomes of the runs
+    /// reaching them: resolved when the upgrade was asked for.
+    pub take_down: weft_core::take_down::TakeDown,
     /// What the start half runs, as the request's sync body carried it.
     pub binary_hash: Option<String>,
     pub definition_hash: Option<String>,
     pub infra_hash: Option<String>,
+    /// The entry tokens of the triggers taken down with it, read before
+    /// that take-down (which may delete their signals): what its stop
+    /// leg's wait counts at the workers' door. Filled as it is issued
+    /// ([`TakeDownCommands::issue_in`]).
+    #[serde(default)]
+    pub waits_on_tokens: Vec<String>,
     /// The stop leg has landed: a claimer taking the upgrade over goes
     /// straight to the start (stopping again would take down what the
     /// start may already have brought up).
@@ -357,38 +364,38 @@ pub struct UpgradeWork {
     pub stopped: bool,
 }
 
-/// What issuing an upgrade came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpgradeIssued {
-    /// Issued; its id, what the person follows to the outcome.
-    Issued(i64),
+/// What issuing [`TakeDownCommands`] came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Issued {
+    /// Issued; their ids, first issued first, what the person follows to
+    /// the outcome.
+    Commands(Vec<i64>),
     /// An upgrade of the same copies is still in flight (its id): a
-    /// second one would cycle them under the first.
-    AlreadyInFlight(i64),
+    /// second one would cycle them under the first. Nothing was issued.
+    UpgradeInFlight(i64),
 }
 
-/// Issue an upgrade of `instance`'s copies (the shared ones for `None`),
-/// unless one of the same copies is still in flight. The check and the
-/// insert run under one advisory lock keyed by the copies, so two
-/// requests racing each other issue one upgrade.
-pub async fn issue_upgrade(
-    pool: &PgPool,
-    tenant_id: &str,
+/// What a person or a program reads when an upgrade of the same copies,
+/// command `command`, is still in flight.
+pub fn upgrade_in_flight_refusal(command: i64) -> (axum::http::StatusCode, String) {
+    (
+        axum::http::StatusCode::CONFLICT,
+        format!(
+            "an upgrade of these copies is already in flight (command {command}); wait for it to finish or cancel it \
+             (`weft infra cancel`)"
+        ),
+    )
+}
+
+/// The upgrade of `instance`'s copies (`None`: the shared ones) under
+/// way, if one is: what a second upgrade of the same copies is refused
+/// over, before it takes anything down and again as it is issued.
+pub async fn upgrade_in_flight<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     project_id: uuid::Uuid,
-    instance: Option<&weft_core::instance::InstanceId>,
-    work: &UpgradeWork,
-    issued_by_replica: &str,
-) -> Result<UpgradeIssued> {
-    let instance = instance.map(|m| m.as_str());
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(crate::lease::advisory_key(
-            crate::lease::UPGRADE_ISSUE_DOMAIN,
-            &format!("{project_id}/{}", instance.unwrap_or("")),
-        ))
-        .execute(&mut *tx)
-        .await?;
-    let in_flight: Option<i64> = sqlx::query_scalar(
+    instance: Option<&str>,
+) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
         "SELECT id FROM infra_lifecycle_command \
          WHERE project_id = $1 AND verb = $2 AND instance_id IS NOT DISTINCT FROM $3 \
            AND completed_at_unix IS NULL \
@@ -397,10 +404,33 @@ pub async fn issue_upgrade(
     .bind(project_id)
     .bind(InfraLifecycleVerb::Upgrade.as_str())
     .bind(instance)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(id) = in_flight {
-        return Ok(UpgradeIssued::AlreadyInFlight(id));
+    .fetch_optional(executor)
+    .await?)
+}
+
+/// Issue an upgrade of `instance`'s copies (the shared ones for `None`)
+/// on `conn`'s transaction, unless one of the same copies is still in
+/// flight. The check and the insert run under one advisory lock keyed by
+/// the copies, held until that transaction ends, so two requests racing
+/// each other issue one upgrade.
+async fn issue_upgrade_in(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: &str,
+    project_id: uuid::Uuid,
+    instance: Option<&weft_core::instance::InstanceId>,
+    work: &UpgradeWork,
+    issued_by_replica: &str,
+) -> Result<Issued> {
+    let instance = instance.map(|m| m.as_str());
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::lease::advisory_key(
+            crate::lease::UPGRADE_ISSUE_DOMAIN,
+            &format!("{project_id}/{}", instance.unwrap_or("")),
+        ))
+        .execute(&mut *conn)
+        .await?;
+    if let Some(id) = upgrade_in_flight(&mut *conn, project_id, instance).await? {
+        return Ok(Issued::UpgradeInFlight(id));
     }
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
@@ -414,10 +444,96 @@ pub async fn issue_upgrade(
     .bind(sqlx::types::Json(work))
     .bind(issued_by_replica)
     .bind(instance)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-    tx.commit().await?;
-    Ok(UpgradeIssued::Issued(id))
+    Ok(Issued::Commands(vec![id]))
+}
+
+/// The commands an infra verb issues over copies it takes down, with the
+/// triggers whose cut reads those copies: issued in the same transaction
+/// that takes the triggers down (`crate::take_down::DownCause::Infra`), so
+/// no trigger is ever down for a command that does not exist, and no
+/// command is claimable while a trigger reading its copies still listens.
+/// Each trigger records the first of them (`WentDown::Infra`), what its
+/// bring-back reads every later command against
+/// ([`since_take_down`]).
+#[derive(Debug, Clone)]
+pub struct TakeDownCommands {
+    pub tenant_id: String,
+    pub issued_by_replica: String,
+    pub work: TakeDownWork,
+}
+
+/// What [`TakeDownCommands`] issue.
+#[derive(Debug, Clone)]
+pub enum TakeDownWork {
+    /// A stop or terminate of `copies`: one command per node in `nodes`,
+    /// one over the owner's copies when it is empty. With `waits`, each
+    /// waits for the runs reaching its copies first.
+    Teardown { nodes: Vec<String>, copies: weft_core::instance::Copies, teardown: Teardown, waits: bool },
+    /// An upgrade of `instance`'s copies.
+    Upgrade { instance: Option<weft_core::instance::InstanceId>, work: UpgradeWork },
+}
+
+impl TakeDownCommands {
+    /// Whether the copies they take down can come back, which is what
+    /// marks the triggers going down with them (`WentDown::Infra`): all
+    /// but a terminate deleting every disk, which takes the copies away
+    /// for good (their owner is going).
+    pub fn copies_can_return(&self) -> bool {
+        !matches!(
+            self.work,
+            TakeDownWork::Teardown { teardown: Teardown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }, .. }
+        )
+    }
+
+    /// Issue them on `conn`'s transaction: their ids, first issued first,
+    /// or the upgrade of the same copies already in flight. `tokens` are
+    /// the entry tokens of the triggers taken down with them, read before
+    /// that take-down: what a stop's or terminate's wait counts at the
+    /// door for them (`waits_on_tokens`).
+    pub async fn issue_in(&self, conn: &mut sqlx::PgConnection, project_id: uuid::Uuid, tokens: &[String]) -> Result<Issued> {
+        let (tenant, replica) = (self.tenant_id.as_str(), self.issued_by_replica.as_str());
+        match &self.work {
+            TakeDownWork::Teardown { nodes, copies, teardown, waits } => {
+                let mut ids = Vec::with_capacity(nodes.len().max(1));
+                match nodes.is_empty() {
+                    true => ids.push(issue_lifecycle(&mut *conn, tenant, project_id, None, copies, *teardown, *waits, tokens, replica).await?),
+                    false => {
+                        for node in nodes {
+                            ids.push(issue_lifecycle(&mut *conn, tenant, project_id, Some(node), copies, *teardown, *waits, tokens, replica).await?);
+                        }
+                    }
+                }
+                Ok(Issued::Commands(ids))
+            }
+            TakeDownWork::Upgrade { instance, work } => {
+                let work = UpgradeWork { waits_on_tokens: tokens.to_vec(), ..work.clone() };
+                issue_upgrade_in(conn, tenant, project_id, instance.as_ref(), &work, replica).await
+            }
+        }
+    }
+
+    /// [`Self::issue_in`] on a transaction of its own: what a take-down
+    /// that reaches no trigger on issues. `None` when the project is gone
+    /// or being removed: the insert holds its row `FOR KEY SHARE`, so a
+    /// removal either finds the commands and deletes them or waits for
+    /// this and then finds them (`ProjectStore::remove`).
+    pub async fn issue(&self, pool: &PgPool, project_id: uuid::Uuid) -> Result<Option<Issued>> {
+        let mut tx = pool.begin().await?;
+        let live: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM project WHERE id = $1 AND NOT removing FOR KEY SHARE")
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if live.is_none() {
+            return Ok(None);
+        }
+        let issued = self.issue_in(&mut tx, project_id, &[]).await?;
+        if let Issued::Commands(_) = issued {
+            tx.commit().await?;
+        }
+        Ok(Some(issued))
+    }
 }
 
 /// Record that upgrade `command_id`'s stop leg landed, while `process`
@@ -645,10 +761,10 @@ pub async fn wait_for_commands(
 /// or an upgrade) reaching the project's shared copies is uncompleted. The dispatcher-side
 /// "infra operation in flight" fact: while it holds, the
 /// reconciliation treats the project as infra-transitional (only
-/// infra_cancel offered), which is what stops NEW runs from starving
-/// a stop/terminate drain (the drain waits for the running set to
-/// empty; a new run would keep refilling it). In-flight work is
-/// untouched; only new launches are gated.
+/// infra_cancel offered), which is what stops a new run started by hand
+/// from keeping a stop's wait for the runs reaching its copies going
+/// (each new one would be waited for too). In-flight work is untouched;
+/// only new launches are gated.
 pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool> {
     // Only what reaches the shared copies, which the bar starts and stops:
     // one instance's copy booting holds none of the program's own verbs
@@ -666,6 +782,76 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
     .fetch_one(pool)
     .await?;
     Ok(exists)
+}
+
+/// How the commands reaching a trigger's copies stand since the infra
+/// take-down that took it down ([`since_take_down`]): what its bring-back
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SinceTakeDown {
+    /// A take-down (stop, terminate, upgrade) reaching them is still under
+    /// way: a copy running now may be on its way down.
+    pub under_way: bool,
+    /// No take-down reaching them since did what it was asked and one
+    /// ended without (called off, or failed), so they are as they were;
+    /// or an apply reaching them succeeded after the last one that did
+    /// (after the mark when none did): they came back up.
+    pub returned: bool,
+}
+
+impl SinceTakeDown {
+    /// Whether the trigger, whose cut's copies all run, comes back: never
+    /// while a take-down reaching them is under way, then once they
+    /// returned. A take-down that did what it was asked brings nothing
+    /// back, even when a unit kept up by its `on_stop` leaves the copy
+    /// reading as running: the person stopped it, and a start brings the
+    /// trigger back.
+    pub fn brings_back(self) -> bool {
+        !self.under_way && self.returned
+    }
+}
+
+/// [`SinceTakeDown`] for `copies` of project `project_id` (each a place
+/// and whose copy: `None` the shared one), against the take-down whose
+/// first command is `first_command`. Read by command ids, never by a
+/// clock: a command issued after another has the larger id, and the
+/// trigger's mark was written in the transaction that issued its own
+/// commands. A command reaches a copy when it names its place or every
+/// place of its owner, and its owner or every copy.
+pub async fn since_take_down(
+    pool: &PgPool,
+    project_id: uuid::Uuid,
+    copies: &[(String, Option<weft_core::instance::InstanceId>)],
+    first_command: i64,
+) -> Result<SinceTakeDown> {
+    let places: Vec<&str> = copies.iter().map(|(place, _)| place.as_str()).collect();
+    // '' for the shared copy: unnest takes no NULL beside a text array.
+    let instances: Vec<&str> = copies.iter().map(|(_, instance)| instance.as_ref().map_or("", |i| i.as_str())).collect();
+    let (under_way, returned): (bool, bool) = sqlx::query_as(
+        "WITH reaching AS ( \
+             SELECT c.id, c.verb, c.completed_at_unix, c.outcome FROM infra_lifecycle_command c \
+             WHERE c.project_id = $1 AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade') \
+               AND EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS t(place, inst) \
+                           WHERE (c.node_id IS NULL OR c.node_id = t.place) \
+                             AND (c.every_copy OR c.instance_id IS NOT DISTINCT FROM NULLIF(t.inst, ''))) \
+         ), downs AS ( \
+             SELECT id, completed_at_unix, outcome FROM reaching WHERE verb <> 'apply' AND id >= $4 \
+         ), last_done AS ( \
+             SELECT MAX(id) AS id FROM downs WHERE outcome = 'succeeded' \
+         ) \
+         SELECT EXISTS (SELECT 1 FROM reaching WHERE verb <> 'apply' AND completed_at_unix IS NULL), \
+                ((SELECT id FROM last_done) IS NULL \
+                  AND EXISTS (SELECT 1 FROM downs WHERE completed_at_unix IS NOT NULL AND outcome IS DISTINCT FROM 'succeeded')) \
+                OR EXISTS (SELECT 1 FROM reaching WHERE verb = 'apply' AND outcome = 'succeeded' \
+                             AND id > COALESCE((SELECT id FROM last_done), $4))",
+    )
+    .bind(project_id)
+    .bind(&places)
+    .bind(&instances)
+    .bind(first_command)
+    .fetch_one(pool)
+    .await?;
+    Ok(SinceTakeDown { under_way, returned })
 }
 
 /// Cancel one owner's in-flight infra work (apply / stop / terminate,
@@ -730,7 +916,7 @@ pub async fn request_cancel_owner(
 
 /// A person asks the supervisor to look at `project_id`'s infra again:
 /// the time is kept on the project's `infra_health_look`, which arms
-/// again every health protocol that gave up at or before it
+/// again every health rule that gave up at or before it
 /// (`weft_broker::lifecycle_writes::health_state`), the supervisor's
 /// passes over the project start a fresh round of tries (no failure
 /// counted, no retry booked: the look is the next pass), and the ask is
@@ -771,7 +957,7 @@ pub async fn remove_project<'e>(
     project_id: uuid::Uuid,
 ) -> Result<u64> {
     let res = sqlx::query(
-        "WITH health AS (DELETE FROM infra_health_protocol WHERE project_id = $1), \
+        "WITH health AS (DELETE FROM infra_health_rule WHERE project_id = $1), \
               look AS (DELETE FROM infra_health_look WHERE project_id = $1) \
          DELETE FROM infra_lifecycle_command WHERE project_id = $1",
     )
@@ -802,25 +988,25 @@ mod tests {
     fn a_take_down_carries_its_answers_on_the_command() {
         use weft_broker_client::protocol::{SupervisorCommandRow, TerminateWork};
         use weft_core::infra::TerminateDisks;
-        let read_back = |take_down: TakeDown| {
-            let (force, spec_json) = take_down.columns();
+        let read_back = |teardown: Teardown| {
+            let (force, spec_json) = teardown.columns();
             let row = SupervisorCommandRow {
                 id: 1,
                 project_id: uuid::Uuid::from_u128(1),
                 node_id: None,
                 copies: weft_core::instance::Copies::Shared,
-                verb: take_down.verb(),
+                verb: teardown.verb(),
                 spec_json,
                 force,
                 cancel_requested: false,
             };
             (row.force, row.terminate_work())
         };
-        let wipe = TakeDown::Terminate { disks: TerminateDisks::DeleteAll };
+        let wipe = Teardown::Terminate { disks: TerminateDisks::DeleteAll };
         assert_eq!(wipe.verb(), InfraLifecycleVerb::Terminate);
         assert_eq!(read_back(wipe), (false, Ok(TerminateWork { disks: TerminateDisks::DeleteAll })));
-        assert_eq!(read_back(TakeDown::TERMINATE), (false, Ok(TerminateWork { disks: TerminateDisks::KeepListed })));
-        let stop = TakeDown::Stop { force: true };
+        assert_eq!(read_back(Teardown::TERMINATE), (false, Ok(TerminateWork { disks: TerminateDisks::KeepListed })));
+        let stop = Teardown::Stop { force: true };
         assert_eq!(stop.verb(), InfraLifecycleVerb::Stop);
         assert_eq!(stop.columns(), (true, None));
     }
@@ -846,18 +1032,4 @@ mod tests {
         assert_eq!(INFRA_WORK_VERBS_SQL, want);
     }
 
-    #[test]
-    fn running_policy_round_trips() {
-        for p in [RunningPolicy::Cancel, RunningPolicy::Wait] {
-            assert_eq!(RunningPolicy::parse(p.as_str()), Some(p));
-        }
-    }
-
-    /// A request that says nothing about running work does not wait on
-    /// it: waiting is the choice a person makes, never the one they
-    /// get for free.
-    #[test]
-    fn running_policy_default_is_cancel() {
-        assert_eq!(RunningPolicy::default(), RunningPolicy::Cancel);
-    }
 }

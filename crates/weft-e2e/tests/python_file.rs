@@ -1,8 +1,9 @@
-//! Layer-4: a file input reaches ExecPython as a plain dict whose `url`
-//! is a download link minted for the firing, and fetching it inside the
-//! snippet works. The `python_file` fixture posts a picture to a route,
-//! the snippet downloads it through the link and answers with what it
-//! got, and hands the picture back on a file port.
+//! Layer-4: a file input reaches ExecPython as a plain dict carrying the
+//! links the node makes for it (`internalUrl` for the script, `externalUrl`
+//! and `public` for another service), and fetching the internal one inside
+//! the snippet works. The `python_file` fixture posts a picture to a route,
+//! the snippet downloads it through the link and answers with what it got,
+//! and hands the picture back on a file port.
 #![cfg(feature = "e2e")]
 
 use base64::Engine;
@@ -35,6 +36,8 @@ async fn a_python_snippet_reads_a_file_through_its_minted_link() -> anyhow::Resu
     assert_eq!(v["mimeType"], json!("image/png"));
     assert_eq!(v["fetched"], json!(PNG.len()), "the snippet downloaded the picture through the link: {v}");
     assert_eq!(v["declared"], json!(PNG.len()));
+    assert!(v["externalUrl"].as_str().is_some_and(|u| u.contains("/runtime/")), "a link for another service: {v}");
+    assert!(v["public"].is_boolean(), "{v}");
 
     // The picture went back out on the file port as a stored-file marker
     // with no link on it: the journal never carries one.
@@ -43,6 +46,8 @@ async fn a_python_snippet_reads_a_file_through_its_minted_link() -> anyhow::Resu
     settled.completed()?;
     let same = settled.completed_outputs()["inspect"]["same"].clone();
     anyhow::ensure!(same.get("__weft_image__").is_some(), "the marker is wrapped again on the way out: {same}");
-    anyhow::ensure!(same["__weft_image__"].get("url").is_none(), "no link leaves the node: {same}");
+    for link in ["url", "internalUrl", "externalUrl", "public"] {
+        anyhow::ensure!(same["__weft_image__"].get(link).is_none(), "no link leaves the node ({link}): {same}");
+    }
     project.finish().await
 }

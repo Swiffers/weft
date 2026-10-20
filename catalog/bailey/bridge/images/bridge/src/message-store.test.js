@@ -65,7 +65,7 @@ test('a seen-ids file that does not read stops the store, naming the file and th
   writeFileSync(`${path}.seen`, '["A", "B"');
   assert.throws(
     () => new MessageStore(500, dir),
-    (err) => err.message.includes(`${path}.seen`) && err.message.includes('weft infra node-terminate'),
+    (err) => err.message.includes(`${path}.seen`) && err.message.includes('weft infra terminate --infra'),
   );
   rmSync(dir, { recursive: true, force: true });
 });
@@ -76,7 +76,7 @@ test('a message history that does not read stops the store instead of starting e
   writeFileSync(path, '{"chat": [');
   assert.throws(
     () => new MessageStore(500, dir),
-    (err) => err.message.includes(path) && err.message.includes('weft infra node-terminate'),
+    (err) => err.message.includes(path) && err.message.includes('weft infra terminate --infra'),
   );
   rmSync(dir, { recursive: true, force: true });
 });

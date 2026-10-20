@@ -31,11 +31,42 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use weft_core::access::spec::percent_encode;
 
 /// The longest a presigned URL may live: a presign is an expiring artifact,
 /// never a durable public link, and seven days is also the most an S3 or a
 /// Cloud Storage signature allows. A store refuses a longer one.
-pub const MAX_PRESIGN_TTL_SECS: u64 = 7 * 24 * 3600;
+pub const MAX_PRESIGN_TTL_SECS: u64 = weft_core::storage::MAX_LINK_SECS;
+
+/// The most an S3 store copies in one request: one piece of a copy. A
+/// bigger object is copied piece by piece ([`copy_ranges`]), so its
+/// caller hears of progress at least once per piece, however slowly the
+/// store copies (one request may copy up to 5 GiB, and reports nothing
+/// until it returns). Every piece but the last is this size, well past
+/// the 5 MiB a multipart part takes at least; the last may be smaller,
+/// which S3 allows.
+const COPY_PIECE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The inclusive byte ranges, in order, that copy an object of `size`
+/// bytes piece by piece.
+fn copy_ranges(size: u64) -> Vec<(u64, u64)> {
+    (0..size.div_ceil(COPY_PIECE_BYTES))
+        .map(|i| (i * COPY_PIECE_BYTES, ((i + 1) * COPY_PIECE_BYTES).min(size) - 1))
+        .collect()
+}
+
+/// A key as a URL path: each segment percent-encoded (RFC 3986), the `/`
+/// between segments kept. S3's copy source and Cloud Storage's object path
+/// both name an object this way.
+pub fn encode_key(key: &str) -> String {
+    key.split('/').map(percent_encode).collect::<Vec<_>>().join("/")
+}
+
+/// The `CopySource` an S3 copy of `key` names: `<bucket>/<key>`, the key
+/// URL-encoded as the API requires (the SDK sends it as given).
+fn copy_source(bucket: &str, key: &str) -> String {
+    format!("{bucket}/{}", encode_key(key))
+}
 
 /// Which network the presigned URL will be used FROM. A signature is bound to
 /// the host in the URL, so the store must sign for the host the caller can reach.
@@ -44,20 +75,106 @@ pub const MAX_PRESIGN_TTL_SECS: u64 = 7 * 24 * 3600;
 /// internal host); a local install's SeaweedFS is exactly that case. A store
 /// every caller reaches at one address (Cloud Storage) signs the same URL for
 /// all of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresignAudience {
-    /// A caller OUTSIDE the install (the browser; the open internet when the
-    /// operator declared the endpoint internet-reachable): sign for the
-    /// public endpoint (`objectStore.publicEndpoint`).
+    /// A person's own machine (the CLI, the editor, a browser beside the
+    /// install): sign for the public endpoint (`objectStore.publicEndpoint`).
     External,
     /// A project's worker running node code: sign for the endpoint workers
     /// reach the store at (`objectStore.workerEndpoint`), or the runtime's
     /// own I/O endpoint when they reach it at the same address.
     Internal,
-    /// weft's own runtime fetching for itself (the broker relaying a
-    /// file link's bytes): sign for the endpoint the runtime does its
-    /// own I/O on.
+    /// weft's own runtime reading for itself (the dispatcher reading a
+    /// version's file, the broker hashing an upload): sign for the endpoint
+    /// the runtime does its own I/O on.
     Runtime,
+    /// Somebody who reaches the store through the install's forwarder
+    /// ([`FILES_DOOR`]) at `base` (`https://<tunnel>`, or a site that passes
+    /// `/weft/...` on: `https://shop.example/weft`): sign for `base`'s host,
+    /// which the forwarder hands the store as `X-Forwarded-Host`, and answer
+    /// the link under `base` ([`forwarded_link`]).
+    Forwarded { base: String },
+}
+
+/// The install's forwarder: the path under which it passes requests on to
+/// the object store unchanged (`<base>/files/<object key>?<query>` goes to
+/// `<store>/<bucket>/<object key>?<query>`), so a link signed for the
+/// install's public address reaches the bytes with every header (`Range`,
+/// `If-None-Match`) intact.
+// SYNC: FILES_DOOR <-> crates/weft-dispatcher/src/api/mod.rs (outside_caller_routes), packages/weft-connect/src/server/passthrough.ts PASSED_DOORS
+pub const FILES_DOOR: &str = "files";
+
+/// The part of the bucket the forwarder passes on: the runtime files, and
+/// nothing of the source plane's chunks and trees.
+pub const FORWARDED_PREFIX: &str = "runtime/";
+
+/// A link signed for `base`'s host (`signed`, as the store signs it:
+/// `<scheme>://<host>/<bucket>/<object key>?<query>`) as the forwarder
+/// serves it: `<base>/files/<object key>?<query>`. The signature covers the
+/// path the STORE sees (`/<bucket>/<object key>`), which is what the
+/// forwarder sends it, so moving the link under `base`'s own path changes
+/// nothing it signs.
+pub fn forwarded_link(base: &str, bucket: &str, signed: &str) -> Result<String> {
+    let parsed = url::Url::parse(signed).with_context(|| format!("a signed link is not a URL: {signed}"))?;
+    let object = parsed
+        .path()
+        .strip_prefix(&format!("/{bucket}/"))
+        .ok_or_else(|| anyhow!("a signed link names no object of bucket '{bucket}': {signed}"))?;
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Ok(format!("{}/{FILES_DOOR}/{object}{query}", base.trim_end_matches('/')))
+}
+
+/// The origin (`<scheme>://<host>[:<port>]`) of an http(s) base, which a
+/// link forwarded under it is signed for. Refused when `base` is not an
+/// http(s) address with a host and nothing past its path.
+pub fn base_origin(base: &str) -> Result<String> {
+    let parsed = url::Url::parse(base).with_context(|| format!("'{base}' is not an address"))?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && parsed.username().is_empty()
+            && parsed.password().is_none(),
+        "'{base}' is not an http(s) address with nothing after its path"
+    );
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// What a download link is for: who opens it, from when it is signed and
+/// how long it lives, and how the store answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetLink {
+    pub audience: PresignAudience,
+    /// The moment the link is signed at, which may be earlier than now:
+    /// signing two links for one file at the same moment gives the same
+    /// link, which is what keeps a link stable across answers.
+    pub signed_at: std::time::SystemTime,
+    /// How long after `signed_at` the link works.
+    pub ttl_secs: u64,
+    /// The `Content-Type` the store answers with.
+    pub content_type: Option<String>,
+    /// The `Content-Disposition` the store answers with.
+    pub disposition: Option<String>,
+}
+
+/// What a copy ([`ObjectStore::copy`]) tells its caller as it goes: a
+/// copy of a big object takes a while, and whoever waits on it learns it
+/// is still alive each time a piece of it is done.
+#[async_trait]
+pub trait CopyProgress: Send + Sync {
+    /// One more piece of the copy is done. An error stops the copy.
+    async fn copied_piece(&self) -> Result<()>;
+}
+
+/// A copy nobody follows.
+pub struct Unfollowed;
+
+#[async_trait]
+impl CopyProgress for Unfollowed {
+    async fn copied_piece(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One entry returned by `list`: the object's full key and its size. The
@@ -122,50 +239,46 @@ pub trait ObjectStore: Send + Sync {
     /// folder view is the caller's projection over them.
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectEntry>>;
 
-    /// Mint a presigned DOWNLOAD (GET) URL for `key`, valid for `ttl_secs`
-    /// seconds, signed for `audience`'s network. The URL grants exactly that
-    /// one read on that one object and expires on its own; the caller uses it
-    /// directly without ever holding a credential.
-    async fn presign_get(
-        &self,
-        key: &str,
-        audience: PresignAudience,
-        ttl_secs: u64,
-    ) -> Result<String>;
+    /// Mint a presigned DOWNLOAD (GET) URL for `key` as `link` describes it:
+    /// signed for its audience's network at its `signed_at`, working for its
+    /// `ttl_secs`, answering with its content type and disposition. The URL
+    /// grants reads of that one object (whole or by `Range`) and expires on
+    /// its own; the caller uses it directly without ever holding a
+    /// credential. Signing is deterministic: the same `link` for the same
+    /// key is the same URL.
+    async fn presign_get(&self, key: &str, link: &GetLink) -> Result<String>;
 
-    /// Mint a presigned single-shot UPLOAD (PUT) URL for `key`, with the
-    /// body's EXACT byte size signed into it: the bucket rejects any body
-    /// that is not exactly `content_length` bytes. There is deliberately NO
-    /// unsized upload URL on this trait: every write grant carries a signed
-    /// length (this one for single objects, `presign_part` for multipart
-    /// parts), so a size a caller reserved can never be exceeded.
-    async fn presign_put(
-        &self,
-        key: &str,
-        content_length: u64,
-        audience: PresignAudience,
-        ttl_secs: u64,
-    ) -> Result<String>;
+    /// Start a multipart upload for `key`, whose object the store will
+    /// keep as `content_type` (what it answers a plain read with). Returns
+    /// the upload id: the handle every subsequent part/complete/abort call
+    /// names, and the resume handle a caller persists to pick the upload
+    /// back up after an interruption. The upload holds no visible object
+    /// until `complete_multipart`.
+    async fn create_multipart(&self, key: &str, content_type: &str) -> Result<String>;
 
-    /// Start a multipart upload for `key`. Returns the upload id: the handle
-    /// every subsequent part/complete/abort call names, and the resume handle
-    /// a caller persists to pick the upload back up after an interruption.
-    /// The upload holds no visible object until `complete_multipart`.
-    async fn create_multipart(&self, key: &str) -> Result<String>;
+    /// Copy the object at `from` to `to` inside the store: no byte leaves
+    /// it. Overwrites `to`. Returns the copy's size. A missing `from` is an
+    /// error. `progress` hears of each piece the store finishes, the last
+    /// one included; its error stops the copy there and is the copy's
+    /// error, and an object the copy already made at `to` is the caller's
+    /// to remove.
+    async fn copy(&self, from: &str, to: &str, progress: &dyn CopyProgress) -> Result<u64>;
 
     /// Mint a presigned URL for uploading ONE part, with the part's EXACT
     /// byte size signed into it (`Content-Length` is a signed header): the
     /// bucket rejects any body that is not exactly `part_size` bytes. That
     /// signed size is what lets a caller reserve bytes against a quota
     /// BEFORE handing out the URL and trust the bucket to enforce the
-    /// reservation. `audience` picks the signing host, same as `presign`.
+    /// reservation. It is the only upload URL this trait mints, so a size
+    /// a caller reserved can never be exceeded. `audience` picks the
+    /// signing host, same as `presign_get`.
     async fn presign_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
         part_size: u64,
-        audience: PresignAudience,
+        audience: &PresignAudience,
         ttl_secs: u64,
     ) -> Result<String>;
 
@@ -425,17 +538,58 @@ impl S3ObjectStore {
         }
     }
 
-    /// The client whose endpoint the presigned-URL caller can actually reach:
-    ///   - External (browser / external API): the public-endpoint client when
+    /// How a link for `audience` is signed: the client whose endpoint that
+    /// caller reaches the store at, and, for a link through the forwarder,
+    /// the origin it is signed for instead (the client's own endpoint
+    /// overridden for that one signature).
+    ///   - External (a person's machine): the public-endpoint client when
     ///     one is configured, else the I/O client (a bucket whose endpoint is
     ///     already publicly reachable).
     ///   - Internal (a project's worker): the worker-endpoint client when
     ///     one is configured, else the I/O client.
-    fn signing_client(&self, audience: PresignAudience) -> &aws_sdk_s3::Client {
+    ///   - Runtime: the I/O client.
+    ///   - Forwarded: the I/O client, signed for the base's origin.
+    fn signer(&self, audience: &PresignAudience) -> Result<(&aws_sdk_s3::Client, Option<String>)> {
+        Ok(match audience {
+            PresignAudience::External => (self.presign_client.as_ref().unwrap_or(&self.client), None),
+            PresignAudience::Internal => (self.worker_client.as_ref().unwrap_or(&self.client), None),
+            PresignAudience::Runtime => (&self.client, None),
+            PresignAudience::Forwarded { base } => (&self.client, Some(base_origin(base)?)),
+        })
+    }
+
+    /// A signed URI as `audience` opens it: under the forwarder's door for
+    /// a forwarded base, as signed otherwise.
+    fn opened_by(&self, audience: &PresignAudience, signed: String) -> Result<String> {
         match audience {
-            PresignAudience::External => self.presign_client.as_ref().unwrap_or(&self.client),
-            PresignAudience::Internal => self.worker_client.as_ref().unwrap_or(&self.client),
-            PresignAudience::Runtime => &self.client,
+            PresignAudience::Forwarded { base } => forwarded_link(base, &self.bucket, &signed),
+            _ => Ok(signed),
+        }
+    }
+
+    /// The size and the store's `Content-Type` of the object at `key`, in
+    /// one head; `None` when no object is there.
+    async fn head(&self, key: &str) -> Result<Option<(u64, Option<String>)>> {
+        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
+            Ok(out) => {
+                // A HEAD on an existing object always carries content_length (a 0-byte
+                // object reports Some(0)). A MISSING field is an SDK/server anomaly, not
+                // a real "size 0": defaulting it to 0 would silently under-report a
+                // present file (quota, range reads). Fail loud instead.
+                let len = out.content_length().ok_or_else(|| {
+                    anyhow::anyhow!("object-store head {key}: response carried no content_length")
+                })?;
+                // A negative content-length is as anomalous as a missing one;
+                // masking it to 0 (`.max(0)`) would under-report a present
+                // file, the exact hole the missing-field branch above guards.
+                // Fail loud.
+                if len < 0 {
+                    anyhow::bail!("object-store head {key}: negative content_length {len}");
+                }
+                Ok(Some((len as u64, out.content_type().map(str::to_string))))
+            }
+            Err(e) if Self::is_not_found(&e) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("object-store head {key}")),
         }
     }
 
@@ -510,27 +664,7 @@ impl ObjectStore for S3ObjectStore {
     }
 
     async fn size(&self, key: &str) -> Result<Option<u64>> {
-        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
-            Ok(out) => {
-                // A HEAD on an existing object always carries content_length (a 0-byte
-                // object reports Some(0)). A MISSING field is an SDK/server anomaly, not
-                // a real "size 0": defaulting it to 0 would silently under-report a
-                // present file (quota, range reads). Fail loud instead.
-                let len = out.content_length().ok_or_else(|| {
-                    anyhow::anyhow!("object-store head {key}: response carried no content_length")
-                })?;
-                // A negative content-length is as anomalous as a missing one;
-                // masking it to 0 (`.max(0)`) would under-report a present
-                // file, the exact hole the missing-field branch above guards.
-                // Fail loud.
-                if len < 0 {
-                    anyhow::bail!("object-store head {key}: negative content_length {len}");
-                }
-                Ok(Some(len as u64))
-            }
-            Err(e) if Self::is_not_found(&e) => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("object-store head {key}")),
-        }
+        Ok(self.head(key).await?.map(|(size, _)| size))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -587,57 +721,34 @@ impl ObjectStore for S3ObjectStore {
         Ok(out)
     }
 
-    async fn presign_get(
-        &self,
-        key: &str,
-        audience: PresignAudience,
-        ttl_secs: u64,
-    ) -> Result<String> {
-        let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(Duration::from_secs(ttl_secs))
+    async fn presign_get(&self, key: &str, link: &GetLink) -> Result<String> {
+        let cfg = aws_sdk_s3::presigning::PresigningConfig::builder()
+            .start_time(link.signed_at)
+            .expires_in(Duration::from_secs(link.ttl_secs))
+            .build()
             .with_context(|| "build presigning config")?;
-        let uri = self
-            .signing_client(audience)
+        let (client, origin) = self.signer(&link.audience)?;
+        let op = client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
-            .presigned(cfg)
-            .await
-            .with_context(|| format!("presign GET {key}"))?;
-        Ok(uri.uri().to_string())
+            .set_response_content_type(link.content_type.clone())
+            .set_response_content_disposition(link.disposition.clone());
+        let signed = match origin {
+            Some(origin) => op.customize().config_override(aws_sdk_s3::config::Builder::default().endpoint_url(origin)).presigned(cfg).await,
+            None => op.presigned(cfg).await,
+        }
+        .with_context(|| format!("presign GET {key}"))?;
+        self.opened_by(&link.audience, signed.uri().to_string())
     }
 
-    async fn presign_put(
-        &self,
-        key: &str,
-        content_length: u64,
-        audience: PresignAudience,
-        ttl_secs: u64,
-    ) -> Result<String> {
-        let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(Duration::from_secs(ttl_secs))
-            .with_context(|| "build presigning config")?;
-        // Setting content_length EXPLICITLY makes it a SIGNED header (the
-        // signer only excludes it when unset): the bucket rejects any body
-        // that is not exactly this many bytes.
-        let uri = self
-            .signing_client(audience)
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .content_length(i64::try_from(content_length).map_err(|_| {
-                anyhow!("presign PUT {key}: content length {content_length} overflows i64")
-            })?)
-            .presigned(cfg)
-            .await
-            .with_context(|| format!("presign PUT {key}"))?;
-        Ok(uri.uri().to_string())
-    }
-
-    async fn create_multipart(&self, key: &str) -> Result<String> {
+    async fn create_multipart(&self, key: &str, content_type: &str) -> Result<String> {
         let out = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
+            .content_type(content_type)
             .send()
             .await
             .with_context(|| format!("object-store create-multipart {key}"))?;
@@ -646,22 +757,82 @@ impl ObjectStore for S3ObjectStore {
             .ok_or_else(|| anyhow!("object-store create-multipart {key}: response carried no upload id"))
     }
 
+    async fn copy(&self, from: &str, to: &str, progress: &dyn CopyProgress) -> Result<u64> {
+        let (size, content_type) = self.head(from).await?.ok_or_else(|| anyhow!("object-store copy: no object at {from}"))?;
+        let source = copy_source(&self.bucket, from);
+        if size <= COPY_PIECE_BYTES {
+            self.client
+                .copy_object()
+                .bucket(&self.bucket)
+                .key(to)
+                .copy_source(&source)
+                .send()
+                .await
+                .with_context(|| format!("object-store copy {from} to {to}"))?;
+            // One request, so one piece.
+            progress.copied_piece().await?;
+            return Ok(size);
+        }
+        // Past one piece, the store copies it piece by piece into a
+        // multipart upload of the target, still all inside it.
+        let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+        let upload_id = self.create_multipart(to, &content_type).await?;
+        let copied: Result<u64> = async {
+            let mut parts = Vec::new();
+            for (index, (start, end)) in copy_ranges(size).into_iter().enumerate() {
+                let part_number = i32::try_from(index + 1).map_err(|_| anyhow!("object-store copy {from}: too many parts"))?;
+                let out = self
+                    .client
+                    .upload_part_copy()
+                    .bucket(&self.bucket)
+                    .key(to)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .copy_source(&source)
+                    .copy_source_range(format!("bytes={start}-{end}"))
+                    .send()
+                    .await
+                    .with_context(|| format!("object-store copy {from} to {to}, part {part_number}"))?;
+                let etag = out
+                    .copy_part_result()
+                    .and_then(|r| r.e_tag())
+                    .ok_or_else(|| anyhow!("object-store copy {from} to {to}: part {part_number} answered no etag"))?;
+                parts.push((part_number, etag.to_string()));
+                progress.copied_piece().await?;
+            }
+            self.complete_multipart(to, &upload_id, &parts).await
+        }
+        .await;
+        match copied {
+            Ok(size) => Ok(size),
+            Err(e) => {
+                // Whichever step failed (a part, or the completion), the
+                // half-made target holds nothing anybody reads; a failed
+                // abort is said beside the copy's own failure.
+                if let Err(abort) = self.abort_multipart(to, &upload_id).await {
+                    return Err(e.context(format!("and its upload {upload_id} could not be aborted: {abort:#}")));
+                }
+                Err(e)
+            }
+        }
+    }
+
     async fn presign_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
         part_size: u64,
-        audience: PresignAudience,
+        audience: &PresignAudience,
         ttl_secs: u64,
     ) -> Result<String> {
         let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(Duration::from_secs(ttl_secs))
             .with_context(|| "build presigning config")?;
+        let (client, origin) = self.signer(audience)?;
         // Setting content_length EXPLICITLY makes it a SIGNED header (the
         // signer only excludes it when unset), which is the whole point: the
         // bucket rejects a body that is not exactly `part_size` bytes.
-        let presigned = self
-            .signing_client(audience)
+        let op = client
             .upload_part()
             .bucket(&self.bucket)
             .key(key)
@@ -669,11 +840,13 @@ impl ObjectStore for S3ObjectStore {
             .part_number(part_number)
             .content_length(i64::try_from(part_size).map_err(|_| {
                 anyhow!("object-store presign-part {key} #{part_number}: part size {part_size} overflows i64")
-            })?)
-            .presigned(cfg)
-            .await
-            .with_context(|| format!("object-store presign-part {key} #{part_number}"))?;
-        Ok(presigned.uri().to_string())
+            })?);
+        let signed = match origin {
+            Some(origin) => op.customize().config_override(aws_sdk_s3::config::Builder::default().endpoint_url(origin)).presigned(cfg).await,
+            None => op.presigned(cfg).await,
+        }
+        .with_context(|| format!("object-store presign-part {key} #{part_number}"))?;
+        self.opened_by(audience, signed.uri().to_string())
     }
 
     async fn upload_part(
@@ -790,9 +963,9 @@ pub mod fake {
         Size { key: String },
         Delete { key: String },
         List { prefix: String },
-        PresignGet { key: String, audience: PresignAudience, ttl_secs: u64 },
-        PresignPut { key: String, content_length: u64, audience: PresignAudience, ttl_secs: u64 },
-        CreateMultipart { key: String },
+        PresignGet { key: String, link: GetLink },
+        CreateMultipart { key: String, content_type: String },
+        Copy { from: String, to: String },
         PresignPart { key: String, upload_id: String, part_number: i32, part_size: u64 },
         UploadPart { key: String, upload_id: String, part_number: i32, len: usize },
         CompleteMultipart { key: String, upload_id: String, parts: usize },
@@ -950,6 +1123,7 @@ pub mod fake {
             let (upload_id, part_number) = rest
                 .split_once('#')
                 .ok_or_else(|| anyhow!("malformed fake part url: {url}"))?;
+            let part_number = part_number.split_once('@').map_or(part_number, |(n, _)| n);
             let part_number: i32 = part_number.parse().context("part number in fake url")?;
             let mut uploads = self.uploads.lock();
             let upload = uploads
@@ -968,6 +1142,18 @@ pub mod fake {
             let etag = format!("\"fake-etag-{upload_id}-{part_number}-{}\"", bytes.len());
             upload.parts.insert(part_number, (etag.clone(), bytes));
             Ok(etag)
+        }
+    }
+
+    /// Where a fake link points for `audience`: the base a forwarded
+    /// link goes under, a fixed address per audience otherwise, so a test
+    /// reads off a link who it was made for.
+    fn fake_origin(audience: &PresignAudience) -> String {
+        match audience {
+            PresignAudience::External => "fake-object-store://external".into(),
+            PresignAudience::Internal => "fake-object-store://internal".into(),
+            PresignAudience::Runtime => "fake-object-store://runtime".into(),
+            PresignAudience::Forwarded { base } => format!("{}/{FILES_DOOR}", base.trim_end_matches('/')),
         }
     }
 
@@ -1039,38 +1225,32 @@ pub mod fake {
                 .collect())
         }
 
-        async fn presign_get(
-            &self,
-            key: &str,
-            audience: PresignAudience,
-            ttl_secs: u64,
-        ) -> Result<String> {
-            self.calls
-                .lock()
-                .push(FakeCall::PresignGet { key: key.to_string(), audience, ttl_secs });
+        async fn presign_get(&self, key: &str, link: &GetLink) -> Result<String> {
+            self.calls.lock().push(FakeCall::PresignGet { key: key.to_string(), link: link.clone() });
             // A deterministic fake URL that encodes the grant, so a test can
             // assert what was minted without a real signer.
-            Ok(format!("fake-object-store://GET/{key}?ttl={ttl_secs}"))
+            let at = link.signed_at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
+            Ok(format!("{}/{key}?at={at}&ttl={}", fake_origin(&link.audience), link.ttl_secs))
         }
 
-        async fn presign_put(
-            &self,
-            key: &str,
-            content_length: u64,
-            audience: PresignAudience,
-            ttl_secs: u64,
-        ) -> Result<String> {
-            self.calls.lock().push(FakeCall::PresignPut {
-                key: key.to_string(),
-                content_length,
-                audience,
-                ttl_secs,
-            });
-            Ok(format!("fake-object-store://PUT/{key}?len={content_length}&ttl={ttl_secs}"))
+        /// One piece, so `progress` hears of it once.
+        async fn copy(&self, from: &str, to: &str, progress: &dyn CopyProgress) -> Result<u64> {
+            self.calls.lock().push(FakeCall::Copy { from: from.to_string(), to: to.to_string() });
+            let size = {
+                let mut objects = self.objects.lock();
+                let bytes = objects.get(from).cloned().ok_or_else(|| anyhow!("no object at {from}"))?;
+                let size = bytes.len() as u64;
+                objects.insert(to.to_string(), bytes);
+                size
+            };
+            progress.copied_piece().await?;
+            Ok(size)
         }
 
-        async fn create_multipart(&self, key: &str) -> Result<String> {
-            self.calls.lock().push(FakeCall::CreateMultipart { key: key.to_string() });
+        async fn create_multipart(&self, key: &str, content_type: &str) -> Result<String> {
+            self.calls
+                .lock()
+                .push(FakeCall::CreateMultipart { key: key.to_string(), content_type: content_type.to_string() });
             let mut seq = self.upload_seq.lock();
             *seq += 1;
             let id = format!("fake-upload-{}", *seq);
@@ -1086,7 +1266,7 @@ pub mod fake {
             upload_id: &str,
             part_number: i32,
             part_size: u64,
-            _audience: PresignAudience,
+            audience: &PresignAudience,
             _ttl_secs: u64,
         ) -> Result<String> {
             self.calls.lock().push(FakeCall::PresignPart {
@@ -1105,7 +1285,12 @@ pub mod fake {
             // Record the "signed" length; the latest presign for a part wins,
             // exactly like re-presigning after a URL expiry.
             upload.reserved.insert(part_number, part_size);
-            Ok(format!("fake-multipart://{upload_id}#{part_number}"))
+            // A forwarded part's link says where it goes, before the part
+            // the fake reads back out of it.
+            Ok(match audience {
+                PresignAudience::Forwarded { base } => format!("fake-multipart://{upload_id}#{part_number}@{base}"),
+                _ => format!("fake-multipart://{upload_id}#{part_number}"),
+            })
         }
 
         async fn upload_part(
@@ -1203,11 +1388,107 @@ mod tests {
         .await;
         let url = |audience| {
             let store = &store;
-            async move { store.presign_get("a/b", audience, 60).await.unwrap() }
+            async move { store.presign_get("a/b", &link(audience)).await.unwrap() }
         };
         assert!(url(PresignAudience::External).await.starts_with("https://files.example.com/weft/a/b?"));
         assert!(url(PresignAudience::Internal).await.starts_with("http://weft-object-store:8333/weft/a/b?"));
         assert!(url(PresignAudience::Runtime).await.starts_with("http://127.0.0.1:14115/weft/a/b?"));
+        assert!(url(PresignAudience::Forwarded { base: "https://shop.example/weft".into() })
+            .await
+            .starts_with("https://shop.example/weft/files/a/b?"));
+    }
+
+    fn link(audience: PresignAudience) -> GetLink {
+        GetLink {
+            audience,
+            signed_at: std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            ttl_secs: 900,
+            content_type: Some("video/mp4".into()),
+            disposition: Some("attachment; filename=\"a.mp4\"".into()),
+        }
+    }
+
+    fn store_at(public: &str) -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint_url: "http://127.0.0.1:14115".into(),
+            bucket: "weft".into(),
+            region: "us-east-1".into(),
+            access_key_id: "k".into(),
+            secret_access_key: "s".into(),
+            force_path_style: true,
+            public_endpoint_url: Some(public.into()),
+            worker_endpoint_url: None,
+        }
+    }
+
+    /// A forwarded link is the link signed for the base's host, moved
+    /// under the base's path and the forwarder's door: the store sees the
+    /// path it signed, so the signature is the one a link straight to that
+    /// host carries.
+    #[tokio::test]
+    async fn a_forwarded_link_carries_the_signature_of_its_host() {
+        let store = S3ObjectStore::clients(&store_at("https://shop.example")).await;
+        let direct = store.presign_get("runtime/t/k", &link(PresignAudience::External)).await.unwrap();
+        let forwarded = store
+            .presign_get("runtime/t/k", &link(PresignAudience::Forwarded { base: "https://shop.example/weft/".into() }))
+            .await
+            .unwrap();
+        let (direct_path, direct_query) = direct.split_once('?').unwrap();
+        let (forwarded_path, forwarded_query) = forwarded.split_once('?').unwrap();
+        assert_eq!(direct_path, "https://shop.example/weft/runtime/t/k");
+        assert_eq!(forwarded_path, "https://shop.example/weft/files/runtime/t/k");
+        assert_eq!(direct_query, forwarded_query);
+    }
+
+    /// The same link asked twice is the same URL (what keeps a link stable
+    /// across answers), and it carries the answer's type and disposition.
+    #[tokio::test]
+    async fn a_link_is_signed_the_same_for_the_same_moment() {
+        let store = S3ObjectStore::clients(&store_at("https://files.example.com")).await;
+        let once = store.presign_get("a/b", &link(PresignAudience::External)).await.unwrap();
+        assert_eq!(once, store.presign_get("a/b", &link(PresignAudience::External)).await.unwrap());
+        assert!(once.contains("response-content-type=video%2Fmp4"), "{once}");
+        assert!(once.contains("response-content-disposition=attachment"), "{once}");
+        assert!(once.contains("X-Amz-Date=20231114T221320Z"), "{once}");
+        let later = GetLink { signed_at: std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_900), ..link(PresignAudience::External) };
+        assert_ne!(once, store.presign_get("a/b", &later).await.unwrap());
+    }
+
+    #[test]
+    fn a_base_is_an_http_address_and_a_link_moves_under_it() {
+        assert_eq!(base_origin("https://shop.example/weft").unwrap(), "https://shop.example");
+        assert_eq!(base_origin("http://127.0.0.1:14111").unwrap(), "http://127.0.0.1:14111");
+        for bad in ["ftp://x.example", "not a url", "https://u:p@x.example", "https://x.example/?q=1"] {
+            assert!(base_origin(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            forwarded_link("https://t.example", "weft", "https://t.example/weft/runtime/a?X=1").unwrap(),
+            "https://t.example/files/runtime/a?X=1"
+        );
+        assert!(forwarded_link("https://t.example", "weft", "https://t.example/other/runtime/a").is_err());
+    }
+
+    #[test]
+    fn a_big_copy_is_cut_into_pieces_that_cover_it_once() {
+        assert_eq!(copy_ranges(10), vec![(0, 9)]);
+        assert_eq!(copy_ranges(COPY_PIECE_BYTES), vec![(0, COPY_PIECE_BYTES - 1)]);
+        assert_eq!(
+            copy_ranges(2 * COPY_PIECE_BYTES + 5),
+            vec![(0, COPY_PIECE_BYTES - 1), (COPY_PIECE_BYTES, 2 * COPY_PIECE_BYTES - 1), (2 * COPY_PIECE_BYTES, 2 * COPY_PIECE_BYTES + 4)]
+        );
+        assert!(copy_ranges(0).is_empty());
+        // Every piece but the last is a whole one: no smaller than the
+        // 5 MiB a multipart part takes.
+        let pieces = copy_ranges(3 * COPY_PIECE_BYTES + 1);
+        assert!(pieces[..pieces.len() - 1].iter().all(|(start, end)| end - start + 1 >= 5 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_copy_source_encodes_each_key_segment() {
+        assert_eq!(
+            copy_source("weft", "runtime/t 1/a+b \u{e9}.txt"),
+            "weft/runtime/t%201/a%2Bb%20%C3%A9.txt"
+        );
     }
 
     #[tokio::test]
@@ -1271,27 +1552,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn presign_encodes_method_length_and_ttl() {
+    async fn presign_get_encodes_audience_time_and_ttl() {
         let store = FakeObjectStore::new();
-        let url = store.presign_get("k", PresignAudience::External, 600).await.unwrap();
-        assert!(url.contains("GET"));
-        assert!(url.contains("ttl=600"));
-        assert!(url.contains("/k"));
-        let url = store.presign_put("k", 42, PresignAudience::External, 600).await.unwrap();
-        assert!(url.contains("PUT"));
-        assert!(url.contains("len=42"));
+        let url = store.presign_get("k", &link(PresignAudience::External)).await.unwrap();
+        assert_eq!(url, "fake-object-store://external/k?at=1700000000&ttl=900");
     }
 
     #[tokio::test]
     async fn multipart_round_trips_in_part_order() {
         let store = FakeObjectStore::new();
-        let id = store.create_multipart("k").await.unwrap();
+        let id = store.create_multipart("k", "text/plain").await.unwrap();
         let u1 = store
-            .presign_part("k", &id, 1, 3, PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 3, &PresignAudience::Internal, 600)
             .await
             .unwrap();
         let u2 = store
-            .presign_part("k", &id, 2, 2, PresignAudience::Internal, 600)
+            .presign_part("k", &id, 2, 2, &PresignAudience::Internal, 600)
             .await
             .unwrap();
         // Land them out of order; completion order comes from the part list.
@@ -1312,9 +1588,9 @@ mod tests {
     #[tokio::test]
     async fn part_with_wrong_size_is_rejected_by_the_signed_length() {
         let store = FakeObjectStore::new();
-        let id = store.create_multipart("k").await.unwrap();
+        let id = store.create_multipart("k", "text/plain").await.unwrap();
         let url = store
-            .presign_part("k", &id, 1, 3, PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 3, &PresignAudience::Internal, 600)
             .await
             .unwrap();
         let err = store.put_part(&url, Bytes::from_static(b"toolong")).unwrap_err();
@@ -1326,9 +1602,9 @@ mod tests {
     #[tokio::test]
     async fn complete_with_wrong_or_missing_etag_fails() {
         let store = FakeObjectStore::new();
-        let id = store.create_multipart("k").await.unwrap();
+        let id = store.create_multipart("k", "text/plain").await.unwrap();
         let url = store
-            .presign_part("k", &id, 1, 1, PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 1, &PresignAudience::Internal, 600)
             .await
             .unwrap();
         store.put_part(&url, Bytes::from_static(b"x")).unwrap();
@@ -1342,9 +1618,9 @@ mod tests {
     #[tokio::test]
     async fn abort_drops_the_upload_and_is_idempotent() {
         let store = FakeObjectStore::new();
-        let id = store.create_multipart("k").await.unwrap();
+        let id = store.create_multipart("k", "text/plain").await.unwrap();
         let url = store
-            .presign_part("k", &id, 1, 1, PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 1, &PresignAudience::Internal, 600)
             .await
             .unwrap();
         store.put_part(&url, Bytes::from_static(b"x")).unwrap();
@@ -1359,10 +1635,10 @@ mod tests {
     #[tokio::test]
     async fn landed_parts_reports_what_arrived() {
         let store = FakeObjectStore::new();
-        let id = store.create_multipart("k").await.unwrap();
+        let id = store.create_multipart("k", "text/plain").await.unwrap();
         for n in [1i32, 3] {
             let url = store
-                .presign_part("k", &id, n, 2, PresignAudience::Internal, 600)
+                .presign_part("k", &id, n, 2, &PresignAudience::Internal, 600)
                 .await
                 .unwrap();
             store.put_part(&url, Bytes::from_static(b"xy")).unwrap();

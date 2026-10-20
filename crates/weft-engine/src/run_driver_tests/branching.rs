@@ -25,38 +25,57 @@
     /// question only the body can answer.
     type Ran = Arc<StdMutex<Vec<&'static str>>>;
 
+    /// A file input whose file is gone (expired, deleted) fails the firing
+    /// that reads it, loudly and naming the file, never a silent skip: the
+    /// failure is the one visible event, at the read.
     #[tokio::test]
     async fn a_missing_file_input_records_a_named_failure_instead_of_silently_skipping() {
         let file = weft_core::storage::StoredFile {
-            key: format!("t1/asset/p1/{}", "a".repeat(64)),
+            key: format!("t1/asset/{}", "a".repeat(64)),
             mime_type: "image/png".into(),
             filename: "cat.png".into(),
             size_bytes: 3,
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         };
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "edges": [],
             "nodes": [{
-                "id": "send_photo", "nodeType": "Echo", "position": {"x": 0, "y": 0},
+                "id": "send_photo", "nodeType": "ReadsFile", "position": {"x": 0, "y": 0},
                 "inputs": [{"name": "value", "portType": "Image", "required": true}],
                 "portLiterals": {"value": file.to_value()}
             }]
         })).unwrap();
         let ran = Arc::new(StdMutex::new(Vec::new()));
-        let nodes = catalog(vec![("Echo", Box::new(Echo { id: "send_photo", ran: ran.clone() }))]);
+        let nodes = catalog(vec![("ReadsFile", Box::new(ReadsFile { ran: ran.clone() }))]);
         // The rig's storage is empty, just as it is after the file expires.
         let (outcome, events) = drive(project, nodes, &["send_photo"]).await;
         assert!(matches!(outcome, RunOutcome::Failed { .. }), "{outcome:?}");
-        assert!(ran.lock().unwrap().is_empty(), "do not run with an unavailable input");
+        assert_eq!(*ran.lock().unwrap(), vec!["send_photo"], "the body ran and met the missing file");
         let errors: Vec<_> = events.iter().filter_map(|event| match event {
             RunEvent::NodeFailed { node_id, error, .. } if node_id == "send_photo" => Some(error),
             _ => None,
         }).collect();
         assert_eq!(errors.len(), 1, "one visible failure: {events:?}");
-        assert!(errors[0].contains("cat.png") && errors[0].contains("Input 'value'"), "{}", errors[0]);
+        assert!(errors[0].contains(&file.key) && errors[0].contains("not found"), "{}", errors[0]);
         assert!(!events.iter().any(|event| matches!(event,
             RunEvent::NodeSkipped { node_id, .. } if node_id == "send_photo"
         )));
+    }
+
+    /// Reads the bytes of the file on `value`.
+    struct ReadsFile {
+        ran: Ran,
+    }
+    test_manifest!(ReadsFile, "ReadsFile");
+    #[async_trait]
+    impl Node for ReadsFile {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            self.ran.lock().unwrap().push("send_photo");
+            let file: weft_core::storage::FileHandle = ctx.inputs.get("value")?;
+            ctx.storage(weft_core::storage::StorageScope::Run).get_bytes(&file).await?;
+            ctx.pulse_downstream(NodeOutput::new()).await
+        }
     }
 
     /// Emits a value and a permission, both fixed by the test.

@@ -197,19 +197,36 @@ impl WorkerStorageOps for RecordFirst<dyn WorkerStorageOps> {
         self.first_for_storage(run_id).await?;
         self.inner.keep(run_id, key, ttl).await
     }
-    async fn presign(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
-        self.first_for_storage(run_id).await?;
-        self.inner.presign(run_id, key, ttl_secs).await
-    }
-    async fn public_link(
+    async fn link(
         &self,
         run_id: RunId,
         key: &str,
         ttl_secs: Option<u64>,
         reach: weft_core::storage::LinkReach,
-    ) -> WeftResult<Option<String>> {
+    ) -> WeftResult<weft_core::storage::LinkAnswer> {
         self.first_for_storage(run_id).await?;
-        self.inner.public_link(run_id, key, ttl_secs, reach).await
+        self.inner.link(run_id, key, ttl_secs, reach).await
+    }
+    async fn copy(
+        &self,
+        run_id: RunId,
+        key: &str,
+        scope: &StorageScope,
+        identity: Option<&str>,
+        keep: Option<KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.writer.stored_files(run_id);
+        self.first_for_storage(run_id).await?;
+        self.inner.copy(run_id, key, scope, identity, keep).await
+    }
+    async fn upload_slot(&self, run_id: RunId, request: &weft_core::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        self.first_for_storage(run_id).await?;
+        self.inner.upload_slot(run_id, request).await
+    }
+    async fn claim_uploads(&self, run_id: RunId, claims: &[(&str, &weft_core::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
+        self.writer.stored_files(run_id);
+        self.first_for_storage(run_id).await?;
+        self.inner.claim_uploads(run_id, claims).await
     }
 }
 

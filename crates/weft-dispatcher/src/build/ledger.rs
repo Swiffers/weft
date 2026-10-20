@@ -66,7 +66,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             failing_since BIGINT,
             -- Where a person reads the build's log, when the builder
             -- keeps one at an address.
-            log_url TEXT
+            log_url TEXT,
+            -- What a worker build left out because it did not compile
+            -- (weft_core::builds::LeftOut, as JSON), read from the built
+            -- image once it succeeded; NULL for an image with nothing to
+            -- report (an infra image, a custom worker template) and for
+            -- every build that has not succeeded.
+            left_out TEXT
         )"#,
         // One row per image a project's running version names, and when
         // it last became part of that version (`note_running`). What
@@ -343,7 +349,9 @@ fn build_name() -> String {
 /// How a build ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Succeeded,
+    /// Built, with the record of what a worker build left out when the
+    /// build reported one ([`left_out`]).
+    Succeeded(Option<weft_core::builds::LeftOut>),
     Failed(String),
     Cancelled,
 }
@@ -353,13 +361,13 @@ pub enum Outcome {
 /// `false` when its end was recorded already (by whoever looked first),
 /// so only one of them frees it.
 pub async fn finish(pool: &PgPool, image_ref: &str, name: &str, outcome: Outcome, now: i64) -> Result<bool> {
-    let (status, reason) = match outcome {
-        Outcome::Succeeded => ("succeeded", None),
-        Outcome::Failed(reason) => ("failed", Some(reason)),
-        Outcome::Cancelled => ("cancelled", None),
+    let (status, reason, left_out) = match outcome {
+        Outcome::Succeeded(left_out) => ("succeeded", None, left_out.map(|record| serde_json::to_string(&record)).transpose()?),
+        Outcome::Failed(reason) => ("failed", Some(reason), None),
+        Outcome::Cancelled => ("cancelled", None, None),
     };
     let res = sqlx::query(
-        "UPDATE image_build SET status = $3, reason = $4, finished_at = $5 \
+        "UPDATE image_build SET status = $3, reason = $4, finished_at = $5, left_out = $6 \
          WHERE image_ref = $1 AND build_name = $2 AND status = 'running'",
     )
     .bind(image_ref)
@@ -367,10 +375,50 @@ pub async fn finish(pool: &PgPool, image_ref: &str, name: &str, outcome: Outcome
     .bind(status)
     .bind(reason)
     .bind(now)
+    .bind(left_out)
     .execute(pool)
     .await
     .context("record how the build ended")?;
     Ok(res.rows_affected() == 1)
+}
+
+/// Whether a build of `image_ref` succeeded and is on record (with its
+/// result, for an image whose build reports one).
+pub async fn succeeded(pool: &PgPool, image_ref: &str) -> Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'succeeded')")
+        .bind(image_ref)
+        .fetch_one(pool)
+        .await
+        .context("read whether the image was built")
+}
+
+/// What the image `image_ref` left out (`weft_core::builds::LeftOut`), with
+/// where its build's log is read: its successful build's record. A version
+/// registers only on a worker whose build succeeded on record
+/// (`super::VersionBuilder::start_images` builds again any other), so a
+/// missing row is refused: another build of the image may have taken it
+/// over since, and registering would run the worker with its gaps
+/// unknown. An empty ref is a version written before records existed,
+/// whose worker could leave nothing out; no record on the row is an image
+/// with nothing to report.
+pub async fn left_out(pool: &PgPool, image_ref: &str) -> Result<(weft_core::builds::LeftOut, Option<String>)> {
+    if image_ref.is_empty() {
+        return Ok(Default::default());
+    }
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT left_out, log_url FROM image_build WHERE image_ref = $1 AND status = 'succeeded'")
+            .bind(image_ref)
+            .fetch_optional(pool)
+            .await
+            .context("read what the image left out")?;
+    let Some((record, log_url)) = row else {
+        anyhow::bail!("no successful build of {image_ref} is on record any more (another build of it may be under way); build again")
+    };
+    let left_out = match record {
+        Some(record) => weft_core::builds::LeftOut::parse(record.as_bytes()).map_err(anyhow::Error::msg)?,
+        None => Default::default(),
+    };
+    Ok((left_out, log_url))
 }
 
 /// Record the build `name` of `image_ref` as cancelled, and answer its id

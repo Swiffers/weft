@@ -1,9 +1,12 @@
 //! Filesystem-backed node catalog.
 //!
-//! The catalog is the project's `nodes/` directory. It is the single
-//! source of truth for every node: the stdlib is cloned in at
-//! `weft new`, so build / parse / run never reach outside the project.
-//! A unit found while walking `nodes/` is one of two shapes:
+//! The catalog is every node a project holds, walked from two roots:
+//! `nodes/` (the standard library, cloned in at `weft new`, and
+//! anything shared) and `src/`, where a node can sit beside the code
+//! that uses it. Both walk into one namespace, and they are the single
+//! source of truth for every node, so build / parse / run never reach
+//! outside the project. A unit found while walking a root is one of two
+//! shapes:
 //!
 //! - **Bare node**: a directory with `metadata.json` at its root. The
 //!   directory IS the node. No `package.toml`. Files: `metadata.json`,
@@ -19,7 +22,7 @@
 //!   `provider` or `portsFromConfig`) every member inherits key-by-key;
 //!   a member's own key, when present, wins.
 //!
-//! Units can sit at any depth under `nodes/`: directly under it or ten
+//! Units can sit at any depth under a root: directly under it or ten
 //! levels deep. The walk recurses until it hits a unit, then stops
 //! descending. A unit never nests inside another unit. Two units
 //! declaring the same `node_type` is an ambiguous collision and fails
@@ -29,6 +32,11 @@
 //! compiling node Rust code. The emitted project binary compiles node
 //! code directly via `#[path]` includes driven by codegen; it does NOT
 //! use this crate at runtime.
+//!
+//! Every byte the catalog reads comes through a [`SourceTree`]: the disk
+//! ([`DiskTree`], what `FsCatalog::discover` walks), or a snapshot a
+//! caller took into memory once, so a command compiles from one fixed
+//! view of the project however its files change on disk meanwhile.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -56,10 +64,12 @@ mod spelling;
 /// stale worker image gets served (hash misses a file the build
 /// copies) or a build context bloats (copies a cache the worker never
 /// compiles). Symlinks are FOLLOWED by every node-tree walk through
-/// `node_tree_entry_kind` (so a project's `nodes/base_catalog` can be
-/// a symlink into a weft checkout's `catalog/`, e.g. this repo's own
-/// `examples/`); the recursive walks refuse symlink cycles through
-/// `guard_node_tree_cycle` (a descent-chain check) and fail loudly.
+/// [`SourceTree::entry_kind`] (`node_tree_entry_kind` on disk), so a
+/// project's `nodes/base_catalog` can be a symlink into a weft
+/// checkout's `catalog/` (e.g. this repo's own `examples/`); the
+/// recursive walks refuse symlink cycles through
+/// `guard_cycle` (`guard_node_tree_cycle` on disk), a descent-chain
+/// check, and fail loudly.
 // SYNC: NODE_TREE_EXCLUDE + NODE_TREE_EXCLUDE_SUFFIXES <-> .dockerignore
 //       (the "Even inside the allowlisted dirs" block)
 // Only names that are never a real node directory: `pkg` (wasm-pack
@@ -176,33 +186,39 @@ pub struct IncludeFile {
     pub description: Option<String>,
 }
 
-/// Every `.weft` file under `root`, by its path under it, sorted, each
-/// with the description its first line gives. The walk is the node
-/// tree's (`read_node_dir`: symlinks followed with a loop guard,
-/// excluded names skipped), so a file in a folder the catalog never
-/// reads is never listed. A missing `root` holds none.
+/// Every `.weft` file under `root` on disk. See [`include_files_in`].
 pub fn include_files(root: &Path) -> Result<Vec<IncludeFile>, CatalogError> {
+    include_files_in(&DiskTree, root)
+}
+
+/// Every `.weft` file under `root` in `tree`, by its path under it,
+/// sorted, each with the description its first line gives. The walk is
+/// the node tree's (`read_node_dir`: symlinks followed with a loop
+/// guard, excluded names skipped), so a file in a folder the catalog
+/// never reads is never listed. A missing `root` holds none.
+pub fn include_files_in(tree: &dyn SourceTree, root: &Path) -> Result<Vec<IncludeFile>, CatalogError> {
     let mut out = Vec::new();
-    if root.is_dir() {
-        collect_include_files(root, root, &mut Vec::new(), &mut out)?;
+    if present(tree, root)? == Some(NodeTreeEntryKind::Dir) {
+        collect_include_files(tree, root, root, &mut Vec::new(), &mut out)?;
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
 
 fn collect_include_files(
+    tree: &dyn SourceTree,
     root: &Path,
     dir: &Path,
     chain: &mut Vec<PathBuf>,
     out: &mut Vec<IncludeFile>,
 ) -> Result<(), CatalogError> {
-    let canon = guard_node_tree_cycle(dir, chain).map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
+    let canon = guard_cycle(tree, dir, chain).map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
     chain.push(canon);
-    for entry in read_node_dir(dir)? {
+    for entry in read_node_dir(tree, dir)? {
         match entry {
-            NodeDirEntry::Dir(path) => collect_include_files(root, &path, chain, out)?,
+            NodeDirEntry::Dir(path) => collect_include_files(tree, root, &path, chain, out)?,
             NodeDirEntry::File(path) if path.extension().is_some_and(|e| e == "weft") => {
-                let first = first_line(&path).map_err(|error| CatalogError::Io { path: path.clone(), error })?;
+                let first = first_line(tree, &path).map_err(|error| CatalogError::Io { path: path.clone(), error })?;
                 let relative = path.strip_prefix(root).expect("the walk stays under its root");
                 out.push(IncludeFile {
                     path: relative.to_string_lossy().replace('\\', "/"),
@@ -216,14 +232,12 @@ fn collect_include_files(
     Ok(())
 }
 
-/// The first line of the file at `path`, read alone (the listing needs no
-/// more) and decoded leniently: a file that is not UTF-8 is no program
-/// either, but its line still lists it.
-fn first_line(path: &Path) -> std::io::Result<String> {
-    use std::io::BufRead;
-    let mut line = Vec::new();
-    std::io::BufReader::new(fs::File::open(path)?).read_until(b'\n', &mut line)?;
-    Ok(String::from_utf8_lossy(&line).into_owned())
+/// The first line of the file at `path`, decoded leniently: a file that
+/// is not UTF-8 is no program either, but its line still lists it.
+fn first_line(tree: &dyn SourceTree, path: &Path) -> std::io::Result<String> {
+    let bytes = tree.read(path)?;
+    let line = bytes.split_inclusive(|b| *b == b'\n').next().unwrap_or_default();
+    Ok(String::from_utf8_lossy(line).into_owned())
 }
 
 /// The text of a first line when that line is a `#` comment.
@@ -239,22 +253,115 @@ fn first_line_comment(source: &str) -> Option<String> {
 /// walk), so they agree on exactly which bytes constitute a node. A
 /// broken symlink is a loud error (its target is part of the node's
 /// source and it is missing).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeTreeEntryKind {
     Dir,
     File,
 }
 
+/// What `path` is on disk. See [`SourceTree::entry_kind`].
 pub fn node_tree_entry_kind(path: &Path) -> std::io::Result<NodeTreeEntryKind> {
-    // `fs::metadata` follows symlinks; a dangling one errors NotFound
-    // here, which is the loud failure we want (the tree names bytes
-    // that do not exist).
-    let meta = fs::metadata(path)?;
-    if meta.is_dir() {
-        Ok(NodeTreeEntryKind::Dir)
-    } else {
-        Ok(NodeTreeEntryKind::File)
+    DiskTree.entry_kind(path)
+}
+
+/// Where the bytes of a project's files come from: its node trees for
+/// discovery and every later read of a catalog (`deps`,
+/// `package_declares_tests`), and its program for the compiler
+/// (`weft_compiler::file_reader::TreeFileReader`). One walk serves the
+/// disk ([`DiskTree`]) and a snapshot a command took into memory once at
+/// its start, which files edited on disk mid-command then never reach.
+/// Paths are absolute, the ones the walk builds by joining child names
+/// onto its roots.
+///
+/// Each question is answered the way the disk answers it, symlinks
+/// followed: the build stages and hashes node code from a disk (the
+/// install's copy of the version, which is the snapshot the command
+/// published), and it must see the tree discovery saw.
+pub trait SourceTree: Send + Sync {
+    /// The paths of `dir`'s immediate children, in no particular order
+    /// (the walk sorts). An error is about `dir` itself.
+    fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>>;
+
+    /// What `path` is, symlinks followed. A path that is not there is a
+    /// `NotFound` error, which is also how a caller asks whether something
+    /// exists (`present`); a symlink whose target is not there is another
+    /// error, never `NotFound`. Asked per child after `read_dir`, so a child
+    /// the walk skips by name (`is_node_tree_excluded`) is never asked.
+    fn entry_kind(&self, path: &Path) -> std::io::Result<NodeTreeEntryKind>;
+
+    /// The bytes of the file at `path`.
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+
+    /// The bytes at `path` as text. A file that is not UTF-8 fails with
+    /// the `InvalidData` error `std::fs::read_to_string` gives, so a
+    /// broken `metadata.json` reads the same from every backing.
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        String::from_utf8(self.read(path)?)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))
     }
+
+    /// The one identity of the file or directory at `path`, however it
+    /// was reached: two paths to one directory (through symlinks) give
+    /// the same answer, and a path that is not there is an error. The
+    /// walk dedupes on it and refuses a symlink cycle by it
+    /// (`guard_cycle`); the compiler names an included file by it.
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf>;
+}
+
+/// What `path` is in `tree`, `None` when nothing is there: the one way a
+/// catalog asks whether an optional file exists. Any other failure (a
+/// dangling link, a permission refused) is an error naming the path,
+/// never read as the file being absent.
+fn present(tree: &dyn SourceTree, path: &Path) -> Result<Option<NodeTreeEntryKind>, CatalogError> {
+    match tree.entry_kind(path) {
+        Ok(kind) => Ok(Some(kind)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CatalogError::Io { path: path.to_path_buf(), error }),
+    }
+}
+
+/// The node tree as it is on disk right now.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiskTree;
+
+impl SourceTree for DiskTree {
+    fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        fs::read_dir(dir)?.map(|child| child.map(|c| c.path())).collect()
+    }
+
+    fn entry_kind(&self, path: &Path) -> std::io::Result<NodeTreeEntryKind> {
+        // `fs::metadata` follows symlinks. A link to nothing is told apart
+        // from nothing at all: the tree names bytes that do not exist, and
+        // nobody may read it as an optional file being absent (`present`).
+        match fs::metadata(path) {
+            Ok(meta) => Ok(if meta.is_dir() { NodeTreeEntryKind::Dir } else { NodeTreeEntryKind::File }),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(path).is_ok_and(|link| link.file_type().is_symlink()) =>
+            {
+                Err(std::io::Error::other(format!("{} is a symlink to nothing", path.display())))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        fs::read_to_string(path)
+    }
+
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        fs::canonicalize(path)
+    }
+}
+
+/// [`guard_cycle`] on disk, for the walks outside this crate (the build's
+/// staging copy, the source hash) that read the real tree.
+pub fn guard_node_tree_cycle(dir: &Path, chain: &[PathBuf]) -> std::io::Result<PathBuf> {
+    guard_cycle(&DiskTree, dir, chain)
 }
 
 /// Canonicalize `dir` and refuse when it already sits on the current
@@ -268,8 +375,8 @@ pub fn node_tree_entry_kind(path: &Path) -> std::io::Result<NodeTreeEntryKind> {
 ///
 /// Returns the canonical path; the caller pushes it onto its chain
 /// before descending and pops it after.
-pub fn guard_node_tree_cycle(dir: &Path, chain: &[PathBuf]) -> std::io::Result<PathBuf> {
-    let canon = fs::canonicalize(dir)?;
+fn guard_cycle(tree: &dyn SourceTree, dir: &Path, chain: &[PathBuf]) -> std::io::Result<PathBuf> {
+    let canon = tree.canonicalize(dir)?;
     if chain.contains(&canon) {
         return Err(std::io::Error::other(format!(
             "symlink cycle in node tree: {} resolves to {}, a directory this walk is \
@@ -360,7 +467,6 @@ impl std::fmt::Display for CatalogWarning {
     }
 }
 
-#[derive(Debug)]
 pub struct FsCatalog {
     entries: HashMap<String, CatalogEntry>,
     /// All discovered packages, keyed by package root. Each
@@ -384,12 +490,34 @@ pub struct FsCatalog {
     /// strings may use the declared names) and carried here so
     /// compile/enrich callers can activate the same registry.
     type_registry: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
+    /// The tree this catalog was discovered from. Its later reads
+    /// (`deps`, `package_declares_tests`) go through it too, so they see
+    /// the bytes discovery saw, a snapshot's included.
+    tree: std::sync::Arc<dyn SourceTree>,
+}
+
+impl std::fmt::Debug for FsCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsCatalog")
+            .field("entries", &self.entries)
+            .field("packages", &self.packages)
+            .field("problems", &self.problems)
+            .field("warnings", &self.warnings)
+            .field("pending", &self.pending)
+            .field("type_registry", &self.type_registry)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FsCatalog {
-    /// Walk one node tree. See `discover_roots`.
+    /// Walk one node tree on disk. See `discover_roots_in`.
     pub fn discover(root: &Path) -> Result<Self, CatalogError> {
         Self::discover_roots(&[root])
+    }
+
+    /// Walk several node trees on disk. See `discover_roots_in`.
+    pub fn discover_roots(roots: &[&Path]) -> Result<Self, CatalogError> {
+        Self::discover_roots_in(std::sync::Arc::new(DiskTree), roots)
     }
 
     /// One catalog over several trees. A project's nodes live in two
@@ -405,12 +533,21 @@ impl FsCatalog {
     /// told about the other: no folder outranks another, so neither can
     /// silently win. The only `Err` is a root that exists and cannot be
     /// read at all.
-    pub fn discover_roots(roots: &[&Path]) -> Result<Self, CatalogError> {
+    ///
+    /// Every read goes through `tree`, which the catalog keeps for its
+    /// later reads; `roots` are absolute paths in it.
+    pub fn discover_roots_in(tree: std::sync::Arc<dyn SourceTree>, roots: &[&Path]) -> Result<Self, CatalogError> {
         let mut cat = Self::empty();
-        let roots: Vec<&Path> = roots.iter().copied().filter(|r| r.exists()).collect();
-        for root in &roots {
-            fs::read_dir(root).map_err(|error| CatalogError::Io { path: root.to_path_buf(), error })?;
+        cat.tree = tree.clone();
+        let tree = &*tree;
+        let mut present_roots = Vec::new();
+        for root in roots.iter().copied() {
+            if present(tree, root)?.is_some() {
+                tree.read_dir(root).map_err(|error| CatalogError::Io { path: root.to_path_buf(), error })?;
+                present_roots.push(root);
+            }
         }
+        let roots = present_roots;
         if roots.is_empty() {
             return Ok(cat);
         }
@@ -418,6 +555,7 @@ impl FsCatalog {
         // metadata.json may use the declared names, so the registry
         // must exist before a single NodeMetadata is deserialized.
         let mut ctx = DiscoverCtx {
+            tree,
             cat: &mut cat,
             units: Vec::new(),
             broken_files: HashMap::new(),
@@ -455,6 +593,7 @@ impl FsCatalog {
             warnings: Vec::new(),
             pending: BTreeMap::new(),
             type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
+            tree: std::sync::Arc::new(DiskTree),
         }
     }
 
@@ -497,7 +636,7 @@ impl FsCatalog {
 
     /// Deduped, sorted package root directories for the given node
     /// types. This is the unit of build-context staging: discovery
-    /// already walked `nodes/` and grouped every node under its
+    /// already walked the node roots and grouped every node under its
     /// package root, so staging copies exactly these directories
     /// rather than re-walking the tree itself. One walker (discovery),
     /// one source of truth for what a node's directory tree is.
@@ -522,10 +661,16 @@ impl FsCatalog {
     /// member node carries a `tests.rs`). THE one definition of "this
     /// package has tests", so every consumer that filters packages for
     /// test builds answers the question identically.
-    pub fn package_declares_tests(&self, package: &Package) -> bool {
-        package.node_types.iter().any(|nt| {
-            self.entry(nt).is_some_and(|e| e.source_dir.join("tests.rs").is_file())
-        })
+    /// A `tests.rs` that cannot be looked at (a dangling link) is an
+    /// error naming it, never a package with no tests.
+    pub fn package_declares_tests(&self, package: &Package) -> Result<bool, CatalogError> {
+        for entry in package.node_types.iter().filter_map(|nt| self.entry(nt)) {
+            let tests = entry.source_dir.join("tests.rs");
+            if present(self.tree.as_ref(), &tests)? == Some(NodeTreeEntryKind::File) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Read the node's optional `deps.toml`. Returns `None` if the
@@ -535,10 +680,10 @@ impl FsCatalog {
             return Ok(None);
         };
         let deps_path = entry.source_dir.join("deps.toml");
-        if !deps_path.exists() {
+        if present(self.tree.as_ref(), &deps_path)?.is_none() {
             return Ok(None);
         }
-        let raw = fs::read_to_string(&deps_path).map_err(|e| CatalogError::Io {
+        let raw = self.tree.read_to_string(&deps_path).map_err(|e| CatalogError::Io {
             path: deps_path.clone(),
             error: e,
         })?;
@@ -637,7 +782,7 @@ pub struct NodeDeps {
 ///
 /// Values support one substitution: `{{catalog_path}}` expands
 /// to the node's directory inside the builder container, where the
-/// project's `nodes/` is staged. Example, a node shipping a config:
+/// project's node trees are staged. Example, a node shipping a config:
 ///
 /// ```toml
 /// [build.env]
@@ -925,10 +1070,11 @@ struct Unit {
     inheriting_apps: BTreeSet<String>,
 }
 
-/// Discovery state threaded through the traversal: the catalog being
-/// built, the units loaded so far, and the files the type pass already
-/// found broken.
+/// Discovery state threaded through the traversal: the tree it reads,
+/// the catalog being built, the units loaded so far, and the files the
+/// type pass already found broken.
 struct DiscoverCtx<'a> {
+    tree: &'a dyn SourceTree,
     cat: &'a mut FsCatalog,
     units: Vec<Unit>,
     /// `metadata.json` files whose `types` declarations could not be
@@ -937,7 +1083,7 @@ struct DiscoverCtx<'a> {
     /// declared the type, never on the whole catalog.
     broken_files: HashMap<PathBuf, String>,
     /// Canonical dirs of the CURRENT descent chain; re-entering one is
-    /// a symlink cycle and fails loudly (see `guard_node_tree_cycle`).
+    /// a symlink cycle and fails loudly (see `guard_cycle`).
     chain: Vec<PathBuf>,
     /// Canonical dirs already fully processed. A folder reachable by
     /// two paths (two symlinks to one shared catalog) registers once
@@ -1219,8 +1365,8 @@ fn refuse_apps(
 /// The node type a folder's `metadata.json` claims, read as plainly as
 /// possible: used only to name a folder that failed to load, so a
 /// program naming that type is told why.
-fn declared_type(node_dir: &Path) -> Option<String> {
-    let raw = fs::read_to_string(node_dir.join("metadata.json")).ok()?;
+fn declared_type(tree: &dyn SourceTree, node_dir: &Path) -> Option<String> {
+    let raw = tree.read_to_string(&node_dir.join("metadata.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value.get("type")?.as_str().map(str::to_string)
 }
@@ -1228,11 +1374,11 @@ fn declared_type(node_dir: &Path) -> Option<String> {
 /// The node types claimed by a package's member folders (every
 /// immediate subdir with a `metadata.json`), for naming a package that
 /// failed to load as a whole.
-fn declared_member_types(entries: &[NodeDirEntry]) -> Vec<String> {
+fn declared_member_types(tree: &dyn SourceTree, entries: &[NodeDirEntry]) -> Vec<String> {
     entries
         .iter()
         .filter_map(|e| match e {
-            NodeDirEntry::Dir(path) => declared_type(path),
+            NodeDirEntry::Dir(path) => declared_type(tree, path),
             NodeDirEntry::File(_) => None,
         })
         .collect()
@@ -1240,11 +1386,15 @@ fn declared_member_types(entries: &[NodeDirEntry]) -> Vec<String> {
 
 /// Read a `metadata.json`, failing with the type pass's reason when that
 /// pass already found the file's `types` declarations unusable.
-fn read_metadata_file(path: &Path, broken_files: &HashMap<PathBuf, String>) -> Result<String, CatalogError> {
+fn read_metadata_file(
+    tree: &dyn SourceTree,
+    path: &Path,
+    broken_files: &HashMap<PathBuf, String>,
+) -> Result<String, CatalogError> {
     if let Some(error) = broken_files.get(path) {
         return Err(CatalogError::Parse { path: path.to_path_buf(), error: error.clone() });
     }
-    fs::read_to_string(path).map_err(|error| CatalogError::Io { path: path.to_path_buf(), error })
+    tree.read_to_string(path).map_err(|error| CatalogError::Io { path: path.to_path_buf(), error })
 }
 
 /// Harvest every `types` declaration under `root` and build the
@@ -1266,9 +1416,9 @@ fn build_type_registry(roots: &[&Path], ctx: &mut DiscoverCtx<'_>) -> weft_core:
     use weft_core::weft_type::{Redeclaration, TypeRegistry};
     let mut declarations: Vec<(String, String, String)> = Vec::new();
     for root in roots {
-        harvest_type_declarations(root, &mut declarations, &mut ctx.broken_files);
+        harvest_type_declarations(ctx.tree, root, &mut declarations, &mut ctx.broken_files);
     }
-    // Lexical order by origin path: `fs::read_dir` order is
+    // Lexical order by origin path: a directory listing's order is
     // filesystem-dependent, and the messages name origins in the order
     // they are met.
     declarations.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
@@ -1336,33 +1486,35 @@ fn build_type_registry(roots: &[&Path], ctx: &mut DiscoverCtx<'_>) -> weft_core:
 /// `broken_files`; anything the walk itself cannot read is left for the
 /// main pass, which reports it on the folder it belongs to.
 fn harvest_type_declarations(
+    tree: &dyn SourceTree,
     dir: &Path,
     out: &mut Vec<(String, String, String)>,
     broken_files: &mut HashMap<PathBuf, String>,
 ) {
     let mut chain = Vec::new();
     let mut done = std::collections::HashSet::new();
-    harvest_type_declarations_inner(dir, out, broken_files, &mut chain, &mut done)
+    harvest_type_declarations_inner(tree, dir, out, broken_files, &mut chain, &mut done)
 }
 
 fn harvest_type_declarations_inner(
+    tree: &dyn SourceTree,
     dir: &Path,
     out: &mut Vec<(String, String, String)>,
     broken_files: &mut HashMap<PathBuf, String>,
     chain: &mut Vec<PathBuf>,
     done: &mut std::collections::HashSet<PathBuf>,
 ) {
-    let Ok(canon) = guard_node_tree_cycle(dir, chain) else { return };
+    let Ok(canon) = guard_cycle(tree, dir, chain) else { return };
     // Same dedupe as discovery: a folder reachable by two symlink paths
     // yields its declarations once.
     if !done.insert(canon.clone()) {
         return;
     }
-    let Ok(entries) = read_node_dir(dir) else { return };
+    let Ok(entries) = read_node_dir(tree, dir) else { return };
     chain.push(canon);
     for entry in entries {
         match entry {
-            NodeDirEntry::Dir(path) => harvest_type_declarations_inner(&path, out, broken_files, chain, done),
+            NodeDirEntry::Dir(path) => harvest_type_declarations_inner(tree, &path, out, broken_files, chain, done),
             NodeDirEntry::File(path) => {
                 if path.file_name().and_then(|n| n.to_str()) != Some("metadata.json") {
                     continue;
@@ -1371,7 +1523,7 @@ fn harvest_type_declarations_inner(
                 // registry we are building. An unreadable or malformed
                 // file is the main pass's error to report (it reads
                 // every metadata.json it loads, package roots included).
-                let Ok(raw) = fs::read_to_string(&path) else { continue };
+                let Ok(raw) = tree.read_to_string(&path) else { continue };
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
                 let Some(types) = value.get("types") else { continue };
                 let Some(map) = types.as_object() else {
@@ -1398,17 +1550,9 @@ fn harvest_type_declarations_inner(
     chain.pop();
 }
 
-/// Recursive directory visitor under `nodes/`. For each directory:
-///   - If it has `package.toml`, it's a package root.
-///   - Else if it has `metadata.json`, it's a bare node.
-///   - Else recurse into subdirectories.
-/// A unit does not nest: once a package root or bare node is detected,
-/// its interior is not re-scanned. Depth and position are irrelevant;
-/// a unit can sit directly under `nodes/` or ten levels deep.
-/// A classified, kept child of a node-tree directory. Symlinks and
-/// `NODE_TREE_EXCLUDE` names are already filtered out by
-/// `read_node_dir`, so every entry here is a real dir or file the
-/// node-tree policy admits.
+/// A classified, kept child of a node-tree directory. `read_node_dir`
+/// already left out the `NODE_TREE_EXCLUDE` names and followed symlinks,
+/// so every entry here is a dir or file the node-tree policy admits.
 enum NodeDirEntry {
     Dir(PathBuf),
     File(PathBuf),
@@ -1422,36 +1566,26 @@ impl NodeDirEntry {
     }
 }
 
-/// Read a directory's immediate children under the node-tree policy:
-/// follow symlinks (see `node_tree_entry_kind` for the loop guard),
-/// skip `NODE_TREE_EXCLUDE` names. The single traversal mechanic for
+/// Read a directory's immediate children in `tree` under the node-tree
+/// policy: follow symlinks (see `guard_cycle` for the loop guard), skip
+/// `NODE_TREE_EXCLUDE` names. The single traversal mechanic for
 /// discovery; `visit_dir` recurses its dirs and `register_package`
 /// matches members/shared files against the same entries, so the two
 /// can't diverge on what a node tree contains (the de-sync that serves
 /// a stale image or bloats the build context).
-fn read_node_dir(dir: &Path) -> Result<Vec<NodeDirEntry>, CatalogError> {
-    let read = fs::read_dir(dir).map_err(|e| CatalogError::Io {
-        path: dir.to_path_buf(),
-        error: e,
-    })?;
+fn read_node_dir(tree: &dyn SourceTree, dir: &Path) -> Result<Vec<NodeDirEntry>, CatalogError> {
+    let children = tree.read_dir(dir).map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
     let mut out = Vec::new();
-    for child in read {
-        let child = child.map_err(|e| CatalogError::Io {
-            path: dir.to_path_buf(),
-            error: e,
-        })?;
-        if is_node_tree_excluded(&child.file_name().to_string_lossy()) {
+    for child in children {
+        if child.file_name().is_some_and(|name| is_node_tree_excluded(&name.to_string_lossy())) {
             continue;
         }
-        match node_tree_entry_kind(&child.path()).map_err(|error| CatalogError::Io {
-            path: child.path(),
-            error,
-        })? {
-            NodeTreeEntryKind::Dir => out.push(NodeDirEntry::Dir(child.path())),
-            NodeTreeEntryKind::File => out.push(NodeDirEntry::File(child.path())),
+        match tree.entry_kind(&child).map_err(|error| CatalogError::Io { path: child.clone(), error })? {
+            NodeTreeEntryKind::Dir => out.push(NodeDirEntry::Dir(child)),
+            NodeTreeEntryKind::File => out.push(NodeDirEntry::File(child)),
         }
     }
-    // Sorted, because `fs::read_dir` order is the filesystem's, not
+    // Sorted, because a directory listing's order is the filesystem's, not
     // the tree's. Every decision the walk makes by ARRIVING somewhere
     // first rides on this: which of two nodes claiming one identity is
     // the one reported as the original, and, under a lenient policy
@@ -1474,11 +1608,19 @@ fn has_node_file(entries: &[NodeDirEntry], name: &str) -> bool {
     })
 }
 
-/// Walk one directory. Nothing here fails the catalog: a folder that
-/// cannot be read or that loops back on itself is recorded as a problem
-/// and the walk goes on with its siblings.
+/// Walk one directory under a node root:
+///   - if it has `package.toml`, it's a package root;
+///   - else if it has `metadata.json`, it's a bare node;
+///   - else recurse into subdirectories.
+/// A unit does not nest: once a package root or bare node is detected,
+/// its interior is not re-scanned. Depth and position are irrelevant;
+/// a unit can sit directly under a root or ten levels deep.
+///
+/// Nothing here fails the catalog: a folder that cannot be read or that
+/// loops back on itself is recorded as a problem and the walk goes on
+/// with its siblings.
 fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
-    let canon = match guard_node_tree_cycle(dir, &ctx.chain) {
+    let canon = match guard_cycle(ctx.tree, dir, &ctx.chain) {
         Ok(canon) => canon,
         Err(error) => return ctx.record(Vec::new(), CatalogError::Io { path: dir.to_path_buf(), error }),
     };
@@ -1487,7 +1629,7 @@ fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
     if !ctx.done.insert(canon.clone()) {
         return;
     }
-    let entries = match read_node_dir(dir) {
+    let entries = match read_node_dir(ctx.tree, dir) {
         Ok(entries) => entries,
         Err(error) => return ctx.record(Vec::new(), error),
     };
@@ -1511,12 +1653,12 @@ fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
 /// package-level metadata defaults: its own `metadata.json` is already
 /// the whole story).
 fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
-    let entry = match load_node_entry(dir, dir, None, &ctx.broken_files) {
+    let entry = match load_node_entry(ctx.tree, dir, dir, None, &ctx.broken_files) {
         Ok(loaded) => match ctx.take_loaded(loaded, dir) {
             Some((entry, _)) => entry,
             None => return,
         },
-        Err(e) => return ctx.record(declared_type(dir).into_iter().collect(), e),
+        Err(e) => return ctx.record(declared_type(ctx.tree, dir).into_iter().collect(), e),
     };
     // The package name is the directory name. A non-UTF-8 name is a
     // node weft can't compile (it becomes a Rust module ident), so it
@@ -1546,9 +1688,9 @@ fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
 fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCtx<'_>) {
     // Whatever makes the package itself unloadable takes out every
     // member with it, named by the types they claim.
-    let parsed = match load_package_toml(&dir.join("package.toml")) {
+    let parsed = match load_package_toml(ctx.tree, &dir.join("package.toml")) {
         Ok(parsed) => parsed,
-        Err(e) => return ctx.record(declared_member_types(&entries), e),
+        Err(e) => return ctx.record(declared_member_types(ctx.tree, &entries), e),
     };
 
     // Package-level metadata defaults: an OPTIONAL, PARTIAL `metadata.json`
@@ -1562,9 +1704,9 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     // staging, and hash use (`has_node_file`), so the catalog's view and
     // the compiled node's (whose derive reads the staged tree) agree.
     let package_defaults = if has_node_file(&entries, "metadata.json") {
-        match load_package_defaults(dir, &ctx.broken_files) {
+        match load_package_defaults(ctx.tree, dir, &ctx.broken_files) {
             Ok(d) => Some(d),
-            Err(e) => return ctx.record(declared_member_types(&entries), e),
+            Err(e) => return ctx.record(declared_member_types(ctx.tree, &entries), e),
         }
     } else {
         None
@@ -1600,10 +1742,10 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
     for entry in entries {
         match entry {
             NodeDirEntry::Dir(path) => {
-                let member_entries = match read_node_dir(&path) {
+                let member_entries = match read_node_dir(ctx.tree, &path) {
                     Ok(member_entries) => member_entries,
                     Err(e) => {
-                        ctx.record(declared_type(&path).into_iter().collect(), e);
+                        ctx.record(declared_type(ctx.tree, &path).into_iter().collect(), e);
                         continue;
                     }
                 };
@@ -1611,7 +1753,7 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
                     continue;
                 }
                 members_seen += 1;
-                match load_node_entry(&path, dir, package_defaults.as_ref(), &ctx.broken_files) {
+                match load_node_entry(ctx.tree, &path, dir, package_defaults.as_ref(), &ctx.broken_files) {
                     Ok(found) => {
                         if let Some((entry, inherits_apps)) = ctx.take_loaded(found, &path) {
                             if inherits_apps {
@@ -1620,11 +1762,16 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
                             loaded.push(entry);
                         }
                     }
-                    Err(e) => ctx.record(declared_type(&path).into_iter().collect(), e),
+                    Err(e) => ctx.record(declared_type(ctx.tree, &path).into_iter().collect(), e),
                 }
             }
+            // A package's `build.rs` is its package crate's build script
+            // (`weft_compiler::codegen`), never a module of the package:
+            // compiled in, it would need the build-dependencies the
+            // package's library does not have.
             NodeDirEntry::File(path)
-                if path.extension().and_then(|e| e.to_str()) == Some("rs") =>
+                if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && path.file_name().and_then(|n| n.to_str()) != Some("build.rs") =>
             {
                 shared_rs.push(path);
             }
@@ -1660,8 +1807,8 @@ fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCt
 }
 
 /// Read and parse a `package.toml`.
-fn load_package_toml(path: &Path) -> Result<PackageToml, CatalogError> {
-    let raw = fs::read_to_string(path).map_err(|error| CatalogError::Io { path: path.to_path_buf(), error })?;
+fn load_package_toml(tree: &dyn SourceTree, path: &Path) -> Result<PackageToml, CatalogError> {
+    let raw = tree.read_to_string(path).map_err(|error| CatalogError::Io { path: path.to_path_buf(), error })?;
     toml::from_str(&raw).map_err(|e| CatalogError::Parse { path: path.to_path_buf(), error: e.to_string() })
 }
 
@@ -1672,11 +1819,12 @@ fn load_package_toml(path: &Path) -> Result<PackageToml, CatalogError> {
 /// identity key, is an error: silently ignoring it would make every member
 /// quietly miss its inherited keys.
 fn load_package_defaults(
+    tree: &dyn SourceTree,
     package_root: &Path,
     broken_files: &HashMap<PathBuf, String>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CatalogError> {
     let path = package_root.join("metadata.json");
-    let raw = read_metadata_file(&path, broken_files)?;
+    let raw = read_metadata_file(tree, &path, broken_files)?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
             path: path.clone(),
@@ -1731,13 +1879,14 @@ enum Loaded {
 /// partial `metadata.json`, merged in key-by-key (top level only) for
 /// every key the node's own file does not set.
 fn load_node_entry(
+    tree: &dyn SourceTree,
     node_dir: &Path,
     package_key: &Path,
     package_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
     broken_files: &HashMap<PathBuf, String>,
 ) -> Result<Loaded, CatalogError> {
     let meta_path = node_dir.join("metadata.json");
-    let raw = read_metadata_file(&meta_path, broken_files)?;
+    let raw = read_metadata_file(tree, &meta_path, broken_files)?;
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
             path: meta_path.clone(),
@@ -1800,12 +1949,21 @@ fn load_node_entry(
             ),
         });
     }
+    // The compiler gives its own nodes these types (a loop's boundaries,
+    // the opaque block an `@include` it does not open up leaves): a
+    // catalog node under one of them would be mistaken for the compiler's.
+    if weft_core::project::own_types::is_own(&metadata.node_type) {
+        return Err(CatalogError::Parse {
+            path: meta_path.clone(),
+            error: format!("node type '{}' is a name weft gives its own nodes; rename it", metadata.node_type),
+        });
+    }
 
     spelling::check_node(&metadata, |key| inherited.contains(key), &mut misspelled);
 
     // The description is sound; the code may not be there yet. The
     // same `read_node_dir` view the walk and the staging use decides.
-    if !has_node_file(&read_node_dir(node_dir)?, "mod.rs") {
+    if !has_node_file(&read_node_dir(tree, node_dir)?, "mod.rs") {
         return Ok(Loaded::Pending { node_type: metadata.node_type, misspelled });
     }
 
@@ -2846,5 +3004,162 @@ mod package_tests {
             "package must contain all three node types, got {:?}",
             pkg.node_types,
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A node tree held in memory: files by absolute path, a directory
+    /// being any path some file sits under, every path its own identity.
+    struct MapTree(BTreeMap<PathBuf, Vec<u8>>);
+
+    impl SourceTree for MapTree {
+        fn read_dir(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+            self.entry_kind(dir)?;
+            let children: BTreeSet<PathBuf> = self
+                .0
+                .keys()
+                .filter_map(|file| file.strip_prefix(dir).ok()?.components().next())
+                .map(|first| dir.join(first))
+                .collect();
+            Ok(children.into_iter().collect())
+        }
+
+        fn entry_kind(&self, path: &Path) -> std::io::Result<NodeTreeEntryKind> {
+            if self.0.contains_key(path) {
+                Ok(NodeTreeEntryKind::File)
+            } else if self.0.keys().any(|file| file != path && file.starts_with(path)) {
+                Ok(NodeTreeEntryKind::Dir)
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        }
+
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.0.get(path).cloned().ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+
+        fn canonicalize(&self, dir: &Path) -> std::io::Result<PathBuf> {
+            self.entry_kind(dir).map(|_| dir.to_path_buf())
+        }
+    }
+
+    /// A bare node under `nodes/` and a package beside the code under
+    /// `src/`, by path under the project.
+    const PROJECT: &[(&str, &str)] = &[
+        ("nodes/x/metadata.json", r#"{"type": "Feed", "label": "Feed", "description": "d", "inputs": [], "outputs": []}"#),
+        ("nodes/x/mod.rs", "// impl\n"),
+        ("nodes/x/deps.toml", "[dependencies]\nserde = \"1\"\n"),
+        ("src/billing/pkg/package.toml", "[package]\nname = \"billing\"\n"),
+        ("src/billing/pkg/shared.rs", "pub fn helper() {}\n"),
+        ("src/billing/pkg/charge/metadata.json", r#"{"type": "Charge", "label": "Charge", "description": "d", "inputs": [], "outputs": []}"#),
+        ("src/billing/pkg/charge/mod.rs", "// impl\n"),
+    ];
+
+    fn map_tree(project: &Path) -> Arc<dyn SourceTree> {
+        Arc::new(MapTree(PROJECT.iter().map(|(rel, body)| (project.join(rel), body.as_bytes().to_vec())).collect()))
+    }
+
+    /// Everything discovery found, in a form two catalogs compare by.
+    fn found(cat: &FsCatalog) -> (Vec<String>, Vec<String>, Vec<CatalogWarning>) {
+        let mut entries: Vec<String> = cat
+            .iter()
+            .map(|e| {
+                let metadata = serde_json::to_string(&e.metadata).expect("metadata serializes");
+                format!("{} {} {} {metadata}", e.node_type, e.source_dir.display(), e.package_key.display())
+            })
+            .collect();
+        entries.sort();
+        let mut packages: Vec<String> = cat
+            .packages()
+            .map(|p| format!("{} {} {:?} {:?} {:?}", p.name, p.root.display(), p.node_types, p.shared_rs, p.package_deps))
+            .collect();
+        packages.sort();
+        (entries, packages, cat.warnings().to_vec())
+    }
+
+    /// The same files discovered from memory and from disk make the same
+    /// catalog, across both roots.
+    #[test]
+    fn a_tree_in_memory_discovers_like_the_same_files_on_disk() {
+        let project = tempfile::tempdir().expect("temp project");
+        for (rel, body) in PROJECT {
+            let path = project.path().join(rel);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            fs::write(path, body).expect("write");
+        }
+        let roots = [project.path().join("nodes"), project.path().join("src")];
+        let roots: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+
+        let on_disk = FsCatalog::discover_roots(&roots).expect("disk catalog");
+        let in_memory = FsCatalog::discover_roots_in(map_tree(project.path()), &roots).expect("memory catalog");
+        assert!(on_disk.problems().is_empty(), "{:?}", on_disk.problems());
+        assert!(in_memory.problems().is_empty(), "{:?}", in_memory.problems());
+        assert!(in_memory.lookup("Feed").is_some() && in_memory.lookup("Charge").is_some());
+        assert_eq!(found(&in_memory), found(&on_disk));
+    }
+
+    /// A package's `build.rs` is its build script, never one of the shared
+    /// files its members compile with.
+    #[test]
+    fn a_package_build_script_is_no_shared_module() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg = dir.path().join("nodes/tools");
+        fs::create_dir_all(pkg.join("feed")).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"tools\"\n").expect("write");
+        fs::write(pkg.join("build.rs"), "pub fn main() {}\n").expect("write");
+        fs::write(pkg.join("helpers.rs"), "pub fn help() {}\n").expect("write");
+        fs::write(pkg.join("feed/metadata.json"), r#"{"type": "Feed", "label": "Feed", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(pkg.join("feed/mod.rs"), "// impl\n").expect("write");
+        let catalog = FsCatalog::discover(&dir.path().join("nodes")).expect("discover");
+        let shared: Vec<String> = catalog
+            .package_of("Feed")
+            .expect("its package")
+            .shared_rs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(shared, ["helpers.rs"]);
+    }
+
+    /// A `deps.toml` or `tests.rs` that is a link to nothing is an error
+    /// naming it: never a node with no deps, never a package with no tests.
+    #[test]
+    fn a_dangling_optional_file_is_an_error_not_an_absence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = dir.path().join("nodes/feed");
+        fs::create_dir_all(&node).expect("mkdir");
+        fs::write(node.join("metadata.json"), r#"{"type": "Feed", "label": "Feed", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(node.join("mod.rs"), "// impl\n").expect("write");
+        let catalog = FsCatalog::discover(&dir.path().join("nodes")).expect("discover");
+        assert!(catalog.deps("Feed").expect("no deps.toml at all").is_none());
+        let package = catalog.package_of("Feed").expect("its package").clone();
+        assert!(!catalog.package_declares_tests(&package).expect("no tests.rs at all"));
+
+        std::os::unix::fs::symlink(dir.path().join("gone.toml"), node.join("deps.toml")).expect("link");
+        std::os::unix::fs::symlink(dir.path().join("gone.rs"), node.join("tests.rs")).expect("link");
+        let err = catalog.deps("Feed").expect_err("a link to nothing").to_string();
+        assert!(err.contains("deps.toml"), "{err}");
+        let err = catalog.package_declares_tests(&package).expect_err("a link to nothing").to_string();
+        assert!(err.contains("tests.rs"), "{err}");
+    }
+
+    /// A catalog's later reads go to the tree it was discovered from:
+    /// nothing of this project exists on disk, and `deps` still reads
+    /// the snapshot's `deps.toml`.
+    #[test]
+    fn deps_read_the_tree_the_catalog_was_discovered_from() {
+        let project = Path::new("/weft-catalog-test/nowhere-on-disk");
+        assert!(!project.exists());
+        let roots = [project.join("nodes"), project.join("src")];
+        let roots: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+        let cat = FsCatalog::discover_roots_in(map_tree(project), &roots).expect("memory catalog");
+
+        let deps = cat.deps("Feed").expect("deps read").expect("Feed has a deps.toml");
+        assert_eq!(deps.dependencies.get("serde").and_then(|v| v.as_str()), Some("1"));
+        assert!(cat.deps("Charge").expect("deps read").is_none(), "Charge has no deps.toml");
     }
 }

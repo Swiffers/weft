@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::instance::InstanceId;
-use crate::running_policy::{DeactivateSpec, RunningChoice};
+use crate::instance::{InstanceId, InstanceTarget};
+use crate::take_down::TakeDownChoice;
 
 /// `GET /projects/{id}/infra/doors`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +199,8 @@ pub const INFRA_NOT_STARTED: &str = "not_started";
 // SYNC: INFRA_PER_INSTANCE <-> packages/weft-graph/src/protocol.ts InfraPlacementStatus.status
 pub const INFRA_PER_INSTANCE: &str = "per_instance";
 
-/// `POST /projects/{id}/infra/sync`: bring the infra up on a build.
+/// `POST /projects/{id}/infra/sync` (`weft infra start`): start what is
+/// not running, and nothing else. Never touches the runs going.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncRequest {
     /// The build the client just made (`POST /projects/{id}/builds`).
@@ -210,81 +211,50 @@ pub struct SyncRequest {
     /// with the build, never from here.
     #[serde(flatten)]
     pub build: crate::builds::BuildHashes,
-    /// How the worker reconciliation inside sync (and an upgrade's
-    /// stop leg) treats runs still running on an older image once
-    /// a new one went live. `cancel` (the default) cancels them; `wait`
-    /// lets them finish up to `drainTimeoutSecs`, then cancels what is
-    /// left. Never a silent kill.
-    /// On an upgrade, outranked by `triggerDeactivation`'s answer when
-    /// that picker was shown.
-    #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Whose copies: an instance's copies of the nodes marked
-    /// `@per_instance`, or (absent) the shared nodes. `weft infra start
-    /// --instance`, and a program's `ctx.infra(..).instance(..).start()`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<InstanceId>,
-    /// Only these infra nodes (by place), every one of the owner's kind
-    /// when empty.
+    /// Whose copies: the shared nodes' (absent), or the named instances'
+    /// (or every instance's) copies of the nodes marked `@per_instance`.
+    #[serde(default, skip_serializing_if = "InstanceTarget::is_shared")]
+    pub instances: InstanceTarget,
+    /// Only these infra nodes (by place), every one of the owners' kind
+    /// when empty. Starting a node starts what it needs upstream that is
+    /// not running; what runs already hands over its outputs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<String>,
 }
 
-/// `POST /projects/{id}/infra/upgrade`: cycle the running infra onto the
-/// current specs (the triggers reading it taken down per
-/// `triggerDeactivation`, then a stop leg, then the start). What to run
-/// is the sync body's.
+/// `POST /projects/{id}/infra/upgrade`: cycle the running copies onto the
+/// build (it is built first): the triggers whose cut contains them taken
+/// down as `take_down` says, a stop, then the start. Only what runs is
+/// replaced, and only infra the build newly needs is started.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpgradeRequest {
     #[serde(flatten)]
     pub sync: SyncRequest,
-    /// How to deactivate the triggers reading this infra when one is on
-    /// (required then: 428 with the trigger-choice header otherwise).
-    /// Same `DeactivateSpec` shape as the standalone `/deactivate`
-    /// endpoint, so clients reuse one picker.
-    #[serde(default, rename = "triggerDeactivation", skip_serializing_if = "Option::is_none")]
-    pub trigger_deactivation: Option<DeactivateSpec>,
+    #[serde(flatten)]
+    pub take_down: TakeDownChoice,
 }
 
-/// `POST /projects/{id}/infra/stop` and `/infra/terminate`. Carries the
-/// trigger-deactivation choice when the project is Active (the same
-/// picker as the standalone Deactivate verb, and its answer governs
-/// the running runs), and the running-work choice on its own
-/// for when it is not: an inactive project can still have runs
-/// running on this infra, and `wait` lets them land before the
-/// supervisor scales it down.
+/// `POST /projects/{id}/infra/stop` and `/infra/terminate`: the triggers
+/// whose cut contains the copies taken down as `take_down` says (they
+/// come back when the copies run again), then the copies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StopRequest {
-    #[serde(default, rename = "triggerDeactivation", skip_serializing_if = "Option::is_none")]
-    pub trigger_deactivation: Option<DeactivateSpec>,
     #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Whose copies: one instance's (`--instance`), or (absent) the shared
-    /// ones.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<InstanceId>,
-}
-
-/// `POST /projects/{id}/infra/nodes/{node}/stop` and `/terminate`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PerNodeRequest {
-    /// What happens to the running runs this copy can reach.
-    /// Which ones use this one instance is not recorded, so for the
-    /// shared copy `cancel` (the default) ends every running run
-    /// of the project, and for an instance's copy every run of that
-    /// instance; `wait` lets the same set land first.
-    #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Stop only: force scale-to-zero every unit, ignoring `on_stop`.
-    /// Lets the user take down a unit that would normally stay up
-    /// (NoOp) so they can update it on the next start. Ignored by
-    /// terminate (terminate already removes everything).
-    #[serde(default)]
+    pub take_down: TakeDownChoice,
+    /// Whose copies: the shared ones (absent), or the named instances'
+    /// (or every instance's).
+    #[serde(default, skip_serializing_if = "InstanceTarget::is_shared")]
+    pub instances: InstanceTarget,
+    /// Only these infra nodes (by place), every one of the owners' kind
+    /// when empty. A node the source no longer declares that still has a
+    /// copy (an orphan) may be named to take it down by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// Stop only: scale every unit to zero, ignoring each unit's
+    /// `on_stop`, so a unit that normally stays up comes down too (to
+    /// update it on the next start). Terminate removes everything anyway.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force: bool,
-    /// Whose copy of the node: an instance's copy of a per-instance node,
-    /// or (absent) the shared one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<InstanceId>,
 }
 
 /// What a sync answers, and `GET /projects/{id}/infra/status`: every
@@ -409,7 +379,10 @@ mod change_progress_tests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleCommandIssued {
-    pub command_id: i64,
+    /// One command per owner whose copies it acts on.
+    pub command_ids: Vec<i64>,
+    /// What taking down the triggers whose cut contains the copies did.
+    pub report: crate::deactivation::TakeDownReport,
 }
 
 /// `GET /projects/{id}/infra/commands/{cmd_id}`: whether the command
@@ -470,11 +443,17 @@ mod tests {
         }).unwrap();
         assert_eq!(wire, serde_json::json!({ "infraHash": "i" }));
         let upgrade: UpgradeRequest = serde_json::from_value(serde_json::json!({
-            "infraHash": "i", "triggerDeactivation": { "mode": "park", "runningPolicy": "wait" }
+            "infraHash": "i", "door": "hide", "running": "cancel", "instances": "all_instances", "nodes": ["db"]
         }))
         .unwrap();
         assert_eq!(upgrade.sync.build.infra_hash.as_deref(), Some("i"));
-        assert!(upgrade.trigger_deactivation.is_some());
+        assert_eq!(upgrade.sync.instances, InstanceTarget::EveryInstance);
+        assert_eq!(upgrade.sync.nodes, vec!["db".to_string()]);
+        assert_eq!(upgrade.take_down.door, Some(crate::take_down::Door::Hide));
+        assert_eq!(upgrade.take_down.running, Some(crate::take_down::Running::Cancel));
+        let stop: StopRequest = serde_json::from_value(serde_json::json!({ "force": true })).unwrap();
+        assert!(stop.force && stop.nodes.is_empty() && stop.take_down == TakeDownChoice::default());
+        assert_eq!(serde_json::to_value(StopRequest::default()).unwrap(), serde_json::json!({}));
     }
 
     fn at(nanos: u32) -> DateTime<Utc> {

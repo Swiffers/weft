@@ -11,8 +11,7 @@
 	import CopyButton from "../ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, entryForSource, entryPortCollisions, entryPortName, hasValue, isEmptyChoiceSet, isFilledIn, isValidFieldKey, type PortEntryDef, type PortSpec } from '../../utils/port-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
-	import { describeProgress } from "../../../../status";
-	import type { ChangeProgress, ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
+	import type { ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink, Pencil } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
@@ -50,10 +49,6 @@
 			/// one in/out dot), no ports/config/body. Run overlays
 			/// (status glyph, inspector, glow) are kept.
 			simplified?: boolean;
-			/// The user aimed the run at this output node (right-click, "Set as
-			/// target"). Renders as a breathing ring in the node's own colour,
-			/// which is the only place the feature shows on the canvas.
-			runTarget?: boolean;
 			config: Record<string, unknown>;
 			/// Body-set PORT values + their written forms, the two-home
 			/// twin of `config` (see NodeInstance.portLiterals).
@@ -92,13 +87,10 @@
 			onToggleGate?: () => void;
 			onSaveFileRef?: (path: string, content: string) => void;
 			onOpenInclude?: (path: string, alias: string) => void;
-			infraNodeStatus?: string;
-			/// For a `per_instance` place: how many instances have a copy.
-			infraInstanceCopies?: number;
-			infraFailureStage?: string;
-			infraFailureMessage?: string;
-			/// While a start is under way: since when, and what it waits on.
-			infraProgress?: ChangeProgress;
+			/// A trigger's or an infra node's badge (`on`, `behind`,
+			/// `3 of 5 running`...), from the state the dispatcher computed;
+			/// its detail shows on hover.
+			lifecycleBadge?: import('../../lifecycle').LifecycleBadge;
 			debugData?: unknown;
 			firings?: NodeFiring[];
 			/// One IRC-style scrollable log per bus this node took part
@@ -329,6 +321,26 @@
 	const isTriggerNode = $derived(
 		nodeIsTrigger({ nodeType: data.nodeType, features: data.features }),
 	);
+
+	/// A lifecycle badge's colours, per tone.
+	const BADGE_PILL: Record<import('../../lifecycle').BadgeTone, string> = {
+		on: 'bg-green-100 text-green-700',
+		off: 'bg-zinc-100 text-zinc-600',
+		busy: 'bg-sky-100 text-sky-700',
+		behind: 'bg-amber-100 text-amber-800',
+		held: 'bg-violet-100 text-violet-700',
+		failed: 'bg-rose-100 text-rose-700',
+		warn: 'bg-amber-100 text-amber-700',
+	};
+	const BADGE_DOT: Record<import('../../lifecycle').BadgeTone, string> = {
+		on: 'bg-green-500',
+		off: 'bg-zinc-400',
+		busy: 'bg-sky-500 animate-pulse',
+		behind: 'bg-amber-500',
+		held: 'bg-violet-500',
+		failed: 'bg-rose-500',
+		warn: 'bg-amber-500',
+	};
 	const showDebugDisplay = $derived(!!typeConfig.features?.showDebugPreview && hasDebugData);
 	const showFileDisplay = $derived(!!(typeConfig.display && displayedFileValue));
 	// Simplified view: a node with anything to show (its display, a
@@ -1588,9 +1600,9 @@
 			     error box (nothing is broken, nothing is running). -->
 			<div class="text-[10px] text-muted-foreground bg-zinc-50 border border-zinc-200 rounded px-2 py-1.5">
 				{#if isTriggerNode}
-					Nothing is listening for this trigger. Activate the project from the action bar.
+					Nothing is listening for this trigger. Select it and turn it on.
 				{:else}
-					Not running. Start it from the action bar.
+					Not running. Select it and start it.
 				{/if}
 			</div>
 		{:else if data.bodyFeed.items.length > 0}
@@ -1713,7 +1725,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		bind:this={nodeElement}
-		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
+		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''}"
 		style="
 			width: 100%;
 			height: 100%;
@@ -1728,7 +1740,6 @@
 			border: 1px solid {selected ? typeConfig.color : 'rgba(0, 0, 0, 0.08)'};
 			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05){selected ? `, 0 0 0 1px ${typeConfig.color}20` : ''};
 			backdrop-filter: blur(8px);
-			--run-target-color: {typeConfig.color};
 		"
 	>
 		<!-- Status glyph (top-right) + inspector (magnifier), same as full view -->
@@ -1803,9 +1814,8 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={nodeElement}
-	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
+	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''}"
 	style="
-		--run-target-color: {typeConfig.color};
 		width: 100%;
 		height: 100%;
 		display: flex;
@@ -1837,34 +1847,14 @@
 			{:else}
 				<span class="text-[11px] font-semibold tracking-wide uppercase" style="color: {typeConfig.color};">{typeConfig.label}</span>
 			{/if}
-			{#if data.infraNodeStatus}
+			{#if data.lifecycleBadge}
+				{@const badge = data.lifecycleBadge}
 				<span
-					class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
-					{data.infraNodeStatus === 'running' ? 'bg-green-100 text-green-700' : ''}
-					{data.infraNodeStatus === 'flaky' ? 'bg-amber-100 text-amber-700' : ''}
-					{data.infraNodeStatus === 'failed' ? 'bg-rose-100 text-rose-700' : ''}
-					{data.infraNodeStatus === 'stopped' || data.infraNodeStatus === 'not_started' || data.infraNodeStatus === 'per_instance' ? 'bg-zinc-100 text-zinc-600' : ''}
-					{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-100 text-sky-700' : ''}
-					"
-					title={data.infraFailureMessage
-						? `${data.infraFailureStage ? data.infraFailureStage + ': ' : ''}${data.infraFailureMessage}`
-						: data.infraProgress
-							? `${data.infraNodeStatus} ${describeProgress(data.infraProgress, Date.now() / 1000)}`
-							: undefined}
+					class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none whitespace-nowrap {BADGE_PILL[badge.tone]}"
+					title={badge.detail}
 				>
-					<span class="w-1.5 h-1.5 rounded-full
-						{data.infraNodeStatus === 'running' ? 'bg-green-500' : ''}
-						{data.infraNodeStatus === 'flaky' ? 'bg-amber-500' : ''}
-						{data.infraNodeStatus === 'failed' ? 'bg-rose-500' : ''}
-						{data.infraNodeStatus === 'stopped' || data.infraNodeStatus === 'not_started' || data.infraNodeStatus === 'per_instance' ? 'bg-zinc-400' : ''}
-						{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-500 animate-pulse' : ''}
-					"></span>
-					<!-- A per-instance place has no copy of its own: the node's
-					     "per instance" badge already says so, so this says how
-					     many instances have one. -->
-					{data.infraNodeStatus === 'per_instance'
-						? `${data.infraInstanceCopies ?? 0} ${data.infraInstanceCopies === 1 ? 'copy' : 'copies'}`
-						: data.infraNodeStatus.replace('_', ' ')}
+					<span class="w-1.5 h-1.5 rounded-full {BADGE_DOT[badge.tone]}"></span>
+					{badge.label}
 				</span>
 			{/if}
 		</div>
@@ -2529,42 +2519,6 @@
 		border-top-color: #f59e0b;
 		border-radius: 50%;
 		animation: debug-spin 0.8s linear infinite;
-	}
-
-	/* An output node the user aimed the run at. A ring in the node's own
-	   colour that breathes, so a targeted node is obvious on a busy canvas
-	   without adding anything permanent to every output node. `!important`
-	   because the inline box-shadow on the card would otherwise win. */
-	:global(.node-run-target) {
-		box-shadow:
-			0 1px 3px rgba(0, 0, 0, 0.08),
-			0 4px 12px rgba(0, 0, 0, 0.05),
-			0 0 0 3px var(--run-target-color) !important;
-		animation: run-target-breathe 2.4s ease-in-out infinite;
-	}
-
-	@keyframes run-target-breathe {
-		0%, 100% {
-			box-shadow:
-				0 1px 3px rgba(0, 0, 0, 0.08),
-				0 4px 12px rgba(0, 0, 0, 0.05),
-				0 0 0 3px var(--run-target-color),
-				0 0 6px 1px var(--run-target-color);
-		}
-		50% {
-			box-shadow:
-				0 1px 3px rgba(0, 0, 0, 0.08),
-				0 4px 12px rgba(0, 0, 0, 0.05),
-				0 0 0 3px var(--run-target-color),
-				0 0 18px 5px var(--run-target-color);
-		}
-	}
-
-	/* Somebody who set reduce-motion still gets the ring, without the pulse. */
-	@media (prefers-reduced-motion: reduce) {
-		:global(.node-run-target) {
-			animation: none;
-		}
 	}
 
 	@keyframes debug-spin {

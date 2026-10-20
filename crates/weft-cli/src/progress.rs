@@ -28,8 +28,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Which CLI verb is emitting events. Webview state machine
 /// disambiguates so the bar can render the right label per phase.
-/// (Reactivate / resume-active reuse the plain `Activate` verb, so
-/// they have no variant here.)
 // SYNC: ActionVerb <-> packages/weft-graph/src/protocol.ts ActionVerb, crates/weft-dispatcher/src/api/project.rs compute_available_actions
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,25 +36,18 @@ pub enum ActionVerb {
     Activate,
     Bake,
     /// Cancel an in-flight `activate` (status=Activating). Wipes
-    /// partial trigger registrations and flips the project back to
-    /// Inactive.
+    /// partial trigger registrations and leaves those triggers down.
     CancelActivate,
     /// Cancel an in-flight build (transition=building): the install
     /// stops the project's image builds.
     CancelBuild,
     Deactivate,
-    /// Force-cancel the runs still going while a deactivate-with-wait
-    /// is draining. The lifecycle target the original deactivate
-    /// wrote stays in place; this just unblocks the drain.
-    CancelRunning,
     Resync,
     Build,
     InfraStart,
     InfraStop,
     InfraTerminate,
     InfraUpgrade,
-    InfraNodeStop,
-    InfraNodeTerminate,
     /// Cancel in-flight infra work: halt claimed lifecycle commands,
     /// cancel unclaimed ones, interrupt the InfraSetup provisioning
     /// run. HALT, not rollback: per-node partial state stays.
@@ -64,6 +55,27 @@ pub enum ActionVerb {
     /// Multi-level project cleanup (deactivate + unregister + optional
     /// infra/journal/image/local wipes).
     Rm,
+}
+
+/// What a wait for the runs going is on ([`Progress::drain_wait`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOn {
+    /// The runs reaching the infra an infra verb takes down.
+    Infra,
+    /// The runs on the old version a resync replaces.
+    Resync,
+    /// The runs the triggers a deactivate takes down fired.
+    Deactivate,
+}
+
+impl DrainOn {
+    fn as_str(self) -> &'static str {
+        match self {
+            DrainOn::Infra => "infra",
+            DrainOn::Resync => "resync",
+            DrainOn::Deactivate => "deactivate",
+        }
+    }
 }
 
 /// All phases any verb can emit. Closed enum so the extension's
@@ -106,12 +118,10 @@ pub enum Phase {
     /// in the verb; node ids in detail).
     InfraProvisionStart,
     InfraProvisionDone,
-    /// The command is about to wait for the project's running
-    /// runs to finish before it lands. Detail carries
-    /// `{ "capSeconds": N }` when the user set `--drain-timeout`, and
-    /// nothing when the dispatcher's own cap applies. Emitted before
-    /// the call that waits, because the wait itself happens on the
-    /// dispatcher: without it the command looks hung.
+    /// The command is about to wait for the runs reaching the infra it
+    /// takes down to end (`--running wait`), however long they take.
+    /// Emitted before the call that waits, because the wait itself
+    /// happens on the dispatcher: without it the command looks hung.
     DrainWait,
     /// Trigger registration started (signals about to be wired up).
     TriggerRegisterStart,
@@ -190,7 +200,6 @@ pub fn report_plain_error(json: bool, e: &anyhow::Error) {
 /// that is where the "why" lives), plus the facts a host acts on
 /// without matching the wording.
 // SYNC: daemonUnreachable, installUnreachable <-> extension-vscode/src/cli.ts CliFailure
-// SYNC: needsTriggerChoice <-> extension-vscode/src/triggerChoice.ts isTriggerChoiceRefusal
 pub fn error_detail(e: &anyhow::Error) -> Value {
     let unreachable = unreachable_install(e);
     let local = unreachable.is_some_and(|install| install.is_local());
@@ -211,10 +220,6 @@ pub fn error_detail(e: &anyhow::Error) -> Value {
         "daemonUnreachable": local,
         // Any install did not answer, this machine's or a remote one.
         "installUnreachable": unreachable.is_some(),
-        // The dispatcher needs to know how triggers come down and
-        // nobody could be asked: a host that can ask opens its picker
-        // and sends the verb again with the choice.
-        "needsTriggerChoice": e.chain().any(|cause| cause.is::<crate::commands::deactivate::NeedsTriggerChoice>()),
     })
 }
 
@@ -344,21 +349,14 @@ impl Progress {
         self.emit(Phase::BuildDone, Some(serde_json::json!({ "project": project, "built": built })));
     }
 
-    /// Say what the call about to be made will wait for, and for how
-    /// long: the running policy and cap the verb is about to send.
-    ///
-    /// The POLICY decides whether there is a wait, and the mode has no
-    /// say: it is the same rule as `DeactivateSpec::drains`, so park and
-    /// hibernate both wait when the person asked to wait. (Wipe cannot
-    /// reach here with `wait`; the spec's validator refuses that pair.)
-    pub fn drain_wait(&self, policy: weft_core::RunningPolicy, cap_seconds: Option<u64>) {
-        if policy != weft_core::RunningPolicy::Wait {
-            return;
+    /// Say that the call about to be made waits for the runs going, when
+    /// it does (`running: wait`), and on which: the ones reaching the infra
+    /// it takes down, the ones on the old version a resync replaces, or the
+    /// ones fired by the triggers a deactivate takes down.
+    pub fn drain_wait(&self, running: weft_core::Running, on: DrainOn) {
+        if running == weft_core::Running::Wait {
+            self.emit(Phase::DrainWait, Some(serde_json::json!({ "on": on.as_str() })));
         }
-        self.emit(
-            Phase::DrainWait,
-            cap_seconds.map(|cap| serde_json::json!({ "capSeconds": cap })),
-        );
     }
 
     pub fn dispatcher_call_start(&self, path: &str) {
@@ -535,16 +533,18 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
             )
         }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
-        Phase::DrainWait => {
-            let cap = match ev.detail.and_then(|d| d.get("capSeconds")).and_then(|v| v.as_u64()) {
-                Some(cap) => format!("at most {cap}s"),
-                None => "up to the dispatcher's cap".to_string(),
-            };
-            format!(
-                "waiting for this project's runs still going to finish, {cap}, then the rest \
-                 are cancelled (`--running-policy cancel` stops them now)"
-            )
-        }
+        Phase::DrainWait => match ev.detail.as_ref().and_then(|d| d.get("on")).and_then(Value::as_str) {
+            Some("resync") => "the triggers that are on and behind go down now, and the new version takes over once any run \
+                 still going on the old one ends, however long it takes (`weft stop <run>` ends one now, `weft cancel-activate` \
+                 gives the resync up; Ctrl+C stops following, the resync goes on)"
+                .to_string(),
+            Some("deactivate") => "the triggers go down now; waiting for the runs they fired to end, however long they take \
+                 (`weft stop <run>` ends one now; Ctrl+C stops waiting, the triggers stay down)"
+                .to_string(),
+            _ => "any run reaching the infra it takes down is waited for first, however long it takes \
+                 (`weft stop <run>` ends one now, `weft infra cancel` calls the command off)"
+                .to_string(),
+        },
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
         Phase::InfraWait => {
             let verb = ev
@@ -617,7 +617,6 @@ pub async fn while_waiting<T>(
 #[cfg(test)]
 mod tests {
     use super::{build_wait_line, error_detail};
-    use crate::commands::deactivate::NeedsTriggerChoice;
 
     /// The wait line names what it knows in every state, never just the time.
     #[test]
@@ -626,23 +625,6 @@ mod tests {
         assert_eq!(build_wait_line(30, &[], &["worker"]), "  still building (30s so far): built worker, the next has not started on the builder yet");
         assert_eq!(build_wait_line(30, &["db"], &[]), "  still building db (30s so far)");
         assert_eq!(build_wait_line(30, &["db"], &["worker"]), "  still building db (30s so far); built: worker");
-    }
-
-    /// The dispatcher's needs-a-choice refusal reaches the error event
-    /// as a flag, even under a context, and keeps its message; any
-    /// other failure says it does not need one.
-    #[test]
-    fn a_needed_trigger_choice_is_a_flag_on_the_error_event() {
-        let refusal = anyhow::Error::new(NeedsTriggerChoice("triggers are on: pass --mode".into()))
-            .context("infra stop");
-        let detail = error_detail(&refusal);
-        assert_eq!(detail["needsTriggerChoice"], true);
-        assert_eq!(detail["daemonUnreachable"], false);
-        assert_eq!(detail["message"], "infra stop: triggers are on: pass --mode");
-
-        let other = error_detail(&anyhow::anyhow!("project not registered"));
-        assert_eq!(other["needsTriggerChoice"], false);
-        assert_eq!(other["message"], "project not registered");
     }
 
     /// A request that never reached this machine's daemon says to start

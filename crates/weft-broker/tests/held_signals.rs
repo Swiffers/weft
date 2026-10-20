@@ -1,7 +1,7 @@
 //! Layer-3 contract tests for `held_signals`, the statements the listener
 //! depends on, against a REAL Postgres: the rule "a listener holds the
-//! rows of a trigger that takes work, and never a wiped one's or a
-//! hibernation's past its window" lives in the SQL's filter, and
+//! rows of a trigger that takes work, and never one whose door refuses
+//! or whose window is over" lives in the SQL's filter, and
 //! "of two listeners woken for the same moment exactly one acts" lives in
 //! the write's WHERE, so only the statements themselves can prove them.
 //!
@@ -60,39 +60,37 @@ async fn signal(pool: &PgPool, token: &str, project_id: uuid::Uuid, status: Proj
 
 const ACTIVE: uuid::Uuid = uuid::Uuid::from_u128(0xa);
 const ACTIVATING: uuid::Uuid = uuid::Uuid::from_u128(0xb);
-const PARKED: uuid::Uuid = uuid::Uuid::from_u128(0xc);
-const DEACTIVATING: uuid::Uuid = uuid::Uuid::from_u128(0xd);
-const WIPED: uuid::Uuid = uuid::Uuid::from_u128(0xe);
-const HIBERNATING: uuid::Uuid = uuid::Uuid::from_u128(0xf);
+const TAKING: uuid::Uuid = uuid::Uuid::from_u128(0xc);
+const REFUSING: uuid::Uuid = uuid::Uuid::from_u128(0xe);
+const HIDING: uuid::Uuid = uuid::Uuid::from_u128(0xf);
 
-/// Take the activation of `token` off work as a wipe leaves it: inactive
-/// and refusing, with no grace window.
-async fn wipe(pool: &PgPool, token: &str) {
+/// Take the activation of `token` down with its door refusing, and no
+/// window.
+async fn refuse(pool: &PgPool, token: &str) {
     sqlx::query("UPDATE trigger_activation SET status = 'inactive', accepting_fires = FALSE, fires_deadline_unix = NULL WHERE trigger = $1")
         .bind(token)
         .execute(pool)
         .await
-        .expect("wipe");
+        .expect("refuse");
 }
 
 /// The listener holds the rows of every trigger that takes work (on, being
-/// set up, draining, parked, or hibernating within its grace window: what
-/// those hear waits for the trigger to be back), and never a wiped one's or
-/// a hibernation's past its window.
+/// set up, or down with its door taking or hiding what arrives within its
+/// window: what those hear waits for the trigger to be back), and never one
+/// whose door refuses or whose window is over.
 #[sqlx::test]
 async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPool) {
     schema(&pool).await;
-    for id in [ACTIVE, ACTIVATING, PARKED, DEACTIVATING, WIPED, HIBERNATING] {
+    for id in [ACTIVE, ACTIVATING, TAKING, REFUSING, HIDING] {
         project(&pool, id).await;
     }
     signal(&pool, "active", ACTIVE, ProjectStatus::Active).await;
     signal(&pool, "activating", ACTIVATING, ProjectStatus::Activating).await;
-    signal(&pool, "parked", PARKED, ProjectStatus::Inactive).await;
-    signal(&pool, "deactivating", DEACTIVATING, ProjectStatus::Deactivating).await;
-    signal(&pool, "wiped", WIPED, ProjectStatus::Inactive).await;
-    wipe(&pool, "wiped").await;
-    for (token, deadline) in [("in_grace", i64::MAX / 2), ("past_grace", 1)] {
-        signal(&pool, token, HIBERNATING, ProjectStatus::Inactive).await;
+    signal(&pool, "taking", TAKING, ProjectStatus::Inactive).await;
+    signal(&pool, "refusing", REFUSING, ProjectStatus::Inactive).await;
+    refuse(&pool, "refusing").await;
+    for (token, deadline) in [("in_window", i64::MAX / 2), ("past_window", 1)] {
+        signal(&pool, token, HIDING, ProjectStatus::Inactive).await;
         sqlx::query("UPDATE trigger_activation SET fires_visible_to_consumers = FALSE, fires_deadline_unix = $2 WHERE trigger = $1")
             .bind(token)
             .bind(deadline)
@@ -103,18 +101,18 @@ async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPo
 
     let mut tokens: Vec<String> = signals_held(&pool, None).await.expect("query").into_iter().map(|r| r.token).collect();
     tokens.sort();
-    assert_eq!(tokens, vec!["activating", "active", "deactivating", "in_grace", "parked"]);
+    assert_eq!(tokens, vec!["activating", "active", "in_window", "taking"]);
 
     // An activation's rehydrate reads its own project's rows only.
     let one: Vec<String> =
         signals_held(&pool, Some(ACTIVATING)).await.expect("query").into_iter().map(|r| r.token).collect();
     assert_eq!(one, vec!["activating".to_string()]);
-    assert!(signals_held(&pool, Some(WIPED)).await.expect("query").is_empty(), "scoped, still only held rows");
+    assert!(signals_held(&pool, Some(REFUSING)).await.expect("query").is_empty(), "scoped, still only held rows");
 
     // One by token follows the same rule.
-    assert_eq!(signal_held(&pool, "parked").await.unwrap().map(|r| r.token).as_deref(), Some("parked"));
-    assert!(signal_held(&pool, "wiped").await.unwrap().is_none(), "a wiped row never comes back");
-    assert!(signal_held(&pool, "past_grace").await.unwrap().is_none(), "nor one past its grace window");
+    assert_eq!(signal_held(&pool, "taking").await.unwrap().map(|r| r.token).as_deref(), Some("taking"));
+    assert!(signal_held(&pool, "refusing").await.unwrap().is_none(), "a refusing door's row never comes back");
+    assert!(signal_held(&pool, "past_window").await.unwrap().is_none(), "nor one past its window");
     assert!(signal_held(&pool, "nothing").await.unwrap().is_none());
 }
 
@@ -202,19 +200,19 @@ fn tokens(rows: &[weft_broker_client::protocol::SignalRowWire]) -> Vec<String> {
 }
 
 /// Two holders share the held signals: each takes only what no live
-/// holder claims, up to its room, and never a wiped project's or one that
-/// holds nothing.
+/// holder claims, up to its room, and never a refusing trigger's or one
+/// that holds nothing.
 #[sqlx::test]
 async fn holders_take_disjoint_shares_within_their_room(pool: PgPool) {
     schema(&pool).await;
-    for id in [ACTIVE, WIPED] {
+    for id in [ACTIVE, REFUSING] {
         project(&pool, id).await;
     }
     for t in ["a", "b", "c"] {
         held_signal(&pool, t, ACTIVE, ProjectStatus::Active).await;
     }
-    held_signal(&pool, "wiped", WIPED, ProjectStatus::Inactive).await;
-    wipe(&pool, "wiped").await;
+    held_signal(&pool, "refusing", REFUSING, ProjectStatus::Inactive).await;
+    refuse(&pool, "refusing").await;
     signal(&pool, "form", ACTIVE, ProjectStatus::Active).await;
 
     let one = hold(&pool, "h1", &[], Some(2), &[]).await.unwrap();
@@ -224,7 +222,7 @@ async fn holders_take_disjoint_shares_within_their_room(pool: PgPool) {
     let mut all = tokens(&one.taken);
     all.extend(tokens(&two.taken));
     all.sort();
-    assert_eq!(all, vec!["a", "b", "c"], "every live held signal once, never the wiped one or the form");
+    assert_eq!(all, vec!["a", "b", "c"], "every live held signal once, never the refusing one or the form");
     assert!(hold(&pool, "h3", &[], None, &[]).await.unwrap().taken.is_empty(), "nothing left");
 }
 
@@ -284,26 +282,26 @@ async fn a_row_that_stops_holding_lets_its_holder_go(pool: PgPool) {
 }
 
 /// Of what a holder holds, a row that is gone or whose activation takes no
-/// work any more has ended; a row still held by it is kept (a parked one
-/// included), and none is two of these.
+/// work any more has ended; a row still held by it is kept (one down with
+/// its door taking included), and none is two of these.
 #[sqlx::test]
-async fn a_gone_or_wiped_row_has_ended(pool: PgPool) {
+async fn a_gone_or_refusing_row_has_ended(pool: PgPool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
-    for t in ["kept", "parked", "gone", "wiped"] {
+    for t in ["kept", "taking", "gone", "refusing"] {
         held_signal(&pool, t, ACTIVE, ProjectStatus::Active).await;
     }
     hold(&pool, "h1", &[], None, &[]).await.unwrap();
     sqlx::query("DELETE FROM signal WHERE token = 'gone'").execute(&pool).await.unwrap();
-    sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE trigger = 'parked'").execute(&pool).await.unwrap();
-    wipe(&pool, "wiped").await;
-    let look = hold(&pool, "h1", &holding(&["kept", "parked", "gone", "wiped"]), None, &[]).await.unwrap();
+    sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE trigger = 'taking'").execute(&pool).await.unwrap();
+    refuse(&pool, "refusing").await;
+    let look = hold(&pool, "h1", &holding(&["kept", "taking", "gone", "refusing"]), None, &[]).await.unwrap();
     let mut kept = look.kept.clone();
     kept.sort();
-    assert_eq!(kept, vec!["kept", "parked"]);
+    assert_eq!(kept, vec!["kept", "taking"]);
     let mut ended = look.ended.clone();
     ended.sort();
-    assert_eq!(ended, vec!["gone", "wiped"]);
+    assert_eq!(ended, vec!["gone", "refusing"]);
     assert!(look.taken.is_empty());
 }
 

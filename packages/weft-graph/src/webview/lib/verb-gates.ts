@@ -1,4 +1,4 @@
-// Which verbs the action bar offers, in one pure decision.
+// Which verbs the editor offers, in one pure decision.
 //
 // The dispatcher's reconciliation table is the authority: it is what its
 // own verb handlers enforce against, so a button and the endpoint behind
@@ -59,15 +59,15 @@ export function sourceInfraReady(inputs: VerbInputs): boolean {
 /// Is the project in the middle of something that collapses the whole
 /// table to one cancel verb?
 ///
-/// The dispatcher returns exactly that during an activation, a
-/// deactivation, a resync, and any infra operation in flight. The source
+/// The dispatcher returns exactly that during an activation, a resync,
+/// and any infra operation in flight. The source
 /// says nothing about it, so a starter verb offered here would be a
 /// button whose click can only 409. The table still speaks for itself:
 /// the cancel verb it names is offered, because it comes from `available`
 /// (and a resync that stopped names two, see [`resyncStopped`]).
 export function transitional(inputs: VerbInputs): boolean {
 	if (inputs.transition === 'resyncing') return true;
-	if (inputs.status === 'activating' || inputs.status === 'deactivating') return true;
+	if (inputs.status === 'activating') return true;
 	const infraLive = inputs.hasInfra || inputs.infraRollup !== 'none';
 	return infraLive
 		&& (inputs.infraBusy
@@ -104,20 +104,18 @@ function starterGate(verb: ActionVerb, inputs: VerbInputs): boolean | undefined 
 		// the dispatcher does and the editor does not. So the source only
 		// answers whether there is a trigger at all, and an activate with
 		// infra down is refused by the door, naming the nodes to start.
-		// Only while the project is not active: once it is, which of its
-		// triggers are off is the dispatcher's to say (a trigger written
-		// since shows as drift, which resync puts live). Reactivate is
-		// never the source's: it brings back the work kept for triggers
-		// that are off, which only the dispatcher knows of.
+		// Turning on what is on already does nothing, so it is offered
+		// whatever is on: a trigger written since the last activate is
+		// one the dispatcher has never seen.
 		case 'activate':
-			return inputs.hasTriggers && inputs.status !== 'active';
+			return inputs.hasTriggers;
 		default:
 			return undefined;
 	}
 }
 
-/// Whether a verb is currently offered at all. The slots layer their own
-/// conditions (an overlay in flight, an empty graph) on top of this.
+/// Whether a verb is currently offered at all. The bars layer their own
+/// conditions (an overlay in flight, what is selected) on top of this.
 export function isVerbOffered(verb: ActionVerb, inputs: VerbInputs): boolean {
 	if (inputs.removing) return false;
 	if (inputs.available.includes(verb)) return true;

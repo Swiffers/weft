@@ -649,7 +649,7 @@ enum PackageGating {
 /// wall-clock date would recompile the worker crate on every build, and
 /// the helper compiles once per lane. Content never hides behind the old
 /// date: the build rewrites the record whenever it leaves something out,
-/// and the helper's directory is named by its content.
+/// and the helper's package is named by its content ([`isolate_dir_name`]).
 fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate::Candidates) -> CompileResult<()> {
     std::fs::write(
         crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME),
@@ -664,7 +664,7 @@ fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate:
 
     let helper = crate_root.join(isolate_dir_name());
     std::fs::create_dir_all(helper.join("src")).map_err(CompileError::Io)?;
-    std::fs::write(helper.join("Cargo.toml"), isolate_cargo_toml()).map_err(CompileError::Io)?;
+    std::fs::write(helper.join("Cargo.toml"), isolate_cargo_toml(&isolate_dir_name())).map_err(CompileError::Io)?;
     std::fs::write(helper.join("src").join("main.rs"), ISOLATE_SOURCE).map_err(CompileError::Io)?;
     for file in [record, helper.join("Cargo.toml"), helper.join("src").join("main.rs")] {
         crate::build::stamp_mtime(&file, crate::build::package_source_mtime());
@@ -687,10 +687,11 @@ const EMPTY_LEFT_OUT_RECORD: &str = "{\"packages\":[]}";
 /// package's `main.rs`.
 const ISOLATE_SOURCE: &str = include_str!("worker_isolate.rs");
 
-/// The helper's manifest: its own empty workspace (so cargo never takes it
-/// for a stray member of the worker's), and only serde and serde_json, on
-/// the specs every generated crate uses.
-fn isolate_cargo_toml() -> String {
+/// The helper's manifest, its package named `package`: its own empty
+/// workspace (so cargo never takes it for a stray member of the worker's),
+/// and only serde and serde_json, on the specs every generated crate uses.
+/// The program it builds is `weft-isolate` whatever the package's name.
+fn isolate_cargo_toml(package: &str) -> String {
     let runtime = base_runtime_deps();
     let mut deps = String::new();
     for name in ["serde", "serde_json"] {
@@ -703,7 +704,7 @@ fn isolate_cargo_toml() -> String {
          [workspace]\n\
          \n\
          [package]\n\
-         name = \"weft-isolate\"\n\
+         name = \"{package}\"\n\
          version = \"0.1.0\"\n\
          edition = \"2021\"\n\
          \n\
@@ -716,17 +717,19 @@ fn isolate_cargo_toml() -> String {
     )
 }
 
-/// The directory `weft-isolate` is emitted to under a crate root,
-/// `weft-isolate-<slot>`, the slot sixteen hex characters over its
-/// manifest and source. Cargo tells path packages apart by their path and
-/// trusts a source older than its last compile, so a fixed directory with
-/// the fixed source date would keep running an older helper out of a kept
-/// compile cache; one directory per content cannot.
+/// The `weft-isolate` package's name, and the directory it is emitted to
+/// under a crate root: `weft-isolate-<slot>`, the slot sixteen hex
+/// characters over its manifest and source. Its sources carry the fixed
+/// package date, and cargo trusts a source older than its last compile; it
+/// tells the helper's compiles apart by package name, never by directory
+/// (a workspace root's own path hashes the same wherever it sits), so with
+/// a fixed name a kept compile cache would keep running an older helper.
+/// One name per content cannot.
 pub fn isolate_dir_name() -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"weft-isolate-v1\nCargo.toml:\n");
-    hasher.update(isolate_cargo_toml().as_bytes());
+    hasher.update(b"weft-isolate-v2\nCargo.toml:\n");
+    hasher.update(isolate_cargo_toml("weft-isolate").as_bytes());
     hasher.update(b"\nmain.rs:\n");
     hasher.update(ISOLATE_SOURCE.as_bytes());
     let slot: String = crate::hash::hex(&hasher.finalize()).chars().take(16).collect();

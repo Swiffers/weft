@@ -101,16 +101,22 @@ impl ResolvedNode {
 
     /// Changes whenever anything the copy runs with changes: any unit's
     /// hash, the set of units, the endpoints (an endpoint to an outside
-    /// address included) and the disks terminate keeps. What an apply
-    /// compares with the copy's last one to skip a copy already running
-    /// as asked.
+    /// address included), the disks terminate keeps and the health rules
+    /// the node writes. What an apply compares with the copy's last one to
+    /// skip a copy already running as asked, so a change to any of them
+    /// stamps the copy's row again.
     pub fn hash(&self) -> String {
         let units: BTreeMap<&str, &str> = self.units.iter().map(|u| (u.unit.name.as_str(), u.hash.as_str())).collect();
-        let doc = serde_json::json!({
+        let mut doc = serde_json::json!({
             "units": units,
             "endpoints": self.spec.endpoints,
             "keep_on_terminate": self.spec.keep_on_terminate,
         });
+        // Only when written, so a copy whose node writes none keeps the
+        // hash it had before rules could be written.
+        if let Some(rules) = &self.spec.health_rules {
+            doc["health_rules"] = serde_json::json!(rules);
+        }
         let mut hasher = Sha256::new();
         hasher.update(b"weft-infra-node-v1\n");
         hasher.update(canonical(&doc).to_string().as_bytes());
@@ -157,6 +163,9 @@ pub enum ResolveError {
     ExternalExposed { node: String, endpoint: String },
     #[error("infra node '{node}': keep_on_terminate names '{volume}', which is not a declared disk")]
     KeptVolumeMissing { node: String, volume: String },
+    #[error("infra node '{node}': health rule '{rule}' reads unit '{unit}', which is not declared; \
+             name one of the node's units, or leave `unit` out to read any of them")]
+    HealthRuleUnitMissing { node: String, rule: String, unit: String },
 }
 
 const MAX_UNIT: usize = 12;
@@ -283,6 +292,13 @@ pub fn resolve(spec: &InfraSpec, node: &NodeRef, tags: &BTreeMap<String, String>
     }
     for ep in &spec.endpoints {
         check_endpoint(id, spec, ep)?;
+    }
+    let rules = spec.health_rules.as_deref().unwrap_or_default();
+    unique(id, "health rule", rules.iter().map(|r| r.name.as_str()))?;
+    for rule in rules {
+        if let Some(unit) = rule.when.units_named().into_iter().find(|unit| !spec.units.iter().any(|u| u.name == *unit)) {
+            return Err(ResolveError::HealthRuleUnitMissing { node: plain(id), rule: rule.name.clone(), unit: unit.to_string() });
+        }
     }
     for kept in &spec.keep_on_terminate {
         let is_disk = spec.volumes.iter().any(|v| &v.name == kept && matches!(v.kind, VolumeKind::Disk { .. }));
@@ -423,6 +439,7 @@ mod tests {
                 expose: Expose::SameNetwork,
             }],
             keep_on_terminate: Vec::new(),
+            health_rules: None,
         }
     }
 
@@ -468,6 +485,35 @@ mod tests {
         let mut kept = spec();
         kept.keep_on_terminate = vec!["store".into()];
         assert_ne!(a, resolve(&kept, &node(), &tags()).unwrap().hash(), "what terminate keeps counts");
+        let mut ruled = spec();
+        ruled.health_rules = Some(crate::infra::health::built_in_rules());
+        assert_ne!(a, resolve(&ruled, &node(), &tags()).unwrap().hash(), "the rules the node writes count");
+    }
+
+    /// A health rule naming a unit the node does not declare is refused
+    /// when the spec is checked, naming the rule and the unit; so is a
+    /// second rule of the same name. A rule naming a declared unit, or
+    /// none, passes.
+    #[test]
+    fn a_health_rule_reads_only_the_nodes_own_units() {
+        use crate::infra::health::{HealthAction, HealthCondition, HealthRule, DEFAULT_RULE_TIMEOUT_SECONDS};
+        let rule = |name: &str, unit: Option<&str>| HealthRule {
+            name: name.into(),
+            when: HealthCondition::Not {
+                condition: Box::new(HealthCondition::UnitFlaky { unit: unit.map(str::to_string) }),
+            },
+            action: HealthAction::BringBack,
+            timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS,
+        };
+        let mut s = spec();
+        s.health_rules = Some(vec![rule("back", Some("db")), rule("any", None)]);
+        resolve(&s, &node(), &tags()).unwrap();
+        s.health_rules = Some(vec![rule("back", Some("cache"))]);
+        let e = resolve(&s, &node(), &tags()).unwrap_err();
+        assert_eq!(e, ResolveError::HealthRuleUnitMissing { node: "db".into(), rule: "back".into(), unit: "cache".into() });
+        assert!(e.to_string().contains("health rule 'back' reads unit 'cache'"), "{e}");
+        s.health_rules = Some(vec![rule("back", None), rule("back", None)]);
+        assert!(matches!(resolve(&s, &node(), &tags()).unwrap_err(), ResolveError::Duplicate { what: "health rule", .. }));
     }
 
     #[test]

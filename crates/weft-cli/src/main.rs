@@ -284,6 +284,13 @@ enum Cmd {
         /// Write the scope flags as `examples/<name>.json` before running.
         #[arg(long, value_name = "name")]
         save: Option<String>,
+        /// Only check that the run could start (its targets, starts and
+        /// stand-ins resolve against the program): nothing is built or
+        /// run. Exits 0 when it could, 1 with the refusal when not; with
+        /// `--json`, prints `{"ok": true}` or `{"ok": false, "refusal":
+        /// "..."}` and exits 0 either way.
+        #[arg(long, conflicts_with_all = ["save", "detach", "seed"])]
+        check: bool,
         /// Clear a saved setting before applying explicit flags: from,
         /// emit, target, before, group, feed, fire, instance, keeping
         /// (what `--durable` or `--fast` saved), keep_for or hold_secs.
@@ -440,31 +447,28 @@ enum Cmd {
         #[arg(long, conflicts_with = "project")]
         referenced: bool,
         #[command(flatten)]
-        running: RunningChoiceOpts,
-        #[command(flatten)]
         scope: ScopeOpts,
     },
-    /// Activate a project. Without a project id, discovers the cwd
-    /// project, compiles + registers it first, then activates.
+    /// Turn triggers on. Without a project id, discovers the cwd project,
+    /// builds and registers it first.
     ///
-    /// `--reactivate-choice` says what happens to the work the triggers
-    /// kept while they were parked or hibernated:
-    /// `execute_parked_keep_suspended` runs the events that arrived
-    /// meanwhile (answers people sent to waiting runs included) and keeps
-    /// the waiting runs waiting; `keep_suspended_only` drops those events,
-    /// the answers people sent among them, and keeps the waiting runs
-    /// waiting; `wipe_all` drops everything and cancels the runs those
-    /// triggers started. Without it a terminal is asked; `--json` mode
-    /// requires it when the triggers kept work.
+    /// It turns on every trigger it names that is off, new ones included,
+    /// and leaves the ones that are on alone: with nothing off it succeeds
+    /// and says so, so a script can always run it. Plain, it is every
+    /// shared trigger; `--instance <id>` (repeatable) names instances'
+    /// triggers, `--all-instances` every instance's, and `--trigger`
+    /// (repeatable) narrows either. It never starts infra (it refuses,
+    /// naming the infra to start) and never touches a run going now.
     ///
-    /// A worker built from an older image than the one being
-    /// activated is replaced: `--running-policy cancel` (the default)
-    /// cancels what it runs and replaces it now; `wait` lets its
-    /// in-flight runs land first, up to `--drain-timeout`.
+    /// `--held run` (the default) releases the work the triggers held while
+    /// they were down, paced at half each trigger's own limits so new
+    /// arrivals still get through; `--held drop` deletes the held events
+    /// and cancels the runs paused on them.
     Activate {
         project: Option<String>,
-        #[arg(long = "reactivate-choice", value_name = "choice")]
-        reactivate_choice: Option<weft_core::activation::ReactivateChoice>,
+        /// What happens to the work the triggers held while they were down.
+        #[arg(long, value_name = "run|drop", default_value = "run")]
+        held: weft_core::ReleaseHeld,
         /// On this machine, the port the project's own address opens on,
         /// kept for later activates. If another program or project holds
         /// it, nothing is activated. Unset, the project keeps the port it
@@ -473,39 +477,34 @@ enum Cmd {
         #[arg(long, value_name = "port")]
         port: Option<u16>,
         #[command(flatten)]
-        running: RunningChoiceOpts,
-        #[command(flatten)]
         scope: ScopeOpts,
     },
-    /// Deactivate a registered project. Choose --mode wipe, hibernate,
-    /// or park explicitly in scripts; a terminal prompts when it is omitted.
-    /// Park keeps everything that arrives and runs it once the triggers are
-    /// back; hibernate does that for a grace window; wipe drops it all and
-    /// cancels the runs waiting on the triggers.
+    /// Take triggers down. Plain, it is every shared trigger that is on,
+    /// and it says how many instances still have theirs on;
+    /// `--instance <id>` (repeatable) takes those instances' down,
+    /// `--all-instances` every instance's, and `--trigger` (repeatable)
+    /// narrows either. `weft activate` brings them back.
     ///
-    /// `--running-policy` controls how in-flight runs are
-    /// handled: `cancel` (the default) stops them and
-    /// flips the project straight to inactive; `wait` leaves them to
-    /// drain, parking new fires meanwhile, up to `--drain-timeout`.
-    ///
-    /// Plain, it takes down the program's own triggers and says how many
-    /// instances still have theirs on. `--instance <id>` takes down one
-    /// instance's; `--all-instances` takes down every instance's that
-    /// are on and leaves the program's own alone.
+    /// Three answers, each with a default, applied in this order:
+    /// `--door take|hide|refuse` (default take) is what happens to work
+    /// arriving while they are down (held for when they are back, held out
+    /// of sight, or refused; `--door-for <minutes>` refuses once that long
+    /// has passed); `--held keep|drop` (default keep) is what happens to the
+    /// work already held (drop deletes it and cancels the runs paused on
+    /// it); `--running wait|cancel` (default wait) is what happens to the
+    /// runs going now: wait lets them finish on their own version and
+    /// answers once they have (Ctrl+C stops waiting, the triggers stay
+    /// down), cancel stops them. It prints what it did.
     Deactivate {
         project: Option<String>,
         #[command(flatten)]
-        opts: TriggerDeactivationOpts,
+        take_down: TakeDownOpts,
         #[command(flatten)]
         scope: ScopeOpts,
-        /// Every instance whose triggers are on, each with the same
-        /// choice. The program's own triggers are left as they are.
-        #[arg(long = "all-instances", conflicts_with = "instance")]
-        all_instances: bool,
     },
     /// Cancel an in-flight `activate`: cancels the setup run of each
     /// trigger still activating, wipes every signal it registered so
-    /// far, and leaves those triggers inactive. 412 if none of them is
+    /// far, and leaves those triggers down. 412 if none of them is
     /// activating.
     #[command(name = "cancel-activate")]
     CancelActivate {
@@ -520,38 +519,36 @@ enum Cmd {
     CancelBuild {
         project: Option<String>,
     },
-    /// Force-cancel the runs still going while a deactivate-with-wait
-    /// is draining. Idempotent: if the project isn't currently in
-    /// `deactivating`, this is a no-op.
-    #[command(name = "cancel-running")]
-    CancelRunning {
-        project: Option<String>,
-        #[command(flatten)]
-        scope: ScopeOpts,
-    },
-    /// Atomic deactivate-then-activate against a fresh worker image.
-    /// Used after editing the trigger or fire subgraph: drops live
-    /// signals, rebuilds if needed, re-registers against the new binary
-    /// in one shot. Plain, it brings every trigger that is on up to
-    /// date: the program's own and every instance's. `--instance <id>`
-    /// is that instance's alone; `--trigger` alone is the program's named
-    /// triggers.
+    /// Build, then bring every trigger that is on and behind the build
+    /// onto it: each taken down, its paused runs moved onto the new build
+    /// when `--held keep` (the default), the runs going on the old version
+    /// left to finish (`--running wait`, the default, however long they
+    /// take) or cancelled (`--running cancel`), and only then back on the
+    /// new version, which takes over from the old. A trigger
+    /// that is off is never turned on: the answer names it with the `weft
+    /// activate` that would. Plain, it is the shared triggers;
+    /// `--instance <id>` (repeatable) names instances', `--all-instances`
+    /// every instance's (what a deploy reaching every instance runs), and
+    /// `--trigger` (repeatable) narrows either. `--door`, `--held` and
+    /// `--running wait|cancel` answer as on `weft deactivate`, with the
+    /// same defaults.
     Resync {
-        /// Trigger-deactivation choice (mode / grace / running-policy /
-        /// drain cap): resync deactivates with YOUR spec before
-        /// re-registering, exactly like the standalone Deactivate.
-        /// A missing `--mode` is asked on a TTY once the dispatcher
-        /// says triggers are on, and is `wipe` off one or in `--json`.
         #[command(flatten)]
-        opts: TriggerDeactivationOpts,
+        take_down: TakeDownOpts,
         #[command(flatten)]
         scope: ScopeOpts,
         /// Take up again the resync this project holds (one that stopped
-        /// with triggers down), where it stopped, with the choice and the
-        /// build it began with: nothing is built, nothing is asked, and no
-        /// new resync starts. Takes no other flag.
+        /// with triggers down), where it stopped, with the answers and the
+        /// build it began with: nothing is built and no new resync starts.
+        /// Takes no other flag.
         #[arg(long)]
         resume: bool,
+    },
+    /// The project's instances: each one weft holds anything for, its
+    /// triggers on, its infra copies, and its last run. The same list
+    /// the `ListInstances` node reads.
+    Instances {
+        project: Option<String>,
     },
     /// List every project registered with the dispatcher.
     Ps,
@@ -1099,137 +1096,164 @@ struct ScopeOpts {
     /// (`receive`, `one.receive`). Repeat for several.
     #[arg(long = "trigger", value_name = "node")]
     triggers: Vec<String>,
-    /// That instance's activations, of the triggers that exist once per
-    /// instance (a trigger reading a `@per_instance` node).
-    #[arg(long, value_name = "id")]
-    instance: Option<weft_core::instance::InstanceId>,
-}
-
-impl From<ScopeOpts> for weft_core::activation::ActivationScope {
-    fn from(opts: ScopeOpts) -> Self {
-        Self { triggers: opts.triggers, instance: opts.instance }
-    }
-}
-
-/// Shared trigger-deactivation flags, used by every verb that takes
-/// triggers down (the standalone `weft deactivate`, `weft resync`, and
-/// every infra verb that deactivates as a side effect: stop, terminate,
-/// upgrade). The running-work pair rides along: the same flags, read
-/// the same way, whether or not the verb ends up showing the picker.
-///
-/// A missing `--mode` prompts on a TTY; off one (and under `--json`)
-/// it is `wipe` for `deactivate` and `resync`, the standing answer while
-/// building. The infra verbs send the choice only when `--mode` or
-/// `--grace` is given, and otherwise ask on a TTY when the dispatcher
-/// says triggers reading that infra are on, or fail naming these flags.
-/// A missing `--running-policy` is `cancel` everywhere: a wait is asked
-/// for.
-#[derive(Debug, clap::Args, Default, Clone)]
-struct TriggerDeactivationOpts {
-    /// What happens to work arriving while the triggers are down: park
-    /// keeps it all and runs it once they are back, hibernate does that for
-    /// a grace window, wipe drops it.
-    #[arg(long, value_name = "wipe|hibernate|park")]
-    mode: Option<String>,
-    /// How long hibernate keeps taking work, in minutes (only with
-    /// --mode hibernate). Default 15.
-    #[arg(long, value_name = "minutes")]
-    grace: Option<u32>,
     #[command(flatten)]
-    running: RunningChoiceOpts,
+    instances: InstanceOpts,
 }
 
-impl From<TriggerDeactivationOpts> for commands::deactivate::TriggerChoiceFlags {
-    fn from(opts: TriggerDeactivationOpts) -> Self {
-        Self {
-            mode: opts.mode,
-            grace: opts.grace,
-            running_policy: opts.running.running_policy,
-            drain_timeout: opts.running.drain_timeout,
-        }
+impl TryFrom<ScopeOpts> for weft_core::activation::ActivationScope {
+    type Error = anyhow::Error;
+
+    fn try_from(opts: ScopeOpts) -> anyhow::Result<Self> {
+        Ok(Self { triggers: opts.triggers, instances: opts.instances.try_into()? })
     }
 }
 
-/// The running-work choice: what happens to the runs running
-/// right now when a verb needs them out of the way (a stale worker
-/// replaced by `weft activate`, `weft bake` or `weft infra start`; the
-/// infra a run uses taken down by a stop, terminate or per-node
-/// verb; the triggers taken down by a deactivate). The pair travels
-/// together: the cap only ever bounds a wait, and a verb that took one
-/// without the other could only refuse it.
+/// Whose triggers or infra copies a verb acts on: the shared ones when no
+/// flag is given.
 #[derive(Debug, clap::Args, Default, Clone)]
-struct RunningChoiceOpts {
-    /// What to do with the runs still going: cancel (default) | wait.
-    #[arg(long = "running-policy", value_name = "cancel|wait")]
-    running_policy: Option<String>,
-    /// Cap in seconds on a `--running-policy wait` before the operation
-    /// proceeds anyway (what is still running is cancelled). Only
-    /// beside `wait`. Default: the server's 60s.
-    #[arg(long = "drain-timeout", value_name = "seconds")]
-    drain_timeout: Option<u64>,
+struct InstanceOpts {
+    /// That instance's (repeat for several): its triggers that exist once
+    /// per instance, its copies of the infra marked `@per_instance`.
+    #[arg(long = "instance", value_name = "id")]
+    instances: Vec<weft_core::instance::InstanceId>,
+    /// Every instance weft holds anything for. A shared thing an
+    /// instance's depends on is never needed here: shared infra taken
+    /// down takes every trigger whose cut contains it down, whoever's.
+    #[arg(long = "all-instances", conflicts_with = "instances")]
+    all_instances: bool,
+    /// The program's own and every instance's, in one command (what a
+    /// deploy runs).
+    #[arg(long = "all", conflicts_with_all = ["instances", "all_instances"])]
+    all: bool,
+}
+
+impl TryFrom<InstanceOpts> for weft_core::instance::InstanceTarget {
+    type Error = anyhow::Error;
+
+    fn try_from(opts: InstanceOpts) -> anyhow::Result<Self> {
+        Self::from_flags(opts.instances, opts.all_instances, opts.all).map_err(anyhow::Error::msg)
+    }
+}
+
+/// How triggers go down, for every verb that takes them down (`weft
+/// deactivate`, `weft resync`, and `weft infra stop | terminate | upgrade`
+/// for the triggers whose cut contains the infra). Each answer left out
+/// takes the verb's default; nothing is ever asked.
+#[derive(Debug, clap::Args, Default, Clone)]
+struct TakeDownOpts {
+    /// What happens to work arriving while they are down: held for when
+    /// they are back (take, the default), held out of sight of the people
+    /// who answer questions (hide), or refused (refuse).
+    #[arg(long, value_name = "take|hide|refuse")]
+    door: Option<weft_core::Door>,
+    /// With `--door take` or `hide`: refuse once this many minutes have
+    /// passed.
+    #[arg(long = "door-for", value_name = "minutes")]
+    door_for: Option<u32>,
+    /// What happens to the work already held (events held while they were
+    /// down, runs paused on them): kept for when they are back (keep, the
+    /// default), or deleted, the paused runs cancelled (drop).
+    #[arg(long, value_name = "keep|drop")]
+    held: Option<weft_core::Held>,
+    /// What happens to the runs going now: they finish on their own
+    /// version and the command goes on once they have, however long that
+    /// takes (wait, the default: the infra stays up, the new version takes
+    /// over, the deactivate answers), or they are cancelled (cancel).
+    #[arg(long, value_name = "wait|cancel")]
+    running: Option<weft_core::Running>,
+}
+
+impl From<TakeDownOpts> for weft_core::TakeDownChoice {
+    fn from(opts: TakeDownOpts) -> Self {
+        Self { door: opts.door, door_for_minutes: opts.door_for, held: opts.held, running: opts.running }
+    }
 }
 
 #[derive(Debug, Subcommand)]
 enum InfraAction {
-    /// Run the InfraSetup subworkflow: per-node either skip-apply
-    /// (hash match) or fresh apply. Use when starting infra from
-    /// scratch.
+    /// Start what is not running and nothing else. With `--infra X`
+    /// (repeatable), X and anything upstream it needs that is not
+    /// running; what runs already hands over its outputs without its
+    /// setup running again. The triggers a stop of this infra took down
+    /// come back on by themselves once it runs; no other trigger is
+    /// touched. Plain, the shared infra;
+    /// `--instance <id>` (repeatable) or `--all-instances` the copies of
+    /// the nodes marked `@per_instance`.
     Start {
         #[command(flatten)]
-        running: RunningChoiceOpts,
-        /// That instance's copies of the nodes marked `@per_instance`
-        /// (the shared infra when absent).
-        #[arg(long, value_name = "id")]
-        instance: Option<weft_core::instance::InstanceId>,
+        infra: InfraNodesOpts,
+        #[command(flatten)]
+        instances: InstanceOpts,
     },
-    /// Re-apply against current images / sources (stop then start).
-    /// When the project is Active, the triggers that read this infra go
-    /// down for the duration and come back on by themselves once it runs
-    /// again.
+    /// Build first, then replace with the build only what is running on
+    /// another one: nothing stopped is started, nothing missing is made
+    /// (`weft infra start` does both), and with nothing to replace it does
+    /// nothing. The triggers whose cut
+    /// contains what is replaced go down for it (`--door`, `--held`,
+    /// `--running wait|cancel`, as on `weft infra stop`) and come back on
+    /// by themselves once it runs again.
     Upgrade {
         #[command(flatten)]
-        opts: TriggerDeactivationOpts,
-        /// That instance's copies of the nodes marked `@per_instance`
-        /// (the shared infra when absent).
-        #[arg(long, value_name = "id")]
-        instance: Option<weft_core::instance::InstanceId>,
+        infra: InfraNodesOpts,
+        #[command(flatten)]
+        take_down: TakeDownOpts,
+        #[command(flatten)]
+        instances: InstanceOpts,
     },
     /// The doors this project's infrastructure has: which pieces of it
     /// a client on this machine can reach, and at what address. A door
     /// is declared by the node (its endpoint says so), so this only
     /// ever reports; nothing here opens or closes one.
     ListDoors,
-    /// Stop the infra containers; their disks stay. When the project
-    /// is Active, triggers deactivate via the standard picker.
+    /// Stop the infra containers; their disks stay. Plain, every shared
+    /// infra node; `--infra X` (repeatable) only those (a node the program
+    /// no longer declares that still runs included). Shared infra reaches
+    /// every trigger and run whose cut contains it, whoever's; an
+    /// instance's copy (`--instance <id>`, `--all-instances`) only that
+    /// instance's.
+    ///
+    /// The triggers whose cut contains it go down first and come back on by
+    /// themselves once it runs again: `--door take|hide|refuse` and
+    /// `--held keep|drop` as on `weft deactivate`; `--running wait` (the
+    /// default) keeps the infra up until the runs reaching it end, however
+    /// long that takes, `--running cancel` stops them.
     Stop {
         #[command(flatten)]
-        opts: TriggerDeactivationOpts,
-        /// That instance's copies of the nodes marked `@per_instance`
-        /// (the shared infra when absent).
-        #[arg(long, value_name = "id")]
-        instance: Option<weft_core::instance::InstanceId>,
+        infra: InfraNodesOpts,
+        #[command(flatten)]
+        take_down: TakeDownOpts,
+        #[command(flatten)]
+        instances: InstanceOpts,
+        /// Scale every unit to zero, ignoring each unit's `on_stop`: units
+        /// that would normally stay up come down too, so you can update
+        /// them on the next start. You accept the downtime (and any slow
+        /// re-warmup) by passing this.
+        #[arg(long)]
+        force: bool,
     },
-    /// Delete every infra container and its disks, except the disks the
-    /// node lists in `keepOnTerminate`. When the project is Active, triggers
-    /// deactivate via the standard picker.
+    /// Delete the infra containers and their disks, except the disks the
+    /// node lists in `keepOnTerminate`. Reaches what `weft infra stop`
+    /// reaches, and takes the same flags.
     Terminate {
         #[command(flatten)]
-        opts: TriggerDeactivationOpts,
-        /// That instance's copies of the nodes marked `@per_instance`
-        /// (the shared infra when absent).
-        #[arg(long, value_name = "id")]
-        instance: Option<weft_core::instance::InstanceId>,
+        infra: InfraNodesOpts,
+        #[command(flatten)]
+        take_down: TakeDownOpts,
+        #[command(flatten)]
+        instances: InstanceOpts,
         /// Skip the are-you-sure prompt (required off a terminal and
         /// under --json).
         #[arg(long)]
         yes: bool,
     },
-    /// Write what an infra node's card shows into an env file, every
-    /// name in one go: `--set DATABASE_USER=User --set
-    /// DATABASE_PASSWORD=Password`. A `secret` item's value is never
-    /// printed; the other values are, in the confirmation line. A new
-    /// file is made readable by you only, an existing one gets those
-    /// lines set and keeps the rest.
+    /// Write what an infra node's card shows, and where its doors answer,
+    /// into an env file, every name in one go: `--set DATABASE_USER=User
+    /// --set DATABASE_PASSWORD=Password --door DATABASE_ADDRESS=pg`. A
+    /// `secret` item's value is never printed; the other values are, in
+    /// the confirmation line. A new file is made readable by you only, an
+    /// existing one gets those lines set and keeps the rest. A door's port
+    /// may change when the infra restarts or is upgraded: run it again to
+    /// write the new address.
     Env {
         /// The infra node, named as `weft infra status` lists it.
         #[arg(value_name = "node")]
@@ -1244,6 +1268,11 @@ enum InfraAction {
         /// A variable for the card's only secret, whatever its label.
         #[arg(long = "as", value_name = "NAME")]
         secret_as: Option<String>,
+        /// A variable and the door whose whole address (host:port) it
+        /// takes, by the door's endpoint as `weft infra list-doors` prints
+        /// it. Repeatable.
+        #[arg(long = "door", value_name = "NAME=endpoint")]
+        doors: Vec<String>,
         /// That instance's copy of a `@per_instance` node (the shared
         /// one when absent).
         #[arg(long, value_name = "id")]
@@ -1310,7 +1339,7 @@ enum InfraAction {
     },
     /// Ask the supervisor to look at this project's infra again: its units'
     /// health, its waiting commands and what gone copies left behind. A
-    /// health protocol that gave up tries again. `weft status` shows what
+    /// health rule that gave up tries again. `weft status` shows what
     /// it finds.
     Look,
     /// Print what the project's infra containers wrote: every unit of
@@ -1329,49 +1358,17 @@ enum InfraAction {
         #[arg(long, short = 'f', default_value_t = false)]
         follow: bool,
     },
-    /// Per-node stop. Targets one infra node, named as `weft
-    /// infra status` lists it (`db`, or `one.db` for the `db` inside
-    /// the file the site `one` includes), and leaves the rest of the
-    /// project's infra untouched. Used from the graph's per-node menu
-    /// (the trash icon's siblings).
-    ///
-    /// Nothing records which running runs use this one piece, so
-    /// `--running-policy cancel` (the default) cancels every running
-    /// run of the project before the piece goes; `wait` lets
-    /// them land first, up to `--drain-timeout`.
-    NodeStop {
-        #[arg(value_name = "node")]
-        node: String,
-        /// Force scale-to-zero every unit, ignoring each unit's
-        /// `on_stop`. Takes down units that would normally stay up
-        /// (NoOp) so you can update them on the next start. You accept
-        /// the downtime (and any slow re-warmup) by passing this.
-        #[arg(long)]
-        force: bool,
-        #[command(flatten)]
-        running: RunningChoiceOpts,
-        /// That instance's copies of the nodes marked `@per_instance`
-        /// (the shared infra when absent).
-        #[arg(long, value_name = "id")]
-        instance: Option<weft_core::instance::InstanceId>,
-    },
-    /// Per-node terminate. Same scope as `node-stop` but deletes
-    /// resources instead of scaling to 0, and the same running-policy
-    /// rule.
-    NodeTerminate {
-        #[arg(value_name = "node")]
-        node: String,
-        #[command(flatten)]
-        running: RunningChoiceOpts,
-        /// That instance's copies of the nodes marked `@per_instance`
-        /// (the shared infra when absent).
-        #[arg(long, value_name = "id")]
-        instance: Option<weft_core::instance::InstanceId>,
-        /// Skip the are-you-sure prompt (required off a terminal and
-        /// under --json).
-        #[arg(long)]
-        yes: bool,
-    },
+}
+
+/// Which infra nodes a verb acts on.
+#[derive(Debug, clap::Args, Default, Clone)]
+struct InfraNodesOpts {
+    /// Only this infra node, named as `weft infra status` lists it
+    /// (`db`, or `one.db` for the `db` inside the file the site `one`
+    /// includes). Repeat for several; every one of the owners' kind when
+    /// none is named.
+    #[arg(long = "infra", value_name = "node")]
+    nodes: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1647,7 +1644,7 @@ enum InfraRequest {
 
 impl InfraAction {
     async fn run(self, ctx: commands::Ctx) -> anyhow::Result<()> {
-        match self.into_request() {
+        match self.into_request()? {
             InfraRequest::Lifecycle(verb, opts) => commands::infra::run(ctx, verb, opts).await,
             InfraRequest::Env(args) => commands::infra_env::run(ctx, args).await,
             InfraRequest::Show(args) => commands::infra_card::run_show(ctx, args).await,
@@ -1656,63 +1653,42 @@ impl InfraAction {
         }
     }
 
-    fn into_request(self) -> InfraRequest {
-        let opts_from = |t: TriggerDeactivationOpts, instance| commands::infra::InfraOpts { trigger: t.into(), instance };
-        let running_only = |running: RunningChoiceOpts, instance| commands::infra::InfraOpts {
-            trigger: commands::deactivate::TriggerChoiceFlags {
-                running_policy: running.running_policy,
-                drain_timeout: running.drain_timeout,
-                ..Default::default()
-            },
-            instance,
+    fn into_request(self) -> anyhow::Result<InfraRequest> {
+        let opts = |infra: InfraNodesOpts, take_down: TakeDownOpts, instances: InstanceOpts| -> anyhow::Result<commands::infra::InfraOpts> {
+            Ok(commands::infra::InfraOpts { nodes: infra.nodes, instances: instances.try_into()?, take_down: take_down.into() })
         };
         let (verb, opts) = match self {
-            InfraAction::Start { running, instance } => (
-                commands::infra::InfraAction::Start,
-                running_only(running, instance),
-            ),
-            InfraAction::Stop { opts, instance } => {
-                (commands::infra::InfraAction::Stop, opts_from(opts, instance))
+            InfraAction::Start { infra, instances } => {
+                (commands::infra::InfraAction::Start, opts(infra, TakeDownOpts::default(), instances)?)
             }
-            InfraAction::Terminate { opts, instance, yes } => {
-                (commands::infra::InfraAction::Terminate { yes }, opts_from(opts, instance))
+            InfraAction::Stop { infra, take_down, instances, force } => {
+                (commands::infra::InfraAction::Stop { force }, opts(infra, take_down, instances)?)
             }
-            InfraAction::Upgrade { opts, instance } => {
-                (commands::infra::InfraAction::Upgrade, opts_from(opts, instance))
+            InfraAction::Terminate { infra, take_down, instances, yes } => {
+                (commands::infra::InfraAction::Terminate { yes }, opts(infra, take_down, instances)?)
+            }
+            InfraAction::Upgrade { infra, take_down, instances } => {
+                (commands::infra::InfraAction::Upgrade, opts(infra, take_down, instances)?)
             }
             InfraAction::Status => (commands::infra::InfraAction::Status, Default::default()),
             InfraAction::Look => (commands::infra::InfraAction::Look, Default::default()),
-            InfraAction::ListDoors => {
-                (commands::infra::InfraAction::ListDoors, Default::default())
+            InfraAction::ListDoors => (commands::infra::InfraAction::ListDoors, Default::default()),
+            InfraAction::Cancel { instance } => (commands::infra::InfraAction::Cancel { instance }, Default::default()),
+            InfraAction::Logs { node, tail, follow } => {
+                (commands::infra::InfraAction::Logs { node, tail, follow }, Default::default())
             }
-            InfraAction::Cancel { instance } => (
-                commands::infra::InfraAction::Cancel,
-                commands::infra::InfraOpts { instance, ..Default::default() },
-            ),
-            InfraAction::NodeStop { node, force, running, instance } => (
-                commands::infra::InfraAction::NodeStop { node, force },
-                running_only(running, instance),
-            ),
-            InfraAction::NodeTerminate { node, running, instance, yes } => (
-                commands::infra::InfraAction::NodeTerminate { node, yes },
-                running_only(running, instance),
-            ),
-            InfraAction::Logs { node, tail, follow } => (
-                commands::infra::InfraAction::Logs { node, tail, follow },
-                Default::default(),
-            ),
-            InfraAction::Env { node, into, set, secret_as, instance } => {
-                return InfraRequest::Env(commands::infra_env::EnvArgs { node, into, set, secret_as, instance });
+            InfraAction::Env { node, into, set, secret_as, doors, instance } => {
+                return Ok(InfraRequest::Env(commands::infra_env::EnvArgs { node, into, set, secret_as, doors, instance }));
             }
             InfraAction::Show { node, instance } => {
-                return InfraRequest::Show(commands::infra_card::ShowArgs { node, instance });
+                return Ok(InfraRequest::Show(commands::infra_card::ShowArgs { node, instance }));
             }
             InfraAction::Press { node, action, instance } => {
-                return InfraRequest::Press(commands::infra_card::PressArgs { node, action, instance });
+                return Ok(InfraRequest::Press(commands::infra_card::PressArgs { node, action, instance }));
             }
-            InfraAction::Rebake { node, instance } => return InfraRequest::Rebake { node, instance },
+            InfraAction::Rebake { node, instance } => return Ok(InfraRequest::Rebake { node, instance }),
         };
-        InfraRequest::Lifecycle(verb, opts)
+        Ok(InfraRequest::Lifecycle(verb, opts))
     }
 }
 
@@ -1953,7 +1929,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, clear, durable, fast, keep_for, hold_secs } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, check, clear, durable, fast, keep_for, hold_secs } => {
             return commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -1966,6 +1942,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
                     root,
                     flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs },
                     save,
+                    check,
                 },
             )
             .await;
@@ -1988,59 +1965,35 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Workers { action } => commands::workers::run(ctx, action.map(Into::into).unwrap_or(commands::workers::WorkersAction::Show)).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { run_id } => commands::stop::run(ctx, run_id).await,
-        Cmd::Bake { project, referenced, running, scope } => {
-            commands::bake::run(
-                ctx,
-                project,
-                node_set(referenced),
-                running.running_policy,
-                running.drain_timeout,
-                scope.into(),
-            )
-            .await
+        Cmd::Bake { project, referenced, scope } => {
+            commands::bake::run(ctx, project, node_set(referenced), scope.try_into()?).await
         }
-        Cmd::Activate { project, reactivate_choice, port, running, scope } => {
-            commands::activate::run(
-                ctx,
-                project,
-                reactivate_choice,
-                port,
-                running.running_policy,
-                running.drain_timeout,
-                scope.into(),
-            )
-            .await
+        Cmd::Activate { project, held, port, scope } => {
+            commands::activate::run(ctx, project, held, port, scope.try_into()?).await
         }
-        Cmd::Deactivate { project, opts, scope, all_instances } => {
-            commands::deactivate::run(ctx, project, opts.into(), scope.into(), all_instances).await
+        Cmd::Deactivate { project, take_down, scope } => {
+            commands::deactivate::run(ctx, project, take_down.into(), scope.try_into()?).await
         }
         Cmd::CancelActivate { project, scope } => {
-            commands::cancel_activate::run(ctx, project, scope.into()).await
+            commands::cancel_activate::run(ctx, project, scope.try_into()?).await
         }
         Cmd::CancelBuild { project } => {
             commands::cancel_build::run(ctx, project).await
         }
-        Cmd::CancelRunning { project, scope } => {
-            commands::cancel_running::run(ctx, project, scope.into()).await
+        Cmd::Resync { take_down, scope, resume: false } => {
+            commands::resync::run(ctx, scope.try_into()?, take_down.into()).await
         }
-        Cmd::Resync { opts, scope, resume: false } => {
-            commands::resync::run(ctx, scope.into(), opts.into()).await
-        }
-        Cmd::Resync { opts, scope, resume: true } => {
-            let scope: weft_core::activation::ActivationScope = scope.into();
-            let opts: commands::deactivate::TriggerChoiceFlags = opts.into();
-            if scope != weft_core::activation::ActivationScope::default()
-                || opts.mode.is_some()
-                || opts.grace.is_some()
-                || opts.running_policy.is_some()
-                || opts.drain_timeout.is_some()
-            {
+        Cmd::Resync { take_down, scope, resume: true } => {
+            let scope: weft_core::activation::ActivationScope = scope.try_into()?;
+            let choice: weft_core::TakeDownChoice = take_down.into();
+            if scope != weft_core::activation::ActivationScope::default() || choice != weft_core::TakeDownChoice::default() {
                 anyhow::bail!(
-                    "--resume takes the resync up with the triggers, choice and build it began with; leave out every other flag"
+                    "--resume takes the resync up with the triggers, answers and build it began with; leave out every other flag"
                 );
             }
             commands::resync::resume(ctx).await
         }
+        Cmd::Instances { project } => commands::instances::run(ctx, project).await,
         Cmd::Ps => commands::ps::run(ctx).await,
         Cmd::Rm { project, journal, local, all, force, yes } => {
             commands::rm::run(
@@ -2133,6 +2086,30 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
 #[cfg(test)]
 mod command_contract_tests {
     use super::*;
+
+    /// Every command's flags hold together (no two named alike), so a verb
+    /// that takes `--all` beside its own flags parses.
+    #[test]
+    fn the_command_line_holds_together() {
+        <Cli as clap::CommandFactory>::command().debug_assert();
+    }
+
+    /// `--all` is the program's own and every instance's; beside
+    /// `--all-instances` or `--instance` it is refused.
+    #[test]
+    fn all_names_the_shared_ones_and_every_instance() {
+        let scope = |args: &[&str]| -> anyhow::Result<weft_core::instance::InstanceTarget> {
+            let cli = Cli::try_parse_from([&["weft", "resync"][..], args].concat())?;
+            let Cmd::Resync { scope, .. } = cli.command else { panic!("resync command") };
+            Ok(weft_core::activation::ActivationScope::try_from(scope)?.instances)
+        };
+        assert_eq!(scope(&["--all"]).unwrap(), weft_core::instance::InstanceTarget::Everything);
+        assert_eq!(scope(&["--all-instances"]).unwrap(), weft_core::instance::InstanceTarget::EveryInstance);
+        assert!(scope(&["--all", "--all-instances"]).is_err());
+        assert!(scope(&["--all", "--instance", "ada"]).is_err());
+        let cli = Cli::try_parse_from(["weft", "infra", "upgrade", "--all", "--running", "cancel"]).unwrap();
+        assert!(matches!(cli.command, Cmd::Infra { .. }));
+    }
 
     #[test]
     fn builds_use_the_full_catalog_unless_referenced_is_requested() {

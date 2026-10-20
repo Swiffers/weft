@@ -40,6 +40,13 @@ pub struct InfraSpec {
     /// Disks (by volume name) terminate keeps. Usually empty.
     #[serde(default, rename = "keepOnTerminate", skip_serializing_if = "Vec::is_empty")]
     pub keep_on_terminate: Vec<String>,
+
+    /// What the supervisor does about a copy whose units stop being ready
+    /// (see `super::health`): read in order, on each copy alone. `None`:
+    /// the node writes none and runs `super::health::built_in_rules`; an
+    /// empty list: it runs none.
+    #[serde(default, rename = "healthRules", skip_serializing_if = "Option::is_none")]
+    pub health_rules: Option<Vec<super::health::HealthRule>>,
 }
 
 /// What a terminate does with the disks the node lists in
@@ -103,7 +110,8 @@ pub struct Unit {
     pub on_stop: StopBehavior,
 
     /// Health windows for this unit's flaky/recovered transitions. Unset
-    /// fields fall back to the supervisor's defaults.
+    /// fields fall back to the supervisor's defaults. What is done about a
+    /// flaky unit is the node's `InfraSpec::health_rules`.
     #[serde(default)]
     pub health: UnitHealth,
 }
@@ -599,6 +607,7 @@ mod tests {
                 expose: Expose::Project,
             }],
             keep_on_terminate: Vec::new(),
+            health_rules: None,
         }
     }
 

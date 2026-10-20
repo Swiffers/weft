@@ -114,15 +114,13 @@ impl EventBus {
         // do NOT have a journal poll-based recovery: ProjectRegistered
         // / ProjectActivated / ProjectDeactivated / TriggerUrlChanged /
         // InfraStatusChanged / InfraFlaky / InfraRecovered /
-        // InfraTerminated / InfraConfigError all ride the NOTIFY-only path.
-        // If one of these blows
-        // the cap, sibling processes miss the event entirely until the
-        // next user action triggers a fresh round-trip; this is a
-        // real failure mode worth alerting on, not a recoverable
-        // race. Every user-string field on a publish-path event
-        // (`reason` on InfraFlaky, `error` on InfraConfigError,
-        // `name` on ProjectRegistered, `node_id`/`url` on
-        // TriggerUrlChanged) is bounded at construction via
+        // InfraTerminated all ride the NOTIFY-only path. If one of
+        // these blows the cap, sibling processes miss the event
+        // entirely until the next user action triggers a fresh
+        // round-trip; this is a real failure mode worth alerting on,
+        // not a recoverable race. Every user-string field on a
+        // publish-path event (`reason` on InfraFlaky, `name` on
+        // ProjectRegistered, `node_id`/`url` on TriggerUrlChanged) is bounded at construction via
         // `weft_core::truncate_user_string(.., 4096)`, so a refusal for
         // its size is an invariant violation (an unbounded field slipped
         // into a publish-path event), not expected input.

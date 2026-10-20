@@ -5,7 +5,7 @@
 use serde_json::json;
 
 use weft::program::ProgramCall;
-use weft::{DeactivationMode, FakeRig, NodeTest, RunningPolicy, StopSelf, WeftResult};
+use weft::{Door, FakeRig, Held, NodeTest, Running, StopSelf, WeftResult};
 
 use super::TerminateInfraNode;
 
@@ -19,17 +19,16 @@ pub fn tests() -> Vec<NodeTest> {
 async fn terminates(rig: FakeRig) -> WeftResult<()> {
     rig.run(
         &TerminateInfraNode,
-        json!({ "node": "one.bridge", "instance": "ada", "triggers": "wipe", "running": "cancel" }),
+        json!({ "node": "one.bridge", "instance": "ada", "door": "refuse", "held": "drop", "running": "cancel" }),
     )
     .await
     .ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraTerminate { node, instance, spec, disks }, StopSelf::Keep) => {
+        (ProgramCall::InfraTerminate { node, instance, take_down, disks }, StopSelf::Keep) => {
             assert_eq!(node, "one.bridge");
             assert_eq!(*disks, weft::infra::TerminateDisks::KeepListed);
             assert_eq!(instance.as_ref().unwrap().as_str(), "ada");
-            assert_eq!(spec.mode, DeactivationMode::Wipe);
-            assert_eq!(spec.running_policy, RunningPolicy::Cancel);
+            assert_eq!((take_down.door, take_down.held, take_down.running), (Some(Door::Refuse), Some(Held::Drop), Some(Running::Cancel)));
         }
         other => panic!("unexpected call {other:?}"),
     }

@@ -588,17 +588,122 @@ pub fn compute_trigger_fire(
     port_snapshot: Option<&Value>,
     saved: &crate::infra::bake::Saved,
 ) -> Result<TriggerFire, String> {
-    let (fired, path) = crate::project::resolve_address(project, firing_node_id);
+    let cut = fire_cut(project, firing_node_id, saved)?;
+    let kicks = KickPlan::for_program(&cut.program, Some((&cut.fired, payload)), port_snapshot);
+    Ok(TriggerFire { kicks, program: cut.program, given: cut.given, baked: cut.baked })
+}
+
+/// The cut a fire of the trigger at `trigger` runs, `saved` standing in for
+/// the infra outputs it reads baked: the one cut function every reader of
+/// a trigger's cut goes through ([`compute_trigger_fire`], what a fire
+/// runs; [`trigger_cut`], what its registration records), so the two
+/// never disagree. Refused when the cut needs a part of the program that
+/// does not compile (`cut::cut`).
+struct FireCut {
+    fired: Located,
+    program: ProjectDefinition,
+    given: Given,
+    baked: BTreeMap<Located, BTreeMap<String, Value>>,
+}
+
+fn fire_cut(project: &ProjectDefinition, trigger: &str, saved: &crate::infra::bake::Saved) -> Result<FireCut, String> {
+    let (fired, path) = crate::project::resolve_address(project, trigger);
     if !project.nodes.iter().any(|node| node.id == fired && node.features.is_trigger) {
-        return Err(format!("'{firing_node_id}' is not a trigger"));
+        return Err(format!("'{trigger}' is not a trigger"));
     }
     let g = ProjectGraph::new(project);
-    let bounds = cut::resolve(&g, &SelectionBounds { fire: Some(firing_node_id.into()), ..Default::default() })?;
+    let bounds = cut::resolve(&g, &SelectionBounds { fire: Some(trigger.into()), ..Default::default() })?;
     let (walked, baked) = walk_reading_baked(&g, bounds, saved, &BTreeSet::from([fired.clone()]));
     let mut given = Given { inputs: BTreeMap::new(), outputs: baked_stand_ins(&baked) };
-    let program = cut::cut(project, &walked, &mut given).map_err(|why| format!("a fire of '{firing_node_id}' cannot run: {why}"))?;
-    let kicks = KickPlan::for_program(&program, Some((&Located::new(fired, path), payload)), port_snapshot);
-    Ok(TriggerFire { kicks, program, given, baked })
+    let program = cut::cut(project, &walked, &mut given).map_err(|why| format!("a fire of '{trigger}' cannot run: {why}"))?;
+    Ok(FireCut { fired: Located::new(fired, path), program, given, baked })
+}
+
+/// A trigger's cut as its registration records it: what tells whether it
+/// is behind the source, and what infra it depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerCut {
+    /// The definition hash of the cut a fire of the trigger runs, every
+    /// infra place it reads only through baked outputs standing in (the
+    /// way a fire runs it once they are saved), so it is a function of
+    /// the source alone. A trigger that is on whose fingerprint differs
+    /// from the source's is behind it.
+    pub fingerprint: String,
+    /// The infra places (spelled the way the program writes them) the
+    /// trigger depends on, sorted: every infra place its fires run, and
+    /// every one its registration listens through (the address its setup
+    /// reads off the infra wired into it). Taking one of them down takes
+    /// the trigger down with it. An infra place its fires read only
+    /// through baked outputs is not among them (a fire does not run it),
+    /// and neither is one that only fed a gate its setup read.
+    pub depends_on: Vec<String>,
+}
+
+/// The cut a registration records for the trigger at `trigger` (an
+/// address: `door`, or `one.door`): the same walk [`compute_trigger_fire`]
+/// runs, with every bakeable infra place's baked outputs taken as saved,
+/// so it reads the source alone, never what an install has saved.
+pub fn trigger_cut(project: &ProjectDefinition, trigger: &str) -> Result<TriggerCut, String> {
+    let bakeable: crate::infra::bake::Saved = crate::project::infra_places(project)
+        .into_iter()
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            (!node.baked_outputs.is_empty())
+                .then(|| (place, node.baked_outputs.iter().map(|port| (port.clone(), Value::Null)).collect()))
+        })
+        .collect();
+    // The places read baked stand in, as a fire's do: the cut says so, and
+    // they are no infra the trigger's fires run.
+    let FireCut { fired, program, .. } = fire_cut(project, trigger, &bakeable)?;
+    let fingerprint = crate::project::hash::compute_definition_hash(&program).map_err(|e| format!("hash the cut of '{trigger}': {e:#}"))?;
+    let g = ProjectGraph::new(project);
+    // What its registration holds: the address it reads off the infra
+    // feeding its inputs, along the wires. A wire into a gate only decides
+    // whether a node of the setup runs, read once: stopping what fed it
+    // later breaks nothing, so the walk never crosses one.
+    let is_infra = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra);
+    let mut fed_by: BTreeSet<Located> = BTreeSet::new();
+    let mut pending = vec![fired];
+    while let Some(place) = pending.pop() {
+        if !fed_by.insert(place.clone()) {
+            continue;
+        }
+        pending.extend(
+            crate::project::places::incoming(&g, &place)
+                .filter(|(edge, _)| edge.target_handle.as_deref() != Some(crate::run::skip::SHOULD_FLOW_PORT))
+                .map(|(_, source)| source),
+        );
+    }
+    let listens_through = fed_by.into_iter().filter(|place| is_infra(place)).map(|place| crate::project::address_of(project, &place.id, &place.path));
+    let depends_on: BTreeSet<String> = crate::project::infra_reached(&program).into_iter().chain(listens_through).collect();
+    Ok(TriggerCut { fingerprint, depends_on: depends_on.into_iter().collect() })
+}
+
+/// Every trigger place's [`TriggerCut`] by address, or why its cut cannot
+/// be walked (a trigger inside a half-selected loop): what `weft status`
+/// sends as the source's cuts (`StatusQuery::desired_trigger_cuts`) and
+/// the dispatcher compares the registered program's with.
+pub fn trigger_cuts(project: &ProjectDefinition) -> BTreeMap<String, Result<TriggerCut, String>> {
+    crate::project::trigger_places(project)
+        .iter()
+        .map(|place| {
+            let address = crate::project::address_of(project, &place.id, &place.path);
+            let cut = trigger_cut(project, &address);
+            (address, cut)
+        })
+        .collect()
+}
+
+/// Each trigger's fingerprint by address ([`trigger_cuts`]), the ones whose
+/// cut can be walked: what the source's cuts are compared by, on the
+/// client that sends them (`StatusQuery::desired_trigger_cuts`) and on the
+/// dispatcher that reads the registered program's. A trigger left out is
+/// one whose cut cannot be walked; its activation says why.
+pub fn trigger_fingerprints(project: &ProjectDefinition) -> BTreeMap<String, String> {
+    trigger_cuts(project)
+        .into_iter()
+        .filter_map(|(trigger, cut)| cut.ok().map(|cut| (trigger, cut.fingerprint)))
+        .collect()
 }
 
 /// What a setup phase of `targets` runs (an activation's triggers, an
@@ -1606,6 +1711,78 @@ mod tests {
         let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert!(resolved.runs.contains(&Located::top("hear")), "the walk stops at the trigger, taking it along");
         refuse_unfed(&project, &resolved, &spec).expect("the trigger does not read its input in this run");
+    }
+
+    /// The program `trigger_cut` is tested on: `hear` listens at what
+    /// `queue` serves and stores what it hears through `db`, reading
+    /// `cache` only by its baked `addr`; `tick` writes through `other`.
+    fn two_triggers() -> ProjectDefinition {
+        let infra = |id: &str, outputs: &[&str], baked: &[&str]| {
+            let mut n = node(id, &[], &[], outputs, false);
+            n["requiresInfra"] = json!(true);
+            n["bakedOutputs"] = json!(baked);
+            n
+        };
+        serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                infra("queue", &["url"], &[]),
+                infra("db", &["conn"], &[]),
+                infra("cache", &["addr"], &["addr"]),
+                infra("other", &["conn"], &[]),
+                node("hear", &[], &[("url", true)], &["text"], true),
+                node("store", &[], &[("text", true), ("conn", true), ("addr", true)], &[], false),
+                node("tick", &[], &[], &["at"], true),
+                node("write", &[], &[("at", true), ("conn", true)], &[], false),
+            ],
+            "edges": [
+                wire("queue", "url", "hear", "url"),
+                wire("hear", "text", "store", "text"),
+                wire("db", "conn", "store", "conn"),
+                wire("cache", "addr", "store", "addr"),
+                wire("tick", "at", "write", "at"),
+                wire("other", "conn", "write", "conn"),
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// A trigger depends on the infra its fires run and the infra its
+    /// setup reads, never on infra its fires read only baked, and never
+    /// on another trigger's.
+    #[test]
+    fn a_trigger_depends_on_the_infra_its_cut_runs_and_its_setup_reads() {
+        let project = two_triggers();
+        assert_eq!(trigger_cut(&project, "hear").unwrap().depends_on, vec!["db".to_string(), "queue".to_string()]);
+        assert_eq!(trigger_cut(&project, "tick").unwrap().depends_on, vec!["other".to_string()]);
+        assert!(trigger_cut(&project, "store").unwrap_err().contains("not a trigger"));
+        let all = trigger_cuts(&project);
+        assert_eq!(all.keys().cloned().collect::<Vec<_>>(), vec!["hear".to_string(), "tick".to_string()]);
+    }
+
+    /// Infra wired into the trigger's own gate decides whether its setup
+    /// runs, read once: it is no dependency of the trigger.
+    #[test]
+    fn infra_feeding_the_triggers_own_gate_is_no_dependency() {
+        let mut project = two_triggers();
+        let mut flag = node("flag", &[], &[], &["ok"], false);
+        flag["requiresInfra"] = json!(true);
+        project.nodes.push(serde_json::from_value(flag).unwrap());
+        project.edges.push(serde_json::from_value(wire("flag", "ok", "hear", "_should_flow")).unwrap());
+        assert_eq!(trigger_cut(&project, "hear").unwrap().depends_on, vec!["db".to_string(), "queue".to_string()]);
+    }
+
+    /// A trigger's fingerprint moves with what its fires run, and only
+    /// with that: an edit elsewhere leaves it where it was.
+    #[test]
+    fn a_triggers_fingerprint_moves_with_its_own_cut_only() {
+        let before = two_triggers();
+        let fingerprint = |project: &ProjectDefinition, trigger: &str| trigger_cut(project, trigger).unwrap().fingerprint;
+        let mut edited = before.clone();
+        edited.nodes.iter_mut().find(|n| n.id == "write").unwrap().config = serde_json::from_value(json!({ "mode": "append" })).unwrap();
+        assert_eq!(fingerprint(&before, "hear"), fingerprint(&edited, "hear"), "an edit outside its cut");
+        assert_ne!(fingerprint(&before, "tick"), fingerprint(&edited, "tick"), "an edit inside its cut");
+        assert_eq!(fingerprint(&before, "hear"), fingerprint(&before.clone(), "hear"), "a function of the source alone");
     }
 
     /// `--group` on a group inside another: the inner group runs inside

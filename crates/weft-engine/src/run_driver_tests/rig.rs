@@ -274,7 +274,7 @@
     pub(super) struct NoopInfraState;
     #[async_trait]
     impl InfraStateClient for NoopInfraState {
-        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::instance::InstanceId>, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
+        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::instance::InstanceId>, _s: serde_json::Value, _r: weft_core::RunId) -> anyhow::Result<i64> { Ok(0) }
         async fn wait_apply(&self, _p: uuid::Uuid, _c: i64, _w: std::time::Duration) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
             Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
                 completed: true,

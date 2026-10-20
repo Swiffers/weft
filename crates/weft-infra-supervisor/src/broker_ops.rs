@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 use weft_broker_client::client::BrokerSupervisorClient;
 use weft_broker_client::protocol::{
-    SupervisorClaim, SupervisorHealthProtocolsResponse, SupervisorInfraNode, SupervisorProject,
+    HealthRuleState, SupervisorClaim, SupervisorInfraNode, SupervisorProject,
     SupervisorSetHealthStateRequest, SupervisorSetHealthStateResponse, SupervisorSetStatusRequest,
     SupervisorSetStatusResponse, SupervisorSyncOwnershipRequest, SupervisorSyncOwnershipResponse,
 };
@@ -51,10 +51,9 @@ pub trait BrokerSupervisorOps: Send + Sync {
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>>;
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>>;
-    /// The project's health protocols (`None`: the defaults) and what
-    /// each did so far.
-    async fn health_protocols(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthProtocolsResponse>;
-    /// Replace what the project's health protocols did, under its lease.
+    /// Where each health rule of the project's copies stands.
+    async fn health_state(&self, project_id: uuid::Uuid) -> Result<Vec<HealthRuleState>>;
+    /// Replace where the project's health rules stand, under its lease.
     async fn set_health_state(&self, req: &SupervisorSetHealthStateRequest) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>>;
     /// The oldest waiting command of a project this supervisor owns that no
     /// older waiting command reaches a copy of, other than the ones it runs
@@ -166,6 +165,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         instance: Option<&weft_core::instance::InstanceId>,
         copy_id: &str,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>>;
 
@@ -183,6 +183,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         notes: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>>;
@@ -194,8 +195,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// Enqueue a dispatcher-targeted lifecycle command. The typed
     /// `LifecycleSpec` only constructs `Deactivate(...)` /
     /// `Reactivate`, so the supervisor cannot accidentally enqueue
-    /// a supervisor-owned verb. Used by HealthProtocol action
-    /// dispatch.
+    /// a supervisor-owned verb. Used by the health rules' actions.
     async fn enqueue_lifecycle(
         &self,
         project_id: uuid::Uuid,
@@ -222,8 +222,8 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>> {
         BrokerSupervisorClient::infra_nodes(self, project_id).await
     }
-    async fn health_protocols(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthProtocolsResponse> {
-        BrokerSupervisorClient::health_protocols(self, project_id).await
+    async fn health_state(&self, project_id: uuid::Uuid) -> Result<Vec<HealthRuleState>> {
+        BrokerSupervisorClient::health_state(self, project_id).await
     }
     async fn set_health_state(&self, req: &SupervisorSetHealthStateRequest) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>> {
         BrokerSupervisorClient::set_health_state(self, req).await
@@ -352,6 +352,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         instance: Option<&weft_core::instance::InstanceId>,
         copy_id: &str,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>> {
         BrokerSupervisorClient::set_provisioning(
@@ -363,6 +364,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             instance,
             copy_id,
             keep_disks,
+            health_rules,
             units,
         )
         .await
@@ -378,6 +380,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         notes: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>> {
@@ -392,6 +395,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             applied_spec_hash,
             addresses,
             keep_disks,
+            health_rules,
             notes,
             units,
         )

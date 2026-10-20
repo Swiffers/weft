@@ -69,7 +69,7 @@
 
     #[async_trait]
     impl crate::context::InfraStateClient for Copy {
-        async fn enqueue_apply(&self, _: uuid::Uuid, _: &str, _: Option<&weft_core::instance::InstanceId>, _: serde_json::Value) -> anyhow::Result<i64> {
+        async fn enqueue_apply(&self, _: uuid::Uuid, _: &str, _: Option<&weft_core::instance::InstanceId>, _: serde_json::Value, _: weft_core::RunId) -> anyhow::Result<i64> {
             Ok(1)
         }
         async fn wait_apply(&self, _: uuid::Uuid, _: i64, _: std::time::Duration) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {

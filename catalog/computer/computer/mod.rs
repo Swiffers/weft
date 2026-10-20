@@ -103,6 +103,7 @@ impl Node for ComputerNode {
             volumes: vec![Volume { name: "home".into(), kind: VolumeKind::Disk { size: disk, class: None } }],
             endpoints,
             keep_on_terminate: Vec::new(),
+            health_rules: None,
         })
     }
 

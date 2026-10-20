@@ -343,10 +343,16 @@ fn read_script_failures(lines: impl Iterator<Item = String>, echo: &mut dyn FnMu
     failures
 }
 
-/// Ask cargo how the worker's crates depend on each other.
+/// Ask cargo how the worker's crates depend on each other, on the platform
+/// it was just built for. Offline: the build fetched exactly that
+/// platform's crates, and a crate only another platform needs (an Android
+/// time zone reader under chrono) is in the registry cache only when some
+/// other build happened to fetch it, so an unfiltered graph fails asking
+/// for it.
 fn crate_graph() -> Result<CrateGraph, String> {
+    let host = host_platform()?;
     let output = Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--offline"])
+        .args(["metadata", "--format-version", "1", "--offline", "--filter-platform", &host])
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("start cargo metadata: {e}"))?;
@@ -355,6 +361,19 @@ fn crate_graph() -> Result<CrateGraph, String> {
     }
     let metadata = serde_json::from_slice(&output.stdout).map_err(|e| format!("cargo metadata does not read: {e}"))?;
     read_graph(&metadata)
+}
+
+/// The platform `rustc` builds for here, as `rustc -vV` names it.
+fn host_platform() -> Result<String, String> {
+    let output = Command::new("rustc").arg("-vV").output().map_err(|e| format!("start rustc -vV: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("rustc -vV failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_string())
+        .ok_or_else(|| "rustc -vV names no host".into())
 }
 
 /// A [`CrateGraph`] from `cargo metadata --format-version 1`.
@@ -478,6 +497,14 @@ fn shorten(text: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The platform the graph is filtered to is rustc's own, a full target
+    /// triple.
+    #[test]
+    fn the_host_platform_is_rustcs_target_triple() {
+        let host = host_platform().unwrap();
+        assert!(host.split('-').count() >= 3 && !host.contains(char::is_whitespace), "{host}");
+    }
 
     /// A trimmed `cargo build --keep-going --message-format=json` stream
     /// from a worker with two package crates: `pkg_basic` compiled,

@@ -17,7 +17,7 @@ use weft_e2e::{client, ensure, live, project::Project};
 #[tokio::test]
 async fn a_broken_include_stops_only_the_trigger_that_needs_it() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let mut project = Project::prepare("compile_what_you_touch", disp.clone()).await?;
+    let project = Project::prepare("compile_what_you_touch", disp.clone()).await?;
     let base = project.unique_live_path()?;
     // Somebody else's half-written edit: the group never closes.
     project.write_file("src/lib/stage.weft", "Group(text: String) -> (body: JsonDict) {\n  shape = ExecPython(\n")?;

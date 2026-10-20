@@ -277,11 +277,6 @@ pub enum DispatcherEvent {
     /// Supervisor finished terminating an infra node; the
     /// `infra_node` row has been deleted.
     InfraTerminated { project_id: uuid::Uuid, node_id: String },
-    /// Supervisor couldn't parse the project's
-    /// `health_protocols_json`. The user's config is broken; the
-    /// supervisor fell back to defaults. Surfaced as a banner in
-    /// the action bar so the user sees their config didn't take.
-    InfraConfigError { project_id: uuid::Uuid, error: String },
     /// A bus participant came online. `bus_id` is the channel's uuid
     /// (same one embedded in the bus marker), so the inspector groups
     /// multiple buses cleanly. `offset` is the bus-local position used
@@ -435,7 +430,6 @@ impl DispatcherEvent {
             | Self::InfraFlaky { project_id, .. }
             | Self::InfraRecovered { project_id, .. }
             | Self::InfraTerminated { project_id, .. }
-            | Self::InfraConfigError { project_id, .. }
             | Self::BusJoined { project_id, .. }
             | Self::BusLeft { project_id, .. }
             | Self::BusWindow { project_id, .. }
@@ -487,7 +481,6 @@ impl DispatcherEvent {
             | Self::InfraFlaky { .. }
             | Self::InfraRecovered { .. }
             | Self::InfraTerminated { .. }
-            | Self::InfraConfigError { .. }
             | Self::BusJoined { .. }
             | Self::BusLeft { .. }
             | Self::BusWindow { .. }
@@ -552,8 +545,7 @@ impl DispatcherEvent {
             | Self::InfraStatusChanged { .. }
             | Self::InfraFlaky { .. }
             | Self::InfraRecovered { .. }
-            | Self::InfraTerminated { .. }
-            | Self::InfraConfigError { .. } => None,
+            | Self::InfraTerminated { .. } => None,
         }
     }
 }

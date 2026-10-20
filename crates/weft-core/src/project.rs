@@ -1498,51 +1498,6 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
     project.nodes.iter().any(|n| n.requires_infra)
 }
 
-/// What an ARMED trigger keeps depending on: for every infra PLACE,
-/// every trigger place whose data path runs through it. Returns
-/// `(infra, trigger)` pairs, each spelled the way a person writes the
-/// place (`svc`, or `one.svc` inside the file the site `one` includes),
-/// sorted by `(infra, trigger)`.
-///
-/// Per place, because that is what runs: a file included twice holds
-/// two infra placements and two registered triggers, and the trigger
-/// under `one` reads its address off the placement under `one` alone.
-/// The spelling is the key every infra row and signal row is stored
-/// under, so a reader compares this against those directly.
-///
-/// This is the STAY-RUNNING question, and it is not the same as
-/// [`infra_triggers_depend_on`], which answers the BEFORE-ARMING one.
-/// A registered trigger holds an address it read off the node feeding
-/// it, so stopping that node breaks a signal that is live right now.
-/// Infra that only fed the GATE deciding whether the trigger's group
-/// flows was read once, during activation, and the armed registration
-/// does not touch it again: stopping it later breaks nothing, and
-/// refusing that stop would trap the user into deactivating first.
-/// Hence the plain data walk here (`places::upstream_by_wires`),
-/// and the run-shaped one there.
-///
-/// Read by:
-///   - the dispatcher's per-node infra stop/terminate guard;
-///   - the broker's `supervisor_trigger_deps` endpoint, so the
-///     supervisor decides the same way when infra goes flaky.
-///
-/// Pure walk over `ProjectDefinition`; no I/O.
-pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
-    let is_infra = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra);
-    let graph = graph::ProjectGraph::new(project);
-    let mut out: Vec<(String, String)> = Vec::new();
-    for trigger in trigger_places(project) {
-        let spelled_trigger = address_of(project, &trigger.id, &trigger.path);
-        for place in places::upstream_by_wires(&graph, std::slice::from_ref(&trigger)) {
-            if is_infra(&place) {
-                out.push((address_of(project, &place.id, &place.path), spelled_trigger.clone()));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 #[cfg(test)]
 mod address_tests {
     use super::*;
@@ -1781,6 +1736,18 @@ pub fn infra_places(project: &ProjectDefinition) -> Vec<Located> {
     places::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
 }
 
+/// The infra places a program runs, spelled (`db`, `one.db`): its infra
+/// places, less the ones it is given instead of running (a stand-in: an
+/// infra node read only through its baked outputs, a seed's saved result).
+/// For a run's cut, the infra the run reaches.
+pub fn infra_reached(program: &ProjectDefinition) -> std::collections::BTreeSet<String> {
+    infra_places(program)
+        .into_iter()
+        .filter(|place| !program.given.outputs.contains(place))
+        .map(|place| address_of(program, &place.id, &place.path))
+        .collect()
+}
+
 /// Whether the node `id` exists once per instance (`@per_instance`): every
 /// copy of it (its infra, its trigger's activation) is an instance's, and
 /// none is shared. Asked of a place by its `id`, of a spelled place
@@ -1914,54 +1881,8 @@ pub fn upstream_closure(g: &impl graph::GraphView, seeds: &[String]) -> std::col
     seen
 }
 
-/// The infra a trigger DEPENDS ON, each PLACE named once, spelled the
-/// way a person writes it (`svc`, `one.svc`): the key its infra row is
-/// stored under, so a reader compares this against the rows directly.
-///
-/// Infra and triggers are independent lifetimes, joined by one rule: a
-/// trigger needs the infra feeding it to be RUNNING. A WhatsApp receive
-/// node takes the bridge's address off the bridge node feeding it, so
-/// arming it before the bridge is up would register a signal against an
-/// address that does not answer. Infra DOWNSTREAM of a trigger belongs
-/// to the run a fire starts and is gated there instead, so the project
-/// arms either way. Nothing here ever starts infra: that is the user's
-/// own verb.
-///
-/// What must be RUNNING before this project's triggers can be armed.
-///
-/// Arming them is a run: the TriggerSetup pass evaluates everything the
-/// registration needs, including the gate deciding whether a trigger's
-/// group flows at all. So this walks the way that run walks
-/// (`cut::Bounds::setup`), and the answer covers every infra node that
-/// run touches: the bridge whose address a trigger reads, and the node
-/// feeding a gate the setup has to evaluate.
-///
-/// Wires that run straight from producer to reader, and call frames, are
-/// what keep it honest in the other direction: infra wired into a group
-/// port no trigger reads is not in it, and does not hold an activation
-/// back.
-///
-/// The STAY-RUNNING question is [`compute_trigger_deps`], and it is a
-/// different set on purpose: once a trigger is armed, the gate's infra
-/// has already done its job. Changing one of these two to match the
-/// other is how the system starts contradicting itself; they answer
-/// different questions about different moments.
-///
-/// Empty when the project has no trigger.
-pub fn infra_triggers_depend_on(
-    project: &ProjectDefinition,
-) -> std::collections::BTreeSet<String> {
-    let graph = graph::ProjectGraph::new(project);
-    cut::walk_bounds(&graph, &cut::Bounds::setup(&trigger_places(project)))
-        .runs
-        .iter()
-        .filter(|place| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra))
-        .map(|place| address_of(project, &place.id, &place.path))
-        .collect()
-}
-
 #[cfg(test)]
-mod infra_triggers_depend_on_tests {
+mod trigger_dependency_tests {
     use super::*;
     use crate::NodeFeatures;
 
@@ -2036,8 +1957,9 @@ mod infra_triggers_depend_on_tests {
         })
     }
 
-    fn ids(set: std::collections::BTreeSet<String>) -> Vec<String> {
-        set.into_iter().collect()
+    /// What the trigger at `trigger` depends on (`crate::run_spec::trigger_cut`).
+    fn deps(p: &ProjectDefinition, trigger: &str) -> Vec<String> {
+        crate::run_spec::trigger_cut(p, trigger).expect("its cut walks").depends_on
     }
 
     #[test]
@@ -2051,7 +1973,7 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("bridge", "receive"), wire("receive", "reply")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
     #[test]
@@ -2066,18 +1988,18 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("bridge", "conf"), wire("conf", "receive")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
+    /// The database a fire writes to is in its cut: taking it down takes
+    /// the trigger down with it, since its fires cannot run without it.
     #[test]
-    fn an_infra_node_downstream_of_a_trigger_stays_out() {
-        // The database the fired run writes to belongs to the run, not
-        // to arming the trigger; the run is what waits on it.
+    fn an_infra_node_downstream_of_a_trigger_counts() {
         let p = project(
             vec![node("receive", true, false), node("db", false, true)],
             vec![wire("receive", "db")],
         );
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert_eq!(deps(&p, "receive"), vec!["db".to_string()]);
     }
 
     #[test]
@@ -2091,21 +2013,19 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("receive", "reply"), wire("svc", "svc_out")],
         );
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert!(deps(&p, "receive").is_empty());
     }
 
     #[test]
-    fn a_project_with_no_trigger_reaches_nothing() {
+    fn a_project_with_no_trigger_has_no_cut() {
         let p = project(vec![node("svc", false, true)], vec![]);
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert!(crate::run_spec::trigger_cuts(&p).is_empty());
     }
 
     /// A group's port is where the walk's port-precision earns its
     /// keep: the trigger sits inside the group and reads the group's `x`,
-    /// so infra feeding the group's `y` never reaches it and must not
-    /// hold the activation back. A cruder walk (every wire into the
-    /// group) would name `svc` here and grey out Activate over infra the
-    /// triggers never touch.
+    /// so infra feeding the group's `y` never reaches it, and stopping it
+    /// leaves the trigger alone.
     #[test]
     fn infra_feeding_a_group_port_the_trigger_does_not_read_stays_out() {
         let node = |id: &str, scope: &[&str], infra: bool| serde_json::json!({
@@ -2128,18 +2048,14 @@ mod infra_triggers_depend_on_tests {
             ],
             "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive", "other"] }]
         })).expect("the fixture deserializes");
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
-        // The stay-running walk is port-precise at the group too.
-        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
-    /// The two questions part company at the GATE: infra deciding
-    /// whether the trigger's group flows is evaluated by the arming run
-    /// and holds the activation back, but the armed trigger never reads
-    /// it again, so stopping it later breaks nothing and the stay-running
-    /// walk leaves it out.
+    /// Infra deciding whether the trigger's group flows is read by the
+    /// arming run once, and the armed trigger never reads it again, so
+    /// stopping it later breaks nothing: it is no dependency.
     #[test]
-    fn gate_infra_holds_the_activation_back_and_nothing_after() {
+    fn gate_infra_is_no_dependency() {
         let node = |id: &str, scope: &[&str], infra: bool| serde_json::json!({
             "id": id, "nodeType": "T", "label": null, "config": {},
             "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": [],
@@ -2159,8 +2075,7 @@ mod infra_triggers_depend_on_tests {
             ],
             "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive"] }]
         })).expect("the fixture deserializes");
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string(), "gate".to_string()]);
-        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
 
@@ -2174,7 +2089,7 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("db", "loopy"), wire("loopy", "db"), wire("db", "receive")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["db".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["db".to_string()]);
     }
 
     /// The shape an include compiles to: one body (`Bridge`) holding an
@@ -2209,26 +2124,15 @@ mod infra_triggers_depend_on_tests {
         })).expect("the fixture deserializes")
     }
 
-    /// Both questions are answered per PLACE, spelled: the trigger under
-    /// `one` depends on the placement under `one` and on the top-level
-    /// node wired into `one`'s door; the trigger under `two` depends on
-    /// its own placement alone, because the top-level node feeds only
-    /// `one`.
+    /// Answered per PLACE, spelled: the trigger under `one` depends on
+    /// the placement under `one` and on the top-level node wired into
+    /// `one`'s door; the trigger under `two` depends on its own placement
+    /// alone, because the top-level node feeds only `one`.
     #[test]
     fn a_file_included_twice_depends_per_call() {
         let p = program_with_two_sites();
-        assert_eq!(
-            compute_trigger_deps(&p),
-            vec![
-                ("one.svc".to_string(), "one.door".to_string()),
-                ("top_db".to_string(), "one.door".to_string()),
-                ("two.svc".to_string(), "two.door".to_string()),
-            ]
-        );
-        assert_eq!(
-            ids(infra_triggers_depend_on(&p)),
-            vec!["one.svc".to_string(), "top_db".to_string(), "two.svc".to_string()]
-        );
+        assert_eq!(deps(&p, "one.door"), vec!["one.svc".to_string(), "top_db".to_string()]);
+        assert_eq!(deps(&p, "two.door"), vec!["two.svc".to_string()]);
     }
 }
 

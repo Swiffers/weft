@@ -138,6 +138,5 @@ mod tests {
         assert_eq!(InfraEventKind::Stopped.as_str(), "stopped");
         assert_eq!(InfraEventKind::Terminated.as_str(), "terminated");
         assert_eq!(InfraEventKind::Started.as_str(), "started");
-        assert_eq!(InfraEventKind::Notify.as_str(), "notify");
     }
 }

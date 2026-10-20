@@ -188,7 +188,6 @@ export class AutoFollowController {
       ev.kind === 'project_registered' ||
       ev.kind === 'project_activated' ||
       ev.kind === 'project_deactivated' ||
-      ev.kind === 'infra_config_error' ||
       ev.kind === 'trigger_url_changed' ||
       // Build/verb lifecycle: the dispatcher announces transition flips
       // (building, activating, ...) so the bar shows "Building... (cancel)"

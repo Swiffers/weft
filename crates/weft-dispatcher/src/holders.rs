@@ -18,9 +18,9 @@ use crate::state::DispatcherState;
 /// Announced when the held set changes: a held signal comes, goes, gives
 /// up or loses its holder (the `signal` table's triggers), and when an
 /// activation changes status, whether it takes work, or until when (the
-/// `trigger_activation` table's): a trigger switched on, wiped, or past
-/// its hibernation's grace window changes which signals are held without a
-/// write to their rows.
+/// `trigger_activation` table's): a trigger switched on, taken down with
+/// its door refusing, or past its door's window changes which signals are
+/// held without a write to their rows.
 // SYNC: HELD_SIGNALS_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (signal_held_notify)
 pub const HELD_SIGNALS_CHANNEL: &str = "weft_held_signals";
 

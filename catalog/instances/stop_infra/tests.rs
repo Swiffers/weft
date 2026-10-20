@@ -1,22 +1,21 @@
 //! StopInfra self-tests: the stop is asked for that instance's copy, or
 //! the program's own when no instance is given, the choices become the
-//! take-down spec,
-//! the self choice follows the toggle, and a wait before a wipe is
+//! take-down, the self choice follows the toggle, and a contradiction is
 //! refused before anything is asked.
 
 use serde_json::json;
 
 use weft::program::ProgramCall;
-use weft::{DeactivationMode, FakeRig, NodeTest, RunningPolicy, StopSelf, WeftResult};
+use weft::{Door, FakeRig, Held, NodeTest, Running, StopSelf, WeftResult};
 
 use super::StopInfraNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
-        NodeTest::fake("parks_and_waits_by_default", defaults),
+        NodeTest::fake("takes_keeps_and_waits_by_default", defaults),
         NodeTest::fake("no_instance_stops_the_programs_own_copy", the_programs_own),
         NodeTest::fake("the_choices_reach_the_call", choices),
-        NodeTest::fake("waiting_before_a_wipe_is_refused", wipe_wait),
+        NodeTest::fake("keep_is_no_running_answer", keep_refused),
         NodeTest::fake("no_copy_is_told_apart_from_done", no_copy),
         NodeTest::fake("a_copy_already_down_is_done", already_down),
     ]
@@ -41,11 +40,11 @@ async fn already_down(rig: FakeRig) -> WeftResult<()> {
 async fn defaults(rig: FakeRig) -> WeftResult<()> {
     rig.run(&StopInfraNode, json!({ "node": "bridge", "instance": "ada" })).await.ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraStop { node, instance, spec }, StopSelf::Keep) => {
+        (ProgramCall::InfraStop { node, instance, take_down }, StopSelf::Keep) => {
             assert_eq!(node, "bridge");
             assert_eq!(instance.as_ref().unwrap().as_str(), "ada");
-            assert_eq!(spec.mode, DeactivationMode::Park);
-            assert_eq!(spec.running_policy, RunningPolicy::Wait);
+            assert_eq!((take_down.door, take_down.door_for_minutes), (Some(Door::Take), None));
+            assert_eq!((take_down.held, take_down.running), (Some(Held::Keep), Some(Running::Wait)));
         }
         other => panic!("unexpected call {other:?}"),
     }
@@ -68,27 +67,23 @@ async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
 async fn choices(rig: FakeRig) -> WeftResult<()> {
     rig.run(
         &StopInfraNode,
-        json!({ "node": "bridge", "instance": "ada", "triggers": "hibernate", "graceMinutes": 30, "running": "cancel", "includeSelf": true }),
+        json!({ "node": "bridge", "instance": "ada", "door": "hide", "doorForMinutes": 30, "held": "drop", "running": "cancel", "includeSelf": true }),
     )
     .await
     .ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraStop { spec, .. }, StopSelf::Include) => {
-            assert_eq!(spec.mode, DeactivationMode::Hibernate);
-            assert_eq!(spec.grace_minutes, 30);
-            assert_eq!(spec.running_policy, RunningPolicy::Cancel);
+        (ProgramCall::InfraStop { take_down, .. }, StopSelf::Include) => {
+            assert_eq!((take_down.door, take_down.door_for_minutes), (Some(Door::Hide), Some(30)));
+            assert_eq!((take_down.held, take_down.running), (Some(Held::Drop), Some(Running::Cancel)));
         }
         other => panic!("unexpected call {other:?}"),
     }
     Ok(())
 }
 
-async fn wipe_wait(rig: FakeRig) -> WeftResult<()> {
-    let err = rig
-        .run(&StopInfraNode, json!({ "node": "bridge", "instance": "ada", "triggers": "wipe", "running": "wait" }))
-        .await
-        .failure()?;
-    assert!(err.contains("wipe requires"), "{err}");
+async fn keep_refused(rig: FakeRig) -> WeftResult<()> {
+    let err = rig.run(&StopInfraNode, json!({ "node": "bridge", "running": "keep" })).await.failure()?;
+    assert!(err.contains("`wait` or `cancel`"), "{err}");
     assert!(rig.program_calls().is_empty());
     Ok(())
 }

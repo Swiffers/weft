@@ -1,14 +1,15 @@
 //! Shared by the instance nodes: how they read an instance id (one they
 //! always need, or one that, left out, means the program's own copies),
-//! and, for the ones that take something down, what happens to the
-//! triggers and runs they reach and whether the run doing it goes too.
-//! One reader, so every such node offers the same choices with the same
-//! defaults.
+//! and, for the ones that take something down, how the triggers they
+//! reach go down (`door`, `doorForMinutes`, `held`, `running`, the same
+//! three questions `weft deactivate` and `weft infra stop` answer) and
+//! whether the run doing it goes too. One reader, so every such node
+//! offers the same choices with the same defaults.
 
 use weft::instance::InstanceId;
 use weft::node::NodeOutput;
 use weft::program::InfraDownAnswer;
-use weft::{node_bail, DeactivateSpec, DeactivationMode, RunContext, RunningPolicy, StopSelf, WeftResult};
+use weft::{node_bail, Door, Held, RunContext, Running, StopSelf, TakeDownChoice, WeftResult};
 
 /// The instance id a node was handed, checked the way every instance id
 /// is (`InstanceId::new`: never blank, a plain id), so a bad one fails
@@ -36,28 +37,27 @@ pub fn instance_if_given(ctx: &RunContext) -> WeftResult<Option<InstanceId>> {
     }
 }
 
-/// What a take-down does to the triggers it reaches (`triggers`: park,
-/// hibernate or wipe) and to the runs they fired (`running`: wait or
-/// cancel). Waiting before a wipe is refused, as everywhere else.
-pub fn take_down_spec(ctx: &RunContext) -> WeftResult<DeactivateSpec> {
+/// How a take-down brings the triggers it reaches down: what happens to
+/// work arriving (`door`, refusing after `doorForMinutes` when set), to
+/// the work they already hold (`held`), and to the runs going (`running`).
+/// A contradiction (`doorForMinutes` beside a refusing door) is refused
+/// here, before anything is asked.
+pub fn take_down_choice(ctx: &RunContext) -> WeftResult<TakeDownChoice> {
     // Read typed: a word outside the enum fails naming the input, the
     // word, and the words it takes.
-    let mode: DeactivationMode = ctx.inputs.get("triggers")?;
-    let running_policy: RunningPolicy = ctx.inputs.get("running")?;
-    let grace: f64 = ctx.inputs.get("graceMinutes")?;
-    if grace < 0.0 || grace.fract() != 0.0 || grace > f64::from(u32::MAX) {
-        node_bail!("graceMinutes must be a whole number of minutes from 0 to {}, got {grace}", u32::MAX);
-    }
-    let spec = DeactivateSpec {
-        mode,
-        grace_minutes: grace as u32,
-        running_policy,
-        drain_timeout_secs: None,
+    let door: Door = ctx.inputs.get("door")?;
+    let held: Held = ctx.inputs.get("held")?;
+    let running: Running = ctx.inputs.get("running")?;
+    let door_for_minutes = match ctx.inputs.opt::<f64>("doorForMinutes")? {
+        None => None,
+        Some(minutes) if minutes >= 1.0 && minutes.fract() == 0.0 && minutes <= f64::from(u32::MAX) => Some(minutes as u32),
+        Some(minutes) => node_bail!("doorForMinutes must be a whole number of minutes from 1 to {}, got {minutes}", u32::MAX),
     };
-    if let Err(why) = spec.validate() {
+    let choice = TakeDownChoice { door: Some(door), door_for_minutes, held: Some(held), running: Some(running) };
+    if let Err(why) = choice.resolve() {
         node_bail!("{why}");
     }
-    Ok(spec)
+    Ok(choice)
 }
 
 /// Whether the run doing the take-down goes too, when it is among what

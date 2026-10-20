@@ -35,6 +35,12 @@ pub struct DoorFire {
     /// parked fire replayed): the next park backs off further.
     #[serde(default)]
     pub attempts: u32,
+    /// Handed over from its trigger's queue, where it was held (the
+    /// trigger was down, or past its limits): it is admitted under half of
+    /// the trigger's own limits (`ResolvedLimits::for_held`), so what is
+    /// released never takes all the room new arrivals need.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub released: bool,
 }
 
 /// How a call to carry on one queued run ended, as the worker answers
@@ -91,8 +97,8 @@ pub enum WaitsOn {
     /// version of the program. Tried again after a backoff that grows.
     #[default]
     Room,
-    /// Its trigger to take work again (parked, hibernating, being set
-    /// up): the activation that brings it back hands it over, and while
+    /// Its trigger to take work again (down with its door holding what
+    /// arrives, or being set up): the activation that brings it back hands it over, and while
     /// its trigger is live it is tried after a backoff, as for room.
     Trigger,
     /// A value its instance has not given: the instance's next change of
@@ -147,7 +153,7 @@ impl WaitsOn {
 /// room and its trigger): only that changing, or the trigger activated
 /// again, hands it over. What `weft status` and the editor show per
 /// trigger.
-// SYNC: the kinds <-> weft_task_store::parked_fires::WaitsFor (parked_fire.waits_for), packages/weft-graph/src/protocol.ts (ActivationEntry.waiting.on)
+// SYNC: the kinds <-> weft_task_store::parked_fires::WaitsFor (parked_fire.waits_for), packages/weft-graph/src/protocol.ts (WaitingFires.on)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnclockedWait {
@@ -271,6 +277,7 @@ mod wire_tests {
             caller: Some("ip:10.0.0.1".into()),
             held_by: None,
             attempts: 2,
+            released: true,
         };
         let back: DoorFire = serde_json::from_value(serde_json::to_value(&fire).unwrap()).unwrap();
         assert_eq!(back, fire);

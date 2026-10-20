@@ -101,6 +101,7 @@ pub trait ProjectStoreOps: Send + Sync {
         code: Option<&ProgramCode>,
         source: Option<&weft_core::project::hash::Manifest>,
         settles: Option<&crate::build::waiting::Settles<'_>>,
+        infra_places: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>>;
 
     /// Sources registered with this exact running program. Refuse a concurrent build.
@@ -160,8 +161,8 @@ pub trait ProjectStoreOps: Send + Sync {
     /// Read the stored binary hash. `Ok(None)` if never set
     /// (project registered but never built / activated /
     /// infra-started). `Err` ONLY on DB failure: a transient hiccup
-    /// must NOT be observed as "no hash" (which would trigger an
-    /// unnecessary stale-worker kill in `reconcile_worker`).
+    /// must NOT be observed as "no hash" (which would read every trigger
+    /// on as current, and every run as on a build nobody registered).
     async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
     /// Read the stored definition hash. Same Result contract as
@@ -183,6 +184,11 @@ pub trait ProjectStoreOps: Send + Sync {
     /// Read the stored infra hash. Same Result contract as
     /// `running_binary_hash`.
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
+
+    /// The hash of each infra place's infra in the registered version
+    /// `definition_hash` (`BuiltProgram::infra_places`); empty for a
+    /// version registered without them.
+    async fn infra_places(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>>;
 
     /// The infra image tags the last build registered (empty before the
     /// first build, or for a program without infra). `Ok(None)` = no such
@@ -541,10 +547,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- replacing the install's (`WorkerOverrides`); empty
                 -- runs on the install's.
                 worker_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                -- Per-project health protocols overriding the weft
-                -- default. NULL = use default. Schema per
-                -- weft_infra_supervisor::protocol::HealthProtocols.
-                health_protocols_json JSONB,
                 -- Verb-transition marker, orthogonal to `status`:
                 -- 'none' | 'building' | 'cancelling_build' | 'resyncing'.
                 -- Written only by its own single-flight methods
@@ -694,6 +696,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- a build registered. A cut is no version: the running hashes
             -- never point at one (`advance_running_hashes`).
             cut_from TEXT,
+            -- For a version a build registered, `place -> hash` of each
+            -- infra place's own infra (`BuiltProgram::infra_places`): what
+            -- an apply of that place stamps on its copy, and what tells a
+            -- copy behind. NULL for a cut, and for a build that named none.
+            infra_places JSONB,
             PRIMARY KEY (project_id, definition_hash)
             -- No foreign key to `project`: the project's removal erases
             -- its runs first and drops these in its own transaction
@@ -795,6 +802,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         code: Option<&ProgramCode>,
         source: Option<&weft_core::project::hash::Manifest>,
         settles: Option<&crate::build::waiting::Settles<'_>>,
+        infra_places: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>> {
         let id = project.id;
         let name = name.to_string();
@@ -862,14 +870,16 @@ impl ProjectStoreOps for PostgresProjectStore {
             // hash is the same program, and is now a registered version
             // too.
             sqlx::query(
-                "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL",
+                "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, infra_places) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL, \
+                     infra_places = COALESCE(EXCLUDED.infra_places, project_definition.infra_places)",
             )
             .bind(id)
             .bind(hash)
             .bind(&project_json)
             .bind(now)
+            .bind(infra_places.map(sqlx::types::Json))
             .execute(&mut *tx)
             .await?;
         }
@@ -1102,6 +1112,17 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.map(|(j,)| j))
     }
 
+    async fn infra_places(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let row: Option<(Option<sqlx::types::Json<std::collections::BTreeMap<String, String>>>,)> = sqlx::query_as(
+            "SELECT infra_places FROM project_definition WHERE project_id = $1 AND definition_hash = $2",
+        )
+        .bind(id)
+        .bind(definition_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(places,)| places).map(|places| places.0).unwrap_or_default())
+    }
+
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT running_infra_hash FROM project WHERE id = $1",
@@ -1309,6 +1330,14 @@ impl ProjectStoreOps for PostgresProjectStore {
             .bind(sqlx::types::Json(&plan))
             .execute(&mut *tx)
             .await?;
+        // Told with the write: a drive waiting for the runs on the old
+        // version, on whichever dispatcher, stops waiting
+        // (`crate::task_kinds::resync::given_up`).
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(crate::task_kinds::resync::RESYNC_GIVEN_UP_CHANNEL)
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(Some(plan))
     }
@@ -1457,6 +1486,8 @@ pub struct FakeProjectStore {
     /// keyed by `(project_id, definition_hash)`, value is the
     /// `project_json` registered under that hash.
     definition_versions: RwLock<HashMap<(uuid::Uuid, String), String>>,
+    /// Mirror of `project_definition.infra_places`, by the same key.
+    infra_places: RwLock<HashMap<(uuid::Uuid, String), std::collections::BTreeMap<String, String>>>,
     tenants: RwLock<HashMap<uuid::Uuid, String>>,
     /// Free-text project description, mirroring the `project.description`
     /// column. A separate map (like `tenants` / `has_infra`) so the `inner`
@@ -1489,6 +1520,7 @@ impl FakeProjectStore {
             infra_hashes: RwLock::new(HashMap::new()),
             infra_image_tags: RwLock::new(HashMap::new()),
             definition_versions: RwLock::new(HashMap::new()),
+            infra_places: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
             descriptions: RwLock::new(HashMap::new()),
             has_infra: RwLock::new(HashMap::new()),
@@ -1526,6 +1558,7 @@ impl ProjectStoreOps for FakeProjectStore {
         // The fake holds no version builds (they live in Postgres): a
         // registration always lands.
         _settles: Option<&crate::build::waiting::Settles<'_>>,
+        infra_places: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>> {
         let id = project.id;
         let name_owned = name.to_string();
@@ -1580,6 +1613,9 @@ impl ProjectStoreOps for FakeProjectStore {
                 .await
                 .insert((id, h.to_string()), project_json.clone());
             self.definition_hashes.write().await.insert(id, h.to_string());
+            if let Some(places) = infra_places {
+                self.infra_places.write().await.insert((id, h.to_string()), places.clone());
+            }
         }
         if let Some(h) = infra_hash {
             self.infra_hashes.write().await.insert(id, h.to_string());
@@ -1738,6 +1774,10 @@ impl ProjectStoreOps for FakeProjectStore {
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         Ok(self.infra_hashes.read().await.get(&id).cloned())
+    }
+
+    async fn infra_places(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        Ok(self.infra_places.read().await.get(&(id, definition_hash.to_string())).cloned().unwrap_or_default())
     }
 
     async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>> {

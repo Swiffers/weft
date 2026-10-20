@@ -16,7 +16,7 @@ use weft_broker::lifecycle_writes::{
     set_waiting, sync_ownership, unowned_work_waiting, FencedWrite, IssuedCommand,
 };
 use weft_broker_client::protocol::{
-    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, HealthProtocolState, InfraNodeStatus as Status,
+    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, HealthRuleState, InfraNodeStatus as Status,
     SupervisorCommandCompleteRequest, SupervisorSetHealthStateRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
     SupervisorSyncOwnershipRequest,
 };
@@ -430,6 +430,79 @@ async fn command_completion_is_once_and_owner_only(pool: PgPool) {
     assert_eq!((outcome.as_str(), message.as_deref()), ("failed", Some("boom")));
     assert_eq!(complete_command(&pool, &req(OWNER, cmd, None)).await.unwrap(), FencedWrite::Gone);
     assert_eq!(complete_command(&pool, &req(OWNER, cmd + 1000, None)).await.unwrap(), FencedWrite::Gone);
+}
+
+/// An apply is issued with the hash of its place in the build its infra
+/// setup runs (the program the run's cut was cut from), and stamps it on
+/// its copy only when it succeeds: a failed one leaves the copy as it was.
+#[sqlx::test]
+async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: PgPool) {
+    use weft_broker::lifecycle_writes::place_hash_of_run;
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    project_row(&pool, PROJECT, true).await;
+    node_row(&pool, "running", serde_json::json!({})).await;
+    for (hash, places, cut_from) in [("program", Some(serde_json::json!({ NODE: "h-2" })), None), ("cut", None, Some("program"))] {
+        sqlx::query(
+            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places) \
+             VALUES ($1, $2, '{}', 0, $3, $4)",
+        )
+        .bind(PROJECT)
+        .bind(hash)
+        .bind(cut_from)
+        .bind(places)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let run_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, cut_from, state, last_seq, started_at) \
+         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'program', 'running', 0, 0)",
+    )
+    .bind(run_id)
+    .bind(PROJECT)
+    .bind(TENANT)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(place_hash_of_run(&pool, PROJECT, run_id, NODE).await.unwrap().as_deref(), Some("h-2"));
+    assert_eq!(place_hash_of_run(&pool, PROJECT, run_id, "other").await.unwrap(), None, "a place the build named no hash for");
+    assert!(place_hash_of_run(&pool, PROJECT, uuid::Uuid::new_v4(), NODE).await.is_err(), "no such run");
+
+    let spec = serde_json::json!({});
+    let apply = IssuedCommand {
+        tenant_id: TENANT,
+        project_id: PROJECT,
+        node_id: Some(NODE),
+        copies: &weft_core::instance::Copies::Shared,
+        verb: InfraLifecycleVerb::Apply,
+        spec_json: Some(&spec),
+        source_hash: Some("h-2"),
+        issued_by_replica: "worker-1",
+    };
+    let stamped = || async {
+        sqlx::query_scalar::<_, Option<String>>("SELECT source_hash FROM infra_node WHERE project_id = $1 AND node_id = $2")
+            .bind(PROJECT)
+            .bind(NODE)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let end = |command_id: i64, error: Option<&str>| SupervisorCommandCompleteRequest {
+        replica: OWNER.into(),
+        command_id,
+        error: error.map(String::from),
+        cancelled: false,
+    };
+    let failed = issue_command(&pool, &apply).await.unwrap().expect("issued");
+    claim_next(&pool, OWNER, &[]).await.unwrap().expect("claimed");
+    assert_eq!(complete_command(&pool, &end(failed, Some("boom"))).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(stamped().await, None, "a failed apply stamps nothing");
+    let landed = issue_command(&pool, &apply).await.unwrap().expect("issued");
+    claim_next(&pool, OWNER, &[]).await.unwrap().expect("claimed");
+    assert_eq!(complete_command(&pool, &end(landed, None)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(stamped().await.as_deref(), Some("h-2"));
 }
 
 /// The owner is handed its projects' commands oldest first. A command it
@@ -953,24 +1026,25 @@ async fn a_removed_projects_leftovers_are_written_down_for_the_install_retried_t
     assert_eq!(rows, 0, "with its count");
 }
 
-/// A health protocol that gave up comes back armed once a person asks for
-/// a look after it gave up.
+/// A health rule that gave up comes back armed once a person asks for a
+/// look after it gave up.
 #[sqlx::test]
-async fn a_persons_look_arms_a_protocol_that_gave_up(pool: PgPool) {
+async fn a_persons_look_arms_a_rule_that_gave_up(pool: PgPool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let now = db_now(&pool).await;
-    let gave_up = HealthProtocolState {
-        protocol: "restart".into(),
-        acted: None,
+    let gave_up = HealthRuleState {
+        copy: weft_broker_client::protocol::InfraCopy { node_id: "db".into(), instance: None },
+        rule: "take-down-while-flaky".into(),
+        fired: false,
         consecutive_failures: 3,
         next_retry_at_unix: None,
         gave_up_at_unix: Some(now - 5),
         gave_up_seen: Some(serde_json::json!([])),
         last_error: Some("refused".into()),
     };
-    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, protocols: vec![gave_up.clone()] };
+    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, rules: vec![gave_up.clone()] };
     assert!(matches!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied));
     assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![gave_up]);
     weft_dispatcher::infra_lifecycle_command::person_asks_for_look(&pool, PROJECT).await.unwrap();
@@ -1128,42 +1202,51 @@ async fn a_command_claimed_and_held_is_skipped_by_a_second_claimer(pool: PgPool)
     assert_eq!(claim_next(&pool, OWNER, &[cmd]).await.unwrap().map(|c| c.id), None);
 }
 
-/// A health protocol that gave up comes back armed once a person's infra
-/// command touched the project since, keeping what it acted on.
+/// A health rule that gave up comes back armed once a person's infra
+/// command touched the project since, keeping whether it fired. Two
+/// copies' rules of one name, a shared one and an instance's, are kept
+/// apart.
 #[sqlx::test]
-async fn a_given_up_protocol_comes_back_armed_after_a_persons_command(pool: PgPool) {
+async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let now = db_now(&pool).await;
-    let given_up = HealthProtocolState {
-        protocol: "restart".into(),
-        acted: Some(Default::default()),
+    let given_up = HealthRuleState {
+        copy: weft_broker_client::protocol::InfraCopy { node_id: "web".into(), instance: None },
+        rule: "take-down-while-flaky".into(),
+        fired: true,
         consecutive_failures: 3,
         next_retry_at_unix: None,
         gave_up_at_unix: Some(now + 5),
         gave_up_seen: Some(serde_json::json!({ "web": "flaky" })),
         last_error: Some("refused".into()),
     };
-    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, protocols: vec![given_up.clone()] };
+    let ada = HealthRuleState {
+        copy: weft_broker_client::protocol::InfraCopy {
+            node_id: "web".into(),
+            instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()),
+        },
+        fired: false,
+        gave_up_at_unix: None,
+        ..given_up.clone()
+    };
+    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, rules: vec![given_up.clone(), ada.clone()] };
     assert_eq!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied);
     let displaced = SupervisorSetHealthStateRequest { replica: OTHER.into(), ..req.clone() };
     assert_eq!(set_health_state(&pool, &displaced).await.unwrap(), FencedWrite::Displaced, "only the lease holder writes");
-    assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![given_up.clone()], "given up, nothing touched it since");
+    assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![given_up.clone(), ada.clone()], "given up, nothing touched it since");
 
     command(&pool).await;
     sqlx::query("UPDATE infra_lifecycle_command SET issued_at_unix = $1").bind(now + 10).execute(&pool).await.unwrap();
     let armed = health_state(&pool, PROJECT).await.unwrap();
     assert_eq!(
         armed,
-        vec![HealthProtocolState {
-            consecutive_failures: 0,
-            gave_up_at_unix: None,
-            gave_up_seen: None,
-            last_error: None,
-            ..given_up
-        }],
-        "a person's command re-arms it, keeping what it acted on"
+        vec![
+            HealthRuleState { consecutive_failures: 0, gave_up_at_unix: None, gave_up_seen: None, last_error: None, ..given_up },
+            ada,
+        ],
+        "a person's command re-arms what gave up, keeping whether it fired; the other copy's state is its own"
     );
 }
 
@@ -1216,6 +1299,7 @@ async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: PgPool) {
         copies: &weft_core::instance::Copies::Shared,
         verb: InfraLifecycleVerb::Apply,
         spec_json: Some(&spec),
+        source_hash: None,
         issued_by_replica: "worker-1",
     };
     let gone = uuid::Uuid::from_u128(9);
@@ -1311,6 +1395,7 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
         copies: &copies,
         verb: InfraLifecycleVerb::Apply,
         spec_json: Some(&spec),
+        source_hash: None,
         issued_by_replica: "worker-1",
     };
     let id = issue_command(&pool, &apply).await.unwrap().expect("issued");
@@ -1320,8 +1405,8 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
     assert_eq!((claimed.id, claimed.copies), (id, Copies::Instance(ada)));
 }
 
-/// A take-down that drains first is the dispatcher's until its running
-/// work is done: the supervisor is handed it only once the drain hands it
+/// A take-down that waits for its running work first is the dispatcher's
+/// until that work is done: the supervisor is handed it only once the drain hands it
 /// over, and a command on the same copy behind it waits for it.
 #[sqlx::test]
 async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: PgPool) {
@@ -1329,13 +1414,13 @@ async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: PgPool) 
     lease(&pool, OWNER).await;
     let draining = command(&pool).await;
     let behind = command(&pool).await;
-    sqlx::query("UPDATE infra_lifecycle_command SET drain_by_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + 60 WHERE id = $1")
+    sqlx::query("UPDATE infra_lifecycle_command SET drains = TRUE WHERE id = $1")
         .bind(draining)
         .execute(&pool)
         .await
         .unwrap();
     assert!(claim_next(&pool, OWNER, &[]).await.unwrap().is_none(), "draining, and the one behind it waits");
-    sqlx::query("UPDATE infra_lifecycle_command SET drain_by_unix = NULL WHERE id = $1").bind(draining).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE infra_lifecycle_command SET drains = FALSE WHERE id = $1").bind(draining).execute(&pool).await.unwrap();
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(draining));
     assert_eq!(claim_next(&pool, OWNER, &[draining]).await.unwrap().map(|c| c.id), None, "{behind} waits for it");
 }

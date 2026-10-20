@@ -841,8 +841,8 @@ pub const CACHE_GC_SCRIPT_NAME: &str = "weft-cache-gc.sh";
 /// worker crate (its build-script units included), whose metadata hash
 /// folds in its package deps so every distinct project leaves its own
 /// copy. The engine and the shared dependencies are never touched. The
-/// `weft-isolate` helper is one fixed package, but each weft that changes
-/// its source compiles it again from a directory of its own
+/// `weft-isolate` helper is compiled again by each weft that changes its
+/// source, as a package named by that source
 /// (`codegen::isolate_dir_name`), so its compiled versions are bounded
 /// like a package's.
 pub const CACHE_GC_SCRIPT: &str = r#"#!/bin/sh

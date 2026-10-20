@@ -1,6 +1,8 @@
 //! `weft ci add --cloud <cloud>`: write the GitHub Actions workflow that
 //! deploys this project onto its weft install on that cloud (the program
-//! with `weft activate`, the frontend in `front/` to the cloud's own
+//! with `weft infra upgrade` then `weft resync`, for the program's own and
+//! every instance's, which bring up to date only what is running and on
+//! and never turn anything on; the frontend in `front/` to the cloud's own
 //! container service). `weft new --ci <cloud>` does the same at creation.
 //!
 //! The file is weft's until somebody edits it: its first line records a
@@ -136,6 +138,22 @@ mod tests {
         let rendered = render(Cloud::Gcp, "p");
         assert!(!rendered.contains("{{SERVICE}}"), "{rendered}");
         assert!(written_by_weft_untouched(&rendered));
+    }
+
+    /// A deploy brings up to date only what runs and what is on, the
+    /// program's own and every instance's, with the runs going answered
+    /// by one setting at the top, and never turns anything on.
+    #[test]
+    fn a_deploy_only_brings_up_to_date_what_runs_and_is_on() {
+        let rendered = render(Cloud::Gcp, "p");
+        assert!(rendered.contains("      RUNNING: wait\n"), "wait by default, a setting the deployer can change");
+        let on = "--on ${{ vars.WEFT_TARGET }}";
+        let steps = [format!("weft infra upgrade {on} --all --running \"$RUNNING\""), format!("weft resync {on} --all --running \"$RUNNING\"")];
+        let at: Vec<usize> = steps.iter().map(|step| rendered.find(step.as_str()).unwrap_or_else(|| panic!("{step}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "infra first, then the triggers");
+        for never in ["weft activate --on", "weft infra start --on"] {
+            assert!(!rendered.lines().any(|line| line.trim_start().starts_with(never)), "a deploy never runs {never}");
+        }
     }
 
     #[test]

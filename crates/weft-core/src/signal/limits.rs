@@ -49,6 +49,17 @@ pub struct ResolvedLimits {
     pub at_once: Option<u32>,
 }
 
+impl ResolvedLimits {
+    /// What work released from its trigger's queue is admitted under: half
+    /// of the trigger's runs per minute and runs at once (at least one
+    /// each), so new arrivals still get through while it drains. A
+    /// caller's own limit stays as it is.
+    pub fn for_held(self) -> Self {
+        let half = |limit: Option<u32>| limit.map(|n| (n / 2).max(1));
+        Self { per_minute: half(self.per_minute), at_once: half(self.at_once), ..self }
+    }
+}
+
 impl EntryLimits {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
@@ -230,6 +241,16 @@ impl Refused {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Released work gets half of the trigger's runs per minute and at
+    /// once, never less than one, and a caller's own limit as it is.
+    #[test]
+    fn held_work_is_admitted_under_half_the_limits() {
+        let limits = ResolvedLimits { per_caller_per_minute: Some(60), per_minute: Some(9), at_once: Some(1) };
+        assert_eq!(limits.for_held(), ResolvedLimits { per_caller_per_minute: Some(60), per_minute: Some(4), at_once: Some(1) });
+        let open = ResolvedLimits { per_caller_per_minute: None, per_minute: None, at_once: None };
+        assert_eq!(open.for_held(), open, "no limit stays no limit");
+    }
 
     #[test]
     fn unset_is_the_default_and_zero_is_no_limit() {

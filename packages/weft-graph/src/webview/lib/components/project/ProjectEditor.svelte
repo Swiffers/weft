@@ -55,25 +55,14 @@
 		onStop,
 		onDismissError,
 		onOpenLocation,
-		onActivate,
 		onCancelActivate,
 		onCancelBuild,
 		onCancelInfra,
-		onDeactivate,
-		onReactivate,
-		onCancelRunning,
-		onResumeActive,
-		onResync,
 		onResumeResync,
-		onStartInfra,
-		onStopInfra,
-		onTerminateInfra,
-		onInfraNodeStop,
-		onInfraNodeTerminate,
-		onUpgradeInfra,
+		onLifecycle,
+		checkRun,
 		actionBarState,
-		drift,
-		infraNodes,
+		status,
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
 		runState,
@@ -98,7 +87,7 @@
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		installView?: import('../../../../protocol').InstallView;
 		onSwitchInstall?: (install: string) => void;
-		onRun?: (targets: string[]) => void;
+		onRun?: (targets: [string, ...string[]]) => void;
 		specs?: import('../../../../run-spec').RunSpec[];
 		resolveSpec?: (spec: import('../../../../run-spec').RunSpec, seeded: boolean) => Promise<import('../../../../run-spec').ResolveSpecResponse>;
 		onRunSpec?: (spec: import('../../../../run-spec').RunSpec, seeded?: boolean) => void;
@@ -109,28 +98,17 @@
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onOpenLocation: (location: SourceLocation) => void;
-		onActivate?: () => void;
 		onCancelActivate?: () => void;
 		onCancelBuild?: () => void;
 		onCancelInfra?: () => void;
-		onDeactivate?: () => void;
-		onReactivate?: () => void;
-		onCancelRunning?: () => void;
-		onResumeActive?: () => void;
-		onResync?: () => void;
 		onResumeResync?: () => void;
-		onStartInfra?: () => void;
-		onStopInfra?: () => void;
-		onTerminateInfra?: () => void;
-		/// Per-node lifecycle, used by the graph's right-click menu
-		/// on a single infra node. The parent dispatches the HTTP
-		/// call through the extension host's CLI verb path.
-		onInfraNodeStop?: (node: string) => void;
-		onInfraNodeTerminate?: (node: string) => void;
-		onUpgradeInfra?: () => void;
+		/// A lifecycle verb from the contextual bar, on the selected
+		/// triggers or infra; the host runs it through the CLI.
+		onLifecycle?: (action: import('../../../../protocol').LifecycleAction) => void;
+		/// The walk's refusal for a run of these targets, or `null`.
+		checkRun?: (targets: [string, ...string[]]) => Promise<string | null>;
 		actionBarState: import('../../../../protocol').ActionBarState;
-		drift: import('../../../../protocol').ActionAvailability | undefined;
-		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
+		status: import('../../../../protocol').ActionAvailability | undefined;
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
 		runState?: import('../../types').RunState;
@@ -162,25 +140,14 @@
 		{onStop}
 		{onDismissError}
 		{onOpenLocation}
-		{onActivate}
 		{onCancelActivate}
 		{onCancelBuild}
 		{onCancelInfra}
-		{onDeactivate}
-		{onReactivate}
-		{onCancelRunning}
-		{onResumeActive}
-		{onResync}
 		{onResumeResync}
-		{onStartInfra}
-		{onStopInfra}
-		{onTerminateInfra}
-		{onInfraNodeStop}
-		{onInfraNodeTerminate}
-		{onUpgradeInfra}
+		{onLifecycle}
+		{checkRun}
 		{actionBarState}
-		{drift}
-		{infraNodes}
+		{status}
 		{hasInfraInGraph}
 		{hasTriggersInGraph}
 		{runState}

@@ -1,7 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { narrowingBound, parseFileValue, tryParseWeftType, typeReferencesFile, type CatalogEntry, type NodeDefinition, type OutputSpec, type Widget } from './protocol';
+import { describeOwnerTriggers, narrowingBound, TAKE_DOWN_DEFAULT, parseFileValue, tryParseWeftType, typeReferencesFile, type CatalogEntry, type NodeDefinition, type OutputSpec, type Widget } from './protocol';
 import { declarationProblem, declarationRule } from './webview/lib/projection/header-ports';
 import { NODE_TYPE_CONFIG, registerCatalog } from './webview/lib/nodes/index.svelte';
+
+describe('TAKE_DOWN_DEFAULT', () => {
+  it('destroys nothing: the door takes, what is held stays, the runs going are waited for', () => {
+    expect(TAKE_DOWN_DEFAULT).toEqual({ door: 'take', held: 'keep', running: 'wait' });
+  });
+});
+
+describe('describeOwnerTriggers', () => {
+  it('names the program\'s own triggers as they are', () => {
+    expect(describeOwnerTriggers([{ owner: { kind: 'shared' }, triggers: ['door', 'feed'] }])).toBe("'door', 'feed'");
+  });
+
+  it('names an instance\'s triggers with the instance, owners apart', () => {
+    expect(
+      describeOwnerTriggers([
+        { owner: { kind: 'shared' }, triggers: ['door'] },
+        { owner: { kind: 'instance', instance: 'ada' }, triggers: ['inbox'] },
+      ]),
+    ).toBe("'door'; 'inbox' of instance 'ada'");
+  });
+});
 
 describe('typeReferencesFile', () => {
 	it('matches file primitives and aliases, alone and in composites', () => {

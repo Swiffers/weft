@@ -488,6 +488,43 @@ mod fs_hashes {
         Ok(hex(&hasher.finalize()))
     }
 
+    /// Each infra place's own infra hash, by place (`db`, `one.db`): what
+    /// [`compute_infra_hash`] hashes, scoped to the place's own closure
+    /// (its node and everything upstream of it, their packages) and the
+    /// place's spelling. A copy applied from one build carries its place's
+    /// (`BuiltProgram::infra_places`); one whose place hashes otherwise in
+    /// the source now is behind it, and an edit to one infra node leaves
+    /// every other place where it was.
+    pub fn compute_infra_place_hashes(
+        project: &ProjectDefinition,
+        project_root: &Path,
+        weft_root: &Path,
+        catalog: &FsCatalog,
+    ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
+        let graph = ProjectGraph::new(project);
+        let mut out = std::collections::BTreeMap::new();
+        for place in weft_core::project::infra_places(project) {
+            let spelled = weft_core::project::address_of(project, &place.id, &place.path);
+            let mut hasher = Sha256::new();
+            hasher.update(b"weft-infra-place-v1\n");
+            hasher.update(spelled.as_bytes());
+            hasher.update(b"\n");
+            let closure = upstream_closure(&graph, std::slice::from_ref(&place.id));
+            hash_definition_slice(&mut hasher, project, &closure)?;
+            hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
+            let roots: Vec<PathBuf> = closure
+                .iter()
+                .filter_map(|id| project.nodes.iter().find(|n| n.id == *id))
+                .filter_map(|n| catalog.package_of(&n.node_type))
+                .map(|pkg| pkg.root.clone())
+                .collect();
+            hash_package_roots(&mut hasher, &roots, &[project_root, weft_root])?;
+            hash_worker_build_env(&mut hasher, weft_root)?;
+            out.insert(spelled, hex(&hasher.finalize()));
+        }
+        Ok(out)
+    }
+
     /// Hash a single image's source: Dockerfile + every file in the
     /// image source dir, scoped by node type. Used verbatim as the
     /// infra docker image tag suffix.

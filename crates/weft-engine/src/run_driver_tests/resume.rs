@@ -245,7 +245,7 @@
         )
         .await;
         let err = format!("{:#}", outcome.expect_err("a rejected row refuses the resume"));
-        assert!(err.contains("cannot be folded"), "{err}");
+        assert!(err.contains("does not fit the program it runs now") && err.contains("weft run --seed"), "{err}");
         let Some(RunEvent::RunFailed { error, .. }) = events.last() else {
             panic!("the failure is the run's terminal, got {:?}", events.last());
         };

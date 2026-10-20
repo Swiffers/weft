@@ -83,6 +83,7 @@ fn version_asked(project: uuid::Uuid, binary: &str, images: &[PlannedImage], ask
             implementations: Default::default(),
             infra_images: Default::default(),
             replaced_infra_images: Vec::new(),
+            infra_places: Default::default(),
             worker_image: images
                 .iter()
                 .find(|image| image.kind == ImageKind::Worker)
@@ -171,7 +172,7 @@ async fn project_store(pool: &PgPool, ids: &[uuid::Uuid]) -> weft_dispatcher::Pr
     let projects: weft_dispatcher::ProjectStore = Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     for id in ids {
         let empty = serde_json::from_value(serde_json::json!({ "id": id, "nodes": [], "edges": [] })).unwrap();
-        projects.register_with_hashes(empty, "p", "", TENANT, None, None, None, None, None, None, None).await.unwrap();
+        projects.register_with_hashes(empty, "p", "", TENANT, None, None, None, None, None, None, None, None).await.unwrap();
     }
     projects
 }

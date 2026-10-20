@@ -2,20 +2,20 @@
 //!
 //! The unit of activation is ONE trigger for ONE owner: the program's
 //! shared copy of a trigger, or one instance's copy of a per-instance one.
-//! These are the names every surface agrees on (the CLI's `--trigger` and
-//! `--instance`, the editor's action bar, a program's `ctx.trigger(..)`),
-//! resolved against the program so a mismatch is refused where it is
-//! written.
+//! These are the names every surface agrees on (the CLI's `--trigger`,
+//! `--instance` and `--all-instances`, the editor's selection, a program's
+//! `ctx.trigger(..)`), resolved against the program so a mismatch is
+//! refused where it is written.
 
 use serde::{Deserialize, Serialize};
 
-use crate::instance::{InstanceId, Owner};
+use crate::instance::{InstanceId, InstanceTarget, Owner};
 use crate::project::ProjectDefinition;
-use crate::running_policy::{DeactivationMode, RunningChoice};
+use crate::take_down::{Door, ReleaseHeld};
 
-/// Where one activation stands, as a person reads it: `registered`,
-/// `activating`, `active`, `deactivating`, or for one taken down, the
-/// way it went (`wipe`, `hibernate`, `park`).
+/// Where one activation stands, as a person reads it: `registered`
+/// (never turned on), `activating`, `active`, or for one taken down, what
+/// its door does (`take`, `hide`, `refuse`).
 // SYNC: ActivationMode <-> packages/weft-graph/src/protocol.ts ActivationMode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,9 +23,8 @@ pub enum ActivationMode {
     Registered,
     Activating,
     Active,
-    Deactivating,
     #[serde(untagged)]
-    Down(DeactivationMode),
+    Down(Door),
 }
 
 impl ActivationMode {
@@ -35,8 +34,7 @@ impl ActivationMode {
             Self::Registered => "registered",
             Self::Activating => "activating",
             Self::Active => "active",
-            Self::Deactivating => "deactivating",
-            Self::Down(how) => how.as_str(),
+            Self::Down(door) => door.as_str(),
         }
     }
 }
@@ -69,22 +67,22 @@ impl std::fmt::Display for ActivationKey {
     }
 }
 
-/// Which activations a verb acts on: every trigger of one owner, or the
-/// named ones. What `weft activate` / `deactivate` / `resync` / `bake` /
-/// `cancel-activate` send (`--trigger`, `--instance`), what the editor's
-/// action bar sends (everything shared), and what a program's
-/// `ctx.trigger(..)` / `ctx.triggers()` calls send.
+/// Which activations a verb acts on: the named triggers, or every one,
+/// of the owners `instances` names. What `weft activate` / `deactivate` /
+/// `resync` / `bake` / `cancel-activate` send (`--trigger`, `--instance`,
+/// `--all-instances`), what the editor sends for its selection, and what
+/// a program's `ctx.trigger(..)` / `ctx.triggers()` calls send.
 // SYNC: ActivationScope <-> packages/weft-graph/src/protocol.ts ActivationScope
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationScope {
-    /// The triggers, by address. Empty means every trigger the owner
-    /// has: every shared trigger for [`Owner::Shared`], every
-    /// per-instance trigger for an instance.
+    /// The triggers, by address. Empty means every trigger each owner
+    /// has: every shared trigger for the shared owner, every per-instance
+    /// trigger for an instance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<String>,
-    /// Whose activations: `None` for the program's shared ones.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<InstanceId>,
+    /// Whose activations: the program's shared ones when absent.
+    #[serde(default, skip_serializing_if = "InstanceTarget::is_shared")]
+    pub instances: InstanceTarget,
 }
 
 impl ActivationScope {
@@ -93,18 +91,20 @@ impl ActivationScope {
         Self::default()
     }
 
-    pub fn owner(&self) -> Owner {
-        Owner::from_instance(self.instance.clone())
+    /// The named triggers (every one when empty) of one owner.
+    pub fn of_owner(triggers: Vec<String>, owner: &Owner) -> Self {
+        Self { triggers, instances: InstanceTarget::of(owner.instance().cloned()) }
     }
 
-    /// The activations this scope names, against `project`. A trigger
-    /// that exists once per instance needs an instance, and a shared one
-    /// cannot be activated for an instance, so either mismatch is refused
-    /// naming the fix. An unknown or non-trigger address is refused too.
-    /// Sorted, never empty unless the project has no trigger of the
-    /// owner's kind (the caller words that case).
-    pub fn resolve(&self, project: &ProjectDefinition) -> Result<Vec<ActivationKey>, String> {
-        let owner = self.owner();
+    /// The activations this scope names, against `project`, for every
+    /// owner it names (`known` is every instance weft holds anything for,
+    /// which [`InstanceTarget::EveryInstance`] reaches). A trigger that exists once
+    /// per instance needs an instance, and a shared one cannot be named
+    /// for an instance, so either mismatch is refused naming the fix; an
+    /// unknown or non-trigger address is refused too. Sorted; empty when
+    /// the program has no trigger of the owners' kind (the caller words
+    /// that case).
+    pub fn resolve<'a>(&self, project: &ProjectDefinition, known: impl IntoIterator<Item = &'a InstanceId>) -> Result<Vec<ActivationKey>, String> {
         let places = crate::project::trigger_places(project);
         let spelled_per_instance: Vec<(String, bool)> = places
             .iter()
@@ -115,40 +115,64 @@ impl ActivationScope {
                 )
             })
             .collect();
-        let mut keys: Vec<ActivationKey> = if self.triggers.is_empty() {
+        // Which kinds of trigger the owners named have: the shared ones
+        // the program's own, the per-instance ones an instance's; `--all`
+        // names both, each trigger reaching the owners of its kind.
+        let reaches_shared = self.instances.admits(&Owner::Shared);
+        let reaches_instances = !self.instances.is_shared();
+        let triggers: Vec<(String, bool)> = if self.triggers.is_empty() {
             spelled_per_instance
-                .into_iter()
-                .filter(|(_, per_instance)| *per_instance == matches!(owner, Owner::Instance(_)))
-                .map(|(trigger, _)| ActivationKey::new(trigger, owner.clone()))
+                .iter()
+                .filter(|(_, p)| if *p { reaches_instances } else { reaches_shared })
+                .cloned()
                 .collect()
         } else {
-            let mut keys = Vec::new();
-            for named in &self.triggers {
-                let Some((trigger, per_instance)) = spelled_per_instance.iter().find(|(t, _)| t == named) else {
-                    return Err(format!("'{named}' is not a trigger of this program"));
+            let mut named = Vec::new();
+            for trigger in &self.triggers {
+                let Some((_, is_per_instance)) = spelled_per_instance.iter().find(|(t, _)| t == trigger) else {
+                    return Err(format!("'{trigger}' is not a trigger of this program"));
                 };
-                match (&owner, per_instance) {
-                    (Owner::Shared, true) => {
+                match (*is_per_instance, reaches_shared, reaches_instances) {
+                    (true, _, false) => {
                         return Err(format!(
-                            "trigger '{trigger}' exists once per instance; name the instance (`--instance <id>` on a command, \
-                             the `instance` input on a node)"
+                            "trigger '{trigger}' exists once per instance; name the instances (`--instance <id>`, \
+                             `--all-instances` or `--all` on a command, the `instance` input on a node)"
                         ));
                     }
-                    (Owner::Instance(instance), false) => {
+                    (false, false, _) => {
                         return Err(format!(
-                            "trigger '{trigger}' is shared by every instance, so it cannot be activated \
-                             for instance '{instance}'; name no instance (leave out `--instance` on a command, \
-                             leave the `instance` input unwired on a node)"
+                            "trigger '{trigger}' is shared by every instance, so it has no copy of an instance's; \
+                             name no instance (leave out `--instance` and `--all-instances` on a command, or pass \
+                             `--all`; leave the `instance` input unwired on a node)"
                         ));
                     }
-                    _ => keys.push(ActivationKey::new(trigger.clone(), owner.clone())),
+                    _ => named.push((trigger.clone(), *is_per_instance)),
                 }
             }
-            keys
+            named
         };
+        let mut keys: Vec<ActivationKey> = self
+            .instances
+            .owners(known)
+            .into_iter()
+            .flat_map(|owner| {
+                let per_instance_owner = owner.instance().is_some();
+                triggers
+                    .iter()
+                    .filter(move |(_, per_instance)| *per_instance == per_instance_owner)
+                    .map(move |(trigger, _)| ActivationKey::new(trigger.clone(), owner.clone()))
+            })
+            .collect();
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    /// Whether `key` is among what this scope names, read off the key
+    /// alone: its owner is named, and its trigger is (or every trigger
+    /// is). What a verb that only takes triggers down reads its rows with.
+    pub fn admits(&self, key: &ActivationKey) -> bool {
+        self.instances.admits(&key.owner) && (self.triggers.is_empty() || self.triggers.contains(&key.trigger))
     }
 
     /// The per-instance triggers a plain activation of the program's
@@ -157,7 +181,7 @@ impl ActivationScope {
     /// activate` reports, so nobody reads "activated" as "every trigger is
     /// on".
     pub fn per_instance_left_out(&self, project: &ProjectDefinition) -> Vec<String> {
-        if self.instance.is_some() || !self.triggers.is_empty() {
+        if !self.instances.is_shared() || !self.triggers.is_empty() {
             return Vec::new();
         }
         let mut left: Vec<String> = crate::project::trigger_places(project)
@@ -171,38 +195,41 @@ impl ActivationScope {
     }
 }
 
-
 /// The owners among `live` (the keys of the activations that are on),
 /// each once: the program itself first when any of its shared triggers
-/// is on, then every instance in id order. What a plain `weft resync`
-/// brings up to date, one owner at a time, and (instances only) what
-/// `weft deactivate --all-instances` takes down.
+/// is on, then every instance in id order.
 pub fn owners_of<'a>(live: impl IntoIterator<Item = &'a ActivationKey>) -> Vec<Owner> {
     let owners: std::collections::BTreeSet<Owner> = live.into_iter().map(|key| key.owner.clone()).collect();
     owners.into_iter().collect()
 }
 
-/// `POST /projects/{id}/activate`.
-///
-/// `running` (`runningPolicy` / `drainTimeoutSecs`) says what happens to
-/// a worker built from an older image than the one being activated:
-/// `cancel` (the default) cancels what it runs and replaces it now;
-/// `wait` lets its in-flight work land first, up to the cap, then
-/// replaces it. The CLI's `--running-policy` and `--drain-timeout` on
-/// `weft activate`.
+/// `keys` grouped by owner, the program first: how a reply names them.
+pub fn by_owner(keys: &[ActivationKey]) -> Vec<OwnerTriggers> {
+    let mut grouped: std::collections::BTreeMap<Owner, Vec<String>> = std::collections::BTreeMap::new();
+    for key in keys {
+        grouped.entry(key.owner.clone()).or_default().push(key.trigger.clone());
+    }
+    grouped.into_iter().map(|(owner, triggers)| OwnerTriggers { owner, triggers }).collect()
+}
+
+/// `POST /projects/{id}/activate`: turn on every trigger the scope names
+/// that is off, and leave the ones on as they are. It never touches the
+/// runs going, and never starts infra.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActivateRequest {
+    /// The build the caller just made: refused when another registered
+    /// since. Absent (activating by id, a program's own call), the
+    /// registered build.
     #[serde(flatten)]
-    pub target: ActivationTarget,
-    #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Which activations: the triggers named (every one of the owner's
-    /// when none is) for the instance named (the shared ones when none
-    /// is). What `weft activate --trigger --instance` and a program's
-    /// `ctx.trigger(..).instance(..).activate()` send; the action bar
-    /// sends nothing, which is every shared trigger.
+    pub build: crate::builds::BuildHashes,
+    /// Which activations: the triggers named (every one of each owner's
+    /// when none is) of the owners named (the shared ones when none is).
     #[serde(default)]
     pub scope: ActivationScope,
+    /// What happens to the work the triggers held while they were down
+    /// (`weft activate --held run|drop`).
+    #[serde(default)]
+    pub held: ReleaseHeld,
     /// The port the project's own address opens on, on an install that
     /// gives projects one (a machine), when the person asked for that one
     /// (`weft activate --port`): another program holding it is an error.
@@ -212,59 +239,26 @@ pub struct ActivateRequest {
     pub port: Option<u16>,
 }
 
-/// What an activate points the project at: the hashes of the version
-/// that built (absent when activating by id, which keeps the recorded
-/// ones) and the answer to "what about the state a hibernated or parked
-/// project kept".
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ActivationTarget {
-    #[serde(flatten)]
-    pub build: crate::builds::BuildHashes,
-    /// Absent is [`ReactivateChoice::ExecuteParkedKeepSuspended`].
-    #[serde(default, rename = "reactivateChoice", skip_serializing_if = "Option::is_none")]
-    pub reactivate_choice: Option<ReactivateChoice>,
-}
-
-crate::wire_enum! {
-    /// What an activate does with the state a deactivate kept (parked fires
-    /// and suspended runs). Matters only when there is some; otherwise the
-    /// activate is a fresh start whatever the choice.
-    #[derive(Default)]
-    pub enum ReactivateChoice {
-        /// Replay every parked fire; suspended runs keep waiting.
-        #[default]
-        ExecuteParkedKeepSuspended = "execute_parked_keep_suspended",
-        /// Drop the parked fires; suspended runs keep waiting.
-        KeepSuspendedOnly = "keep_suspended_only",
-        /// Drop every signal and cancel the runs these triggers fired: a
-        /// fresh start, as after a `wipe` deactivate.
-        WipeAll = "wipe_all",
-    }
-}
-
-/// The `--reactivate-choice` flag's parse: a word nobody spells is
-/// refused naming the ones that exist.
-impl std::str::FromStr for ReactivateChoice {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        Self::parse(s).ok_or_else(|| format!("unknown reactivate choice '{s}'; must be one of: {}", Self::accepted()))
-    }
-}
-
-/// `POST /projects/{id}/bake`: which triggers to prepare, and what
-/// happens to a worker built from an older image first.
+/// `POST /projects/{id}/bake`: which triggers to prepare.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BakeRequest {
-    #[serde(flatten)]
-    pub running: RunningChoice,
     #[serde(default)]
     pub scope: ActivationScope,
 }
 
-/// What an activate answers.
+/// What an activate answers: what it turned on, what it did with what
+/// they held, and where their routes answer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivateResponse {
+    /// The triggers it turned on, by owner. Empty when every one named was
+    /// on already: nothing to turn on, which is no error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turned_on: Vec<OwnerTriggers>,
+    /// What those triggers held while they were down, and whether it is
+    /// released (paced) or dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<HeldReleased>,
     pub urls: Vec<ActivationUrl>,
     /// The program's shared infra that is not running, and how to start
     /// it. Activating starts only what a trigger reads (and refuses when
@@ -288,6 +282,15 @@ pub struct ActivateResponse {
     pub broken: Vec<crate::project::Broken>,
 }
 
+/// What an activate did with the work its triggers held: how much there
+/// was, and the answer it acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldReleased {
+    pub held: crate::projects::HeldWork,
+    pub release: ReleaseHeld,
+}
+
 /// One address a listener answers on, for the trigger at `node_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -296,19 +299,32 @@ pub struct ActivationUrl {
     pub url: String,
 }
 
-/// What a resync answers: the listener URLs its reactivations minted,
-/// and whose triggers it brought up to date, in the order it did them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResyncResponse {
-    pub urls: Vec<ActivationUrl>,
-    pub resynced: Vec<Owner>,
-}
-
 /// One owner's triggers, by name.
+// SYNC: OwnerTriggers <-> packages/weft-graph/src/protocol.ts OwnerTriggers
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerTriggers {
     pub owner: Owner,
     pub triggers: Vec<String>,
+}
+
+impl OwnerTriggers {
+    /// The triggers as a person reads them: `'door', 'feed'` for the
+    /// program's own, `'inbox' of instance 'ada'` for an instance's.
+    // SYNC: OwnerTriggers::words <-> packages/weft-graph/src/protocol.ts describeOwnerTriggers
+    pub fn words(&self) -> String {
+        let names = self.triggers.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ");
+        match &self.owner {
+            Owner::Shared => names,
+            Owner::Instance(instance) => format!("{names} of instance '{instance}'"),
+        }
+    }
+
+    /// Several owners' triggers as a person reads them: each owner's
+    /// [`Self::words`], apart with `; `.
+    // SYNC: OwnerTriggers::list_words <-> packages/weft-graph/src/protocol.ts describeOwnerTriggers
+    pub fn list_words(owned: &[OwnerTriggers]) -> String {
+        owned.iter().map(OwnerTriggers::words).collect::<Vec<_>>().join("; ")
+    }
 }
 
 /// What `POST /projects/{id}/cancel-activate` answers.
@@ -327,31 +343,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_activate_flattens_its_target_and_running_choice() {
+    fn an_activate_flattens_its_build_and_names_what_to_do_with_held_work() {
         let body = ActivateRequest {
-            target: ActivationTarget {
-                build: crate::builds::BuildHashes { binary_hash: Some("b".into()), ..Default::default() },
-                reactivate_choice: Some(ReactivateChoice::WipeAll),
-            },
-            running: RunningChoice { running_policy: Some(crate::RunningPolicy::Wait), drain_timeout_secs: Some(9) },
-            scope: ActivationScope::default(),
-            port: None,
+            build: crate::builds::BuildHashes { binary_hash: Some("b".into()), ..Default::default() },
+            held: ReleaseHeld::Drop,
+            ..Default::default()
         };
         let wire = serde_json::to_value(&body).unwrap();
         assert_eq!(wire["binaryHash"], "b");
-        assert_eq!(wire["reactivateChoice"], "wipe_all");
-        assert_eq!(wire["runningPolicy"], "wait");
-        assert_eq!(wire["drainTimeoutSecs"], 9);
+        assert_eq!(wire["held"], "drop");
         assert!(wire.get("definitionHash").is_none(), "an unnamed hash stays off the wire: {wire}");
-        let back: ActivateRequest = serde_json::from_value(wire).unwrap();
-        assert_eq!(back.target.reactivate_choice, Some(ReactivateChoice::WipeAll));
-    }
-
-    crate::wire_enum_roundtrip_tests!(ReactivateChoice);
-
-    #[test]
-    fn an_unknown_reactivate_choice_is_refused_naming_the_real_ones() {
-        assert!("keep".parse::<ReactivateChoice>().unwrap_err().contains("wipe_all"));
+        let back: ActivateRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(back.held, ReleaseHeld::Run, "held work runs unless the request says drop");
     }
 
     #[test]
@@ -360,21 +363,24 @@ mod tests {
             (ActivationMode::Registered, "registered"),
             (ActivationMode::Activating, "activating"),
             (ActivationMode::Active, "active"),
-            (ActivationMode::Deactivating, "deactivating"),
-            (ActivationMode::Down(DeactivationMode::Wipe), "wipe"),
-            (ActivationMode::Down(DeactivationMode::Hibernate), "hibernate"),
-            (ActivationMode::Down(DeactivationMode::Park), "park"),
+            (ActivationMode::Down(Door::Take), "take"),
+            (ActivationMode::Down(Door::Hide), "hide"),
+            (ActivationMode::Down(Door::Refuse), "refuse"),
         ];
         for (mode, word) in words {
             assert_eq!(serde_json::to_value(mode).unwrap(), serde_json::json!(word));
             assert_eq!(mode.as_str(), word);
             assert_eq!(serde_json::from_value::<ActivationMode>(serde_json::json!(word)).unwrap(), mode);
         }
-        assert!(serde_json::from_value::<ActivationMode>(serde_json::json!("asleep")).is_err());
+        assert!(serde_json::from_value::<ActivationMode>(serde_json::json!("park")).is_err());
     }
 
     fn instance(id: &str) -> Owner {
         Owner::Instance(InstanceId::new(id).unwrap())
+    }
+
+    fn ids(ids: &[&str]) -> Vec<InstanceId> {
+        ids.iter().map(|id| InstanceId::new(*id).unwrap()).collect()
     }
 
     fn project() -> ProjectDefinition {
@@ -390,20 +396,54 @@ mod tests {
         .unwrap()
     }
 
+    /// No flag is the shared triggers only; named instances get their
+    /// per-instance ones, and every instance weft knows for "all".
     #[test]
-    fn every_trigger_of_the_owner_kind() {
-        let shared = ActivationScope::shared().resolve(&project()).unwrap();
+    fn every_trigger_of_each_owner_named() {
+        let known = ids(&["b", "a"]);
+        let shared = ActivationScope::shared().resolve(&project(), &known).unwrap();
         assert_eq!(shared, vec![ActivationKey::new("cron", Owner::Shared)]);
-        let scope = ActivationScope { instance: Some(InstanceId::new("m").unwrap()), ..Default::default() };
-        assert_eq!(scope.resolve(&project()).unwrap(), vec![ActivationKey::new("receive", instance("m"))]);
+        let named = ActivationScope { instances: InstanceTarget::named(ids(&["m"])), ..Default::default() };
+        assert_eq!(named.resolve(&project(), &known).unwrap(), vec![ActivationKey::new("receive", instance("m"))]);
+        let all = ActivationScope { instances: InstanceTarget::EveryInstance, ..Default::default() };
+        assert_eq!(
+            all.resolve(&project(), &known).unwrap(),
+            vec![ActivationKey::new("receive", instance("a")), ActivationKey::new("receive", instance("b"))]
+        );
+    }
+
+    /// `--all` is every shared trigger for the program and every
+    /// per-instance one for each instance; a trigger named beside it reaches
+    /// the owners of its kind, shared or per instance.
+    #[test]
+    fn all_names_each_trigger_for_the_owners_of_its_kind() {
+        let known = ids(&["b", "a"]);
+        let everything = ActivationScope { instances: InstanceTarget::Everything, ..Default::default() };
+        assert_eq!(
+            everything.resolve(&project(), &known).unwrap(),
+            vec![
+                ActivationKey::new("cron", Owner::Shared),
+                ActivationKey::new("receive", instance("a")),
+                ActivationKey::new("receive", instance("b")),
+            ]
+        );
+        let shared = ActivationScope { triggers: vec!["cron".into()], instances: InstanceTarget::Everything };
+        assert_eq!(shared.resolve(&project(), &known).unwrap(), vec![ActivationKey::new("cron", Owner::Shared)]);
+        let per_instance = ActivationScope { triggers: vec!["receive".into()], instances: InstanceTarget::Everything };
+        assert_eq!(
+            per_instance.resolve(&project(), &known).unwrap(),
+            vec![ActivationKey::new("receive", instance("a")), ActivationKey::new("receive", instance("b"))]
+        );
+        let none: [InstanceId; 0] = [];
+        assert_eq!(everything.resolve(&project(), &none).unwrap(), vec![ActivationKey::new("cron", Owner::Shared)], "no instance yet");
     }
 
     #[test]
     fn a_plain_activation_names_the_per_instance_triggers_it_leaves_off() {
         assert_eq!(ActivationScope::shared().per_instance_left_out(&project()), vec!["receive".to_string()]);
-        let scope = ActivationScope { instance: Some(InstanceId::new("m").unwrap()), ..Default::default() };
+        let scope = ActivationScope { instances: InstanceTarget::EveryInstance, ..Default::default() };
         assert!(scope.per_instance_left_out(&project()).is_empty(), "an instance's activation leaves nothing off");
-        let named = ActivationScope { triggers: vec!["cron".into()], instance: None };
+        let named = ActivationScope { triggers: vec!["cron".into()], ..Default::default() };
         assert!(named.per_instance_left_out(&project()).is_empty(), "named triggers are exactly what was asked");
     }
 
@@ -417,19 +457,37 @@ mod tests {
         ];
         assert_eq!(owners_of(&live), vec![Owner::Shared, instance("a"), instance("b")]);
         assert!(owners_of(&[]).is_empty());
+        assert_eq!(
+            by_owner(&live),
+            vec![
+                OwnerTriggers { owner: Owner::Shared, triggers: vec!["cron".into()] },
+                OwnerTriggers { owner: instance("a"), triggers: vec!["receive".into()] },
+                OwnerTriggers { owner: instance("b"), triggers: vec!["receive".into(), "other".into()] },
+            ]
+        );
     }
 
     #[test]
     fn a_named_trigger_must_fit_the_owner() {
-        let err = ActivationScope { triggers: vec!["receive".into()], instance: None }.resolve(&project()).unwrap_err();
-        assert!(err.contains("name the instance"), "{err}");
-        let err = ActivationScope { triggers: vec!["cron".into()], instance: Some(InstanceId::new("m").unwrap()) }
-            .resolve(&project())
+        let none: [InstanceId; 0] = [];
+        let err = ActivationScope { triggers: vec!["receive".into()], ..Default::default() }.resolve(&project(), &none).unwrap_err();
+        assert!(err.contains("--all-instances"), "{err}");
+        let err = ActivationScope { triggers: vec!["cron".into()], instances: InstanceTarget::named(ids(&["m"])) }
+            .resolve(&project(), &none)
             .unwrap_err();
         assert!(err.contains("name no instance"), "{err}");
-        let err = ActivationScope { triggers: vec!["plain".into()], instance: None }.resolve(&project()).unwrap_err();
+        let err = ActivationScope { triggers: vec!["plain".into()], ..Default::default() }.resolve(&project(), &none).unwrap_err();
         assert!(err.contains("not a trigger"), "{err}");
-        let one = ActivationScope { triggers: vec!["cron".into()], instance: None }.resolve(&project()).unwrap();
+        let one = ActivationScope { triggers: vec!["cron".into()], ..Default::default() }.resolve(&project(), &none).unwrap();
         assert_eq!(one, vec![ActivationKey::new("cron", Owner::Shared)]);
+    }
+
+    #[test]
+    fn a_scope_admits_the_keys_of_the_owners_and_triggers_it_names() {
+        let scope = ActivationScope { triggers: vec!["receive".into()], instances: InstanceTarget::EveryInstance };
+        assert!(scope.admits(&ActivationKey::new("receive", instance("z"))));
+        assert!(!scope.admits(&ActivationKey::new("other", instance("z"))));
+        assert!(!scope.admits(&ActivationKey::new("receive", Owner::Shared)));
+        assert!(ActivationScope::shared().admits(&ActivationKey::new("cron", Owner::Shared)));
     }
 }

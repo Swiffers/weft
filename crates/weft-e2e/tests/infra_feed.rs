@@ -31,7 +31,7 @@ async fn a_trigger_listens_to_the_programs_own_infra() -> anyhow::Result<()> {
     let value = settled.input_of("out").and_then(|i| i.get("data").cloned());
     anyhow::ensure!(value.as_ref().is_some_and(|v| v.as_u64().is_some()), "a tick's value reached Debug, got {value:?}");
 
-    project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
+    project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     infra::terminate_and_wait_gone(&project, "svc").await?;
     project.finish().await
 }

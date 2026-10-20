@@ -398,6 +398,17 @@ impl DispatcherClient {
         Ok(Some(self.answer(resp).await?))
     }
 
+    /// POST answering JSON, `None` when the install says the resource is
+    /// gone (a 404 carrying the `x-weft-not-found` marker): for a step of a
+    /// removal, whose retry after a finished one must land on success.
+    pub async fn post_idempotent_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<Option<serde_json::Value>> {
+        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && resp.headers().contains_key("x-weft-not-found") {
+            return Ok(None);
+        }
+        Ok(Some(self.answer(resp).await?))
+    }
+
     pub async fn post_empty(&self, path: &str) -> anyhow::Result<()> {
         let resp = self.send(reqwest::Method::POST, path, None).await?;
         self.check(resp).await?;
@@ -421,26 +432,6 @@ impl DispatcherClient {
     pub async fn delete_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
         let resp = self.send(reqwest::Method::DELETE, path, None).await?;
         self.answer(resp).await
-    }
-
-    /// POST with a JSON body, returning JSON, or `Ok(Err(refusal))` when
-    /// the dispatcher asks for the person's trigger-deactivation choice
-    /// (a 428 carrying `TRIGGER_CHOICE_REQUIRED_HEADER`; the other 428,
-    /// infra that is not running, stays an error), so the caller can ask
-    /// for the choice or pass the refusal on. Every other failure is
-    /// `check`'s.
-    pub async fn post_json_or_choice_needed(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-    ) -> anyhow::Result<Result<serde_json::Value, String>> {
-        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
-        if resp.status() == reqwest::StatusCode::PRECONDITION_REQUIRED
-            && resp.headers().contains_key(weft_core::TRIGGER_CHOICE_REQUIRED_HEADER)
-        {
-            return Ok(Err(self.text(resp).await?.trim().to_string()));
-        }
-        Ok(Ok(self.answer(resp).await?))
     }
 
     /// POST with a JSON body, handing back the status and the body

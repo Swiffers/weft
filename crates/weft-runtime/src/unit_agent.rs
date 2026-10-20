@@ -294,7 +294,7 @@ const ASK_TRIES: u32 = 3;
 pub async fn host() -> anyhow::Result<()> {
     use weft_platform_gcp::infra_host::{AGENT_IMAGE_ENV, MD_CORE_ACCOUNT, MD_GCP_PROJECT, MD_GPU};
     use weft_platform_local::{DiskBacking, GpuAccess, LocalInfraHostConfig, Publish};
-    use weft_platform_traits::unit_agent::{HOST_APPLY, HOST_LOGS, HOST_OBSERVE, HOST_RESTART};
+    use weft_platform_traits::unit_agent::{HOST_APPLY, HOST_LOGS, HOST_OBSERVE};
 
     // The Docker CLI this process runs reads its login from here.
     std::env::set_var("DOCKER_CONFIG", Path::new(HOST_STATE).join("docker"));
@@ -370,14 +370,6 @@ pub async fn host() -> anyhow::Result<()> {
             move || async move {
                 host.apply_in_background();
                 axum::http::StatusCode::ACCEPTED
-            }
-        }))
-        .route(HOST_RESTART, post({
-            let host = host.clone();
-            move || async move {
-                use weft_platform_traits::InfraHost as _;
-                let a = Host::assignment().await.map_err(err)?;
-                host.local.restart_unit(&a.node.node, &a.unit).await.map_err(err)
             }
         }))
         .route(HOST_OBSERVE, axum::routing::get({

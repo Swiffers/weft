@@ -75,12 +75,6 @@ describe('a project in the middle of something', () => {
 		expect(isVerbOffered('run', stopped)).toBe(false);
 	});
 
-	it('offers no starter verb while it drains', () => {
-		const i = inputs({ available: ['cancel_running'], status: 'deactivating', hasTriggers: true });
-		expect(isVerbOffered('run', i)).toBe(false);
-		expect(isVerbOffered('activate', i)).toBe(false);
-	});
-
 	it('offers no starter verb in the window the rollup cannot see', () => {
 		// `infraBusy` exists for exactly this: a claimed stop still
 		// draining reads as `stopped`, and Start Infra would only 409.
@@ -132,7 +126,6 @@ describe('a project the dispatcher has never registered', () => {
 
 	it('is offered no trigger verb when the source has no trigger', () => {
 		expect(isVerbOffered('activate', inputs())).toBe(false);
-		expect(isVerbOffered('reactivate', inputs())).toBe(false);
 	});
 });
 
@@ -161,15 +154,13 @@ describe('a registration older than the source', () => {
 });
 
 describe('an active project', () => {
-	// Every trigger on: the source has triggers, but nothing is left to
-	// turn on, so no second button (the bug was "Reactivate the rest"
-	// on every active project, which `activate` then refused).
-	it('offers no activate of its own, and reactivate only from the table', () => {
+	// Turning on what is on already does nothing, so activate stays
+	// offered while triggers are on: it turns on the rest, a trigger
+	// written since the last activate included.
+	it('still offers activate, for the triggers that are off', () => {
 		const on = inputs({ available: ['deactivate'], status: 'active', hasTriggers: true });
-		expect(isVerbOffered('activate', on)).toBe(false);
-		expect(isVerbOffered('reactivate', on)).toBe(false);
-		const partly = inputs({ available: ['deactivate', 'reactivate'], status: 'active', hasTriggers: true });
-		expect(isVerbOffered('reactivate', partly)).toBe(true);
+		expect(isVerbOffered('activate', on)).toBe(true);
+		expect(isVerbOffered('deactivate', on)).toBe(true);
 	});
 });
 

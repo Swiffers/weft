@@ -42,55 +42,6 @@ use super::Ctx;
 use crate::client::DispatcherClient;
 use crate::progress::Progress;
 
-/// User's local choice for how to handle in-flight Fire runs
-/// when a `run` lands with a stale binary or a `deactivate` lands with
-/// running runs. The type lives in weft-core (one definition shared
-/// with the broker/dispatcher wire protocol); re-exported here so
-/// every CLI verb keeps importing it from the gate that consumes it.
-pub use weft_core::{RunningChoice, RunningPolicy};
-
-/// Parse an optional `--running-policy` CLI flag value, mapping an
-/// unrecognized value to a uniform error. `None` stays `None` (the
-/// verb prompts or defaults). One parser for every verb's
-/// `--running-policy` so the accepted set can't drift.
-pub fn parse_running_policy_flag(flag: Option<&str>) -> Result<Option<RunningPolicy>> {
-    match flag {
-        None => Ok(None),
-        Some(s) => RunningPolicy::parse(&s.to_ascii_lowercase())
-            .map(Some)
-            .ok_or_else(|| {
-                anyhow::anyhow!("invalid --running-policy '{s}'; expected 'wait' or 'cancel'")
-            }),
-    }
-}
-
-/// The running-policy answer a verb puts on the wire: the flag parsed
-/// (cancel unless it says wait) and the drain cap, which only ever
-/// rides a wait. A `--drain-timeout` beside cancel is refused rather
-/// than dropped: it would bound nothing, and a flag that changes
-/// nothing is one the person believes did. One reading for every verb
-/// that takes the pair (`activate`, `deactivate`, `resync`, the infra
-/// verbs), so they cannot disagree about what the cap means.
-pub fn parse_running_choice(
-    policy: Option<&str>,
-    drain_timeout: Option<u64>,
-) -> Result<(RunningPolicy, Option<u64>)> {
-    let policy = parse_running_policy_flag(policy)?.unwrap_or_default();
-    if policy == RunningPolicy::Cancel && drain_timeout.is_some() {
-        anyhow::bail!(
-            "--drain-timeout bounds a wait, and the running policy is cancel (the default); \
-             pass `--running-policy wait` with it, or drop it"
-        );
-    }
-    Ok((policy, drain_timeout))
-}
-
-/// The running-work answer as every verb sends it: the policy always
-/// (so the wire never guesses), the cap when one was given.
-pub fn running_choice(policy: RunningPolicy, drain_timeout: Option<u64>) -> RunningChoice {
-    RunningChoice { running_policy: Some(policy), drain_timeout_secs: drain_timeout }
-}
-
 pub struct ProjectHandle {
     pub id: String,
     pub name: String,
@@ -125,12 +76,6 @@ impl ProjectHandle {
     }
     pub fn definition_hash(&self) -> &str {
         &self.built.definition_hash
-    }
-
-    /// This build as an activate names it (no reactivate choice: the
-    /// caller sets one when it has one).
-    pub fn activation_target(&self) -> weft_core::activation::ActivationTarget {
-        weft_core::activation::ActivationTarget { build: self.built.named(), reactivate_choice: None }
     }
 
     /// Say every part of the build that does not compile, once the command
@@ -343,7 +288,7 @@ async fn follow_version(
 /// requests this is read on (asking for the build, which joins the one
 /// already asked for, and reading where it is) are safe to send again. The
 /// error itself when anything else answered.
-fn look_again_after(e: anyhow::Error) -> Result<String> {
+pub(crate) fn look_again_after(e: anyhow::Error) -> Result<String> {
     use reqwest::StatusCode;
     let busy = crate::client::refusal(&e).is_some_and(|refused| {
         matches!(refused.status(), StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT)

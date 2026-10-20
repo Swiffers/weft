@@ -2,6 +2,7 @@
 //! for every platform.
 //!
 //! - `types`: the spec a node's `provision_infra` returns.
+//! - `health`: the health rules a spec carries, and the built-in ones.
 //! - `resolve`: check a spec and resolve its images, pure, one hash per
 //!   unit (what an apply compares to decide what to replace).
 //! - `status`: the lifecycle state of one infra node copy.
@@ -16,6 +17,7 @@
 pub mod action;
 pub mod bake;
 mod handle;
+pub mod health;
 mod install;
 pub mod resolve;
 pub mod run_gate;

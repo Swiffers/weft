@@ -231,6 +231,7 @@ pub(crate) async fn drain_token(state: &DispatcherState, token: &str, due: Due) 
             caller: head.waiting.caller.clone(),
             held_by: None,
             attempts: head.waiting.attempts,
+            released: true,
         };
         let landed = crate::api::signal::fire_entry(state, &routing, fire).await;
         let now = crate::lease::now_unix();

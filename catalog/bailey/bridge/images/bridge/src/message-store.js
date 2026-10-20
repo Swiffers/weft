@@ -326,7 +326,7 @@ export class MessageStore {
 // Both files live on the bridge's own volume, which no weft command
 // edits file by file; the way to start again is to drop that volume.
 const START_AGAIN =
-  'to start again, run `weft infra node-terminate <this bridge node>` (it deletes the bridge volume: this ' +
+  'to start again, run `weft infra terminate --infra <this bridge node>` (it deletes the bridge volume: this ' +
   'history, the seen ids and the WhatsApp login, so you pair the phone again) and then `weft infra start`';
 
 export function toNumber(ts) {

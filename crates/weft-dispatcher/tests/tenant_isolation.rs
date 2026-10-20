@@ -35,7 +35,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
 
 async fn register(store: &FakeProjectStore, id: Uuid, name: &str, tenant: &str) {
     store
-        .register_with_hashes(definition(id), name, "", tenant, None, None, None, None, None, None, None)
+        .register_with_hashes(definition(id), name, "", tenant, None, None, None, None, None, None, None, None)
         .await
         .expect("register");
 }
@@ -84,7 +84,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
     register(&store, shared_id, "a-owned", TENANT_A).await;
 
     let takeover = store
-        .register_with_hashes(definition(shared_id), "b-grab", "", TENANT_B, None, None, None, None, None, None, None)
+        .register_with_hashes(definition(shared_id), "b-grab", "", TENANT_B, None, None, None, None, None, None, None, None)
         .await;
     assert!(takeover.is_err(), "cross-tenant re-register must be refused");
     assert_eq!(
@@ -95,7 +95,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
 
     // The owner CAN re-register its own project (idempotent update).
     store
-        .register_with_hashes(definition(shared_id), "a-owned-v2", "", TENANT_A, None, None, None, None, None, None, None)
+        .register_with_hashes(definition(shared_id), "a-owned-v2", "", TENANT_A, None, None, None, None, None, None, None, None)
         .await
         .expect("owner re-register allowed");
 }
@@ -225,7 +225,7 @@ async fn removing_a_project_takes_its_recorded_programs() {
     let project = Uuid::new_v4();
     register(&store, project, "doomed", TENANT_A).await;
     store
-        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("ran"), None, None, None, None, None)
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("ran"), None, None, None, None, None, None)
         .await
         .expect("record a version");
     assert!(store.definition_for_hash(project, "ran").await.unwrap().is_some());
@@ -250,7 +250,7 @@ async fn a_project_being_removed_says_so_and_takes_no_registration() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
     assert_eq!(message, weft_core::projects::PROJECT_BEING_REMOVED);
     let registered = store
-        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("late"), None, None, None, None, None)
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("late"), None, None, None, None, None, None)
         .await
         .expect_err("a registration over a project being removed is refused");
     assert!(weft_dispatcher::project_store::ProjectRemoving::is(&registered), "{registered:#}");

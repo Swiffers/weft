@@ -36,9 +36,75 @@ pub struct RunArgs {
     pub root: bool,
     pub flags: RunFlags,
     pub save: Option<String>,
+    /// `--check`: only say whether the run could start ([`RunCheck`]).
+    pub check: bool,
+}
+
+/// What `weft run --check --json` prints: whether the run could start,
+/// and when not, the refusal the run itself would give. The editor reads
+/// it to disable its Run button with the reason.
+// SYNC: RunCheck <-> packages/weft-graph/src/protocol.ts RunCheck
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RunCheck {
+    pub ok: bool,
+    /// Why it could not start; absent when it could.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+impl RunCheck {
+    fn of(checked: anyhow::Result<()>) -> Self {
+        match checked {
+            Ok(()) => Self { ok: true, refusal: None },
+            Err(why) => Self { ok: false, refusal: Some(format!("{why:#}")) },
+        }
+    }
+}
+
+/// `weft run --check`: compile the program and resolve the run the flags
+/// (or the example) describe, the way a run is refused before it starts,
+/// and say whether it could. Nothing is built, registered or uploaded;
+/// whatever stops the check (the program not compiling, a value that
+/// cannot be read) is the refusal, so `--json` always prints its one
+/// line.
+async fn check(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<std::process::ExitCode> {
+    let checked = RunCheck::of(could_start(ctx, args).await);
+    if ctx.json_out(&checked)? {
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    match &checked.refusal {
+        None => {
+            println!("the run can start");
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Some(refusal) => {
+            eprintln!("{refusal}");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+    }
+}
+
+/// [`check`]'s work: why the run could not start, if it could not. A
+/// program that does not compile cannot run either; its diagnostics go to
+/// stderr, never into the one line a `--json` reader parses.
+async fn could_start(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<()> {
+    seed_bounds_need_a_seed(args)?;
+    // One snapshot, as a run takes it: the example and the program it
+    // reads are the ones a run started now would.
+    let snapshot = super::snapshot::Snapshot::take(&ctx.project()?.root)?;
+    let mut spec = spec_for(ctx, args, &snapshot.then_disk())?;
+    let compiled = super::ensure::compile_snapshot(&crate::progress::Progress::new(ActionVerb::Run, false), snapshot)?;
+    if let Some(spec) = &mut spec {
+        let (client, _, _) = super::resolve_project(ctx)?;
+        super::assets::resolve_run_values(&client, &compiled.files(), spec, false).await?;
+    }
+    validate_run(&compiled.definition, spec.as_ref(), args)
 }
 
 pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
+    if args.check {
+        return check(&ctx, &args).await;
+    }
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Run, |progress| async move {
         run_inner(&ctx_inner, &progress, args).await
@@ -64,10 +130,17 @@ fn spec_for(ctx: &Ctx, args: &RunArgs, files: &super::snapshot::SnapshotFirst<'_
     }
 }
 
-async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
+/// `--seed-until` and `--seed-before` bound a seed: without `--seed`
+/// they are refused before anything is read or saved.
+fn seed_bounds_need_a_seed(args: &RunArgs) -> anyhow::Result<()> {
     if (!args.seed_until.is_empty() || !args.seed_before.is_empty()) && args.seed.is_none() {
         bail!("--seed-until and --seed-before need --seed");
     }
+    Ok(())
+}
+
+async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArgs) -> anyhow::Result<std::process::ExitCode> {
+    seed_bounds_need_a_seed(&args)?;
     let seed_run = match args.seed.as_deref() {
         Some(run) if !run.is_empty() => Some(super::resolve_run_id(ctx, run).await?.parse().context("a resolved run id")?),
         _ => None,
@@ -98,7 +171,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     // keeps the markers, so an example reads its file afresh every run.
     if let Some(spec) = &mut spec {
         let (client, _, _) = super::resolve_project(ctx)?;
-        super::assets::resolve_run_values(&client, &compiled.files(), spec).await?;
+        super::assets::resolve_run_values(&client, &compiled.files(), spec, true).await?;
     }
     validate_run(&compiled.definition, spec.as_ref(), &args)?;
     let node_set = args.node_set.unwrap_or(weft_core::builds::NodeSet::Full);
@@ -228,6 +301,14 @@ mod tests {
             ran: ran.iter().map(|s| s.to_string()).collect(),
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn a_check_prints_ok_or_the_refusal() {
+        let ok = serde_json::to_value(super::RunCheck::of(Ok(()))).unwrap();
+        assert_eq!(ok, serde_json::json!({ "ok": true }));
+        let refused = serde_json::to_value(super::RunCheck::of(Err(anyhow::anyhow!("needs `door`")))).unwrap();
+        assert_eq!(refused, serde_json::json!({ "ok": false, "refusal": "needs `door`" }));
     }
 
     #[test]

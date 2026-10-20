@@ -35,7 +35,8 @@ pub async fn asset_resolutions(
     definition: &weft_core::project::ProjectDefinition,
     publish: bool,
 ) -> Result<AssetResolutions> {
-    let (map, key_refs, text_refs) = resolve_asset_map(client, files, definition, publish).await?;
+    let missing = if publish { Missing::Upload } else { Missing::Refuse };
+    let (map, key_refs, text_refs) = resolve_asset_map(client, files, definition, missing).await?;
     let source_refs = key_refs
         .into_iter()
         .chain(text_refs.into_iter().filter(weft_compiler::file_ref::is_runtime_key_ref))
@@ -80,7 +81,9 @@ pub async fn publish_references(
 /// the tenant's assets (or fetched, or looked up) and replaced by
 /// the value its declared type stands for. An uploaded file is not added
 /// to the project's published assets, so it lives on the store's own
-/// countdown, which every read of it pushes back.
+/// countdown, which every read of it pushes back. Without `upload` (a
+/// check that runs nothing), a file not stored yet stands for the value
+/// its upload would give it, and nothing is written to the install.
 ///
 /// `files` is the command's snapshot, then the disk: a value naming a
 /// project file gets the bytes the run's version holds.
@@ -88,11 +91,13 @@ pub async fn resolve_run_values(
     client: &DispatcherClient,
     files: &super::snapshot::SnapshotFirst<'_>,
     spec: &mut weft_core::run_spec::RunSpec,
+    upload: bool,
 ) -> Result<()> {
     let fs = weft_compiler::CompileFs::with_reader(files, Some(files.root()));
     weft_compiler::file_ref::resolve_file_markers(spec, &fs)
         .map_err(|errs| anyhow::anyhow!("a run value cannot be read:\n  {}", errs.join("\n  ")))?;
-    let (map, _, _) = resolve_asset_map(client, files, &*spec, true).await?;
+    let missing = if upload { Missing::Upload } else { Missing::Assume };
+    let (map, _, _) = resolve_asset_map(client, files, &*spec, missing).await?;
     weft_compiler::file_ref::apply_asset_resolutions(spec, &map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
     Ok(())
@@ -109,14 +114,13 @@ async fn resolve_asset_map(
     client: &DispatcherClient,
     files: &dyn weft_assets::AssetSource,
     target: &impl weft_compiler::file_ref::MarkedValues,
-    publish: bool,
+    missing: Missing,
 ) -> Result<(BTreeMap<String, serde_json::Value>, Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
     let refs = weft_compiler::file_ref::collect_asset_refs(target);
     let mut map = if refs.is_empty() {
         BTreeMap::new()
     } else {
-        let mut store = DispatcherStore::new(client);
-        store.publish = publish;
+        let store = DispatcherStore { missing, ..DispatcherStore::new(client) };
         weft_assets::sync_assets(&refs, files, &store).await.context("sync project assets")?
     };
     // Refs whose source is a RUNTIME STORAGE KEY (a stored file picked in the
@@ -270,12 +274,28 @@ impl AssetSource for DiskSource {
 /// presigned part URLs it returns (the same contract the editor's upload
 /// field drives).
 pub(crate) struct DispatcherStore<'a> {
-    publish: bool,
+    missing: Missing,
+    /// What the store answered an upload of each content it does not hold
+    /// is stored under, for [`Missing::Assume`].
+    unheld: std::sync::Mutex<BTreeMap<String, String>>,
     client: &'a DispatcherClient,
     /// For the presigned part PUTs (bucket-direct; not dispatcher traffic).
     http: reqwest::Client,
     /// Says on stderr how far the uploads have got, when set.
     told: Option<std::sync::Mutex<Uploads>>,
+}
+
+/// What a [`DispatcherStore`] does with content the store does not hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    /// Upload it.
+    Upload,
+    /// Refuse it, naming `weft bake`: a build that must not publish.
+    Refuse,
+    /// Answer the key its upload would store it under (the store says it,
+    /// `AssetsHeldResponse::unheld`), uploading nothing: a check that runs
+    /// nothing reads the value a run would.
+    Assume,
 }
 
 /// How far a publish's uploads have got, as last said.
@@ -292,7 +312,7 @@ const UPLOAD_TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(3)
 
 impl<'a> DispatcherStore<'a> {
     pub(crate) fn new(client: &'a DispatcherClient) -> Self {
-        Self { client, http: reqwest::Client::new(), publish: true, told: None }
+        Self { client, http: reqwest::Client::new(), missing: Missing::Upload, unheld: Default::default(), told: None }
     }
 
     /// [`Self::new`], saying on stderr how far its uploads have got.
@@ -339,13 +359,14 @@ impl AssetStore for DispatcherStore<'_> {
         // Each key must be the asset its hash names. Parsed through the one
         // key grammar and failed loud on anything else: an entry taken on
         // faith would skip uploading content the store does not hold.
-        for (hash, key) in &held.keys {
+        for (hash, key) in held.keys.iter().chain(&held.unheld) {
             let parsed = weft_core::storage::key::parse_key(key)
                 .map_err(|e| anyhow::anyhow!("the stored-contents answer holds a malformed key: {e}"))?;
             if parsed.scope != weft_core::storage::key::KeyScope::Asset || &parsed.id != hash {
                 bail!("the stored-contents answer names '{key}' for {hash}, which is not that content's asset");
             }
         }
+        self.unheld.lock().expect("unheld keys").extend(held.unheld);
         Ok(held.keys)
     }
 
@@ -357,7 +378,17 @@ impl AssetStore for DispatcherStore<'_> {
         size_bytes: u64,
         bytes: &mut (dyn Read + Send),
     ) -> Result<String> {
-        anyhow::ensure!(self.publish, "asset '{filename}' is not stored in your account's assets yet; run `weft bake` to publish the current files and capture trigger settings");
+        match self.missing {
+            Missing::Upload => {}
+            Missing::Refuse => bail!(
+                "asset '{filename}' is not stored in your account's assets yet; run `weft bake` to publish the current files and capture trigger settings"
+            ),
+            Missing::Assume => {
+                return self.unheld.lock().expect("unheld keys").get(hash).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("the store named no key for '{filename}' ({hash}), which it neither holds nor would store")
+                });
+            }
+        }
         // NOT wrapped in a Ctrl-C handler, and that is deliberate.
         //
         // Cancelling the upload on an interrupt looks right and costs too

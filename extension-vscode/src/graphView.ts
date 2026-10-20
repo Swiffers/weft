@@ -18,7 +18,8 @@ import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, CatalogWarning, DeactivationSpec, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, TriggerChoiceIntent, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, CatalogWarning, EditOp, ErrorVerb, FollowMode, HostMessage, InstallView, LifecycleAction, LiveDataItem, NodeFeedState, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import { lifecycleCommand } from '../../packages/weft-graph/src/lifecycle-cli';
 import { addressOf, exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
@@ -112,7 +113,10 @@ export class GraphViewController {
   /// while it was in flight (see triggerParse).
   private parseSeq = 0;
   // Host-side callbacks wired by extension.ts.
-  private runHandler: ((targets: string[]) => void) | undefined;
+  private runHandler: ((targets: [string, ...string[]]) => void) | undefined;
+  /// Whether a run of these targets would start (`weft run --check`):
+  /// the walk's refusal, or `null`.
+  private runCheckHandler: ((targets: [string, ...string[]]) => Promise<string | null>) | undefined;
   /// Told the group the user stands in (an include's alias chain, or
   /// null at the top level) on every navigation, so the Runs view
   /// marks the runs scoped to it.
@@ -126,15 +130,11 @@ export class GraphViewController {
   /// User dismissed the action-bar error banner. Extension.ts
   /// clears the slot's `error` field via `actionBar.clearError`.
   private dismissErrorHandler: (() => void) | undefined;
-  /// Architecture-4: every action-bar verb (activate, deactivate,
+  /// Architecture-4: every lifecycle verb (activate, deactivate,
   /// resync, infra start/stop/terminate/upgrade) shells out to the
   /// CLI. Extension.ts installs this; graphView calls it with the
   /// verb name + arg list.
-  /// Resolves to a picker intent when the dispatcher asked how the
-  /// triggers come down (see `triggerChoice.ts`).
-  private cliVerbHandler:
-    | ((verb: string, args: string[]) => Promise<TriggerChoiceIntent | undefined>)
-    | undefined;
+  private cliVerbHandler: ((verb: string, args: string[]) => Promise<void>) | undefined;
   /// Runs `weft status --json` and pushes drift bits + available
   /// actions into the action-bar state machine. Used on graph
   /// open + after every action + on file-change debounce + on
@@ -226,7 +226,8 @@ export class GraphViewController {
 
   /** Called by extension.ts so sidebar-initiated runs and action-bar
    *  clicks route through the same business logic. */
-  setRunHandler(fn: (targets: string[]) => void): void { this.runHandler = fn; }
+  setRunHandler(fn: (targets: [string, ...string[]]) => void): void { this.runHandler = fn; }
+  setRunCheckHandler(fn: (targets: [string, ...string[]]) => Promise<string | null>): void { this.runCheckHandler = fn; }
   setNavHandler(fn: (focusedGroup: string | null) => void): void { this.navHandler = fn; }
 
   /** Tell the graph which version the followed run ran and which one
@@ -320,9 +321,7 @@ export class GraphViewController {
   /// extension.ts via this handler, which shells out to the CLI.
   /// The CLI handles build, hash-skip, registry push, dispatcher
   /// call, and any user prompts.
-  setCliVerbHandler(
-    fn: (verb: string, args: string[]) => Promise<TriggerChoiceIntent | undefined>,
-  ): void {
+  setCliVerbHandler(fn: (verb: string, args: string[]) => Promise<void>): void {
     this.cliVerbHandler = fn;
   }
   setReadyHandler(fn: () => void): void {
@@ -1190,79 +1189,44 @@ export class GraphViewController {
     }
   }
 
-  /// CLI flags for a trigger-deactivation spec chosen in the SHARED
-  /// webview picker (`DeactivationPicker`). The picker owns the UX +
-  /// business rules (wipe forces cancel, grace only for hibernate,
-  /// drain cap only with wait); this host just translates the spec
-  /// into `weft` flags.
-  private deactivationFlags(spec: DeactivationSpec): string[] {
-    const args = ['--mode', spec.mode, '--running-policy', spec.runningPolicy];
-    if (spec.mode === 'hibernate' && spec.graceMinutes !== undefined) {
-      args.push('--grace', String(spec.graceMinutes));
+  /// A lifecycle verb from the contextual bar, as the CLI's verb and
+  /// flags. Terminate deletes every resource, stored data included unless
+  /// the node keeps it, so it is confirmed first; the CLI is then told it
+  /// was.
+  private async runLifecycle(action: LifecycleAction): Promise<void> {
+    const { verb, args } = lifecycleCommand(action);
+    if (action.verb === 'infra_terminate') {
+      const confirm = await vscode.window.showWarningMessage(
+        `Terminate ${action.infra.join(', ')}? Every resource is deleted, stored data included unless the node keeps it.`,
+        { modal: true },
+        'Terminate',
+      );
+      if (confirm !== 'Terminate') return;
+      args.push('--yes');
     }
-    if (spec.drainTimeoutSecs !== undefined) {
-      args.push('--drain-timeout', String(spec.drainTimeoutSecs));
+    void this.dispatchVerb(verb, args);
+  }
+
+  /// Whether a run of `targets` would start, answering the contextual
+  /// bar's `checkRun`.
+  private async checkRun(requestId: number, targets: [string, ...string[]]): Promise<void> {
+    let refusal: string | null;
+    if (!this.runCheckHandler) {
+      refusal = 'no project is pinned, so there is nothing to run';
+    } else {
+      try {
+        refusal = await this.runCheckHandler(targets);
+      } catch (err) {
+        refusal = err instanceof Error ? err.message : String(err);
+      }
     }
-    return args;
+    void this.panel?.webview.postMessage({ kind: 'runChecked', requestId, refusal } satisfies HostMessage);
   }
 
-  /// Per-node infra verb (stop / terminate) for partial-state
-  /// recovery from the graph context menu. `node` is the instance's
-  /// PLACE as a person spells it (`one.db`), which is what the CLI
-  /// verb takes. Confirms via QuickPick then dispatches the CLI verb,
-  /// which gives the action bar the usual cli_running overlay + spinner.
-  private async confirmAndDispatchPerNodeVerb(
-    node: string,
-    verb: 'stop' | 'terminate',
-  ): Promise<void> {
-    const confirm = await vscode.window.showQuickPick(
-      [
-        {
-          label: verb === 'stop' ? 'Stop this node' : 'Terminate this node',
-          detail:
-            verb === 'stop'
-              ? 'Scale ALL its units to 0 (PVCs preserved), even units that would normally stay up on stop (NoOp). Reversible via Start.'
-              : 'Delete all resources, including PVCs unless preserved by the spec.',
-          value: true,
-        },
-        { label: 'Cancel', detail: 'Abort the action.', value: false },
-      ],
-      { placeHolder: `Confirm per-node ${verb}`, ignoreFocusOut: true },
-    );
-    if (!confirm || !confirm.value) return;
-    // Per-node stop from the graph forces: the user explicitly picked
-    // one node to take down, so NoOp units come down too (otherwise a
-    // right-click stop on a NoOp-only node would silently do nothing).
-    // Terminate passes `--yes`: the quick pick above was the confirmation.
-    const args = verb === 'stop' ? ['node-stop', node, '--force'] : ['node-terminate', node, '--yes'];
-    void this.dispatchVerb('infra', args);
-  }
-
-  /// Cancel running while in `deactivating`. Shells out to
-  /// `weft cancel-running` so the architecture-4 rule "every action
-  /// bar verb goes through the CLI" stays uniform. The CLI POSTs
-  /// the dispatcher's `/cancel-running` endpoint; the drain watcher
-  /// CASes status to `inactive` once the running set empties.
-  /// The lifecycle target the original deactivate wrote stays in
-  /// place (mode/visibility/deadline are unchanged).
-  private async runCancelRunning(): Promise<void> {
-    void this.dispatchVerb('cancel-running', []);
-  }
-
-  /// Cancel an in-flight activate (status=Activating). Wipes
-  /// partial trigger registrations; CASes status Activating →
-  /// Inactive.
+  /// Cancel a trigger setup under way (or give up a resync that
+  /// stopped): the triggers it has not turned on stay off.
   private async runCancelActivate(): Promise<void> {
     void this.dispatchVerb('cancel-activate', []);
-  }
-
-  /// Resume Active during `deactivating`. Same activate verb as
-  /// the normal flow; the dispatcher's activate handler handles
-  /// the "rolling back from deactivating" case naturally (it just
-  /// flips lifecycle to active and runs the drain pass against
-  /// anything that parked during the transient).
-  private async runResumeActive(): Promise<void> {
-    void this.dispatchVerb('activate', []);
   }
 
   private async dispatchVerb(verb: string, args: string[]): Promise<void> {
@@ -1276,12 +1240,7 @@ export class GraphViewController {
     // graphView no longer needs its own try/catch -> reportActionFailure
     // shim because the bar reads error state directly from
     // actionBarState.
-    //
-    // A verb sent without a trigger-deactivation choice that the
-    // dispatcher needed comes back as a picker intent: the webview opens
-    // its picker and sends the verb again with the choice.
-    const intent = await this.cliVerbHandler?.(verb, args);
-    if (intent) this.post({ kind: 'needsTriggerChoice', intent });
+    await this.cliVerbHandler?.(verb, args);
     void this.refreshActionAvailability();
   }
 
@@ -1360,7 +1319,10 @@ export class GraphViewController {
         console[msg.level]('[weft/webview]', msg.message);
         break;
       case 'runProject':
-        this.runHandler?.(msg.targets ?? []);
+        this.runHandler?.(msg.targets);
+        break;
+      case 'checkRun':
+        void this.checkRun(msg.requestId, msg.targets);
         break;
       case 'resolveSpec':
         void this.resolveSpec(msg.requestId, msg.spec, msg.seeded);
@@ -1384,34 +1346,8 @@ export class GraphViewController {
       case 'branchTo':
         void this.branchTo(msg.reference);
         break;
-      case 'infraStart':
-        void this.dispatchVerb('infra', ['start']);
-        break;
-      case 'infraStop':
-        void this.dispatchVerb('infra', [
-          'stop',
-          ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
-        ]);
-        break;
-      case 'infraTerminate':
-        // Asked once, on the first click: a second send carries the
-        // trigger choice the dispatcher asked for, after this confirmed.
-        void (async () => {
-          if (!msg.deactivation) {
-            const confirm = await vscode.window.showWarningMessage(
-              'Terminate the infra? Every resource is deleted, stored data included unless the node keeps it.',
-              { modal: true },
-              'Terminate',
-            );
-            if (confirm !== 'Terminate') return;
-          }
-          // The confirmation happened here, so the CLI is told it did.
-          void this.dispatchVerb('infra', [
-            'terminate',
-            '--yes',
-            ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
-          ]);
-        })();
+      case 'lifecycle':
+        void this.runLifecycle(msg.action);
         break;
       case 'infraCancel':
         void this.dispatchVerb('infra', ['cancel']);
@@ -1419,36 +1355,8 @@ export class GraphViewController {
       case 'cancelBuild':
         void this.dispatchVerb('cancel-build', []);
         break;
-      case 'infraNodeStop':
-        // Route through the CLI like every other verb so the action
-        // bar's `cli_running` overlay fires (gives us the spinner +
-        // label). The CLI proxies to the dispatcher's per-node
-        // endpoint.
-        void this.confirmAndDispatchPerNodeVerb(msg.node, 'stop');
-        break;
-      case 'infraNodeTerminate':
-        void this.confirmAndDispatchPerNodeVerb(msg.node, 'terminate');
-        break;
-      case 'activateProject':
-        void this.dispatchVerb('activate', []);
-        break;
-      case 'deactivateProject':
-        void this.dispatchVerb('deactivate', this.deactivationFlags(msg.spec));
-        break;
-      case 'reactivateProject':
-        // Same CLI verb as activate; the CLI's own reactivate-
-        // choice prompt picks up via stdin (or the host's
-        // maybePromptReactivateChoice round-trips it via JSON).
-        void this.dispatchVerb('activate', []);
-        break;
-      case 'cancelRunning':
-        void this.runCancelRunning();
-        break;
       case 'cancelActivate':
         void this.runCancelActivate();
-        break;
-      case 'resumeActive':
-        void this.runResumeActive();
         break;
       case 'displayAction':
         void this.pressDisplayAction(msg.nodeId, msg.actionKind, msg.payload, msg.confirm);
@@ -1456,18 +1364,8 @@ export class GraphViewController {
       case 'dismissError':
         this.dismissErrorHandler?.();
         break;
-      case 'resyncProject':
-        // The picker's spec rides along as trigger-deactivation flags.
-        void this.dispatchVerb('resync', this.deactivationFlags(msg.spec));
-        break;
       case 'resumeResync':
         void this.dispatchVerb('resync', ['--resume']);
-        break;
-      case 'infraUpgrade':
-        void this.dispatchVerb('infra', [
-          'upgrade',
-          ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
-        ]);
         break;
       case 'refreshStatus':
         void this.refreshActionAvailability();

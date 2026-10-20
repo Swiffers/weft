@@ -78,6 +78,8 @@ pub struct BuildPlan {
     pub definition_hash: String,
     /// Infra closure identity: infra-node sources + engine. Drives infra upgrade.
     pub infra_hash: String,
+    /// Each infra place's own hash (`crate::hash::compute_infra_place_hashes`).
+    pub infra_places: std::collections::BTreeMap<String, String>,
     /// The worker image plus every infra image, each with its ref + build context.
     pub images: Vec<PlannedImage>,
 }
@@ -124,6 +126,8 @@ pub fn plan_build_from(
     let infra_hash =
         crate::hash::compute_infra_hash(definition, &project.root, &weft_root, catalog)
             .map_err(|e| e.context("compute infra hash"))?;
+    let infra_places = crate::hash::compute_infra_place_hashes(definition, &project.root, &weft_root, catalog)
+        .map_err(|e| e.context("compute the infra places' hashes"))?;
     let definition_json = serde_json::to_string(definition)
         .map_err(|e| anyhow::anyhow!("serialize compiled definition: {e}"))?;
 
@@ -168,6 +172,7 @@ pub fn plan_build_from(
         implementations,
         definition_hash,
         infra_hash,
+        infra_places,
         images,
     })
 }

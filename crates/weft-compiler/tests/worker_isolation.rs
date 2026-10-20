@@ -147,6 +147,12 @@ fn the_isolation_files_sit_beside_the_crate() {
     let helper = out.path().join(weft_compiler::codegen::isolate_dir_name());
     let manifest: toml::Value = read(&helper, "Cargo.toml").parse().expect("helper manifest parses");
     assert!(manifest.get("workspace").is_some(), "its own workspace");
+    assert_eq!(
+        manifest["package"]["name"].as_str(),
+        Some(weft_compiler::codegen::isolate_dir_name().as_str()),
+        "named by its content, so a kept compile cache never runs an older helper"
+    );
+    assert_eq!(manifest["bin"][0]["name"].as_str(), Some("weft-isolate"));
     let deps: Vec<&String> = manifest["dependencies"].as_table().unwrap().keys().collect();
     assert_eq!(deps, vec!["serde", "serde_json"]);
     assert_eq!(read(&helper, "src/main.rs"), include_str!("../src/worker_isolate.rs"));

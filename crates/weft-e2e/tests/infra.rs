@@ -116,7 +116,7 @@ svc = MiniService { reachable: true }
 out = Debug
 out.data = svc.status
 "#)?;
-    project.weft(&["infra", "upgrade", "--mode", "wipe"]).await?;
+    project.weft(&["infra", "upgrade"]).await?;
 
     let listed: weft_core::infra::wire::DoorsResponse =
         serde_json::from_str(project.weft(&["infra", "list-doors", "--json"]).await?.trim())?;
@@ -141,7 +141,7 @@ svc = MiniService
 out = Debug
 out.data = svc.status
 "#)?;
-    project.weft(&["infra", "upgrade", "--mode", "wipe"]).await?;
+    project.weft(&["infra", "upgrade"]).await?;
     let closed = project.weft(&["infra", "list-doors"]).await?;
     anyhow::ensure!(closed.contains("no doors"), "the input closed it again: {closed}");
 

@@ -474,6 +474,41 @@ async fn apply_stamps_the_host_notes_on_the_row() {
     assert_eq!(notes, vec![vec!["the container gets every GPU on this machine".to_string()]]);
 }
 
+/// The health rules the node wrote land on the applied row, where the
+/// health loop reads them; a node that wrote none leaves none there (it
+/// runs the built-in ones). A rule naming a unit the node does not have
+/// fails the apply, naming the rule and the unit, before anything runs.
+#[tokio::test]
+async fn apply_stamps_the_nodes_health_rules_on_the_row() {
+    let rig = rig();
+    rig.broker.enqueue_command(apply_cmd(1));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().health_rules, None);
+
+    let rules = serde_json::json!([{
+        "name": "back",
+        "when": { "kind": "not", "condition": { "kind": "unit_flaky", "unit": "bridge" } },
+        "action": { "kind": "bring_back" }
+    }]);
+    let mut ruled = apply_cmd(2);
+    ruled.spec_json.as_mut().unwrap()["healthRules"] = rules;
+    rig.broker.enqueue_command(ruled);
+    assert!(rig.tick_lifecycle().await.unwrap());
+    let stamped = rig.broker.infra_node(PROJECT, NODE).unwrap().health_rules;
+    assert_eq!(serde_json::to_value(stamped).unwrap()[0]["name"], "back", "a changed rule set is stamped, not skipped");
+
+    let mut ghost = apply_cmd(3);
+    ghost.spec_json.as_mut().unwrap()["healthRules"] = serde_json::json!([{
+        "name": "back",
+        "when": { "kind": "unit_flaky", "unit": "ghost" },
+        "action": { "kind": "take_down_triggers" }
+    }]);
+    rig.broker.enqueue_command(ghost);
+    assert!(rig.tick_lifecycle().await.unwrap());
+    let (_, error, _) = rig.broker.completed_commands().into_iter().find(|(id, _, _)| *id == 3).unwrap();
+    assert!(error.as_deref().is_some_and(|e| e.contains("health rule 'back' reads unit 'ghost'")), "{error:?}");
+}
+
 #[tokio::test]
 async fn apply_failure_flips_to_failed_and_bubbles() {
     let rig = rig();

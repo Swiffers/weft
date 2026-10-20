@@ -842,8 +842,10 @@ fn checked_snapshot(run_id: RunId, live: &weft_journal::LiveFold) -> anyhow::Res
         .map(|c| format!("{:?}: {}", c.site, c.reason))
         .collect();
     anyhow::bail!(
-        "the journal of run {run_id} cannot be folded over its program ({} row(s) rejected: \
-         {}); the run cannot resume. `weft clean {run_id}` removes it.",
+        "the record of run {run_id} does not fit the program it runs now ({} row(s) rejected: \
+         {}), so the run cannot resume: a resync moved it, paused, onto a build it no longer \
+         fits, or its record is damaged. Its record is kept: `weft run --seed {run_id}` runs the \
+         program again from what it did, and `weft clean {run_id}` removes it.",
         reasons.len(),
         reasons.join("; "),
     )
@@ -2399,6 +2401,7 @@ async fn drive(
                         &provision_place,
                         provision_copy.as_ref(),
                         &spec,
+                        run_id_task,
                     )
                     .await
                     {

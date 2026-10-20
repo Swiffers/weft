@@ -1147,10 +1147,12 @@ pub struct AssetsHeldRequest {
 
 /// The answer to [`AssetsHeldRequest`]: `content hash -> stored key` for
 /// every named content the tenant stores whole (an upload still in flight
-/// is not held).
+/// is not held), and for every other one the key its upload is stored
+/// under (`unheld`), which a check that uploads nothing stands in with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetsHeldResponse {
     pub keys: std::collections::BTreeMap<String, String>,
+    pub unheld: std::collections::BTreeMap<String, String>,
 }
 
 /// `POST /storage/files/download`: a download link for one of the

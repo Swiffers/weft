@@ -9,9 +9,13 @@
 	import CommandPalette from "./CommandPalette.svelte";
 	import CustomEdge from "./CustomEdge.svelte";
 	import ActionBar from "./ActionBar.svelte";
+	import ContextBar from "./ContextBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
-	import { pruneTargets, runTargetFacts } from "../../run-targets";
+	import { runCheckKey, runInfraIds, runProgress } from "../../run-targets";
+	import { infraBadge, runUnavailable, triggerBadge, type SelectedNode } from "../../lifecycle";
+	import { isVerbOffered, type VerbInputs } from "../../verb-gates";
+	import { emptyActionAvailability } from "../../../../status";
 	import { containerStatus } from "../../utils/container-status";
 	import { clampZoom, isOnScreen, zoomAfterCollapse, zoomAfterExpand, zoomAround, zoomFrame, MAX_ZOOM, MIN_ZOOM, ZOOM_ANIMATION_MS } from "../../utils/group-zoom";
 	import { derefKeys, derefType } from '../../utils/deref-menu';
@@ -66,25 +70,14 @@
 		onStop,
 		onDismissError,
 		onOpenLocation,
-		onActivate,
 		onCancelActivate,
 		onCancelBuild,
 		onCancelInfra,
-		onDeactivate,
-		onReactivate,
-		onCancelRunning,
-		onResumeActive,
-		onResync,
 		onResumeResync,
-		onStartInfra,
-		onStopInfra,
-		onTerminateInfra,
-		onInfraNodeStop,
-		onInfraNodeTerminate,
-		onUpgradeInfra,
+		onLifecycle,
+		checkRun,
 		actionBarState,
-		drift,
-		infraNodes,
+		status,
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
 		runState,
@@ -137,11 +130,11 @@
 		// (the switch, top right). Absent when the project names no target.
 		installView?: import('../../../../protocol').InstallView;
 		onSwitchInstall?: (install: string) => void;
-		// Action-bar verb callbacks. The webview emits these; the
-		// host translates each into a CLI shell-out.
-		/// Targets are the nodes the user aimed the run at, empty for the
-		/// ordinary run.
-		onRun?: (targets: string[]) => void;
+		// Verb callbacks. The webview emits these; the host translates
+		// each into a CLI shell-out.
+		/// Run the selected nodes, each by its place. Never empty: the
+		/// graph has no gesture that runs the whole program.
+		onRun?: (targets: [string, ...string[]]) => void;
 		specs?: RunSpec[];
 		resolveSpec?: (spec: RunSpec, seeded: boolean) => Promise<ResolveSpecResponse>;
 		onRunSpec?: (spec: RunSpec, seeded?: boolean) => void;
@@ -152,40 +145,26 @@
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onOpenLocation: (location: SourceLocation) => void;
-		onActivate?: () => void;
 		onCancelActivate?: () => void;
 		onCancelBuild?: () => void;
 		onCancelInfra?: () => void;
-		onDeactivate?: () => void;
-		onReactivate?: () => void;
-		onCancelRunning?: () => void;
-		onResumeActive?: () => void;
-		onResync?: () => void;
 		onResumeResync?: () => void;
-		onStartInfra?: () => void;
-		onStopInfra?: () => void;
-		onTerminateInfra?: () => void;
-		/// Per-node infra lifecycle. The graph's node context-menu
-		/// emits these when the user right-clicks an infra node, with
-		/// the node's PLACEMENT (`addressOf(callPath, id)`, so `one.db`
-		/// for the `db` of the call this view walked into). Routed
-		/// through the host's CLI verb path so the action bar's
-		/// `cli_running` overlay covers them.
-		onInfraNodeStop?: (node: string) => void;
-		onInfraNodeTerminate?: (node: string) => void;
-		onUpgradeInfra?: () => void;
-		// Action-bar state machine (host-owned single source of
-		// truth) and drift snapshot. Passed straight through to
-		// the ActionBar component; nothing in this file decides.
+		/// A lifecycle verb from the contextual bar, on the selected
+		/// triggers or infra.
+		onLifecycle?: (action: import('../../../../protocol').LifecycleAction) => void;
+		/// The walk's refusal for a run of these targets, or `null` when
+		/// it resolves (`weft run --check`).
+		checkRun?: (targets: [string, ...string[]]) => Promise<string | null>;
+		// Action-bar state machine (host-owned single source of truth).
+		// Passed straight through to the ActionBar; nothing here decides.
 		actionBarState: import('../../../../protocol').ActionBarState;
-		drift: import('../../../../protocol').ActionAvailability | undefined;
-		// Per-instance infra status, keyed by PLACE (`node` is the spelling
-		// `addressOf(callPath, id)` gives the node on screen): a file
-		// included twice provisions twice, and this view shows the
-		// instance of the call it walked into. Used by the graph node
-		// decorations (badge under each infra node); independent of the
-		// action bar's infra rollup.
-		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
+		// The latest status answer: every trigger's, infra copy's and
+		// instance's state, as the dispatcher computed it. The node
+		// badges and the contextual bar only draw it. An infra or trigger
+		// entry is keyed by PLACE (`addressOf(callPath, id)` spells the
+		// node on screen): a file included twice provisions twice, and
+		// this view shows the copy of the call it walked into.
+		status: import('../../../../protocol').ActionAvailability | undefined;
 		// Source-derived flags from the parsed project: does this
 		// graph DECLARE infra / trigger nodes. Drives bar-section
 		// visibility (don't show Infra section on a project with
@@ -1835,19 +1814,6 @@
 		value: {},
 	};
 
-	/// Output nodes the user aimed the run at, by node id. Empty is the
-	/// ordinary run: the dispatcher starts from every output node. This is
-	/// deliberately not surfaced anywhere except the right-click menu and the
-	/// glow on a targeted node, so it stays out of the way of somebody who
-	/// never wants it.
-	let runTargets = $state<Set<string>>(new Set());
-
-	function toggleRunTarget(nodeId: string): void {
-		const next = new Set(runTargets);
-		if (!next.delete(nodeId)) next.add(nodeId);
-		runTargets = next;
-	}
-
 	// Everything dynamic painted onto the projected graph, gathered in one
 	// place so there is ONE decoration pass (no per-source effects mutating
 	// `nodes` in place). `readOverlayCtx()` reads every reactive source, so
@@ -1872,16 +1838,11 @@
 		/// onto every node so a node card or inspector can name who
 		/// stopped the run.
 		runTerminal: import('../../types').RunTerminal | undefined;
-		infraNodes: typeof infraNodes;
+		status: typeof status;
 		fileContents: typeof fileContents;
 		displayByNode: typeof displayByNode;
 		showInfraSubgraph: boolean;
 		showTriggerSubgraph: boolean;
-		/// Output nodes the run is aimed at. Read here rather than straight
-		/// from the state so setting a target repaints immediately: `decorate`
-		/// runs untracked, so a source it reads on its own never registers as
-		/// a dependency of the overlay effect.
-		runTargets: ReadonlySet<string>;
 		/// The followed run's node set (`null` = whole graph, `undefined`
 		/// = no run or its birth has not arrived).
 		runScope: ReadonlySet<string> | null | undefined;
@@ -1920,12 +1881,11 @@
 			journalCorruptions: state?.journalCorruptions ?? [],
 			runTags: state?.tags ?? [],
 			runTerminal: state?.terminal,
-			infraNodes,
+			status,
 			fileContents,
 			displayByNode,
 			showInfraSubgraph,
 			showTriggerSubgraph,
-			runTargets,
 			runScope: runState?.scope === undefined ? undefined
 				: runState.scope === null ? null
 				: new Set(runState.scope),
@@ -2214,9 +2174,9 @@
 						? (loopEventsByGroup[firingKey(n.id)] ?? [])
 						: [];
 
-					// Per-node infra badge (status snapshot from the host): the
-					// instance at this view's place, through the one lookup.
-					const backendNode = infraStatusOf(n.id);
+					// The trigger's or infra node's badge, from the status the
+					// dispatcher computed: the entry at this view's place.
+					const lifecycleBadge = lifecycleBadgeOf(n.id, ctx.status);
 
 					// What this node is showing, if it shows anything. Own-property
 					// read: node ids come off the wire, and a node literally named
@@ -2242,7 +2202,6 @@
 						...n,
 						data: {
 							...n.data,
-							runTarget: ctx.runTargets.has(n.id),
 							debugData,
 							firings,
 							busLogs,
@@ -2252,11 +2211,7 @@
 							runTerminal,
 							fileContents: ctx.fileContents,
 							bodyFeed,
-							infraNodeStatus: backendNode?.status,
-							infraInstanceCopies: backendNode?.instanceCopyCount,
-							infraFailureStage: backendNode?.failureStage,
-							infraFailureMessage: backendNode?.failureMessage,
-							infraProgress: backendNode?.progress,
+							lifecycleBadge,
 						},
 						class: cls,
 					};
@@ -2437,27 +2392,52 @@
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
 
-	/// Targets the graph still holds. A targeted node the user then deleted
-	/// is dropped here rather than sent to a dispatcher that would refuse it.
-	const liveRunTargets = $derived([...pruneTargets(runTargets, nodes)]);
-	// And the STATE prunes itself too (the derived view above covers the
-	// same render tick): without this, deleting a targeted node and later
-	// re-creating one with the same id would bring it back already
-	// targeted, showing "Unset target" on a node the user never aimed at.
-	$effect(() => {
-		const pruned = pruneTargets(runTargets, nodes);
-		if (pruned.size !== runTargets.size) runTargets = new Set(pruned);
-	});
+	/// The latest status answer, or the empty one before any arrived.
+	const statusNow = $derived(status ?? emptyActionAvailability());
 
-	/// What the aimed run executes, read off the graph: whether its joined
-	/// subgraph touches any trigger (if not, the action bar offers Run
-	/// beside the trigger lifecycle), and which infra nodes it holds.
-	// Read off the PROJECTION, not the rendered graph: a collapsed
-	// ancestor re-parents (or hides) what it holds for drawing, and the
-	// facts of a run are about the program, not the picture.
-	const runTargetFactsLive = $derived(
-		runTargetFacts(
-			liveRunTargets,
+	/// The status entries behind a node on screen: the ones at THIS
+	/// view's place (`addressOf(callPath, id)`), never another call's. A
+	/// view that is no place names no entry, whatever the status holds.
+	function infraStatusOf(nodeId: string, from: typeof status = status) {
+		if (!interactive) return undefined;
+		const place = addressOf(callPath, nodeId);
+		return from?.infraNodes.find((inf) => inf.node === place);
+	}
+	function triggerStatusOf(nodeId: string, from: typeof status) {
+		if (!interactive) return undefined;
+		const place = addressOf(callPath, nodeId);
+		return from?.triggers.find((t) => t.node === place);
+	}
+
+	/// The badge a trigger or infra node wears, when the status names it.
+	function lifecycleBadgeOf(nodeId: string, from: typeof status) {
+		const infra = infraStatusOf(nodeId, from);
+		if (infra) return infraBadge(infra, from?.instanceInfra ?? [], Date.now() / 1000);
+		const trigger = triggerStatusOf(nodeId, from);
+		return trigger ? triggerBadge(trigger) : undefined;
+	}
+
+	// ── The contextual bar ────────────────────────────────────────────────
+	/// The nodes selected right now (annotations are notes, never acted
+	/// on), in the order the canvas holds them.
+	const selectedIds = $derived(nodes.filter((n) => n.selected && n.type !== 'annotation').map((n) => n.id));
+	/// The same nodes as the contextual bar reads them, each by its place.
+	const selectedForBar = $derived<SelectedNode[]>(
+		selectedIds.flatMap((id) => {
+			const node = fold.project.nodes.find((n) => n.id === id);
+			return node
+				? [{ place: addressOf(callPath, id), isTrigger: nodeIsTrigger(node), isInfra: nodeRequiresInfra(node), perInstance: !!node.perInstance }]
+				: [];
+		}),
+	);
+
+	/// The infra a run of the selection reaches that is not running,
+	/// read off the PROJECTION, not the rendered graph: a collapsed
+	/// ancestor re-parents (or hides) what it holds for drawing, and the
+	/// facts of a run are about the program, not the picture.
+	const selectionInfraDown = $derived(
+		runInfraIds(
+			selectedIds,
 			fold.project.nodes.map((n) => ({
 				id: n.id,
 				isTrigger: nodeIsTrigger(n),
@@ -2465,36 +2445,98 @@
 				parentId: n.parentId,
 			})),
 			fold.project.edges,
-		),
+		).filter((id) => infraStatusOf(id)?.status !== 'running'),
 	);
 
-	/// The aimed run is ready infra-wise when every infra node in ITS
-	/// subgraph reports running. Infra elsewhere in the project has no
-	/// say: a targeted run never touches it.
-	const runTargetsInfraReady = $derived(
-		runTargetFactsLive.infraIds.every((id) => infraStatusOf(id)?.status === 'running'),
+	/// What stops a run of the selection whatever the walk says.
+	const runBlocked = $derived(
+		!interactive
+			? 'This file was opened on its own, so there is nothing to run here. Open src/main.weft and run from there.'
+			: selectionInfraDown.length > 0
+				? `Start ${selectionInfraDown.map((id) => addressOf(callPath, id)).join(', ')} first: this run reaches it.`
+				: null,
 	);
 
-	/// The infra placement behind a node on screen: the one at THIS view's
-	/// place (`addressOf(callPath, id)`), never another call's. A view
-	/// that is no place names no placement, whatever the status holds.
-	function infraStatusOf(nodeId: string) {
-		if (!interactive) return undefined;
-		const place = addressOf(callPath, nodeId);
-		return infraNodes?.find((inf) => inf.node === place);
-	}
+	const verbInputs = $derived<VerbInputs>({
+		removing: actionBarState.backend.removing,
+		available: actionBarState.backend.available,
+		hasInfra: hasInfraInGraph,
+		hasTriggers: hasTriggersInGraph,
+		infraRollup: actionBarState.backend.infraRollup,
+		status: actionBarState.backend.status,
+		transition: actionBarState.backend.transition,
+		infraBusy: actionBarState.backend.infraBusy,
+	});
+	/// A verb or a build in flight: the contextual bar waits for it.
+	const verbsBlocked = $derived(
+		actionBarState.overlay.kind === 'cli_running'
+			|| actionBarState.overlay.kind === 'pending'
+			|| actionBarState.backend.transition === 'building'
+			|| actionBarState.backend.transition === 'cancelling_build',
+	);
 
-	/// The one funnel every "run" gesture goes through (the action bar's
-	/// button, Ctrl+Enter), so the place check lives here and not on
-	/// each gesture: a view that is no place in the program cannot start
-	/// a run, and says so rather than starting one silently.
-	function runWithTargets(): void {
-		if (!interactive) {
-			toast.error('This file was opened on its own, so there is nothing to run here. Open src/main.weft and run from there.');
+	/// The selection as a run names it: each node by its place.
+	const runTargets = $derived(selectedIds.map((id) => addressOf(callPath, id)));
+	/// What the walk's answer depends on, by value: the targets and the
+	/// source the engine holds now. Every change of the program advances
+	/// that source (the text tab or an outside writer through
+	/// `applyExternalSource`, a canvas edit once the host confirms it),
+	/// while the `project` prop only changes on a fresh mount. A `nodes`
+	/// array replaced around an unchanged selection and source (a run
+	/// event, a status refresh) keeps the key, so the walk is not asked.
+	const runKey = $derived(runCheckKey(runTargets, engine.truth.weftCode));
+	/// The walk's answer for the selection on screen (`weft run
+	/// --check`): `undefined` while it is asked, `null` when it
+	/// resolves, else its refusal.
+	let runRefusal = $state<string | null | undefined>(undefined);
+	$effect(() => {
+		void runKey;
+		const asked = untrack(() => runTargets);
+		runRefusal = undefined;
+		if (!checkRun || runBlocked || asked.length === 0) return;
+		let current = true;
+		// A selection dragged across the canvas changes on every node it
+		// passes: ask once it settles.
+		const timer = setTimeout(() => {
+			checkRun(asked as [string, ...string[]]).then(
+				(answer) => { if (current) runRefusal = answer; },
+				(err) => { if (current) runRefusal = err instanceof Error ? err.message : String(err); },
+			);
+		}, 300);
+		return () => {
+			current = false;
+			clearTimeout(timer);
+		};
+	});
+	/// Whether Run may go, and why not: the one rule the bar's Run
+	/// button and every run gesture read, or `undefined` when it may.
+	const runWhy = $derived(
+		runUnavailable({ blocked: verbsBlocked, offered: isVerbOffered('run', verbInputs), runBlocked, refusal: runRefusal }),
+	);
+
+	/// The one funnel every "run" gesture goes through (the contextual
+	/// bar's Run, Ctrl+Enter): the selected nodes, each by its place.
+	function runSelection(): void {
+		// An editor given no way to run, or to check one, has no Run.
+		if (!onRun || !checkRun) return;
+		const [first, ...rest] = runTargets;
+		if (first === undefined) {
+			toast.info('Select the nodes to run first: the run takes them and what they need.');
 			return;
 		}
-		onRun?.(liveRunTargets);
+		if (runWhy) {
+			toast.error(runWhy);
+			return;
+		}
+		onRun([first, ...rest]);
 	}
+
+	/// How far the followed run got, for the bottom bar.
+	const followedProgress = $derived(
+		actionBarState.overlay.kind === 'run_running' && runState
+			? runProgress(runState.nodeFirings, runState.scope)
+			: undefined,
+	);
 
 	/// The run spec dialog: `null` closed, else the spec it opened with.
 	let specDialogInitial = $state<RunSpec | null>(null);
@@ -2525,15 +2567,12 @@
 	});
 	// An OPEN node menu closes itself when its target can no longer fill it:
 	// the node vanished from the graph (deleted from the text tab in another
-	// column while the menu was open), or, in simplified view, its only menu
-	// content (infra lifecycle actions) disappeared mid-run. Same
-	// predicates that gate rendering the items, so open-time and stay-open
-	// agree and an empty popover shell can never linger. The empty-area menu
-	// (no nodeId) always has Undo/Redo, never empties.
+	// column while the menu was open). The empty-area menu (no nodeId)
+	// always has Undo/Redo, never empties.
 	$effect(() => {
 		if (!contextMenu?.nodeId) return;
 		const target = nodes.find(n => n.id === contextMenu!.nodeId);
-		if (!target || (simplified && !nodeInfraActions(contextMenu.nodeId).has)) {
+		if (!target || !nodeMenuHasItems()) {
 			contextMenu = null;
 		}
 	});
@@ -3065,7 +3104,7 @@
 				saveProject();
 				break;
 			case 'run':
-				runWithTargets();
+				runSelection();
 				break;
 			case 'undo':
 				undo();
@@ -3076,6 +3115,13 @@
 			case 'selectAll':
 				nodes = nodes.map(n => ({ ...n, selected: true }));
 				break;
+			case 'selectTriggers': {
+				// Acting on every trigger is selecting every trigger: the
+				// contextual bar then offers each action once, counted.
+				const triggers = new Set(fold.project.nodes.filter((n) => nodeIsTrigger(n)).map((n) => n.id));
+				nodes = nodes.map(n => (!!n.selected === triggers.has(n.id) ? n : { ...n, selected: triggers.has(n.id) }));
+				break;
+			}
 			case 'fitView':
 				doFitView();
 				break;
@@ -3953,17 +3999,12 @@
 		}
 	}
 
-	/** Whether a node's context menu has any INFRA lifecycle action (stop/terminate).
-	 *  The one source of truth for "infra actions present", used both to decide
-	 *  whether to open the menu in simplified view and to render the infra section. */
-	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
-		const infra = nodeId ? infraStatusOf(nodeId) : undefined;
-		// A place with no shared copy (never started, or one per instance)
-		// has nothing to stop or terminate here.
-		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_instance';
-		const stop = hasCopy && (infra.status === 'running' || infra.status === 'flaky');
-		const terminate = hasCopy && infra.status !== 'terminating';
-		return { stop, terminate, has: stop || terminate };
+	/** Whether a node's context menu has anything to show. Simplified view
+	 *  hides the structural items (Duplicate/Delete), leaving the run items,
+	 *  which only a view that is a place in the program offers. The one
+	 *  predicate for opening the menu, keeping it open, and rendering it. */
+	function nodeMenuHasItems(): boolean {
+		return !simplified || interactive;
 	}
 
 	function onContextMenu(event: MouseEvent) {
@@ -3972,11 +4013,9 @@
 		const flowPos = screenToFlowPosition({ x: event.clientX, y: event.clientY });
 		const clickedNodeId = findNodeAtPosition(event.clientX, event.clientY);
 
-		// Simplified view hides the structural node-menu items (Duplicate/Delete),
-		// leaving only infra lifecycle actions. A node with no infra actions would
-		// open an empty popover, so don't open the menu at all in that case. (The
-		// empty-area menu still has Undo/Redo, so it's never empty.)
-		if (simplified && clickedNodeId && !nodeInfraActions(clickedNodeId).has) {
+		// A node menu with nothing in it would open an empty popover, so it
+		// does not open at all. (The empty-area menu still has Undo/Redo.)
+		if (clickedNodeId && !nodeMenuHasItems()) {
 			contextMenu = null;
 			return;
 		}
@@ -4432,79 +4471,57 @@
 		     the program (a run, the project's lifecycle): a file opened on
 		     its own has none, so none of it is drawn (see `interactive`). -->
 		{#if interactive}
-		<!-- Drift banner. A redundant surfacing of the action-bar
-		     affordance, in case the user misses the button. The verb
-		     it names must match whichever button is actually showing:
-		     if infra is running + drifted the button is Upgrade; if
-		     it's stopped + drifted the button is Start (Start re-applies
-		     the changed spec and reaps orphans on the way up). Keyed on
-		     `availableActions` so banner text and button agree. -->
-		{#if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_upgrade')}
-			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
-				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-					Infrastructure has changed. Click Upgrade to apply.
+		<!-- The bars at the bottom: the contextual bar for the selected
+		     nodes (only with a selection), and under it the bottom bar,
+		     which shows what is going on right now. Their state comes from
+		     the host's ActionBarStore and the status answer; nothing here
+		     decides a state, only which nodes are selected. -->
+		<div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 z-20">
+			{#if versionMismatch && runState?.seed !== undefined}
+				<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg">
+					<span>This run is from version {versionMismatch.slice(0, 8)}; your code differs.</span>
+					{#if onBranchTo}
+						<button class="px-2 py-0.5 rounded border border-amber-300 hover:bg-amber-100" onclick={() => onBranchTo?.(versionMismatch)}>Branch here</button>
+					{/if}
 				</div>
-			</div>
-		{:else if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_start')}
-			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
-				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-					Infrastructure has changed. Click Start to apply.
-				</div>
-			</div>
-		{/if}
-
-		<!-- Floating action bar. State + drift come from the host's
-		     ActionBarStore (single source of truth). The bar reads
-		     `state.backend` for at-rest facts and `state.overlay`
-		     for the in-flight user-action; `drift` lights
-		     Resync/Upgrade indicators. -->
-		{#if versionMismatch && runState?.seed !== undefined}
-			<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg mb-1">
-				<span>This run is from version {versionMismatch.slice(0, 8)}; your code differs.</span>
-				{#if onBranchTo}
-					<button class="px-2 py-0.5 rounded border border-amber-300 hover:bg-amber-100" onclick={() => onBranchTo?.(versionMismatch)}>Branch here</button>
-				{/if}
-			</div>
-		{/if}
-		<ActionBar
-			state={actionBarState}
-			{drift}
-			onRun={runWithTargets}
-			runTargetCount={liveRunTargets.length}
-			specs={menuSpecs}
-			{focusedGroup}
-			onRunSpec={onRunSpecFile}
-			onOpenSpecDialog={(initial) => openSpecDialog(initial ?? { name: 'one-off' })}
-			onOpenSpecMenu={onListSpecs}
-			{onStop}
-			{onDismissError}
-			{onOpenLocation}
-			{onActivate}
-			{onCancelActivate}
-			{onCancelBuild}
-			{onCancelInfra}
-			{onDeactivate}
-			{onReactivate}
-			{onCancelRunning}
-			{onResumeActive}
-			{onResync}
-			{onResumeResync}
-			{onStartInfra}
-			{onStopInfra}
-			{onTerminateInfra}
-			{onUpgradeInfra}
-			hasInfra={hasInfraInGraph}
-			hasTriggers={hasTriggersInGraph}
-			runTargetsAvoidTriggers={runTargetFactsLive.avoidsTriggers}
-			{runTargetsInfraReady}
-			onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
-			{showInfraSubgraph}
-			onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
-			{showTriggerSubgraph}
-			nodeCount={nodes.length}
-		/>
+			{/if}
+			{#if selectedForBar.length > 0 && onRun && onLifecycle && checkRun}
+				<ContextBar
+					selected={selectedForBar}
+					status={statusNow}
+					project={project.id}
+					blocked={verbsBlocked}
+					offered={(verb) => isVerbOffered(verb, verbInputs)}
+					{runWhy}
+					onRun={runSelection}
+					{onLifecycle}
+				/>
+			{/if}
+			<ActionBar
+				state={actionBarState}
+				{status}
+				runProgress={followedProgress}
+				specs={menuSpecs}
+				{focusedGroup}
+				specsEnabled={!verbsBlocked}
+				onRunSpec={onRunSpecFile}
+				onOpenSpecDialog={(initial) => openSpecDialog(initial ?? { name: 'one-off' })}
+				onOpenSpecMenu={onListSpecs}
+				{onStop}
+				{onDismissError}
+				{onOpenLocation}
+				{onCancelActivate}
+				{onCancelBuild}
+				{onCancelInfra}
+				{onResumeResync}
+				hasInfra={hasInfraInGraph}
+				hasTriggers={hasTriggersInGraph}
+				onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
+				{showInfraSubgraph}
+				onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
+				{showTriggerSubgraph}
+			/>
+		</div>
 		{/if}
 	</div>
 	{#if specDialogInitial && resolveSpec && onRunSpec}
@@ -4578,21 +4595,15 @@
 				{@const targetNodeId = contextMenu.nodeId}
 				{@const nodeToEdit = nodes.find(n => n.id === targetNodeId)}
 				{@const nodeConfig = nodeToEdit ? NODE_TYPE_CONFIG[nodeToEdit.data.nodeType as NodeType] : null}
-				{@const infraInfo = infraStatusOf(targetNodeId)}
-				{@const infraActions = nodeInfraActions(targetNodeId)}
-				{@const canNodeStop = infraActions.stop}
-				{@const canNodeTerminate = infraActions.terminate}
-				{@const hasInfraActions = infraActions.has}
-				<!-- In simplified view the only node-menu items are infra lifecycle actions
+				<!-- In simplified view the only node-menu items are the run items
 				     (structural Duplicate/Delete are hidden), so render the menu only when
 				     there's something to show, never an empty popover. -->
-				{#if nodeToEdit && nodeConfig && (!simplified || hasInfraActions)}
+				{#if nodeToEdit && nodeConfig && nodeMenuHasItems()}
 					<div class="px-1">
 						<!-- Duplicate/Delete are STRUCTURAL edits: hidden in simplified view
-						     (read-only for structure). Infra Stop/Terminate below are runtime
-						     lifecycle actions (not source edits), so they stay available. This
-						     is the same gate STRUCTURAL_ACTIONS applies to the palette/keyboard;
-						     the context menu is the other entry point and must gate too. -->
+						     (read-only for structure). This is the same gate STRUCTURAL_ACTIONS
+						     applies to the palette/keyboard; the context menu is the other entry
+						     point and must gate too. -->
 						{#if !simplified}
 							<button
 								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
@@ -4633,17 +4644,10 @@
 								</button>
 							{/if}
 						{/if}
-						<!-- Aiming a run names a PLACE (`addressOf` spells the node
-						     under this view's calls), so a view that is no place
-						     offers none of it. -->
+						<!-- A run names a PLACE (`addressOf` spells the node under
+						     this view's calls), so a view that is no place offers
+						     none of it. -->
 						{#if interactive}
-						<button
-							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
-						>
-							<span class="text-muted-foreground text-xs">◎</span>
-							<span>{runTargets.has(targetNodeId) ? 'Unset target' : 'Set as target'}</span>
-						</button>
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
 							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', addressOf(callPath, targetNodeId))); }}
@@ -4660,30 +4664,6 @@
 								<span>Run this group…</span>
 							</button>
 						{/if}
-						{/if}
-						{#if hasInfraActions}
-							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
-							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">
-								Infra ({infraInfo!.status})
-							</div>
-							{#if canNodeStop && onInfraNodeStop}
-								<button
-									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-									onclick={() => { const place = addressOf(callPath, contextMenu!.nodeId!); contextMenu = null; onInfraNodeStop?.(place); }}
-								>
-									<span class="text-muted-foreground text-xs">⏸</span>
-									<span>Stop this node</span>
-								</button>
-							{/if}
-							{#if canNodeTerminate && onInfraNodeTerminate}
-								<button
-									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
-									onclick={() => { const place = addressOf(callPath, contextMenu!.nodeId!); contextMenu = null; onInfraNodeTerminate?.(place); }}
-								>
-									<span class="text-xs">✕</span>
-									<span>Terminate this node</span>
-								</button>
-							{/if}
 						{/if}
 					</div>
 				{/if}

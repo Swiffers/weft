@@ -21,16 +21,16 @@ use serde_json::Value;
 
 use crate::activation::ActivationScope;
 use crate::error::{WeftError, WeftResult};
-use crate::instance::InstanceId;
+use crate::instance::{InstanceId, InstanceTarget};
 use crate::infra::{InfraNodeStatus, TerminateDisks};
 use crate::instance_door::ValuesChanged;
 use crate::program::{
     CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, RunPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
-    MintedInstanceToken, NodeState, PaidBy, ProgramCall, RunFilter, RunsCounted, TokensRevoked, MAX_RUNS_PAGE,
+    MintedInstanceToken, NodeState, PaidBy, ProgramCall, RunFilter, RunsCounted, StillGoing, TokensRevoked, MAX_RUNS_PAGE,
 };
-use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::signal::timer::{Timer, TimerSpec};
 use crate::tag::StopSelf;
+use crate::take_down::{ReleaseHeld, TakeDownChoice};
 use crate::RunId;
 
 use super::RunContext;
@@ -52,16 +52,18 @@ impl RunContext {
         InfraCalls { ctx: self, node: node.into(), instance: None }
     }
 
-    /// One trigger's activation: the shared one, or an instance's
-    /// (`.instance(id)`) for a trigger that exists once per instance.
+    /// One trigger's activations: the shared one, or, for a trigger that
+    /// exists once per instance, the instances' named with `.instance(id)`
+    /// (repeatable) or every instance's with `.all_instances()`.
     pub fn trigger(&self, node: impl Into<String>) -> TriggerCalls<'_> {
-        TriggerCalls { ctx: self, triggers: vec![node.into()], instance: None }
+        TriggerCalls { ctx: self, triggers: vec![node.into()], instances: Vec::new(), all_instances: false }
     }
 
-    /// Every trigger of one owner: every shared trigger, or with
-    /// `.instance(id)` every per-instance trigger of that instance.
+    /// Every trigger of its owners: every shared trigger, or every
+    /// per-instance trigger of the instances named with `.instance(id)`,
+    /// or of every instance with `.all_instances()`.
     pub fn triggers(&self) -> TriggerCalls<'_> {
-        TriggerCalls { ctx: self, triggers: Vec::new(), instance: None }
+        TriggerCalls { ctx: self, triggers: Vec::new(), instances: Vec::new(), all_instances: false }
     }
 
     /// What an instance provides for the program's `@instance_filled`
@@ -232,32 +234,48 @@ impl InfraCalls<'_> {
         }
     }
 
-    /// Scale the copy down, keeping its disk. `spec` says what happens to
-    /// the triggers reading it and the runs using it; `stop_self` whether
-    /// this run goes too when it uses the copy. Answers whether there was
-    /// a copy to take down ([`InfraDownAnswer`]), so a program can tell an
-    /// instance with no copy (a mistyped id, one terminated before) apart.
-    pub async fn stop(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
-        let call = ProgramCall::InfraStop { node: self.node, instance: instance_id(&self.instance)?, spec };
+    /// Scale the copy down, keeping its disk. `take_down` says what
+    /// happens to the triggers whose cut contains it (they come back when
+    /// it runs again) and to the runs reaching it, each answer left out
+    /// being an infra command's default: the door holds, what is held is
+    /// kept, and the copy waits for its runs to end. `stop_self` decides
+    /// whether this run goes too when it reaches the copy. Answers whether
+    /// there was a copy to take down ([`InfraDownAnswer`]), so a program
+    /// can tell an instance with no copy (a mistyped id, one terminated
+    /// before) apart.
+    pub async fn stop(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
+        let call = ProgramCall::InfraStop { node: self.node, instance: instance_id(&self.instance)?, take_down };
         self.ctx.program_call(call, stop_self).await
     }
 
     /// Delete the copy and its disks, keeping the ones its node lists in
     /// `keepOnTerminate` (a later start of the same copy finds them
-    /// again). Same `spec` and `stop_self` as [`Self::stop`].
-    pub async fn terminate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
-        self.take_away(spec, stop_self, TerminateDisks::KeepListed).await
+    /// again). Same `take_down` and `stop_self` as [`Self::stop`].
+    pub async fn terminate(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
+        self.take_away(take_down, stop_self, TerminateDisks::KeepListed).await
     }
 
     /// Delete the copy and every one of its disks, the ones listed in
     /// `keepOnTerminate` too: the copy's owner is going for good (a
-    /// instance being wiped). Same `spec` and `stop_self` as [`Self::stop`].
-    pub async fn wipe(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
-        self.take_away(spec, stop_self, TerminateDisks::DeleteAll).await
+    /// instance being wiped). Same `take_down` and `stop_self` as [`Self::stop`].
+    pub async fn wipe(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
+        self.take_away(take_down, stop_self, TerminateDisks::DeleteAll).await
     }
 
-    async fn take_away(self, spec: DeactivateSpec, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<InfraDownAnswer> {
-        let call = ProgramCall::InfraTerminate { node: self.node, instance: instance_id(&self.instance)?, spec, disks };
+    /// Cycle the running copy onto the registered build's infra (a stop,
+    /// then a start; nothing is built), taking down the triggers whose cut
+    /// contains it as `take_down` says, the way [`Self::stop`] does; they
+    /// come back with it. Answers once the upgrade is under way, or at once
+    /// when the copy runs on the registered build already (nothing to
+    /// cycle); a copy that is not running is refused, since there is
+    /// nothing to cycle either.
+    pub async fn upgrade(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<()> {
+        let call = ProgramCall::InfraUpgrade { node: self.node, instance: instance_id(&self.instance)?, take_down };
+        self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
+    }
+
+    async fn take_away(self, take_down: TakeDownChoice, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<InfraDownAnswer> {
+        let call = ProgramCall::InfraTerminate { node: self.node, instance: instance_id(&self.instance)?, take_down, disks };
         self.ctx.program_call(call, stop_self).await
     }
 
@@ -280,7 +298,8 @@ impl InfraCalls<'_> {
 pub struct TriggerCalls<'a> {
     ctx: &'a RunContext,
     triggers: Vec<String>,
-    instance: Option<String>,
+    instances: Vec<String>,
+    all_instances: bool,
 }
 
 impl TriggerCalls<'_> {
@@ -292,30 +311,42 @@ impl TriggerCalls<'_> {
         self
     }
 
-    /// That instance's activations, of triggers that exist once per
-    /// instance.
+    /// That instance's activations too, of triggers that exist once per
+    /// instance (call it again for another instance).
     pub fn instance(mut self, id: impl Into<String>) -> Self {
-        self.instance = Some(id.into());
+        self.instances.push(id.into());
+        self
+    }
+
+    /// Every instance's activations, of triggers that exist once per
+    /// instance.
+    pub fn all_instances(mut self) -> Self {
+        self.all_instances = true;
         self
     }
 
     fn scope(&self) -> WeftResult<ActivationScope> {
-        Ok(ActivationScope { triggers: self.triggers.clone(), instance: instance_id(&self.instance)? })
+        trigger_scope(&self.triggers, &self.instances, self.all_instances)
     }
 
-    /// Activate them. An instance's trigger reading that instance's infra copy
-    /// needs the copy running first. Activating what is active does
-    /// nothing.
-    pub async fn activate(self) -> WeftResult<()> {
-        let call = ProgramCall::TriggerActivate { scope: self.scope()? };
+    /// Turn on the ones that are off, leaving the ones on as they are
+    /// (with none off, this does nothing). What they held while down runs
+    /// (paced so new arrivals still get through) or is dropped, as `held`
+    /// says. An instance's trigger reading that instance's infra copy
+    /// needs the copy running first.
+    pub async fn activate(self, held: ReleaseHeld) -> WeftResult<()> {
+        let call = ProgramCall::TriggerActivate { scope: self.scope()?, held };
         self.ctx.program_call::<Value>(call, StopSelf::Keep).await.map(drop)
     }
 
-    /// Take them down under `spec` (wipe, hibernate or park; cancel or
-    /// wait for the runs they fired). `stop_self` decides this run's fate
-    /// when one of them fired it.
-    pub async fn deactivate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
-        let call = ProgramCall::TriggerDeactivate { scope: self.scope()?, spec };
+    /// Take them down as `take_down` says, each answer left out being the
+    /// default: the door holds what arrives, what is held is kept, and the
+    /// runs going finish on their own version (`Running::Wait`; the call
+    /// answers once the triggers are down, never waiting on runs from
+    /// inside this one) or are cancelled (`Running::Cancel`). `stop_self`
+    /// decides this run's fate when one of them fired it.
+    pub async fn deactivate(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<()> {
+        let call = ProgramCall::TriggerDeactivate { scope: self.scope()?, take_down };
         self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
     }
 }
@@ -536,10 +567,10 @@ impl RunQuery<'_> {
     }
 
     /// Delete them. A run still going is never deleted from under itself:
-    /// `running: Cancel` stops it (its rows go with the next clean),
-    /// `Wait` leaves it running. This run is never deleted; with
+    /// `StillGoing::Cancel` stops it (its rows go with the next clean),
+    /// `Leave` leaves it running. This run is never deleted; with
     /// `StopSelf::Include` and matching the filters, it is stopped.
-    pub async fn clean(mut self, running: RunningPolicy, stop_self: StopSelf) -> WeftResult<CleanOutcome> {
+    pub async fn clean(mut self, running: StillGoing, stop_self: StopSelf) -> WeftResult<CleanOutcome> {
         self.filter.instance = instance_id(&self.instance)?;
         self.ctx.program_call(ProgramCall::RunsClean { filter: self.filter, running }, stop_self).await
     }
@@ -627,5 +658,42 @@ impl InstanceTokens<'_> {
         let call = ProgramCall::TokensRevoke { instance: required_instance(&self.instance)?, id: None };
         let answer: TokensRevoked = self.ctx.program_call(call, StopSelf::Keep).await?;
         Ok(answer.revoked)
+    }
+}
+
+/// The activations a [`TriggerCalls`] names: `triggers` (every one when
+/// empty) of the program's own and of the instances `instances`, or of
+/// every instance with `all_instances`, which names none of its own.
+fn trigger_scope(triggers: &[String], instances: &[String], all_instances: bool) -> WeftResult<ActivationScope> {
+    let named = instances.iter().map(|id| required_instance(id)).collect::<WeftResult<Vec<InstanceId>>>()?;
+    let instances = match (all_instances, named.is_empty()) {
+        (true, false) => {
+            return Err(WeftError::Input(
+                "`.all_instances()` acts on every instance and `.instance(..)` names some; call one of the two".into(),
+            ))
+        }
+        (true, true) => InstanceTarget::EveryInstance,
+        (false, _) => InstanceTarget::named(named),
+    };
+    Ok(ActivationScope { triggers: triggers.to_vec(), instances })
+}
+
+#[cfg(test)]
+mod trigger_scope_tests {
+    use super::*;
+
+    /// No instance named is the program's own; named ones are those;
+    /// every instance is all of them, and naming some beside it is refused.
+    #[test]
+    fn a_trigger_call_names_its_activations() {
+        let feed = vec!["feed".to_string()];
+        let own = trigger_scope(&feed, &[], false).unwrap();
+        assert_eq!((own.triggers, own.instances), (feed.clone(), InstanceTarget::Shared));
+        let ada = trigger_scope(&[], &["ada".to_string()], false).unwrap();
+        assert_eq!(ada.instances, InstanceTarget::named(vec![InstanceId::new("ada").unwrap()]));
+        assert_eq!(trigger_scope(&feed, &[], true).unwrap().instances, InstanceTarget::EveryInstance);
+        let both = trigger_scope(&feed, &["ada".to_string()], true).unwrap_err();
+        assert!(both.to_string().contains("call one of the two"), "{both}");
+        assert!(trigger_scope(&feed, &["".to_string()], false).is_err(), "an instance must be named");
     }
 }

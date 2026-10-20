@@ -42,7 +42,7 @@ fn rig_project(id: Uuid) -> ProjectDefinition {
 
 async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
     projects
-        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None)
+        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None, None)
         .await
         .expect("register project");
 }
@@ -163,9 +163,9 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     let keys = [ActivationKey::new("door", Owner::Shared)];
     let setup_run_id = Uuid::new_v4();
     assert!(activations.try_begin_activating(project, &keys, setup_run_id, None, None).await.unwrap().is_ok());
-    assert!(activations.record_activation_source(project, setup_run_id, &activated, "v1").await.unwrap());
+    assert!(activations.record_activation_source(project, setup_run_id, &activated, "v1", &Default::default()).await.unwrap());
     activations.end_activating(project, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
-    projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None).await.unwrap();
+    projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None, None).await.unwrap();
     let listed = activations.list(project).await.unwrap();
     assert_eq!(listed[0].program, Some(activated), "a build preserves the code activation used");
     let head = versions.head(project).await.unwrap();
@@ -176,7 +176,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
         .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(run_id), activated_versions: vec![] }, Some("v2"), None)
         .await
         .unwrap();
-    activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::wiped(), SignalsGoing::Kept, None).await.unwrap();
+    activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::refused(), SignalsGoing::Kept, weft_dispatcher::activation_store::Forget::Nothing, weft_dispatcher::activation_store::DownCause::Person, None).await.unwrap();
     assert_eq!(activations.list(project).await.unwrap()[0].program, None);
     let head = versions.head(project).await.unwrap();
     assert_eq!((head.head_version.as_deref(), head.head_run, head.activated_versions), (Some("v2"), None, vec![]));

@@ -493,6 +493,7 @@ async fn registered_in_store(
             Some(&code),
             Some(&version.manifest),
             Some(&settles),
+            Some(&answer.infra_places),
         )
         .await
         .context("register the build")?;

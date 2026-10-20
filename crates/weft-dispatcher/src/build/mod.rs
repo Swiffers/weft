@@ -249,6 +249,7 @@ impl VersionBuilder {
                 implementations: plan.implementations,
                 infra_images,
                 replaced_infra_images: Vec::new(),
+                infra_places: plan.infra_places,
                 worker_image,
                 left_out: Vec::new(),
                 worker_log: None,

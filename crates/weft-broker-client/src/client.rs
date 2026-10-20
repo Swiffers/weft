@@ -820,11 +820,14 @@ impl BrokerSupervisorClient {
         Ok(resp.nodes)
     }
 
-    pub async fn health_protocols(&self, project_id: Uuid) -> Result<SupervisorHealthProtocolsResponse> {
-        self.http.post("/v1/supervisor/health_protocols", &SupervisorHealthProtocolsRequest { project_id }).await
+    /// Where each health rule of the project's copies stands.
+    pub async fn health_state(&self, project_id: Uuid) -> Result<Vec<HealthRuleState>> {
+        let resp: SupervisorHealthStateResponse =
+            self.http.post("/v1/supervisor/health_state", &SupervisorHealthStateRequest { project_id }).await?;
+        Ok(resp.rules)
     }
 
-    /// Replace a project's health protocol state (see
+    /// Replace where a project's health rules stand (see
     /// [`SupervisorSetHealthStateRequest`]).
     pub async fn set_health_state(
         &self,
@@ -961,18 +964,6 @@ impl BrokerSupervisorClient {
         Ok(resp.commands)
     }
 
-    pub async fn trigger_deps(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<SupervisorTriggerDep>> {
-        let req = SupervisorTriggerDepsRequest {
-            project_id,
-        };
-        let resp: SupervisorTriggerDepsResponse =
-            self.http.post("/v1/supervisor/trigger_deps", &req).await?;
-        Ok(resp.deps)
-    }
-
     pub async fn set_applied(
         &self,
         replica: &str,
@@ -984,6 +975,7 @@ impl BrokerSupervisorClient {
         applied_spec_hash: &str,
         addresses: AppliedEndpoints,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         notes: Vec<String>,
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
     ) -> Result<WriteOutcome<SupervisorSetAppliedResponse>> {
@@ -999,6 +991,7 @@ impl BrokerSupervisorClient {
             keep_disks,
             notes,
             units,
+            health_rules,
         };
         self.http
             .post_fenced::<_, SupervisorSetAppliedResponse>("/v1/supervisor/set_applied", &req)
@@ -1018,6 +1011,7 @@ impl BrokerSupervisorClient {
         instance: Option<&weft_core::instance::InstanceId>,
         copy_id: &str,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
     ) -> Result<WriteOutcome<SupervisorSetProvisioningResponse>> {
         let req = SupervisorSetProvisioningRequest {
@@ -1029,6 +1023,7 @@ impl BrokerSupervisorClient {
             copy_id: copy_id.to_string(),
             keep_disks,
             units,
+            health_rules,
         };
         self.http
             .post_fenced::<_, SupervisorSetProvisioningResponse>(
@@ -1055,8 +1050,8 @@ impl BrokerSupervisorClient {
     }
 
     /// Enqueue a dispatcher-targeted lifecycle command
-    /// (`Deactivate(...)` | `Reactivate`). Used by HealthProtocol
-    /// action dispatch in the supervisor. Verb-and-payload are
+    /// (`Deactivate(...)` | `Reactivate`). Used by the health rules'
+    /// actions in the supervisor. Verb-and-payload are
     /// typed via `LifecycleSpec`, so the supervisor cannot
     /// accidentally enqueue a supervisor-owned verb.
     pub async fn enqueue_lifecycle(
@@ -1095,12 +1090,14 @@ impl BrokerInfraStateClient {
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         spec_json: serde_json::Value,
+        run_id: weft_core::RunId,
     ) -> Result<i64> {
         let req = InfraEnqueueApplyRequest {
             project_id,
             node_id: node_id.to_string(),
             instance: instance.cloned(),
             spec_json,
+            run_id,
         };
         let resp: InfraEnqueueApplyResponse =
             self.http.post("/v1/infra/enqueue_apply", &req).await?;

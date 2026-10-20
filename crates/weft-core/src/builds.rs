@@ -35,6 +35,12 @@ pub struct BuiltProgram {
     /// before.
     #[serde(rename = "replacedInfraImages", default)]
     pub replaced_infra_images: Vec<String>,
+    /// `place -> hash` of each infra place's own infra (its node, what
+    /// feeds it, their packages; the compiler's `compute_infra_place_hashes`):
+    /// a copy applied from this build carries its place's, and one whose
+    /// place hashes otherwise in the source now is behind it.
+    #[serde(rename = "infraPlaces", default)]
+    pub infra_places: BTreeMap<String, String>,
     /// The worker image's ref, whose build record says which node
     /// packages it left out ([`LeftOut`]). Empty in a version a release
     /// before records wrote down, whose worker could leave nothing out.
@@ -301,12 +307,13 @@ mod tests {
             implementations: [("Llm".to_string(), "h".to_string())].into(),
             infra_images: [("one.db".to_string(), [("db".to_string(), "r/db:1".to_string())].into())].into(),
             replaced_infra_images: vec!["one.db".into()],
+            infra_places: [("one.db".to_string(), "p".to_string())].into(),
             worker_image: "r/weft-worker:b".into(),
             left_out: vec![LeftOutPackage { package: "media".into(), node_types: vec!["Resize".into()], error: "error[E0308]".into() }],
             worker_log: Some("https://log/1".into()),
         };
         let wire = serde_json::to_value(&built).unwrap();
-        for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "replacedInfraImages", "workerImage", "leftOut", "workerLog"] {
+        for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "replacedInfraImages", "infraPlaces", "workerImage", "leftOut", "workerLog"] {
             assert!(wire.get(key).is_some(), "{key} missing from {wire}");
         }
         let back: BuiltProgram = serde_json::from_value(wire.clone()).unwrap();

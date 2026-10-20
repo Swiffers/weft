@@ -446,7 +446,7 @@ async function inPool<T>(items: T[], width: number, work: (item: T) => Promise<v
 	let failure: unknown;
 	const lane = async () => {
 		while (failure === undefined && next < items.length) {
-			const item = items[next++];
+			const item = items[next++]!;
 			try {
 				await work(item);
 			} catch (e) {

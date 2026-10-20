@@ -65,20 +65,23 @@ export class Sha256 {
 		const w = this.w;
 		for (let i = 0; i < 16; i++) {
 			const j = at + i * 4;
-			w[i] = (bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3];
+			w[i] = (bytes[j]! << 24) | (bytes[j + 1]! << 16) | (bytes[j + 2]! << 8) | bytes[j + 3]!;
 		}
 		for (let i = 16; i < 64; i++) {
-			const a = w[i - 15];
-			const b = w[i - 2];
+			const a = w[i - 15]!;
+			const b = w[i - 2]!;
 			const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
 			const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
-			w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+			w[i] = (w[i - 16]! + s0 + w[i - 7]! + s1) | 0;
 		}
-		let [a, b, c, d, e, f, g, h] = this.h;
+		// Fixed-size arrays (8 state words, 64 schedule words, 64 constants),
+		// indexed in range, so every read below is a number.
+		const H = this.h;
+		let a = H[0]!, b = H[1]!, c = H[2]!, d = H[3]!, e = H[4]!, f = H[5]!, g = H[6]!, h = H[7]!;
 		for (let i = 0; i < 64; i++) {
 			const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
 			const ch = (e & f) ^ (~e & g);
-			const t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+			const t1 = (h + S1 + ch + K[i]! + w[i]!) | 0;
 			const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
 			const maj = (a & b) ^ (a & c) ^ (b & c);
 			const t2 = (S0 + maj) | 0;
@@ -91,13 +94,13 @@ export class Sha256 {
 			b = a;
 			a = (t1 + t2) | 0;
 		}
-		this.h[0] += a;
-		this.h[1] += b;
-		this.h[2] += c;
-		this.h[3] += d;
-		this.h[4] += e;
-		this.h[5] += f;
-		this.h[6] += g;
-		this.h[7] += h;
+		H[0] = H[0]! + a;
+		H[1] = H[1]! + b;
+		H[2] = H[2]! + c;
+		H[3] = H[3]! + d;
+		H[4] = H[4]! + e;
+		H[5] = H[5]! + f;
+		H[6] = H[6]! + g;
+		H[7] = H[7]! + h;
 	}
 }

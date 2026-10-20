@@ -110,9 +110,9 @@ pub enum LifecycleWrite {
 pub enum DownCause<'a> {
     /// A person, a program or a resync: they stay down until switched on.
     Person,
-    /// The health loop, over a copy that broke: its auto-recover brings
-    /// them back.
-    Health,
+    /// The health loop, over the copies it found broken (never empty):
+    /// its auto-recover brings them back.
+    Health(&'a [weft_broker_client::protocol::InfraCopy]),
     /// An infra verb over copies their cut reads: its commands are issued
     /// in the same write, and the copies' return brings them back (when
     /// they can return, `TakeDownCommands::copies_can_return`).
@@ -1040,7 +1040,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         // listed stays theirs, never marked to come back.
         let keys: Vec<ActivationKey> = match cause {
             DownCause::Person => keys.to_vec(),
-            DownCause::Health | DownCause::Infra(_) => {
+            DownCause::Health(_) | DownCause::Infra(_) => {
                 let on: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
                     "SELECT a.trigger, a.instance_id FROM trigger_activation a \
                      WHERE a.project_id = $1 AND a.status = 'active' AND {KEYS_JOIN} FOR UPDATE"
@@ -1062,7 +1062,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         // once the triggers reading their copies are down.
         let (went_down, commands) = match cause {
             DownCause::Person => (None, Vec::new()),
-            DownCause::Health => (Some(WentDown::Health), Vec::new()),
+            DownCause::Health(_) => (Some(WentDown::Health), Vec::new()),
             DownCause::Infra(commands) => match commands.issue_in(&mut tx, project_id, &tokens).await? {
                 crate::infra_lifecycle_command::Issued::Commands(ids) => {
                     let first_command = *ids.first().ok_or_else(|| anyhow::anyhow!("an infra take-down issued no command"))?;
@@ -1339,7 +1339,7 @@ impl ActivationStoreOps for FakeActivationStore {
     ) -> anyhow::Result<LifecycleWrite> {
         let went_down = match cause {
             DownCause::Person => None,
-            DownCause::Health => Some(weft_broker_client::activation::WentDown::Health),
+            DownCause::Health(_) => Some(weft_broker_client::activation::WentDown::Health),
             DownCause::Infra(_) => anyhow::bail!("the in-memory store issues no infra command; an infra take-down needs Postgres"),
         };
         if self.building.read().await.contains(&project_id) {

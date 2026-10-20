@@ -399,8 +399,9 @@ async fn export(
 
 /// What activating this program on `client`'s install would refuse of its
 /// connection picks, each gap as the line that says how to fix it: the
-/// deploy workflow's activation refuses the program until they are fixed,
-/// and that is a late place to find out. The install answers with
+/// deploy workflow's `weft resync` refuses to move the triggers that are
+/// on onto the new version until they are fixed, and so does `weft
+/// activate` turning them on, and both are late places to find out. The install answers with
 /// activation's own check, run on this machine's compile of the program
 /// (the install may not have built it yet). A program that does not
 /// compile, or an install that cannot answer, come back as one line saying
@@ -426,7 +427,10 @@ fn print_unpicked(unpicked: &[String], target: &str) {
         println!("connections: every connection the program reads is picked on {target}");
         return;
     }
-    println!("the deploy workflow cannot turn the program on until these are fixed on {target} (add `--on {target}`):");
+    println!(
+        "until these are fixed on {target}, the deploy workflow's resync refuses to move the triggers that are on \
+         onto the new version, and `weft activate --on {target}` refuses to turn them on (add `--on {target}` to each fix below):"
+    );
     for line in unpicked {
         println!("  {line}");
     }

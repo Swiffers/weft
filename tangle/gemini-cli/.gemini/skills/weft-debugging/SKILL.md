@@ -13,7 +13,9 @@ whole journal. You read in this order and stop when you hold the failing
 node and the wrong value.
 
 - **If you want to know what ran, or whether your trigger fired since the
-  change**: `weft runs --limit 10 --phase fire`. One line per run:
+  change**: `weft runs --limit 10 --phase fire` (`--node <trigger>` for one
+  trigger's runs, `--since 10m` for the recent ones, `--status failed` for
+  the ones that broke). One line per run:
   run id, status (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`), phase, the
   start time in UTC, the project id, the entry node (the trigger that fired), the tags. An
   activate, a resync or an infra start creates setup runs, phases
@@ -44,16 +46,31 @@ node and the wrong value.
   screen, not stored short. `weft events <run-id> --node <id> --full` prints
   it whole, and `--json` gives you the replay rows for `grep` or `jq` (their field names are camelCase, like `runId` and `atUnix`, and a kind is a snake_case value, like `node_skipped`). No
   value a run recorded is unreadable, so you never report one as unreadable.
+- **If a client says it missed part of a stream or a socket's messages**:
+  `weft events <run-id> --kind caller` is the conversation with its caller.
+  A `caller_window` line carrying `dropped=12,13 (the caller read too slowly
+  and never received these messages)` means the trigger's `whenCallerIsSlow`
+  let them go; under `block` that never happens. A `caller_disconnected` line
+  carrying `dropped=...` names what was still waiting to go out when the
+  exchange ended. The numbers are the messages' offsets, the same `offset`
+  the window lines carry, so `--full` shows what each one held. A
+  `caller_errored` line saying `a chunk was dropped and the exchange went on`
+  is a message the program could not make, skipped because `whenChunkFails`
+  is `drop_chunk`; the rest of the line says why. Every other message the
+  program sent went out to the caller, so if none of these names the missing
+  one, the program never sent it: walk back to the node that should have.
 - **If a node did not run**: its `node_skipped` line carries the reason.
   `did_not_flow`: the node's `_should_flow` said no. `flow_closed`: nothing
   ever answered its `_should_flow`, so walk to whatever drives that wire.
   `required_input_closed` names the input that arrived closed, so walk to
   that node's line. `every_input_closed` and `one_of_group_closed` are the
   same story for a node with no required inputs and for a `@require_one_of`
-  group. `scope_skipped` names the group or loop whose `_should_flow` said
-  no, taking this node with it: walk to that container. (A group input
-  arriving closed is not this: it passes through to the nodes inside that
-  read it, and they carry their own reason.) `wait_skipped`: the node was
+  group. `scope_skipped` names the group or loop that did not run, taking this
+  node with it: walk to that container, whose own reason is its gate
+  saying no, or `every_input_closed` when every wire into it closed with
+  nothing on it. (One group input arriving closed while another brings a
+  value is not this: it passes through to the nodes inside that read it,
+  and they carry their own reason.) `wait_skipped`: the node was
   waiting on a person (a form, a question) and they skipped it, so it
   ends with nothing sent on and what reads it skips: not a bug to chase.
 - **If a `Debug` shows `output=` empty**: correct, a `Debug` has no
@@ -82,7 +99,13 @@ node and the wrong value.
    src/main.weft` re-checks without building. A diagnostic naming the
    catalog (an enrichment error, an unknown field, "a stale base_catalog
    copy") means the stdlib copy lags the installed weft: `weft catalog
-   update`, then re-check, before anything else.
+   update`, then re-check, before anything else. A command refused with
+   `it needs parts of the program that do not compile:` lists each broken
+   part with its file and line, and only those stand between you and the
+   run: fix them, or cut the run so it does not reach them. A part reading
+   `package '<name>' didn't compile: <first error>; its full errors are in
+   the build log: <url>` is a node package the worker was built without:
+   the log at that address has the whole compiler output.
 2. **A run failed.** `weft logs <run-id>` names the node and the error. If
    that is not enough, `weft events <run-id> --node <that node>` shows the
    values that reached it, on its `node_started` line. For the compiler
@@ -104,10 +127,14 @@ node and the wrong value.
    worker exits, and the answer resumes it. The person answers in the
    browser extension (built with `./setup.sh --browser --no-sign`). If
    nobody should have been asked, the bug is the `_should_flow` that routed
-   into the person.
+   into the person. A run waiting on an outside job (a render, a crawl) is
+   suspended the same way, and `weft node-state <run-id> <node>` prints the
+   last answer its wait read from the service (`last answer: ...`), which the
+   editor also shows on the waiting node while you follow the run.
 5. **Cancelled.** Read the reason on `run_cancelled`. `Cancelled by
-   user` is a person: the Stop button, `weft stop`, a project deactivate or
-   wipe, or a cancel through a signal token. `Stopped by run <run-id>
+   user` is a person or a take-down: the Stop button, `weft stop`, a
+   take-down that cancelled the runs going (`--running cancel`) or dropped
+   the paused ones (`--held drop`), `weft rm`, or a cancel through a signal token. A run the infra health check stopped says so (`the infra health check found 'db' broken and took down the triggers that read it, stopping their runs`), and `Stopped by run <run-id>, which took its triggers down` means a program's own run took those triggers down: look at that run. `Stopped by run <run-id>
    (tag <tag>)` means another run asked the engine to stop everything
    carrying that tag: look at **that** run, and if no sibling was supposed
    to stop this one, the bug is in whichever node tagged and stopped it
@@ -119,8 +146,13 @@ node and the wrong value.
    received (`theirs has value, still waiting on go`): walk to whatever
    should have driven the missing port.
 7. **Nothing ran.** Nothing reached the branch: check that the trigger that
-   should have fired is activated, then walk from it down to the first
-   `_should_flow` or required input that closed. If it fired and no run
+   should have fired is on, then walk from it down to the first
+   `_should_flow` or required input that closed. If the trigger is off,
+   `weft status` says on its line whether it was taken down with its infra
+   or by the health check, and adds `held back: <why>` when it cannot come
+   back yet; one that only reads `off` was turned off by hand. The
+   `weft-running` skill, "Taking triggers down, and bringing them back",
+   says what brings each one back. If the trigger fired and no run
    came of it, `weft status` says what the event waits on, under
    `triggers:`:
    - `<N> fires wait until the instance's values change: <reason>`, `...
@@ -135,7 +167,7 @@ node and the wrong value.
      again.
 
    A fire waiting for room (a limit reached, permits taken) or for its
-   parked trigger gets no line there. One waiting for room tries again by
+   trigger to come back on gets no line there. One waiting for room tries again by
    itself, waiting longer each time, up to 5 minutes; one waiting for its
    trigger is handed over when the trigger is activated again.
 8. **Too much is running.** The one failure nobody reports, because nothing
@@ -179,8 +211,12 @@ node and the wrong value.
    busy or limiting calls is still retried. If you want either kind back
    and its connection was the trouble, reconnecting that connection is
    enough: weft brings back every trigger that uses it. For anything else,
-   a setup error for instance, fix it and run `weft resync`. `weft
-   activate` does not bring it back, because the trigger still counts as on.
+   a setup error for instance, fix it: when the fix changed the program,
+   `weft resync` sets the trigger up again on the new version; when it did
+   not (a public address opened, say), a resync finds nothing behind and
+   does nothing, so `weft deactivate --trigger <node>` then `weft activate
+   --trigger <node>` sets it up again. A plain `weft activate` does not: the
+   trigger still counts as on.
 10. **[the daemon] unreachable** (connection refused, an editor button that
    does nothing). You read, never restart: `weft daemon status` and `weft
    daemon logs --tail 50` say what [the daemon] is doing. Then you tell the
@@ -233,16 +269,13 @@ node and the wrong value.
      again in <s> s)`, 5 seconds after a first failure and 10 after a
      second, or, at the third, ``(failed 3 times in a row, so the supervisor
      stopped trying; `weft infra look` tries again)``. A pass that goes
-     through starts the count again from zero. A health protocol
-     (what the supervisor does about a sick unit: restart it, take down the
-     triggers that read it) that failed 3 times shows in this line as `its
-     health protocol '<name>' failed 3 times: <error>`. Once you have fixed
-     what the error names, run `weft infra look`: it starts a fresh round of
-     three tries and gives every health protocol that gave up another go.
-     The units reporting a change, all of them turning healthy, or you
-     starting, stopping, upgrading or terminating the infra also give a
-     protocol that gave up another go. The line goes once a try over the
-     infra goes through.
+     through starts the count again from zero. A health rule whose action
+     (taking down the triggers that reach a broken copy, or bringing them
+     back) kept failing shows in this line as `its health rule '<name>' on
+     <copy> failed <n> times: <error>`. Once you have fixed what the error
+     names, run `weft infra look`: it starts a fresh round of tries and gives
+     every health rule that gave up another go. The line goes once a try over
+     the infra goes through.
    - `weft's supervisor could not delete what the infra host still holds
      of removed projects (their disks included)`: the error names each
      removed project, what went wrong and what happens next. On the user's
@@ -262,8 +295,8 @@ node and the wrong value.
    - `weft could not repair work of this project whose holder went away`:
      weft tries again twice within half a minute, then whenever it next
      looks at lapsed work, and the error says what fixes it by hand.
-   - `the listener still serves triggers of this project whose hibernation
-     ended, and what they pick up is refused`: the error names each node and
+   - `the listener still serves triggers of this project whose door
+     stopped taking work, and what they pick up is refused`: the error names each node and
      why it was kept. weft tells the listener to let go of them again at the
      next change of a trigger.
    - `a resync of this project stopped with triggers it took down still

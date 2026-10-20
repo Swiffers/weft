@@ -753,9 +753,9 @@
     impl crate::caller_conn::CallerJournalSink for Unkept {
         fn connected(&self, _: RunId, _: u64, _: weft_core::signal::Protocol) {}
         fn inbound(&self, _: RunId, _: u64, _: &weft_core::caller::InboundMessage) {}
-        fn outbound(&self, _: RunId, _: u64, _: &weft_core::caller::OutboundChunk, _: bool) {}
+        fn outbound(&self, _: RunId, _: u64, _: &weft_core::caller::OutboundChunk, _: bool, _: Option<u64>) {}
         fn errored(&self, _: RunId, _: u64, _: &str) {}
-        fn disconnected(&self, _: RunId, _: u64, _: &str) {}
+        fn disconnected(&self, _: RunId, _: u64, _: &str, _: &[u64]) {}
         fn close(&self) {}
     }
 

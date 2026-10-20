@@ -232,7 +232,12 @@ fails naming `weft activate`. `StartInfra`, `StopInfra`, `TerminateInfra`,
 `ActivateTriggers` and `DeactivateTriggers` act on the instance you give
 them in `instance`; left unwired, they act on the program's own copies (the
 shared container of a node not marked `@per_instance`, the shared triggers).
-The instance nodes read the names of infra nodes and triggers you write in
+The ones that take triggers down (`StopInfra`, `TerminateInfra`,
+`DeactivateTriggers`) take the same three answers as `weft deactivate`, as
+inputs: `door` (with `doorForMinutes` for its time limit), `held` and
+`running`, each with the CLI's default when left empty, plus `includeSelf`,
+which cancels this run too when it is one of the runs reached; and `ActivateTriggers` takes `held` the way `weft
+activate --held` does. The instance nodes read the names of infra nodes and triggers you write in
 them at compile time (a name that is not an infra node, or not the kind the
 `instance` input calls for, is refused then); a name arriving on a wire is
 checked only when the run reaches it.
@@ -290,6 +295,39 @@ token, and the old value stops working.
 `InstanceCosts` (or `ctx.costs().instance(id)`) reads what an instance's calls
 cost and whose credential paid each one, with the total; that is how a
 program shows or bills usage per instance. weft only records the cost.
+`run` narrows it to one run (its id from `GetRunId`), and `unpricedCalls`
+counts the calls whose price weft does not know, which `totalUsd` leaves
+out.
+
+If an instance's spending has a ceiling, the program checks it before the
+paid node runs: `CurrentInstance` names the run's instance, `InstanceCosts`
+reads what it has spent, and a `Switch` on the total gates the paid node.
+
+```weft
+who = CurrentInstance
+spent = InstanceCosts { instance: who.instance }
+budget = Switch {
+  value: spent.totalUsd
+  cases: [
+    { "kind": "lt", "value": 5, "port": "under" },
+    { "kind": "otherwise", "port": "over" }
+  ]
+}
+answer = LlmInference { provider: model.provider, prompt: ask.body.text, _should_flow: budget.under }
+```
+
+Tell the user its limits before they rely on it. A cost is recorded when its
+call ends, so two runs of the same instance checking at the same moment both
+read the old total, both pass, and together they can spend past the ceiling
+by what they cost. A call with no known price adds nothing to `totalUsd`, so
+when the ceiling has to hold, add a second `Switch` on `spent.unpricedCalls`
+(`known`, with a case `{ "kind": "equals", "value": 0, "port": "allPriced" }`),
+put both answers into `both = All { under: budget.under, priced:
+known.allPriced }`, and gate the paid node on `both.yes`, so it runs only
+when both hold. And a
+run for no instance (a schedule's tick, say) gets `nobody` from
+`CurrentInstance`, so the check never runs and neither does the paid node:
+give those runs a branch of their own.
 
 ## The ctx calls
 
@@ -299,9 +337,9 @@ something they do not cover calls the ctx directly in a node of its own:
 | Call | What it does |
 |---|---|
 | `ctx.instance()` | Which instance this run is for (the `CurrentInstance` node fires `instance` or `nobody`) |
-| `ctx.infra("bridge").instance(id).start()` / `.request_start()` / `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` / `.wipe(spec, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too |
+| `ctx.infra("bridge").instance(id).start()` / `.request_start()` / `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too. `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
 | `ctx.infra("bridge").copies()` | Every copy of the node: the shared one and each instance's (the `ListInstanceInfra` node) |
-| `ctx.triggers().instance(id).activate()` / `.deactivate(spec, stop_self)` | An instance's triggers (`.only([..])` narrows) |
+| `ctx.triggers().instance(id).activate(held)` / `.deactivate(take_down, stop_self)` | An instance's triggers (`.only([..])` narrows, `.all_instances()` takes every instance's); `held`, `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
 | `ctx.values().instance(id).get()` / `.set(node, field, value)` / `.clear(node, field)` / `.apply()` / `.forget()` | What was given for an instance's `@instance_filled` fields: read (the `GetInstanceValues` node), change in one go (the `SetInstanceValues` node; `apply()` returns the triggers it set up again), or forget all |
 | `ctx.connections().instance(id).list()` / `.forget()` | An instance's connections (forgetting takes the values naming them) |
 | `ctx.instances().list()` | Every instance weft holds anything for, with counts and states and the events waiting on a field not yet filled (the `ListInstances` node) |
@@ -347,14 +385,20 @@ instance's own tokens are untouched.
 
 ## Checking your work
 
-`weft infra status` lists each instance's container on its own line; `weft
+`weft instances` lists every instance weft holds anything for, with how
+many of its triggers are on, how many of its infra copies are up, and its
+last run. `weft infra status` lists each instance's container on its own line; `weft
 status` lists every infra node the program declares under `infra:` (a
 `@per_instance` one with how many instances have a container, one never
 started as `not started`), each instance's container under `instance infra:`,
 and each instance's triggers under `triggers:`, with the events a trigger
 holds for a missing field. A plain `weft activate` turns on the shared
 triggers and names the per-instance ones it left off; `weft activate
---instance <id>` (or `ActivateTriggers` given the instance) turns those on. `weft
+--instance <id>` (or `ActivateTriggers` given the instance) turns those on,
+and `--all-instances` every instance's. Every lifecycle command acts on the
+shared triggers alone unless told otherwise, so after a change, `weft resync
+--all` is what brings every instance onto it (the `weft-running` skill,
+"Taking triggers down, and bringing them back"). `weft
 runs --instance <id>` lists an instance's runs. To try the per-instance
 path yourself, start a container (`weft infra start --instance test-1`), turn
 on its triggers (`weft activate --instance test-1`), and run with `--instance

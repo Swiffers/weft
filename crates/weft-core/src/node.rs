@@ -1081,15 +1081,21 @@ impl NodeMetadata {
         if features.live_connection.is_some() && features.called_from_outside {
             return Err("features.liveConnection already means somebody outside calls the trigger; remove features.calledFromOutside".into());
         }
+        if features.live_connection.is_some() && features.journal_settings {
+            return Err("features.liveConnection already gives the trigger the journal settings; remove features.journalSettings".into());
+        }
         let mut added: Vec<InputSpec> = Vec::new();
         if features.is_trigger {
             added.extend(crate::signal::EntryLimits::node_inputs(features.has_outside_caller()));
             added.extend(crate::run_settings::RunSettings::node_inputs(features.live_connection.is_some()));
         }
+        if features.live_connection.is_some() || features.journal_settings {
+            added.extend(crate::stream_journal::JournalPolicy::node_inputs());
+        }
         for name in added.iter().map(|i| &i.name) {
             if self.inputs.iter().any(|i| i.name == *name) {
                 return Err(format!(
-                    "input '{name}' is a setting the language gives every trigger that \
+                    "input '{name}' is a setting the language gives every node that \
                      needs it; remove it from this node's inputs"
                 ));
             }
@@ -2585,6 +2591,15 @@ pub struct NodeFeatures {
     /// caller and does not either. Backend-only, like `liveConnection`.
     #[serde(default, rename = "calledFromOutside", skip_serializing_if = "std::ops::Not::not")]
     pub called_from_outside: bool,
+    /// The node opens a bus whose recording its users may tune, so the
+    /// language gives it the journal settings (`journalEphemeral`,
+    /// `journalWindowMs`, [`crate::stream_journal::JournalPolicy::node_inputs`])
+    /// and the node hands what they set to the bus it opens
+    /// (`BusOptions { journal: ctx.journal_policy()?, .. }`). A
+    /// `liveConnection` trigger has them already and never declares it.
+    /// Backend-only, like `liveConnection`.
+    #[serde(default, rename = "journalSettings", skip_serializing_if = "std::ops::Not::not")]
+    pub journal_settings: bool,
     /// Webview hint: render the node's latest output as a JSON
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
@@ -4697,8 +4712,29 @@ mod input_semantics_tests {
         let mut expected: Vec<String> = crate::signal::EntryLimits::NODE_FIELDS.iter().map(|s| s.to_string()).collect();
         // A trigger holding a caller also gets whether its run may outlive them.
         expected.extend(crate::run_settings::RunSettings::node_inputs(true).into_iter().map(|i| i.name));
+        // And the journal settings of the conversation it holds.
+        let journal = || crate::stream_journal::JournalPolicy::node_inputs().into_iter().map(|i| i.name);
+        expected.extend(journal());
         assert_eq!(names(&live), expected);
         live.validate_semantics().expect("the added inputs pass the semantic rules");
+
+        // A node that opens a bus its users tune gets the journal settings
+        // and nothing else; a live trigger has them already and says so.
+        let mut opens_bus = metadata_with(vec![]);
+        opens_bus.features.journal_settings = true;
+        opens_bus.add_language_ports().unwrap();
+        assert_eq!(names(&opens_bus), journal().collect::<Vec<_>>());
+        opens_bus.validate_semantics().expect("the journal settings pass the semantic rules");
+        let mut twice = metadata_with(vec![]);
+        twice.features.is_trigger = true;
+        twice.features.live_connection = Some(LiveWire::Websocket);
+        twice.features.journal_settings = true;
+        assert!(twice.add_language_ports().unwrap_err().contains("journalSettings"));
+        let own = crate::stream_journal::JournalPolicy::node_inputs().remove(0);
+        let mut declares_journal = metadata_with(vec![own]);
+        declares_journal.features.journal_settings = true;
+        let e = declares_journal.add_language_ports().unwrap_err();
+        assert!(e.contains("journalEphemeral") && e.contains("remove it"), "{e}");
 
         let mut not_a_trigger = metadata_with(vec![]);
         not_a_trigger.features.live_connection = Some(LiveWire::Http);

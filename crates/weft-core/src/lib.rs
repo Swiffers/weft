@@ -86,9 +86,10 @@ pub mod signed_token;
 // aliases are runtime-gated, inside the module.
 pub mod storage;
 // What every channel's messages look like once written down: the one
-// trim rule and the one meaning of "ephemeral" a bus and a live caller
-// conversation both answer to. Runtime-only: it records bus payloads.
-#[cfg(feature = "runtime")]
+// recording policy (mode and window), the one trim rule, and the one
+// meaning of "ephemeral" a bus and a live caller conversation both answer
+// to. The policy is pure (the language gives nodes its settings); what
+// records a payload is runtime-gated inside the module.
 pub mod stream_journal;
 pub mod tag;
 pub mod take_down;
@@ -187,7 +188,7 @@ pub use reqwest;
 
 #[cfg(feature = "runtime")]
 pub use bus::{
-    BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusMode, BusOptions,
+    BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusOptions,
     BusRegistry, CursorError, RegisterError, SendError, WaitError,
 };
 #[cfg(feature = "runtime")]

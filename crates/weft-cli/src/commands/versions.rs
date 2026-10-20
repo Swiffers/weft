@@ -656,6 +656,19 @@ pub struct OutsideFacts {
 
 pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
     let mut facts = OutsideFacts::default();
+    // The program's messages the caller never received, and why: a
+    // window names those a caller reading too slowly lost (possibly ones
+    // an earlier window carried), the row saying the caller left names
+    // those still waiting then. All are known before any message is
+    // written down.
+    let dropped: BTreeMap<u64, &str> = rows
+        .iter()
+        .flat_map(|row| match &row.event {
+            DispatcherEvent::CallerWindow { dropped, .. } => dropped.iter().map(|o| (*o, "caller_too_slow")).collect(),
+            DispatcherEvent::CallerDisconnected { dropped, .. } => dropped.iter().map(|o| (*o, "exchange_ended")).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
     // node -> frames key -> the firing input the person saw.
     let mut inputs: BTreeMap<(String, String), Value> = BTreeMap::new();
     for row in rows {
@@ -681,10 +694,16 @@ pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
             // its own `direction`, which is what makes the answer
             // readable beside the request. Recording the window rows
             // whole instead would put the journal's batching into a
-            // file a person reads.
+            // file a person reads. A message the caller never received
+            // says so and why (`"dropped": "caller_too_slow"` or
+            // `"exchange_ended"`).
             DispatcherEvent::CallerWindow { messages, .. } => {
                 for message in messages {
-                    facts.caller.push(serde_json::to_value(message).context("write down a caller message")?);
+                    let mut written = serde_json::to_value(message).context("write down a caller message")?;
+                    if let Some(why) = dropped.get(&message.offset) {
+                        written["dropped"] = Value::String((*why).to_string());
+                    }
+                    facts.caller.push(written);
                 }
             }
             _ => {}
@@ -1264,6 +1283,14 @@ mod tests {
                 { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payloadByteSize": 4, "atUnix": 1 },
                 { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payloadByteSize": 5, "terminal": true, "atUnix": 1 },
             ], "totals": [] })),
+            // A later window whose chunk pushed the first one out before
+            // the caller read it.
+            row(json!({ "kind": "caller_window", "firstOffset": 2, "lastOffset": 3, "messages": [
+                { "offset": 2, "direction": "outbound", "payload": { "kind": "json", "data": "late" }, "payloadByteSize": 6, "atUnix": 1 },
+                { "offset": 3, "direction": "outbound", "payload": { "kind": "json", "data": "later" }, "payloadByteSize": 7, "atUnix": 1 },
+            ], "totals": [], "dropped": [1] })),
+            // The caller left with the last one still waiting to go out.
+            row(json!({ "kind": "caller_disconnected", "offset": 4, "reason": "caller hung up", "dropped": [3] })),
         ];
         let facts = outside_facts(&rows).unwrap();
         assert_eq!(facts.answers.len(), 3, "one per wait that ended; a boundary re-fire is none");
@@ -1274,10 +1301,16 @@ mod tests {
         assert_eq!(facts.answers[2].node, "held");
         assert_eq!(facts.answers[2].ended, AwaitEnd::GaveUp { error: "node 'held' gave up its wait: quiet".into() });
         assert_eq!(facts.answers[2].question, Some(json!({ "prompt": "still there?" })), "a wait given up keeps the question it asked");
-        assert_eq!(facts.caller.len(), 2, "both halves of the exchange, request AND answer");
+        assert_eq!(facts.caller.len(), 4, "both halves of the exchange, request AND answer");
         let directions: Vec<&str> =
             facts.caller.iter().filter_map(|m| m["direction"].as_str()).collect();
-        assert_eq!(directions, vec!["inbound", "outbound"], "each message says which way it went");
+        assert_eq!(directions, vec!["inbound", "outbound", "outbound", "outbound"], "each message says which way it went");
+        let dropped: Vec<Option<&str>> = facts.caller.iter().map(|m| m.get("dropped").and_then(Value::as_str)).collect();
+        assert_eq!(
+            dropped,
+            vec![None, Some("caller_too_slow"), None, Some("exchange_ended")],
+            "a message the record names as never received says so, and why"
+        );
     }
 
     #[test]

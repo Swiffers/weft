@@ -215,6 +215,24 @@ impl RuleInputs {
     pub fn units_of(&self, copy: &InfraCopy) -> &[UnitReading] {
         self.copies.iter().find(|c| c.copy == *copy).map(|c| c.units.as_slice()).unwrap_or_default()
     }
+
+    /// The rule `on` names, as its copy's node runs it, and whether it
+    /// holds for the copy now. `None` when this look did not see the copy,
+    /// or its node no longer runs a rule of that name.
+    pub fn rule_on(&self, on: &RuleOn) -> Option<(&HealthRule, bool)> {
+        let copy = self.copies.iter().find(|c| c.copy == on.copy)?;
+        let rule = copy.rules.iter().find(|r| r.name == on.rule)?;
+        Some((rule, rule.when.holds(&self.reading(copy))))
+    }
+
+    /// Whether a bring-back rule of `copy`'s node holds for it now: its
+    /// node's own word that the copy came back.
+    pub fn brought_back(&self, copy: &InfraCopy) -> bool {
+        self.copies.iter().find(|c| c.copy == *copy).is_some_and(|c| {
+            let reading = self.reading(c);
+            c.rules.iter().any(|rule| rule.action == HealthAction::BringBack && rule.when.holds(&reading))
+        })
+    }
 }
 
 /// One rule on one copy: what its state is kept by. Two nodes' rules of
@@ -251,7 +269,8 @@ pub struct Fire<'a> {
 }
 
 impl Fire<'_> {
-    /// How long the action may take: the longest of its rules' timeouts.
+    /// How long queueing the action may take: the longest of its rules'
+    /// timeouts.
     pub fn timeout(&self) -> Duration {
         let secs = self.rules.iter().map(|(_, rule)| rule.timeout_seconds.get()).max().unwrap_or_default();
         Duration::from_secs(u64::from(secs))
@@ -262,18 +281,19 @@ impl Fire<'_> {
     ///
     /// - a take-down aims at exactly the copies whose rule fired: the
     ///   dispatcher takes down the live triggers whose cut contains one;
-    /// - a bring-back names the copies still broken ([`still_broken`]):
-    ///   the dispatcher brings back what the health check took down whose
-    ///   cut contains none of them.
-    pub fn plan(&self, inputs: &RuleInputs) -> LifecycleSpec {
+    /// - a bring-back names the copies still broken ([`still_broken`],
+    ///   `took_down` being the copies whose take-down took something down
+    ///   or is queued): the dispatcher brings back what the health check
+    ///   took down whose cut contains none of them.
+    pub fn plan(&self, inputs: &RuleInputs, took_down: &BTreeSet<InfraCopy>) -> LifecycleSpec {
         match self.action {
             HealthAction::TakeDownTriggers => {
                 let broken: BTreeSet<InfraCopy> = self.rules.iter().map(|(on, _)| on.copy.clone()).collect();
                 LifecycleSpec::Deactivate(TakeDownReaders { broken: broken.into_iter().collect() })
             }
-            HealthAction::BringBack => {
-                LifecycleSpec::Reactivate(RestoreReaders { still_broken: still_broken(inputs).into_iter().collect() })
-            }
+            HealthAction::BringBack => LifecycleSpec::Reactivate(RestoreReaders {
+                still_broken: still_broken(inputs, took_down).into_iter().collect(),
+            }),
         }
     }
 }
@@ -290,16 +310,21 @@ pub fn next_fire<'a>(inputs: &'a RuleInputs, fired: &BTreeSet<RuleOn>, waiting: 
     })
 }
 
-/// Pure: the seen copies no `bring_back` rule of their node holds for:
-/// what a bring-back keeps the readers of down. A copy whose node runs no
-/// bring-back rule stays here, so only a person brings its readers back.
-pub fn still_broken(inputs: &RuleInputs) -> BTreeSet<InfraCopy> {
+/// Pure: the seen copies a bring-back keeps the readers of down: those
+/// no bring-back rule of their node holds for, when either their node
+/// runs one (its own rules say the copy has not come back) or the copy is
+/// in `took_down` (a take-down of it took something down, or is queued,
+/// and nothing brought the copy back since). So a copy whose node runs no
+/// bring-back rule keeps down what its own take-down took down, until a
+/// person brings it back, and never holds back a trigger another copy's
+/// rule took down: however it is doing, nothing asked it to.
+pub fn still_broken(inputs: &RuleInputs, took_down: &BTreeSet<InfraCopy>) -> BTreeSet<InfraCopy> {
     inputs
         .copies
         .iter()
         .filter(|copy| {
-            let reading = inputs.reading(copy);
-            !copy.rules.iter().any(|rule| rule.action == HealthAction::BringBack && rule.when.holds(&reading))
+            let has_bring_back = copy.rules.iter().any(|rule| rule.action == HealthAction::BringBack);
+            (has_bring_back || took_down.contains(&copy.copy)) && !inputs.brought_back(&copy.copy)
         })
         .map(|copy| copy.copy.clone())
         .collect()
@@ -309,17 +334,7 @@ pub fn still_broken(inputs: &RuleInputs) -> BTreeSet<InfraCopy> {
 /// copy unseen, or the rule gone from its node, included), so the copy's
 /// next episode fires it again.
 pub fn rearm(fired: &mut BTreeSet<RuleOn>, inputs: &RuleInputs) {
-    fired.retain(|on| {
-        inputs.copies.iter().find(|copy| copy.copy == on.copy).is_some_and(|copy| {
-            let reading = inputs.reading(copy);
-            copy.rules.iter().any(|rule| rule.name == on.rule && rule.when.holds(&reading))
-        })
-    });
-}
-
-/// Pure: is every unit healthy now: fully ready, and none declared flaky?
-pub fn all_units_healthy(units: &[UnitReading]) -> bool {
-    units.iter().all(|u| u.ready && !u.flaky)
+    fired.retain(|on| inputs.rule_on(on).is_some_and(|(_, holds)| holds));
 }
 
 #[cfg(test)]
@@ -538,7 +553,7 @@ mod tests {
         let latched = inputs(vec![copy(ada_svc.clone(), false, true), copy(of("svc", "bob"), true, false), copy(shared("db"), true, false)]);
         let f = next_fire(&latched, &BTreeSet::new(), |_| false).expect("take down");
         assert_eq!(f.action, HealthAction::TakeDownTriggers);
-        assert_eq!(f.plan(&latched), LifecycleSpec::Deactivate(TakeDownReaders { broken: vec![ada_svc] }));
+        assert_eq!(f.plan(&latched, &BTreeSet::new()), LifecycleSpec::Deactivate(TakeDownReaders { broken: vec![ada_svc] }));
         let quiet = RuleInputs { listening: false, ..latched };
         assert!(fire(&quiet, &BTreeSet::new()).is_none(), "nothing listens: nothing to take down");
     }
@@ -596,14 +611,14 @@ mod tests {
         let f = next_fire(&look, &BTreeSet::new(), |_| false).expect("bring back");
         assert_eq!(f.action, HealthAction::BringBack);
         assert_eq!(f.rules.iter().map(|(on, _)| on.clone()).collect::<Vec<_>>(), vec![on(&bob, BRING_BACK), on(&shared("db"), BRING_BACK)]);
-        assert_eq!(f.plan(&look), LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada.clone()] }));
+        assert_eq!(f.plan(&look, &BTreeSet::new()), LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada.clone()] }));
 
         // Fired for bob and db: it fires again once ada heals, for her.
         let fired = BTreeSet::from([on(&shared("db"), BRING_BACK), on(&bob, BRING_BACK)]);
         assert!(fire(&look, &fired).is_none());
         let healed = RuleInputs { copies: vec![copy(ada.clone(), true, false), copy(bob, true, false), copy(shared("db"), true, false)], ..look };
         assert_eq!(fire(&healed, &fired), Some((HealthAction::BringBack, vec![on(&ada, BRING_BACK)])));
-        assert!(still_broken(&healed).is_empty());
+        assert!(still_broken(&healed, &BTreeSet::new()).is_empty());
     }
 
     /// A take-down goes before a bring-back in the same look: the
@@ -614,18 +629,31 @@ mod tests {
         assert_eq!(fire(&look, &BTreeSet::new()).map(|(action, _)| action), Some(HealthAction::TakeDownTriggers));
     }
 
-    /// A copy whose node runs no bring-back rule counts as still broken:
-    /// only a person brings its readers back.
+    /// A copy whose node runs no bring-back rule holds down only what its
+    /// own take-down took down (`took_down`): healthy or not, it never
+    /// holds back a trigger another copy's rule took down. Here `db`
+    /// (the built-in rules) recovered, `cache` runs no rules at all and
+    /// `keep` only a take-down: neither holds anything down until a
+    /// take-down of it took something down, and then only a person
+    /// brings that back.
     #[test]
-    fn a_copy_with_no_bring_back_holds_its_readers_down() {
+    fn a_copy_with_no_bring_back_holds_down_only_what_it_took_down() {
+        let no_rules = CopyView { copy: shared("cache"), rules: Vec::new(), units: vec![unit("cache", false, true)] };
         let keep_down = CopyView {
-            copy: shared("db"),
+            copy: shared("keep"),
             rules: vec![rule(TAKE_DOWN, HealthCondition::UnitFlaky { unit: None }, HealthAction::TakeDownTriggers)],
-            units: vec![unit("db", true, false)],
+            units: vec![unit("keep", true, false)],
         };
-        let look = RuleInputs { taken_down_by_health: true, ..inputs(vec![keep_down, copy(shared("svc"), true, false)]) };
-        let f = next_fire(&look, &BTreeSet::new(), |_| false).expect("svc brings back");
-        assert_eq!(f.plan(&look), LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![shared("db")] }));
+        let look = RuleInputs { taken_down_by_health: true, ..inputs(vec![copy(shared("db"), true, false), no_rules, keep_down]) };
+        let f = next_fire(&look, &BTreeSet::new(), |_| false).expect("db brings back");
+        assert_eq!(f.rules.iter().map(|(on, _)| on.clone()).collect::<Vec<_>>(), vec![on(&shared("db"), BRING_BACK)]);
+        assert_eq!(f.plan(&look, &BTreeSet::new()), LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![] }));
+        let took_down = BTreeSet::from([shared("keep"), shared("db")]);
+        assert_eq!(
+            f.plan(&look, &took_down),
+            LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![shared("keep")] }),
+            "db came back by its own rule; keep has no way back but a person"
+        );
     }
 
     /// A rule backing off or given up on a copy keeps that copy out of the
@@ -675,16 +703,5 @@ mod tests {
         let nothing_down = RuleInputs { taken_down_by_health: false, ..now };
         rearm(&mut fired, &nothing_down);
         assert_eq!(fired, BTreeSet::from([on(&bob, TAKE_DOWN)]));
-    }
-
-    // ---------- all_units_healthy ----------
-
-    #[test]
-    fn healthy_means_every_unit_ready_and_none_flaky() {
-        assert!(all_units_healthy(&[unit("a", true, false), unit("b", true, false)]));
-        assert!(!all_units_healthy(&[unit("a", true, false), unit("b", false, false)]));
-        assert!(!all_units_healthy(&[unit("a", true, true)]), "ready inside the recovery window is not healthy");
-        // No expected-running unit keeps nothing armed.
-        assert!(all_units_healthy(&[]));
     }
 }

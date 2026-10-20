@@ -12,7 +12,7 @@
 # daemon there, `weft test-node` also runs cargo, which fetches crates and
 # writes its build outside the project, and pnpm fetches packages. A command line runs
 # outside the sandbox only when every command in it is allowed here, so
-# `weft resync --mode wipe && curl ...` still goes to the sandbox and asks.
+# `weft resync && curl ...` still goes to the sandbox and asks.
 # A rule matches the start of the command, so `weft build` also covers
 # `weft build --referenced`, and a verb also covers `--on <target>` written
 # after it (`weft status --on prod`); a flag written before the verb
@@ -25,7 +25,7 @@
 # specialist may run at all is that list. A deleting verb here (`weft rm`,
 # `clean`, `prune`) is on no specialist's list, so only Tangle reaches it.
 # They mirror the Claude Code copy's allow list, so a verb a skill names that
-# is not on that list (`weft infra cancel`, `look`, `node-terminate`,
+# is not on that list (`weft infra cancel`,
 # `weft workers`) is not here either: it asks, a specialist reports it
 # BLOCKED, and Tangle runs it where the approval reaches the user.
 
@@ -47,7 +47,7 @@ prefix_rule(
     pattern = ["weft", [
         "validate", "parse", "describe-nodes", "status", "ps", "runs",
         "events", "logs", "follow", "tree", "diff", "examples", "options",
-        "node-test-hash",
+        "node-test-hash", "node-state", "wait", "instances",
     ]],
     decision = "allow",
     justification = "Tangle's reads: the compiler, the catalog, and what runs and ran",
@@ -63,7 +63,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["weft", [
         "build", "run", "test-node", "catalog", "activate", "cancel-activate",
-        "cancel-build", "cancel-running", "stop", "checkpoint", "branch",
+        "cancel-build", "stop", "checkpoint", "branch",
         "freeze", "bake", "wake", "deactivate", "resync", "new",
     ]],
     decision = "allow",
@@ -71,7 +71,7 @@ prefix_rule(
     match = [
         "weft run --group triage={\"text\":\"hi\"}",
         "weft test-node Gmail",
-        "weft resync --mode wipe",
+        "weft resync --all",
         "weft catalog update",
         "weft new my-project",
     ],
@@ -112,7 +112,7 @@ prefix_rule(
 # its disks, except the disks a node keeps on terminate.
 prefix_rule(
     pattern = ["weft", "infra", [
-        "start", "stop", "upgrade", "status", "node-stop", "show", "press",
+        "start", "stop", "upgrade", "status", "look", "show", "press",
         "env", "rebake", "logs", "list-doors", "--json", "terminate",
     ]],
     decision = "allow",

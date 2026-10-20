@@ -10,15 +10,19 @@
 //!      (`weft_core::infra::health`), ordered (condition, action) pairs
 //!      read on that copy's own units; its first rule that holds and has
 //!      not fired is its pick, and one action per look serves every copy
-//!      whose pick asks for it. While a project's action is in flight, the
-//!      next look re-checks once it settles.
+//!      whose pick asks for it. The action is a command the dispatcher
+//!      runs; its rules count as fired while it runs, and the look after
+//!      it ends (the dispatcher asks for one as it does) reads what it
+//!      did, or counts its failure (or its running past the rule's
+//!      timeout) against the rules and tries again.
 //!
 //! Everything a look decides lives in the database, never in this
 //! process: a unit's latch and the window it is in on its row
 //! (`UnitRuntime`), whether each rule fired on each copy and how its
 //! failures stand in `infra_health_rule` (`HealthRuleState`). So any
 //! process carries on where the last look left off, and the broker knows
-//! when the next look is due (a window ending, a rule's retry) and books
+//! when the next look is due (a window ending, a rule's retry, a queued
+//! command's deadline) and books
 //! it for a supervisor that scales to zero.
 //!
 //! When it looks: in one process that lives as long as the install (a
@@ -34,12 +38,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use uuid::Uuid;
-use weft_broker_client::protocol::{HealthRuleState, InfraCopy, ProjectTrouble};
-use weft_core::infra::health::UnitReading;
+use weft_broker_client::protocol::{
+    HealthCommandEnding, HealthRuleState, InfraCopy, LifecycleOutcome, ProjectTrouble, QueuedHealthCommand,
+};
+use weft_core::infra::health::{HealthAction, UnitReading};
 
 use crate::health_engine::{
-    all_units_healthy, next_fire, observe_unit, rearm, CopyView, NodeEdgeEvent, NodeHealthState, NodeObservation, RuleInputs,
-    RuleOn,
+    next_fire, observe_unit, rearm, CopyView, NodeEdgeEvent, NodeHealthState, NodeObservation, RuleInputs, RuleOn,
 };
 use crate::SupervisorState;
 
@@ -47,9 +52,11 @@ use crate::SupervisorState;
 /// and what its looks came to, for the next ownership sync to report.
 #[derive(Default)]
 pub struct HealthRegistry {
-    /// Projects with a health rule's action in flight. While one is, the
-    /// supervisor fires no other rule for that project (avoids action
-    /// storms when health flaps mid-action).
+    /// Projects whose health action this process is queueing right now.
+    /// While one is, it fires no other rule for that project (avoids
+    /// action storms when health flaps mid-action); once queued, the
+    /// command's rules wait on it through their state
+    /// (`HealthRuleState::queued`).
     in_flight: HashSet<Uuid>,
     /// The steps of each project this process could not get through
     /// since its last look: that look does not report it settled while
@@ -440,15 +447,11 @@ async fn tick_project(
         listening: project.status == weft_broker_client::protocol::ProjectStatus::Active,
         taken_down_by_health: project.health_down,
     };
-    let mut rows: BTreeMap<RuleOn, HealthRuleState> = state
-        .broker
-        .health_state(project.project_id)
-        .await?
-        .into_iter()
-        .map(|s| (RuleOn { copy: s.copy.clone(), rule: s.rule.clone() }, s))
-        .collect();
+    let read = state.broker.health_state(project.project_id).await?;
+    let mut rows: BTreeMap<RuleOn, HealthRuleState> =
+        read.rules.into_iter().map(|s| (RuleOn { copy: s.copy.clone(), rule: s.rule.clone() }, s)).collect();
     let before = rows.clone();
-    let look = act(state, project, &inputs, &mut rows, now).await;
+    let look = act(state, project, &inputs, &mut rows, &read.ended, now).await;
     if rows != before {
         let req = weft_broker_client::protocol::SupervisorSetHealthStateRequest {
             replica: state.replica.clone(),
@@ -462,33 +465,80 @@ async fn tick_project(
     Ok(look)
 }
 
-/// Re-arm the rules against this look, fire what has something to do,
-/// and keep how it went in `rows` (the project's [`HealthRuleState`]s,
-/// which the caller writes back when they changed).
+/// Settle the commands the rules queued (`ended`: how the ones that ended
+/// did), re-arm the rules against this look, fire what has something to
+/// do, and keep how it went in `rows` (the project's
+/// [`HealthRuleState`]s, which the caller writes back when they changed).
 async fn act(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
     inputs: &RuleInputs,
     rows: &mut BTreeMap<RuleOn, HealthRuleState>,
+    ended: &[HealthCommandEnding],
     now: i64,
 ) -> Look {
-    // A rule that gave up tries again once what it looked at (its copy's
-    // units) changed (a machine said so), or every unit of its copy is
-    // healthy; one a person's command or look touched since comes back
-    // from the broker armed already.
     let seen_of = |copy: &InfraCopy| serde_json::to_value(inputs.units_of(copy)).expect("a unit reading serializes");
+    let mut given_up = Vec::new();
+    // The commands the rules queued. One that ended is done with; one
+    // that failed, or that has not ended by its deadline, is a failure of
+    // its rule, tried again like any failed action. The dispatcher asks
+    // for a look as each one ends, so this look is usually that one.
+    let mut landed: BTreeSet<RuleOn> = BTreeSet::new();
     for (on, row) in rows.iter_mut() {
-        if all_units_healthy(inputs.units_of(&on.copy)) || row.gave_up_seen.as_ref().is_some_and(|s| *s != seen_of(&on.copy)) {
-            *row = HealthRuleState { fired: row.fired, ..unarmed(on) };
+        let Some(queued) = row.queued else { continue };
+        let error = match ended.iter().find(|e| e.command == queued.command) {
+            Some(HealthCommandEnding { outcome: LifecycleOutcome::Failed, message, .. }) => {
+                format!("its command {} failed: {}", queued.command, message.as_deref().unwrap_or("no reason given"))
+            }
+            Some(HealthCommandEnding { outcome, .. }) => {
+                row.queued = None;
+                row.consecutive_failures = 0;
+                row.last_error = None;
+                let took_down = inputs.rule_on(on).is_some_and(|(rule, _)| rule.action == HealthAction::TakeDownTriggers);
+                if *outcome == LifecycleOutcome::Succeeded && took_down {
+                    row.took_down = true;
+                    landed.insert(on.clone());
+                }
+                continue;
+            }
+            None if now >= queued.deadline_unix => {
+                format!("its command {} did not end within the rule's timeout", queued.command)
+            }
+            None => continue,
+        };
+        row.queued = None;
+        row.fired = false;
+        given_up.extend(failed(project.project_id, on, row, &error, seen_of(&on.copy), now));
+    }
+    // A rule that no longer holds for its copy (or whose copy this look
+    // did not see) starts its next episode afresh; one that gave up while
+    // it holds tries again once what it looked at (its copy's units)
+    // changed (a machine said so). One a person's command or look
+    // touched since comes back from the broker armed already.
+    for (on, row) in rows.iter_mut() {
+        let holds = inputs.rule_on(on).is_some_and(|(_, holds)| holds);
+        if !holds || row.gave_up_seen.as_ref().is_some_and(|s| *s != seen_of(&on.copy)) {
+            *row = HealthRuleState { fired: row.fired, queued: row.queued, took_down: row.took_down, ..unarmed(on) };
         }
     }
     // What fired, re-armed rule by rule, copy by copy.
     let mut fired: BTreeSet<RuleOn> = rows.iter().filter(|(_, r)| r.fired).map(|(on, _)| on.clone()).collect();
     rearm(&mut fired, inputs);
+    // What a take-down took down stays its until its copy came back by
+    // its node's own rule, or nothing the health check took down is down
+    // any more (a person brought it back). A take-down seen landing in
+    // this very look keeps its mark: the project was read before the
+    // command's ending, so it may not show what the take-down did yet.
     for (on, row) in rows.iter_mut() {
         row.fired = fired.contains(on);
+        if row.took_down && (inputs.brought_back(&on.copy) || (!inputs.taken_down_by_health && !landed.contains(on))) {
+            row.took_down = false;
+        }
     }
     rows.retain(|on, r| *r != unarmed(on));
+    if !given_up.is_empty() {
+        crate::give_up(state, project.project_id, &given_up.join("; ")).await;
+    }
 
     let gave_up = |rows: &BTreeMap<RuleOn, HealthRuleState>| {
         if rows.values().any(|r| r.gave_up_at_unix.is_some()) {
@@ -500,10 +550,12 @@ async fn act(
     if state.health.lock().await.in_flight.contains(&project.project_id) {
         return gave_up(rows);
     }
-    // Backing off, or given up: that rule waits on its copy (the broker
-    // books its retry).
+    // Backing off, given up (the broker books its retry), or its command
+    // still running: that rule waits on its copy.
     let waiting = |on: &RuleOn| {
-        rows.get(on).is_some_and(|r| r.gave_up_at_unix.is_some() || r.next_retry_at_unix.is_some_and(|at| now < at))
+        rows.get(on).is_some_and(|r| {
+            r.gave_up_at_unix.is_some() || r.queued.is_some() || r.next_retry_at_unix.is_some_and(|at| now < at)
+        })
     };
     let Some(fire) = next_fire(inputs, &fired, waiting) else {
         return gave_up(rows);
@@ -516,55 +568,85 @@ async fn act(
     }
     let names = fire.rules.iter().map(|(on, _)| format!("'{}' on {}", on.rule, copy_name(&on.copy))).collect::<Vec<_>>().join(", ");
     tracing::info!(project_id = %project.project_id, rules = %names, "health rules hold; firing their action");
-    // Bound the action by its rules' timeout. A hung broker call would
+    // A copy whose take-down took something down, or is queued, keeps
+    // its readers down when a bring-back runs.
+    let took_down: BTreeSet<InfraCopy> = rows
+        .iter()
+        .filter(|(on, r)| {
+            r.took_down
+                || (r.queued.is_some() && inputs.rule_on(on).is_some_and(|(rule, _)| rule.action == HealthAction::TakeDownTriggers))
+        })
+        .map(|(on, _)| on.copy.clone())
+        .collect();
+    // Bound the queueing by its rules' timeout. A hung broker call would
     // otherwise pin `in_flight` forever, wedging this project's health
     // monitoring; the timeout maps it to a loud failure.
     let timeout = fire.timeout();
-    let action = state.broker.enqueue_lifecycle(project.project_id, fire.plan(inputs));
+    let action = state.broker.enqueue_lifecycle(project.project_id, fire.plan(inputs, &took_down));
     let result = match tokio::time::timeout(timeout, action).await {
         Ok(r) => r,
         Err(_elapsed) => Err(anyhow::anyhow!("the health rules' action timed out after {}s (broker call hung)", timeout.as_secs())),
     };
     state.health.lock().await.in_flight.remove(&project.project_id);
+    let mut given_up = Vec::new();
     match result {
-        Ok(_) => {
-            // Only a success latches: a failed action never took effect.
-            for (on, _) in &fire.rules {
-                rows.insert(on.clone(), HealthRuleState { fired: true, ..unarmed(on) });
+        Ok(command) => {
+            // Queued: the rule counts as fired while its command runs. A
+            // look that finds the command failed, or past the rule's
+            // timeout from now, takes that back and tries again.
+            for (on, rule) in &fire.rules {
+                let row = rows.entry(on.clone()).or_insert_with(|| unarmed(on));
+                let deadline_unix = now.saturating_add(i64::from(rule.timeout_seconds.get()));
+                *row = HealthRuleState {
+                    fired: true,
+                    queued: Some(QueuedHealthCommand { command, deadline_unix }),
+                    took_down: row.took_down,
+                    consecutive_failures: row.consecutive_failures,
+                    last_error: row.last_error.clone(),
+                    ..unarmed(on)
+                };
             }
         }
         Err(e) => {
             let error = format!("{e:#}");
-            let mut given_up = Vec::new();
-            for (on, rule) in &fire.rules {
+            for (on, _) in &fire.rules {
                 let row = rows.entry(on.clone()).or_insert_with(|| unarmed(on));
-                row.consecutive_failures += 1;
-                row.last_error = Some(error.clone());
-                match weft_broker_client::protocol::supervisor_retry_after(row.consecutive_failures) {
-                    None => {
-                        row.next_retry_at_unix = None;
-                        row.gave_up_at_unix = Some(now);
-                        row.gave_up_seen = Some(seen_of(&on.copy));
-                        given_up.push(format!(
-                            "its health rule '{}' on {} failed {} times: {error}",
-                            rule.name,
-                            copy_name(&on.copy),
-                            row.consecutive_failures
-                        ));
-                    }
-                    Some(delay) => {
-                        let delay = delay.as_secs() as i64;
-                        row.next_retry_at_unix = Some(now + delay);
-                        tracing::warn!(project_id = %project.project_id, rule = %rule.name, node_id = %on.copy.node_id, %error, retry_in_secs = delay, "a health rule's action failed; it tries again");
-                    }
-                }
-            }
-            if !given_up.is_empty() {
-                crate::give_up(state, project.project_id, &given_up.join("; ")).await;
+                given_up.extend(failed(project.project_id, on, row, &error, seen_of(&on.copy), now));
             }
         }
     }
+    if !given_up.is_empty() {
+        crate::give_up(state, project.project_id, &given_up.join("; ")).await;
+    }
     gave_up(rows)
+}
+
+/// Count one failure of `on`'s action (`row`, its state) with `error`: it
+/// tries again after its backoff, or, at the last failure, gives up on
+/// what its copy's units looked like (`seen`), and says so (for
+/// `crate::give_up`).
+fn failed(project: Uuid, on: &RuleOn, row: &mut HealthRuleState, error: &str, seen: serde_json::Value, now: i64) -> Option<String> {
+    row.consecutive_failures += 1;
+    row.last_error = Some(error.to_string());
+    match weft_broker_client::protocol::supervisor_retry_after(row.consecutive_failures) {
+        None => {
+            row.next_retry_at_unix = None;
+            row.gave_up_at_unix = Some(now);
+            row.gave_up_seen = Some(seen);
+            Some(format!(
+                "its health rule '{}' on {} failed {} times: {error}",
+                on.rule,
+                copy_name(&on.copy),
+                row.consecutive_failures
+            ))
+        }
+        Some(delay) => {
+            let delay = delay.as_secs() as i64;
+            row.next_retry_at_unix = Some(now + delay);
+            tracing::warn!(project_id = %project, rule = %on.rule, node_id = %on.copy.node_id, %error, retry_in_secs = delay, "a health rule's action failed; it tries again");
+            None
+        }
+    }
 }
 
 /// A copy as a person reads it: `'db'`, or `'db' of instance 'ada'`.
@@ -581,6 +663,8 @@ fn unarmed(on: &RuleOn) -> HealthRuleState {
         copy: on.copy.clone(),
         rule: on.rule.clone(),
         fired: false,
+        queued: None,
+        took_down: false,
         consecutive_failures: 0,
         next_retry_at_unix: None,
         gave_up_at_unix: None,

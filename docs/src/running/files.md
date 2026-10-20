@@ -68,7 +68,9 @@ weft files download <key> -o ~/Desktop/chart.png
 Without `-o`, it lands in the folder you run it from, under the file's own
 name. It streams straight from storage into a temporary file and renames it only
 after the size checks out, so a download that fails never leaves you a
-plausible half file, and never overwrites a good copy with a broken one.
+plausible half file, and never overwrites a good copy with a broken one. If
+the connection drops partway, it picks up from where it stopped, and if the
+file changes on the install meanwhile, it stops and says so.
 
 ## Removing them
 
@@ -89,23 +91,15 @@ Type 'yes' to confirm:
 
 ## Links
 
-When somebody needs to open a file, a node makes a link to it, of one of two
-kinds:
+A node hands out a link when somebody outside the install has to open a file:
+a route's answer carries one in place of the file, for instance. For how a
+node asks for one, how long it lives and what opening it does, go and read
+[handing a file out](../nodes/storage.md#handing-a-file-out). A link expires,
+which is why a stored file travels as a marker rather than a URL.
 
-- an internal one, for code inside the install, straight to storage
-- an external one, for a browser, an app or an outside service, which is what
-  a route's answer carries in place of a file
-
-An external link goes through the cloud store on a cloud install. On a local
-one it goes through the project's visitor address (`weft frontend
-visitor-address`), else weft's tunnel when it is open, else the install's own
-address, which only this machine opens.
-
-A link lives fifteen minutes unless the program set another lifetime (the
-`LinkOptions` node, up to seven days), and opening it in a tab downloads the
-file under its name. It
-expires, which is why a stored file travels as a marker rather than a URL. The
-marker keeps working; a link does not.
+If you want to choose who can open those links (anyone on the internet, the
+devices on your network, or only this machine), go and read [which address a
+file link gets](../build/public-address.md#which-address-a-file-link-gets).
 
 ## When a file goes missing
 

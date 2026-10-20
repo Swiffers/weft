@@ -227,16 +227,22 @@ pub async fn push_until_held(feed: &SseFake, disp: &Dispatcher, pid: &Uuid, even
 // verbatim copy in two test files, which is how two readers of one
 // output format stop agreeing.
 
-/// The run returned by run or bake.
+/// The run returned by run or bake. A bake answers one setup per owner
+/// of the triggers it prepared (`baked`), so it names one run only when
+/// it prepared one owner's; a bake of several is refused here, since
+/// "the" run would be a guess.
 pub fn run_id_of(stdout: &str) -> anyhow::Result<Uuid> {
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        let run_id = if v.get("verb").and_then(Value::as_str) == Some("bake") {
-            v.pointer("/detail/result/runId")
-        } else {
-            v.pointer("/detail/runId")
-        };
-        if let Some(c) = run_id.and_then(Value::as_str) {
+        if v.get("verb").and_then(Value::as_str) == Some("bake") {
+            let Some(baked) = v.pointer("/detail/result/baked").and_then(Value::as_array) else { continue };
+            let runs: Vec<&str> = baked.iter().filter_map(|bake| bake.get("runId").and_then(Value::as_str)).collect();
+            match runs.as_slice() {
+                [run] => return Ok(run.parse()?),
+                _ => anyhow::bail!("expected the bake to run one setup, it ran {}:\n{stdout}", runs.len()),
+            }
+        }
+        if let Some(c) = v.pointer("/detail/runId").and_then(Value::as_str) {
             return Ok(c.parse()?);
         }
     }

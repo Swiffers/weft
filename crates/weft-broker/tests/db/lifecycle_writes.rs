@@ -13,7 +13,7 @@ use weft_broker::lifecycle_writes::{
     set_waiting, sync_ownership, unowned_work_waiting, FencedWrite, IssuedCommand,
 };
 use weft_broker_client::protocol::{
-    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, HealthRuleState, InfraNodeStatus as Status,
+    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, HealthCommandEnding, HealthRuleState, QueuedHealthCommand, InfraNodeStatus as Status,
     SupervisorCommandCompleteRequest, SupervisorSetHealthStateRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
     SupervisorSyncOwnershipRequest,
 };
@@ -1035,6 +1035,8 @@ async fn a_persons_look_arms_a_rule_that_gave_up(pool: PgPool) {
         copy: weft_broker_client::protocol::InfraCopy { node_id: "db".into(), instance: None },
         rule: "take-down-while-flaky".into(),
         fired: false,
+        queued: None,
+        took_down: false,
         consecutive_failures: 3,
         next_retry_at_unix: None,
         gave_up_at_unix: Some(now - 5),
@@ -1043,9 +1045,9 @@ async fn a_persons_look_arms_a_rule_that_gave_up(pool: PgPool) {
     };
     let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, rules: vec![gave_up.clone()] };
     assert!(matches!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied));
-    assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![gave_up]);
+    assert_eq!(health_state(&pool, PROJECT).await.unwrap().rules, vec![gave_up]);
     weft_dispatcher::infra_lifecycle_command::person_asks_for_look(&pool, PROJECT).await.unwrap();
-    let armed = health_state(&pool, PROJECT).await.unwrap();
+    let armed = health_state(&pool, PROJECT).await.unwrap().rules;
     assert_eq!(armed[0].gave_up_at_unix, None, "armed again: {armed:?}");
     assert_eq!(armed[0].consecutive_failures, 0);
 }
@@ -1213,6 +1215,10 @@ async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) 
         copy: weft_broker_client::protocol::InfraCopy { node_id: "web".into(), instance: None },
         rule: "take-down-while-flaky".into(),
         fired: true,
+        // Its take-down landed and a retry of it is queued: a re-arm keeps
+        // both.
+        queued: Some(QueuedHealthCommand { command: 999_999, deadline_unix: now + 1800 }),
+        took_down: true,
         consecutive_failures: 3,
         next_retry_at_unix: None,
         gave_up_at_unix: Some(now + 5),
@@ -1232,11 +1238,11 @@ async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) 
     assert_eq!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied);
     let displaced = SupervisorSetHealthStateRequest { replica: OTHER.into(), ..req.clone() };
     assert_eq!(set_health_state(&pool, &displaced).await.unwrap(), FencedWrite::Displaced, "only the lease holder writes");
-    assert_eq!(health_state(&pool, PROJECT).await.unwrap(), vec![given_up.clone(), ada.clone()], "given up, nothing touched it since");
+    assert_eq!(health_state(&pool, PROJECT).await.unwrap().rules, vec![given_up.clone(), ada.clone()], "given up, nothing touched it since");
 
     command(&pool).await;
     sqlx::query("UPDATE infra_lifecycle_command SET issued_at_unix = $1").bind(now + 10).execute(&pool).await.unwrap();
-    let armed = health_state(&pool, PROJECT).await.unwrap();
+    let armed = health_state(&pool, PROJECT).await.unwrap().rules;
     assert_eq!(
         armed,
         vec![
@@ -1244,6 +1250,65 @@ async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) 
             ada,
         ],
         "a person's command re-arms what gave up, keeping whether it fired; the other copy's state is its own"
+    );
+}
+
+/// The command a health rule queued is read back with its rule, how it
+/// ended once it did, and its deadline is booked as the supervisor's next
+/// pass (a command that never ends still gets its look).
+#[sqlx::test]
+async fn a_queued_health_command_is_read_with_how_it_ended_and_its_deadline_is_booked(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let (booking, _alarm) = supervisor_booking(&pool);
+    let now = db_now(&pool).await;
+    let (command,): (i64,) = sqlx::query_as(
+        "INSERT INTO infra_lifecycle_command (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix) \
+         VALUES ($1, $2, 'deactivate', '{}', 'supervisor', EXTRACT(EPOCH FROM NOW())::BIGINT) RETURNING id",
+    )
+    .bind(TENANT)
+    .bind(PROJECT)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let queued = HealthRuleState {
+        copy: weft_broker_client::protocol::InfraCopy { node_id: "db".into(), instance: None },
+        rule: "take-down-while-flaky".into(),
+        fired: true,
+        queued: Some(QueuedHealthCommand { command, deadline_unix: now + 100 }),
+        took_down: false,
+        consecutive_failures: 1,
+        next_retry_at_unix: None,
+        gave_up_at_unix: None,
+        gave_up_seen: None,
+        last_error: Some("refused".into()),
+    };
+    let req = SupervisorSetHealthStateRequest { replica: OWNER.into(), project_id: PROJECT, rules: vec![queued.clone()] };
+    assert_eq!(set_health_state(&pool, &req).await.unwrap(), FencedWrite::Applied);
+    let read = health_state(&pool, PROJECT).await.unwrap();
+    assert_eq!(read.rules, vec![queued.clone()]);
+    assert!(read.ended.is_empty(), "still running");
+    let due = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap().next_due_unix;
+    assert_eq!(due, Some(now + 100), "the command's deadline is looked at");
+
+    sqlx::query(
+        "UPDATE infra_lifecycle_command SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
+                outcome = 'failed', outcome_message = 'the dispatcher could not reach the listener' WHERE id = $1",
+    )
+    .bind(command)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let read = health_state(&pool, PROJECT).await.unwrap();
+    assert_eq!(read.rules, vec![queued]);
+    assert_eq!(
+        read.ended,
+        vec![HealthCommandEnding {
+            command,
+            outcome: weft_broker_client::protocol::LifecycleOutcome::Failed,
+            message: Some("the dispatcher could not reach the listener".into()),
+        }]
     );
 }
 

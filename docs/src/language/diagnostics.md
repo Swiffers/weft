@@ -40,6 +40,7 @@ a slug per cause.
 | `deref-path` | The dotted path on a wire cannot be read off the source's type | Fix the path, or change the source type |
 | `type-mismatch` | The source's type does not fit the target's | Change one side, or cast. The message suggests a cast where one exists |
 | `unresolved-typevar` | A connected port still has a type variable nothing pinned down | Connect it to something concrete, or declare the type |
+| `type-bound` | A type variable limited to some types got another one: a `String` into a group declared `Group[T: Media]`, or into `KeepFile`, which takes only a file | Connect a value of a type the limit takes; the message names the limit and what you connected |
 | `cast-not-allowed` | A cast node's two ports are a pair the conversion table does not allow | Pick types the table allows |
 | `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus |
 | `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a node inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
@@ -58,6 +59,8 @@ a slug per cause.
 | `config-null-literal` (warning) | A key is written `key: null`, which does nothing | Leave the key out and let the default apply |
 | `require-one-of-unknown-port` | `@require_one_of(...)` names a port the node does not have | Fix it; the message lists the real inputs |
 | `require-one-of-unmet` | None of the ports in a `@require_one_of` group is driven | Drive at least one |
+| `placeholder-not-an-input` | A query or template you wrote names a placeholder (`$userId` in a Postgres query, `{{name}}` in a `Format` template) that is not an input of the node | Declare the input (`PostgresExecuteQuery(userId: String)`), or fix the placeholder; the message suggests a close input, lists the inputs you added, or, if you added none, shows how to declare one |
+| `input-not-a-placeholder` | You added an input to a node that takes a query or template, and the text never uses it | Use it in the text, or drop the input |
 
 ## Names and shape
 
@@ -128,16 +131,21 @@ or a switch's cases.
 | Slug | What it found | What to do |
 |---|---|---|
 | `run-settings` | A trigger's `durable`, `recorded` or `outlivesCaller` is not `true` or `false`, or it is durable or outlives its caller and is not recorded | Write `true` or `false`; turn `recorded` back on, or the other one off |
-| `trigger-into-trigger` | A trigger is wired into another trigger | Remove the wire. A trigger's inputs are frozen at setup, so another trigger's output could never reach it |
-| `trigger-into-infra` | An infra node sits downstream of a trigger | Remove the wire. Provisioning happens before any event exists |
-| `trigger-in-loop` | A trigger inside a loop body | Move it out. A trigger registers once and fires outside any iteration |
-| `infra-in-loop` | An infra node inside a loop body | Move it out. Infra is provisioned once for the project, not once per item |
+| `trigger-into-trigger` | A trigger is wired into another trigger | Remove the wire |
+| `trigger-into-infra` | An infra node sits downstream of a trigger | Remove the wire |
+| `trigger-in-loop` | A trigger inside a loop body | Move it out of the loop |
+| `infra-in-loop` | An infra node inside a loop body | Move it out of the loop |
 | `route-path-missing` | A node claiming a public address has none, or an empty one | Give it a path, like `hooks/stripe` or `chat/{room}` |
 | `route-path-invalid` | The path is not a servable pattern | The message says what is wrong |
 | `route-method-unknown` | That is not an HTTP method | Fix it |
 | `route-capture-shadows-output` | A path captures a name that is also one of the node's own outputs (`cards/{body}` on a `Route`), so the capture could never be read | Rename the capture |
 | `route-output-not-a-capture` | An output added to a `Route` names no capture of its path, or is not typed `String` | Add `{name}` to the path or remove the port, and type every capture `String` |
 | `route-overlap` | Two nodes claim addresses one call could reach, and neither is more specific | Make one spell out what the other captures, or change a path or a method |
+
+For why a trigger cannot be wired into another trigger or have an infra node
+after it, go and read [what a trigger cannot do](triggers-and-routes.md#what-a-trigger-cannot-do).
+For why neither a trigger nor an infra node can sit inside a loop, go and read
+[what cannot go in a loop](loops.md#what-cannot-go-in-one).
 
 ## Instances
 

@@ -47,31 +47,34 @@ and sleep in your body: that holds a worker for the whole job. Submit the job
 inside `ctx.run`, then wait on the status address with `PollEndpoint`:
 
 ```rust
-use weft::signal::{PollEndpoint, Predicate};
+use weft::signal::{CancelCall, PollEndpoint, Predicate};
 
 let submitted = ctx.run("submit", || async {
     post_json(&http, &submit_url, &payload, "submitting the render").await
 }).await?;
 let id = submitted["request_id"].as_str().node_err("the submit answered no request_id")?;
 
-let status = ctx.await_signal(PollEndpoint {
-    url: format!("{API}/requests/{id}/status"),
-    interval_secs: 5,
-    access: Some(weft::primitive::AccessRef::from(&account)),
-    filters: vec![
-        Predicate::neq("status", "IN_QUEUE"),
-        Predicate::neq("status", "IN_PROGRESS"),
-    ],
-    ..Default::default()
-}).await?;
+let status = ctx.await_signal_with_cancel(
+    PollEndpoint {
+        url: format!("{API}/requests/{id}/status"),
+        interval_secs: 5,
+        access: Some(weft::primitive::AccessRef::from(&account)),
+        filters: vec![
+            Predicate::neq("status", "IN_QUEUE"),
+            Predicate::neq("status", "IN_PROGRESS"),
+        ],
+        ..Default::default()
+    },
+    CancelCall::put(format!("{API}/requests/{id}/cancel")),
+).await?;
 ```
 
 The run parks and the worker goes away. Weft checks the address once straight
 away (a job that is already done resumes at once), then every `interval_secs`,
-and an interval under 5 seconds is refused. The first answer that passes every filter is what
-`await_signal` returns, and the checking stops. With no filters, the first
-successful answer is the one. An error status or a failed request is not an
-answer: it is tried again at the next check and shown on the node. `access`
+and an interval under 5 seconds is refused. The first answer that passes every
+filter is what the wait returns, and the checking stops. With no filters, the
+first successful answer is the one. An error status or a failed request is not
+an answer: it is tried again at the next check and shown on the node. `access`
 signs each check with that connection.
 
 If the finished answer is heavy (a crawl's status that embeds its first page
@@ -87,6 +90,55 @@ for it.
 Write the filters as "not one of the in-flight statuses" rather than "one of
 the finished ones", the way the example does. A status you did not expect then
 ends the wait, and your code can fail on it, instead of waiting for ever.
+
+### If the run is cancelled while the job runs
+
+Cancelling the run takes the wait down, but the provider hears nothing and
+goes on working, and charging, for an answer nobody will read. If you want the
+provider told, wait with `ctx.await_signal_with_cancel` and give it, as its
+second argument, one request to send if the run is cancelled, usually to the
+provider's own cancel address for the job.
+Whatever cancelled the run (a person, another run's `stop_tagged`, a
+take-down that cancels the runs still going), weft sends that request once, signed
+with the same `access` as the checks. It is never sent when the answer
+arrives, or when the run ends any other way.
+
+`CancelCall::post`, `put`, `patch` and `delete` take the address. If the
+provider's cancel wants a body, add `.with_body(json!({ .. }))`.
+If the address is empty, or is not `http` or `https`, the wait fails at once,
+before anything parks, with `invalid signal spec: the cancel call's url must not be empty` or
+`invalid signal spec: the cancel call's url must be http(s): got '<url>'`.
+
+If the provider has no way to cancel a job, wait with plain
+`ctx.await_signal`.
+
+If the provider refuses the call, or does not answer within 60 seconds, weft
+does not try again, and the job may still be running. The runtime's log
+(`weft daemon logs` on your machine) says `a cancelled run's last call to its
+outside service failed`, with the address and what the provider answered.
+
+If you want to check the call in a test, read it off the wait:
+
+```rust
+assert_eq!(
+    rig.awaited_signals()[0].on_cancel,
+    Some(CancelCall::put("https://queue.example/requests/req-1/cancel")),
+);
+```
+
+### Watching it while it waits
+
+If you want to show how far the job has got (a progress bar for a render,
+say), weft keeps the last answer a check got while the node waits, exactly as
+the provider sent it. A failed check does not replace it, and an answer over
+64 KiB is kept only as its size. You can read it:
+
+- in the editor, on the waiting node's panel, while you follow the run;
+- in the terminal, with `weft node-state <run> <node>`, which prints
+  `render: waiting` and then `last answer: {"status":"IN_QUEUE"}`;
+- in a program, with the `GetNodeState` node, which takes a run's id (a run
+  gets its own id from the `GetRunId` node);
+- in your own node's code, with `ctx.node_state(run, node)`.
 
 ## When the run cannot pause
 

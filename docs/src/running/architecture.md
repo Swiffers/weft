@@ -139,13 +139,13 @@ asks for a credential or the call carries an instance token (which names the
 [instance](instances.md) the call is for), nothing reaches the database before
 the run starts.
 
-If a route's trigger is parked, hibernating within its grace window, or still
-being set up, the worker answers `503` with a `Retry-After` at once, so a client that retries
-gets through once the trigger is on. When a new version of the program
-replaces the worker, on your machine the port stays closed while the old
-worker hands its runs back or ends them (10 seconds at most, then it is
-killed) and the new one starts. A caller
-arriving then is refused, as with any server restarting.
+If a route's trigger is down, however it was taken down, or still being set
+up, the worker answers `503` with a `Retry-After` at once, so a client that retries
+gets through once the trigger is on. When a new version of the program takes
+over, on your machine its worker takes the project's port only once the old
+worker has nothing left running: the old one is then told to stop, killed 10
+seconds later if it has not, and the new one starts. A caller arriving in
+that moment is refused, as with any server restarting.
 
 If a route still belongs to another version of the program than the one at
 the project's address (a new version is taking over), the call gets the same
@@ -158,7 +158,10 @@ When a timer fires or a subscription delivers something, the listener holding
 it hands the event straight to the worker of its project, through the same
 door callers use: the worker checks whether the trigger takes work now and
 the trigger's limits, and works out what the run reads. If the trigger is
-parked, it is past its limits, or what the run reads is not ready (its
+down and set to hold what arrives (for those settings, go and read [taking
+triggers down](lifecycles.md#taking-triggers-down-three-questions)), if it is
+past its limits, or if what the run
+reads is not ready (its
 infrastructure is down, its instance has not given a value it needs), the
 event waits in the trigger's queue, and the dispatcher hands it over again
 once it can run. Otherwise the
@@ -406,9 +409,12 @@ retried.
 If you want a stopped or given-up trigger back, fix what stopped it and
 register it again. If it was its connection, reconnecting that connection is
 enough: weft brings back every trigger that uses it, the ones that keep a
-connection open included. If it was anything else, a setup error for
-instance, run `weft resync` once it is fixed. `weft activate` does not bring
-it back, because the trigger still counts as on.
+connection open included. If it was anything else (say, a setup error),
+fix the cause and register it again: if `weft status` then shows
+the trigger as behind, `weft resync` does that; if not, run `weft deactivate
+--trigger <name>` and then `weft activate --trigger <name>`. `weft activate`
+alone does not bring it back, even with `--trigger`, because the trigger
+still counts as on.
 
 A trigger that acts as one of your connections keeps that connection's
 credentials for as long as it is registered. If you reconnect the
@@ -452,11 +458,12 @@ free, and asks for a look when how the unit stands changes (a container
 stopped, a check started failing or passing again), and Compute Engine's own
 record of a machine stopping or failing asks too. Once something is not fine,
 the supervisor's next look is booked for the exact moment it needs one, such
-as when a unit that stopped being ready would count as flaky. What the
-supervisor does about an unhealthy unit (restart it, take down the triggers
-that read it) is called a health protocol. If one fails, it is tried again
-after 5 and then 10 seconds. At the third failure the supervisor gives up on
-it and `weft status` lists it under `waiting on weft:`. It tries again once
+as when a unit that stopped being ready would count as flaky. The node's
+health rules decide what the supervisor does about an unhealthy unit; with
+none written, it takes down the triggers that depend on it and brings
+them back once it is healthy again. If a rule's action fails, it is tried
+again after 5 and then 10 seconds. At the third failure the supervisor gives
+up on it and `weft status` lists it under `waiting on weft:`. It tries again once
 the units report a change, once they are all healthy, once you start, stop,
 upgrade or terminate the project's infra, or once you run `weft infra look`.
 

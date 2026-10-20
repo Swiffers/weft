@@ -45,6 +45,14 @@ that close because a body returned are worked out again on replay.
 **Loops, streams and buses** get their own events: an iteration launching, a
 gather assembling, a bus participant joining, a window of messages.
 
+**A live caller's exchange** does too: the caller arriving, a window of what
+the caller and the program said, an error, the caller leaving. A window also
+names the program's messages the caller never received because it read too
+slowly, and the row saying the caller left names the ones still waiting to go
+out when the exchange ended. For the settings that let a slow caller's
+messages go, go and read [slow callers and messages that cannot be
+made](../language/triggers-and-routes.md#slow-callers-and-messages-that-cannot-be-made).
+
 **What a call cost**, from the meter, as it happens. A node can never write one
 of those.
 

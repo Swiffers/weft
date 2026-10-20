@@ -457,8 +457,11 @@ enum Cmd {
     /// and says so, so a script can always run it. Plain, it is every
     /// shared trigger; `--instance <id>` (repeatable) names instances'
     /// triggers, `--all-instances` every instance's, and `--trigger`
-    /// (repeatable) narrows either. It never starts infra (it refuses,
-    /// naming the infra to start) and never touches a run going now.
+    /// (repeatable) narrows either. It never starts infra and never
+    /// touches a run going now: a trigger whose setup reads infra that is
+    /// not running is refused, naming the infra to start; any other
+    /// trigger is turned on, with a note naming the program's infra that
+    /// is not running.
     ///
     /// `--held run` (the default) releases the work the triggers held while
     /// they were down, paced at half each trigger's own limits so new
@@ -528,8 +531,9 @@ enum Cmd {
     /// that is off is never turned on: the answer names it with the `weft
     /// activate` that would. Plain, it is the shared triggers;
     /// `--instance <id>` (repeatable) names instances', `--all-instances`
-    /// every instance's (what a deploy reaching every instance runs), and
-    /// `--trigger` (repeatable) narrows either. `--door`, `--held` and
+    /// every instance's, `--all` the shared ones and every instance's (what
+    /// the deploy workflow `weft ci add` writes runs), and `--trigger`
+    /// (repeatable) narrows any of them. `--door`, `--held` and
     /// `--running wait|cancel` answer as on `weft deactivate`, with the
     /// same defaults.
     Resync {

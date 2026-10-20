@@ -62,7 +62,7 @@ const cases: Case[] = [
   ["designer", "pnpm run dev --port 5174 --strictPort", "allow"],
   ["designer", "node x.mjs", "deny"],
   ["deployer", "weft activate --on prod", "allow"],
-  ["deployer", "timeout 360 weft resync --on prod --mode park", "allow"],
+  ["deployer", "timeout 360 weft resync --on prod --all", "allow"],
   ["deployer", "weft target export prod --github", "deny"],
   ["deployer", "weft login prod", "deny"],
   ["deployer", "weft daemon restart", "deny"],

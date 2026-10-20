@@ -43,7 +43,7 @@ impl Node for LlmStreamNode {
         // is a failure `_error` can catch while nothing has been read;
         // past that, the bus ends the way the body does, failed included.
         let model = llm.generator.model.clone();
-        let opts = BusOptions { meta: json!({ "model": model }), ..BusOptions::default() };
+        let opts = BusOptions { journal: ctx.journal_policy()?, meta: json!({ "model": model }), ..BusOptions::default() };
         let mut bus = ctx.pending_bus("stream", opts, "llm");
 
         let mut stream = leaf

@@ -127,6 +127,7 @@ Unknown keys are a loud parse error. Top level:
 | `service` | access nodes only, the connection recipe |
 | `claimsRoute` | a node that claims a public address: `pathField` names the input holding the route pattern, and the optional `methodField` the input holding the HTTP method. Leave `methodField` out and the node serves every method; with it set, a program that leaves that input empty serves every method too. Naming an input the node does not declare fails the load |
 | `accessApps` | project-shipped OAuth apps, keyed by service name (`google`); what an entry may hold is below the table |
+| `placeholdersAreInputs` | a node whose added inputs are named inside one of its text settings (a query's `$userId`, a template's `{{name}}`): `{ "in": "<that setting>", "pattern": "<a regex whose group (?<name>...) is the input>" }`. The compiler then holds the two to each other, so every placeholder the setting holds must be an input of the node and every added input must appear in it, and a typo in a query fails the build instead of the first call. The pattern may also match text to skip (a string literal, a comment) through an alternative without the `name` group; those matches are ignored. Copy `Format`'s or `PostgresExecuteQuery`'s before writing your own |
 
 An `accessApps` entry holds `label`, `client_id` and the service's
 `registrationFields` that it marks `"secret": false` (a field is secret unless
@@ -379,6 +380,14 @@ second job. Filter on "not in flight" as above, so an unknown status ends the
 wait and your code can fail on it. `delta` is refused here. Read the
 stdlib's `nodes/base_catalog/ai/fal/fal.rs` (`run_queued`) for a whole worked case.
 
+If the service can cancel a job, hand the wait its cancel call, so a run
+stopped while it waits stops the job and its bill too:
+`ctx.await_signal_with_cancel(PollEndpoint { .. }, CancelCall::put(cancel_url))`
+(`weft::signal::CancelCall`, also `post` and `delete`, and `.with_body(json)`).
+weft sends it once, with the wait's own `access`, when the run is cancelled
+while it waits, and never when the wait is answered or the run ends any
+other way. `run_queued` in that same file does it.
+
 You emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
 ports you did not emit are closed, which is the skip signal downstream. For
 user-added output ports use `ctx.fan_declared(...)`.
@@ -439,10 +448,10 @@ and end in one call:
 | Call | Answers |
 |---|---|
 | `ctx.infra(node).instance(id).start()` | `()` once the instance's container runs (the run parks between looks); fails with its `failure` |
-| `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` | `()`; `spec` is a `DeactivateSpec`, `stop_self` a `StopSelf` |
+| `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` | `InfraDownAnswer` from stop, terminate and wipe (`TakenDown`, `AlreadyDown` or `NoCopy`), `()` from upgrade. `take_down` is a `TakeDownChoice`, the answers of `weft deactivate` as optional fields (`door`, `door_for_minutes`, `held`, `running`): `TakeDownChoice::default()` takes every default, and `TakeDownChoice { running: Some(Running::Cancel), ..Default::default() }` changes one. `stop_self` is a `StopSelf` |
 | `.status()` | `Option<InfraCopy>`: `{ node, instance, status, failure }`, `None` when there is no container |
 | `ctx.infra(node).copies()` | `Vec<InfraCopy>`, the shared container and each instance's |
-| `ctx.triggers().instance(id).activate()` / `.deactivate(spec, stop_self)` | `()`; `.only([..])` narrows to named triggers |
+| `ctx.triggers().instance(id).activate(held)` / `.deactivate(take_down, stop_self)` | `()`; `held` is a `ReleaseHeld` (`Run` or `Drop`); `.only([..])` narrows to named triggers, `.all_instances()` reaches every instance's |
 | `ctx.values().instance(id).get()` | `InstanceValues`: node -> field -> value, what was given for the instance's `@instance_filled` fields |
 | `ctx.values().instance(id).set(node, field, value).clear(node, field).apply()` | `Vec<String>`, the instance's triggers set up again; each value is checked against its node first, all or none |
 | `ctx.values().instance(id).forget()` | `Vec<String>`, as `apply()` |
@@ -617,7 +626,51 @@ containers, each to completion; one failing fails the start), `fs_group`
 (a group id every mounted disk is writable by), `on_stop`
 (`StopBehavior::Stop` by default; `StopBehavior::KeepRunning` leaves the unit
 up through a project stop, for a model that takes long to load) and `health`
-(`UnitHealth { flaky_after_seconds, recovery_after_seconds }`).
+(`UnitHealth { flaky_after_seconds, recovery_after_seconds }`: how long a
+unit stays not ready before it counts as flaky, and how long it stays ready
+again before it stops counting).
+
+**Health rules** (`InfraSpec.health_rules`) say what a copy of your node
+does to the triggers whose fires reach it when its units go wrong. Leave it
+`None` and two built-in rules run: while a unit is flaky and some trigger
+is on, take those triggers down (what arrives is held, the runs reaching
+the copy are cancelled), and once no unit is flaky, bring back what the
+health check took down. `Some(vec![])` runs no rule at all. Write your own
+only when that pair is wrong for the service. Say your node has a `cache`
+unit that may restart without the triggers caring: narrow both rules to the
+`db` unit, so only `db` going flaky takes them down.
+
+```rust
+use weft::infra::health::{HealthAction, HealthCondition, HealthRule, DEFAULT_RULE_TIMEOUT_SECONDS};
+
+let db_flaky = HealthCondition::UnitFlaky { unit: Some("db".into()) };
+let health_rules = Some(vec![
+    HealthRule {
+        name: "take-down-while-db-flaky".into(),
+        when: HealthCondition::All { conditions: vec![db_flaky.clone(), HealthCondition::Listening] },
+        action: HealthAction::TakeDownTriggers,
+        timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS,
+    },
+    HealthRule {
+        name: "bring-back-once-db-healthy".into(),
+        when: HealthCondition::All {
+            conditions: vec![HealthCondition::Not { condition: Box::new(db_flaky) }, HealthCondition::TakenDownByHealth],
+        },
+        action: HealthAction::BringBack,
+        timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS,
+    },
+]);
+```
+
+A rule reads one copy alone: its own units (`UnitFlaky`, with `unit: None`
+for any of them), `Listening` (a trigger of the project is on and none is
+being switched on) and `TakenDownByHealth`, combined with `All`, `Any` and
+`Not`. `BringBack` never brings back what a person or an infra command took
+down, and a take-down rule with no bring-back rule leaves the triggers it took down
+down until somebody runs `weft activate`. Names are unique within the node, a
+rule naming a unit the spec does not declare fails the spec, and
+`timeout_seconds` is how long the action may take before the attempt counts
+as failed (`weft status` names a rule that keeps failing).
 
 **A container** is `Container::new(name, image)` plus setters:
 `with_command(Vec<String>)` (replaces the entrypoint), `with_args`,
@@ -893,8 +946,14 @@ fail before the first piece. The
 options, all declared at creation and read back by every consumer: `payload`
 (`Json` by default, `Bytes` for media frames, wrong shape refused loud), `meta`
 for facts a reader needs about the stream (sample rate, model name),
-`ephemeral` to keep payloads out of the journal, `window` for how far a slow
-reader may fall behind (64 frames).
+`journal` for what the run's record keeps of the stream (journaled or
+ephemeral, and the window one row gathers), `window` for how far a slow
+reader may fall behind (64 frames). If your node's users should choose the
+journal, set `features.journalSettings: true` in its `metadata.json` (it then
+gets the inputs `journalEphemeral` and `journalWindowMs`, so do not declare
+them, and a `liveConnection` trigger already has them, so do not set both) and
+pass `journal: ctx.journal_policy()?`. Without it the default applies;
+`JournalPolicy::ephemeral()` keeps payloads out whatever anyone sets.
 
 A bus must end, because a reader parked on one that never ends waits for
 ever. It ends when the body of the firing that created or joined it returns:
@@ -1063,6 +1122,16 @@ Sections: `[dependencies]` (cargo), `[build-dependencies]`, `[system.build]`
 keyed by distro like `debian_12`, `ubuntu_24_04`, `alpine_3_19`, or
 `default`), `[build.env]`.
 
+If the package needs a build script, it is a `build.rs` at the package's
+root, and its crates go under `[build-dependencies]` (declaring those with
+no `build.rs` fails the build). The script runs for that package's own
+crate alone, so a script or a build dependency that fails leaves only that
+package out of the worker. What it prints with `cargo:rustc-env`,
+`cargo:rustc-cfg` and `OUT_DIR` reaches the package's own code, and
+`cargo:rustc-link-lib` and `cargo:rustc-link-search` reach the worker that
+links it; a `cargo:rustc-link-arg` does not, since cargo applies one only to
+the binaries of the package that prints it.
+
 You declare the version you actually built and tested against, current and
 maintained: the latest stable or LTS, never a bleeding-edge major when a
 stable one works, never a deprecated one. A version copied from an old
@@ -1173,5 +1242,11 @@ yours to read.
 
 Check it landed: `weft describe-nodes --node MyThing --compact` must
 succeed, or re-run `weft validate`, which compiles against `nodes/` fresh.
+
+A package whose Rust does not compile is left out of the worker, and every
+run that reaches one of its nodes is refused, naming the package. Only a
+green `weft test-node` proves your node compiles. For the exact messages,
+go and read the `weft-running` skill, "When files change, or part of the
+program does not compile".
 Then use the type in `src/main.weft` like any catalog node. A custom type
 name must not collide with an existing one (loud error, no shadowing).

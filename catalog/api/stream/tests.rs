@@ -12,7 +12,8 @@ use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::StreamNode;
 use crate::framing::{ndjson_line, sse_event, Format};
-use crate::testing::{http_caller, ws_caller};
+use crate::testing::{caller_skipping_unmade_chunks, http_caller, ws_caller};
+use weft::signal::Protocol;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -28,6 +29,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("sse_frames_text_per_line_and_json_whole", sse_framing),
         NodeTest::basic("ndjson_is_one_json_value_per_line", ndjson_framing),
         NodeTest::fake("a_redirect_is_a_replys_answer", redirect_refused),
+        NodeTest::fake("a_message_it_cannot_send_fails_the_answer_or_is_skipped", unmade_message),
     ]
 }
 
@@ -251,5 +253,40 @@ fn sse_framing() -> WeftResult<()> {
 fn ndjson_framing() -> WeftResult<()> {
     assert_eq!(ndjson_line(&json!("hel")), "\"hel\"\n");
     assert_eq!(ndjson_line(&json!({ "a": 1 })), "{\"a\":1}\n");
+    Ok(())
+}
+
+/// A message the caller's data type cannot carry (an object on a text
+/// route): by default the Stream fails after what already went out; a
+/// trigger set to skip such a chunk (`whenChunkFails: drop_chunk`) has it
+/// skipped, said to the connection, and the stream carries on to `done`,
+/// on a route and on a socket alike.
+async fn unmade_message(rig: FakeRig) -> WeftResult<()> {
+    let messages = [json!("a"), json!({ "n": 1 }), json!("c")];
+
+    let strict = http_caller(DataType::Text, LiveRequest::default(), InboundMessage::Text(String::new()));
+    rig.attach_caller(strict.clone());
+    let bus = closed_bus(&rig, &messages)?;
+    let err = rig.run(&StreamNode, json!({ "bus": bus })).await.failure()?;
+    assert!(err.contains("must be a String"), "{err}");
+    assert_eq!(strict.chunks(), vec![OutboundChunk::Text("a".into())], "nothing after the message it could not send");
+
+    for protocol in [Protocol::Http, Protocol::Websocket] {
+        let skipping = caller_skipping_unmade_chunks(protocol, DataType::Text);
+        rig.attach_caller(skipping.clone());
+        let bus = closed_bus(&rig, &messages)?;
+        let outcome = rig.run(&StreamNode, json!({ "bus": bus })).await.ok()?;
+        assert_eq!(outcome.outputs["done"], json!(true), "{protocol:?}");
+        assert_eq!(
+            skipping.chunks(),
+            vec![OutboundChunk::Text("a".into()), OutboundChunk::Text("c".into())],
+            "{protocol:?}: the stream went on past the message it skipped"
+        );
+        let skipped: Vec<_> = skipping.calls().into_iter().filter(|c| matches!(c, CallerCall::ChunkDropped { .. })).collect();
+        assert!(
+            matches!(skipped.as_slice(), [CallerCall::ChunkDropped { why }] if why.contains("must be a String")),
+            "{protocol:?}: {skipped:?}"
+        );
+    }
     Ok(())
 }

@@ -494,13 +494,14 @@ impl RunProjector {
                     protocol: protocol.clone(), at_unix,
                 }]
             }
-            RunEvent::CallerWindow { first_offset, last_offset, messages, totals, .. } => {
+            RunEvent::CallerWindow { first_offset, last_offset, messages, totals, dropped, .. } => {
                 vec![DispatcherEvent::CallerWindow {
                     run_id, project_id,
                     first_offset: *first_offset,
                     last_offset: *last_offset,
                     messages: messages.clone(),
                     totals: totals.clone(),
+                    dropped: dropped.clone(),
                     at_unix,
                 }]
             }
@@ -510,10 +511,10 @@ impl RunProjector {
                     message: message.clone(), at_unix,
                 }]
             }
-            RunEvent::CallerDisconnected { offset, reason, .. } => {
+            RunEvent::CallerDisconnected { offset, reason, dropped, .. } => {
                 vec![DispatcherEvent::CallerDisconnected {
                     run_id, project_id, offset: *offset,
-                    reason: reason.clone(), at_unix,
+                    reason: reason.clone(), dropped: dropped.clone(), at_unix,
                 }]
             }
             // LogLine / RunOutput / NodeKicked / PulsesConsumed /
@@ -718,7 +719,7 @@ fn sniff_bus_participants(
         );
         return Vec::new();
     };
-    let ephemeral = mode == weft_core::bus::BusMode::Ephemeral;
+    let ephemeral = mode == weft_core::stream_journal::JournalMode::Ephemeral;
     let mut out = vec![DispatcherEvent::BusParticipant {
         run_id,
         project_id,

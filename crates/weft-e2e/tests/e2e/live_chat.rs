@@ -25,11 +25,13 @@ async fn websocket_echoes_with_turn_counter() -> anyhow::Result<()> {
     // read the same connection: inbound is BROADCAST to every reader, so each
     // sent message must come back twice (once per echo, in either order),
     // each reply carrying { echo: <sent>, turn: <n> } with that echo's own
-    // turn counter.
+    // turn counter. The Socket keeps its default `json` messages, each held
+    // to `JsonDict`, so every message is a JSON object: a bare string is
+    // refused back to the caller by the Socket, the other reader here.
     let mut ws = live::open_ws(&disp, &path).await?;
     let timeout = Duration::from_secs(20);
 
-    for (round, msg) in [json!("hello"), json!("again")].iter().enumerate() {
+    for (round, msg) in [json!({ "text": "hello" }), json!({ "text": "again" })].iter().enumerate() {
         ws.send_json(msg).await?;
         for _ in 0..2 {
             let r: Value = ws.recv_json(timeout).await?;

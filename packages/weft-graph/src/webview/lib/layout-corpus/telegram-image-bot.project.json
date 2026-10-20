@@ -733,7 +733,7 @@
           "name": "callsPerMinute",
           "portType": "Number",
           "required": false,
-          "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it is dropped, and `weft status` counts it.",
+          "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
           "accepts": [
             "literal",
             "wire"
@@ -1562,7 +1562,7 @@
           "name": "callsPerMinute",
           "portType": "Number",
           "required": false,
-          "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it is dropped, and `weft status` counts it.",
+          "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
           "accepts": [
             "literal",
             "wire"

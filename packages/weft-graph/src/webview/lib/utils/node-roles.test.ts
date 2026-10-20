@@ -20,7 +20,7 @@ describe('the project-level questions count through includes', () => {
     expect(projectHasTriggers(nodes)).toBe(true);
     // This is the bug it fixes: the graph shows one plain node and one
     // opaque box, so counting per-node says the project has no trigger
-    // and the Activate button never appears.
+    // and Turn on is never offered.
     expect(nodes.some(nodeIsTrigger)).toBe(false);
   });
 

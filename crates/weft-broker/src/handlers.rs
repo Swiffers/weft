@@ -1164,8 +1164,7 @@ pub async fn supervisor_health_state(
     require_supervisor(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let rules = crate::lifecycle_writes::health_state(&state.pool, req.project_id).await.map_err(internal)?;
-    Ok(Json(SupervisorHealthStateResponse { rules }))
+    Ok(Json(crate::lifecycle_writes::health_state(&state.pool, req.project_id).await.map_err(internal)?))
 }
 
 pub async fn supervisor_claim_command(

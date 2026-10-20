@@ -16,8 +16,8 @@ use weft_broker_client::lifecycle_command::{
     pending_supervisor_command,
 };
 use weft_broker_client::protocol::{
-    HealthRuleState, InfraLifecycleVerb, LifecycleOutcome, ProjectStatus,
-    SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorProject,
+    HealthCommandEnding, HealthRuleState, InfraLifecycleVerb, LifecycleOutcome, ProjectStatus, QueuedHealthCommand,
+    SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorHealthStateResponse, SupervisorProject,
     SupervisorSetHealthStateRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
     SupervisorSyncOwnershipRequest, SupervisorSyncOwnershipResponse, SUPERVISOR_GIVE_UP_AFTER,
 };
@@ -487,7 +487,9 @@ where
 /// the supervisors have to look at that nothing announces, for the
 /// supervisor bound at `replica_param` whose host holds the projects
 /// bound at `held_param`: a command waiting on a project no lease covers
-/// (now), a unit's health window ending, a health rule's retry, a
+/// (now), a unit's health window ending, a health rule's retry, the
+/// deadline of a command a health rule queued (its ending asks for a look
+/// itself; the deadline is for one that never ends), a
 /// failed pass's retry (once no lease covers the project: its holder
 /// looks anyway; and only while the project is ownable: nothing claims
 /// one that is not, so its retry stays set until the project is ownable
@@ -526,6 +528,9 @@ fn supervisor_due(replica_param: &str, held_param: &str, listed_param: &str) -> 
            UNION ALL \
              SELECT h.project_id, h.next_retry_at_unix FROM infra_health_rule h \
               WHERE h.gave_up_at_unix IS NULL AND h.next_retry_at_unix IS NOT NULL \
+           UNION ALL \
+             SELECT h.project_id, h.queued_deadline_unix FROM infra_health_rule h \
+              WHERE h.queued_deadline_unix IS NOT NULL \
            UNION ALL \
              SELECT l.project_id, GREATEST(l.retry_at_unix, ( \
                         SELECT MAX(io.leased_until_unix) + 1 FROM infra_owner io \
@@ -745,16 +750,18 @@ fn gave_up_message() -> String {
 }
 
 /// Where each health rule of `project_id`'s copies stands
-/// (`infra_health_rule`). A rule that gave up comes back armed once a
-/// person's infra command touched the project since, or a person asked
-/// for a look since (`infra_health_look.asked_at_unix`): its failures and
-/// its give-up are cleared (whether it fired is kept), and the
-/// supervisor's next write of the state stores that.
-pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Result<Vec<HealthRuleState>> {
+/// (`infra_health_rule`), and how the commands they queued ended. A rule
+/// that gave up comes back armed once a person's infra command touched
+/// the project since, or a person asked for a look since
+/// (`infra_health_look.asked_at_unix`): its failures and its give-up are
+/// cleared (whether it fired, the command it queued and what it took
+/// down are kept), and the supervisor's next write of the state stores
+/// that.
+pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Result<SupervisorHealthStateResponse> {
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT h.node_id, h.instance_id, h.rule, h.fired, h.consecutive_failures, h.next_retry_at_unix, \
-                h.gave_up_at_unix, h.gave_up_seen, h.last_error, \
+                h.gave_up_at_unix, h.gave_up_seen, h.last_error, h.queued_command, h.queued_deadline_unix, h.took_down, \
                 (EXISTS (SELECT 1 FROM infra_lifecycle_command c \
                           WHERE c.project_id = h.project_id AND c.issued_at_unix >= h.gave_up_at_unix \
                             AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade')) \
@@ -766,7 +773,8 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
     .fetch_all(pool)
     .await
     .context("read the health rules' state")?;
-    rows.iter()
+    let rules = rows
+        .iter()
         .map(|r| {
             let rule: String = r.try_get("rule")?;
             let node_id: String = r.try_get("node_id")?;
@@ -776,12 +784,23 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("infra_health_rule.instance_id of '{rule}' on '{node_id}': {e}"))?;
             let copy = weft_broker_client::protocol::InfraCopy { node_id, instance };
+            let queued = match (r.try_get::<Option<i64>, _>("queued_command")?, r.try_get::<Option<i64>, _>("queued_deadline_unix")?) {
+                (Some(command), Some(deadline_unix)) => Some(QueuedHealthCommand { command, deadline_unix }),
+                (None, None) => None,
+                (command, deadline) => anyhow::bail!(
+                    "infra_health_rule '{rule}' on '{}' has queued_command {command:?} and queued_deadline_unix {deadline:?}: both or neither",
+                    copy.node_id
+                ),
+            };
             let fired: bool = r.try_get("fired")?;
+            let took_down: bool = r.try_get("took_down")?;
             if r.try_get::<bool, _>("touched")? {
                 return Ok(HealthRuleState {
                     copy,
                     rule,
                     fired,
+                    queued,
+                    took_down,
                     consecutive_failures: 0,
                     next_retry_at_unix: None,
                     gave_up_at_unix: None,
@@ -796,13 +815,39 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
                 copy,
                 rule,
                 fired,
+                queued,
+                took_down,
                 next_retry_at_unix: r.try_get("next_retry_at_unix")?,
                 gave_up_at_unix: r.try_get("gave_up_at_unix")?,
                 gave_up_seen: r.try_get("gave_up_seen")?,
                 last_error: r.try_get("last_error")?,
             })
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<HealthRuleState>>>()?;
+    let queued: Vec<i64> = rules.iter().filter_map(|r| r.queued.map(|q| q.command)).collect();
+    let ended = match queued.is_empty() {
+        true => Vec::new(),
+        false => sqlx::query(
+            "SELECT id, outcome, outcome_message FROM infra_lifecycle_command \
+             WHERE id = ANY($1) AND completed_at_unix IS NOT NULL ORDER BY id",
+        )
+        .bind(&queued)
+        .fetch_all(pool)
+        .await
+        .context("read how the health rules' commands ended")?
+        .iter()
+        .map(|r| {
+            let command: i64 = r.try_get("id")?;
+            let outcome: Option<String> = r.try_get("outcome")?;
+            let outcome = outcome
+                .as_deref()
+                .and_then(LifecycleOutcome::parse)
+                .ok_or_else(|| anyhow::anyhow!("infra_lifecycle_command {command} completed with outcome {outcome:?}"))?;
+            Ok(HealthCommandEnding { command, outcome, message: r.try_get("outcome_message")? })
+        })
+        .collect::<anyhow::Result<Vec<HealthCommandEnding>>>()?,
+    };
+    Ok(SupervisorHealthStateResponse { rules, ended })
 }
 
 /// Replace a project's health rules' state with `req.rules` (a rule on a
@@ -834,8 +879,8 @@ pub async fn set_health_state(pool: &PgPool, req: &SupervisorSetHealthStateReque
         sqlx::query(
             "INSERT INTO infra_health_rule \
                  (project_id, node_id, instance_id, rule, fired, consecutive_failures, next_retry_at_unix, \
-                  gave_up_at_unix, gave_up_seen, last_error) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  gave_up_at_unix, gave_up_seen, last_error, queued_command, queued_deadline_unix, took_down) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(req.project_id)
         .bind(&r.copy.node_id)
@@ -847,6 +892,9 @@ pub async fn set_health_state(pool: &PgPool, req: &SupervisorSetHealthStateReque
         .bind(r.gave_up_at_unix)
         .bind(&r.gave_up_seen)
         .bind(&r.last_error)
+        .bind(r.queued.map(|q| q.command))
+        .bind(r.queued.map(|q| q.deadline_unix))
+        .bind(r.took_down)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("write health rule '{}' on '{}'", r.rule, r.copy.node_id))?;

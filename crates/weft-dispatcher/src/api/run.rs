@@ -431,10 +431,23 @@ pub async fn outputs(
     Path(run_id_str): Path<String>,
 ) -> Result<Json<weft_core::run_spec::Expected>, (StatusCode, String)> {
     let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".into()))?;
-    authorize_run(&*state.journal, &caller.0, run_id).await?;
+    let owner = authorize_run(&*state.journal, &caller.0, run_id).await?;
     let sources = crate::projection::reconstruct_run(&state, run_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
-    let project = sources[&run_id].project();
+    let fold = &sources[&run_id];
+    // The run's own program is its cut, and a seeded run's cut leaves out
+    // what it reuses (a run that reuses everything it reaches runs an
+    // empty one), while its record holds the reused results too. So every
+    // place is spelled through the registered program the cut was taken
+    // from: ids are that program's own, and only it still has the loop a
+    // reused `LoopIn` or `LoopOut` belongs to.
+    let registered = match owner.registered_hash() {
+        Some(hash) => state.program(owner.project_id, hash).await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the run's program: {error:#}")))?
+            .ok_or_else(|| (StatusCode::CONFLICT, format!("the program run {run_id} was cut from ({hash}) is no longer recorded")))?,
+        None => fold.project().clone(),
+    };
+    let project = &*registered;
     // A loop's `LoopIn` is the compiler's: what it hands the body is the
     // wire of the node that fed the loop, so its wire says nothing a
     // person's wire does not, and its name (the loop's) would collide
@@ -443,13 +456,15 @@ pub async fn outputs(
     // output (`doubler.results`).
     let boundary = |id: &str| project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some()
         && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
-    let wires = sources[&run_id].output_wires()
+    let wires = fold.output_wires()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .iter().filter(|wire| !boundary(&wire.node))
         .map(|wire| weft_core::run_spec::ExpectedWire::spell(project, wire)).collect();
-    // Every place of the run, spelled the way the wires are: a node in
-    // an included file once per site that reaches it, a group once.
-    let nodes = weft_core::project::places::every_place(project).iter()
+    // Every place the run covers, spelled the way the wires are: what its
+    // cut runs and what its seed reused (a node in an included file once
+    // per site that reaches it, a loop once).
+    let nodes = weft_core::project::places::every_place(fold.project()).into_iter()
+        .chain(fold.snapshot().inherited_origins.keys().cloned())
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))

@@ -122,8 +122,11 @@ return, since weft fills it; to fail on purpose, raise. `_error` is not only
 for scripts: every node has one. For which failures reach it, go and read
 [when a node fails](how-a-program-runs.md#when-a-node-fails).
 
-You can only declare the ports a node leaves open for you. Ports whose types
-are already fixed keep them. Declare inputs, outputs, or both:
+You can declare any of the node's own inputs, with its type or a narrower
+one, and add new inputs on a node that takes them. An output you can declare only where the node leaves it open: one it lets
+you add, one typed with a type variable (a stand-in like `T` that takes its
+type where the node is used), or one it lets you narrow. Declaring an output
+looks like this:
 
 ```weft
 answer = LlmInferenceJson -> (response: { label: String })
@@ -131,7 +134,8 @@ convert = Cast -> (value: Boolean)
 ```
 
 Those are fragments: the nodes still need their other required inputs before
-they can run.
+they can run. For narrowing an output like `response`, go and read [saying
+what a broad output holds](types.md#saying-what-a-broad-output-holds).
 
 ### Optional and required inputs
 

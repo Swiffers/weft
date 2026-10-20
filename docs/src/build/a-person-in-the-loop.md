@@ -27,9 +27,12 @@ you two boolean outputs, `sendApproved` and `sendRejected`, so you gate what
 happens next on the one you want:
 
 ```weft
-reply = SendMessage {
+# ask is the BaileyReceive trigger the message came in on, whatsapp its BaileyBridge
+reply = BaileySend {
   _should_flow: review.sendApproved
-  text: draft.answer
+  bridge: whatsapp.bridge
+  to: ask.chatId
+  message: draft.answer
 }
 ```
 

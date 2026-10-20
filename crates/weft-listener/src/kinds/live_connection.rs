@@ -105,8 +105,7 @@ mod tests {
                 data_type: Default::default(),
                 backpressure: Default::default(),
                 error_mode: Default::default(),
-                journal_mode: Default::default(),
-                journal_window_secs: None,
+                journal: Default::default(),
                 window: None,
             },
         })

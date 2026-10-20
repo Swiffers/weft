@@ -145,9 +145,10 @@ export type DispatcherEvent = { eventId: string } & (
   // bus window's messages carry.
   // SYNC: DispatcherEvent 'caller_window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-core/src/live_event.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window'
   | { kind: 'caller_connected'; runId: string; projectId: string; offset: number; protocol: string; atUnix: number }
-  | { kind: 'caller_window'; runId: string; projectId: string; firstOffset: number; lastOffset: number; messages: Array<{ offset: number; direction: 'inbound' | 'outbound'; payload?: WirePayload; payloadByteSize: number; trimmed?: boolean; terminal?: boolean; atUnix: number }>; totals: Array<{ direction: 'inbound' | 'outbound'; count: number; bytes: number }>; atUnix: number }
+  | { kind: 'caller_window'; runId: string; projectId: string; firstOffset: number; lastOffset: number; messages: Array<{ offset: number; direction: 'inbound' | 'outbound'; payload?: WirePayload; payloadByteSize: number; trimmed?: boolean; terminal?: boolean; atUnix: number }>; totals: Array<{ direction: 'inbound' | 'outbound'; count: number; bytes: number }>; dropped?: number[]; atUnix: number }
   | { kind: 'caller_errored'; runId: string; projectId: string; offset: number; message: string; atUnix: number }
-  | { kind: 'caller_disconnected'; runId: string; projectId: string; offset: number; reason: string; atUnix: number }
+  // SYNC: DispatcherEvent 'caller_disconnected' <-> crates/weft-journal/src/events.rs CallerDisconnected, crates/weft-core/src/live_event.rs CallerDisconnected, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'disconnected'
+  | { kind: 'caller_disconnected'; runId: string; projectId: string; offset: number; reason: string; dropped?: number[]; atUnix: number }
   // Loop events. Carry the inspector groupId + parentFrames so
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
@@ -647,6 +648,7 @@ export class RunFollower implements vscode.Disposable {
               atUnix: m.atUnix,
             })),
             totals: e.totals,
+            dropped: e.dropped,
             atUnix: e.atUnix,
           },
         });
@@ -660,7 +662,7 @@ export class RunFollower implements vscode.Disposable {
       case 'caller_disconnected':
         this.post({
           kind: 'callerEvent',
-          event: { kind: 'disconnected', offset: e.offset, reason: e.reason, atUnix: e.atUnix },
+          event: { kind: 'disconnected', offset: e.offset, reason: e.reason, dropped: e.dropped, atUnix: e.atUnix },
         });
         break;
       case 'loop_instantiated':

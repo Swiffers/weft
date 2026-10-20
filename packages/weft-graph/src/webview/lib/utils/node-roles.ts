@@ -50,12 +50,12 @@ export function canBePerInstance(node: RoleNodeShape): boolean {
 /// in the graph at all. So "can this project be activated" and "does this
 /// project need its infra up" have to count through includes, which is
 /// what `includeContents` is for. Get this wrong and a project whose only
-/// trigger sits in an included file shows no Activate button.
+/// trigger sits in an included file is never offered Turn on.
 ///
 /// Only SHARED nodes count: a `@per_instance` node's copies each belong
 /// to one instance, armed and started by the program for it, so the
-/// action bar's Activate and Start infra have nothing to act on for it
-/// (an included file's contents already leave such nodes out).
+/// context bar's Turn on and Start have nothing to act on for it (an
+/// included file's contents already leave such nodes out).
 type ProjectRoleNode = RoleNodeShape & {
   requiresInfra?: boolean;
   perInstance?: PerInstance;

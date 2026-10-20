@@ -54,9 +54,14 @@ async fn a_late_caller_is_served_and_a_much_later_one_is_told_to_ask_again() -> 
         Ok(ws) => ws,
         Err((status, said)) => anyhow::bail!("a caller a minute late must still be served, got HTTP {status}: {said}"),
     };
-    ws.send_json(&json!("hello")).await?;
+    // The Socket's messages are JSON objects (its default `json` messages
+    // are held to `JsonDict`): a bare string would be refused back by the
+    // Socket while the echoes answer it too, and which of those arrives
+    // first is a race.
+    let hello = json!({ "text": "hello" });
+    ws.send_json(&hello).await?;
     let answered: Value = ws.recv_json(cell.scaled(std::time::Duration::from_secs(60))).await?;
-    anyhow::ensure!(answered["echo"] == json!("hello"), "and be served properly: {answered}");
+    anyhow::ensure!(answered["echo"] == hello, "and be served properly: {answered}");
     ws.close().await?;
 
     // Two more minutes, which is past the second ticket's life.

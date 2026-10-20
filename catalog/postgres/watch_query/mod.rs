@@ -98,8 +98,8 @@ impl Node for PostgresWatchQueryNode {
         // Both open with the first result, so a query that fails before
         // it answers is a failure `_error` can catch, and a consumer of
         // either is attached for the opening result.
-        let mut rows_bus = read_bus(&ctx, "rows");
-        let mut row_bus = read_bus(&ctx, "row");
+        let mut rows_bus = read_bus(&ctx, "rows")?;
+        let mut row_bus = read_bus(&ctx, "row")?;
         let cancel = ctx.cancellation();
         let mut last_rows: Option<Vec<Value>> = None;
         let mut last_row: Option<Value> = None;
@@ -151,8 +151,9 @@ pub fn first_row(rows: &[Value]) -> Value {
 /// The bus on `port`, only when something reads it (a journaled bus
 /// records every message, so one nobody reads would be written on every
 /// change for nothing), opening with the first piece it carries.
-fn read_bus<'c>(ctx: &'c RunContext, port: &str) -> Option<PendingBus<'c>> {
-    ctx.is_output_wired(port).then(|| ctx.pending_bus(port, BusOptions::default(), "watch"))
+fn read_bus<'c>(ctx: &'c RunContext, port: &str) -> WeftResult<Option<PendingBus<'c>>> {
+    let journal = ctx.journal_policy()?;
+    Ok(ctx.is_output_wired(port).then(|| ctx.pending_bus(port, BusOptions { journal, ..BusOptions::default() }, "watch")))
 }
 
 /// Whether a bus's value moved since its last message. The first one

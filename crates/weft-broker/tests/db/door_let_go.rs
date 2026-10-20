@@ -134,6 +134,34 @@ async fn a_run_that_parks_is_announced(pool: PgPool) {
     assert!(tokio::time::timeout(std::time::Duration::from_millis(300), heard.recv()).await.is_err(), "one announcement, the park's");
 }
 
+/// A run asked to stop while its worker drove it, after the drive had
+/// already decided to park, is queued rather than parked: the cancel took
+/// its wake signals, so parked it would wait for good with the ask unread.
+/// The worker that claims it next reads the cancel with its claim.
+#[sqlx::test]
+async fn a_run_asked_to_stop_is_queued_when_its_worker_parks_it(pool: PgPool) {
+    schema(&pool).await;
+    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    heard.listen(weft_task_store::runs::RUN_QUEUED_CHANNEL).await.unwrap();
+    let run_id = driven_by(&pool, "w1").await;
+    let cause = weft_core::run::CancelCause::Run { by: weft_core::new_run_id(), tag: Some("user_7".into()) };
+    sqlx::query("UPDATE run SET cancel_requested = $2 WHERE run_id = $1")
+        .bind(run_id)
+        .bind(sqlx::types::Json(&cause))
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The birth's own queueing was announced before the listener could
+    // have missed it; drain it so only the let-go's is left to hear.
+    while tokio::time::timeout(std::time::Duration::from_millis(200), heard.recv()).await.is_ok() {}
+    assert!(let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap());
+    assert_eq!(standing(&pool, run_id).await, ("queued".into(), None));
+    tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv()).await.expect("its queueing is announced").unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let claimed = weft_journal::record::claim(&mut conn, run_id, PROJECT, "w1").await.unwrap().expect("claimed again");
+    assert_eq!(claimed.cancel_requested, Some(cause), "the claim carries the cancel");
+}
+
 /// A run that ended is nobody's to let go of.
 #[sqlx::test]
 async fn a_run_that_ended_meanwhile_is_left_alone(pool: PgPool) {

@@ -72,8 +72,9 @@ And the one you are most likely to meet:
 this trigger needs 'slack' to deliver events TO your weft, which requires your
 weft to be reachable from the internet, and it is not. If you accept making its
 public trigger surface reachable, rerun `./setup.sh --public-url`, then `weft
-activate` (or `weft resync`, when the trigger is already on); or use a
-connection that supports dialing out (your own provider app), where the
+activate`, or, when the trigger is already on, turn it off and on again
+(`weft deactivate --trigger <name>`, then `weft activate --trigger <name>`);
+or use a connection that supports dialing out (your own provider app), where the
 service offers one. See https://weavemindai.github.io/weft/connections/events.html
 ```
 

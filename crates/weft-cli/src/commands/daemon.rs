@@ -333,8 +333,9 @@ async fn port_holder(port: u16) -> Option<String> {
 /// The ports this start runs the install on, saved in its `ports.json`
 /// so every later command (and the next start) finds the same address.
 /// A first start seeds them: the block's ports for the default install,
-/// free ports for a named one ([`weft_core::ports::free_ports`]: it sits
-/// beside the default install, so the block is taken). On the default
+/// free ports for a named one ([`ports::PortsTurn::free_ports`]: it sits
+/// beside the default install, so the block is taken), picked and saved
+/// while this start holds the machine's turn to pick ports. On the default
 /// install a `WEFT_*_PORT` set on this start moves that port for good; a
 /// named install ignores them, because a variable exported for the
 /// default install would otherwise land every test cell on the same port.
@@ -343,13 +344,15 @@ async fn port_holder(port: u16) -> Option<String> {
 /// ([`ports::SavedPorts::to_start_on`]): every other command reads the
 /// file as it is.
 fn ports(install: &Install) -> Result<Ports> {
+    // Held until the ports are saved: another start picking at the same
+    // moment reads them there.
+    let turn = ports::PortsTurn::take().map_err(anyhow::Error::msg)?;
     let saved = ports::SavedPorts::read(&install.dir).map_err(anyhow::Error::msg)?;
     let seeded = match (saved, install.id.name()) {
-        (Some(saved), _) => saved.to_start_on(&install.id).map_err(anyhow::Error::msg)?,
+        (Some(saved), _) => saved.to_start_on(&install.id, &turn).map_err(anyhow::Error::msg)?,
         (None, None) => Ports::DEFAULT,
         (None, Some(_)) => {
-            let [public, internal, outside, postgres, tunnel_metrics] =
-                weft_core::ports::free_ports(&[]).map_err(anyhow::Error::msg)?;
+            let [public, internal, outside, postgres, tunnel_metrics] = turn.free_ports(&[]).map_err(anyhow::Error::msg)?;
             Ports { public, internal, outside, postgres, tunnel_metrics }
         }
     };

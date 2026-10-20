@@ -125,7 +125,7 @@ impl EntryLimits {
         inputs.push(number(
             per_minute,
             "Runs started per minute",
-            "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it is dropped, and `weft status` counts it.",
+            "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
         ));
         inputs.push(number(
             at_once,

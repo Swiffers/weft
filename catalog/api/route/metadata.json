@@ -96,10 +96,33 @@
       "description": "Largest request body in MB; bigger is answered 413. A `data:` URL inflates its bytes by about a third, so the default 16 fits roughly 12 MB of picture."
     },
     {
-      "name": "journalEphemeral",
-      "type": "Boolean",
-      "label": "Keep the exchange out of the journal",
-      "description": "On: the journal keeps only sizes and counts, never the request or answer content (also hidden from you when debugging). Off (default): both are recorded, trimmed above 100 KB; raw bytes are never recorded."
+      "name": "whenChunkFails",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "surface",
+          "drop_chunk"
+        ]
+      },
+      "default": "surface",
+      "label": "When a message cannot be sent",
+      "description": "What happens when a Stream cannot turn one message into the route's `dataType` (a value that is not a String on a `text` route, a file it cannot read). `surface` (default): the Stream fails and the caller is told, with an error status if nothing was sent yet, the format's error marker after. `drop_chunk`: that message is skipped, noted on the run's record, and the stream goes on; pick it when one missing message is fine, like a frame of a live feed. A run that fails, or a bus that ends failed, is told to the caller either way."
+    },
+    {
+      "name": "whenCallerIsSlow",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "block",
+          "drop_oldest",
+          "drop_newest"
+        ]
+      },
+      "default": "block",
+      "label": "When the caller reads slower than you send",
+      "description": "What gives when a streamed answer is written faster than the caller reads it and the 256 chunks waiting for it fill up. `block` (default): the next write waits for room, so a slow caller slows the program and gets every chunk. `drop_oldest`: the oldest waiting chunk is thrown away, so the caller always gets the latest; pick it for live video or a price feed. `drop_newest`: the new chunk is thrown away and what was already waiting goes out in order. A dropped chunk never reaches the caller, so keep `block` for anything the caller must read whole."
     }
   ],
   "outputs": [

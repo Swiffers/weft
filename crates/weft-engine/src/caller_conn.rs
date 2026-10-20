@@ -17,6 +17,9 @@
 //!     `block` awaits a slot, `drop_newest` sheds the incoming chunk,
 //!     `drop_oldest` pops the front and enqueues (so one slow caller
 //!     cannot grow a multiplexing process's RAM). Terminal items always land.
+//!     A drop is decided as the chunk arrives, before it is recorded
+//!     ([`Admission`]), so the record names every chunk the caller will
+//!     never receive in the row it writes anyway.
 //!   - INBOUND (WebSocket): the socket task publishes each decoded
 //!     message onto a bounded `InboundLog`; every node's `receive` holds
 //!     its own absolute-offset cursor over the same window, so inbound
@@ -70,8 +73,10 @@ pub(crate) enum Outbound {
     /// connection refuses a second one (`HeadAlreadySent`), so the
     /// drainer sees it at most once, and only ahead of the first item.
     Head(ResponseHead),
-    /// A non-terminal chunk to write to the wire.
-    Chunk(OutboundChunk),
+    /// A non-terminal chunk to write to the wire, and the offset the
+    /// exchange's record holds it at, so pushing it out of the queue
+    /// can say which one it was.
+    Chunk { chunk: OutboundChunk, offset: u64 },
     /// The terminal: final optional body, then close the wire (with
     /// this close frame on a WebSocket; `None` = normal closure).
     Terminate(Option<OutboundChunk>, Option<CloseReason>),
@@ -140,6 +145,17 @@ impl Ending {
 /// end). The `capacity` therefore bounds queued chunks, not the whole
 /// buffer, which can briefly hold `capacity + 1` when a terminal arrives
 /// behind a full queue.
+///
+/// A chunk enters in two steps under the connection's `sending` lock:
+/// [`Self::admit`] decides what the policy does with it and has it
+/// recorded, then [`Self::push_admitted`] (or [`Self::push_block`])
+/// queues it. Chunks enter only that way and the drainer only takes them
+/// out, so a slot `admit` found or made is still free at the push.
+///
+/// Recording happens under the queue's lock, and so does the end of the
+/// exchange ([`Self::end`]): a chunk is on the record either before the
+/// row saying the caller left, and then that row names it if it never
+/// went out, or not at all.
 pub(crate) struct OutboundQueue {
     inner: Mutex<OutboundInner>,
     /// Woken on every push (drainer) AND on every drain/close (a blocked
@@ -150,6 +166,13 @@ pub(crate) struct OutboundQueue {
 
 struct OutboundInner {
     items: std::collections::VecDeque<Outbound>,
+    /// How many of `items` are chunks: the count the capacity bounds,
+    /// kept as they come and go rather than counted on every push.
+    chunks: usize,
+    /// The chunk admitted and recorded but not queued yet (a durable run
+    /// waits for its record in between, `block` for a slot): if the
+    /// exchange ends first, it never reaches the caller either.
+    in_flight: Option<u64>,
     /// Set when the socket task ends: producers stop queueing (return a
     /// transport error) and the drainer drains the tail then returns `None`.
     closed: bool,
@@ -160,21 +183,13 @@ impl OutboundQueue {
         Arc::new(Self {
             inner: Mutex::new(OutboundInner {
                 items: std::collections::VecDeque::new(),
+                chunks: 0,
+                in_flight: None,
                 closed: false,
             }),
             notify: tokio::sync::Notify::new(),
             capacity: capacity.max(1),
         })
-    }
-
-    /// Count of queued non-terminal chunks (the capacity bound applies to
-    /// these; terminals always land). Caller holds the lock.
-    fn chunk_count(inner: &OutboundInner) -> usize {
-        inner
-            .items
-            .iter()
-            .filter(|o| matches!(o, Outbound::Chunk(_)))
-            .count()
     }
 
     /// `Block` mode: wait until a chunk slot frees, then enqueue. Errors
@@ -189,7 +204,9 @@ impl OutboundQueue {
                 if g.closed {
                     return Err(CallerError::Transport("outbound queue closed".into()));
                 }
-                if Self::chunk_count(&g) < self.capacity {
+                if g.chunks < self.capacity {
+                    g.chunks += 1;
+                    g.in_flight = None;
                     g.items.push_back(chunk);
                     drop(g);
                     self.notify.notify_waiters();
@@ -200,36 +217,51 @@ impl OutboundQueue {
         }
     }
 
-    /// `DropNewest`: enqueue if there is room, else shed the incoming chunk.
-    fn push_drop_newest(&self, chunk: Outbound) -> Result<(), CallerError> {
+    /// What `policy` does with a chunk arriving now, handed to `record`,
+    /// which writes the chunk down and returns its offset. `Block` decides
+    /// nothing up front: it waits for a slot as it pushes. The drop
+    /// policies decide at once, while the queue is full: `DropNewest`
+    /// refuses the arriving chunk, `DropOldest` evicts the OLDEST queued
+    /// chunk (never a terminal) to make room, which an `mpsc` cannot do.
+    /// Errors, recording nothing, if the exchange already ended.
+    fn admit(&self, policy: Backpressure, record: impl FnOnce(Admission) -> u64) -> Result<(Admission, u64), CallerError> {
         let mut g = self.inner.lock().expect("outbound queue poisoned");
         if g.closed {
             return Err(CallerError::Transport("outbound queue closed".into()));
         }
-        if Self::chunk_count(&g) < self.capacity {
-            g.items.push_back(chunk);
-            drop(g);
-            self.notify.notify_waiters();
+        let admission = match policy {
+            Backpressure::Block => Admission::Waits,
+            _ if g.chunks < self.capacity => Admission::Room,
+            Backpressure::DropNewest => Admission::Refused,
+            Backpressure::DropOldest => {
+                let pos = g.items.iter().position(|o| matches!(o, Outbound::Chunk { .. }))
+                    .expect("a full queue holds a chunk");
+                let Some(Outbound::Chunk { offset, .. }) = g.items.remove(pos) else {
+                    unreachable!("the position found a chunk")
+                };
+                g.chunks -= 1;
+                Admission::Evicted(offset)
+            }
+        };
+        let offset = record(admission);
+        if admission != Admission::Refused {
+            g.in_flight = Some(offset);
         }
-        Ok(())
+        Ok((admission, offset))
     }
 
-    /// `DropOldest`: if full, evict the OLDEST queued chunk (not a terminal)
-    /// to make room, then enqueue the incoming one. This is the behavior an
-    /// `mpsc` cannot provide.
-    fn push_drop_oldest(&self, chunk: Outbound) -> Result<(), CallerError> {
-        let mut g = self.inner.lock().expect("outbound queue poisoned");
-        if g.closed {
-            return Err(CallerError::Transport("outbound queue closed".into()));
-        }
-        if Self::chunk_count(&g) >= self.capacity {
-            // Drop the oldest CHUNK (skip terminals, which must survive).
-            if let Some(pos) = g.items.iter().position(|o| matches!(o, Outbound::Chunk(_))) {
-                g.items.remove(pos);
+    /// Queue a chunk [`Self::admit`] made room for. Errors only if the
+    /// exchange ended meanwhile, whose record then named it.
+    fn push_admitted(&self, chunk: Outbound) -> Result<(), CallerError> {
+        {
+            let mut g = self.inner.lock().expect("outbound queue poisoned");
+            if g.closed {
+                return Err(CallerError::Transport("outbound queue closed".into()));
             }
+            g.chunks += 1;
+            g.in_flight = None;
+            g.items.push_back(chunk);
         }
-        g.items.push_back(chunk);
-        drop(g);
         self.notify.notify_waiters();
         Ok(())
     }
@@ -261,6 +293,9 @@ impl OutboundQueue {
             {
                 let mut g = self.inner.lock().expect("outbound queue poisoned");
                 if let Some(item) = g.items.pop_front() {
+                    if matches!(item, Outbound::Chunk { .. }) {
+                        g.chunks -= 1;
+                    }
                     drop(g);
                     // Wake a Block-mode producer that may be waiting for the
                     // slot we just freed.
@@ -280,6 +315,48 @@ impl OutboundQueue {
         self.inner.lock().expect("outbound queue poisoned").closed = true;
         self.notify.notify_waiters();
     }
+
+    /// The exchange is over: close, take out every chunk still waiting
+    /// (and the one admitted but not queued yet), none of which will ever
+    /// reach the caller, and hand their offsets to `record`, under the
+    /// lock a chunk is recorded under ([`Self::admit`]). Terminals stay
+    /// for a drainer still running; chunks would only go to a caller who
+    /// is gone.
+    fn end(&self, record: impl FnOnce(Vec<u64>)) {
+        {
+            let mut g = self.inner.lock().expect("outbound queue poisoned");
+            g.closed = true;
+            let mut undelivered = Vec::with_capacity(g.chunks + 1);
+            g.items.retain(|item| match item {
+                Outbound::Chunk { offset, .. } => {
+                    undelivered.push(*offset);
+                    false
+                }
+                _ => true,
+            });
+            g.chunks = 0;
+            undelivered.extend(g.in_flight.take());
+            record(undelivered);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+/// What the queue toward the caller does with a chunk as it arrives, per
+/// the trigger's `whenCallerIsSlow` ([`OutboundQueue::admit`]). Decided
+/// BEFORE the chunk is recorded, so the row that records it also says
+/// which chunk the caller will never receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// `block`: the chunk waits for a slot as it is pushed.
+    Waits,
+    /// There is a slot: the chunk joins the queue.
+    Room,
+    /// The queue was full: the oldest chunk waiting, the one the record
+    /// holds at this offset, was pushed out to make room (`drop_oldest`).
+    Evicted(u64),
+    /// The queue is full: this chunk is let go (`drop_newest`).
+    Refused,
 }
 
 /// Production live caller connection. Shared (`Arc`) across the
@@ -589,31 +666,35 @@ impl LiveCallerConnection {
     /// sink, so a flip first could close it before the row was handed over.
     /// Only the first call writes and flips: a second one returning at once
     /// leaves the flip to the first, so it never lands ahead of the row.
+    ///
+    /// The chunks still waiting to go out never will: the queue gives
+    /// them up, and the row names them as never received.
     pub(crate) fn mark_disconnected(&self, reason: &str) {
         if !self.disconnect_recorded.swap(true, Ordering::SeqCst) {
-            if self.arrival_recorded.load(Ordering::SeqCst) {
-                self.record.disconnected(reason);
-            }
+            self.outbound.end(|undelivered| {
+                if self.arrival_recorded.load(Ordering::SeqCst) {
+                    self.record.disconnected(reason, &undelivered);
+                }
+            });
             self.connected.send_replace(false);
         }
     }
 
-    /// Surface a node/run error to the caller per the error mode. Best
-    /// effort: records the `CallerErrored` event and pushes an `Error`
-    /// outbound (the socket task turns it into an in-band chunk for HTTP
-    /// after streaming started, or a WS close frame with the reason). Used
-    /// by the execute path when a live-connection run fails with the
-    /// caller still attached, so the caller learns why instead of seeing a
-    /// silently dropped socket. A program that already answered keeps its
-    /// answer: the error is recorded and never pushed after it, whether
-    /// that answer already left or still waits for the run's record.
-    /// `ending` is how the caller hears which kind of end it was.
+    /// Surface a run's error to the caller. Best effort: records the
+    /// `CallerErrored` event and pushes an `Error` outbound (a real status
+    /// before the first byte, an in-band chunk for HTTP after streaming
+    /// started, a WS close frame with the reason). Used by the execute
+    /// path when a live-connection run fails with the caller still
+    /// attached, so the caller learns why instead of seeing a silently
+    /// dropped socket. In every error mode: a run that ended has nothing
+    /// left to continue, so `drop_chunk` (which skips one chunk a node
+    /// could not make) has nothing to skip here. A program that already
+    /// answered keeps its answer: the error is recorded and never pushed
+    /// after it, whether that answer already left or still waits for the
+    /// run's record. `ending` is how the caller hears which kind of end
+    /// it was.
     pub async fn surface_error(&self, message: &str, ending: Ending) {
         self.record.errored(message);
-        // Tolerant streams: the chosen mode says swallow it.
-        if self.config.error_mode == weft_core::signal::ErrorMode::DropChunk {
-            return;
-        }
         if self.take_end(|_| ()).is_some() {
             self.outbound.push_terminal(Outbound::Error { ending });
         }
@@ -770,20 +851,22 @@ impl CallerConnection for LiveCallerConnection {
             return Err(CallerError::JournalLost(why));
         }
         // An answer that streams is recorded whole, its caller's arrival
-        // first.
+        // first, and each chunk with what a slow caller's policy did to
+        // it or to the oldest chunk still waiting.
         self.caller_arrived();
-        self.record.outbound(&chunk, false);
+        let (admission, offset) = self.outbound.admit(self.config.backpressure, |admission| self.record.chunk(&chunk, admission))?;
+        if admission == Admission::Refused {
+            // Let go as it arrived, and on the record as such; nothing
+            // leaves, so nothing waits for the record.
+            return Ok(());
+        }
         // A durable run's answer leaves only once it is on record.
         self.record.sink.committed().await.map_err(CallerError::JournalLost)?;
-        let chunk = Outbound::Chunk(chunk);
-        match self.config.backpressure {
+        let chunk = Outbound::Chunk { chunk, offset };
+        match admission {
             // Await a free slot; only errors if the socket is gone.
-            Backpressure::Block => self.outbound.push_block(chunk).await,
-            // Shed the incoming chunk if the queue is full; keep what's queued.
-            Backpressure::DropNewest => self.outbound.push_drop_newest(chunk),
-            // Evict the oldest queued chunk to make room, then enqueue. Real
-            // drop-oldest: the producer owns the buffer (see `OutboundQueue`).
-            Backpressure::DropOldest => self.outbound.push_drop_oldest(chunk),
+            Admission::Waits => self.outbound.push_block(chunk).await,
+            _ => self.outbound.push_admitted(chunk),
         }
     }
 
@@ -834,24 +917,18 @@ impl CallerConnection for LiveCallerConnection {
         Ok(())
     }
 
+    /// In every error mode: a stream that broke off is never ended as if
+    /// it were whole, which is what a clean end would tell the caller.
     async fn fail(&self, message: &str) -> Result<(), CallerError> {
         let _sending = self.sending.lock().await;
-        let streaming = {
+        {
             let mut g = self.inner.lock().expect("caller conn poisoned");
             try_terminate(g.terminated)?;
-            let streaming = g.wire_started;
             g.terminated = true;
             g.wire_started = true;
-            streaming
-        };
+        }
         self.record.errored(message);
-        let terminal = match (self.config.error_mode, streaming) {
-            // Tolerant streams: the route's author chose to end a stream
-            // that broke off as it stands. Before the first byte there is
-            // no stream to end, only a failure to answer.
-            (weft_core::signal::ErrorMode::DropChunk, true) => Outbound::Terminate(None, None),
-            _ => Outbound::Error { ending: Ending::ProgramFailed },
-        };
+        let terminal = Outbound::Error { ending: Ending::ProgramFailed };
         // A durable run's last word, held for its record like any
         // terminal (see `terminate`).
         if self.record.sink.waits_for_commit() {
@@ -861,6 +938,10 @@ impl CallerConnection for LiveCallerConnection {
         }
         self.outbound.push_terminal(terminal);
         Ok(())
+    }
+
+    fn chunk_dropped(&self, why: &str) {
+        self.record.errored(&format!("{}: {why}", weft_core::caller::CHUNK_DROPPED));
     }
 
     async fn receive(
@@ -1040,16 +1121,35 @@ impl CallerRecord {
         self.sink.inbound(self.run_id, self.take_offset(), msg);
     }
 
+    /// One of the program's messages that reaches the caller as it is
+    /// (an answer's last words, a fired run's answer).
     pub(crate) fn outbound(&self, chunk: &OutboundChunk, terminal: bool) {
-        self.sink.outbound(self.run_id, self.take_offset(), chunk, terminal);
+        self.sink.outbound(self.run_id, self.take_offset(), chunk, terminal, None);
+    }
+
+    /// A streamed chunk, with what the queue toward the caller did as it
+    /// arrived ([`Admission`]): the chunk itself let go, or an older one
+    /// pushed out for it, is said in the same row. Returns the chunk's
+    /// offset.
+    pub(crate) fn chunk(&self, chunk: &OutboundChunk, admission: Admission) -> u64 {
+        let offset = self.take_offset();
+        let dropped = match admission {
+            Admission::Refused => Some(offset),
+            Admission::Evicted(oldest) => Some(oldest),
+            Admission::Waits | Admission::Room => None,
+        };
+        self.sink.outbound(self.run_id, offset, chunk, false, dropped);
+        offset
     }
 
     pub(crate) fn errored(&self, message: &str) {
         self.sink.errored(self.run_id, self.take_offset(), message);
     }
 
-    pub(crate) fn disconnected(&self, reason: &str) {
-        self.sink.disconnected(self.run_id, self.take_offset(), reason);
+    /// The exchange is over, for `reason`. `dropped` are the program's
+    /// messages still waiting to go out, which the caller never received.
+    pub(crate) fn disconnected(&self, reason: &str, dropped: &[u64]) {
+        self.sink.disconnected(self.run_id, self.take_offset(), reason, dropped);
     }
 }
 
@@ -1060,9 +1160,17 @@ impl CallerRecord {
 pub trait CallerJournalSink: Send + Sync {
     fn connected(&self, run_id: RunId, offset: u64, protocol: Protocol);
     fn inbound(&self, run_id: RunId, offset: u64, msg: &InboundMessage);
-    fn outbound(&self, run_id: RunId, offset: u64, chunk: &OutboundChunk, terminal: bool);
+    /// One of the program's messages at `offset`. `dropped` is the
+    /// offset of a message of the program's the caller will never receive,
+    /// decided as this one was sent: this one itself, or an older one
+    /// pushed out for it ([`Admission`]). It belongs in the same row as
+    /// this message.
+    fn outbound(&self, run_id: RunId, offset: u64, chunk: &OutboundChunk, terminal: bool, dropped: Option<u64>);
     fn errored(&self, run_id: RunId, offset: u64, message: &str);
-    fn disconnected(&self, run_id: RunId, offset: u64, reason: &str);
+    /// The exchange is over, for `reason`; `dropped` are the offsets of
+    /// the program's messages still waiting to go out, which the caller
+    /// never received.
+    fn disconnected(&self, run_id: RunId, offset: u64, reason: &str, dropped: &[u64]);
 
     /// Stop taking rows, and hand over what is held. A run closes its
     /// caller's sink once it is over, before it lets go of its record
@@ -1821,7 +1929,7 @@ async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft
     };
     let (conn, run_id) = (here.conn.clone(), here.run_id);
     let response = match first {
-        Some(Outbound::Chunk(chunk)) => {
+        Some(Outbound::Chunk { chunk, .. }) => {
             let head = committed_head(explicit, Some(&chunk));
             let body = stream_body(StreamedAnswer {
                 conn: conn.clone(),
@@ -1935,7 +2043,7 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                             target: "weft_engine::caller_conn",
                             %run_id, "a response head reached a stream already under way"
                         ),
-                        Some(Outbound::Chunk(c)) => {
+                        Some(Outbound::Chunk { chunk: c, .. }) => {
                             let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
                             match write_or_end(sent, tx.closed(), &mut session).await {
                                 Ok(true) => heartbeat.sent(),
@@ -2103,7 +2211,7 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                 // (`bound_silence`, set before the protocol branch), so
                 // the machine aborts a connection whose data sits
                 // unacknowledged, or behind a closed window, that long.
-                Some(Outbound::Chunk(c)) => {
+                Some(Outbound::Chunk { chunk: c, .. }) => {
                     let sent = async { socket.send(chunk_to_ws(&c)).await.is_ok() };
                     match write_or_end(sent, std::future::pending(), &mut session).await {
                         Ok(true) => heartbeat.sent(),
@@ -2207,10 +2315,35 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<String>>,
+        /// The program's messages as recorded: offset, payload, and the
+        /// message the caller will never receive said in the same row.
+        sent: Mutex<Vec<(u64, OutboundChunk, Option<u64>)>>,
+        /// The messages the row saying the caller left names as never
+        /// received.
+        left_behind: Mutex<Vec<u64>>,
     }
     impl RecordingSink {
         fn events(&self) -> Vec<String> {
             self.events.lock().unwrap().clone()
+        }
+
+        /// What the record says reached the caller: every message of the
+        /// program's, in order, minus those a row says it never received.
+        fn received(&self) -> Vec<i64> {
+            let sent = self.sent.lock().unwrap();
+            let mut dropped: std::collections::HashSet<u64> = sent.iter().filter_map(|(_, _, d)| *d).collect();
+            dropped.extend(self.left_behind.lock().unwrap().iter().copied());
+            sent.iter()
+                .filter(|(offset, _, _)| !dropped.contains(offset))
+                .map(|(_, chunk, _)| match chunk {
+                    OutboundChunk::Json(v) => v.as_i64().unwrap(),
+                    other => panic!("expected a json chunk, got {other:?}"),
+                })
+                .collect()
+        }
+
+        fn dropped(&self) -> usize {
+            self.sent.lock().unwrap().iter().filter(|(_, _, d)| d.is_some()).count()
         }
     }
     impl CallerJournalSink for RecordingSink {
@@ -2220,14 +2353,16 @@ mod tests {
         fn inbound(&self, _c: RunId, off: u64, _m: &InboundMessage) {
             self.events.lock().unwrap().push(format!("inbound@{off}"));
         }
-        fn outbound(&self, _c: RunId, off: u64, _ch: &OutboundChunk, terminal: bool) {
+        fn outbound(&self, _c: RunId, off: u64, ch: &OutboundChunk, terminal: bool, dropped: Option<u64>) {
             self.events.lock().unwrap().push(format!("outbound@{off}:term={terminal}"));
+            self.sent.lock().unwrap().push((off, ch.clone(), dropped));
         }
         fn errored(&self, _c: RunId, off: u64, message: &str) {
             self.events.lock().unwrap().push(format!("errored@{off}:{message}"));
         }
-        fn disconnected(&self, _c: RunId, off: u64, _r: &str) {
+        fn disconnected(&self, _c: RunId, off: u64, _r: &str, dropped: &[u64]) {
             self.events.lock().unwrap().push(format!("disconnected@{off}"));
+            self.left_behind.lock().unwrap().extend_from_slice(dropped);
         }
 
         fn close(&self) {
@@ -2274,7 +2409,7 @@ mod tests {
         ws.close().await.unwrap();
         // Socket task would drain these:
         let first = out_rx.recv().await.expect("chunk");
-        assert!(matches!(first, Outbound::Chunk(_)));
+        assert!(matches!(first, Outbound::Chunk { .. }));
         let term = out_rx.recv().await.expect("terminate");
         assert!(matches!(term, Outbound::Terminate(None, None)));
         // Journal saw connect and the outbound chunk. The disconnect is the
@@ -2446,7 +2581,7 @@ mod tests {
         assert_eq!(reply, InboundMessage::Json(serde_json::json!("pong")));
         // The "ping" was actually queued to the socket.
         let sent = out_rx.recv().await.expect("ping queued");
-        assert!(matches!(sent, Outbound::Chunk(_)));
+        assert!(matches!(sent, Outbound::Chunk { .. }));
     }
 
     #[tokio::test]
@@ -2498,13 +2633,44 @@ mod tests {
     // ----- OutboundQueue backpressure policies (the real DropOldest) --------
 
     fn chunk(n: i64) -> Outbound {
-        Outbound::Chunk(OutboundChunk::Json(serde_json::json!(n)))
+        Outbound::Chunk { chunk: OutboundChunk::Json(serde_json::json!(n)), offset: n as u64 }
     }
     fn chunk_n(o: &Outbound) -> i64 {
         match o {
-            Outbound::Chunk(OutboundChunk::Json(v)) => v.as_i64().unwrap(),
+            Outbound::Chunk { chunk: OutboundChunk::Json(v), .. } => v.as_i64().unwrap(),
             other => panic!("expected json chunk, got {other:?}"),
         }
+    }
+
+    /// A chunk through a drop policy, the way `send_chunk` does it:
+    /// admitted (and recorded, at offset `n`) first, queued unless
+    /// refused. Returns the admission.
+    fn offer(q: &OutboundQueue, policy: Backpressure, n: i64) -> Admission {
+        let (admission, _) = q.admit(policy, |_| n as u64).unwrap();
+        if admission != Admission::Refused {
+            q.push_admitted(chunk(n)).unwrap();
+        }
+        admission
+    }
+
+    /// The exchange ending gives up every chunk still waiting, and the one
+    /// admitted but not queued yet (a durable run waiting on its record),
+    /// whose push then fails; a terminal stays for the drainer.
+    #[tokio::test]
+    async fn an_ended_exchange_gives_up_what_still_waited() {
+        let q = OutboundQueue::new(4);
+        offer(&q, Backpressure::DropOldest, 1);
+        offer(&q, Backpressure::DropOldest, 2);
+        assert_eq!(chunk_n(&q.recv().await.unwrap()), 1, "1 went out");
+        let (_, offset) = q.admit(Backpressure::DropOldest, |_| 3).unwrap();
+        q.push_terminal(Outbound::Terminate(None, None));
+        let mut undelivered = Vec::new();
+        q.end(|offsets| undelivered = offsets);
+        assert_eq!(undelivered, vec![2, offset], "the waiting chunk and the one on its way in");
+        assert!(q.push_admitted(chunk(3)).is_err(), "the exchange is over");
+        assert!(matches!(q.recv().await, Some(Outbound::Terminate(None, None))), "the terminal stays");
+        assert!(q.recv().await.is_none());
+        assert!(q.admit(Backpressure::Block, |_| panic!("nothing is recorded once it ended")).is_err());
     }
 
     /// `DropNewest`: once full, the INCOMING chunk is shed; the queued ones
@@ -2512,9 +2678,9 @@ mod tests {
     #[tokio::test]
     async fn outbound_drop_newest_sheds_incoming() {
         let q = OutboundQueue::new(2);
-        q.push_drop_newest(chunk(1)).unwrap();
-        q.push_drop_newest(chunk(2)).unwrap();
-        q.push_drop_newest(chunk(3)).unwrap(); // full -> 3 is shed
+        assert_eq!(offer(&q, Backpressure::DropNewest, 1), Admission::Room);
+        assert_eq!(offer(&q, Backpressure::DropNewest, 2), Admission::Room);
+        assert_eq!(offer(&q, Backpressure::DropNewest, 3), Admission::Refused, "full: 3 is shed");
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 1);
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 2);
         // Nothing else queued.
@@ -2528,9 +2694,9 @@ mod tests {
     #[tokio::test]
     async fn outbound_drop_oldest_evicts_front() {
         let q = OutboundQueue::new(2);
-        q.push_drop_oldest(chunk(1)).unwrap();
-        q.push_drop_oldest(chunk(2)).unwrap();
-        q.push_drop_oldest(chunk(3)).unwrap(); // full -> evict 1, keep 2,3
+        offer(&q, Backpressure::DropOldest, 1);
+        offer(&q, Backpressure::DropOldest, 2);
+        assert_eq!(offer(&q, Backpressure::DropOldest, 3), Admission::Evicted(1), "full: 1 is evicted, by its offset");
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 2);
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 3);
         q.close();
@@ -2543,9 +2709,9 @@ mod tests {
     #[tokio::test]
     async fn outbound_terminal_always_lands_and_is_never_evicted() {
         let q = OutboundQueue::new(1);
-        q.push_drop_oldest(chunk(1)).unwrap();
+        offer(&q, Backpressure::DropOldest, 1);
         q.push_terminal(Outbound::Terminate(None, None)); // lands despite full chunks
-        q.push_drop_oldest(chunk(2)).unwrap(); // evicts chunk 1, NOT the terminal
+        assert_eq!(offer(&q, Backpressure::DropOldest, 2), Admission::Evicted(1), "chunk 1, NOT the terminal");
         // Assert the EXACT surviving sequence in FIFO order: the terminal
         // (queued 2nd) then chunk 2. This pins all three properties: chunk 1
         // was the one evicted, chunk 2 was enqueued, and the terminal kept its
@@ -3143,8 +3309,9 @@ mod tests {
 
     /// A node failing the exchange (a stream whose bus broke off) is the
     /// same failure: in-band after the first byte, the plain failure under
-    /// a `500`; a second terminal is refused. A route that tolerates
-    /// dropped chunks ends the stream as it stands instead.
+    /// a `500`; a second terminal is refused. A route that skips chunks it
+    /// cannot make says so too: a stream that broke off is not a chunk,
+    /// and ending it cleanly would tell the caller it was whole.
     #[tokio::test]
     async fn a_node_failing_the_exchange_says_so_in_band() {
         let (status, _headers, body) = exchange("{}", |conn| async move {
@@ -3163,17 +3330,16 @@ mod tests {
 
         let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
         let request = LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() };
-        let (response, _, _) = open_exchange(tolerant, request, "{}", 0, |conn| async move {
+        let (response, run_id, _) = open_exchange(tolerant, request, "{}", 0, |conn| async move {
             let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
             http.write(OutboundChunk::Text("partial".into())).await.unwrap();
             http.fail("the stream broke off").await.unwrap();
         })
         .await;
         let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
-        assert_eq!(body, "partial", "a tolerant stream ends as it stands");
+        assert_eq!(body, format!("partial\n[error] {}", PlainFailure::of(run_id).line()), "what went out stays, and the break is told");
 
-        // Before the first byte there is no stream to end as it stands:
-        // even a tolerant route answers the failure.
+        // Before the first byte: the failure under a real status.
         let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
         let request = LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() };
         let (response, run_id, _) = open_exchange(tolerant, request, "{}", 0, |conn| async move {
@@ -3194,7 +3360,7 @@ mod tests {
         assert_eq!(Ending::of_cancel(&CancelCause::Limit { detail: "cap".into() }), Ending::TimeLimit);
         for cause in [
             CancelCause::User,
-            CancelCause::Run { by: RunId::nil(), tag: "t".into() },
+            CancelCause::Run { by: RunId::nil(), tag: Some("t".into()) },
             CancelCause::Runtime { detail: "the drain's deadline".into() },
             CancelCause::CallerGone,
         ] {
@@ -3435,7 +3601,7 @@ mod tests {
             .await
             .unwrap();
         let first = out.recv().await.unwrap();
-        assert!(matches!(first, Outbound::Chunk(_)), "no Head item on a websocket: {first:?}");
+        assert!(matches!(first, Outbound::Chunk { .. }), "no Head item on a websocket: {first:?}");
         conn.terminate(None, None, Some(CloseReason { code: 4000, reason: "done".into() }))
             .await
             .unwrap();
@@ -3497,6 +3663,346 @@ mod tests {
             match recv.await.expect("task joins") {
                 Err(CallerError::Disconnected) => {}
                 other => panic!("expected Disconnected on close, got {other:?}"),
+            }
+        }
+    }
+
+    // ----- What gives on a live exchange: whenChunkFails, whenCallerIsSlow --
+
+    /// A chunk a node could not make, as the node hands it over.
+    fn unmade() -> weft_core::WeftResult<OutboundChunk> {
+        Err(weft_core::node_error("the frame does not fit the route's text"))
+    }
+
+    /// One HTTP exchange driven like `open_exchange`, with its record kept
+    /// so a test can read what the exchange wrote down.
+    async fn recorded_exchange<F, Fut>(cfg: CallerRuntimeConfig, program: F) -> (RunId, String, Vec<String>)
+    where
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (state, _) = server_state();
+        let run_id = RunId::new_v4();
+        let sink = Arc::new(RecordingSink::default());
+        let (conn, outbound, _) = new_connection(
+            cfg,
+            run_id,
+            Arc::new(LiveRequest { method: "POST".into(), path: "feed".into(), ..Default::default() }),
+            Some(InboundMessage::Json(serde_json::Value::Null)),
+            sink.clone(),
+        );
+        let run: futures::future::BoxFuture<'static, ()> = Box::pin(program(conn.clone()));
+        let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), run_id };
+        let response = answer_http(here, 0, state.clock).await;
+        let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        (run_id, body, sink.events())
+    }
+
+    /// `drop_chunk` on a stream: the chunk a node could not make is
+    /// skipped, the stream goes on with the next one and ends as the
+    /// program ends it, and the skip is on the exchange's record.
+    /// `surface`: the node gets the failure back, returns it, the run
+    /// fails, and the caller is told in-band after what already went out.
+    #[tokio::test]
+    async fn a_stream_skips_a_chunk_it_cannot_make_or_tells_the_caller() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
+        let (_, body, record) = recorded_exchange(tolerant, |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+            http.write(OutboundChunk::Text("a\n".into())).await.unwrap();
+            assert!(http.drop_or_fail(unmade()).expect("skipped, not failed").is_none());
+            http.write(OutboundChunk::Text("c\n".into())).await.unwrap();
+            http.close().await.unwrap();
+        })
+        .await;
+        assert_eq!(body, "a\nc\n", "the stream went on past the chunk it skipped");
+        let skip = format!("{}: the frame does not fit the route's text", weft_core::caller::CHUNK_DROPPED);
+        assert!(record.iter().any(|e| e.ends_with(&skip)), "the skip is on the record: {record:?}");
+
+        let (run_id, body, _) = recorded_exchange(http_cfg(), |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            http.write(OutboundChunk::Text("a\n".into())).await.unwrap();
+            let failed = http.drop_or_fail(unmade()).expect_err("the route tells its caller");
+            // What the run does with a node that returned its failure.
+            conn.surface_error(&format!("run failed: {failed}"), Ending::ProgramFailed).await;
+            assert!(http.write(OutboundChunk::Text("c\n".into())).await.is_err(), "nothing follows the failure");
+        })
+        .await;
+        assert_eq!(body, format!("a\n\n[error] {}", PlainFailure::of(run_id).line()));
+    }
+
+    /// A run that fails is told to its caller in every mode: there is no
+    /// next chunk to go on with, so a route that skips chunks still ends
+    /// the stream as failed rather than as complete, with the status the
+    /// ending has.
+    #[tokio::test]
+    async fn a_failed_run_is_told_whatever_the_route_skips() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
+        let (run_id, body, _) = recorded_exchange(tolerant.clone(), |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            let head = ResponseHead::new(200).with_header("content-type", "application/x-ndjson");
+            http.write_with(head, OutboundChunk::Text("{\"a\":1}\n".into())).await.unwrap();
+            conn.surface_error("run failed: the model went away", Ending::ProgramFailed).await;
+        })
+        .await;
+        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last, serde_json::json!({ "error": weft_core::caller::PLAIN_FAILURE, "runId": run_id, "status": 500 }));
+
+        for (ending, status) in [(Ending::TimeLimit, StatusCode::GATEWAY_TIMEOUT), (Ending::Stopped, StatusCode::SERVICE_UNAVAILABLE)] {
+            let (state, _) = server_state();
+            let (here, _, _) = run_here(tolerant.clone(), LiveRequest::default(), "{}", move |conn| async move {
+                conn.surface_error("ended", ending).await;
+            });
+            let response = answer_http(here, 0, state.clock).await;
+            assert_eq!(response.status(), status, "before the first byte, the ending's own status: {ending:?}");
+        }
+    }
+
+    /// A socket with its caller on a real WebSocket: `program` runs
+    /// against the connection once the socket is open, and the caller
+    /// reads every frame until the close. Hands back the messages, the
+    /// close frame, the run's id and the exchange's record.
+    async fn socket_exchange<F, Fut>(
+        cfg: CallerRuntimeConfig,
+        program: F,
+    ) -> (Vec<String>, Option<tokio_tungstenite::tungstenite::protocol::CloseFrame<'static>>, RunId, Vec<String>)
+    where
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use futures::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message as Frame;
+        let run_id = RunId::new_v4();
+        let sink = Arc::new(RecordingSink::default());
+        let (conn, outbound, inbound) = new_connection(cfg.clone(), run_id, Arc::new(LiveRequest::default()), None, sink.clone());
+        let canceller = Arc::new(RecordingCanceller::default());
+        let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: canceller.clone(), run_id, armed: true };
+        let pump = SocketPump {
+            conn: conn.clone(),
+            outbound,
+            inbound: inbound.expect("a websocket connection has an inbound log"),
+            config: cfg,
+            heartbeat_secs: 0,
+            clock: weft_platform_traits::SystemClock::new(),
+            canceller,
+            run_id,
+        };
+        let opened = Arc::new(Mutex::new(Some((pump, unopened))));
+        let app = Router::new().route(
+            "/",
+            axum::routing::get(move |ws: WebSocketUpgrade| async move {
+                let (pump, unopened) = opened.lock().unwrap().take().expect("one socket");
+                ws.on_upgrade(move |socket| pump_ws(socket, pump, unopened))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/")).await.unwrap();
+        tokio::spawn(program(conn));
+        let mut messages = Vec::new();
+        let close = loop {
+            match socket.next().await {
+                Some(Ok(Frame::Text(t))) => messages.push(t.as_str().to_owned()),
+                Some(Ok(Frame::Close(frame))) => break frame,
+                Some(Ok(_)) => {}
+                // The socket went without a close frame.
+                Some(Err(_)) | None => break None,
+            }
+        };
+        (messages, close, run_id, sink.events())
+    }
+
+    /// The same two modes on a socket: `drop_chunk` skips the message and
+    /// the session goes on to a normal close; `surface` closes it `1011`
+    /// after what already went out.
+    #[tokio::test]
+    async fn a_socket_skips_a_message_it_cannot_make_or_closes_failed() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..ws_cfg() };
+        let (messages, close, _, record) = socket_exchange(tolerant, |conn| async move {
+            let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn) else { unreachable!() };
+            ws.send(OutboundChunk::Text("a".into())).await.unwrap();
+            assert!(ws.drop_or_fail(unmade()).expect("skipped, not failed").is_none());
+            ws.send(OutboundChunk::Text("c".into())).await.unwrap();
+            ws.close().await.unwrap();
+        })
+        .await;
+        assert_eq!(messages, vec!["a", "c"], "the session went on past the message it skipped");
+        assert_eq!(close.map(|c| u16::from(c.code)), Some(1000), "a normal close");
+        assert!(record.iter().any(|e| e.contains(weft_core::caller::CHUNK_DROPPED)), "{record:?}");
+
+        let (messages, close, run_id, _) = socket_exchange(ws_cfg(), |conn| async move {
+            let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            ws.send(OutboundChunk::Text("a".into())).await.unwrap();
+            let failed = ws.drop_or_fail(unmade()).expect_err("the socket tells its caller");
+            conn.surface_error(&format!("run failed: {failed}"), Ending::ProgramFailed).await;
+        })
+        .await;
+        assert_eq!(messages, vec!["a"]);
+        let close = close.expect("a close frame, never a dropped socket");
+        assert_eq!(u16::from(close.code), 1011);
+        assert_eq!(&*close.reason, PlainFailure::of(run_id).line());
+    }
+
+    /// A socket whose run fails is closed `1011` whatever it skips: before,
+    /// a route that skipped chunks swallowed the failure and the caller
+    /// saw its socket vanish with no close frame.
+    #[tokio::test]
+    async fn a_failed_run_closes_a_tolerant_socket_with_a_frame() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..ws_cfg() };
+        let (_, close, run_id, _) = socket_exchange(tolerant, |conn| async move {
+            conn.surface_error("run failed: boom", Ending::ProgramFailed).await;
+            conn.hang_up().await;
+        })
+        .await;
+        let close = close.expect("a close frame, never a dropped socket");
+        assert_eq!(u16::from(close.code), 1011);
+        assert_eq!(&*close.reason, PlainFailure::of(run_id).line());
+    }
+
+    /// `OUTBOUND_BUFFER + extra` numbered chunks sent through `cfg`'s
+    /// connection while nobody drains it (a caller that stopped reading),
+    /// then what the wire would carry, in order. Also checks the record
+    /// says exactly that, and names `extra` chunks as never received.
+    async fn sent_to_a_stalled_caller(cfg: CallerRuntimeConfig, extra: usize) -> Vec<i64> {
+        let http_body = (cfg.protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
+        let record = Arc::new(RecordingSink::default());
+        let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, record.clone());
+        for n in 0..(OUTBOUND_BUFFER + extra) as i64 {
+            conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.expect("a drop mode never waits or fails");
+        }
+        conn.terminate(None, None, None).await.unwrap();
+        let mut carried = Vec::new();
+        while let Some(item) = outbound.recv().await {
+            match item {
+                Outbound::Terminate(..) => break,
+                chunk => carried.push(chunk_n(&chunk)),
+            }
+        }
+        assert_eq!(record.received(), carried, "the record says what the caller received");
+        assert_eq!(record.dropped(), extra, "and names every chunk it did not");
+        carried
+    }
+
+    /// `drop_oldest` keeps the newest: the caller that catches up reads
+    /// the last `OUTBOUND_BUFFER` chunks; `drop_newest` keeps the oldest:
+    /// it reads the first ones and the gap is at the end. Neither ever
+    /// makes the program wait, on either wire.
+    #[tokio::test]
+    async fn a_slow_caller_gets_the_newest_or_the_oldest_per_the_route() {
+        let extra = 10;
+        for protocol in [Protocol::Http, Protocol::Websocket] {
+            let oldest = CallerRuntimeConfig { protocol, backpressure: Backpressure::DropOldest, ..ws_cfg() };
+            let carried = sent_to_a_stalled_caller(oldest, extra).await;
+            let newest: Vec<i64> = (extra as i64..(OUTBOUND_BUFFER + extra) as i64).collect();
+            assert_eq!(carried, newest, "{protocol:?}: drop_oldest keeps the newest");
+
+            let newest_shed = CallerRuntimeConfig { protocol, backpressure: Backpressure::DropNewest, ..ws_cfg() };
+            let carried = sent_to_a_stalled_caller(newest_shed, extra).await;
+            let first: Vec<i64> = (0..OUTBOUND_BUFFER as i64).collect();
+            assert_eq!(carried, first, "{protocol:?}: drop_newest keeps the oldest");
+        }
+    }
+
+    /// A caller that leaves (or whose session cap ends the exchange) with
+    /// chunks still waiting: the row saying it left names each of them,
+    /// so the record says exactly what the caller received, under every
+    /// policy.
+    #[tokio::test]
+    async fn a_caller_that_leaves_never_received_what_still_waited() {
+        for backpressure in [Backpressure::Block, Backpressure::DropOldest, Backpressure::DropNewest] {
+            for end in [ExchangeEnd::CallerHungUp, ExchangeEnd::SessionCapExceeded] {
+                let cfg = CallerRuntimeConfig { protocol: Protocol::Http, backpressure, ..ws_cfg() };
+                let record = Arc::new(RecordingSink::default());
+                let (conn, outbound, _) = new_connection(
+                    cfg, RunId::nil(), Arc::new(LiveRequest::default()),
+                    Some(InboundMessage::Json(serde_json::Value::Null)), record.clone(),
+                );
+                for n in 0..10 {
+                    conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.unwrap();
+                }
+                let carried: Vec<i64> = vec![chunk_n(&outbound.recv().await.unwrap()), chunk_n(&outbound.recv().await.unwrap())];
+                exchange_ended(&conn, &outbound, &RecordingCanceller::default(), RunId::nil(), end);
+                assert!(outbound.recv().await.is_none(), "nothing left to write");
+                assert_eq!(record.received(), carried, "{backpressure:?} {end:?}: the record says what the caller received");
+                assert_eq!(record.left_behind.lock().unwrap().len(), 8, "{backpressure:?} {end:?}: and names the rest");
+                // A send after the caller left (refused, or swallowed for a
+                // run that outlives its caller) is never on the record as
+                // received.
+                let _ = conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(99))).await;
+                assert_eq!(record.received(), carried, "{backpressure:?} {end:?}: a later send is not on the record");
+            }
+        }
+    }
+
+    // A caller reading slowly WHILE the program sends, under both drop
+    // policies and on both wires: whatever the race between a send and
+    // the read beside it, the record names exactly the chunks the caller
+    // did not receive (a caller that never reads at all is
+    // `sent_to_a_stalled_caller`). Stress-looped multi-thread, since the
+    // read racing the send is the point.
+    weft_core::stress_test! {
+        name: a_slow_callers_record_says_exactly_what_it_received,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            for protocol in [Protocol::Http, Protocol::Websocket] {
+                for backpressure in [Backpressure::DropOldest, Backpressure::DropNewest] {
+                    let cfg = CallerRuntimeConfig { protocol, backpressure, ..ws_cfg() };
+                    let http_body = (protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
+                    let record = Arc::new(RecordingSink::default());
+                    let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, record.clone());
+                    // The caller: reads one, then lets a few sends go by.
+                    let reader = tokio::spawn(async move {
+                        let mut carried = Vec::new();
+                        while let Some(item) = outbound.recv().await {
+                            match item {
+                                Outbound::Terminate(..) => break,
+                                chunk => carried.push(chunk_n(&chunk)),
+                            }
+                            for _ in 0..3 { tokio::task::yield_now().await; }
+                        }
+                        carried
+                    });
+                    for n in 0..(OUTBOUND_BUFFER * 3) as i64 {
+                        conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.expect("a drop mode never waits or fails");
+                    }
+                    conn.terminate(None, None, None).await.unwrap();
+                    let carried = reader.await.expect("joins");
+                    assert_eq!(record.received(), carried, "{protocol:?} {backpressure:?}: the record says what the caller received");
+                }
+            }
+        }
+    }
+
+    // `block`: with the buffer full the program's next send waits, and
+    // it goes out (last, in order) once the caller reads one. Stress-looped
+    // multi-thread: a lost wakeup between the drain and the waiting send
+    // would hang `waiting.await`, failing the iteration.
+    weft_core::stress_test! {
+        name: a_slow_caller_under_block_makes_the_program_wait,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            for protocol in [Protocol::Http, Protocol::Websocket] {
+                let cfg = CallerRuntimeConfig { protocol, backpressure: Backpressure::Block, ..ws_cfg() };
+                let http_body = (protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
+                let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, Arc::new(RecordingSink::default()));
+                for n in 0..OUTBOUND_BUFFER as i64 {
+                    conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.unwrap();
+                }
+                let sender = conn.clone();
+                let waiting = tokio::spawn(async move {
+                    sender.send_chunk(None, OutboundChunk::Json(serde_json::json!(OUTBOUND_BUFFER as i64))).await
+                });
+                for _ in 0..8 { tokio::task::yield_now().await; }
+                assert!(!waiting.is_finished(), "{protocol:?}: a full buffer makes the send wait");
+                assert_eq!(chunk_n(&outbound.recv().await.unwrap()), 0);
+                waiting.await.expect("joins").expect("it went once there was room");
+                let mut carried = Vec::new();
+                for _ in 0..OUTBOUND_BUFFER {
+                    carried.push(chunk_n(&outbound.recv().await.unwrap()));
+                }
+                assert_eq!(carried, (1..=OUTBOUND_BUFFER as i64).collect::<Vec<_>>(), "{protocol:?}: nothing shed, in order");
             }
         }
     }

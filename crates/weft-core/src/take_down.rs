@@ -23,8 +23,11 @@
 //! [`TakeDownChoice`] (each answer optional), resolved against the
 //! defaults every command shares ([`TakeDown::DEFAULT`]). `weft rm` and an infra copy
 //! found broken take triggers down with fixed answers
-//! ([`TakeDown::REMOVE`], [`TakeDown::HEALTH`]). Nothing is ever asked
-//! interactively: what a command did is printed after it did it.
+//! ([`TakeDown::REMOVE`], [`TakeDown::HEALTH`]). The three answers are
+//! never asked interactively: each comes from its flag or its default, and
+//! what a command did is printed after it did it. (`weft infra terminate`
+//! and `weft rm` do ask once whether to delete at all, unless `--yes`;
+//! that question is about the deletion, never about these answers.)
 //!
 //! Coming back is `weft activate`, which releases what was held
 //! ([`ReleaseHeld`]), paced so new arrivals still get through.

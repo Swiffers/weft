@@ -138,7 +138,7 @@ impl Node for AudioStreamNode {
             .open_bus(
                 "stream",
                 BusOptions {
-                    ephemeral: true,
+                    journal: weft::stream_journal::JournalPolicy::ephemeral(),
                     window: Some(WINDOW_CHUNKS),
                     payload: BusPayloadKind::Bytes,
                     meta: json!({ "sample_rate": rate, "encoding": "pcm_s16le" }),

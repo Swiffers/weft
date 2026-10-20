@@ -101,15 +101,40 @@
     async fn a_run_cancelled_before_it_was_picked_up_books_its_open_charge() {
         let project = project();
         let run_id = uuid::Uuid::new_v4();
-        // Without its kick: a run cancelled before it loads holds none of
-        // its record's tables, and the rig checks the record folds back
-        // into what the drive held.
-        let mut rows = rows(&project, run_id);
-        rows.retain(|row| !matches!(row, RunEvent::NodeKicked { .. }));
+        let rows = rows(&project, run_id);
         let cancellation = CancellationFlag::new_arc();
         cancellation.cancel_because(weft_core::run::CancelCause::User);
         let (outcome, events) =
             drive_journal(project, catalog(vec![("Done", Box::new(Done))]), run_id, rows, cancellation).await;
         assert!(matches!(outcome.expect("the drive runs"), RunOutcome::Cancelled { .. }));
         assert_eq!(costs(&events), vec![("node".to_string(), None, Some("job-1".to_string()))], "{events:?}");
+    }
+
+    /// A run that parked on a wait and was asked to stop before it let go
+    /// of its worker is queued and claimed with its cancel waiting: the
+    /// drive that claims it ends its waiting firing Cancelled with the
+    /// cause, the same row a cancel of a run nobody drives writes, then
+    /// the run.
+    #[tokio::test]
+    async fn a_run_claimed_with_its_cancel_waiting_cancels_the_firing_it_parked_on() {
+        let project = project();
+        let run_id = uuid::Uuid::new_v4();
+        let mut rows = rows(&project, run_id);
+        rows.retain(|row| !matches!(row, RunEvent::ChargeOpened { .. }));
+        rows.push(RunEvent::NodeStarted { run_id, node_id: "node".into(), frames: vec![], at_unix: 0 });
+        rows.push(RunEvent::NodeSuspended { run_id, node_id: "node".into(), frames: vec![], token: "form".into(), at_unix: 0 });
+        let cause = weft_core::run::CancelCause::Run { by: uuid::Uuid::new_v4(), tag: Some("user_7".into()) };
+        let cancellation = CancellationFlag::new_arc();
+        cancellation.cancel_because(cause.clone());
+        let (outcome, events) =
+            drive_journal(project, catalog(vec![("Done", Box::new(Done))]), run_id, rows, cancellation).await;
+        assert!(matches!(outcome.expect("the drive runs"), RunOutcome::Cancelled { .. }));
+        let cancelled: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::NodeCancelled { node_id, reason, .. } => Some((node_id.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cancelled, vec![("node".to_string(), cause.to_string())], "{events:?}");
     }

@@ -271,7 +271,8 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     anyhow::ensure!(status == 200, "bob's pick is its own: {status}");
 
     // A connection written as an instance's fallback is the old way: its
-    // id means nothing on another install, so the compiler refuses it.
+    // id means nothing on another install, so the node does not compile,
+    // and the resync of the trigger that needs it is refused saying why.
     project.set_node_config("theirs", "account", &format!("@instance_filled({})", keys.handle()))?;
     let refused = project.weft_refused(&["resync"]).await?;
     anyhow::ensure!(refused.contains("falls back to a connection written in the source"), "{refused}");

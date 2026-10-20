@@ -1036,8 +1036,9 @@ pub async fn held_attempt_failed(
 /// alarm gives it. A failure on the last of them gives the signal up,
 /// once, with why, shown on its node, and answers the wake as handled
 /// (`Ok(Some(why))`): it stays stopped until it is registered again,
-/// which a resync of its project (`weft resync`) does, and, for one that
-/// signs in through a connection, reconnecting that connection. The why
+/// which turning its trigger off and on does, as does a resync moving it
+/// onto a new build, and, for one that signs in through a connection,
+/// reconnecting that connection. The why
 /// tells a wake that failed to act from one that acted and could not set
 /// the wake after it ([`NextWakeNotSet`]). A failure on an earlier one is
 /// `Err`, which the alarm delivers again.

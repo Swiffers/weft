@@ -61,6 +61,10 @@ impl CancelCall {
         Self { url: url.into(), method: CancelMethod::Put, body: None }
     }
 
+    pub fn patch(url: impl Into<String>) -> Self {
+        Self { url: url.into(), method: CancelMethod::Patch, body: None }
+    }
+
     pub fn delete(url: impl Into<String>) -> Self {
         Self { url: url.into(), method: CancelMethod::Delete, body: None }
     }
@@ -100,6 +104,21 @@ mod tests {
         let with_body = CancelCall::post("https://x/cancel").with_body(serde_json::json!({ "id": 7 }));
         let back: CancelCall = serde_json::from_value(serde_json::to_value(&with_body).unwrap()).unwrap();
         assert_eq!(back, with_body);
+    }
+
+    /// Each verb has its constructor, and each writes its own wire word.
+    #[test]
+    fn every_verb_has_a_constructor() {
+        let url = "https://x/jobs/1";
+        for (call, method, word) in [
+            (CancelCall::post(url), CancelMethod::Post, "post"),
+            (CancelCall::put(url), CancelMethod::Put, "put"),
+            (CancelCall::patch(url), CancelMethod::Patch, "patch"),
+            (CancelCall::delete(url), CancelMethod::Delete, "delete"),
+        ] {
+            assert_eq!(call, CancelCall { url: url.into(), method, body: None });
+            assert_eq!(serde_json::to_value(&call).unwrap()["method"], word);
+        }
     }
 
     #[test]

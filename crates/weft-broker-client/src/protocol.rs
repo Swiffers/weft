@@ -859,9 +859,35 @@ pub struct SupervisorHealthStateRequest {
     pub project_id: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorHealthStateResponse {
     pub rules: Vec<HealthRuleState>,
+    /// How each command a rule queued ([`HealthRuleState::queued`]) ended,
+    /// for the ones that did: read with the state, never written back. A
+    /// command not listed is still running (or gone, which its deadline
+    /// settles).
+    pub ended: Vec<HealthCommandEnding>,
+}
+
+/// How a command a health rule queued ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCommandEnding {
+    pub command: i64,
+    pub outcome: LifecycleOutcome,
+    /// The error of a failed one, the reason of a cancelled one.
+    pub message: Option<String>,
+}
+
+/// The take-down or bring-back command a health rule's action queued for
+/// the dispatcher, until a look sees it end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedHealthCommand {
+    /// Its `infra_lifecycle_command` id.
+    pub command: i64,
+    /// Not ended by then (unix seconds: when it was queued plus the
+    /// rule's `timeoutSeconds`), it counts as failed. The broker books a
+    /// look at it.
+    pub deadline_unix: i64,
 }
 
 /// Where one health rule stands on one copy, kept across the supervisor's
@@ -874,16 +900,28 @@ pub struct HealthRuleState {
     pub copy: InfraCopy,
     /// The rule's name, unique among its node's rules.
     pub rule: String,
-    /// Its action ran for the copy, and the rule has held for it ever
-    /// since: it runs again only once the rule stopped holding.
+    /// Its action was queued for the copy and has not failed, and the
+    /// rule has held for it ever since: it runs again only once the rule
+    /// stopped holding.
     pub fired: bool,
+    /// The command its action queued that no look has seen end yet. A
+    /// look that finds it failed, or past its deadline, counts a failure
+    /// of the rule and tries again like any failed action; while it runs,
+    /// the rule fires nothing else on the copy.
+    pub queued: Option<QueuedHealthCommand>,
+    /// A take-down rule's: its take-down was queued for the copy and did
+    /// not fail, and the copy has not come back since (no bring-back rule
+    /// of its node holds for it, and something the health check took down
+    /// is still down). What lets a copy whose node runs no bring-back rule
+    /// keep down what it took down, and only that.
+    pub took_down: bool,
     /// Failed attempts in a row since its last success.
     pub consecutive_failures: u32,
     /// Not before (unix seconds) does it try again after a failure.
     pub next_retry_at_unix: Option<i64>,
     /// When it gave up (unix seconds): it tries again once the copy's
     /// units it saw then (`gave_up_seen`) change, a person's infra command
-    /// touches the project, or every unit of the copy is healthy.
+    /// touches the project, or the rule stops holding for the copy.
     pub gave_up_at_unix: Option<i64>,
     pub gave_up_seen: Option<serde_json::Value>,
     pub last_error: Option<String>,

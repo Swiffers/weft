@@ -48,8 +48,12 @@ pub struct HealthRule {
     pub name: String,
     pub when: HealthCondition,
     pub action: HealthAction,
-    /// How long the action may take: past it, the attempt counts as
-    /// failed and is tried again later.
+    /// How long the action may take, from the supervisor queueing it to
+    /// the dispatcher finishing the take-down or bring-back it queued:
+    /// past it, or once that command failed, the attempt counts as failed
+    /// and is tried again later (after 5 s, then 10 s; the third failure
+    /// in a row gives up). The rule counts as fired while its command
+    /// runs, and stays fired once it succeeded.
     #[serde(default = "default_timeout")]
     pub timeout_seconds: NonZeroU32,
 }
@@ -94,8 +98,12 @@ pub enum HealthAction {
     /// does not contain it keeps running.
     TakeDownTriggers,
     /// Bring back what the health check took down, except the triggers
-    /// whose cut contains a copy no `bring_back` rule holds for (one still
-    /// broken). Never what a person or an infra command took down.
+    /// whose cut contains a copy still broken: one whose node runs a
+    /// `bring_back` rule and none holds for it, or one whose node runs
+    /// none and whose own take-down took something down (that stays down
+    /// until a person brings it back). A copy that took nothing down and
+    /// runs no `bring_back` rule holds nothing back. Never what a person
+    /// or an infra command took down.
     BringBack,
 }
 

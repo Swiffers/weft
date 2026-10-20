@@ -1,7 +1,11 @@
 # The three lifecycles
 
-Three things in a weft project are alive on their own clocks, and you start
-each one yourself. None of them starts another.
+Three things in a weft project are alive on their own clocks. Infrastructure
+and triggers start only when you (or your program) start them, and runs also
+start when a trigger fires or a caller arrives. The one exception: if
+infrastructure stops or breaks, the triggers that read it go down with it,
+and weft turns them back on by itself once it runs again (unless the node's own health rules say
+otherwise).
 
 | | What it is | You start it with |
 |---|---|---|

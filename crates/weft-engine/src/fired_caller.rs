@@ -108,7 +108,7 @@ impl FiredCaller {
             self.record.outbound(&chunk, terminal);
         }
         if terminal {
-            self.record.disconnected("the fired run answered");
+            self.record.disconnected("the fired run answered", &[]);
         }
         Ok(())
     }
@@ -172,8 +172,13 @@ impl CallerConnection for FiredCaller {
         self.started.store(true, Ordering::SeqCst);
         self.terminated.send_replace(true);
         self.record.errored(message);
-        self.record.disconnected("the fired run answered with a failure");
+        self.record.disconnected("the fired run answered with a failure", &[]);
         Ok(())
+    }
+
+    /// The skip, on the record the run's owner reads, like a real one.
+    fn chunk_dropped(&self, why: &str) {
+        self.record.errored(&format!("{}: {why}", weft_core::caller::CHUNK_DROPPED));
     }
 
     async fn receive(
@@ -233,13 +238,13 @@ mod tests {
         fn inbound(&self, _: RunId, at: u64, msg: &InboundMessage) {
             self.0.lock().unwrap().push(format!("{at} inbound {msg:?}"));
         }
-        fn outbound(&self, _: RunId, at: u64, chunk: &OutboundChunk, terminal: bool) {
+        fn outbound(&self, _: RunId, at: u64, chunk: &OutboundChunk, terminal: bool, _: Option<u64>) {
             self.0.lock().unwrap().push(format!("{at} outbound {chunk:?} terminal={terminal}"));
         }
         fn errored(&self, _: RunId, at: u64, message: &str) {
             self.0.lock().unwrap().push(format!("{at} errored {message}"));
         }
-        fn disconnected(&self, _: RunId, at: u64, reason: &str) {
+        fn disconnected(&self, _: RunId, at: u64, reason: &str, _: &[u64]) {
             self.0.lock().unwrap().push(format!("{at} disconnected {reason}"));
         }
 

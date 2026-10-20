@@ -124,8 +124,8 @@ Every stored file value carries a `version`: 1 when the file is made, going up
 every time the content is written. A key always names the same file,
 so a key plus a version always means the same bytes.
 
-If you seed a run that would reuse a node whose file has changed since, the run
-is refused; for what to do then, go and read
+If you seed a run that would hand a node's saved file to a node that runs
+again, and that file has changed since, the run is refused; for what to do then, go and read
 [when a reused node's file changed](../running/versions.md#when-a-reused-nodes-file-changed).
 
 ### Storing the same thing twice
@@ -162,7 +162,7 @@ takes one file and is received once, and an upload nobody received within
 | `get_range(&file, range)` | Part of them |
 | `get_bytes(&file)` | The whole thing in memory. Small files only |
 | `list()` | Everything in this scope |
-| `delete(&file)` | Gone. Stored files only, not URL-backed ones |
+| `delete(&file)` | Gone. Stored files only, not URL-backed ones. In a program, the `DeleteFile` node does the same |
 
 ## Handing a file out
 
@@ -180,21 +180,25 @@ whether the open internet can open `url`. An external link goes the first of
 these ways that exists:
 
 1. On a cloud install, the cloud store's own link. Public.
-2. Through the project's visitor address: the address a site's server passes
-   weft's doors on at, set with `weft frontend add <name> --visitor-address
-   https://shop.example/weft` or later with `weft frontend visitor-address
-   <name> <url>`. Public.
-3. Through weft's tunnel, when it is open (`./setup.sh --public-url`). Public.
+2. Through the project's visitor address, when the project has a site whose
+   server forwards requests to weft. Public.
+3. Through weft's tunnel, when it is open. Public.
 4. The install's own address, which only this machine opens (and the devices
-   on its network, if the install was started with `WEFT_NETWORK_ADDRESS`).
-   `public` is `false`.
+   on its network, if the install has a network address set). `public` is
+   `false`.
+
+Your node does not pick between these, and neither does the program: the
+person running the install sets them up. If you want to know how, go and
+read [files at run time](../running/files.md) and [a public
+address](../build/public-address.md).
 
 If you are handing a file to a provider's API (an image to edit, a video to
 dub) and the link says `public: false`, the provider cannot fetch it, so send
 the bytes in your request instead. `external_file` makes that choice for you.
 
-A link lives 15 minutes. If you want the links to a file you store to live
-longer (a video somebody will watch for an hour), set it on the handle:
+Unless you set a lifetime, a link lives at least 15 minutes from when it was
+asked for. If you want the links to a file you store to live longer (a video
+somebody will watch for an hour), or shorter, set it on the handle:
 
 ```rust
 ctx.storage(StorageScope::Project)
@@ -204,15 +208,23 @@ ctx.storage(StorageScope::Project)
 ```
 
 The value that comes back carries `linkSecs`, and every link any node makes
-from that value lives that long. For a file a program already has, the
+from that value lives at least that long. For a file a program already has, the
 `LinkOptions` node sets it. A link lives at most seven days: a longer lifetime
 is refused right where you set it. Handing a link out also keeps the file
 stored at least as long as the link works.
 
 Every link is a download: opening it in a tab saves the file under its name,
-while an `<img>`, `<video>` or `<audio>` tag still shows or plays it. And the
-same file asked for twice within one link lifetime gets the same link, so a
-page that asks again keeps its video playing.
+while an `<img>`, `<video>` or `<audio>` tag still shows or plays it. A link
+answers range requests, so a video seeks and a broken download picks up where
+it stopped, with nothing for your node or a page to add.
+
+If a page asks for the same file again, it gets the same link, so its video
+keeps playing: weft cuts time into windows as long as the link's lifetime
+(quarter hours, for a 15 minute link) and hands out one link per file per
+window. Each link works until its window ends plus one lifetime, so a 15
+minute link works for between 15 and 30 minutes from when it was asked for.
+For a lifetime over three and a half days the window is seven days minus that
+lifetime, so a seven day link is a new one every time it is asked for.
 
 ## Whole values full of files
 

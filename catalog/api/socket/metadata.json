@@ -77,10 +77,33 @@
       "description": "Largest single message in MB; a bigger one ends the session with an error."
     },
     {
-      "name": "journalEphemeral",
-      "type": "Boolean",
-      "label": "Keep the conversation out of the journal",
-      "description": "On: the journal keeps only sizes and counts, never message content. Off (default): every message both ways is recorded (batched per second, trimmed above 100 KB; raw bytes never recorded)."
+      "name": "whenChunkFails",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "surface",
+          "drop_chunk"
+        ]
+      },
+      "default": "surface",
+      "label": "When a message cannot be sent",
+      "description": "What happens when a Reply or a Stream cannot turn one message into the socket's `dataType` (a value that is not a String on a `text` socket, a file it cannot read). `surface` (default): that node fails and the socket closes with 1011. `drop_chunk`: that message is skipped, noted on the run's record, and the session goes on; pick it when one missing message is fine, like a frame of a live feed. A run that fails, or a bus that ends failed, closes the socket with 1011 either way."
+    },
+    {
+      "name": "whenCallerIsSlow",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "block",
+          "drop_oldest",
+          "drop_newest"
+        ]
+      },
+      "default": "block",
+      "label": "When the caller reads slower than you send",
+      "description": "What gives when messages are sent faster than the caller reads them and the 256 messages waiting for it fill up. `block` (default): the next send waits for room, so a slow caller slows the program and gets every message. `drop_oldest`: the oldest waiting message is thrown away, so the caller always gets the latest; pick it for live video or a price feed. `drop_newest`: the new message is thrown away and what was already waiting goes out in order. A dropped message never reaches the caller, so keep `block` for a conversation the caller must read whole."
     }
   ],
   "outputs": [

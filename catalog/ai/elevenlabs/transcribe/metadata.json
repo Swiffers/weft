@@ -245,5 +245,8 @@
         "port": "transcriptEdit"
       }
     }
-  ]
+  ],
+  "features": {
+    "journalSettings": true
+  }
 }

@@ -91,6 +91,7 @@
     }
   ],
   "features": {
-    "oneOfRequired": [["prompt", "historyFile", "media"]]
+    "oneOfRequired": [["prompt", "historyFile", "media"]],
+    "journalSettings": true
   }
 }

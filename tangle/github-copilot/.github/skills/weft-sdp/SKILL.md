@@ -68,7 +68,17 @@ weft run --from triage='{"text":"the invoice is wrong"}' --before publish --deta
   at your start, or start further up so the source runs. A start is where
   the walk upstream stops, so neither `--group` nor `--from` runs what feeds
   the start's own ports: only what feeds the nodes AFTER it. On a `--seed`
-  run a saved result can feed it instead.
+  run a saved result can feed it instead. When the source is a trigger the
+  run does not fire, the refusal says so: `reply.chatId gets nothing in this
+  run: it only comes from the trigger ask, which this run does not fire, and
+  reply cannot run without it. Fire it (--fire ask='<event>'), or hand the
+  value at a start (...)`. `--emit` standing in for the trigger works
+  too.
+- `--check`, with the same `--from`, `--group`, `--target`, `--before`,
+  `--emit` and `--fire` (never with `--seed`,
+  `--save` or `--detach`), only says whether that run could start
+  (`the run can start`, or the refusal and exit `1`), building and running
+  nothing.
 - `--feed start` runs what feeds a start: for each of its inputs you did
   not hand, the node that feeds it (through every group or include door on
   the way, however deep), and nothing above that node. A loop feeding it
@@ -135,10 +145,8 @@ weft run --emit incoming='{"message":"the emitted output value"}' --detach
 ```
 
 If the program carries infrastructure, bring it up first with `weft infra
-start`. A RUN refuses outright while a node's container is not up, naming
-the node. A bake does not refuse; it brings the infrastructure up itself,
-which is right but takes as long as starting it would, so a bake that seems
-to hang on a program with infrastructure is usually provisioning.
+start`. A run refuses while a node's container is not up, naming the node,
+and so does a bake whose trigger setup reads one; neither starts it.
 
 This is also how you test an infra node: live tests do not cover infra
 nodes for now, so you prove one inside a real program. Start its infra, then
@@ -157,20 +165,19 @@ Changed code or configuration needs a matching new bake. Closed group
 gates can leave a trigger unprepared; you inspect the bake instead of
 forcing it. `weft activate` prepares and arms real listeners.
 `weft bake <project-id>` uses that project's registered build. If you
-deliberately use `--referenced`, you pass it to both bake and run. Off a
-terminal `deactivate` and `resync` use `wipe` unless you say otherwise
-(`infra stop`, `infra terminate` and `infra upgrade` stop and name `--mode`
-when a trigger reads the infra), so a change to the program never leaves a run waiting on
-something nobody will answer. Say `--mode park` or `--mode hibernate`
-when the work in flight has to survive, and say it deliberately.
+deliberately use `--referenced`, you pass it to both bake and run.
 
 ## Reuse completed work while developing
 
 `weft run --seed --detach` takes eligible results from [head]'s run. If
 [head] is a version without a run, it finds a finished run on that
-version or its nearest ancestor. To choose an older run, you run
-`weft branch <run-id>` first; that also restores its code, so you
-checkpoint edits you want to keep.
+version or its nearest ancestor. `--seed=<run-id>` takes them from any run
+of the project instead, one a trigger started or one that failed included,
+which is how a run that failed or broke off is picked up again after a fix
+(the `=` is required, since a bare word after `--seed` is an example name).
+`--root` starts a new tree with nothing to reuse, so it is refused beside a
+seed. If you also want that run's code back, `weft branch <run-id>` first;
+that restores the files, so you checkpoint edits you want to keep.
 
 - `--seed --seed-before classify` reuses earlier compatible work and runs
   `classify` and what follows.
@@ -178,7 +185,7 @@ checkpoint edits you want to keep.
 
 These flags limit reuse within the requested run; the [cut] limits
 what runs. A node whose saved output names a stored file that has
-been edited since, or is gone, cannot be reused: the run is refused before
+been edited since, or is gone, cannot be reused by a node that runs again: the run is refused before
 it starts, naming the node, the port and the file, and you either hand the
 file in with `--emit` or run the node again with `--seed-before` it. Changed implementations, inputs, dependencies, failed
 work, and live handles can prevent reuse. A loop is reused whole. An

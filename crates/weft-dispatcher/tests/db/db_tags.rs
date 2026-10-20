@@ -212,7 +212,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
         .await
         .unwrap();
 
-    let cause = CancelCause::Run { by, tag: "user_7".into() };
+    let cause = CancelCause::Run { by, tag: Some("user_7".into()) };
     let program = rig_project(project);
     let write = journal.cancel_run(victim, Some(&program), &cause).await.unwrap();
     assert_eq!(write.removed.len(), 1, "the parked run's form is gone: {write:?}");

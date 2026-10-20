@@ -12,7 +12,10 @@
 //! answer: the exchange fails instead (`fail`), a real error status when
 //! nothing went out yet, the format's error marker after (an SSE `error`
 //! event, a last ndjson line, an `[error]` line), a `1011` close on a
-//! socket, and `done` stays absent. The framing is the package's pure
+//! socket, and `done` stays absent. A message that cannot be made into
+//! a chunk (a value the trigger's data type does not carry) goes through
+//! `drop_or_fail`: it fails the answer, or is skipped when the trigger's
+//! `whenChunkFails` is `drop_chunk`. The framing is the package's pure
 //! `framing.rs`; a raw payload rides per the trigger's data type through
 //! `wire::chunk_for`.
 
@@ -74,13 +77,17 @@ impl Node for StreamNode {
                 if let Some(filler) = format.keepalive() {
                     head = head.map(|h| h.with_keepalive(filler));
                 }
+                // A chunk that cannot be made fails the answer, or is
+                // skipped when the trigger says so (`whenChunkFails`).
                 if let Some(value) = &first {
-                    let chunk = framed(&ctx, format, data_type, WirePayload::Json(value.clone().into())).await?;
-                    write_chunk(&http, &mut head, chunk).await?;
+                    let made = framed(&ctx, format, data_type, WirePayload::Json(value.clone().into())).await;
+                    if let Some(chunk) = http.drop_or_fail(made)? {
+                        write_chunk(&http, &mut head, chunk).await?;
+                    }
                 }
                 while let Some(entry) = messages.next().await {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
-                    let chunk = framed(&ctx, format, data_type, payload).await?;
+                    let Some(chunk) = http.drop_or_fail(framed(&ctx, format, data_type, payload).await)? else { continue };
                     write_chunk(&http, &mut head, chunk).await?;
                 }
                 if let Some(why) = broke_off(&bus) {
@@ -96,13 +103,15 @@ impl Node for StreamNode {
             CallerHandle::Websocket(ws) => {
                 wire::refuse_head_on_socket("Stream", status, headers.as_ref())?;
                 if let Some(value) = &first {
-                    let chunk = framed(&ctx, Format::Raw, data_type, WirePayload::Json(value.clone().into())).await?;
-                    ws.send(chunk).await?;
+                    let made = framed(&ctx, Format::Raw, data_type, WirePayload::Json(value.clone().into())).await;
+                    if let Some(chunk) = ws.drop_or_fail(made)? {
+                        ws.send(chunk).await?;
+                    }
                 }
                 while let Some(entry) = messages.next().await {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
                     // A socket message is a frame: no HTTP framing.
-                    let chunk = framed(&ctx, Format::Raw, data_type, payload).await?;
+                    let Some(chunk) = ws.drop_or_fail(framed(&ctx, Format::Raw, data_type, payload).await)? else { continue };
                     ws.send(chunk).await?;
                 }
                 if let Some(why) = broke_off(&bus) {

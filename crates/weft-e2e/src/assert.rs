@@ -202,13 +202,25 @@ fn wire_value(payload: &Value) -> Value {
     /// A message the journal did not keep (an ephemeral exchange, raw
     /// bytes) still has a row, carrying only its size. It has no
     /// payload, so it is not returned here; a test that wants to see
-    /// those reads the rows itself.
+    /// those reads the rows itself. Nor is a message of the program's
+    /// that a window (the caller read too slowly) or the row saying the
+    /// caller left (it was still waiting to go out) names in `dropped`:
+    /// the caller never received it.
     fn caller_messages(&self, direction: &str) -> Vec<(Value, bool)> {
+        let dropped: std::collections::HashSet<u64> = self
+            .replay
+            .by_kind("caller_window")
+            .chain(self.replay.by_kind("caller_disconnected"))
+            .filter_map(|e| e.field("dropped").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_u64)
+            .collect();
         self.replay
             .by_kind("caller_window")
             .filter_map(|e| e.field("messages").and_then(Value::as_array))
             .flatten()
             .filter(|m| m.get("direction").and_then(Value::as_str) == Some(direction))
+            .filter(|m| m.get("offset").and_then(Value::as_u64).is_none_or(|offset| !dropped.contains(&offset)))
             .filter_map(|m| {
                 let payload = m.get("payload").map(Self::wire_value)?;
                 let terminal = m.get("terminal").and_then(Value::as_bool).unwrap_or(false);

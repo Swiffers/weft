@@ -820,11 +820,10 @@ impl BrokerSupervisorClient {
         Ok(resp.nodes)
     }
 
-    /// Where each health rule of the project's copies stands.
-    pub async fn health_state(&self, project_id: Uuid) -> Result<Vec<HealthRuleState>> {
-        let resp: SupervisorHealthStateResponse =
-            self.http.post("/v1/supervisor/health_state", &SupervisorHealthStateRequest { project_id }).await?;
-        Ok(resp.rules)
+    /// Where each health rule of the project's copies stands, and how the
+    /// commands they queued ended.
+    pub async fn health_state(&self, project_id: Uuid) -> Result<SupervisorHealthStateResponse> {
+        self.http.post("/v1/supervisor/health_state", &SupervisorHealthStateRequest { project_id }).await
     }
 
     /// Replace where a project's health rules stand (see

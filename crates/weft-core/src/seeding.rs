@@ -8,6 +8,10 @@
 //! Everything here is per PLACE (`Located`): a node of an included file
 //! has one result per call that reached it, and a child reuses the result
 //! of the call it runs, never the other call's.
+//!
+//! This is the runtime planner: it reads the old run's snapshot. What it
+//! hands the resolver, `crate::run_spec::SeedPlan`, is pure and lives with
+//! the resolver, so a build without the runtime resolves the same way.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -21,7 +25,7 @@ use crate::project::hash::ProgramIdentity;
 use crate::project::graph::{GraphView, ProjectGraph};
 use crate::project::cut::{self, Walk};
 use crate::project::places::{enclosing_loops, every_place, incoming, members_in, outgoing, scopes_around};
-use crate::run_spec::{OutputWire, RunSpec};
+use crate::run_spec::{reused_group_start, OutputWire, RunSpec, SeedPlan};
 use crate::RunId;
 
 /// One complete result the parent retained. Its origin is already chosen;
@@ -57,20 +61,6 @@ pub fn gates_handed_around(given: &crate::project::Given, project: &ProjectDefin
             .filter(|(port, _)| crate::run::skip::is_gate_port(port))
             .map(move |(port, value)| (format!("{}.{port}", crate::project::group_address(project, &scope.id, &scope.path)), value.clone())))
         .collect()
-}
-
-/// The members of the group start at `start` that a run walking `runs`
-/// runs, when a seed reusing `origins` reuses every one of them (the start
-/// is then reused whole and does not run); `None` otherwise. The one
-/// reading both the plan's announcement and the resolver's skip use.
-pub fn reused_group_start(
-    g: &ProjectGraph,
-    start: &Located,
-    runs: &BTreeSet<Located>,
-    origins: &BTreeMap<Located, RunId>,
-) -> Option<Vec<Located>> {
-    let members: Vec<Located> = members_in(g, &start.id, &start.path).into_iter().filter(|member| runs.contains(member)).collect();
-    (!members.is_empty() && members.iter().all(|member| origins.contains_key(member))).then_some(members)
 }
 
 /// A stored file as the store holds it now, for a reused output that
@@ -130,27 +120,6 @@ pub fn sent_ports(node: &crate::project::NodeDefinition, place: &Located, output
         sent.insert(port.name.clone(), given);
     }
     sent
-}
-
-/// What a seeded run reuses ([`seed_plan`]): the run each reused place's
-/// result comes from, which of them stand in for themselves in the cut,
-/// the values the old run handed its starts that this one keeps, and the
-/// places it runs again that replay the answers their waits were given
-/// there.
-#[derive(Debug, Default)]
-pub struct SeedPlan {
-    pub origins: BTreeMap<Located, RunId>,
-    pub stand_ins: BTreeMap<Located, StandIn>,
-    pub handed: BTreeMap<Located, BTreeMap<String, Value>>,
-    pub answers: BTreeSet<Located>,
-    pub warnings: Vec<String>,
-}
-
-impl SeedPlan {
-    /// The places it reuses.
-    pub fn reused(&self) -> BTreeSet<Located> {
-        self.origins.keys().cloned().collect()
-    }
 }
 
 /// Choose what a run walked as `authored` reuses of `outcomes` (the old

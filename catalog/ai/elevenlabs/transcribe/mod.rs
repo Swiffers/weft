@@ -505,7 +505,7 @@ impl Node for ElevenLabsTranscribeNode {
         // The live segments bus, opened with the first segment (a
         // downstream consumer reads while segments land) and ended the
         // way the body ends.
-        let mut segments_bus = ctx.pending_bus("segments", BusOptions::default(), "transcriber");
+        let mut segments_bus = ctx.pending_bus("segments", BusOptions { journal: ctx.journal_policy()?, ..BusOptions::default() }, "transcriber");
 
         let mut transcript = Transcript::default();
         // The context rides the first chunk only, whichever that is.

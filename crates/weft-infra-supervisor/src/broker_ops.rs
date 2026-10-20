@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 use weft_broker_client::client::BrokerSupervisorClient;
 use weft_broker_client::protocol::{
-    HealthRuleState, SupervisorClaim, SupervisorInfraNode, SupervisorProject,
+    SupervisorClaim, SupervisorHealthStateResponse, SupervisorInfraNode, SupervisorProject,
     SupervisorSetHealthStateRequest, SupervisorSetHealthStateResponse, SupervisorSetStatusRequest,
     SupervisorSetStatusResponse, SupervisorSyncOwnershipRequest, SupervisorSyncOwnershipResponse,
 };
@@ -51,8 +51,9 @@ pub trait BrokerSupervisorOps: Send + Sync {
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>>;
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>>;
-    /// Where each health rule of the project's copies stands.
-    async fn health_state(&self, project_id: uuid::Uuid) -> Result<Vec<HealthRuleState>>;
+    /// Where each health rule of the project's copies stands, and how the
+    /// commands they queued ended.
+    async fn health_state(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthStateResponse>;
     /// Replace where the project's health rules stand, under its lease.
     async fn set_health_state(&self, req: &SupervisorSetHealthStateRequest) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>>;
     /// The oldest waiting command of a project this supervisor owns that no
@@ -222,7 +223,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>> {
         BrokerSupervisorClient::infra_nodes(self, project_id).await
     }
-    async fn health_state(&self, project_id: uuid::Uuid) -> Result<Vec<HealthRuleState>> {
+    async fn health_state(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthStateResponse> {
         BrokerSupervisorClient::health_state(self, project_id).await
     }
     async fn set_health_state(&self, req: &SupervisorSetHealthStateRequest) -> Result<WriteOutcome<SupervisorSetHealthStateResponse>> {

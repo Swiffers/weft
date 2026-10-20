@@ -1604,7 +1604,7 @@
     #[tokio::test]
     async fn worker_terminal_names_the_recorded_cancel_cause() {
         let by = weft_core::RunId::new_v4();
-        let cause = weft_core::run::CancelCause::Run { by, tag: "user_7".into() };
+        let cause = weft_core::run::CancelCause::Run { by, tag: Some("user_7".into()) };
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),
             "nodes": [{

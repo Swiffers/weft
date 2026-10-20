@@ -76,11 +76,10 @@ declared without `?` is refused, and so is one carrying a field you never
 declared, at the top level and nested. `weft run --fire` checks a payload you
 typed by hand against it too.
 
-One honest caveat: nothing enforces at build time that a trigger has a
-`firesWith`, or that a non-trigger does not. A repo test holds the shipped
-catalog to both. A node you write is held to neither, and a typo in one of the
-type strings is not caught when the metadata loads, so it reaches a real firing
-before it fails.
+The metadata does not load if a node that is not a trigger declares
+`firesWith`, or if a type in its `firesWith` is not a weft type. A trigger may
+leave `firesWith` out, but then nothing checks what it fires with, and `weft
+run --fire` cannot tell you what to send.
 
 ## What can wake you
 
@@ -93,7 +92,7 @@ before it fails.
 | `SocketListen` | A socket weft dials out to and holds |
 | `StreamListen` | A TCP or TLS stream |
 | `SseSubscribe` | A server-sent-event stream weft subscribes to |
-| `PollEndpoint` | An address weft checks on a timer. If your node started an outside job and waits on its status address with `await_signal`, the first check runs at once, and the first answer that passes the filters (`status` matching `COMPLETED\|FAILED`, say) is what `await_signal` returns |
+| `PollEndpoint` | An address weft checks on a timer. For waiting on the status address of a job your node started, go and read [waiting on a job a service runs](durable-execution.md#waiting-on-a-job-a-service-runs) |
 | `ProviderEvents` | A service's own events, by topic, through its recipe |
 
 If your node registers a `SocketListen` or `StreamListen` with a connection,

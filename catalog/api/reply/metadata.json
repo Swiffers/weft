@@ -57,7 +57,7 @@
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the message was handed to the caller."
+      "description": "True once the message was handed to the caller. Absent when a Socket's message could not be made and its `whenChunkFails` skips it."
     }
   ],
   "features": {

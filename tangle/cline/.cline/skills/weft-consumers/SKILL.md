@@ -158,8 +158,8 @@ is nothing behind the display yet the door answers 404 as well, so read the
 listing's `status` to say which: `provisioning` is "starting" (a copy can take
 minutes, so show that it is on its way, and read the feed again once it says
 `running`), `none` or `stopped` is "not started" with the button that starts
-it, and `failed` is the error. A trigger's display 404s until the project is
-activated.
+it, and `failed` is the error. A trigger's display 404s until the trigger is
+turned on.
 
 ## What a listed signal looks like
 
@@ -181,9 +181,8 @@ An [entry] is one object of the listing:
 `token`, `nodeId`, `kind`, `isResume` and `title` are on every [entry]; the
 rest is the kind's own payload, and `kind` says how to read it. `isResume`
 splits the list: a parked question disappears once answered (a second
-answer gets 404 once it is gone, 409 while the project is parked and the
-first answer waits in its queue); a trigger stays listed while the project
-is active and fires again and again, each fire a new run. Every field name
+answer gets 409, or 404 once it is gone); a trigger stays listed while it is
+on and fires again and again, each fire a new run. Every field name
 weft writes in these answers is camelCase, and the value of a fixed-set
 field (`kind`, `consumerKind`, a display's `status`) is snake_case, so a
 client reads `entry.nodeId`, and checks
@@ -233,13 +232,14 @@ The answer body is one JSON object, every answerable field present:
 `{ "ok": true, "reason": "looks fine", "tone": ["formal"] }`. A field left
 out lands as null on its port, which a typed port refuses: the port closes
 with a warning in the journal and whatever reads it skips, so you send every
-field. The dispatcher answers 200 on a live project, and also 200 when the
-project is parked (the answer is queued and played when it wakes); 404 for
-an unknown or already-answered [signal token]; 409 for a second answer
-while the first waits in a parked project's queue (you show it as "someone
-else answered"); 410 when the project no longer accepts anything (you show
-it as "the project is gone"); 429 when a trigger's queue is full while
-parked. On any other failure you show the message text.
+field. The dispatcher answers 200 when the answer reached its run, and also
+200 while the run's trigger is down and set to hold what arrives (the
+answer is kept and handed over once the trigger is back on); 404 for an
+unknown [signal token]; 409 for a second answer to the same question (you
+show it as "someone else answered"); 410 when the run it answers has ended,
+or its trigger takes nothing any more (you show it as "this is closed");
+429, with a `Retry-After`, when a trigger is firing more often than its
+limits allow. On any other failure you show the message text.
 
 ## A file in a form
 

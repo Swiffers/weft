@@ -421,19 +421,22 @@ work._should_flow = live.fired      # the route runs the group; nothing else con
 `Route` and `Socket` have a `fired` output, always `true` when called: gate
 work on `route.fired`, never on a request port like `method`.
 
-A group, and so an included file, starts only once everything the run wires
-into it has arrived, `_should_flow` included. A closed input counts as
-arrived: the group still starts and the closure goes inside to whatever
-reads it. Only a closed or `false` `_should_flow` skips the whole group.
+A group, and so an included file, decides once whether it runs (once per
+iteration inside a loop, once for each `@include` of the file). With a gate
+wired onto it, or written in its braces, the gate decides, the way a node's
+does. With none, it opens on the first value that reaches it from outside,
+or at once when nothing comes in from outside, and it skips only when every
+wire coming into it closed with nothing on it. Once it is open, a closed
+input goes inside like any other pulse, to whatever reads it.
 
-A node with no inputs at all inside a group runs when the group starts, so it
-needs no `_should_flow` to get its turn, and it never runs before the group's
-slowest input lands. It runs only in a run that takes it along, though: a
-trigger's run holds what the trigger feeds plus what those nodes read, so it
-takes the node along when something that run uses reads it, or when the run
-feeds the group's `_should_flow`, which brings in the whole group. If several
-routes feed one include, a route that did not fire never holds it up: it is
-left out of the run, or closes its outputs, which counts as arrived. At the
+A node with no inputs at all inside a group runs when the group opens, so it
+needs no `_should_flow` to get its turn. It runs only in a run that takes it
+along, though: a trigger's run holds what the trigger feeds plus what those
+nodes read, so it takes the node along when something that run uses reads
+it, or when the run feeds the group's `_should_flow`, which brings in the
+whole group. If several routes feed one include, a route that did not fire
+never holds it up: the include opens on the value the route that fired
+sends. At the
 top level of a file, an unconnected node with no inputs runs only on a
 manual run; a trigger's run never takes it along.
 
@@ -510,7 +513,7 @@ A node literal as a value, with a mandatory trailing `.port`:
 ````weft
 router = OpenRouterAccess
 out.data = Text { value: "hi" }.value
-provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider
+ask = LlmInference { provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider, prompt: "hi" }
 ````
 
 It synthesizes an anonymous child with id `{host}__{field}` plus the edge.
@@ -879,9 +882,11 @@ stop = StopTagged {
   sender: ask.chatId
 }
 
+router = OpenRouterAccess
 draft = LlmInference {
   _should_flow: stop.done
-  ...
+  provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider
+  prompt: ask.text
 }
 ```
 
@@ -979,18 +984,20 @@ preprocessor.raw = input.value
 `self` is the boundary: read `self.<input>` for what the group received,
 write `self.<output>` for what it emits. Children reach each other and
 `self`, nothing else (`scope-reachability`). A [boundary port] is set from
-outside by wire or literal on its own line. Groups nest, names are scoped,
-and the compiler flattens them away: at run time there is one flat graph. A
-group is a region, not a function: it has no call sites and does not return.
+outside by wire or literal on its own line. Groups nest and names are
+scoped. A group is a region, not a function: it has no call sites and does
+not return, and wires run straight through its boundary.
 
-A group stops as a whole only through its `_should_flow`; then every node
-inside is skipped with the group's name as the reason (`scope_skipped`). When
-a group starts, every node inside that no wire feeds starts with it (once per
-iteration in a loop body), so a group can hold its own source.
+A group stops as a whole when its gate says no, or, with no gate, when every
+wire into it closed with nothing on it; then every node inside is skipped,
+naming the group (`scope_skipped`). When a group opens, every node inside
+that no wire feeds starts with it (once per iteration in a loop body), so a
+group can hold its own source.
 
-A [closed] pulse on a group INPUT does not stop the group. It travels in like
-any other pulse and lands on the nodes that read that input; those skip, and
-everything else in the group runs. A card whose picture is optional:
+A [closed] pulse on one group input, while another brings a value, does not
+stop the group. It travels in like any other pulse and lands on the nodes
+that read that input; those skip, and everything else in the group runs. A
+card whose picture is optional:
 
 ````weft
 look = Route -> (body: { text: String, photo?: Image }) { path: "cards", method: "POST" }
@@ -1214,7 +1221,12 @@ Every try leaves a slot in `verdicts`, empty for the ones that failed, so
 when none did. A carried value needs its first value wired from outside
 (`grade.problem = ""`); without it the build stops at
 `required-port-unmet`. A retry that calls a paid service pays for every try,
-so the cap is part of the price.
+so the cap is part of the price. If the call keeps a conversation in a file
+(like the AI nodes' `historyFile`), wire that same file into every try as a
+broadcast input of the loop. A try whose answer did not fit the record type
+leaves the file exactly as it came in, so the next try sends the same
+conversation, plus the reason the last try failed, which the carried
+`problem` puts in its prompt.
 
 A `Generator[T]` port in `over` pulls the stream (must be the only over
 port).
@@ -1253,8 +1265,10 @@ and size), never as bytes, and never with a link in it: a node that needs a
 link makes one while it runs, so the journal and `weft events` hold none. A
 node that runs your code may hand the reference over in its own shape
 (`ExecPython` passes a plain dict with `photo["internalUrl"]` to fetch the
-bytes from the script and `photo["externalUrl"]` to hand another service), and
-its description says how.
+bytes from the script and `photo["externalUrl"]` to hand another service,
+with `photo["public"]` False when the open internet cannot open that link,
+so the script sends that service the bytes instead), and its description
+says how.
 
 A stored file lives as long as its scope says: a run's files are swept when
 the run ends, a project's stay. The storage nodes `TextToFile`,
@@ -1268,6 +1282,14 @@ stores it for its run only: if you want it longer, or in a later run, wire
 it through `KeepFile`. Every write makes a new file, except where a node
 keeps a growing value: it edits the file it was handed, in place, and its
 description says so.
+
+A link made to a stored file lives 15 minutes. If people need it longer (a
+video somebody watches for an hour), pass the file through `LinkOptions {
+file: clip.file, minutes: 120 }` (seven days at most): every link made from
+its output lives that long.
+
+If you want a stored file gone before its scope ends, `DeleteFile { file:
+old.file }` deletes it now. A file that lives at a URL is refused.
 
 `@file` is bidirectional (the editor writes edits back into the file), so
 binary types are refused; it is the marker for `assets/prompts/` and
@@ -1299,7 +1321,7 @@ edit and by your own validate run, and what keeps the graph rendering. [the runt
 not picked on an access node (the compiler synthesizes that rule from the
 node's `service` declaration; `connectionOptional: true` in the service
 block is the opt-out, for a node that runs with no connection picked). `weft
-validate` and the editor's pre-flight gate on Run, Activate and Resync report
+validate` and the editor's pre-flight gate on Run, Turn on and Resync report
 it; the Problems panel is structural only and never shows it; `weft build`
 skips it, so a half-wired program still compiles, and a run, an activate or
 a resync is refused before it starts while one is open, naming the `weft

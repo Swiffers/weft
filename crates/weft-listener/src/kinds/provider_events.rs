@@ -419,8 +419,8 @@ async fn resolve_and_decide(
 /// settled decides it here. An unservable decision is TERMINAL: retrying
 /// would re-derive the same facts. The signal is given up on, and comes
 /// back, deciding again, when the account is reconnected (which lifts
-/// the give-up of every held signal acting as it) or the project is
-/// resynced (`weft resync`).
+/// the give-up of every held signal acting as it) or the trigger is set
+/// up again (turned off and on, or a resync moving it onto a new build).
 fn serve_subscription(
     cfg: ProviderEvents,
     access: AccessRef,
@@ -452,8 +452,8 @@ fn serve_subscription(
             // until aborted at unregister.
             Transport::Socket => serve_socket(&cfg, &access, decided.provider_account, &ctx).await,
             Transport::Webhook => serve_webhook(&cfg, &access, &decided.topic, &ctx).await,
-            // Given up on; a reconnect of the account or a resync brings
-            // it back, and the decision runs again.
+            // Given up on; a reconnect of the account or the trigger set
+            // up again brings it back, and the decision runs again.
             Transport::Unservable(reason) => ctx.fire.give_up(&format!("the subscription cannot be served: {reason}")).await,
         }
     })
@@ -622,8 +622,9 @@ fn spawn_shared_engine(
             // A cycle that can never serve: every subscription on it is
             // given up on. A connection refused, gone or needing a
             // reconnect comes back with a reconnect of the account; a
-            // recipe that cannot serve, once it is fixed, with a resync
-            // of the project (`weft resync`).
+            // recipe that cannot serve, once it is fixed, with the resync
+            // that moves the trigger onto the build with the fix
+            // (`weft resync`).
             if let Err(PrepareError::Fatal(e)) = &plan {
                 let fires: Vec<FireContext> = subscribers.iter().map(|s| s.fire.clone()).collect();
                 for fire in fires {

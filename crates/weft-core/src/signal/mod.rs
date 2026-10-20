@@ -80,7 +80,7 @@ pub use socket_listen::{SocketFrame, SocketListen};
 pub use stream_listen::{Framing, LengthCounts, ScriptStep, StreamListen, StreamReply};
 #[cfg(feature = "runtime")]
 pub use live_connection::{
-    Backpressure, DataType, ErrorMode, JournalMode, LiveConnectionConfig,
+    Backpressure, DataType, ErrorMode, LiveConnectionConfig,
     Protocol, Route, Socket, DEFAULT_CALLER_SILENCE_SECS,
 };
 

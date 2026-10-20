@@ -47,18 +47,15 @@ for `user-42`, and `reply` answers through `user-42`'s copy.
 
 For customer `user-42`, from the project's folder:
 
-0. If you have not activated the program since you last changed it, run
-   `weft activate` once: that builds the bridge's image, which every
-   instance's copy starts from.
-1. `weft infra start --instance user-42` starts their bridge.
-2. Wait until `weft infra status` shows that copy as running.
-3. `weft activate --instance user-42` turns on its `receive` trigger.
-4. `weft token mint --instance user-42 --expires 7d --display bridge` mints an
+1. `weft infra start --instance user-42` builds the program if it changed,
+   starts their bridge, and answers once it is running.
+2. `weft activate --instance user-42` turns on its `receive` trigger.
+3. `weft token mint --instance user-42 --expires 7d --display bridge` mints an
    instance token that can read that bridge's display.
-5. The customer adds the token to the weft browser extension, opens the
+4. The customer adds the token to the weft browser extension, opens the
    bridge's display, and scans the QR code with their phone.
 
-If you want your own website to do steps 1 to 4 for a customer, a program can do
+If you want your own website to do steps 1 to 3 for a customer, a program can do
 each of them itself; for how, go and read [the instance nodes](#the-instance-nodes).
 
 ## What `@per_instance` marks
@@ -200,9 +197,16 @@ From the terminal, the verbs that start, stop, upgrade or remove infra take
 
 ```bash
 weft infra start --instance user-42
-weft infra stop --instance user-42                     # the container goes, its disk stays
-weft infra node-terminate bridge --instance user-42 --yes    # the container goes, and its disk unless the node keeps it
+weft infra stop --instance user-42                                 # the container goes, its disk stays
+weft infra terminate --infra bridge --instance user-42 --yes       # the container goes, and its disk unless the node keeps it
 ```
+
+`--all-instances` acts on every instance's copies, and `--all` on the shared
+infra and every instance's. Taking an instance's copy down takes
+down only that instance's triggers that depend on it, and reaches only that
+instance's runs. Taking shared infra down reaches further: every trigger that
+depends on it goes down, every instance's included, since none of them can
+run without it, and they all come back with it.
 
 `weft infra status` lists each instance's copy on its own line. `weft status`
 lists them under `instance infra:`, and under `infra:` it lists every infra
@@ -223,8 +227,7 @@ let every = ctx.infra("bridge").copies().await?;                     // shared +
 ```
 
 weft never starts an instance's copy on its own: you do, from the terminal as
-above, or your program does. If you skipped step 0, the start fails and names
-`weft activate`.
+above, or your program does.
 
 `start()` returns once the copy is running, so the next line can activate the
 triggers that read it. A container can take minutes to come up, and the run
@@ -244,35 +247,44 @@ which instances you mean:
 ```bash
 weft activate --instance user-42
 weft activate --trigger receive --instance user-42
-weft deactivate --instance user-42 --mode park
+weft deactivate --instance user-42
 ```
 
-`weft status` lists every trigger's state under `triggers:`, an instance's with
-the instance beside it. A trigger being turned on reads `activating` from the
-moment the activate is taken, even while weft is still moving the program's
-workers. If you are scripting this, `weft status --json` has the same list
-under `activations`, each entry with its `trigger`, `instance` (absent for the
-program's own), `status` and `mode`, plus `waiting` (`{ fires, reason }`) when
-the instance's trigger holds events until a field is filled.
+`weft status` lists every trigger under `triggers:`: one that exists once per
+instance says how many instances have it on (`receive: once per instance, 3
+of 4 on`), then each instance's state on a line of its own. If you are
+scripting this, `weft status --json` has the same list under `triggers`, each
+entry with its `node`, `perInstance`, and either `shared` (the program's own
+trigger) or `copies` (one per instance), and the infra it reads under
+`dependsOn`. Each copy has its `instance` (absent on `shared`), its `state`
+(`off`, `turning_on`, `on` or `behind`), `downWith` (`health` or `infra`) when
+the health check or an infra command took it down, and `heldBack` (the reason)
+when it should be back but another build keeps it down. While its queued
+events wait on something, it also has `waiting` (`{ fires, on, reason }`: how
+many fires are held, what they wait on, one of `room`, `trigger`, `instance`,
+`infra`, `picks` or `failure`, and why). `weft instances` gives one line per instance: how many of its
+triggers are on, how many of its infra copies are up, and when it last ran.
 
-A plain `weft deactivate` turns off the program's own triggers and leaves the
-instances' on, and it tells you how many instances still have triggers on. If
-you want every instance's off too, run it again with `--all-instances`:
+Every trigger verb acts on the program's own triggers unless you name
+instances. A plain `weft deactivate` turns off the program's own triggers,
+leaves the instances' on, and tells you how many instances still have
+triggers on. The same goes for `weft resync`: a plain one moves only the
+program's own triggers. Since one build answers all of a project's routes, a
+plain resync onto new code is refused while instances' triggers are on the
+older build, and the refusal names `weft resync --all`.
 
 ```bash
-weft deactivate --mode park
-weft deactivate --all-instances --mode park
+weft deactivate --all-instances     # every instance's, not the program's own
+weft resync --all                   # the program's own and every instance's
 ```
 
-`weft resync` works the other way round: with no flag it brings every trigger
-that is on up to date with your program, the program's own first and then each
-instance's, and prints whose it did. `--instance user-42` limits it to that
-instance.
+If a deploy should reach every customer, run `weft infra upgrade --all` and
+then `weft resync --all`. That is what the workflow from `weft ci add` does.
 
 From your program:
 
 ```rust
-ctx.triggers().instance("user-42").activate().await?;
+ctx.triggers().instance("user-42").activate(ReleaseHeld::Run).await?;
 ```
 
 If you want to turn one off from your program, the call takes a few choices; for
@@ -349,7 +361,7 @@ With it, a browser or the extension can:
 - read the displays of that instance's copies, such as its bridge's QR code;
 - fill in that instance's values, its connections among them.
 
-An instance token always expires. If you mint one from the terminal (step 4
+An instance token always expires. If you mint one from the terminal (step 3
 above), it reads a display only when you pass `--display <node>` for that node,
 or `--displays` for all of them. A token your program mints reads all of the
 instance's displays and lives at most a year. If a customer just logged in to
@@ -396,23 +408,22 @@ let spent = ctx.costs().instance("user-42").service("openrouter").since(month_st
 
 ## Taking something down from a run
 
-A program's `stop`, `terminate` and `deactivate` calls each take a
-`DeactivateSpec`, the same choices `weft deactivate` asks you for:
+A program's `stop`, `terminate`, `upgrade` and `deactivate` calls each take a
+`TakeDownChoice`, the same three answers `weft deactivate` takes as flags (for
+what each does, go and read [taking triggers down](lifecycles.md#taking-triggers-down-three-questions)).
+Every answer you leave out takes its default:
 
 ```rust
-let park = DeactivateSpec {
-    mode: DeactivationMode::Park,          // or Hibernate, or Wipe
-    grace_minutes: 0,                      // Hibernate's window before it wipes
-    running_policy: RunningPolicy::Wait,   // or Cancel
-    drain_timeout_secs: None,              // how long Wait waits; None is 60 seconds
-};
-ctx.trigger("receive").instance("user-42").deactivate(park, StopSelf::Keep).await?;
+let quiet = TakeDownChoice { door: Some(Door::Hide), running: Some(Running::Cancel), ..Default::default() };
+ctx.trigger("receive").instance("user-42").deactivate(quiet, StopSelf::Keep).await?;
+ctx.infra("bridge").instance("user-42").stop(TakeDownChoice::default(), StopSelf::Keep).await?;
 ```
 
-The mode decides what happens to the triggers. The running policy decides what
-happens to runs that were using the thing you took down: taking down an
-instance's copy touches only that instance's runs, and taking down an
-instance's trigger touches only the runs that trigger started.
+Taking down an instance's copy touches only that instance's triggers and
+runs, and taking down an instance's trigger touches only the runs that trigger
+started. A `deactivate` with `running` left at `wait` answers once the
+triggers are down: the runs they started finish on their own, and the call
+never waits on them from inside this run.
 
 If the run making the call is one of the runs the call would take down, the last
 argument decides what happens to it:
@@ -427,8 +438,9 @@ run](../nodes/ctx.md#your-project-beyond-this-run)).
 
 ## Cleaning up after instances
 
-If you want to see which instances there are, `ctx.instances().list()` (or the
-`ListInstances` node) gives one entry per instance weft holds anything for: how
+If you want to see which instances there are, `weft instances` lists them,
+and in a program `ctx.instances().list()` (or the `ListInstances` node) gives
+one entry per instance weft holds anything for: how
 many values, connections and live tokens it has, its infra copies, and its
 triggers. It never hands back a value or a secret.
 
@@ -442,7 +454,7 @@ weft clean --project <id> --instance user-42 --yes
 
 ```rust
 let week = Duration::from_secs(7 * 86400);
-ctx.runs().instance("user-42").status("completed").older_than(week).clean(RunningPolicy::Wait, StopSelf::Keep).await?;
+ctx.runs().instance("user-42").status("completed").older_than(week).clean(StillGoing::Leave, StopSelf::Keep).await?;
 ```
 
 If a program wants to read its runs rather than delete them, the same filters
@@ -455,8 +467,8 @@ let failed_today = ctx.runs().instance("user-42").status("failed").count().await
 ```
 
 `clean` never deletes a run that is still going. With
-`--cancel-running` (or `RunningPolicy::Cancel`) it cancels it, and the run's
-rows go with the next clean; without it (`RunningPolicy::Wait`) the run is left
+`--cancel-running` (or `StillGoing::Cancel`) it cancels it, and the run's
+rows go with the next clean; without it (`StillGoing::Leave`) the run is left
 to finish.
 
 weft has no "delete an instance" command. The `WipeInstance` node removes
@@ -477,7 +489,7 @@ the `instances` package of the standard catalog has a node for each step:
 | `InstanceInfraStatus` | Reads the state of an instance's copy |
 | `ListInstanceInfra` | Lists every copy of an infra node, the shared one and each instance's |
 | `ListInstances` | Lists every instance weft holds anything for (values, connections, copies, tokens, triggers), with counts and states, and the events waiting on a field not yet filled |
-| `CurrentInstance` | Says which instance the run is for: fires `instance` with its id, or `none` |
+| `CurrentInstance` | Says which instance the run is for: fires `instance` with its id, or `nobody` |
 | `InstanceCosts` | Lists what an instance's runs cost, with the total |
 | `GetInstanceValues` | Reads an instance's values for the `@instance_filled` fields, keyed `node.field` |
 | `SetInstanceValues` | Sets or clears an instance's `@instance_filled` values, and sets up again any of its triggers that read a changed one |
@@ -489,7 +501,10 @@ the `instances` package of the standard catalog has a node for each step:
 If you leave `instance` unwired on `StartInfra`, `StopInfra`, `TerminateInfra`,
 `ActivateTriggers` or `DeactivateTriggers`, it acts on the program's own copies
 instead: the shared copy of an infra node not marked `@per_instance`, or the
-triggers every instance shares.
+triggers every instance shares. `StopInfra`, `TerminateInfra` and
+`DeactivateTriggers` take the same answers as `weft deactivate` as inputs
+(`door`, `doorForMinutes`, `held`, `running`), each defaulting the same way,
+and `ActivateTriggers` takes `held`.
 
 If your backend should create instances, put `MintInstanceToken`,
 `StartInfra` and `ActivateTriggers` behind a gated route, in

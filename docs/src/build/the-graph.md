@@ -1,8 +1,8 @@
 # Working in the graph
 
-Everything here works with the mouse, and every gesture rewrites your `.weft`
-file. The two panes are one file, so nothing you do on the canvas is stored in
-a second place that could disagree with your source.
+Everything here works with the mouse. Whatever you change on the canvas is
+written into your `.weft` file, so the two never disagree. The one exception is
+where a box sits: positions are kept in `layouts/`, beside your source.
 
 ## Getting around
 
@@ -80,7 +80,8 @@ That same right-click menu makes an input required or optional, removes it, or
 puts a catalog port back the way it was.
 
 Double-click a box's name to rename it. Right-click a box for **Duplicate**,
-**Delete**, **Tags…**, **Set as target** and **Run from here…**.
+**Delete**, **Tags…** and **Run from here…**, plus **Run this group…** on a
+group or an included file.
 
 On an infra node, the same menu has **One per instance**: each instance of
 your program then gets its own copy of it, and it shows a **per instance**
@@ -102,41 +103,64 @@ for each instance too, and shows a dashed **per instance (follows)** badge. For
 what all of this means, go and read
 [programs with instances](../running/instances.md).
 
-## Run one branch instead of everything
+## Run part of the graph
 
-Right-click the box whose answer you want and choose **Set as target**. It gets
-a breathing ring, and the Run button becomes **Run 1 target**. Only that box
-and the boxes feeding it will run. Set as many as you like; right-clicking a
-target again offers **Unset target**.
-![A node set as target, and the Run button counting it](../img/graph-target.png)
-
-
-The same thing from a terminal:
+Select the boxes whose answers you want (click one, or hold **Shift** and drag
+around several). The selection bar appears at the bottom of the canvas, with a
+**Run (2)** button: 2 is how many boxes you picked.
+Click it, or press **Ctrl+Enter**, and those boxes run together with
+everything they need. That is the same run as:
 
 ```bash
-weft run --target dailyReport
+weft run --target dailyReport --target weeklyReport
 ```
 
-The walk stops when it reaches a trigger, and a box that two branches share
-does not drag the other branch in. A target inside a group brings only the work
-needed through it. A loop is the exception and comes along whole.
+To work out what a box needs, weft follows the wires back up from it and
+stops at any trigger. That trigger does not fire in this run, so a box only a
+trigger feeds is skipped; if you want it to run, fire the trigger with a
+made-up event from **Run from a spec…** (below). A box that two branches share
+does not drag the other branch in. If the box sits inside a group, only the
+boxes of that group it needs run, plus whatever feeds the switch that decides
+whether the group runs at all (its `_should_flow` or `_should_not_flow`). If weft reaches a loop on the way, the whole loop comes along, and a
+box inside a loop cannot be picked on its own: Run stays grey and tells you to
+select the whole loop.
 
-For anything more specific, the chevron glued to the Run button opens
-**Run from a spec…**, a dialog where you can start partway in with values you
-supply, exclude an endpoint, run one group on its own, fire a single trigger
-with a made-up event, or reuse what did not change since the last run. Right-clicking a box and
-choosing **Run from here…** opens the same dialog already filled in.
-Everything in there has a flag on [the CLI](../running/cli.md), and the rules
-are in [versions, seeds and frozen examples](../running/versions.md).
+While weft works out what the selection needs, the button is greyed out and
+says `Checking what this run needs...` on hover. If the run cannot start
+(say it needs a trigger nobody fired), the button stays grey and its
+tooltip gives weft's reason, the same one `weft run --check` prints.
+
+If you want the whole program, open the **Weft** icon in the side strip and
+click **Run Project** on the project's row. That is a plain `weft run`.
+
+For anything more specific, the **Specs** button on the status bar (below)
+lists your saved examples (`examples/*.json`), and clicking one runs it. The
+same list has **Run from a spec…**, a dialog where you can start partway in
+with values you supply, exclude an endpoint, run one group on its own, fire a
+single trigger with a made-up event, or reuse what did not change since the
+last run. If you have opened an included file (the **Open** button on its
+box, below), the list starts with **Run this group (&lt;name&gt;)…**, which opens
+that dialog set to run just that file. Right-clicking a box and choosing
+**Run from here…** opens the same dialog already filled in. Everything in that
+dialog also has a flag on [the CLI](../running/cli.md). For the rules behind
+it, go and read [versions, seeds and frozen examples](../running/versions.md).
 
 ## Watch it go
 
-**Run Project** is at the bottom of the canvas, or press **Ctrl+Enter** with
-the graph focused. While a run is going, that button becomes **Stop
-Run**. The bar follows what happens whoever started it: an `infra start`
-typed in a terminal, or asked for by Tangle, shows as **Starting infra...** on
-the infrastructure buttons, and an activation as **Activating...**, each with
-its Cancel, the same as clicking them.
+The status bar, at the very bottom of the canvas, shows what is happening right
+now. While the run on the graph is going, it shows **Stop** and how far the run
+got (`run 3f2a... 4/9 nodes`). Which run that is depends on the toggle in
+[look at an older run](#look-at-an-older-run). The bar also shows work started
+elsewhere: an
+`infra start` typed in a terminal, or asked for by Tangle, shows as
+**Starting infra...**, an activation as **Turning triggers on...**, a build as
+**Building...**. If that work can still be cancelled, the label ends in
+**(Cancel)**, and clicking the label cancels it.
+
+If a command fails, a red banner sits above the bar with the error. Click it
+for the whole message, and the **×** to dismiss it. A dark line above the bar
+shows the last thing the command printed, while it runs and, if it failed, for
+as long as the banner is up. Clicking it shows everything it printed.
 
 Each box gets a glow and a small mark:
 
@@ -194,10 +218,72 @@ If your project deploys to a cloud install, the switch at the top right shows
 the graph as that install runs it. For how it works, go and read
 [Look at prod from the editor](../running/cloud.md#look-at-prod-from-the-editor).
 
+## Turn triggers and infra on and off
+
+Select a trigger or an infra node, or several (with the graph focused,
+**Ctrl+P** opens its list, and **Select All Triggers** there picks every
+trigger). The selection bar then offers what each can do right now, with how many of the selected nodes it applies to:
+**Turn on**, **Turn off** and **Resync** for triggers, **Start**, **Stop**,
+**Terminate** and **Upgrade** for infra. These are `weft activate`,
+`weft deactivate`, `weft resync` and the `weft infra` commands.
+
+If you want to choose how triggers go down, **options...** asks you three
+things. What happens to work that arrives while they are down: **Hold it**,
+**Hold it, hidden** (held, but not listed for the people who answer your
+program's questions), or **Refuse it**. If you hold it, you can also say "then
+refuse after N minutes". What happens to work already waiting: **Keep it** or
+**Drop it**. And what happens to the runs going now: **Wait for them** or
+**Cancel them**.
+Each starts on the default the `weft` commands use: **Hold it**, **Keep it**
+and **Wait for them**. If you are stopping, terminating
+or upgrading infra, the panel asks the same three questions again for the
+triggers that go down with it, and names them. For turning triggers on, it asks
+what to do with what they held while they were down: **Run it** or **Drop it**.
+For what each answer does, go and read
+[taking triggers down](../running/lifecycles.md#taking-triggers-down-three-questions).
+
+If a selected node exists once per instance, the bar shows an
+**instance:** picker. It starts on **shared**, the copy that belongs to no
+instance; you can pick **all instances**, or find or type one instance's id. The pick
+applies to every action on the bar and is remembered until you close the
+editor.
+
+Each trigger and infra node carries a small badge with its state, and hovering
+it says more:
+
+| Badge | What it means |
+|---|---|
+| `on`, `off`, `turning on...` | The trigger's state |
+| `held 3` | Off, with three arrivals or paused runs waiting for it |
+| `behind` | On, but firing an older version of the program, or infra running from older source. **Resync** or **Upgrade** brings it up to date |
+| `held back` | Taken down by the health check or with its infra, and it cannot come back by itself because other triggers are on another build. The hover names them and says `weft resync --all` |
+| `running`, `stopped`, `starting...`, `stopping...`, `terminating...`, `flaky`, `failed` | The infra node's state |
+| `3 of 5 on`, `3 of 5 running` | A node that exists once per instance. The hover lists each instance. An infra node no instance has a copy of yet reads `no copies`; such a trigger reads `off` |
+
+If the health check took a trigger down, the hover says so. With the built-in
+health rules, the trigger comes back on its own once its infra is healthy. If
+the infra node's own rules never bring it back, click **Turn on**. For what
+the health check watches, go and read
+[when a unit stops being ready](../nodes/infrastructure.md#when-a-unit-stops-being-ready).
+
+If a resync stopped partway with triggers still down, the status bar shows
+**Resync stopped**, with **Resync** to pick it up where it stopped and
+**Give up** to leave those triggers off.
+
 ## Fold a big program down
 
 Every group has **Collapse group** in its header, and **Expand group** when it
-is shut. The wiring outside does not change either way.
+is shut. The wiring outside does not change either way. Groups start shut.
+
+If you are zoomed in when you open a group, the view zooms out around your
+mouse until about a dozen of its boxes fit on the screen. If closing one
+leaves five boxes or fewer on screen, the view zooms back in. Each zoom takes
+under half a second, and scrolling or dragging during it stops it where it
+is.
+
+An included file's box has an **Open** button that shows that file's own
+graph, where you can edit it. There, the group holding the whole file starts
+open. **Return** at the top left takes you back.
 ![One group collapsed, then expanded with the same outside connections](../img/graph-groups.png)
 
 

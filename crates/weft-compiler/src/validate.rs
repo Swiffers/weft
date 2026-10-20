@@ -3694,7 +3694,8 @@ fn check_placeholders(project: &ProjectDefinition, catalog: &dyn MetadataCatalog
             let hint = match did_you_mean(placeholder, &added) {
                 Some(close) => format!("; did you mean `{close}`?"),
                 None if added.is_empty() => format!(
-                    ". Declare it as an input: `{name}({placeholder}: String)`"
+                    ". Declare it as an input: `{name} = {}({placeholder}: String)`",
+                    node.node_type
                 ),
                 None => format!(". Its inputs are {}", added.join(", ")),
             };

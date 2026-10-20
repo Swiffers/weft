@@ -52,11 +52,14 @@ pub type WeftResult<T> = Result<T, WeftError>;
 /// node code that detects a bad condition itself: use it inside
 /// `map_err`/`ok_or_else` closures that build a rich message, or reach
 /// for [`node_bail!`](crate::node_bail) to return it in one statement.
-/// A node body never names a `WeftError` variant: the ctx accessors
-/// stamp input/config errors themselves, every ctx handle already
-/// returns `WeftResult`, outside errors go through `.node_err("doing
-/// X")`, and node-detected conditions go through `node_bail!` /
-/// `node_error`.
+/// The ctx accessors stamp input/config errors themselves, every ctx
+/// handle already returns `WeftResult`, outside errors go through
+/// `.node_err("doing X")`, and a failure of the work the node worked out
+/// itself goes through `node_bail!` / `node_error`, which a program can
+/// catch on `_error`. A node names a variant itself only when it spots a
+/// mistake in the program (SQL that does not parse, an input value of the
+/// wrong shape): `WeftError::Input`, which fails the run even with
+/// `_error` wired, because the fix is in the program.
 pub fn node_error(message: impl std::fmt::Display) -> WeftError {
     WeftError::NodeFailed(message.to_string())
 }

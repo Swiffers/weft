@@ -4,16 +4,23 @@ A loop runs what is inside it once per item of a list, or until the body says
 stop.
 
 ```weft
-grade = Loop(cards: List[JsonDict], rubric: String) -> (scores: List[Number | Null]) {
+grade = Loop(cards: List[JsonDict], rubric: String, provider: LlmProvider) -> (scores: List[Number | Null]) {
   over: ["cards"]
 
-  mark = LlmInference -> (response: String) {
-    prompt: self.rubric
-    ...
+  ask = Format(card: JsonDict, rubric: String) {
+    template: "{{rubric}}\n\nThe card: {{card}}\n\nAnswer with one number."
+    card: self.cards
+    rubric: self.rubric
+  }
+  mark = LlmInference {
+    prompt: ask.text
+    provider: self.provider
   }
   self.scores = Cast { value: mark.response }.value
 }
 grade.cards = pull.rows
+grade.rubric = "Score this flashcard from 0 to 10 for clarity."
+grade.provider = model.provider
 ```
 
 Unlike a group, a loop becomes nodes: the compiler turns it into a `LoopIn` and
@@ -45,8 +52,10 @@ Which kind a port is depends on where it is and whether you named it.
 | **Gathered**, any output not in `carry` | `List[T \| Null]`, one slot per iteration | You write one `T` per iteration |
 | **Carried**, named in `carry` | The seed goes in, the final value comes out | The running value in, the new one out |
 
-A gathered output **has** to allow null, because an iteration that failed
-leaves an empty slot. That is the `gather-output-must-be-nullable` error.
+A gathered output **has** to allow null, because an iteration that sends
+nothing on it (it failed, or a branch inside it was not taken) leaves a null
+in its slot. If you declare it without `| Null`, the build stops with
+`gather-output-must-be-nullable`.
 
 The list that comes out is built for every gathered port, even one that no
 iteration ever wrote, because a port that produces nothing at all would leave
@@ -141,5 +150,9 @@ per-iteration one is not a thing.
 
 ## Cutting a run inside one
 
-You cannot. `weft run --target` stops at a loop's edge and brings the whole
-loop along, because half an iteration is not a state the runtime has.
+You cannot start or end a run inside a loop. A run that reaches a loop takes
+the whole loop along, because a node inside a loop runs once per iteration,
+and starting or stopping at it would not say which iteration you mean. If you name a
+node inside a loop as a start or an end (`--from`, `--emit`, `--target`,
+`--before`), the run is refused: `cannot cut at 'grade.mark' inside loop
+'grade'; select the whole loop`.

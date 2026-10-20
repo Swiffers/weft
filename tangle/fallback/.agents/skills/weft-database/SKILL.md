@@ -83,8 +83,9 @@ are settings of the compute in the Neon console (**Branches**, the compute,
 Neon's free plan gives a project 100 CU-hours a month, which at 0.25 CU is
 about 400 hours awake. The database sleeps 5 minutes after the last thing that
 used it, and an idle install wakes nothing: weft books a wake-up only for a
-moment something is due (a hibernation ending, a queued event's retry),
-and its services hold no busy connection to the database once quiet.
+moment something is due (a queued event's retry, or the moment a trigger
+taken down with a time limit starts refusing what arrives), and its services hold no busy
+connection to the database once quiet.
 Infrastructure that runs fine lets it sleep too, because a machine reports
 only when its state changes, and so does a run waiting on a person or on a
 caller who says nothing (a run waiting on a silent caller still keeps its

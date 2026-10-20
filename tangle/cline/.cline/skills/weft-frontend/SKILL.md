@@ -618,9 +618,23 @@ carry the header.
   on the address the route was called on, so a page calls routes through the
   pass-through (`/weft/connect/...`), never from its own server code straight
   to the dispatcher: called that way, the links point at an address the
-  browser may not reach. A picture the page
-  sends goes in the JSON body as a `data:` URL on the key the route declares
-  as `Image`; never as multipart, never as a separate upload.
+  browser may not reach. weft serves that file exactly as stored: the link
+  answers range requests, so a `<video>` seeks and a broken download picks
+  up where it stopped, and the same file asked for again within the link's
+  lifetime gets the same link, so a page that fetches its answer again keeps
+  its video playing. The page writes no range handling and keeps no file
+  cache of its own. Every such link is a download: opened in a tab it saves
+  the file under its name, while an `<img>`, `<video>` or `<audio>` shows or
+  plays it.
+- A picture the page sends goes in the JSON body as a `data:` URL on the key
+  the route declares as `Image`, never as multipart. A file too big for
+  that (a video, a long recording) goes through an upload slot the program
+  hands the page: `uploadFile(slot, file, (done, total) => ...)` from
+  `$lib/weft-connect` sends it in parts straight to storage, through the
+  `/weft` pass-through, resuming after a dropped connection, and answers the
+  slot string, which the page then sends to the route in the field it
+  declares as a file. A refusal (a file too big, a type the slot does not
+  take) comes back as an error whose message is a sentence ready to show.
 - If a page shows a conversation read from a conversation file (the AI
   nodes' `historyFile`), it skips the messages whose `role` is `system`: the
   file can open with the system prompt as its first message. It finds

@@ -2731,6 +2731,49 @@ async fn health_verbs_of_a_project_are_claimed_in_order(pool: PgPool) {
     assert_eq!((third.id, third.verb), (recover, InfraLifecycleVerb::Reactivate));
 }
 
+/// A health take-down or bring-back that ends, whether it succeeded or
+/// failed, asks the supervisor for exactly one look at its project, so the
+/// rules that read what it did (or count its failure) run again without
+/// waiting for a unit to change. Any other command's ending asks for none.
+#[sqlx::test]
+async fn a_health_command_that_ends_asks_for_exactly_one_look(pool: PgPool) {
+    use weft_broker_client::lifecycle_command::{look_payload, INFRA_COMMAND_CHANNEL};
+    let (_journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let take_down = seed_dispatcher_command(&pool, project, "deactivate").await;
+    let bring_back = seed_dispatcher_command(&pool, project, "reactivate").await;
+    let stop = seed_dispatcher_command(&pool, project, "stop").await;
+    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    heard.listen(INFRA_COMMAND_CHANNEL).await.unwrap();
+    for (id, outcome) in [(take_down, "succeeded"), (bring_back, "failed"), (stop, "succeeded")] {
+        sqlx::query("UPDATE infra_lifecycle_command SET completed_at_unix = $1, outcome = $2 WHERE id = $3")
+            .bind(weft_dispatcher::lease::now_unix())
+            .bind(outcome)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Notices arrive in commit order: everything the endings sent comes
+    // before this mark.
+    sqlx::query("SELECT pg_notify($1, 'mark')").bind(INFRA_COMMAND_CHANNEL).execute(&pool).await.unwrap();
+    let mut payloads = Vec::new();
+    loop {
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv()).await.expect("the mark arrives").unwrap();
+        if notice.payload() == "mark" {
+            break;
+        }
+        payloads.push(notice.payload().to_string());
+    }
+    let look = look_payload(project);
+    assert_eq!(
+        payloads,
+        vec![format!("done:{take_down}"), look.clone(), format!("done:{bring_back}"), look.clone(), format!("done:{stop}")],
+        "one look per health command, whatever its outcome; none for a stop"
+    );
+}
+
 /// One upgrade of the same copies at a time: a second is refused naming the
 /// one in flight, another owner's goes ahead, and once the first ends a new
 /// one is issued.

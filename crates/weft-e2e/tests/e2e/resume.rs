@@ -82,7 +82,7 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
 
 /// A run paused on a build whose worker can no longer start ends the
 /// first time it is handed to a worker, never retried, and says how to
-/// pick it back up: `weft resync` for the triggers, `weft run --seed <run
+/// pick it back up: `weft resync` for the triggers, `weft run --seed=<run
 /// id>` for the run.
 ///
 /// Shape: the run pauses at the form on build A, the project moves on to
@@ -136,7 +136,7 @@ async fn a_paused_run_whose_build_cannot_start_ends_once_naming_the_way_back() -
     anyhow::ensure!(settled.status == "cancelled", "the run ends, it is {}", settled.status);
     let reason = settled.cancel_reason().unwrap_or_default();
     anyhow::ensure!(
-        reason.contains("`weft resync`") && reason.contains(&format!("`weft run --seed {run_id}`")),
+        reason.contains("`weft resync`") && reason.contains(&format!("`weft run --seed={run_id}`")),
         "the ending names the way back: {reason}"
     );
     anyhow::ensure!(settled.input_of("out").is_none(), "nothing of the run went on past the form");

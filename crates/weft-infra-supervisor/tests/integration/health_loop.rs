@@ -640,6 +640,90 @@ async fn failed_action_backs_off_then_retries_after_window() {
     assert_eq!(rule_state(&rig), None, "healthy: nothing failed is kept");
 }
 
+/// The take-down the built-in rule queued, still waiting on the
+/// dispatcher.
+fn queued_command(rig: &SupervisorTestRig) -> i64 {
+    rule_state(rig).and_then(|r| r.queued).expect("a command is queued").command
+}
+
+/// The rule counts as fired while its command runs; a command the
+/// dispatcher failed is a failure of the rule, tried again after 5 s,
+/// then 10 s, and given up at the third, exactly like an action that
+/// could not be queued. A success clears what failed.
+#[tokio::test]
+async fn a_health_command_that_fails_on_the_dispatcher_is_retried_then_given_up() {
+    use weft_broker_client::protocol::LifecycleOutcome;
+    let rig = rig_with_a_breaking_unit().await;
+    rig.broker.keep_health_commands_running();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    assert_eq!(take_down_calls(&rig), 1);
+    let row = rule_state(&rig).unwrap();
+    assert!(row.fired && row.queued.is_some() && !row.took_down, "queued, not landed yet: {row:?}");
+    rig.tick_health().await.unwrap();
+    assert_eq!(take_down_calls(&rig), 1, "a rule waits on its running command");
+
+    for (failure, wait) in [(1, 5), (2, 10)] {
+        rig.broker.end_health_command(queued_command(&rig), LifecycleOutcome::Failed, Some("the listener did not answer"));
+        rig.tick_health().await.unwrap();
+        let row = rule_state(&rig).unwrap();
+        assert!(!row.fired && row.queued.is_none(), "the failure takes the firing back: {row:?}");
+        assert_eq!(row.consecutive_failures, failure);
+        assert_eq!(row.next_retry_at_unix, Some(rig.clock.now_unix() + wait));
+        assert!(row.last_error.as_deref().is_some_and(|e| e.contains("the listener did not answer")), "{row:?}");
+        assert_eq!(take_down_calls(&rig), failure as usize, "nothing again inside the backoff");
+        rig.advance(Duration::from_secs(wait as u64 + 1));
+        rig.tick_health().await.unwrap();
+        assert_eq!(take_down_calls(&rig), failure as usize + 1, "tried again after the backoff");
+    }
+    rig.broker.end_health_command(queued_command(&rig), LifecycleOutcome::Failed, Some("the listener did not answer"));
+    rig.tick_health().await.unwrap();
+    let row = rule_state(&rig).unwrap();
+    assert!(row.gave_up_at_unix.is_some() && row.next_retry_at_unix.is_none(), "the third failure gives up: {row:?}");
+    rig.tick_ownership().await.unwrap();
+    assert_eq!(rig.broker.gave_up(), vec![PROJECT]);
+    rig.advance(Duration::from_secs(60));
+    rig.tick_health().await.unwrap();
+    assert_eq!(take_down_calls(&rig), 3, "given up: no retry while what it saw stays the same");
+
+    // A person's look re-arms it (the broker clears the give-up); this
+    // time the dispatcher succeeds, and the failures are cleared.
+    rig.broker.set_health_state_rows(
+        PROJECT,
+        vec![weft_broker_client::protocol::HealthRuleState { consecutive_failures: 0, gave_up_at_unix: None, gave_up_seen: None, last_error: None, ..row }],
+    );
+    rig.tick_health().await.unwrap();
+    assert_eq!(take_down_calls(&rig), 4);
+    rig.broker.end_health_command(queued_command(&rig), LifecycleOutcome::Succeeded, None);
+    rig.tick_health().await.unwrap();
+    let row = rule_state(&rig).unwrap();
+    assert!(row.fired && row.queued.is_none() && row.took_down && row.consecutive_failures == 0 && row.last_error.is_none(), "{row:?}");
+}
+
+/// A command that never ends counts as failed once the rule's timeout has
+/// passed since it was queued, and is tried again.
+#[tokio::test]
+async fn a_health_command_past_its_timeout_counts_as_failed() {
+    let rig = rig_with_a_breaking_unit().await;
+    rig.broker.keep_health_commands_running();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    let deadline = rule_state(&rig).and_then(|r| r.queued).unwrap().deadline_unix;
+    assert_eq!(deadline, rig.clock.now_unix() + 1800, "the built-in rules' timeout");
+    rig.advance(Duration::from_secs(1799));
+    rig.tick_health().await.unwrap();
+    assert!(rule_state(&rig).unwrap().queued.is_some(), "still inside its timeout");
+    rig.advance(Duration::from_secs(1));
+    rig.tick_health().await.unwrap();
+    let row = rule_state(&rig).unwrap();
+    assert_eq!(row.consecutive_failures, 1, "{row:?}");
+    assert!(row.queued.is_none() && !row.fired);
+    assert!(row.last_error.as_deref().is_some_and(|e| e.contains("did not end within")), "{row:?}");
+    rig.advance(Duration::from_secs(6));
+    rig.tick_health().await.unwrap();
+    assert_eq!(take_down_calls(&rig), 2, "tried again");
+}
+
 #[tokio::test]
 async fn completed_action_frees_in_flight() {
     // The success side, through the FULL tick: the action does NOT
@@ -861,6 +945,51 @@ async fn the_built_in_bring_back_fires_once_infra_is_healthy() {
     assert!(
         reactivated,
         "the built-in bring-back must enqueue a reactivate when infra is up and the health check took something down"
+    );
+}
+
+/// `db` (the built-in rules) goes flaky and takes trigger T down; T also
+/// reads `cache`, whose node runs no health rules at all. Once `db`
+/// recovers, the bring-back names nothing still broken: `cache` took
+/// nothing down, so it holds nothing back, and T comes back.
+#[tokio::test]
+async fn a_node_with_no_rules_never_holds_back_another_nodes_recovery() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, "db", "c-db", Status::Running);
+    rig.broker.add_infra_node(PROJECT, "cache", "c-cache", Status::Running);
+    rig.broker.set_health_rules(PROJECT, "cache", None, Some(Vec::new()));
+    let units = |db: bool| [("db", "c-db", "db", db), ("cache", "c-cache", "cache", true)];
+    observe(&rig, PROJECT, &units(true));
+    rig.tick_health().await.unwrap();
+    observe(&rig, PROJECT, &units(false));
+    rig.tick_health().await.unwrap();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    let db = weft_broker_client::protocol::InfraCopy { node_id: "db".into(), instance: None };
+    assert_eq!(take_downs(&rig, PROJECT).iter().map(|d| d.broken.clone()).collect::<Vec<_>>(), vec![vec![db.clone()]]);
+    // The dispatcher took T down: nothing listens, and the health check
+    // holds something down. Its ending asks for a look.
+    rig.broker.add_project_with_status(PROJECT, weft_broker_client::protocol::ProjectStatus::Inactive);
+    rig.broker.set_health_down(PROJECT, true);
+    rig.tick_health().await.unwrap();
+
+    observe(&rig, PROJECT, &units(true));
+    rig.tick_health().await.unwrap();
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    let bring_backs: Vec<_> = rig
+        .broker
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            BrokerCall::EnqueueLifecycle { spec: weft_broker_client::protocol::LifecycleSpec::Reactivate(r), .. } => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        bring_backs,
+        vec![weft_broker_client::protocol::RestoreReaders { still_broken: Vec::new() }],
+        "db came back and cache took nothing down: T comes back"
     );
 }
 

@@ -61,7 +61,8 @@ wins over `.env`.
 ## Tests
 
 ```bash
-cargo test                                                     # the workspace
+cargo nextest run --workspace                                  # every test but the Postgres ones
+cargo test --workspace --doc                                   # the doc tests, which nextest does not run
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo check -p weft-compiler --no-default-features             # the parse-only build
 scripts/validate-examples.sh                                   # every project in examples/ still compiles
@@ -73,6 +74,22 @@ node --test catalog/bailey/bridge/images/bridge/src/*.test.js  # the WhatsApp br
 pnpm -C extension-browser exec tsc --noEmit                    # the browser extension's type check
 pnpm -C extension-browser check                                # and its Svelte check
 ```
+
+The tests run under [cargo-nextest](https://nexte.st). If you do not have it
+yet, install it once with `cargo install cargo-nextest --locked`.
+
+If you want only the tests your change can break, keep `--workspace` and
+filter what runs: `cargo nextest run --workspace -E 'rdeps(weft-compiler)'`
+runs the tests of `weft-compiler` and of every crate that depends on it.
+Building with `-p weft-compiler` instead turns on different features in the crates
+it depends on, so cargo compiles a second copy of them.
+
+Most crates that have integration tests keep them in one test binary,
+`tests/integration/main.rs`, with one module per file, and a crate whose tests
+need Postgres keeps those in `tests/db/`. If you add an integration test, make it
+a module in `tests/integration/` (or `tests/db/` if it needs Postgres) rather
+than a new file directly under `tests/`, which would be one more binary
+linking every dependency again.
 
 CI runs all of those, plus the Postgres ones further down. If you want to run
 the graph, syntax and VS Code suites, run `./setup.sh` (or just

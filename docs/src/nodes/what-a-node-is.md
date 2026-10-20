@@ -8,8 +8,10 @@ word_count/
   mod.rs           what it does
 ```
 
-The `metadata.json` is what makes the folder a node. Put one anywhere under
-your project's `nodes/` directory and weft finds it.
+The `metadata.json` is what makes the folder a node. Put the folder anywhere
+under your project's `nodes/` or `src/` folder and weft finds it. The two
+folders make one catalog, so a name (a node type, a service, a package) has to
+be unique across both.
 
 | File | Needed | What it is |
 |---|---|---|
@@ -21,13 +23,16 @@ your project's `nodes/` directory and weft finds it.
 
 ## A folder with metadata and no code
 
-That is not an error. weft finds it, reports it as pending, and leaves it out
-of the build. A program that never names it builds fine, and a program that
-does gets told which folder is waiting for its Rust.
+That is not an error. weft finds it, warns that it has no `mod.rs` yet, and leaves it
+out of the build. A program that never names it builds fine, and a program that
+does is told which folder is waiting for its Rust:
 
-So writing the interface first and the body second is a supported way to work.
-It is also worth knowing when a node you are sure exists comes back as an
-unknown type: check whether its `mod.rs` is there.
+```text
+node type 'WordCount' is not ready yet: node 'WordCount' at <project>/nodes/word_count
+has no mod.rs yet; it is left out until it does
+```
+
+So you can write the `metadata.json` first and the Rust later.
 
 ## Packages
 
@@ -48,11 +53,8 @@ slack/
     mod.rs
 ```
 
-Package defaults merge key by key, and a node's own value wins. `type`, `label`
-and `description` can never be defaults, because they are one node's identity,
-and the compiler refuses a package file carrying any of them.
-
-Two nodes with the same `type` fail loudly rather than one shadowing the other.
+For the shared code, the defaults and the dependencies, go and read
+[packaging](packaging.md).
 
 ## The trait
 
@@ -83,12 +85,11 @@ on a real event, with the payload on `ctx.wake`.
 
 ## How it gets into the binary
 
-There is no registration file. The compiler walks your `nodes/` folder, finds
-the metadata, and generates the lookup table. Adding a node is adding a folder.
+There is no registration file: the compiler generates the lookup table from
+the folders it finds.
 
-It only generates what your program references, and it emits one cargo crate
-per package, so editing one node recompiles that package and relinks rather
-than rebuilding everything.
+It only compiles the packages your program uses, each as its own cargo crate.
+For what that buys you, go and read [shared code](packaging.md#shared-code).
 
 Your program's definition is not baked into the binary. The worker fetches it
 by hash at run time, which is why rewiring your graph without touching any Rust

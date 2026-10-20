@@ -48,8 +48,9 @@ Read an input, send an output. That is the shape of every node.
 
 ## Write one
 
-Make a folder under your project's `nodes/`, anywhere except
-`nodes/base_catalog/`. That folder holds the standard library, and it is a
+Make a folder anywhere under your project's `nodes/` (except
+`nodes/base_catalog/`), or anywhere under `src/`, for example next to the
+`.weft` file that uses it. `nodes/base_catalog/` holds the standard library, and it is a
 folder of nodes like any other: weft loads and builds it the same way, and
 you can delete it if you do not use it. The one thing particular to it is
 that `weft catalog update` replaces it with the installed weft's copy, so
@@ -156,8 +157,12 @@ weft::node_bail!("pick a destination: a channel or a user");
 `node_bail!` is for something your own code worked out. Write the message as an
 instruction, because it is going in front of whoever is building the program.
 
-Your node never names a weft error type. Those two, plus `?` on anything the
-ctx hands back, cover it.
+Those two, plus `?` on anything the ctx hands back, cover almost every
+failure. The exception is a mistake in the program that your code spots, like
+SQL that does not parse: return `Err(WeftError::Input(..))` for that. For why,
+and for which failures a program can catch on `_error` (an output weft gives
+every node), go and read [which failures a program can
+handle](values-and-emission.md#which-failures-a-program-can-handle).
 
 ## Then a test
 

@@ -551,6 +551,21 @@ q.userId = src.id
     assert!(!message.contains("literal"), "a string literal holds no placeholder: {d:?}");
 }
 
+/// A node that added no input is shown the declaration that adds one,
+/// written the way the language declares a node: its name, then its type.
+#[test]
+fn a_placeholder_on_a_node_with_no_inputs_shows_the_declaration_to_write() {
+    let (_, _, d) = check(
+        r#"
+db = PostgresAccess
+q = PostgresExecuteQuery { query: "SELECT * FROM cards WHERE owner = $userId" }
+q.account = db.access
+"#,
+    );
+    let message = message_of(&d, "placeholder-not-an-input");
+    assert!(message.contains("`q = PostgresExecuteQuery(userId: String)`"), "{message}");
+}
+
 /// Text read in through `@file` is held to the inputs the same way.
 #[test]
 fn a_template_read_from_a_file_is_checked_too() {

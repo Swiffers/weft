@@ -128,6 +128,22 @@ impl Bounds {
     }
 }
 
+/// A node named as an end of a cut: one that does not compile is refused
+/// with the compiler's own reason, before any rule about where an end may
+/// sit (an infra node inside a loop is refused for being there, never
+/// told to select the loop), then [`validate_place`].
+fn node_endpoint(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<(), String> {
+    refuse_broken(&g.project().broken, &BTreeSet::from([place.id.as_str()]))?;
+    validate_place(g, place, spelled)
+}
+
+/// [`node_endpoint`] for a group: its own compile errors, then
+/// [`validate_group_place`].
+fn group_endpoint(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<(), String> {
+    refuse_broken(&g.project().broken, &BTreeSet::from([place.id.as_str()]))?;
+    validate_group_place(g, place, spelled)
+}
+
 /// Resolve `bounds` against the program. Refuses bounds that name
 /// nothing, name something inside a loop, or contradict each other.
 pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, String> {
@@ -136,10 +152,10 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
     for spelled in &bounds.from {
         let place = locate(g, spelled)?;
         let fresh = if g.group(&place.id).is_some() {
-            validate_group_place(g, &place, spelled)?;
+            group_endpoint(g, &place, spelled)?;
             resolved.group_starts.insert(place)
         } else {
-            validate_place(g, &place, spelled)?;
+            node_endpoint(g, &place, spelled)?;
             resolved.node_starts.insert(place)
         };
         if !fresh {
@@ -154,7 +170,7 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
         if g.group(&place.id).is_none() {
             return Err(format!("unknown group '{group}'"));
         }
-        validate_group_place(g, &place, group)?;
+        group_endpoint(g, &place, group)?;
         resolved.targets.extend(members_in(g, &place.id, &place.path));
         resolved.group_starts.insert(place);
     }
@@ -163,12 +179,12 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
         if g.group(&place.id).is_some() {
             return Err(format!("cannot supply outputs of group '{spelled}'; use --from {spelled} with its input payload"));
         }
-        validate_place(g, &place, spelled)?;
+        node_endpoint(g, &place, spelled)?;
         resolved.emits.insert(place);
     }
     if let Some(spelled) = &bounds.fire {
         let place = locate(g, spelled)?;
-        validate_place(g, &place, spelled)?;
+        node_endpoint(g, &place, spelled)?;
         if !g.is_trigger(&place.id) {
             return Err(format!("'{spelled}' is not a trigger"));
         }
@@ -181,10 +197,10 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
         for spelled in ends {
             let place = locate(g, spelled)?;
             let endpoints: Vec<Located> = if g.group(&place.id).is_some() {
-                validate_group_place(g, &place, spelled)?;
+                group_endpoint(g, &place, spelled)?;
                 members_in(g, &place.id, &place.path)
             } else {
-                validate_place(g, &place, spelled)?;
+                node_endpoint(g, &place, spelled)?;
                 vec![place]
             };
             if inclusive { resolved.targets.extend(endpoints) } else { resolved.befores.extend(endpoints) }
@@ -213,7 +229,7 @@ pub fn walk(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Walk, String> 
 /// a target inside a loop and a walk that would hold part of one.
 pub fn walk_setup(g: &ProjectGraph, targets: &[Located]) -> Result<Walk, String> {
     for target in targets {
-        validate_place(g, target, &super::address_of(g.project(), &target.id, &target.path))?;
+        node_endpoint(g, target, &super::address_of(g.project(), &target.id, &target.path))?;
     }
     let walked = walk_bounds(g, &Bounds::setup(targets));
     validate_loops(g, &walked)?;

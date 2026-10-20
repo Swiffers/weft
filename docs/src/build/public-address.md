@@ -111,6 +111,71 @@ naming the value it expects.
 
 The tunnel comes down and the address stops answering.
 
+## Devices on your own network
+
+If you want a phone or another computer on your wifi to open what your program
+hands out, without the internet in between, give weft this machine's address
+on that network:
+
+```bash
+WEFT_NETWORK_ADDRESS=192.168.1.20 weft daemon start
+```
+
+```text
+network address: http://192.168.1.20:14112 (the doors outside callers use, for devices on this machine's network; a start with WEFT_NETWORK_ADDRESS=off closes it)
+```
+
+weft then answers the paths in the table above on that address too, on the
+port the tunnel uses (14112 on the default install), and nothing else: your projects and runs stay on `127.0.0.1`. weft
+remembers the address for every later start. If you want to close it, start
+once with `WEFT_NETWORK_ADDRESS=off`.
+
+It takes the bare IP (`ip -brief address` lists yours), and weft adds the
+scheme and the port itself. The start refuses a value with a scheme, a port or
+a path. It also refuses a loopback address (no other device can reach
+it), `0.0.0.0` or `::` (that would open these paths on every network this
+machine is on), a link-local IPv6 one starting `fe80:`, and one this machine
+does not have. Each refusal names
+what to give instead.
+
+## Your own site in front
+
+If your project has its own site and you want links to its stored files to
+go through that site, tell weft the address where the site passes its
+visitors' calls on to weft (the `weftPassThrough` helper from `@weft/connect/server`,
+mounted at `/weft` on the site):
+
+```bash
+weft frontend visitor-address shop https://shop.example/weft
+```
+
+`shop` is the name you gave the frontend with `weft frontend add`. If you are
+making the frontend now, `weft frontend add shop --visitor-address
+https://shop.example/weft` sets it in the same step. To clear it, give `off` in
+place of the address. One
+frontend per project can hold it: asking for a second is refused, naming the
+frontend that has it.
+
+## Which address a file link gets
+
+When your program hands somebody outside a link to a stored file (a file in a
+route's answer, say), the link goes through this tunnel only on a local install
+whose project has no visitor address. With the tunnel closed too, it goes to
+the install's own address: the network address if you set one, which only
+devices on your network can open, otherwise `127.0.0.1`, which only this
+machine can open. For the full order and what a node sees, go and read
+[handing a file out](../nodes/storage.md#handing-a-file-out).
+
+If your tunnel is the one whose address changes on restart (`./setup.sh
+--public-url` without a hostname of your own), weft asks it for its address each time it makes a
+link, so a new link always carries the current address. A link handed out
+before the tunnel restarted still points at the old one. If the tunnel cannot say its address at that
+moment, the link is refused:
+
+```text
+the install's tunnel does not say its address right now; `weft daemon start` opens it again
+```
+
 ## When you do not need it
 
 Triggers that go and fetch rather than wait to be pushed work with no public

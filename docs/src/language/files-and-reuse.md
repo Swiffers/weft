@@ -67,18 +67,21 @@ nothing to write back to. The error points you at `@asset`.
 ## @asset
 
 ```weft
-badge = Text {
-  value: @asset("https://example.com/terms.txt")
+terms = Text {
+  value: @asset("https://example.com/terms.txt", String)
 }
-stamp = Watermark {
+fal = FalAccess
+sharper = FalUpscaleImage {
+  account: fal.access
   image: @asset("assets/logo.png", Image)
 }
 ```
 
-The type is **required** for a file, and it has to name one concrete kind:
-`Image`, `Video`, `Audio` or `Blob`. `File` and `Media` are refused, because a
-value carries exactly one marker and those leave it open. weft will not guess
-the kind from the extension or from the bytes.
+The type is **required**, because weft will not guess it from the extension
+or from the bytes. For text, it is the type to read the text as
+(`String`, `Number`, `JsonDict`, a record). For a file, it names one concrete
+kind: `Image`, `Video`, `Audio` or `Blob`. `File` and `Media` are refused:
+each covers several kinds, and weft has to know which one the file is.
 
 It is fetched or read when you build, not when you write it, so a URL is
 resolved once into your project rather than every run.
@@ -95,7 +98,11 @@ An included file is one group, and its header is the interface:
 # triage.weft
 Group(email: JsonDict) -> (severity: String) {
   # Classify an inbound ticket
-  ...
+  classify = ExecPython(email: JsonDict) -> (severity: String) {
+    email: self.email
+    code: "return {'severity': 'high' if 'urgent' in str(email) else 'low'}"
+  }
+  self.severity = classify.severity
 }
 ```
 

@@ -14,6 +14,7 @@ List[Number]
 Dict[String, Number]
 String | Number
 { role: String, name?: String }
+{ role: String, .. }
 Generator[String]
 ```
 
@@ -25,15 +26,16 @@ Generator[String]
 | `Media` | Short for `Image \| Video \| Audio` |
 | `File` | Short for those three plus `Blob` |
 | `List[T]` | Any number of `T` |
-| `Dict[K, V]` | Keys and values, all the same type |
+| `Dict[String, V]` | Text keys, and values all of type `V`. `Dict[Number, String]` is refused, and the message suggests `List[{key: Number, value: String}]` |
 | `JsonDict` | An object whose values nobody checked |
 | `{ a: String, b?: Number }` | A record, with `?` marking a field that may be missing |
+| `{ a: String, .. }` | An open record: a record that also takes keys it does not name, and drops them |
 | `A \| B` | Either one |
 | `Access` | A connection to a service. Go and read [how connections work](../connections/how-they-work.md) |
 | `Generator[T]` | A stream of `T`. Go and read [streams and buses](streams-and-buses.md) |
 | `Bus` | A live channel. Same page |
 | `Empty` | Nothing can be one. See below |
-| `T`, `T1` to `T99` | A type variable. The node works with whatever you connect |
+| `T`, or `T` and a number (`T1`, `T2`) | A type variable. The node works with whatever you connect |
 
 A stored file on a wire is never the bytes. It is a small marker saying where
 the file is, which is why a `String` holding a URL is not an `Image`.
@@ -48,7 +50,7 @@ the file is, which is why a `String` holding a URL is not an `Image`.
 | `Record` | `JsonDict` | Yes. A record forgets itself |
 | `JsonDict` | `Record` | **No.** Use a `Cast`, which checks the shape |
 | `Dict[String, V]` | `JsonDict` | Yes, and back |
-| `Record` | `Record` | Every field you have must be declared on the target, every required field it wants must be required on yours, and the types must match |
+| `Record` | `Record` | Every field you have must be declared on the target (unless the target ends with `..`), every required field it wants must be required on yours, and the types must match |
 | `A` | `A \| B` | Yes |
 | `A \| B` | `A` | Only if **both** `A` and `B` fit `A` |
 | `Generator[A]` | `Generator[B]` | Only if they fit both ways. A stream is invariant |
@@ -56,10 +58,17 @@ the file is, which is why a `String` holding a URL is not an `Image`.
 | anything | `Empty` | No |
 
 Records are strict. A field the target does not declare is a mismatch, not
-something quietly carried along. And a field that can be null says so: `extra:
-JsonDict | Null`. A `JsonDict` alone refuses a null, so a query whose rows all
-have that column empty fails the node with `does not accept (got
-List[Dict[String, String | Null]])`, and the fix is the `| Null` on that field.
+something quietly carried along. If you want a record that takes keys it does
+not name, end it with `..`: `{ email: String, .. }` takes any record with an
+`email`. At run time, a value checked against it (a request's body, a model's answer,
+what a `Cast` makes) loses every key the type does not name, so what flows on
+carries only `email`. A missing required field is refused either way.
+
+A field that can be null says so: `extra: JsonDict | Null`. A `JsonDict` alone
+refuses a null, so if you declare a query's rows as
+`List[{ id: String, extra: JsonDict }]` and a row comes back with `extra`
+null, the node fails with `... does not accept: [0].extra: expected JsonDict,
+got Null`, and the fix is the `| Null` on that field.
 
 `Empty` is the type of a value that cannot exist. An empty list `[]` is
 `List[Empty]`, because there is no item to learn from, and that goes into a
@@ -67,12 +76,45 @@ List[Dict[String, String | Null]])`, and the fix is the `| Null` on that field.
 disappears: `Number | Empty` is just `Number`.
 
 A port typed with a type variable (`T`, `T2`) gets its type where the node is
-used: from the type your program declares on it, or from what is wired to
-it. `Cast`'s output is the type variable `T2` (its input is `T`), so it takes
-the type you declare on it (`-> (value: Boolean)`), or else the type of the
-port it feeds. A port you declare in a
-header with no type, like `(x)`, takes its type from what is wired to it. A
-type variable nothing pins is the `unresolved-typevar` error.
+used: from the type your program declares on it, from what is wired to it, or
+from a value written into it. `Cast`'s output is the type variable `T2` (its
+input is `T`), so it takes the type you declare on it (`-> (value: Boolean)`),
+or else the type of the port it feeds. A port you declare in a header with no
+type, like `(x)`, gets a type variable of its own, so for a group
+`g = Group(x) -> (y: String)`, writing `g.x = 3` makes `x` a `Number`. A type variable nothing pins is the `unresolved-typevar` error.
+
+A type variable can be limited to some types. A group says so right after
+the word `Group`, `blur = Group[T: Media](file: T) -> (out: T)`, and so can a
+node you declare inline (`ExecPython[T: Media](f: T)`). A node's author does
+it in its `metadata.json` (`KeepFile` only takes a file); for how, go and read
+[typeParams](../nodes/metadata.md#typeparams). Wire a `String` into that
+group's `file` and the build stops with `type-bound`: `` `T` has to fit in
+Media, and what is connected makes it String``.
+
+## Saying what a broad output holds
+
+Some outputs carry a shape only your program knows, like the JSON a model
+answers with or the body of a request. Their node types them broadly, usually
+`JsonDict`, and lets you declare what they hold on the node, like this:
+
+```weft
+type Verdict = { label: String, score: Number }
+judge = LlmInferenceJson -> (response: Verdict) {
+  prompt: "Label this review and score it from 0 to 1"
+  provider: model.provider
+}
+```
+
+From there on the wire carries a `Verdict`, so `judge.response.score` reads
+as a `Number`. At run time every value is checked against `Verdict`, and one
+that does not fit fails the node, which `_error` catches when it is wired.
+
+You can only do this on an output whose node allows it, and only with a type
+that fits inside the widest one the node accepts there. Declaring
+`-> (response: Number)` on `LlmInference`, whose answer is always text, is
+refused when you build: `... output port 'response' is declared Number, but
+LlmInference always gives it String: only an output its node marks narrowable
+takes the type the program declares`.
 
 ## Giving a type a name
 
@@ -96,9 +138,8 @@ falls away. Going the other direction needs a `Cast`, which checks the value
 really has that shape.
 
 **Nothing shadows.** A name already visible cannot be redeclared, even to the
-same thing. Two catalog packages shipping an identical type is fine and they
-absorb; two packages shipping the same name with different bodies names both.
-And a port that restates a declared name with a different body is the
+same thing. Two catalog packages shipping an identical type is fine (for two that
+disagree, go and read [custom types](../nodes/custom-types.md)). And a port that restates a declared name with a different body is the
 `named-type-conflict` error, because a named type has one body everywhere.
 
 ## Reading a key off a wire
@@ -142,9 +183,10 @@ conversion exists at all.
 If an ordinary arrow is refused and a cast would work, the `type-mismatch`
 message says so and tells you to wire it through a `Cast`.
 
-At run time the check names the exact path that was wrong, like
-`messages[2].role: expected String, got Number`, rather than failing with a
-shrug.
+At run time, a value that does not convert fails the node naming the field
+that was wrong: `cannot cast the value into Verdict: not a valid Verdict:
+field "score": "high" is not a number`. If you want to handle that instead of
+failing the run, wire the `Cast`'s `_error`.
 
 ## What an unwired port starts as
 

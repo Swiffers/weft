@@ -1191,15 +1191,16 @@ export interface Failure {
   error: string;
 }
 
-/// Why a run was cancelled: a person, a sibling run's
-/// `ctx.stop_tagged` (naming the run and the tag), the live caller
+/// Why a run was cancelled: a person, a sibling run (naming it, and the
+/// tag when it was `ctx.stop_tagged`; none when it took the run's
+/// triggers down), the live caller
 /// dropping, the runtime itself, or a time limit running out. Rides the `run_cancelled`
 /// event beside its text `reason`; absent only on a journal row written
 /// before the field existed.
 // SYNC: CancelCause <-> crates/weft-core/src/run/cancel.rs CancelCause
 export type CancelCause =
   | { kind: 'user' }
-  | { kind: 'run'; by: string; tag: string }
+  | { kind: 'run'; by: string; tag?: string }
   | { kind: 'caller_gone' }
   | { kind: 'runtime'; detail: string }
   | { kind: 'limit'; detail: string };
@@ -1840,10 +1841,19 @@ export type CallerInspectorEvent =
       lastOffset: number;
       messages: WindowedCallerMessage[];
       totals: Array<{ direction: CallerDirection; count: number; bytes: number }>;
+      /// Offsets of the program's messages the caller never received
+      /// (it read too slowly and the trigger's `whenCallerIsSlow` let
+      /// them go), possibly messages of an earlier window. Absent when
+      /// none.
+      dropped?: number[];
       atUnix: number;
     }
   | { kind: 'errored'; offset: number; message: string; atUnix: number }
-  | { kind: 'disconnected'; offset: number; reason: string; atUnix: number };
+  // SYNC: CallerInspectorEvent 'disconnected' <-> crates/weft-journal/src/events.rs CallerDisconnected, crates/weft-core/src/live_event.rs CallerDisconnected, extension-vscode/src/runFollower.ts DispatcherEvent 'caller_disconnected'
+  /// `dropped`: offsets of the program's messages still waiting to go
+  /// out when the exchange ended (`reason` says how), which the caller
+  /// never received. Absent when none.
+  | { kind: 'disconnected'; offset: number; reason: string; dropped?: number[]; atUnix: number };
 
 /// Per-bus metadata derived dispatcher-side from the bus marker JSON
 /// (`{"__weft_bus__": {"id":..., "mode":"journaled"|"ephemeral"}}`).

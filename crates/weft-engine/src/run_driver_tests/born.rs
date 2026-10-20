@@ -417,3 +417,37 @@
         // rest.
         assert_eq!(journal.batches.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
+
+    /// A live conversation keeps the journal window its trigger was set
+    /// up with: two messages a few short windows apart land in rows of
+    /// their own, where the default one-second window would have put them
+    /// in one row.
+    #[tokio::test(start_paused = true)]
+    async fn a_conversation_keeps_the_journal_window_it_was_set_up_with() {
+        use crate::caller_conn::CallerJournalSink;
+        use weft_core::stream_journal::{JournalPolicy, DEFAULT_JOURNAL_WINDOW, MIN_JOURNAL_WINDOW};
+        let rows_of = |window: std::time::Duration| async move {
+            let run_id = weft_core::new_run_id();
+            let journal = std::sync::Arc::new(MemJournal::default());
+            let clients = clients_writing(journal.clone(), Default::default());
+            let run = handle(&clients, run_id, &[], 0, Default::default());
+            let sink = crate::worker::ExchangeJournal::new(run, "instance-test".into(), JournalPolicy { window, ..Default::default() });
+            let said = |n: u64| weft_core::caller::InboundMessage::Json(json!(n));
+            sink.inbound(run_id, 1, &said(1));
+            tokio::time::sleep(MIN_JOURNAL_WINDOW * 3).await;
+            sink.inbound(run_id, 2, &said(2));
+            sink.disconnected(run_id, 3, "done", &[]);
+            clients.writer.written().await;
+            let rows: Vec<usize> = journal
+                .events_of(run_id)
+                .iter()
+                .filter_map(|e| match e {
+                    weft_journal::RunEvent::CallerWindow { messages, .. } => Some(messages.len()),
+                    _ => None,
+                })
+                .collect();
+            rows
+        };
+        assert_eq!(rows_of(MIN_JOURNAL_WINDOW).await, [1, 1], "a short window, a row each");
+        assert_eq!(rows_of(DEFAULT_JOURNAL_WINDOW).await, [2], "the default, one row for both");
+    }

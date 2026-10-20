@@ -66,7 +66,7 @@ pub async fn stop_tagged(
         stopping = targets.len(),
         "stop_tagged"
     );
-    let cause = CancelCause::Run { by, tag: tag.to_string() };
+    let cause = CancelCause::Run { by, tag: Some(tag.to_string()) };
     let targets: Vec<(weft_core::RunId, &CancelCause)> = targets.iter().map(|c| (*c, &cause)).collect();
     crate::api::run::cancel_run_ids(state, &targets).await
 }

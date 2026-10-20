@@ -15,13 +15,19 @@
 //!    empty.
 //! 2. Otherwise it decides from what cargo produced: a candidate
 //!    (`isolate.json`: one per package crate) is kept when cargo reported
-//!    its library artifact, and left out when it did not, whatever the
-//!    cause (its code, its build script failing to compile or crashing
-//!    when it runs, a dependency or build-dependency failing). Each one
-//!    left out carries the first error cargo printed about it or about the
-//!    dependency that took it down (`cargo metadata` says which crates
-//!    each package depends on), and the record of them is written to
-//!    `left-out.json`, which the worker's registry embeds.
+//!    its library artifact. One cargo built nothing for is left out only
+//!    when an error cargo printed traces to it: a compile error in it or in
+//!    a crate it depends on (`cargo metadata` says which), or a build
+//!    script of one of those failing when it ran. It carries the first
+//!    such error, and the record of them is written to `left-out.json`,
+//!    which the worker's registry embeds.
+//!
+//!    A candidate cargo built nothing for, with no error tracing to it,
+//!    fails the whole build instead: cargo stopped for a reason outside
+//!    the package (the registry or the network unreachable, the machine
+//!    out of disk or memory), and leaving it out would bake that outage
+//!    into an image every later build with the same sources reuses. A
+//!    failed build produces no image, so the next one tries again.
 //! 3. It builds the worker again with only the kept packages' features.
 //!
 //! Every JSON message cargo writes in either build is appended to the
@@ -140,10 +146,6 @@ struct Decision {
     healthy: Vec<String>,
 }
 
-/// The line a package carries when cargo printed no error about it or a
-/// crate it depends on.
-const NO_ERROR_LINE: &str = "did not build, see the log";
-
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -201,11 +203,7 @@ fn run() -> Result<ExitCode, String> {
 
     let graph = crate_graph()?;
     let decision = match decide(&candidates.packages, &report, &graph) {
-        Ok(decision) if !decision.left_out.is_empty() => decision,
-        Ok(_) => {
-            eprintln!("weft: the worker did not compile, and none of its node packages is the cause (the errors are above)");
-            return Ok(ExitCode::FAILURE);
-        }
+        Ok(decision) => decision,
         Err(why) => {
             eprintln!("weft: {why}");
             return Ok(ExitCode::FAILURE);
@@ -440,11 +438,12 @@ fn failures(report: &BuildReport, graph: &CrateGraph) -> Vec<(String, String)> {
 }
 
 /// Kept: every candidate cargo produced a library for. Left out: every
-/// other one, whatever the cause, carrying the first failure in itself or
-/// in a crate it depends on ([`NO_ERROR_LINE`] when cargo printed none).
-/// A failure in the worker crate or in a crate it reaches other than
-/// through a candidate (the engine) is one leaving packages out cannot
-/// fix: the answer is an error naming it, and the build fails.
+/// other one a failure traces to, carrying the first failure in itself or
+/// in a crate it depends on. The answer is an error, and the build fails,
+/// when leaving packages out cannot fix the build: a failure in the worker
+/// crate or in a crate it reaches other than through a candidate (the
+/// engine), a candidate cargo built nothing for with no failure tracing to
+/// it ([`nothing_traced`]), or nothing to leave out at all.
 fn decide(candidates: &[Candidate], report: &BuildReport, graph: &CrateGraph) -> Result<Decision, String> {
     let failures = failures(report, graph);
     let ids: Vec<Option<&str>> = candidates
@@ -457,20 +456,42 @@ fn decide(candidates: &[Candidate], report: &BuildReport, graph: &CrateGraph) ->
         return Err(format!("the worker did not compile, and none of its node packages is the cause: {line}"));
     }
     let mut decision = Decision { left_out: Vec::new(), healthy: Vec::new() };
+    let mut untraced = Vec::new();
     for (candidate, id) in candidates.iter().zip(&ids) {
         if report.libraries.iter().any(|built| names_crate(built, &candidate.crate_dir)) {
             decision.healthy.push(candidate.feature.clone());
             continue;
         }
         let reached = id.map(|id| graph.reach(id, &BTreeSet::new())).unwrap_or_default();
-        let error = failures
-            .iter()
-            .find(|(failed, _)| reached.contains(failed))
-            .map(|(_, line)| line.clone())
-            .unwrap_or_else(|| NO_ERROR_LINE.to_string());
-        decision.left_out.push(LeftOutPackage { package: candidate.package.clone(), node_types: candidate.node_types.clone(), error });
+        match failures.iter().find(|(failed, _)| reached.contains(failed)) {
+            Some((_, line)) => decision.left_out.push(LeftOutPackage {
+                package: candidate.package.clone(),
+                node_types: candidate.node_types.clone(),
+                error: line.clone(),
+            }),
+            None => untraced.push(candidate.package.as_str()),
+        }
+    }
+    if !untraced.is_empty() || decision.left_out.is_empty() {
+        return Err(nothing_traced(&untraced));
     }
     Ok(decision)
+}
+
+/// Why a build fails when cargo stopped and no error it printed traces to
+/// a package: `unbuilt` are the packages it built nothing for.
+fn nothing_traced(unbuilt: &[&str]) -> String {
+    let which = match unbuilt {
+        [] => String::new(),
+        [one] => format!(" (it built nothing for the package {one})"),
+        many => format!(" (it built nothing for the packages {})", many.join(", ")),
+    };
+    format!(
+        "cargo stopped before printing an error that traces to any node package{which}, so no package is left out and the \
+         build fails. This is usually something outside the project's code, like crates.io or the network being unreachable, \
+         or the build machine running out of disk or memory: cargo's own output above, in the build log, says which. Once \
+         that is over, build again: a failed build leaves no image behind, so the next one tries every package again."
+    )
 }
 
 /// The record as JSON within `limit` bytes: every error is cut shorter
@@ -690,12 +711,34 @@ not a message
     }
 
     /// A package cargo built no library for, with no error anywhere it
-    /// reaches, is still left out: the record says to read the log.
+    /// reaches (crates.io down, the network gone mid-build), is never left
+    /// out: the build fails naming it and saying to build again, so no
+    /// image keeps the outage. The same holds when cargo built nothing at
+    /// all, and when another package beside it is left out for a real
+    /// error.
     #[test]
-    fn a_package_that_did_not_build_for_no_printed_reason_is_left_out() {
-        let decision = decide(&two_packages(), &read(&library(BASIC)).0, &graph()).unwrap();
-        assert_eq!(decision.left_out.len(), 1);
-        assert_eq!(decision.left_out[0].error, NO_ERROR_LINE);
+    fn a_package_that_did_not_build_for_no_printed_reason_fails_the_build() {
+        let err = decide(&two_packages(), &read(&library(BASIC)).0, &graph()).unwrap_err();
+        assert!(err.contains("before printing an error that traces to any node package (it built nothing for the package media)"), "{err}");
+        assert!(err.contains("build again"), "{err}");
+
+        let err = decide(&two_packages(), &BuildReport::default(), &graph()).unwrap_err();
+        assert!(err.contains("the packages basic, media"), "{err}");
+
+        let mut graph = graph();
+        graph.deps.get_mut(MEDIA).unwrap().retain(|dep| dep != IMAGE);
+        graph.deps.get_mut(BASIC).unwrap().push(IMAGE.into());
+        let err = decide(&two_packages(), &read(&error(IMAGE, "error: boom")).0, &graph).unwrap_err();
+        assert!(err.contains("the package media)"), "{err}");
+    }
+
+    /// Cargo failed but built every package and printed no error: there is
+    /// nothing to leave out, and the build fails the same way.
+    #[test]
+    fn a_failed_build_that_built_every_package_fails() {
+        let stream = [library(BASIC), library(MEDIA)].join("\n");
+        let err = decide(&two_packages(), &read(&stream).0, &graph()).unwrap_err();
+        assert!(err.contains("traces to any node package, so no package is left out"), "{err}");
     }
 
     /// A library only packages share failing takes all of them out.

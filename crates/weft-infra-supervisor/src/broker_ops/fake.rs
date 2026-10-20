@@ -178,6 +178,14 @@ struct Inner {
     /// last wrote it.
     health_state: HashMap<uuid::Uuid, Vec<HealthRuleState>>,
 
+    /// How each health command `enqueue_lifecycle` queued ended: every one
+    /// succeeds as it is queued, unless `health_commands_run_on`.
+    health_endings: HashMap<i64, weft_broker_client::protocol::HealthCommandEnding>,
+
+    /// The health commands `enqueue_lifecycle` queues keep running until a
+    /// test ends them (`end_health_command`).
+    health_commands_run_on: bool,
+
     /// Every issued lifecycle command, oldest first; tests push via
     /// `enqueue_command`. A command stays here after it is claimed, as
     /// the broker's row does: `completed_commands` is what retires it.
@@ -713,6 +721,18 @@ impl FakeBroker {
         self.inner.lock().hang_enqueues = true;
     }
 
+    /// Keep every health command queued from now on running, until
+    /// `end_health_command` ends it.
+    pub fn keep_health_commands_running(&self) {
+        self.inner.lock().health_commands_run_on = true;
+    }
+
+    /// End health command `command` with `outcome` (and its `message`).
+    pub fn end_health_command(&self, command: i64, outcome: weft_broker_client::protocol::LifecycleOutcome, message: Option<&str>) {
+        let ending = weft_broker_client::protocol::HealthCommandEnding { command, outcome, message: message.map(str::to_string) };
+        self.inner.lock().health_endings.insert(command, ending);
+    }
+
     /// What `set_health_state` last wrote for the project.
     pub fn health_state_rows(&self, project_id: uuid::Uuid) -> Vec<HealthRuleState> {
         self.inner.lock().health_state.get(&project_id).cloned().unwrap_or_default()
@@ -887,10 +907,17 @@ impl BrokerSupervisorOps for FakeBroker {
             .collect())
     }
 
-    async fn health_state(&self, project_id: uuid::Uuid) -> Result<Vec<HealthRuleState>> {
+    async fn health_state(&self, project_id: uuid::Uuid) -> Result<weft_broker_client::protocol::SupervisorHealthStateResponse> {
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::HealthState { project_id });
-        Ok(inner.health_state.get(&project_id).cloned().unwrap_or_default())
+        let rules = inner.health_state.get(&project_id).cloned().unwrap_or_default();
+        let mut ended: Vec<weft_broker_client::protocol::HealthCommandEnding> = rules
+            .iter()
+            .filter_map(|r| r.queued.and_then(|q| inner.health_endings.get(&q.command).cloned()))
+            .collect();
+        ended.sort_by_key(|e| e.command);
+        ended.dedup();
+        Ok(weft_broker_client::protocol::SupervisorHealthStateResponse { rules, ended })
     }
 
     async fn set_health_state(
@@ -1334,6 +1361,14 @@ impl BrokerSupervisorOps for FakeBroker {
                 project_id,
                 spec,
             });
+            if !inner.health_commands_run_on {
+                let ending = weft_broker_client::protocol::HealthCommandEnding {
+                    command: id,
+                    outcome: weft_broker_client::protocol::LifecycleOutcome::Succeeded,
+                    message: None,
+                };
+                inner.health_endings.insert(id, ending);
+            }
             (id, inner.hang_enqueues)
         };
         if hang {

@@ -1616,8 +1616,11 @@ pub(crate) struct Desired {
     /// way is current.
     pub full_binary: Option<String>,
     pub definition: Option<String>,
-    /// Each trigger's cut fingerprint, by address.
-    pub trigger_cuts: std::collections::BTreeMap<String, String>,
+    /// Each trigger's cut fingerprint, by address: `None` for a trigger
+    /// the program has whose cut cannot be walked (it needs a part that
+    /// does not compile), which no trigger on was set up from, so one on
+    /// is behind and bringing it up is refused, saying why.
+    pub trigger_cuts: std::collections::BTreeMap<String, Option<String>>,
     /// Each infra place's hash, by place; empty when neither the caller nor
     /// the registered build named them.
     pub infra_places: std::collections::BTreeMap<String, String>,
@@ -1636,7 +1639,10 @@ impl Desired {
             binary: binary_hash.map(str::to_string),
             full_binary: None,
             definition: definition_hash.map(str::to_string),
-            trigger_cuts: weft_core::run_spec::trigger_fingerprints(project),
+            trigger_cuts: weft_core::run_spec::trigger_cuts(project)
+                .into_iter()
+                .map(|(trigger, cut)| (trigger, cut.ok().map(|cut| cut.fingerprint)))
+                .collect(),
             infra_places: match definition_hash {
                 Some(hash) => state
                     .projects
@@ -1665,23 +1671,24 @@ impl Desired {
             binary: query.desired_binary_hash.clone().or(registered.binary),
             full_binary: query.desired_full_binary_hash.clone(),
             definition: query.desired_definition_hash.clone().or(registered.definition),
-            trigger_cuts: Self::named_over(registered.trigger_cuts, query.desired_trigger_cuts.as_deref(), "desiredTriggerCuts")?,
-            infra_places: Self::named_over(registered.infra_places, query.desired_infra_places.as_deref(), "desiredInfraPlaces")?,
+            trigger_cuts: Self::named_over(registered.trigger_cuts, query.desired_trigger_cuts.as_deref(), "desiredTriggerCuts", Some)?,
+            infra_places: Self::named_over(registered.infra_places, query.desired_infra_places.as_deref(), "desiredInfraPlaces", |hash| hash)?,
         })
     }
 
     /// The registered build's hashes by name, each the query named
-    /// (`encoded`, the `what` parameter) put in its place: one the client
-    /// left out is the registered one.
-    fn named_over(
-        registered: std::collections::BTreeMap<String, String>,
+    /// (`encoded`, the `what` parameter, each hash read by `read`) put in
+    /// its place: one the client left out is the registered one.
+    fn named_over<T>(
+        registered: std::collections::BTreeMap<String, T>,
         encoded: Option<&str>,
         what: &str,
-    ) -> Result<std::collections::BTreeMap<String, String>, (StatusCode, String)> {
+        read: impl Fn(String) -> T,
+    ) -> Result<std::collections::BTreeMap<String, T>, (StatusCode, String)> {
         let mut merged = registered;
         if let Some(encoded) = encoded {
             let named = weft_core::projects::NamedHashes::decode(encoded).map_err(|e| (StatusCode::BAD_REQUEST, format!("{what}: {e}")))?;
-            merged.extend(named.0);
+            merged.extend(named.0.into_iter().map(|(name, hash)| (name, read(hash))));
         }
         Ok(merged)
     }
@@ -1695,8 +1702,9 @@ impl Desired {
     }
 
     /// Whether the activation is on and behind: its cut changed since it
-    /// was set up, or the code it fires did. One set up before cuts were
-    /// recorded reads as behind, so a resync records its cut.
+    /// was set up (or can no longer be walked), or the code it fires did.
+    /// One set up before cuts were recorded reads as behind, so a resync
+    /// records its cut.
     pub(crate) fn behind(&self, activation: &crate::activation_store::Activation) -> bool {
         if activation.lifecycle.status != crate::activation_store::ProjectStatus::Active {
             return false;
@@ -1704,7 +1712,10 @@ impl Desired {
         let cut_moved = match self.trigger_cuts.get(&activation.key.trigger) {
             // The program has it no more: nothing to bring it up to.
             None => false,
-            Some(want) => activation.cut.as_ref().map(|cut| &cut.fingerprint) != Some(want),
+            // Its cut cannot be walked: it is not what the trigger was set
+            // up from, and the resync's refusal names the part it needs.
+            Some(None) => true,
+            Some(Some(want)) => activation.cut.as_ref().map(|cut| &cut.fingerprint) != Some(want),
         };
         let code_moved = activation.program.as_ref().is_some_and(|fired| self.binary_drifts(Some(fired.binary_hash.as_str())));
         cut_moved || code_moved
@@ -5705,12 +5716,12 @@ mod behind_tests {
     fn the_queried_hashes_go_over_the_registered_ones() {
         let registered: std::collections::BTreeMap<String, String> =
             [("door".to_string(), "r1".to_string()), ("feed".to_string(), "r2".to_string())].into();
-        let merged = Desired::named_over(registered.clone(), Some("feed:q2,inbox:q3"), "desiredTriggerCuts").unwrap();
+        let merged = Desired::named_over(registered.clone(), Some("feed:q2,inbox:q3"), "desiredTriggerCuts", |hash| hash).unwrap();
         let want: std::collections::BTreeMap<String, String> =
             [("door", "r1"), ("feed", "q2"), ("inbox", "q3")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         assert_eq!(merged, want);
-        assert_eq!(Desired::named_over(registered.clone(), None, "desiredTriggerCuts").unwrap(), registered);
-        let (status, message) = Desired::named_over(registered, Some("feed"), "desiredTriggerCuts").unwrap_err();
+        assert_eq!(Desired::named_over(registered.clone(), None, "desiredTriggerCuts", |hash| hash).unwrap(), registered);
+        let (status, message) = Desired::named_over(registered, Some("feed"), "desiredTriggerCuts", |hash| hash).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.starts_with("desiredTriggerCuts"), "{message}");
     }
@@ -5724,7 +5735,7 @@ mod behind_tests {
             binary: Some("new-code".into()),
             full_binary: Some("full-code".into()),
             definition: Some("graph".into()),
-            trigger_cuts: [("door".to_string(), "cut-2".to_string())].into(),
+            trigger_cuts: [("door".to_string(), Some("cut-2".to_string())), ("broken".to_string(), None)].into(),
             infra_places: [("db".to_string(), "db-2".to_string())].into(),
         }
     }
@@ -5755,6 +5766,16 @@ mod behind_tests {
         assert!(d.behind(&activation(Some("cut-1"), Some("new-code"))));
         assert!(d.behind(&activation(Some("cut-2"), Some("old-code"))));
         assert!(d.behind(&activation(None, Some("new-code"))));
+    }
+
+    /// A trigger the program still has, whose cut can no longer be walked
+    /// (it needs a part that does not compile), is behind: never read as
+    /// gone, so a resync takes it up and refuses naming the part.
+    #[test]
+    fn a_trigger_whose_cut_cannot_be_walked_is_behind() {
+        let mut broken = activation(Some("cut-2"), Some("new-code"));
+        broken.key = ActivationKey::new("broken", Owner::Shared);
+        assert!(desired().behind(&broken));
     }
 
     /// Only a trigger that is on can be behind; one the program no longer
@@ -5978,7 +5999,7 @@ mod trigger_entries_tests {
             binary: None,
             full_binary: None,
             definition: None,
-            trigger_cuts: cuts.iter().map(|(t, c)| (t.to_string(), c.to_string())).collect(),
+            trigger_cuts: cuts.iter().map(|(t, c)| (t.to_string(), Some(c.to_string()))).collect(),
             infra_places: Default::default(),
         }
     }

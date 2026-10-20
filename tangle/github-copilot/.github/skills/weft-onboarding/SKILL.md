@@ -52,9 +52,10 @@ screen, never a lecture about what is not.
 | the small amber arrow top-left of a box | the on/off switch: filled means something said "run this", hollow means nothing did |
 | a big box holding smaller boxes | a group: nodes bundled into one named box, collapsible like a folder |
 | a violet box with a rotate icon | a loop: the same nodes run once per item of a list |
-| the white bar at the bottom of the canvas | the action bar: Run in the middle, infra on the left, triggers on the right |
-| a trigger | what starts the program on its own (a message arriving, a schedule, a form); the action bar grows an Activate button when one is in the program |
-| a node with a status pill | infra: the program's own long-running service (its own Postgres, the WhatsApp bridge) that stays up between runs |
+| the small bar that appears once boxes are selected | what you can do with them: Run, and for a trigger or a service Turn on, Turn off, Start, Stop |
+| the white bar at the bottom of the canvas | what is happening right now: the run being followed, or a command at work |
+| a trigger | what starts the program on its own (a message arriving, a schedule, a form); its pill says whether it is on |
+| a node whose pill reads `running`, `stopped` or `starting...` | infra: the program's own long-running service (its own Postgres, the WhatsApp bridge) that stays up between runs |
 | a node with "Connect ..." | an access node: where an account gets attached; the credential lives outside the code |
 | the run list in the sidebar | runs: every run of this program, node by node with their values (a trigger with `recorded` off shows only the runs that failed or reported a cost) |
 | a cyan box mid-run | waiting: the run paused for a person or an event and costs nothing while it waits |
@@ -74,8 +75,10 @@ project has the thing to show, or they ask.
    arrows carry results, colors carry types, the small amber arrow top-left
    is the on/off switch. The label on a box is its name; the small text is
    its type.
-3. **Run it once.** The "Run Project" button (or Ctrl+Enter). Boxes glow
-   amber as they work, green as they land. Click one: the inspector shows
+3. **Run it once.** Select the boxes to run (Ctrl+A for all of them) and
+   press "Run (2)" (the number is how many are selected) on the bar that
+   appears, or Ctrl+Enter. Boxes glow amber as
+   they work, green as they land. Click one: the inspector shows
    what went in and what came out. The value is always one click away.
 4. **Three things that are alive, on three clocks.** This is the one
    piece of weft that catches everybody, so say it before they meet it the
@@ -104,14 +107,15 @@ project has the thing to show, or they ask.
    palette and arrives with the wire already drawn. Double-click a name to
    rename. The header arrow opens a box's fields. Scrolling moves the
    canvas and does not zoom; zoom is the buttons at the bottom left.
-7. **Aim a run.** Right-click a node, "Set as target": the Run button
-   becomes "Run 1 target" and only that node's branch runs.
+7. **Aim a run.** Select one box and press "Run (1)": only that box and
+   what it needs run. Right-click a box for "Run from here...", which
+   starts the run at that box with the inputs they type in.
 8. **Groups and loops.** Collapse a group: the wiring outside it does not
    change. Open it again with its expand button. Groups nest. A loop runs its inside
    once per item; its iteration number is on its rail.
 9. **When something starts on its own.** If the project has a trigger:
-   "Activate" in the action bar turns it on, and the trigger's own body
-   shows its live feed. Tell them what activating actually does, because
+   select it and press "Turn on", and the trigger's own body shows its live
+   feed. Tell them what turning it on actually does, because
    it explains the two rules that follow: it reaches out and registers
    with the other side, so a Slack trigger subscribes with Slack right
    then, and it fails loudly there rather than leaving a dead trigger.
@@ -121,13 +125,14 @@ project has the thing to show, or they ask.
    still building, `weft bake` prepares a trigger without switching the
    listening on. A run started by a trigger only walks that trigger's
    path.
-10. **The program's own services.** If the project has infra: "Start
-    Infra" in the action bar, the status pill on the node, and, on
-    right-click, "Stop" versus "Terminate". Be exact about those two,
-    because one of them loses data: stop keeps the disk, terminate deletes
-    it. The amber "Upgrade Infra" appears when they changed a service's
-    settings after starting it, and it leaves the listening switched off
-    afterwards so they choose when the new version takes real traffic.
+10. **The program's own services.** If the project has infra: select its
+    node and press "Start", and watch the pill on the node. Then show them
+    Stop and Terminate, and be exact about the difference, because one of
+    them loses data: stop keeps the disk, terminate deletes it. The pill
+    reads `behind` when they changed a service's settings after starting
+    it, and "Upgrade" brings it up to date. While a service is stopped or
+    being upgraded, the triggers that use it are down, and they come back
+    on by themselves once it runs again.
 11. **Attaching an account.** Any "Connect <Service>..." button: the
     doors, the identity chip after, and the fact that no credential ever
     lands in the code. Connect what they did before installing to what

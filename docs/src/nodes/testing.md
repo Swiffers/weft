@@ -176,7 +176,7 @@ Looking at what happened:
 | Signature | What it does |
 |---|---|
 | `access(&self, service: &str) -> Value` | The test's connection marker. The service must be the one the test declared |
-| `fixture(&self, name: &str) -> WeftResult<String>` | A `--fixture` value, or a failure naming the variable to set |
+| `fixture(&self, name: &str) -> WeftResult<String>` | The value of `WEFT_NODE_TEST_<name>`, or a failure naming the variable to set |
 | `store_file(&self, filename: &str, mime_type: &str, bytes: impl Into<Vec<u8>>) -> WeftResult<Value>` (async) | Stores a real file and gives its value |
 | `connect(&self) -> WeftResult<OpenedConnection>` (async) | Opens the test's connection, for setup and cleanup calls of your own around the node |
 | `bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)>` | A real bus you write into, and its marker |
@@ -240,9 +240,13 @@ afterwards.
 Every prompt happens before any credential exists and before any signal handler
 is armed, so Ctrl+C at a prompt leaks nothing.
 
-`--fixture` values, declared with `.with_fixture(...)` on a live test, are how
-a test names the real thing it needs: a channel it may post in, an account it
-may read. Read them with `rig.fixture("NAME")`.
+If a live test needs a real thing to act on (a chat it may post in, an
+account it may read), declare it as a fixture:
+`.with_fixture(fixture_spec("CHAT_ID", "Chat", "a chat the bot may post in"))`,
+which is a name, a label and a description. Set `WEFT_NODE_TEST_CHAT_ID` in
+the shell you run `weft test-node` from, and the test reads it with
+`rig.fixture("CHAT_ID")`. If any fixture is missing, the runner lists every
+variable to set, with its label, before it runs anything.
 
 If your node waits on a signal (`ctx.await_signal`), a live test waits for the
 real answer, held in the node's call the way it is in

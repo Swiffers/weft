@@ -60,6 +60,19 @@ pub fn ws_caller(
     conn
 }
 
+/// A connected fake caller of `protocol` speaking `data_type` whose
+/// trigger skips a chunk it cannot make (`whenChunkFails: drop_chunk`).
+pub fn caller_skipping_unmade_chunks(protocol: Protocol, data_type: DataType) -> Arc<FakeCallerConnection> {
+    let conn = FakeCallerConnection::connected(CallerRuntimeConfig {
+        error_mode: ErrorMode::DropChunk,
+        ..config(protocol, data_type)
+    });
+    if protocol == Protocol::Http {
+        conn.set_http_body(InboundMessage::Json(serde_json::Value::Null));
+    }
+    conn
+}
+
 /// A representative opening request: a POST on `chat/{room}` with a
 /// capture, a query parameter, a header and a gate identity.
 pub fn request() -> LiveRequest {

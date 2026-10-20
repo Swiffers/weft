@@ -373,7 +373,14 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_co
     if locked.project_id != worker.project {
         return Ok(false);
     }
+    // A run asked to stop while it was driven is queued whatever it was
+    // let go for: its wake signals went with the cancel, so parked it
+    // would wait for good with the ask unread. The worker that claims it
+    // next reads the cancel with its claim and writes its ending. This is
+    // the cancel that landed after the drive decided to park and before
+    // it let go, so its flag fired on a drive that was already over.
     let to = match why {
+        _ if locked.cancel_requested.is_some() => "queued",
         LetGo::Parked => "parked",
         LetGo::HandedBack => "queued",
     };
@@ -394,13 +401,13 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_co
     // before it let go, goes on its record now, and the run is queued to
     // carry on with it.
     let resolved = weft_journal::record::resolve_handed_in(&mut tx, run_id, &locked, worker.replica).await?;
-    match why {
-        LetGo::HandedBack if !resolved => weft_journal::record::notify_queued_in(&mut tx, worker.project).await?,
+    match to {
+        _ if resolved => {}
+        "queued" => weft_journal::record::notify_queued_in(&mut tx, worker.project).await?,
         // Parked for good, not queued again at once with an answer it was
         // handed: whoever follows the run hears that it now waits (`weft
         // wait --waiting-for-input`), which no record row would tell them.
-        LetGo::Parked if !resolved => notify_parked_in(&mut tx, worker.project, run_id).await?,
-        LetGo::HandedBack | LetGo::Parked => {}
+        _ => notify_parked_in(&mut tx, worker.project, run_id).await?,
     }
     tx.commit().await?;
     weft_task_store::announce::committed(pool);

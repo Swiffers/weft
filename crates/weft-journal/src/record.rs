@@ -660,6 +660,11 @@ pub struct Locked {
     /// only a queued run carries (`run.waited_on_workers`): read when it
     /// leaves the queue, never for whether it still waits on them now.
     pub waited_on_workers: bool,
+    /// Why it was asked to stop while a worker drove it
+    /// (`run.cancel_requested`): the worker that drives it ends it for
+    /// this, and whoever lets go of it must not leave it waiting with the
+    /// ask unread.
+    pub cancel_requested: Option<sqlx::types::Json<CancelCause>>,
 }
 
 /// Lock `run_id`'s row on the caller's transaction (`FOR UPDATE`),
@@ -667,8 +672,8 @@ pub struct Locked {
 /// owner goes through.
 pub async fn lock_in(conn: &mut PgConnection, run_id: RunId) -> anyhow::Result<Option<Locked>> {
     Ok(sqlx::query_as(
-        "SELECT project_id, tenant_id, state, keeping, owner, last_seq, epoch, keep_for, definition_hash, waited_on_workers \
-         FROM run WHERE run_id = $1 FOR UPDATE",
+        "SELECT project_id, tenant_id, state, keeping, owner, last_seq, epoch, keep_for, definition_hash, waited_on_workers, \
+         cancel_requested FROM run WHERE run_id = $1 FOR UPDATE",
     )
     .bind(run_id)
     .fetch_optional(&mut *conn)

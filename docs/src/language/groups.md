@@ -123,7 +123,11 @@ whole subgraph.
 
 ```weft
 brief = Group(request: String) -> (prompt: String) {
-  ...
+  write = Format(request: String) {
+    template: "Draw this: {{request}}"
+    request: self.request
+  }
+  self.prompt = write.text
 }
 brief.request = ask.text
 brief._should_flow = credit.paid

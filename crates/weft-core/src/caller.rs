@@ -358,7 +358,7 @@ impl CallerRuntimeConfig {
             max_session_secs: cfg.max_session_secs,
             outlives_caller: cfg.outlives_caller,
             inbound_window: cfg.window.unwrap_or(DEFAULT_INBOUND_WINDOW),
-            journal: cfg.journal_policy(),
+            journal: cfg.journal,
         }
     }
 }
@@ -679,6 +679,12 @@ pub trait CallerConnection: Send + Sync {
     /// where its owner reads it. Terminal; first terminal wins.
     async fn fail(&self, message: &str) -> Result<(), CallerError>;
 
+    /// A chunk a node could not make was skipped (the trigger's
+    /// `whenChunkFails` is `drop_chunk`, see [`ErrorMode`]): `why` goes
+    /// on the exchange's record and the exchange goes on. Not a terminal
+    /// and nothing toward the wire.
+    fn chunk_dropped(&self, why: &str);
+
     /// WebSocket only: await the next inbound message at `cursor` (the
     /// reader's next absolute offset to read over the windowed inbound log),
     /// advancing it on success. Inbound is BROADCAST: every reader has its
@@ -824,6 +830,36 @@ impl CallerHandle {
     }
 }
 
+/// What the exchange's record says before why, when a chunk a node could
+/// not make was skipped ([`CallerConnection::chunk_dropped`]), so a
+/// skipped chunk reads as a skip and never as the exchange failing.
+pub const CHUNK_DROPPED: &str = "a chunk was dropped and the exchange went on (whenChunkFails is drop_chunk)";
+
+/// What a node does with a chunk it tried to make, per the trigger's
+/// `whenChunkFails` ([`ErrorMode`]): a made chunk comes back to send; a
+/// failure comes back as the error under `surface`, for the node to
+/// return (which fails the exchange the way any node failure does), and
+/// is skipped under `drop_chunk`, on the exchange's record, with `None`
+/// telling the node to go on with the next one.
+///
+/// Only an outcome of the work is ever skipped, the same failures a
+/// program may catch on `_error` ([`crate::context::catchable_message`]):
+/// a cancel, a suspension or a mistake in the program's own shape always
+/// comes back, in every mode.
+fn drop_or_fail<T>(conn: &Arc<dyn CallerConnection>, made: WeftResult<T>) -> WeftResult<Option<T>> {
+    match made {
+        Ok(chunk) => Ok(Some(chunk)),
+        Err(e) if conn.config().error_mode == ErrorMode::DropChunk => match crate::context::catchable_message(&e) {
+            Some(why) => {
+                conn.chunk_dropped(&why);
+                Ok(None)
+            }
+            None => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 /// HTTP talk surface. No `receive`: an HTTP connection has no
 /// independent inbound stream (the request body is read once via
 /// [`Self::request_parts`]).
@@ -871,6 +907,17 @@ impl HttpCaller {
     /// FIRST outbound item; after that it fails with `HeadAlreadySent`.
     pub async fn write_with(&self, head: ResponseHead, chunk: OutboundChunk) -> WeftResult<()> {
         self.conn.send_chunk(Some(head), chunk).await.map_err(Into::into)
+    }
+
+    /// A chunk this node tried to make for the stream, through the
+    /// trigger's `whenChunkFails`: `Ok(Some(chunk))` to write,
+    /// `Ok(None)` when making it failed and the route skips such a chunk
+    /// (on the exchange's record; go on with the next one), and the
+    /// failure itself when the route tells its caller, for the node to
+    /// return. For a streamed piece only: a one-shot answer is the whole
+    /// answer, and a failure to make it is the node's failure.
+    pub fn drop_or_fail<T>(&self, made: WeftResult<T>) -> WeftResult<Option<T>> {
+        drop_or_fail(&self.conn, made)
     }
 
     /// One-shot response: a final body with no prior streaming, under
@@ -945,6 +992,15 @@ impl WsCaller {
     /// Send a message (non-terminal). Concurrent sends interleave.
     pub async fn send(&self, msg: OutboundChunk) -> WeftResult<()> {
         self.conn.send_chunk(None, msg).await.map_err(Into::into)
+    }
+
+    /// A message this node tried to make, through the trigger's
+    /// `whenChunkFails`: `Ok(Some(msg))` to send, `Ok(None)` when making
+    /// it failed and the socket skips such a message (on the exchange's
+    /// record; the session goes on), and the failure itself when the
+    /// socket tells its caller, for the node to return.
+    pub fn drop_or_fail<T>(&self, made: WeftResult<T>) -> WeftResult<Option<T>> {
+        drop_or_fail(&self.conn, made)
     }
 
     /// Await the next inbound message on this handle's built-in cursor
@@ -1129,6 +1185,7 @@ pub enum CallerCall {
     Request(OutboundChunk),
     HttpRequest,
     Fail { message: String },
+    ChunkDropped { why: String },
 }
 
 /// Hand-rolled fake `CallerConnection` for contract tests. Records every
@@ -1347,6 +1404,10 @@ impl CallerConnection for FakeCallerConnection {
         Ok(())
     }
 
+    fn chunk_dropped(&self, why: &str) {
+        self.record(CallerCall::ChunkDropped { why: why.to_string() });
+    }
+
     async fn receive(
         &self,
         cursor: &std::sync::atomic::AtomicU64,
@@ -1546,8 +1607,7 @@ mod tests {
             data_type: DataType::Text,
             backpressure: Backpressure::DropNewest,
             error_mode: ErrorMode::DropChunk,
-            journal_mode: crate::signal::JournalMode::Journaled,
-            journal_window_secs: None,
+            journal: crate::stream_journal::JournalPolicy::default(),
             window: None,
         };
         let rc = CallerRuntimeConfig::from_config(&cfg, Protocol::Websocket);
@@ -1604,6 +1664,30 @@ mod tests {
             DisconnectAction::ContinueIntoVoid,
             "a run that outlives its caller carries on, writing into the void"
         );
+    }
+
+    /// `drop_or_fail` reads the trigger's `whenChunkFails`: a made chunk
+    /// comes back to send in either mode; a failure to make one is skipped
+    /// (and said to the connection) under `drop_chunk` and handed back
+    /// under `surface`. A cancel or a mistake in the program's own shape is
+    /// never skipped: those are not a chunk going wrong.
+    #[test]
+    fn a_chunk_that_cannot_be_made_is_dropped_or_handed_back_per_the_trigger() {
+        use crate::error::WeftError;
+        let tolerant = FakeCallerConnection::connected(CallerRuntimeConfig { error_mode: ErrorMode::DropChunk, ..ws_cfg() });
+        let CallerHandle::Websocket(ws) = CallerHandle::from_connection(tolerant.clone()) else { unreachable!() };
+        assert_eq!(ws.drop_or_fail(Ok(1)).unwrap(), Some(1));
+        assert_eq!(ws.drop_or_fail::<i32>(Err(crate::node_error("no frame"))).unwrap(), None);
+        assert!(matches!(ws.drop_or_fail::<i32>(Err(WeftError::Cancelled)), Err(WeftError::Cancelled)));
+        assert!(matches!(ws.drop_or_fail::<i32>(Err(WeftError::Input("bad".into()))), Err(WeftError::Input(_))));
+        assert_eq!(tolerant.calls(), vec![CallerCall::ChunkDropped { why: "no frame".into() }], "only the real failure was skipped");
+
+        let strict = FakeCallerConnection::connected(http_cfg());
+        let CallerHandle::Http(http) = CallerHandle::from_connection(strict.clone()) else { unreachable!() };
+        assert_eq!(http.drop_or_fail(Ok("a")).unwrap(), Some("a"));
+        let back = http.drop_or_fail::<i32>(Err(crate::node_error("no frame"))).expect_err("surface hands it back");
+        assert!(matches!(back, WeftError::NodeFailed(ref m) if m == "no frame"), "{back:?}");
+        assert!(strict.calls().is_empty(), "nothing was skipped: {:?}", strict.calls());
     }
 
     #[tokio::test]

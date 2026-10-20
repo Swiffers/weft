@@ -25,10 +25,15 @@ pub enum CancelCause {
     /// deactivate or wipe of the project, a cancel through a signal
     /// token.
     User,
-    /// Another run of the same project stopped this one through
-    /// `ctx.stop_tagged`: `by` is the run that asked, `tag` is
-    /// the tag that matched.
-    Run { by: RunId, tag: String },
+    /// Another run of the same project stopped this one: `by` is the run
+    /// that asked. Through `ctx.stop_tagged`, `tag` is the tag that
+    /// matched; through taking its triggers down with the runs going
+    /// cancelled, there is none.
+    Run {
+        by: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+    },
     /// The live caller this run was tied to dropped its connection, so
     /// the run had nobody left to answer.
     CallerGone,
@@ -64,9 +69,8 @@ impl std::fmt::Display for CancelCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::User => write!(f, "Cancelled by user"),
-            Self::Run { by, tag } => {
-                write!(f, "Stopped by run {by} (tag {tag})")
-            }
+            Self::Run { by, tag: Some(tag) } => write!(f, "Stopped by run {by} (tag {tag})"),
+            Self::Run { by, tag: None } => write!(f, "Stopped by run {by}, which took its triggers down"),
             Self::CallerGone => write!(f, "Caller disconnected"),
             Self::Runtime { detail } | Self::Limit { detail } => write!(f, "{detail}"),
         }
@@ -86,9 +90,10 @@ mod tests {
         let cases = [
             (CancelCause::User, "Cancelled by user".to_string()),
             (
-                CancelCause::Run { by, tag: "user_42".into() },
+                CancelCause::Run { by, tag: Some("user_42".into()) },
                 format!("Stopped by run {by} (tag user_42)"),
             ),
+            (CancelCause::Run { by, tag: None }, format!("Stopped by run {by}, which took its triggers down")),
             (CancelCause::CallerGone, "Caller disconnected".to_string()),
             (
                 CancelCause::Runtime { detail: "worker instance shutting down".into() },

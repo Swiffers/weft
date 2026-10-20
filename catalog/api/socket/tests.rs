@@ -36,6 +36,26 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(spec["kind"], "socket");
     assert_eq!(spec["config"]["path"], "chat/{room}");
     assert!(spec["config"].get("methods").is_none(), "a socket serves no method");
+    assert_eq!(spec["config"]["error_mode"], "surface");
+    assert_eq!(spec["config"]["backpressure"], "block");
+
+    rig.run_setup_trigger(
+        &SocketNode,
+        json!({ "path": "frames", "whenChunkFails": "drop_chunk", "whenCallerIsSlow": "drop_newest" }),
+    )
+    .await
+    .ok()?;
+    let spec = serde_json::to_value(&rig.registered_signals().last().expect("a second socket").0).expect("spec serializes");
+    assert_eq!(spec["config"]["error_mode"], "drop_chunk");
+    assert_eq!(spec["config"]["backpressure"], "drop_newest");
+    let err = rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "whenCallerIsSlow": "skip" })).await.failure()?;
+    assert!(err.contains("'skip'") && err.contains("drop_oldest"), "a word outside the set is refused, naming the set: {err}");
+
+    rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "journalWindowMs": 5000 })).await.ok()?;
+    let spec = serde_json::to_value(&rig.registered_signals().last().expect("a slow-window socket").0).expect("spec serializes");
+    assert_eq!(spec["config"]["journal_window_ms"], 5000, "the window reaches the socket");
+    let err = rig.run_setup_trigger(&SocketNode, json!({ "path": "frames", "journalWindowMs": 20 })).await.failure()?;
+    assert!(err.contains("journalWindowMs"), "a window under the floor is refused, naming the setting: {err}");
     Ok(())
 }
 

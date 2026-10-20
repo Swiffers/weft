@@ -1,7 +1,7 @@
 //! Routes whose runs cannot pause: a wait holds in the worker while the
 //! caller is on the line (or the run is unrecorded), its answer carries the
 //! run on, and a wait that outlasts the route's `holdSecs` is given up,
-//! failing the call with the reason.
+//! failing the call (its reason goes on the run, never to the caller).
 #![cfg(feature = "e2e")]
 
 use std::time::{Duration, Instant};
@@ -29,18 +29,23 @@ async fn a_route_holds_its_wait_and_gives_up_after_its_hold() -> anyhow::Result<
     }
 
     // A thirty second timer under a one second hold: given up, a time
-    // limit (504), and the caller hears why long before the timer.
+    // limit (504), long before the timer. The caller is told only that
+    // the run failed and which run it was; why is on the run.
     let started = Instant::now();
     let (status, _, body) = live::http_request(&disp, Method::GET, &format!("{base}/impatient"), &[], None).await?;
     let said = String::from_utf8_lossy(&body).to_string();
     assert_eq!(status.as_u16(), 504, "{said}");
-    assert!(said.contains("gave up its wait") && said.contains("holdSecs"), "{said}");
     assert!(started.elapsed() < Duration::from_secs(20), "given up after its hold, not the timer");
+    let told: Value = serde_json::from_slice(&body)?;
+    let run_id = told["runId"].as_str().unwrap_or_default().to_string();
+    assert_eq!(told, json!({ "error": "Something went wrong", "runId": run_id }), "{said}");
 
-    // Its run lists failed. Its ending is written after the caller heard,
-    // so wait for the row to leave `running`.
+    // Its run lists failed, with the reason on it for its owner. Its
+    // ending is written after the caller heard, so wait for the row to
+    // leave `running`.
     let failed = poll_until("the given-up run to end", Duration::from_secs(60), Duration::from_millis(250), || {
         let disp = disp.clone();
+        let run_id = run_id.clone();
         async move {
             let page: Value = disp.get_json(&format!("/runs?project_id={pid}&phase=fire&limit=50")).await?;
             Ok(page["runs"]
@@ -48,11 +53,16 @@ async fn a_route_holds_its_wait_and_gives_up_after_its_hold() -> anyhow::Result<
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|row| row["entryNode"] == "impatient" && row["status"] != "running"))
+                .find(|row| row["runId"] == run_id.as_str() && row["status"] != "running"))
         }
     })
     .await?;
     assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["entryNode"], "impatient", "{failed}");
+    assert!(
+        failed["error"].as_str().is_some_and(|e| e.contains("gave up its wait") && e.contains("holdSecs")),
+        "the reason is on the run: {failed}"
+    );
 
     project.finish().await
 }

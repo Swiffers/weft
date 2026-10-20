@@ -704,6 +704,14 @@ pub enum RunEvent {
     /// even when it does not say what it was. What decides that lives
     /// in one place for every channel in the language
     /// ([`weft_core::stream_journal`]).
+    ///
+    /// `dropped` names the program's messages the caller never received:
+    /// it read too slowly and the trigger's `whenCallerIsSlow` let them
+    /// go. Each drop rides the row of the message whose sending decided
+    /// it, so it costs no row of its own; under `drop_oldest` it names
+    /// the message that was pushed out, which may sit in an earlier row
+    /// ([`weft_core::stream_journal::aggregate_caller_window`]). Every
+    /// other message of the program's reached the caller's connection.
     // SYNC: CallerWindow <-> crates/weft-core/src/live_event.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/runFollower.ts DispatcherEvent 'caller_window'
     CallerWindow {
         #[serde(skip)]
@@ -712,12 +720,17 @@ pub enum RunEvent {
         last_offset: u64,
         messages: Vec<weft_core::stream_journal::WindowedCallerMessage>,
         totals: Vec<weft_core::stream_journal::CallerWindowTotal>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<u64>,
         at_unix: u64,
     },
 
-    /// A node error surfaced to the caller (the `error_mode` path:
-    /// status/body before streaming, in-band error chunk after, WS close
-    /// frame). Recorded so the exchange replay shows where it broke.
+    /// An error on the exchange: one surfaced to the caller (status/body
+    /// before streaming, in-band error chunk after, WS close frame), or a
+    /// chunk a node could not make and skipped under `whenChunkFails:
+    /// drop_chunk` (its message starts with
+    /// `weft_core::caller::CHUNK_DROPPED`). Recorded so the exchange
+    /// replay shows where it broke.
     CallerErrored {
         #[serde(skip)]
         run_id: RunId,
@@ -728,11 +741,20 @@ pub enum RunEvent {
 
     /// The caller is gone (response complete OR disconnected, the same
     /// event from the run's view). Last event in the caller stream.
+    ///
+    /// `dropped` names the program's messages still waiting to go out
+    /// when the exchange ended (the caller left, the session cap ran
+    /// out): the caller never received them. A drop because the caller
+    /// read too slowly is on a [`Self::CallerWindow`] instead, so the row
+    /// a drop is on says why.
+    // SYNC: CallerDisconnected <-> crates/weft-core/src/live_event.rs CallerDisconnected, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'disconnected', extension-vscode/src/runFollower.ts DispatcherEvent 'caller_disconnected'
     CallerDisconnected {
         #[serde(skip)]
         run_id: RunId,
         offset: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<u64>,
         at_unix: u64,
     },
 }
@@ -1008,8 +1030,8 @@ impl RunEvent {
             Self::RunFailed { error: text, .. }
             | Self::RunCancelled { reason: text, .. }
             | Self::CallerConnected { protocol: text, .. }
-            | Self::CallerErrored { message: text, .. }
-            | Self::CallerDisconnected { reason: text, .. } => text.len(),
+            | Self::CallerErrored { message: text, .. } => text.len(),
+            Self::CallerDisconnected { reason, dropped, .. } => reason.len() + std::mem::size_of_val(dropped.as_slice()),
             Self::BusJoined { bus_id, name, .. } | Self::BusLeft { bus_id, name, .. } => bus_id.len() + name.len(),
             Self::BusClosed { bus_id, .. } => bus_id.len(),
             Self::BusWindow { bus_id, messages, totals, .. } => {
@@ -1025,8 +1047,9 @@ impl RunEvent {
                         })
                         .sum::<usize>()
             }
-            Self::CallerWindow { messages, totals, .. } => {
+            Self::CallerWindow { messages, totals, dropped, .. } => {
                 std::mem::size_of_val(totals.as_slice())
+                    + std::mem::size_of_val(dropped.as_slice())
                     + messages
                         .iter()
                         .map(|message| std::mem::size_of_val(message) + message.payload.as_ref().map_or(0, payload_bytes))
@@ -1427,10 +1450,13 @@ mod wire_tests {
                         bytes: 5,
                     },
                 ],
+                // One of the program's messages never reached the
+                // caller: it read too slowly.
+                dropped: vec![4],
                 at_unix: 10,
             },
             RunEvent::CallerErrored { run_id: run_id(), offset: 4, message: "node blew up".into(), at_unix: 11 },
-            RunEvent::CallerDisconnected { run_id: run_id(), offset: 5, reason: "response complete".into(), at_unix: 12 },
+            RunEvent::CallerDisconnected { run_id: run_id(), offset: 5, reason: "caller hung up".into(), dropped: vec![3], at_unix: 12 },
         ];
         let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
         kinds.sort_unstable();
@@ -1442,6 +1468,32 @@ mod wire_tests {
             assert_eq!(json["kind"], kind);
             assert!(json.get("run_id").is_none(), "the run is the row's, never the event's: {json}");
         }
+    }
+
+    /// A caller window names the program's messages the caller never
+    /// received, and a window with none says nothing about it, which is
+    /// what keeps an ordinary conversation's rows as small as before.
+    #[test]
+    fn a_caller_window_names_its_dropped_messages_only_when_there_are_some() {
+        let window = |dropped: Vec<u64>| RunEvent::CallerWindow {
+            run_id: run_id(),
+            first_offset: 3,
+            last_offset: 3,
+            messages: vec![weft_core::stream_journal::WindowedCallerMessage {
+                offset: 3,
+                direction: weft_core::stream_journal::CallerDirection::Outbound,
+                payload: Some(weft_core::bus::WirePayload::Json(json!("tick"))),
+                payload_byte_size: 4,
+                trimmed: false,
+                terminal: false,
+                at_unix: 1,
+            }],
+            totals: vec![],
+            dropped,
+            at_unix: 1,
+        };
+        assert_eq!(round_trip(window(vec![1, 3]))["dropped"], json!([1, 3]));
+        assert!(round_trip(window(vec![])).get("dropped").is_none(), "nothing dropped, nothing written");
     }
 
     /// The fields that are legitimately `None` are still always

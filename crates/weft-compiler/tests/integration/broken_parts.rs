@@ -144,3 +144,27 @@ fn an_entry_file_that_does_not_parse_stops_everything() {
     let errors = compile_in(&[], "tick = Cron { cron: \"0 0 * * * *\"\nd = = Debug\n").unwrap_err();
     assert!(errors.iter().any(|d| matches!(d.severity, weft_compiler::Severity::Error) && d.subjects.is_empty()), "{errors:?}");
 }
+
+/// A trigger inside a loop is an error about that trigger alone, and a cut
+/// that names it as an end is refused with the compiler's own reason (it
+/// cannot live in a loop body), never told to select the whole loop: the
+/// node's own errors come before any rule about where an end may sit.
+#[test]
+fn an_end_that_does_not_compile_is_refused_with_its_own_reason() {
+    let main = "scope = Loop(values: List[Number]) -> (out: List[String | Null]) {
+  over: [\"values\"]
+  tick = Cron { cron: \"0 0 * * * *\" }
+  self.out = tick.scheduledTime
+}
+scope.values = [1]
+";
+    let program = compile_in(&[], main).expect("the program around the trigger compiles");
+    assert!(program.broken.iter().any(|part| part.parts == ["scope.tick"] && part.why.contains("inside a Loop")), "{:?}", program.broken);
+    for refused in [
+        setup_cut(&program, &[Located::top("scope.tick")]).unwrap_err(),
+        compute_trigger_fire(&program, "scope.tick", &serde_json::Value::Null, None, &Default::default()).unwrap_err(),
+    ] {
+        assert!(refused.contains("do not compile") && refused.contains("inside a Loop"), "{refused}");
+        assert!(!refused.contains("select the whole loop"), "{refused}");
+    }
+}

@@ -66,7 +66,7 @@ pub fn validate_fire_bake(node: &str, program: &crate::project::hash::ProgramIde
         .map(|bake| format!(" (the last one was made for graph {} and binary {})", bake.program.definition_hash, bake.program.binary_hash))
         .unwrap_or_default();
     Err(Refusal::error(format!(
-        "the code changed since trigger '{node}' was last prepared, so its bake is stale{older}. Prepare it again: `weft bake` does it without listening, `weft activate` does it and listens"
+        "the code changed since trigger '{node}' was last prepared, so its bake is stale{older}. Prepare it again: `weft bake` does it and changes nothing that listens; if the trigger is off, `weft activate` does it and turns it on; if it is on, `weft resync` brings it onto the new build and prepares it there"
     )))
 }
 
@@ -845,6 +845,43 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// What a seeded run reuses (`crate::seeding::seed_plan`, the runtime
+/// planner that reads it off the old run): the run each reused place's
+/// result comes from, which of them stand in for themselves in the cut,
+/// the values the old run handed its starts that this one keeps, and the
+/// places it runs again that replay the answers their waits were given
+/// there.
+#[derive(Debug, Default)]
+pub struct SeedPlan {
+    pub origins: BTreeMap<Located, RunId>,
+    pub stand_ins: BTreeMap<Located, StandIn>,
+    pub handed: BTreeMap<Located, BTreeMap<String, Value>>,
+    pub answers: BTreeSet<Located>,
+    pub warnings: Vec<String>,
+}
+
+impl SeedPlan {
+    /// The places it reuses.
+    pub fn reused(&self) -> BTreeSet<Located> {
+        self.origins.keys().cloned().collect()
+    }
+}
+
+/// The members of the group start at `start` that a run walking `runs`
+/// runs, when a seed reusing `origins` reuses every one of them (the start
+/// is then reused whole and does not run); `None` otherwise. The one
+/// reading both the seed planner's announcement and the resolver's skip
+/// use.
+pub fn reused_group_start(
+    g: &ProjectGraph,
+    start: &Located,
+    runs: &BTreeSet<Located>,
+    origins: &BTreeMap<Located, RunId>,
+) -> Option<Vec<Located>> {
+    let members: Vec<Located> = crate::project::places::members_in(g, &start.id, &start.path).into_iter().filter(|member| runs.contains(member)).collect();
+    (!members.is_empty() && members.iter().all(|member| origins.contains_key(member))).then_some(members)
+}
+
 /// Resolve a spec: walk its bounds, cut the program, and give the cut what
 /// the spec hands in (`from` and `group` values at the starts, `emit`
 /// outputs as stand-ins) and the baked infra it reads. Pure: trigger
@@ -863,7 +900,7 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::
 /// not run, the ones among them that send into what runs stand in with
 /// their saved results, and the starts that run again keep what the old
 /// run handed them.
-pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::infra::bake::Saved, seed: Option<&crate::seeding::SeedPlan>) -> Result<Resolved, Refusal> {
+pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::infra::bake::Saved, seed: Option<&SeedPlan>) -> Result<Resolved, Refusal> {
     let g = ProjectGraph::new(project);
     let named: BTreeSet<String> = spec.from.keys().chain(spec.emit.keys()).chain(&spec.target).chain(&spec.before)
         .chain(spec.feed.iter()).chain(spec.group.iter().map(|(group, _)| group)).chain(spec.fire.iter().map(|(node, _)| node))
@@ -948,7 +985,7 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
             // A group start the seed reuses whole kept what it made with
             // these values (`crate::seeding::seed_plan` says so): it does
             // not run. One the walk does not reach is no start of this run.
-            if seed.is_some_and(|seed| crate::seeding::reused_group_start(&g, place, &authored_runs, &seed.origins).is_some()) {
+            if seed.is_some_and(|seed| reused_group_start(&g, place, &authored_runs, &seed.origins).is_some()) {
                 continue;
             }
             if !members.iter().any(|member| walked.runs.contains(member) || walked.stand_ins.contains(member)) {

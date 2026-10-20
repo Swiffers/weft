@@ -863,7 +863,7 @@ impl BusCoordinator {
         self: &Arc<Self>,
         opts: BusOptions,
         node: FiringLocation,
-    ) -> Result<BusHandle, &'static str> {
+    ) -> Result<BusHandle, String> {
         let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
         let pump_notify_weak = Arc::downgrade(&self.journal_pump_notify);
         let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node))?;
@@ -1168,11 +1168,11 @@ async fn drain_buses(
             }
             match &entry.kind {
                 BusEntryKind::Message { payload_byte_size, .. } => {
-                    let policy = journal_policy(&inner);
+                    let policy = inner.journal();
                     let weighs = policy.kept_at_most(*payload_byte_size);
                     let state = windows.entry(bus_id).or_insert_with(|| PumpBusState {
                         entries: Vec::new(),
-                        deadline: tokio::time::Instant::now() + inner.journal_window(),
+                        deadline: tokio::time::Instant::now() + policy.window,
                         kept_bound: 0,
                         buffered_through: entry.offset,
                     });
@@ -1194,7 +1194,7 @@ async fn drain_buses(
                     }
                     if state.entries.is_empty() {
                         state.deadline =
-                            tokio::time::Instant::now() + inner.journal_window();
+                            tokio::time::Instant::now() + policy.window;
                     }
                     state.buffered_through = entry.offset + 1;
                     state.kept_bound += weighs;
@@ -1280,7 +1280,7 @@ async fn write_open_window(
     replica: &str,
     state: &mut PumpBusState,
 ) -> WindowWrite {
-    let Some(aggregate) = weft_core::bus::aggregate_window(&state.entries, &journal_policy(inner))
+    let Some(aggregate) = weft_core::bus::aggregate_window(&state.entries, &inner.journal())
     else {
         return WindowWrite::UpToDate;
     };
@@ -1311,18 +1311,6 @@ async fn write_open_window(
     state.entries.clear();
     state.kept_bound = 0;
     WindowWrite::UpToDate
-}
-
-/// How this bus reaches the journal: its window, whether it keeps
-/// content at all, and the two size bounds. Built in ONE place so the
-/// pump's decision to close a window early and the fold's decision on
-/// what to keep cannot come from two different policies.
-fn journal_policy(inner: &Arc<BusInner>) -> weft_core::stream_journal::JournalPolicy {
-    weft_core::stream_journal::JournalPolicy {
-        window: inner.journal_window(),
-        ephemeral: inner.ephemeral(),
-        ..Default::default()
-    }
 }
 
 /// Project one membership `BusEntry` to its `RunEvent` shape. Message
@@ -5026,7 +5014,10 @@ mod bus_pump_tests {
             let mut bus = new_bus(
                 &coord,
                 BusOptions {
-                    journal_window: Some(std::time::Duration::from_millis(50)),
+                    journal: weft_core::stream_journal::JournalPolicy {
+                        window: weft_core::stream_journal::MIN_JOURNAL_WINDOW,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             );
@@ -5067,6 +5058,60 @@ mod bus_pump_tests {
             shutdown_and_join(coord, pump).await;
         }
     );
+
+    /// A bus keeps the journal window it was opened with: two messages a
+    /// few short windows apart land in rows of their own, where the
+    /// default one-second window would have put them in one row.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_keeps_the_journal_window_it_was_opened_with() {
+        let rows_of = |window: std::time::Duration| async move {
+            let run_id = uuid::Uuid::new_v4();
+            let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
+            let journal = Arc::new(CaptureJournal::default());
+            let pump = spawn_pump(&coord, journal.clone(), run_id);
+            let opts = BusOptions {
+                journal: weft_core::stream_journal::JournalPolicy { window, ..Default::default() },
+                ..Default::default()
+            };
+            let mut bus = new_bus(&coord, opts);
+            bus.register("mic").unwrap();
+            bus.send("frame", serde_json::json!(1)).unwrap();
+            tokio::time::sleep(weft_core::stream_journal::MIN_JOURNAL_WINDOW * 3).await;
+            bus.send("frame", serde_json::json!(2)).unwrap();
+            bus.close();
+            drop(bus);
+            shutdown_and_join(coord, pump).await;
+            let rows: Vec<usize> = journal
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    RunEvent::BusWindow { messages, .. } => Some(messages.len()),
+                    _ => None,
+                })
+                .collect();
+            rows
+        };
+        assert_eq!(rows_of(weft_core::stream_journal::MIN_JOURNAL_WINDOW).await, [1, 1], "a short window, a row each");
+        assert_eq!(rows_of(weft_core::stream_journal::DEFAULT_JOURNAL_WINDOW).await, [2], "the default, one row for both");
+    }
+
+    /// A journal window out of range is refused when the bus is opened,
+    /// naming the range.
+    #[tokio::test]
+    async fn a_journal_window_out_of_range_is_refused_at_open() {
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
+        let opts = BusOptions {
+            journal: weft_core::stream_journal::JournalPolicy {
+                window: std::time::Duration::from_millis(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let why = coord.new_bus(opts, FiringLocation::new("test-node", Vec::new())).expect_err("too short a window");
+        assert!(why.contains("between 100 and 60000 ms"), "{why}");
+    }
 
     /// On a journal write failure, the affected bus is marked
     /// `journal_degraded`; the next `send` returns
@@ -5129,7 +5174,7 @@ mod bus_pump_tests {
             let mut bus = new_bus(
                 &coord,
                 BusOptions {
-                    ephemeral: true,
+                    journal: weft_core::stream_journal::JournalPolicy::ephemeral(),
                     window: Some(4),
                     ..Default::default()
                 },

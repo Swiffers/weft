@@ -520,7 +520,7 @@ async fn run_deactivate(
         &crate::take_down::TakeDownTarget::Activations(targets),
         &weft_core::take_down::TakeDown::HEALTH,
         // The health loop's own take-down: its auto-recover may bring it back.
-        crate::take_down::DownCause::Health,
+        crate::take_down::DownCause::Health(&take_down.broken),
         crate::take_down::TakeDownAsker::Outside,
     )
     .await

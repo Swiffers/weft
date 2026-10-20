@@ -33,9 +33,12 @@
 //! (`ctx.await_signal`) DO coexist: a bus-held worker resolves the
 //! suspension in process (the driver's idle loop polls the journal for
 //! the `SuspensionResolved` row while a bus keeps the worker alive). The
-//! one real restriction is unrelated to the bus: a node may not
-//! `await_signal` AFTER it has emitted on an output port (replay would
-//! re-emit), enforced in the engine, not here.
+//! restriction on waiting is unrelated to the bus, and enforced in the
+//! engine, not here: a node may `await_signal` after sending on an
+//! ordinary output port (on resume the body replays and that send is
+//! a no-op, its value already recorded), but not after yielding on or
+//! closing a stream output, nor while it reads a stream input, since
+//! those items went out or were consumed live and cannot be replayed.
 //!
 //! ## Windowed journaling (the inspector trail)
 //!
@@ -43,7 +46,7 @@
 //! signals a per-run `journal_pump_notify`; the engine's
 //! bus-journal-pump task drains every live bus's unjournaled tail. The
 //! pump buffers each bus's `Message` entries and flushes ONE
-//! `BusWindow` journal row per bus per `journal_window` (a journaled
+//! `BusWindow` journal row per bus per journal window (a journaled
 //! bus's row carries every message in the window; an ephemeral bus's
 //! row carries only the per-sender/kind totals). Membership entries
 //! (`Joined` / `Left` / `Closed`) are journaled as individual rows, and
@@ -52,15 +55,16 @@
 //! the bus only AFTER a write succeeds, and owns the per-bus
 //! `journaled_through` cursor.
 //!
-//! ## `BusOptions` (all five knobs)
+//! ## `BusOptions` (all four knobs)
 //!
-//! - **`ephemeral`**: picks the payload-retention mode (see below).
+//! - **`journal`**: what the journal keeps, the same
+//!   [`crate::stream_journal::JournalPolicy`] every channel takes: the
+//!   payload-retention mode (see below) and the journal aggregation
+//!   window (default 1s, one `BusWindow` row per bus per window).
 //! - **`window`**: the in-RAM bound, in `Message` entries, for BOTH
 //!   modes (default 64).
 //! - **`payload`**: what messages carry, `Json` or `Bytes`, frozen at
 //!   creation.
-//! - **`journal_window`**: the journal aggregation window (default 1s):
-//!   one `BusWindow` row per bus per window.
 //! - **`meta`**: creator-declared stream metadata readable off the
 //!   handle by every consumer.
 //!
@@ -160,33 +164,6 @@ use uuid::Uuid;
 use crate::liveness::{no_liveness, wait_on, FiringLocation, WaitLiveness, WaitSource};
 
 // ----- Public types ----------------------------------------------------
-
-/// Bus payload-retention mode. Encoded as a string in the marker
-/// (`"journaled"` or `"ephemeral"`) so consumers can read it without
-/// touching the bus inner; centralised here so the two wire spellings
-/// have a single source of truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusMode {
-    Journaled,
-    Ephemeral,
-}
-
-impl BusMode {
-    pub fn as_wire_str(self) -> &'static str {
-        match self {
-            BusMode::Journaled => "journaled",
-            BusMode::Ephemeral => "ephemeral",
-        }
-    }
-
-    pub fn from_wire_str(s: &str) -> Option<Self> {
-        match s {
-            "journaled" => Some(BusMode::Journaled),
-            "ephemeral" => Some(BusMode::Ephemeral),
-            _ => None,
-        }
-    }
-}
 
 /// What a bus's messages carry, declared at creation and frozen: JSON
 /// values (chat-shaped traffic) or raw bytes (media frames; no base64
@@ -467,7 +444,7 @@ pub fn aggregate_window(
                 bytes: *payload_byte_size,
             }),
         }
-        if !policy.ephemeral {
+        if !policy.is_ephemeral() {
             // What the journal keeps of a message is decided in one
             // place for every channel in the language, so a bus message
             // too big to write down is cut exactly as a caller's is,
@@ -499,15 +476,15 @@ pub fn aggregate_window(
 /// Configuration the producer passes to `ctx.create_bus(opts)`.
 #[derive(Debug, Clone, Default)]
 pub struct BusOptions {
-    /// `true` switches the bus to ephemeral mode (metadata-only in the
-    /// journal, slow consumers silently skip to the oldest retained
-    /// entry). `false` (default)
-    /// is the journaled mode (full payload persisted to the journal/DB for
-    /// durability). NOTE: in EITHER mode the in-RAM log is a bounded
-    /// window (cursors only ever read RAM, never the DB); the mode only
-    /// decides whether the payload is also persisted for replay-after-
-    /// worker-death, not whether RAM is bounded.
-    pub ephemeral: bool,
+    /// What the journal keeps of this bus: whether payloads are written
+    /// down (journaled, the default) or only counted (ephemeral, where
+    /// slow consumers also silently skip to the oldest retained entry),
+    /// and the window one journal row gathers. NOTE: in EITHER mode the
+    /// in-RAM log is a bounded window (cursors only ever read RAM, never
+    /// the DB); the mode only decides whether the payload is also
+    /// persisted, not whether RAM is bounded. A node whose users tune it
+    /// passes `ctx.journal_policy()?` here.
+    pub journal: crate::stream_journal::JournalPolicy,
     /// Per-bus in-RAM window size. `None` falls back to
     /// `DEFAULT_BUS_WINDOW`. Bounds RAM in BOTH modes: a journaled bus
     /// trims log entries that are already persisted to the DB once the
@@ -520,14 +497,6 @@ pub struct BusOptions {
     /// (media frames). Frozen at creation; a `send` of the other shape
     /// is refused loudly. Consumers read it off the handle/marker.
     pub payload: BusPayloadKind,
-    /// The journal aggregation window: the pump ships ONE journal row
-    /// per bus per window (the window's messages for a journaled bus,
-    /// the rollup for an ephemeral one) instead of a row per message.
-    /// `None` falls back to [`DEFAULT_JOURNAL_WINDOW`] (1s). A quiet
-    /// bus degenerates to per-message rows (a window holds one
-    /// message); a fast stream collapses to one row per window. Only
-    /// the JOURNAL granularity: what travels the bus is untouched.
-    pub journal_window: Option<std::time::Duration>,
     /// Creator-declared stream metadata, frozen at creation and
     /// readable by every consumer (off the handle or the marker):
     /// what a per-message header would otherwise repeat (an audio
@@ -535,11 +504,6 @@ pub struct BusOptions {
     /// Keep it small; it rides the marker. `Null` = none.
     pub meta: Value,
 }
-
-/// Default journal aggregation window. Every channel in the language
-/// starts from the same one, so it lives with the rest of the recording
-/// rules rather than here.
-pub use crate::stream_journal::DEFAULT_JOURNAL_WINDOW;
 
 /// Default in-RAM window for a bus (both modes). 64 entries fits the
 /// common consumer-lags-a-few-messages case without growing RAM
@@ -733,8 +697,9 @@ pub struct BusInner {
     /// `BusRegistry::lookup` resolves a marker back to `Arc<BusInner>`
     /// via this id.
     id: Uuid,
-    /// Whether this bus runs in ephemeral mode. Frozen at creation.
-    ephemeral: bool,
+    /// What the journal keeps of this bus (its mode and window).
+    /// Frozen at creation.
+    journal: crate::stream_journal::JournalPolicy,
     /// The entry log, ordered by offset. ALL state-changes (Joined,
     /// Left, Message, Closed) go through here. Cursors read by
     /// offset; the journal pump drains the unjournaled tail.
@@ -800,12 +765,11 @@ pub struct BusInner {
     /// append; the pump wakes, walks every live bus, drains tails.
     /// `Weak::new()` outside an engine-driven run.
     journal_pump_notify: Weak<Notify>,
-    /// Optional ephemeral payload store. `Some` iff `ephemeral`.
+    /// Optional ephemeral payload store. `Some` iff the journal mode is
+    /// ephemeral.
     ephemeral_store: Option<EphemeralStore>,
     /// What the messages carry (JSON vs raw bytes). Frozen at creation.
     payload_kind: BusPayloadKind,
-    /// The journal aggregation window (see [`BusOptions::journal_window`]).
-    journal_window: std::time::Duration,
     /// Creator-declared stream metadata (see [`BusOptions::meta`]).
     meta: Value,
     /// In-RAM retained-window size, in Message entries, for BOTH modes.
@@ -1034,19 +998,16 @@ impl BusInner {
         self.id
     }
 
-    pub fn ephemeral(&self) -> bool {
-        self.ephemeral
+    /// What the journal keeps of this bus. The pump's decision to close
+    /// a window and the fold's decision on what to keep both read it, so
+    /// they cannot come from two different policies.
+    pub fn journal(&self) -> crate::stream_journal::JournalPolicy {
+        self.journal
     }
 
     /// What the messages carry (JSON vs raw bytes).
     pub fn payload_kind(&self) -> BusPayloadKind {
         self.payload_kind
-    }
-
-    /// The journal aggregation window: how often the pump ships one
-    /// aggregate row for this bus.
-    pub fn journal_window(&self) -> std::time::Duration {
-        self.journal_window
     }
 
     /// Creator-declared stream metadata (`Null` when none was set).
@@ -1147,8 +1108,8 @@ impl BusHandle {
     }
 
     /// Create with explicit options, no engine hooks. Errors on an
-    /// invalid `window`.
-    pub fn create_with_options(opts: BusOptions) -> Result<Self, &'static str> {
+    /// invalid `window` or journal window.
+    pub fn create_with_options(opts: BusOptions) -> Result<Self, String> {
         Self::create_with_engine(opts, no_liveness(), Weak::<Notify>::new(), None)
     }
 
@@ -1157,26 +1118,29 @@ impl BusHandle {
     /// append; the pump notify fires after every append to signal the
     /// engine's bus-journal-pump task. `node` is the minting node
     /// run (`None` outside an engine-driven node). Errors on an
-    /// invalid `window` (must be >= 1 when `ephemeral=true`).
+    /// invalid `window` (must be >= 1) or a journal window out of range
+    /// ([`crate::stream_journal::JournalPolicy::check`]).
     pub fn create_with_engine(
         opts: BusOptions,
         liveness: Weak<dyn WaitLiveness>,
         journal_pump_notify: Weak<Notify>,
         node: Option<FiringLocation>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, String> {
         let window = opts.window.unwrap_or(DEFAULT_BUS_WINDOW);
         if window == 0 {
             return Err("bus window must be >= 1; 0 would evict every entry before any \
-                        cursor could read it");
+                        cursor could read it"
+                .into());
         }
-        let ephemeral_store = if opts.ephemeral {
+        opts.journal.check().map_err(|why| format!("bus: {why}"))?;
+        let ephemeral_store = if opts.journal.is_ephemeral() {
             Some(EphemeralStore::new(window)?)
         } else {
             None
         };
         let inner = Arc::new(BusInner {
             id: Uuid::new_v4(),
-            ephemeral: opts.ephemeral,
+            journal: opts.journal,
             log: Mutex::new(Vec::new()),
             ever_joined: Mutex::new(HashSet::new()),
             journaled_through: AtomicU64::new(0),
@@ -1191,7 +1155,6 @@ impl BusHandle {
             journal_pump_notify,
             ephemeral_store,
             payload_kind: opts.payload,
-            journal_window: opts.journal_window.unwrap_or(DEFAULT_JOURNAL_WINDOW),
             meta: opts.meta,
             window,
         });
@@ -1222,7 +1185,13 @@ impl BusHandle {
 
     /// Whether this bus runs in ephemeral mode.
     pub fn is_ephemeral(&self) -> bool {
-        self.inner.ephemeral
+        self.inner.journal.is_ephemeral()
+    }
+
+    /// What the journal keeps of this bus: its mode and window, as it
+    /// was opened with them.
+    pub fn journal(&self) -> crate::stream_journal::JournalPolicy {
+        self.inner.journal
     }
 
     /// What this bus's messages carry (JSON vs raw bytes).
@@ -1338,7 +1307,7 @@ impl BusHandle {
         // mode hides it from the log (the inspector renders the size +
         // hash prefix instead) and parks the bytes in the per-bus
         // sliding-window store for live cursors to pick up.
-        let entry_payload = if self.inner.ephemeral { None } else { Some(payload.clone()) };
+        let entry_payload = if self.inner.journal.is_ephemeral() { None } else { Some(payload.clone()) };
         let mut log = self.inner.lock_log();
         // Check Closed BEFORE JournalDegraded: a closed bus is the more
         // fundamental failure (no further sends will ever succeed),
@@ -1348,7 +1317,7 @@ impl BusHandle {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SendError::Closed);
         }
-        if !self.inner.ephemeral && self.inner.is_journal_degraded() {
+        if !self.inner.journal.is_ephemeral() && self.inner.is_journal_degraded() {
             let reason = self
                 .inner
                 .degraded_reason
@@ -1559,8 +1528,7 @@ impl BusHandle {
     /// JSON marker for THIS bus. The marker is what a producer puts
     /// on an output port; consumers resolve it back via `ctx.bus`.
     pub fn marker(&self) -> Value {
-        let mode = if self.inner.ephemeral { BusMode::Ephemeral } else { BusMode::Journaled };
-        crate::weft_type::WeftType::bus_marker(&self.inner.id.to_string(), mode)
+        crate::weft_type::WeftType::bus_marker(&self.inner.id.to_string(), self.inner.journal.mode)
     }
 }
 
@@ -1990,7 +1958,7 @@ impl std::fmt::Debug for BusHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BusHandle")
             .field("id", &self.inner.id)
-            .field("ephemeral", &self.inner.ephemeral)
+            .field("journal", &self.inner.journal)
             .field("name", &self.name())
             .field("closed", &self.is_closed())
             .finish()
@@ -2027,9 +1995,11 @@ mod tests {
     #[tokio::test]
     async fn a_bytes_bus_carries_frames_and_declares_its_parameters() {
         let bus = BusHandle::create_with_options(BusOptions {
-            ephemeral: true,
+            journal: crate::stream_journal::JournalPolicy {
+                window: std::time::Duration::from_millis(250),
+                ..crate::stream_journal::JournalPolicy::ephemeral()
+            },
             payload: BusPayloadKind::Bytes,
-            journal_window: Some(std::time::Duration::from_millis(250)),
             meta: serde_json::json!({ "sample_rate": 16000 }),
             ..Default::default()
         })
@@ -2079,7 +2049,7 @@ mod tests {
 
         let kept = crate::stream_journal::JournalPolicy::default();
         let metadata_only =
-            crate::stream_journal::JournalPolicy { ephemeral: true, ..Default::default() };
+            crate::stream_journal::JournalPolicy::ephemeral();
 
         let journaled = aggregate_window(&entries, &kept).unwrap();
         assert_eq!((journaled.first_offset, journaled.last_offset), (3, 6));
@@ -2479,7 +2449,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_send_does_not_journal_payload_in_log_entry() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8), ..Default::default() }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "bytes": "AAAA" })).unwrap();
         // Read entries directly out of the log to confirm payload=None.
@@ -2500,7 +2470,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_cursor_returns_payload_when_window_still_has_it() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8), ..Default::default() }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "n": 1 })).unwrap();
         let mut c = bus.cursor_from_start();
@@ -2521,7 +2491,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_slow_consumer_silently_resumes_at_retained_floor() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(2), ..Default::default() }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(2), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         // Create the cursor BEFORE sends so it starts at the joined-only
         // tail; the test exercises a consumer reading slowly enough that
@@ -2547,7 +2517,7 @@ mod tests {
     /// Joined "a" (0), msg (1, evicted), Joined "b" (2), msg (3, live).
     fn sparse_membership_bus() -> BusHandle {
         let bus = BusHandle::create_with_options(BusOptions {
-            ephemeral: true,
+            journal: crate::stream_journal::JournalPolicy::ephemeral(),
             window: Some(1),
             ..Default::default()
         })
@@ -2591,7 +2561,7 @@ mod tests {
     async fn resume_is_forward_to_next_retained_never_backward() {
         // window=1 so each new message evicts the previous one's payload;
         // Join entries are never evicted.
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(1), ..Default::default() })
+        let bus = BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(1), ..Default::default() })
             .expect("opts");
         let a = registered(&bus, "a");        // Joined @0
         a.send("A", json!(0)).unwrap();        // @1 msg
@@ -2653,14 +2623,14 @@ mod tests {
         );
         assert_eq!(
             crate::weft_type::WeftType::bus_marker_mode(&m),
-            Some(BusMode::Journaled)
+            Some(crate::stream_journal::JournalMode::Journaled)
         );
-        let eph = BusHandle::create_with_options(BusOptions { ephemeral: true, window: None, ..Default::default() })
+        let eph = BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: None, ..Default::default() })
             .expect("valid options");
         let me = eph.marker();
         assert_eq!(
             crate::weft_type::WeftType::bus_marker_mode(&me),
-            Some(BusMode::Ephemeral)
+            Some(crate::stream_journal::JournalMode::Ephemeral)
         );
     }
 
@@ -2671,7 +2641,7 @@ mod tests {
         // window applies to both modes, so a zero is rejected regardless of
         // `ephemeral`.
         let err = BusHandle::create_with_options(BusOptions {
-            ephemeral: true,
+            journal: crate::stream_journal::JournalPolicy::ephemeral(),
             window: Some(0),
             ..Default::default()
         })
@@ -2868,7 +2838,7 @@ mod tests {
     /// over the RAM bound. The full history is still readable from RAM.
     #[tokio::test]
     async fn journaled_keeps_unshipped_entries_past_window() {
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2), ..Default::default() })
+        let bus = BusHandle::create_with_options(BusOptions { window: Some(2), ..Default::default() })
             .expect("opts");
         let tx = registered(&bus, "tx");
         let rx = registered(&bus, "rx");
@@ -2893,7 +2863,7 @@ mod tests {
     /// has the data but a cursor never reads it).
     #[tokio::test]
     async fn journaled_trims_shipped_entries_past_window() {
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2), ..Default::default() })
+        let bus = BusHandle::create_with_options(BusOptions { window: Some(2), ..Default::default() })
             .expect("opts");
         let tx = registered(&bus, "tx");
         for i in 0..5 {

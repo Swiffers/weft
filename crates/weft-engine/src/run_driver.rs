@@ -682,13 +682,6 @@ async fn drive_run_id(
     if let StartsFrom::Record(events) = &starts_from {
         reopen_charges(clients, record, replica, run_id, cancellation, weft_journal::ChargeBook::of_record(events));
     }
-    if cancellation.is_cancelled() {
-        // Nothing ran, but the run still gets its end: a cancel from
-        // inside this worker (its caller refused or gone before
-        // attaching), or one waiting for it when it was claimed.
-        let outcome = RunOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) };
-        return Ok(Drove { outcome, pulses, firings, loop_runtime, kicked, scopes });
-    }
     let (born_with, mut fold) = match starts_from {
         StartsFrom::Plan { born_with, kicked: opening } => {
             // The run's values go where its program says it is given
@@ -717,15 +710,34 @@ async fn drive_run_id(
                 &program, snap, &mut pulses, &mut firings, &mut kicked, &mut scopes, &mut awaited_sequences,
                 &mut loop_runtime,
             );
-            fail_crashed_firings(
-                crashed, run_id, project, program_idx, &mut pulses, &mut firings,
-                journal, replica,
-            )
-            .await;
+            // A run claimed with its cancel waiting ends every open firing
+            // Cancelled below, a body a dead drive left behind included.
+            if !cancellation.is_cancelled() {
+                fail_crashed_firings(
+                    crashed, run_id, project, program_idx, &mut pulses, &mut firings,
+                    journal, replica,
+                )
+                .await;
+            }
             (born_with, fold)
         }
     };
     let BornWith { phase, instance, instance_values, picks, settings, given } = born_with;
+    if cancellation.is_cancelled() {
+        // Nothing runs, but the run still gets its end: a cancel from
+        // inside this worker (its caller refused or gone before
+        // attaching), or one waiting for it when it was claimed. A run
+        // carried on from its record ends what its record leaves open
+        // (a parked wait, a body a dead drive left) Cancelled with it,
+        // the same rows a cancel of a run nobody drives writes.
+        let cause = recorded_cancel_cause(cancellation);
+        cancel_open_firings(
+            &mut firings, &mut pulses, &mut kicked, &mut scopes, &mut loop_runtime, run_id, project, program_idx,
+            journal, replica, &cause.to_string(), phase, &given,
+        )
+        .await;
+        return Ok(Drove { outcome: RunOutcome::Cancelled { cause }, pulses, firings, loop_runtime, kicked, scopes });
+    }
 
     let mut outcome = drive(
         &program,
@@ -844,7 +856,7 @@ fn checked_snapshot(run_id: RunId, live: &weft_journal::LiveFold) -> anyhow::Res
     anyhow::bail!(
         "the record of run {run_id} does not fit the program it runs now ({} row(s) rejected: \
          {}), so the run cannot resume: a resync moved it, paused, onto a build it no longer \
-         fits, or its record is damaged. Its record is kept: `weft run --seed {run_id}` runs the \
+         fits, or its record is damaged. Its record is kept: `weft run --seed={run_id}` runs the \
          program again from what it did, and `weft clean {run_id}` removes it.",
         reasons.len(),
         reasons.join("; "),

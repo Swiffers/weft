@@ -6,6 +6,7 @@
 use serde_json::json;
 
 use weft::bus::{BusEntryKind, StreamEnd};
+use weft::stream_journal::JournalPolicy;
 use weft::context::ERROR_PORT;
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
@@ -15,6 +16,7 @@ use super::LlmStreamNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("deltas_ride_the_bus_then_the_reply_pulses", streams),
+        NodeTest::fake("the_journal_settings_reach_the_bus", journal_settings),
         NodeTest::fake("a_dropped_stream_fails_loud_after_partial_deltas", truncated),
         NodeTest::fake("a_call_refused_before_its_first_chunk_opens_no_bus", refused),
         NodeTest::live("one_real_streamed_completion", "openrouter", live_stream),
@@ -164,5 +166,28 @@ async fn streams(rig: FakeRig) -> WeftResult<()> {
     }
     assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);
     assert_eq!(bus.end(), Some(StreamEnd::Finished));
+    assert_eq!(bus.journal(), JournalPolicy::default(), "unset, the bus is journaled on the default window");
+    Ok(())
+}
+
+/// What the node's users set on the journal settings is the bus's
+/// journal: written down or not, and how long one row gathers deltas.
+async fn journal_settings(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["Hi"], Some("stop")));
+    let outcome = rig
+        .run(
+            &LlmStreamNode,
+            json!({
+                "provider": { "kind": "openrouter", "model": "test/model", "account": rig.access("openrouter") },
+                "prompt": "say hi",
+                "journalEphemeral": true,
+                "journalWindowMs": 200,
+            }),
+        )
+        .await
+        .ok()?;
+    let journal = rig.bus(&outcome.outputs["stream"])?.journal();
+    assert!(journal.is_ephemeral());
+    assert_eq!(journal.window, std::time::Duration::from_millis(200));
     Ok(())
 }

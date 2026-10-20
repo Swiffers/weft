@@ -1430,7 +1430,10 @@ fn build_type_registry(roots: &[&Path], ctx: &mut DiscoverCtx<'_>) -> weft_core:
     // until none more can be taken, and leave out the ones that never
     // fit; when one of those restates a name an accepted file declares
     // differently, that accepted file is just as much at fault, so it
-    // is left out too and the round runs again without it.
+    // is left out too and the round runs again without it. Each try
+    // builds from the accepted files' declarations plus the new file's,
+    // never on top of a registry already built, so a clash names the
+    // file that declared the name first as well as the one restating it.
     let mut by_origin: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
     for decl in declarations {
         by_origin.entry(decl.2.clone()).or_default().push(decl);
@@ -1438,22 +1441,29 @@ fn build_type_registry(roots: &[&Path], ctx: &mut DiscoverCtx<'_>) -> weft_core:
     let mut excluded: BTreeMap<String, String> = BTreeMap::new();
     loop {
         let mut registry = TypeRegistry::builtin();
+        let mut taken: Vec<(String, String, String)> = Vec::new();
         let mut accepted: Vec<&String> = Vec::new();
         let mut waiting: Vec<&String> = by_origin.keys().filter(|o| !excluded.contains_key(*o)).collect();
         let mut last_error: BTreeMap<&String, String> = BTreeMap::new();
         loop {
             let before = waiting.len();
-            waiting.retain(|origin| match registry.extended(&by_origin[*origin], Redeclaration::AbsorbIdentical) {
-                Ok(next) => {
-                    registry = next;
-                    accepted.push(*origin);
-                    false
+            let mut still: Vec<&String> = Vec::new();
+            for origin in waiting {
+                let mut trial = taken.clone();
+                trial.extend(by_origin[origin].iter().cloned());
+                match TypeRegistry::builtin().extended(&trial, Redeclaration::AbsorbIdentical) {
+                    Ok(next) => {
+                        registry = next;
+                        taken = trial;
+                        accepted.push(origin);
+                    }
+                    Err(error) => {
+                        last_error.insert(origin, error);
+                        still.push(origin);
+                    }
                 }
-                Err(error) => {
-                    last_error.insert(origin, error);
-                    true
-                }
-            });
+            }
+            waiting = still;
             if waiting.is_empty() || waiting.len() == before {
                 break;
             }
@@ -2832,6 +2842,9 @@ mod package_tests {
         for node_type in ["Alpha", "Beta"] {
             let told = cat.unavailable(node_type).expect("named");
             assert!(told.contains("declared twice"), "{told}");
+            // Both files are named, the one that declared it first included.
+            let (a, b) = (root.path().join("a/metadata.json"), root.path().join("b/metadata.json"));
+            assert!(told.contains(&format!("first in {}", a.display())) && told.contains(&format!("then in {}", b.display())), "{told}");
         }
     }
 

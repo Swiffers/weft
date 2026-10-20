@@ -411,9 +411,11 @@ fn row_to_subscription(
 /// reach, as it is switched on or, on, as its subscription is made
 /// again (the signal then stops until it is registered again): states
 /// the need, the risk-accepting fix and the way back for either case,
-/// and the door to the full explanation. A trigger already on refuses
-/// `weft activate`; `weft resync` registers its signals again. The doc
-/// path is stable on purpose; the editor renders it as a link.
+/// and the door to the full explanation. A trigger already on is left
+/// alone by `weft activate`, and `weft resync` moves only a trigger that
+/// is behind its build, so one that is on is set up again by turning it
+/// off and on. The doc path is stable on purpose; the editor renders it
+/// as a link.
 // SYNC: no_public_url_error <-> docs/src/connections/events.md (the section
 //       '"This trigger needs your weft to be reachable..."')
 pub fn no_public_url_error(service: &str) -> String {
@@ -421,7 +423,8 @@ pub fn no_public_url_error(service: &str) -> String {
         "this trigger needs '{service}' to deliver events TO your weft, which requires \
          your weft to be reachable from the internet, and it is not. If you accept \
          making its public trigger surface reachable, rerun `./setup.sh --public-url`, \
-         then `weft activate` (or `weft resync`, when the trigger is already on); \
+         then `weft activate`, or, when the trigger is already on, turn it off and on again \
+         (`weft deactivate --trigger <name>`, then `weft activate --trigger <name>`); \
          or use a connection that supports dialing out (your own \
          provider app), where the service offers one. \
          See https://weavemindai.github.io/weft/connections/events.html"

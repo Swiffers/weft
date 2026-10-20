@@ -32,13 +32,14 @@ here, for this run. It is how a node says no rather than saying nothing.
 It is not `null`. `null` is a value, and a port whose type allows it takes it
 like any other.
 
-For an ordinary node:
+Here is what a closure does to the node it reaches:
 
 | What happened | What the node does |
 |---|---|
 | An input it needs closed | Skips |
 | An input you declared `x?: T` closed | Nothing. It runs without that input |
 | Every `@require_one_of` input closed | Skips |
+| It takes the first of several branches, like `FirstInOrder`, and every one of them closed | Skips |
 | `_should_flow` is `false`, or closed | Skips |
 | It was waiting on a person, who skipped the question | Skips |
 
@@ -49,7 +50,12 @@ and read [optional and required inputs](syntax.md#optional-and-required-inputs).
 If every input wired into a node is written with `?`, nothing says when it
 should run, and the compiler stops with `run-undecided`: gate it with
 `_should_flow`, drop the `?` from the input it cannot do without, or add
-`@require_one_of`.
+`@require_one_of`. A node that joins branches, like `FirstInOrder`, needs none
+of these. Neither does a node whose input comes from a port that always
+carries something when its group or loop runs, such as a port of a group whose
+gate is wired, a group port with a value written on it (`g.x = "hi"`), the
+item a loop iterates over (a port named in its `over`), or `self.index`: the
+way its value arrives already says when it runs.
 
 A skipped node closes its own outputs, which can skip the next node, and the
 next, until the closures reach something that can carry on with what it has.
@@ -161,10 +167,19 @@ shows in the node's log, as `failed, handed to the '_error' output: ...`, so
 
 Only a failure of the node's own work goes to `_error`: a service refusing or
 not answering, a script raising, a wait that gave up, a node whose worker died
-in the middle of a durable run. A mistake in the program fails the run even
-with `_error` wired, because the fix is in the program: a bad setting, an input
-of the wrong shape, a value of the wrong type. A cancel, or a node pausing to
-wait for an answer, is not a failure, so it never comes out on `_error` either.
+in the middle of a `durable` run, or a value that does not fit the type you
+declared on its output (a model's answer missing a field of the record you
+declared on `LlmInferenceJson`, or a value a `Cast` cannot convert). A mistake
+in the program, like a bad setting or an input the node cannot read as the
+type that input declares, fails the run even with `_error` wired, because only
+changing the program fixes it. Scripts are the exception to the output case:
+a script's code is part of your program, so a script returning the wrong type
+for an output is a mistake in the program and fails the run. For what a script may return, go
+and read [declaring ports](syntax.md#declaring-ports), and for which nodes
+fail and which run again when a worker dies, [how a run is
+kept](triggers-and-routes.md#how-a-run-is-kept). A cancel, or a node pausing
+to wait for an answer, is not a failure, so it never comes out on `_error`
+either.
 
 **Once a node has started a stream, its failure fails the run.** As soon as
 anything went out on a `Bus` or `Generator` output, the readers already hold
@@ -201,19 +216,12 @@ output now and another later. Whatever it never mentions is closed when it
 finishes. Generators and buses have their own rules, in
 [streams and buses](streams-and-buses.md).
 
-## A group is not a node at run time
+## Groups and loops at run time
 
-A wire that passes through a group's ports is one wire, from the node that
-sends to the node that reads, and it only notes which groups it enters and
-leaves on the way. The group itself is a **scope**: the runtime decides, once
-for each copy of it, whether it opens or skips, and the nodes inside follow
-that decision. An included file works the same way: its body is in the program
-once, and each `@include` of it is its own copy. Only a loop becomes nodes, a
-`LoopIn` and a `LoopOut`.
-
-So folding a group in the editor costs nothing at run time, and neither does
-nesting groups five deep. For when a group opens, go and read
-[groups](groups.md), and for loops, [loops](loops.md).
+When the program runs, no node stands for a group, and a loop becomes two
+nodes, a `LoopIn` and a `LoopOut`. For the details, go and read [no node
+stands for a group](groups.md#no-node-stands-for-a-group-when-the-program-runs)
+and [loops](loops.md).
 
 ## What happens when you hit run
 
@@ -268,7 +276,9 @@ start further up so ask runs too.
 
 The flag in the message is the one the start was named with: `--group` for a
 `--group` start. An input no start lies in front of is named where the wire
-lands, and the way to hand it a value is to start there.
+lands, and the way to hand it a value is to start there. When the value could
+only come from a trigger the run does not fire, the message says so and
+offers `--fire` on that trigger as well as handing the value in.
 
 The input is named at the start you gave, even when the missing value would
 pass through more group ports on the way (a group inside an included file), and a value you
@@ -308,6 +318,16 @@ Without `--target`, a run goes everywhere downstream of its starts, so
 `--from db` alone runs every branch `db` feeds. `--target` narrows that to
 what the target needs, starting no further up than the starts. It is one
 shape, not a run that goes until it reaches the target.
+
+If you want everything a node needs but not the node itself (say a node
+called `post` that publishes the result), end with `--before post` instead of
+`--target`.
+
+If you want to get
+past a node without running it (a trigger you have not activated, an infra
+node, a call you do not want to pay for twice), stand in for it with
+`--emit`: `--emit fetch='{"body": "..."}'` says what `fetch` would have sent,
+and the run starts from there, the way it starts at a `--from`.
 
 On a `--seed` run the check waits for the seed, since a saved result can
 supply the input. It only can when the run it reads completed that node and

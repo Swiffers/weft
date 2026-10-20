@@ -274,6 +274,9 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
         // this is usually reading it because a value never arrived.
         line.push_str("  output=(nothing emitted)");
     }
+    if let Some((dropped, why)) = undelivered(row) {
+        line.push_str(&format!("  dropped={dropped} ({why})"));
+    }
     for (key, value) in printed_fields(row) {
         line.push_str(&format!("  {key}={}", field_text(value, full)));
     }
@@ -296,6 +299,28 @@ fn silent_completion(row: &serde_json::Value) -> bool {
     }
 }
 
+/// The rows that can name the program's messages the caller never
+/// received, each with why, as its line says it: a window (the caller
+/// read too slowly) and the row saying the caller left (they were still
+/// waiting to go out).
+const UNDELIVERED: &[(&str, &str)] = &[
+    ("caller_window", "the caller read too slowly and never received these messages"),
+    ("caller_disconnected", "still waiting to go out when the exchange ended; the caller never received these messages"),
+];
+
+/// The offsets a caller row names as never received by the caller,
+/// joined, with why, or `None` when it names none. The bare list would
+/// print as `dropped=[12,13]` and leave the reader guessing what was
+/// dropped, on the line they are reading because their client missed
+/// part of a stream; the offsets are the `offset` of the program's
+/// messages, in an earlier window or this one.
+fn undelivered(row: &serde_json::Value) -> Option<(String, &'static str)> {
+    let kind = row.get("kind").and_then(|v| v.as_str())?;
+    let (_, why) = UNDELIVERED.iter().find(|(k, _)| *k == kind)?;
+    let offsets: Vec<String> = row.get("dropped")?.as_array()?.iter().map(|o| o.to_string()).collect();
+    (!offsets.is_empty()).then(|| (offsets.join(","), *why))
+}
+
 /// The fields one row shows in its generic tail: everything it carries
 /// except the columns printed in their own place, and except the ones
 /// saying nothing (an absent value and an empty one say the same
@@ -313,7 +338,10 @@ fn printed_fields(row: &serde_json::Value) -> impl Iterator<Item = (&String, &se
             serde_json::Value::String(text) => text.is_empty(),
             _ => false,
         };
-        !COLUMNS.contains(&key.as_str()) && !empty
+        // A caller window's drops are said in their own words
+        // (`undelivered`).
+        let said = key.as_str() == "dropped" && undelivered(row).is_some();
+        !COLUMNS.contains(&key.as_str()) && !empty && !said
     })
 }
 
@@ -1247,6 +1275,28 @@ mod tests {
             "atUnix": 1_756_838_207u64, "reason": {"kind": "did_not_flow"},
         });
         assert!(!event_line(&skipped, false).contains("nothing emitted"));
+    }
+
+    /// A caller window that names messages the caller never received
+    /// says what they are, and one that names none says nothing about it.
+    #[test]
+    fn a_caller_window_says_which_messages_never_reached_the_caller() {
+        let window = |dropped: serde_json::Value| json!({
+            "kind": "caller_window", "firstOffset": 3, "lastOffset": 4,
+            "messages": [], "totals": [], "dropped": dropped, "atUnix": 1_756_838_207u64,
+        });
+        let line = event_line(&window(json!([1, 4])), false);
+        assert!(line.contains("dropped=1,4 (the caller read too slowly and never received these messages)"), "{line}");
+        assert!(!line.contains("dropped=["), "said once, in words: {line}");
+        let line = event_line(&window(json!([])), false);
+        assert!(!line.contains("dropped"), "{line}");
+        let left = json!({
+            "kind": "caller_disconnected", "offset": 9, "reason": "caller hung up",
+            "dropped": [7, 8], "atUnix": 1_756_838_207u64,
+        });
+        let line = event_line(&left, false);
+        assert!(line.contains("dropped=7,8 (still waiting to go out when the exchange ended"), "{line}");
+        assert!(line.contains("reason=caller hung up") && !line.contains("dropped=["), "{line}");
     }
 
     /// kind has.

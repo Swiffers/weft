@@ -342,6 +342,9 @@ pub enum DispatcherEvent {
     /// What the conversation said during one window, both directions in
     /// one row, the same shape and clock as a bus window. A message
     /// whose content was not kept still appears carrying its size.
+    /// `dropped` names the program's messages the caller never received
+    /// (it read too slowly), possibly ones of an earlier window
+    /// ([`crate::stream_journal::aggregate_caller_window`]).
     // SYNC: CallerWindow <-> crates/weft-journal/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/runFollower.ts DispatcherEvent 'caller_window'
     CallerWindow {
         run_id: RunId,
@@ -350,6 +353,8 @@ pub enum DispatcherEvent {
         last_offset: u64,
         messages: Vec<crate::stream_journal::WindowedCallerMessage>,
         totals: Vec<crate::stream_journal::CallerWindowTotal>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<u64>,
         at_unix: u64,
     },
     /// A node error surfaced to the caller.
@@ -361,12 +366,17 @@ pub enum DispatcherEvent {
         at_unix: u64,
     },
     /// The caller is gone (response complete OR disconnected). Last
-    /// event in the caller stream; replay cursors stop here.
+    /// event in the caller stream; replay cursors stop here. `dropped`
+    /// names the program's messages still waiting to go out when the
+    /// exchange ended, which the caller never received.
+    // SYNC: CallerDisconnected <-> crates/weft-journal/src/events.rs CallerDisconnected, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'disconnected', extension-vscode/src/runFollower.ts DispatcherEvent 'caller_disconnected'
     CallerDisconnected {
         run_id: RunId,
         project_id: uuid::Uuid,
         offset: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<u64>,
         at_unix: u64,
     },
     /// Graph-level participation: a node was wired to a bus. Derived

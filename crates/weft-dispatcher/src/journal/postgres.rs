@@ -1123,10 +1123,10 @@ impl Journal for PostgresJournal {
             return Ok(Lost::NotLost);
         }
         // Its owner still holds it (`weft_task_store::run_held_until_sql!`).
-        let (held, cancel_requested): (bool, Option<sqlx::types::Json<weft_core::run::CancelCause>>) = sqlx::query_as(concat!(
+        let (held,): (bool,) = sqlx::query_as(concat!(
             "SELECT ",
             weft_task_store::run_held_until_sql!("r"),
-            " >= $2, r.cancel_requested FROM run r WHERE r.run_id = $1"
+            " >= $2 FROM run r WHERE r.run_id = $1"
         ))
         .bind(run_id)
         .bind(lapsed_before)
@@ -1140,7 +1140,7 @@ impl Journal for PostgresJournal {
         // Queued again, it would only start a worker to read the cancel
         // off its claim (and one for a project being removed, whose
         // workers were just killed).
-        if let Some(cause) = cancel_requested {
+        if let Some(cause) = locked.cancel_requested.take() {
             sqlx::query("UPDATE run SET owner = NULL, epoch = epoch + 1, delivered_until = NULL WHERE run_id = $1")
                 .bind(run_id)
                 .execute(&mut *tx)

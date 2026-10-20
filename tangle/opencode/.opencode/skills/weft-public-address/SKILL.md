@@ -18,8 +18,9 @@ subscription again:
 > this trigger needs '<service>' to deliver events TO your weft, which
 > requires your weft to be reachable from the internet, and it is not. If
 > you accept making its public trigger surface reachable, rerun
-> `./setup.sh --public-url`, then `weft activate` (or `weft resync`, when
-> the trigger is already on); or use a connection that supports dialing
+> `./setup.sh --public-url`, then `weft activate`, or, when the trigger is
+> already on, turn it off and on again (`weft deactivate --trigger <name>`,
+> then `weft activate --trigger <name>`); or use a connection that supports dialing
 > out (your own provider app), where the service offers one. See
 > https://weavemindai.github.io/weft/connections/events.html
 
@@ -43,8 +44,9 @@ thing the tool told them. Steps:
    `ask`-first moves.
 3. Run `./setup.sh --public-url`, then `weft daemon status` to read back
    the hostname it minted.
-4. Run `weft activate`, or `weft resync` if the trigger is already on
-   (`weft activate` refuses a trigger that is on). If the same error comes back, the transport
+4. If `weft status` shows the trigger off, run `weft activate`. If it is
+   already on, take it down and up: `weft deactivate --trigger <node>`,
+   then `weft activate --trigger <node>`. If the same error comes back, the transport
    was never the problem; go and read the trigger's own metadata for
    which transports its connection actually supports.
 

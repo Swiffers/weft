@@ -5,7 +5,7 @@ description: "Read when the user asks what a run costs, or when a node is wired 
 
 # What a call costs
 
-A node never computes what its API call cost. Every cost figure in weft comes from a [meter]: separate code that watches the request go out and the answer come back, and works out the real number. The number lands on [the trail], the durable record of what a run spent, read with `weft events <run-id> --kind cost_reported`.
+A node never computes what its API call cost. Every cost figure in weft comes from a [meter]: separate code that watches the request go out and the answer come back, and works out the real number. The number lands on [the trail], the durable record of what a run spent, read with `weft events <run-id> --kind cost_reported`. If the user wants a ceiling on what one instance spends (one customer, one chat), the program reads that record before the paid call: for the shape and its limits, go and read the `weft-instances` skill, "Tokens and costs".
 
 ## Two kinds of meter, and only one of them is yours
 

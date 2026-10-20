@@ -30,8 +30,16 @@ That one is cheap enough to call every iteration.
 The flag is sticky. Once it is set, every later check sees it, so there is no
 race between the cancel arriving and your next look.
 
-What needs an arm: every wait, every long call to somebody else, and every read
-that could block for minutes.
+If your node waits on something itself (a sleep, a long call to somebody
+else, a read that could block for minutes), race it against
+`cancel.cancelled()` in a `select!` like the one above. The waits weft parks
+for you need none: `ctx.await_signal`, `ctx.await_signal_with_cancel`, and the
+ctx calls that wait through them, like `infra(..).start()`. Cancelling the run
+takes those down for you.
+
+If the wait is on a job a provider runs, and you want the provider
+told too, go and read [if the run is cancelled while the job
+runs](durable-execution.md#if-the-run-is-cancelled-while-the-job-runs).
 
 ## Stopping other runs
 
@@ -98,7 +106,8 @@ assert_eq!(rig.stops().len(), 1);
 
 `StopSelf` is also the last argument of every call that takes part of the
 project down (`ctx.infra("bridge").stop(..)`, `terminate(..)`,
-`ctx.trigger("receive").deactivate(..)`, `ctx.runs().clean(..)`). For what
+`wipe(..)`, `upgrade(..)`, `ctx.trigger("receive").deactivate(..)`,
+`ctx.runs().clean(..)`). For what
 `Keep` and `Include` do there, go and read
 [taking something down from a run](../running/instances.md#taking-something-down-from-a-run).
 

@@ -111,12 +111,10 @@ For an observer that must **not** end the bus when it is done (a debug tap, or
 a node streaming the bus out to a caller), use `ctx.bus_from_input("channel")`
 instead.
 
-Registering is the "I am here and ready" moment. A node with a slow warmup
-should hold the bus and register when it is genuinely ready, because that is
-what everybody else's `wait_for` is waiting on.
-
-Each reader has its own cursor. Reading does not consume, so ten readers all
-see everything.
+If your node has a slow warmup, call `join_bus` only once it is ready, because
+registering is what everybody else's `wait_for` waits on. Each reader has its
+own cursor, starting where it joined, so reading takes nothing away from the
+others.
 
 `wait_for(name)` parks until that name is live, or returns an error if the bus
 closed first. You never have to decide whether a name will ever turn up: the
@@ -155,41 +153,36 @@ read [talking to a live caller](live-callers.md)).
 ## Choosing options
 
 ```rust
-BusOptions::default()
-    .ephemeral(true)
-    .window(256)
-    .payload(BusPayload::Bytes)
+use weft::bus::{BusOptions, BusPayloadKind};
+
+BusOptions {
+    journal: ctx.journal_policy()?,
+    window: Some(256),
+    payload: BusPayloadKind::Bytes,
+    ..BusOptions::default()
+}
 ```
 
-| Option | Default | What it decides |
+| Field | Default | What it decides |
 |---|---|---|
-| `ephemeral` | `false` | Whether payloads are recorded, or only counts |
-| `window` | 64 messages | How far back a reader can reach |
-| `payload` | JSON | JSON or bytes. Frozen at creation; sending the other shape is refused |
-| `journal_window` | 1 second | How often the record is written |
-| `meta` | nothing | Details every reader can read off the marker: a sample rate, dimensions. Keep it small, it rides the marker |
+| `journal` | `JournalPolicy::default()`: journaled, one-second window | What the record keeps of this bus and how often it writes a row. `ctx.journal_policy()?` hands over what your node's users set, `JournalPolicy::ephemeral()` keeps payloads out whatever they set (what `ElevenLabsSpeak` does) |
+| `window` | `None`, which is 64 messages | How far back a reader can reach |
+| `payload` | `BusPayloadKind::Json` | JSON or bytes. Frozen at creation; sending the other shape is refused |
+| `meta` | `Value::Null` | Details every reader can read off the marker: a sample rate, dimensions. Keep it small, it rides the marker |
 
-Ephemeral is for a firehose. Video frames should not stall because a reader is
-slow, and should not end up in permanent storage either. A slow reader on an
-ephemeral bus silently skips to the oldest message still held, because there is
-no backpressure: the camera does not wait.
-
-On a journaled bus, a send is refused if the record cannot be written, before
-anything is appended. On an ephemeral one it never is, because its record is
-notes rather than the data.
-
-In both, who joined and who left is always kept, so nothing a reader needs can
-hide in a gap.
+If you want your node's users to choose between the two modes and pick the
+window, set `features.journalSettings` in its `metadata.json` (go and read
+[features](metadata.md#features)) and pass `ctx.journal_policy()?` as above.
+For what each mode keeps and what the window does, go and read [two
+modes](../language/streams-and-buses.md#two-modes).
 
 ## What a send tells you
 
 Failures are values, never silent drops: the bus was closed, you never
 registered, you sent the wrong payload shape, or the record is degraded.
 
-## The one thing to remember
+## A bus dies with its worker
 
-A bus lives exactly as long as its worker. It is not rebuilt when a worker
-restarts, and a marker resolved afterwards fails saying the bus is unknown.
-
-It is for nodes that are alive together right now. Anything that has to survive
-goes in [storage](storage.md), or through a node that ends.
+A bus is not rebuilt when a worker restarts: a node that reads its port
+afterwards fails with `no bus with id ... is live in this run`. Anything that has to survive goes in
+[storage](storage.md), or out as an ordinary output of a node that finishes.

@@ -214,7 +214,7 @@ impl StandIn {
                  it (`weft activate` prints the URL)"
             );
         }
-        let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = ExchangeJournal::new(journal, replica.to_string(), cfg.journal_policy());
+        let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = ExchangeJournal::new(journal, replica.to_string(), cfg.journal);
         // The stand-in serves the REQUEST and records the answer, and that
         // is all it can honestly do: a fired run's body, when the author
         // typed one, is a field of the trigger's own wake payload, and the
@@ -607,6 +607,10 @@ struct PendingCallerWindow {
     /// flush.
     run_id: Option<RunId>,
     messages: Vec<weft_core::stream_journal::WindowedCallerMessage>,
+    /// The program's messages the caller will never receive, each
+    /// decided as one of `messages` was sent, so it joins the same row
+    /// (`aggregate_caller_window`).
+    dropped: Vec<u64>,
     /// What the messages above already weigh, so a window closes on
     /// size as well as on time (see `JOURNAL_ROW_BYTES`).
     kept_bytes: usize,
@@ -644,7 +648,10 @@ impl ExchangeJournal {
         let weak = self.me.clone();
         let window = self.policy.window;
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(window);
+            // The first tick one window from now, not at once: a plain
+            // `interval` completes its first tick immediately, which
+            // would write the window's first message in a row of its own.
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + window, window);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -664,7 +671,8 @@ impl ExchangeJournal {
     /// Hold one message for the open window. What the journal keeps of
     /// it is decided here rather than at flush time, so an oversized
     /// payload is cut once and the buffer never holds more than the
-    /// journal will.
+    /// journal will. `dropped` joins under the same lock as the message,
+    /// so a flush between the two can never leave it in a row of its own.
     fn hold(
         &self,
         run_id: RunId,
@@ -672,6 +680,7 @@ impl ExchangeJournal {
         direction: weft_core::stream_journal::CallerDirection,
         payload: &weft_core::bus::WirePayload,
         terminal: bool,
+        dropped: Option<u64>,
     ) {
         self.start_clock();
         let kept = weft_core::stream_journal::record(payload, &self.policy);
@@ -691,6 +700,7 @@ impl ExchangeJournal {
         let mut pending = self.pending.lock().expect("caller journal buffer");
         pending.run_id.get_or_insert(run_id);
         pending.kept_bytes += weighs;
+        pending.dropped.extend(dropped);
         pending.messages.push(weft_core::stream_journal::WindowedCallerMessage {
             offset,
             direction,
@@ -704,16 +714,16 @@ impl ExchangeJournal {
 
     /// Write the open window, if it holds anything.
     fn flush(&self) {
-        let (run_id, messages) = {
+        let (run_id, messages, dropped) = {
             let mut pending = self.pending.lock().expect("caller journal buffer");
             if pending.messages.is_empty() {
                 return;
             }
             pending.kept_bytes = 0;
-            (pending.run_id, std::mem::take(&mut pending.messages))
+            (pending.run_id, std::mem::take(&mut pending.messages), std::mem::take(&mut pending.dropped))
         };
         let Some(run_id) = run_id else { return };
-        let Some(window) = weft_core::stream_journal::aggregate_caller_window(messages) else {
+        let Some(window) = weft_core::stream_journal::aggregate_caller_window(messages, dropped) else {
             return;
         };
         self.emit(weft_journal::RunEvent::CallerWindow {
@@ -722,6 +732,7 @@ impl ExchangeJournal {
             last_offset: window.last_offset,
             messages: window.messages,
             totals: window.totals,
+            dropped: window.dropped,
             at_unix: window.last_at_unix,
         });
     }
@@ -804,6 +815,7 @@ impl crate::caller_conn::CallerJournalSink for ExchangeJournal {
             weft_core::stream_journal::CallerDirection::Inbound,
             &inbound_payload(msg),
             false,
+            None,
         );
     }
     fn outbound(
@@ -812,6 +824,7 @@ impl crate::caller_conn::CallerJournalSink for ExchangeJournal {
         offset: u64,
         chunk: &weft_core::caller::OutboundChunk,
         terminal: bool,
+        dropped: Option<u64>,
     ) {
         self.hold(
             run_id,
@@ -819,6 +832,7 @@ impl crate::caller_conn::CallerJournalSink for ExchangeJournal {
             weft_core::stream_journal::CallerDirection::Outbound,
             &outbound_payload(chunk),
             terminal,
+            dropped,
         );
     }
     fn errored(&self, run_id: RunId, offset: u64, message: &str) {
@@ -829,7 +843,7 @@ impl crate::caller_conn::CallerJournalSink for ExchangeJournal {
             at_unix: crate::now_unix(),
         });
     }
-    fn disconnected(&self, run_id: RunId, offset: u64, reason: &str) {
+    fn disconnected(&self, run_id: RunId, offset: u64, reason: &str, dropped: &[u64]) {
         // The exchange is over: write what is held, say so, and let the
         // window clock stop. Nothing said after this can be lost,
         // because nothing is said after this.
@@ -837,6 +851,7 @@ impl crate::caller_conn::CallerJournalSink for ExchangeJournal {
             run_id,
             offset,
             reason: reason.to_string(),
+            dropped: dropped.to_vec(),
             at_unix: crate::now_unix(),
         });
         self.pending.lock().expect("caller journal buffer").closed = true;
@@ -1300,7 +1315,7 @@ impl crate::caller_conn::LiveStarter for LiveStarter {
             }
         };
         let sink: Arc<dyn crate::caller_conn::CallerJournalSink> =
-            ExchangeJournal::new(start.journal.clone(), self.worker.replica.clone(), admitted.live_config.journal_policy());
+            ExchangeJournal::new(start.journal.clone(), self.worker.replica.clone(), admitted.live_config.journal);
         let run_id = start.run_id;
         let worker = self.worker.clone();
         start.slot = Some(admitted.slot);

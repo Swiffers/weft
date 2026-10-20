@@ -60,9 +60,12 @@ impl Node for ReplyNode {
         // Read before the body is spent: a file sent as bytes names its
         // own type and filename on the response.
         let file = (data_type == DataType::Bytes).then(|| StoredFile::from_value(&body).ok()).flatten();
-        let chunk = wire::chunk_for(&ctx, data_type, body).await?;
+        let made = wire::chunk_for(&ctx, data_type, body).await;
         match caller {
             CallerHandle::Http(http) => {
+                // The whole answer: one that cannot be made is this
+                // node's failure, whatever the route skips in a stream.
+                let chunk = made?;
                 let mut head = wire::head_for(status, headers.as_ref())?;
                 if let Some(file) = &file {
                     head = wire::with_file_head(head, file);
@@ -71,6 +74,10 @@ impl Node for ReplyNode {
             }
             CallerHandle::Websocket(ws) => {
                 wire::refuse_head_on_socket("Reply", status, headers.as_ref())?;
+                // One message of many: one that cannot be made fails the
+                // session, or is skipped when the socket's
+                // `whenChunkFails` says so, `done` then staying absent.
+                let Some(chunk) = ws.drop_or_fail(made)? else { return Ok(()) };
                 ws.send(chunk).await?;
             }
         }

@@ -233,7 +233,7 @@ pub async fn take_down(
     };
     if keys.is_empty() && matches!(target, TakeDownTarget::Activations(_)) {
         let commands = match cause {
-            DownCause::Person | DownCause::Health => Vec::new(),
+            DownCause::Person | DownCause::Health(_) => Vec::new(),
             DownCause::Infra(commands) => match commands.issue(&state.pg_pool, project_id).await.map_err(|e| internal("issue the infra commands", e))? {
                 Some(crate::infra_lifecycle_command::Issued::Commands(ids)) => ids,
                 Some(crate::infra_lifecycle_command::Issued::UpgradeInFlight(command)) => {
@@ -304,9 +304,9 @@ pub async fn take_down(
     // running now, as the answers say. Cancelling strips a run's own waits.
     let runs = live_runs(state, project_id).await.map_err(|e| internal("live runs", e))?;
     let affected = affected_runs(target, &runs, asked_by);
-    let user = weft_core::run::CancelCause::User;
+    let why = cancel_cause(&cause, asker);
     let cancelled: Vec<(RunId, &weft_core::run::CancelCause)> =
-        runs_to_cancel(take_down, &affected).into_iter().map(|r| (r.run_id, &user)).collect();
+        runs_to_cancel(take_down, &affected).into_iter().map(|r| (r.run_id, &why)).collect();
     crate::api::run::cancel_run_ids(state, &cancelled).await.map_err(|e| internal("cancel", e))?;
 
     // Nothing of the project takes work any more: its front goes.
@@ -314,6 +314,32 @@ pub async fn take_down(
     state.events.publish(DispatcherEvent::ProjectDeactivated { project_id }).await;
     let going = affected.iter().filter(|run| !run.suspended).count() as u64;
     Ok(TakenDown::Done(Taken { keys, held, runs: going, commands, tokens }))
+}
+
+/// Why the runs a take-down cancels were cancelled, as their record says
+/// it: the health check names the copies it found broken, a program's run
+/// names itself, and anything else was a person's command.
+fn cancel_cause(cause: &DownCause<'_>, asker: TakeDownAsker) -> weft_core::run::CancelCause {
+    use weft_core::run::CancelCause;
+    match (cause, asker.run()) {
+        (DownCause::Health(broken), _) => {
+            let copies: Vec<String> = broken
+                .iter()
+                .map(|copy| match &copy.instance {
+                    Some(instance) => format!("'{}' of instance '{instance}'", copy.node_id),
+                    None => format!("'{}'", copy.node_id),
+                })
+                .collect();
+            CancelCause::Runtime {
+                detail: format!(
+                    "the infra health check found {} broken and took down the triggers that read it, stopping their runs",
+                    copies.join(", ")
+                ),
+            }
+        }
+        (_, Some(by)) => CancelCause::Run { by, tag: None },
+        (_, None) => CancelCause::User,
+    }
 }
 
 #[cfg(test)]
@@ -415,5 +441,26 @@ mod tests {
         assert_eq!(report.triggers.len(), 2);
         assert_eq!(report.held, HeldWork { arrivals: 2, paused: 0 });
         assert_eq!(report.runs, 1);
+    }
+
+    /// A run the health check stops says the health check did, naming the
+    /// broken copies; one a program's run stops names that run; the rest
+    /// were a person's.
+    #[test]
+    fn the_cancelled_runs_say_what_took_their_triggers_down() {
+        use weft_broker_client::protocol::InfraCopy;
+        use weft_core::run::CancelCause;
+        let broken = [
+            InfraCopy { node_id: "db".into(), instance: None },
+            InfraCopy { node_id: "cache".into(), instance: Some(InstanceId::new("ada").unwrap()) },
+        ];
+        let CancelCause::Runtime { detail } = cancel_cause(&DownCause::Health(&broken), TakeDownAsker::Outside) else {
+            panic!("the health check is no person");
+        };
+        assert!(detail.contains("health check") && detail.contains("'db', 'cache' of instance 'ada'"), "{detail}");
+        let by = RunId::from_u128(7);
+        assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Run(by)), CancelCause::Run { by, tag: None });
+        assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Outside), CancelCause::User);
+        assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Resync(uuid::Uuid::nil())), CancelCause::User);
     }
 }

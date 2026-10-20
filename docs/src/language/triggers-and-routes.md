@@ -15,12 +15,8 @@ Nothing listens until you run `weft activate`. Go and read
 ## What a run started by a trigger covers
 
 Everything downstream of the trigger that fired, plus whatever that work needs
-upstream, stopping the walk when it reaches another trigger.
-
-Only the trigger that actually fired gets the event. Any others in the project
-close their outputs, so paths that needed them skip.
-
-Two triggers can share the nodes in the middle without their runs becoming one.
+upstream. Any other trigger in the project closes its outputs, so paths that
+needed it skip.
 
 ## A trigger's inputs are frozen
 
@@ -47,19 +43,32 @@ does it and listens
 `Route` claims an address and starts a run when somebody calls it.
 
 ```weft
-post = Route -> (body: JsonDict) {
+type Card = { title: String, color?: String }
+
+post = Route -> (body: Card) {
   path: "cards"
   method: "POST"
 }
 
-reply = Reply {
-  body: { "id": saved.id }
+answer = JsonObject {
+  title: post.body.title
+  status: "saved"
 }
+
+reply = Reply { body: answer.object }
 ```
 
 The caller is held open while your program works, and `Reply` is what answers
 them. For streaming an answer as it is produced, and for the Rust side, go and
 read [talking to a live caller](../nodes/live-callers.md).
+
+The request's body comes out whole on `body`. Left undeclared, it is a
+`JsonDict`. If you declare a type on it, as `Card` above, a call whose body
+does not fit is answered `400` naming what is wrong, and no node after `post`
+runs. A body carrying a key that `Card` does not declare is answered `400`
+too. If callers may
+send more than you read, end the type with `..`; for what that does, go and
+read [what fits into what](types.md#what-fits-into-what). A request with no body, like a `GET`, closes `body`.
 
 If you want part of the path as a value, capture it with `{name}` and declare
 an output of the same name:
@@ -73,11 +82,10 @@ card = Route -> (id: String) {
 
 A call to `cards/42` puts `"42"` on `card.id`. Every other output you add to a
 `Route` has to be a capture of its path, typed `String`, or the build stops
-with `route-output-not-a-capture`. Declaring one of `Route`'s own outputs,
-like `body` above, is fine. A capture can't share a name with one of
+with `route-output-not-a-capture`. A capture can't share a name with one of
 `Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`, `caller`,
-`fired`), so `cards/{body}` is a compile error asking you to rename the
-capture.
+`fired`), so `cards/{body}` is the `route-capture-shadows-output` error,
+asking you to rename the capture.
 
 **Two routes that one call could reach, where neither is more specific, is an
 error.** `cards/count` beside `cards/{id}` is fine, because the first is more
@@ -107,11 +115,14 @@ activates. If another program or another of your projects holds that port,
 `weft activate` prints the address, and `weft status` shows it later or says
 why it is unavailable. Your routes keep answering under `/connect/local/<project id>/` as well.
 
-If a call arrives while the route's trigger is parked, hibernating within its
-grace window, or still being set up, it is answered `503` with a `Retry-After`
-at once, so a client that retries gets through once the trigger is on. Once
-the project is switched off (wiped), its own port is closed and
-`/connect/local/<project id>/<path>` answers `404`.
+If a call arrives while the route's trigger is down or still being set up, it
+does not wait for the trigger: it is answered `503` at once, with a `Retry-After` of 5 seconds,
+so a client that retries gets through once the trigger is back on. The
+exception is a trigger taken down with `weft deactivate --door refuse --held
+drop`, which takes its route away with it, so a call is answered `404`,
+the same as a call to a path no route serves. For what a take-down does with
+other work, like a webhook or a form, go and read [starting and stopping
+things](../running/lifecycles.md).
 
 ## How a run is kept
 
@@ -138,6 +149,8 @@ pay = Route -> (body: JsonDict) {
 | `recorded` | on | a page asks a route for something every few seconds (turn it off) |
 | `outlivesCaller` | off | a run answers its caller early and keeps working (only on a trigger that holds a caller on the line, like `Route` and `Socket`) |
 | `keepRunsFor` | the project's, else a week | you want its runs kept longer or shorter once they end (`12h`, `30d`, `forever`). For the project-wide default, go and read [how long a run is kept](../running/the-journal.md#how-long-a-run-is-kept) |
+| `journalEphemeral` | off | what streams through the route should not be written to the run's record, only counted. For what that keeps, go and read [two modes](streams-and-buses.md#two-modes) |
+| `journalWindowMs` | 1000 | you want the record's rows to cover less or more time, from 100 to 60000 ms. Same page |
 | `holdSecs` | 60 | a run that cannot pause should wait longer for an answer (up to 30 days), or not at all (`0`). See [when a run cannot pause](#when-a-run-cannot-pause) |
 
 **By default (`durable` off), a run is fast: it only waits for the database
@@ -339,6 +352,58 @@ and that ends only its connection), or, when the page passes credentials,
 the route refuses them. A browser is told nothing about a socket refused at
 its opening (it sees only that it closed), so a socket opened without
 credentials keeps trying, at most every 15 seconds.
+
+## Slow callers and messages that cannot be made
+
+Picture a live price page streaming from a `Route`, and a phone on a bad
+connection reading it. Your program writes faster than the phone reads, so
+messages pile up for it. Up to 256 wait; past that, the route's
+`whenCallerIsSlow` decides what gives:
+
+| `whenCallerIsSlow` | What happens when 256 are waiting | Set it when |
+|---|---|---|
+| `block` (the default) | Your program's next send waits for room, so a slow caller slows the program down and gets every message | The caller has to read the whole thing: a model's answer, a conversation |
+| `drop_oldest` | The oldest waiting message is thrown away to make room, so the caller always gets the latest | Only the newest value matters: live video, a price feed |
+| `drop_newest` | The new message is thrown away, and what was already waiting goes out in order | The messages already waiting matter more than the ones arriving while the caller is behind |
+
+```weft
+db = PostgresDatabase { database: "shop" }
+
+prices = Route -> (symbol: String) {
+  path: "prices/{symbol}"
+  method: "GET"
+  whenCallerIsSlow: "drop_oldest"
+}
+latest = PostgresWatchQuery(symbol: String) {
+  account: db.access
+  symbol: prices.symbol
+  query: "SELECT price FROM quote WHERE symbol = $symbol"
+  channel: "quote_changed"
+}
+feed = Stream { format: "ndjson", bus: latest.row }
+```
+
+The other setting, `whenChunkFails`, is for a message your program cannot turn
+into the route's `dataType` at all: a value that is not a `String` on a `text`
+route, a file that cannot be read.
+
+| `whenChunkFails` | What happens | Set it when |
+|---|---|---|
+| `surface` (the default) | The node sending it fails and the caller is told, the way [a run that ends before it answers](#when-a-run-ends-before-it-answers) tells them | Every message counts |
+| `drop_chunk` | That message is skipped, the skip goes on the run's record, and the answer goes on | One missing message is fine, like a frame of a live feed |
+
+A `Socket` has both settings and they mean the same, for every message a
+`Reply` or a `Stream` sends on it; under `surface` the socket closes with
+`1011`. A run that fails, or a bus that ends failed, is told to the caller
+whatever `whenChunkFails` says.
+
+If a caller says part of a stream never arrived, the run's record shows
+which. The inspector strikes each lost message through and says why, and
+`weft events` prints them on the caller's rows as `dropped=<offsets> (<why>)`,
+an offset being the message's place in the conversation. The messages still
+waiting when the caller left are named the same way, whatever
+`whenCallerIsSlow` says. A message skipped under `drop_chunk` shows as
+an error row saying `a chunk was dropped and the exchange went on`, then why.
 
 ## Which triggers need a public address
 

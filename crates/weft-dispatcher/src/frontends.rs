@@ -334,7 +334,7 @@ async fn another_visitor_address(state: &DispatcherState, project: uuid::Uuid) -
         StatusCode::CONFLICT,
         format!(
             "{holder} already carries this project's visitor address, and a link to a stored file has one way to go; \
-             `weft frontend visitor-address <name>` with no address clears it"
+             `weft frontend visitor-address <name> off` clears it"
         ),
     )
 }

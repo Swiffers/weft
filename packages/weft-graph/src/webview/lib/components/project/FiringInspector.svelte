@@ -603,10 +603,17 @@
 			{#if runTerminal?.state === 'cancelled'}
 				{#if runTerminal.cause?.kind === 'run'}
 					<!-- The structured cause: the run that asked is a run a
-					     person can look up, the tag is what it matched on. -->
-					<span title="Stopped by run {runTerminal.cause.by} (a sibling run's stop_tagged)">
-						stopped by run <span class="font-mono">{runTerminal.cause.by.slice(0, 8)}</span> on tag <span class="font-mono">{runTerminal.cause.tag}</span>
-					</span>
+					     person can look up, the tag is what it matched on
+					     (none when that run took this one's triggers down). -->
+					{#if runTerminal.cause.tag !== undefined}
+						<span title="Stopped by run {runTerminal.cause.by} (a sibling run's stop_tagged)">
+							stopped by run <span class="font-mono">{runTerminal.cause.by.slice(0, 8)}</span> on tag <span class="font-mono">{runTerminal.cause.tag}</span>
+						</span>
+					{:else}
+						<span title="Stopped by run {runTerminal.cause.by}, which took this run's triggers down">
+							stopped by run <span class="font-mono">{runTerminal.cause.by.slice(0, 8)}</span>, which took its triggers down
+						</span>
+					{/if}
 				{:else if runTerminal.reason}
 					<span title="How this run ended (the cancel's cause)">ended: {runTerminal.reason}</span>
 				{/if}

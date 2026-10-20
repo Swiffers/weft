@@ -375,7 +375,9 @@ impl TypeRegistry {
                             if existing.nominal && existing.body == body {
                                 // Identical redeclaration: absorbed.
                             } else if existing.nominal {
-                                let first = first_origin.get(name.as_str()).copied().unwrap_or("?");
+                                // A name the registry held before this call has no
+                                // origin here: say where it was, not "?".
+                                let first = first_origin.get(name.as_str()).copied().unwrap_or("the registry this extends");
                                 return Err(format!(
                                     "type `{name}` is declared twice with different bodies \
                                      (first in {first}, then in {origin}: `{body_str}`); rename one"
@@ -1446,7 +1448,7 @@ impl WeftType {
     }
 
     /// Public helper: extract the mode from a Bus marker. Returns
-    /// `Some(BusMode)` on success, `None` if the value is not a Bus
+    /// `Some(JournalMode)` on success, `None` if the value is not a Bus
     /// marker OR the mode field is missing OR the field carries an
     /// unrecognised string. Callers MUST treat `None` as "this is not
     /// a routable bus marker for THIS run"; do NOT default to
@@ -1454,19 +1456,19 @@ impl WeftType {
     /// journaled would route a frame-rate stream into permanent
     /// journal storage.
     #[cfg(feature = "runtime")]
-    pub fn bus_marker_mode(value: &serde_json::Value) -> Option<crate::bus::BusMode> {
+    pub fn bus_marker_mode(value: &serde_json::Value) -> Option<crate::stream_journal::JournalMode> {
         let s = Self::detect_bus_type(value.as_object()?)?.get("mode")?.as_str()?;
-        crate::bus::BusMode::from_wire_str(s)
+        crate::stream_journal::JournalMode::from_wire_str(s)
     }
 
     /// Build a Bus marker JSON value from a channel id and a mode.
-    /// Takes `BusMode` (not `&str`) so the wire-vocabulary invariant
+    /// Takes `JournalMode` (not `&str`) so the wire-vocabulary invariant
     /// is enforced at the type system; a typo can't slip through.
     /// `id` and `mode` are the marker's whole payload: every other bus
     /// parameter is read off the live handle a consumer resolves from
     /// the marker.
     #[cfg(feature = "runtime")]
-    pub fn bus_marker(id: &str, mode: crate::bus::BusMode) -> serde_json::Value {
+    pub fn bus_marker(id: &str, mode: crate::stream_journal::JournalMode) -> serde_json::Value {
         serde_json::json!({ "__weft_bus__": {
             "id": id,
             "mode": mode.as_wire_str(),

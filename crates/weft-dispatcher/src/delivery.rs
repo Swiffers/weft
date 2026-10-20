@@ -309,7 +309,7 @@ pub fn wont_start_cause(run_id: RunId, why: &str) -> weft_core::run::CancelCause
     weft_core::run::CancelCause::Runtime {
         detail: format!(
             "{why}. Nothing will run on that build again: fix the program and build again (`weft resync` puts \
-             triggers that are on onto the new build), then `weft run --seed {run_id}` picks this run up from \
+             triggers that are on onto the new build), then `weft run --seed={run_id}` picks this run up from \
              what it did"
         ),
     }
@@ -754,7 +754,7 @@ mod tests {
             panic!("a runtime cause");
         };
         assert!(detail.starts_with("the worker of this build cannot start: it exited."), "{detail}");
-        assert!(detail.contains("weft resync") && detail.contains(&format!("weft run --seed {run_id}")), "{detail}");
+        assert!(detail.contains("weft resync") && detail.contains(&format!("weft run --seed={run_id}")), "{detail}");
     }
 
     /// A busy answer is never a refusal: the worker's own busy `503` waits

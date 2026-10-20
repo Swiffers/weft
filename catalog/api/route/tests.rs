@@ -581,6 +581,27 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(spec["config"]["data_type"], "text");
     assert_eq!(spec["config"]["outlives_caller"], true);
     assert_eq!(spec["config"]["auth"]["kind"], "none");
+    assert_eq!(spec["config"]["error_mode"], "surface", "a route that says nothing tells its caller");
+    assert_eq!(spec["config"]["backpressure"], "block", "a route that says nothing waits for a slow caller");
+    assert_eq!(spec["config"]["journal_mode"], "journaled", "a route that says nothing is written down");
+    assert_eq!(spec["config"]["journal_window_ms"], 1000, "on the window every channel starts from");
+
+    rig.run_setup_trigger(&RouteNode, json!({ "path": "quiet", "journalEphemeral": true, "journalWindowMs": 250 }))
+        .await
+        .ok()?;
+    let spec = serde_json::to_value(&rig.registered_signals().last().expect("a quiet route").0).expect("spec serializes");
+    assert_eq!(spec["config"]["journal_mode"], "ephemeral");
+    assert_eq!(spec["config"]["journal_window_ms"], 250, "the journal settings reach the route");
+
+    rig.run_setup_trigger(
+        &RouteNode,
+        json!({ "path": "feed", "whenChunkFails": "drop_chunk", "whenCallerIsSlow": "drop_oldest" }),
+    )
+    .await
+    .ok()?;
+    let spec = serde_json::to_value(&rig.registered_signals().last().expect("a second route").0).expect("spec serializes");
+    assert_eq!(spec["config"]["error_mode"], "drop_chunk");
+    assert_eq!(spec["config"]["backpressure"], "drop_oldest");
     Ok(())
 }
 

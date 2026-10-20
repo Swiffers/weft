@@ -166,18 +166,29 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             instance_id          TEXT,
             -- The rule's name, unique among its node's rules.
             rule                 TEXT NOT NULL,
-            -- Its action ran for the copy and the rule has held since.
+            -- Its action was queued for the copy and has not failed, and
+            -- the rule has held since.
             fired                BOOLEAN NOT NULL DEFAULT false,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             -- When its failed action is tried again (unix seconds).
             next_retry_at_unix   BIGINT,
             -- When it gave up (unix seconds), shown in `weft status`; it is
             -- armed again when the units it saw then change, a command
-            -- touches the project, or every unit is healthy.
+            -- touches the project, or the rule stops holding.
             gave_up_at_unix      BIGINT,
             -- The copy's units the health loop saw when it gave up.
             gave_up_seen         JSONB,
-            last_error           TEXT
+            last_error           TEXT,
+            -- The command its action queued (infra_lifecycle_command.id)
+            -- that no look has seen end yet, and when it counts as failed
+            -- if it has not ended (unix seconds; both set or neither).
+            queued_command       BIGINT,
+            queued_deadline_unix BIGINT,
+            -- A take-down rule's: its take-down was queued for the copy and
+            -- did not fail, and the copy has not come back since. Only
+            -- such a copy, or one whose bring-back rules say it is still
+            -- broken, keeps a trigger down when a bring-back runs.
+            took_down            BOOLEAN NOT NULL DEFAULT false
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_health_rule_key
               ON infra_health_rule(project_id, node_id, instance_id, rule) NULLS NOT DISTINCT"#,
@@ -185,6 +196,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_infra_health_rule_retry
               ON infra_health_rule(next_retry_at_unix)
               WHERE gave_up_at_unix IS NULL AND next_retry_at_unix IS NOT NULL"#,
+        // The broker's look for the deadline of a command a rule queued.
+        r#"CREATE INDEX IF NOT EXISTS idx_infra_health_rule_queued
+              ON infra_health_rule(queued_deadline_unix)
+              WHERE queued_deadline_unix IS NOT NULL"#,
         r#"CREATE TABLE IF NOT EXISTS infra_health_look (
             -- How the supervisor's passes over one project stand, kept
             -- across its processes (weft_broker::lifecycle_writes::sync_ownership).
@@ -208,13 +223,25 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // claimers wake) and when it completes (whoever waits on its
         // outcome wakes), from a trigger so no writer (the dispatcher's
         // own verbs, the broker's supervisor and worker paths) can forget.
-        // SYNC: the payloads <-> weft_broker_client::lifecycle_command::InfraCommandSignal
+        // A health take-down or bring-back that completes, however it
+        // ended, also asks the supervisor for one look at its project
+        // (`look:`): the rules that read what it did (the triggers'
+        // listening, what the health check took down), and the one whose
+        // command failed, are read again now rather than at the project's
+        // next unit change, which on an idle install never comes. One
+        // notice per command, so nothing is held open or looked at again.
+        // SYNC: the payloads <-> weft_broker_client::lifecycle_command::InfraCommandSignal,
+        //       weft_task_store::infra_command::look_payload
+        // SYNC: 'deactivate', 'reactivate' <-> InfraLifecycleVerb::{Deactivate, Reactivate}
         r#"CREATE OR REPLACE FUNCTION infra_command_notify() RETURNS trigger AS $$
             BEGIN
                 IF TG_OP = 'INSERT' OR (NEW.completed_at_unix IS NULL AND NOT NEW.drains) THEN
                     PERFORM pg_notify('weft_infra_command', 'issued:' || NEW.project_id::text);
                 ELSE
                     PERFORM pg_notify('weft_infra_command', 'done:' || NEW.id::text);
+                    IF NEW.verb IN ('deactivate', 'reactivate') THEN
+                        PERFORM pg_notify('weft_infra_command', 'look:' || NEW.project_id::text);
+                    END IF;
                 END IF;
                 RETURN NULL;
             END;

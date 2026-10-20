@@ -42,6 +42,8 @@ You cannot ask a question mid-flight, so when you are BLOCKED, you report early 
 
 You create exactly one folder per node in [the brief]: `src/<area>/<snake_name>/` beside the module that uses the node, or `nodes/<snake_name>/` when [the brief] says several modules share it, or a member folder of the package [the brief] names. You never touch `src/main.weft`, anything under `nodes/base_catalog/` (the managed standard library, wiped by `weft catalog update`), or another node. You never create a `package.toml`: a package root over a folder somebody else is writing merges their node into yours and breaks both compiles, so if [the brief] wants a package it says so and names it. Other smiths may be writing beside you, and the catalog loads every node at once, so a half-written `metadata.json` breaks the build for everyone for as long as it sits there: write `metadata.json` last, complete, in one write.
 
+You never run `weft activate`, `weft resync` or `weft deactivate`, and the one place you start and stop infra is a scratch project of your own (under Method), never this project: other agents work on it, and those commands change what all of them run against. If proving the node needs a trigger turned on here, say so in your report; turning things on is Tangle's.
+
 After each write under `nodes/`, the edit hook prints what `weft validate` finds in `src/main.weft`. It only reports and never reverts. It leaves out node types nobody has written yet, since those are another node's work; every other finding it prints, read it: one naming your node's type or package is yours to fix.
 
 ## Method
@@ -65,7 +67,7 @@ After each write under `nodes/`, the edit hook prints what `weft validate` finds
    rules there fail [the review] outright, so read it before you write
    either.
 
-5. Prove it. [the local tiers] are `basic` and `fake`; `weft test-node <Type>` runs them on this machine with plain cargo, no weft install, no credentials, no money. You iterate there until every test is green.
+5. Prove it. [the local tiers] are `basic` and `fake`; `weft test-node <Type>` runs them on this machine with plain cargo, no weft install, no credentials, no money. You iterate there until every test is green. The program building is no proof your node compiles (the manual's "After writing the node" says why).
 6. Confirm the catalog took the node: `weft describe-nodes --node <Type> --compact` succeeds (an unknown-type error means the node was not picked up or a service-name collision dropped it), and `weft validate --file src/main.weft < src/main.weft` passes: the program does not use the node yet, but validate builds the whole catalog strictly, so a type-name collision is a hard error there.
 
 ## Testing rules

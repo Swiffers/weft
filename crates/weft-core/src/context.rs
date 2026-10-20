@@ -519,14 +519,25 @@ impl RunContext {
     /// like a String. There is no per-port "bus registration" on the
     /// producer.
     ///
-    /// `opts` picks the mode (journaled vs ephemeral) and any per-bus
-    /// tuning. `BusOptions::default()` is the journaled-mode shape; use
-    /// `BusOptions { ephemeral: true, .. }` for video / high-rate
-    /// streams where dropping old payloads under load is preferable to
-    /// growing the journal unboundedly.
+    /// `opts` picks what the journal keeps (`opts.journal`: journaled or
+    /// ephemeral, and the window one row gathers) and any per-bus
+    /// tuning. `BusOptions::default()` is the journaled shape with the
+    /// one-second window; a node whose users choose passes
+    /// `BusOptions { journal: ctx.journal_policy()?, .. }`. A journal
+    /// window out of range is refused here, naming the range.
     ///
     /// The bus ends when this body does, with how it returned
     /// ([`crate::bus::FiringBuses`]), unless the body closes it first.
+    /// What this node's users set on the journal settings the language
+    /// gave it (`journalEphemeral`, `journalWindowMs`: a node declaring
+    /// `features.journalSettings`, or a live-connection trigger), as the
+    /// policy a channel takes. Unset, the default every channel starts
+    /// from. The one line a node needs to hand its users' choice to a bus
+    /// it opens: `BusOptions { journal: ctx.journal_policy()?, .. }`.
+    pub fn journal_policy(&self) -> WeftResult<crate::stream_journal::JournalPolicy> {
+        crate::stream_journal::JournalPolicy::from_node_fields(self.inputs.object()?).map_err(crate::error::node_error)
+    }
+
     pub fn create_bus(
         &self,
         opts: crate::bus::BusOptions,

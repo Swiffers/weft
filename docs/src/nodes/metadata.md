@@ -18,7 +18,8 @@ Three keys are required: `type`, `label` and `description`.
 ## Spelling
 
 The node's `type` and any types you declare under `types` are PascalCase
-(`WordCount`). Every key weft defines (`requiresInfra`) is camelCase, and so
+(`WordCount`), and a type variable under `typeParams` is `T`, or `T` and a
+number (`T1`). Every key weft defines (`requiresInfra`) is camelCase, and so
 is every port, setting and record field you name. So are the fields under `firesWith`, and the names under each
 event's `fields` in a service's `events` (for what those are, go and read
 [Events from a service](../connections/events.md#what-a-topic-declares)).
@@ -90,7 +91,9 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `display` | Object | none | What to render on the node's body after a firing |
 | `validate` | List | `[]` | Rules the compiler checks against the graph |
 | `portsFromConfig` | Object | none | Says this node's ports come from a list in its own config |
-| `types` | Map | `{}` | Named types this node contributes to the project |
+| `types` | Map | `{}` | Named types this node contributes to the project. Go and read [custom types](custom-types.md) |
+| `typeParams` | Map | `{}` | What each type variable of the ports may stand for. Go and read [typeParams](#typeparams) |
+| `placeholdersAreInputs` | Object | none | Which text setting's placeholders name the node's inputs. Go and read [placeholdersAreInputs](#placeholdersareinputs) |
 | `firesWith` | Map | `{}` | For a trigger: the shape of the event it wakes with |
 | `claimsRoute` | Object | none | Which config fields hold the public address this node claims |
 | `accessApps` | Map | `{}` | Public OAuth apps this node ships, by service |
@@ -119,7 +122,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `name` | String | **required** | The port name |
 | `type` | type string | **required** | What it emits |
 | `description` | String | none | A sentence next to the port |
-| `narrowable` | `true` or a type string | none | For an output whose shape only the program knows (a model's JSON answer, a request's body, a query's rows): type it broadly and set this, and a program declares what it holds (`-> (response: Verdict)`). `true` lets a program declare any type that fits inside `type`. A type string lets it declare anything that fits inside that type instead, which may be wider than `type`. Each value is checked against the declared type at run time, and one that does not fit fails the node. Without it, a program can only restate the output's own type |
+| `narrowable` | `true` or a type string | none | For an output whose shape only the program knows (a model's JSON answer, a request's body, a query's rows): type it broadly and set this, and a program declares what it holds (`-> (response: Verdict)`). `true` lets a program declare any type that fits inside `type`. A type string lets it declare anything that fits inside that type instead, which may be wider than `type`. Each value is checked against the declared type at run time, and one that does not fit fails the node, a failure the program can catch on `_error`. Without it, a program can only restate the output's own type |
 | `baked` | Boolean | `false` | On an infrastructure node: the value is worked out when the node's infra is applied, and saved, so a run that reads nothing else from the node uses the saved value instead of running the node. For how, go and read [baking](infrastructure.md#outputs-saved-with-the-infrastructure-baking) |
 
 An output has no `required`. A firing that emits nothing on a port closes it,
@@ -135,7 +138,8 @@ handle](values-and-emission.md#which-failures-a-program-can-handle).
 | Key | Type | Default | What it does |
 |---|---|---|---|
 | `isTrigger` | Boolean | `false` | This node starts runs from outside instead of running inside one. Weft gives it `callsPerMinute`, `callsAtOnce`, `durable`, `recorded`, `keepRunsFor` and `holdSecs` inputs (and `outlivesCaller` too when it sets `liveConnection`), so do not declare those |
-| `liveConnection` | `"http"` or `"websocket"` | none | On a trigger whose run answers a caller holding the connection open: `"http"` for a request waiting on its response (a route), `"websocket"` for a socket. It also gets `callsPerMinutePerCaller` |
+| `liveConnection` | `"http"` or `"websocket"` | none | On a trigger whose run answers a caller holding the connection open: `"http"` for a request waiting on its response (a route), `"websocket"` for a socket. It also gets `callsPerMinutePerCaller`, `journalEphemeral` and `journalWindowMs` |
+| `journalSettings` | Boolean | `false` | Set it on a node that opens a bus and wants its users to choose how the run's record keeps it: the node gets the `journalEphemeral` and `journalWindowMs` inputs, and reads them with `ctx.journal_policy()?`. Weft refuses it together with `liveConnection` (which gives the same two inputs) and refuses a node that declares either input itself. For what they do, go and read [two modes](../language/streams-and-buses.md#two-modes) |
 | `answersCaller` | `"whole"`, `"stream"` or `"end"` | none | This node answers its run's live caller. `"whole"`: the response in one go (a Reply). `"stream"`: the response head, then the body piece by piece (a Stream). `"end"`: the end of the exchange (a Close). Set it on your own node too if it answers through the ctx, so a route's "never answers its caller" warning counts it |
 | `calledFromOutside` | Boolean | `false` | On a trigger somebody outside calls whose call ends there (a form somebody submits). It also gets `callsPerMinutePerCaller`. A `liveConnection` trigger is called from outside already, so it never sets this; a trigger that picks its events up itself (a schedule, a feed, a provider's push) has no caller and does not either |
 | `pure` | Boolean | `false` | Set it when the node's body does nothing outside its run that weft does not put on record first: no network, no connection, no `ctx.run`, no `ctx.await_signal`, no tag, no storage beyond the run's own files. It may answer its caller (a durable run's answer leaves only once its record is written), read stored files, store files for this run alone, hand its caller links to them, and use a bus to another node of the run. A durable run then starts it without waiting for the database, and may run it again after a crash (for when, go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-run)). A pure node that reaches outside through the ctx anyway fails at that call, naming this flag; weft cannot see a body that opens a socket or a file on its own, so if you mark one of those pure, a durable run may do what it does twice after a crash. `Text`, `JsonObject`, `Switch`, `Route` and `Reply` are pure; `HttpRequest` and `PostgresExecuteQuery` are not, because each one reaches outside the run on its own |
@@ -260,6 +264,7 @@ The conditions are a closed list:
 | `config_in_set` | `field`, `values` | Is its string one of these |
 | `config_matches` | `field`, `regex` | Does its string match. False if absent, not a string, or the regex is broken |
 | `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own |
+| `output_type_fits` | `port`, `within` | Does this output, as the program declared it (or as your metadata types it, if the program declared nothing), fit in the type `within`. Use it when the types that make sense on a narrowable output depend on a setting: a route whose `dataType` is `text` takes only a `String` body. False when the node has no such output |
 | `run_reaches` | `direction`, `with` | Does this node's run hold a node `with` a feature. `downstream`: every run this node starts holds one. `upstream`: this node is in the run of one |
 | `downstream_of` | `with` | Is a node `with` a feature wired upstream of this one, so it runs first. `{with}` in the message names those nodes |
 | `per_instance` | | Does this node exist once per instance: marked `@per_instance`, with an `@instance_filled` field, or reading one of those (a group that receives a per-instance value on any port counts for everything reading its ports). `{perInstanceReason}` in the message says why, path included: "it reads 'blender'", or "it sits inside group 'work', which receives 'blender'" |
@@ -321,13 +326,63 @@ its key.
 
 ## types
 
-A flat map from a name to a type. Nominal and project-wide: any node's ports
-can use a name any node declared. The same declaration in two files is fine and
-absorbs, so a package root can declare its shared types once.
+A flat map from a name to a type, usable by every node in the project:
 
 ```json
 "types": { "ChatMessage": "{ role: String, content: String }" }
 ```
+
+For how the names are shared and compared, go and read [custom
+types](custom-types.md).
+
+## typeParams
+
+If a port is typed with a type variable (`T`, or `T` and a number), it takes
+whatever type is wired to it. If you want to limit what that can be, give the
+variable a bound here:
+
+```json
+"typeParams": { "T": "File" }
+```
+
+`KeepFile` does this with `"T": "File"`. Its `file` input and its `file` output are
+both `T`, so a `Video` in gives a `Video` out. Wire a `String` into it and the
+build stops with `type-bound`. A bound never picks the type: the compiler works
+the variable out from what is connected, then checks the result against the
+bound. A bound may name another variable that one of your ports uses
+(`"T": "List[T2]"`). The file fails to
+load if a variable here is used by no port, or if two bounds name each other
+in a cycle.
+
+## placeholdersAreInputs
+
+If your node takes a text setting whose placeholders name inputs the program
+adds to it (a query's `$userId`, a template's `{{name}}`), say so here, and
+the compiler checks that the placeholders and those inputs match. The node
+needs `features.canAddInputPorts`, or the file fails to load.
+
+```json
+"placeholdersAreInputs": { "in": "template", "pattern": "\\{\\{\\s*(?<name>[A-Za-z_][A-Za-z0-9_]*)\\s*\\}\\}" }
+```
+
+`in` is the input holding the text, and it must hold a `String`. `pattern` is
+a regular expression finding one placeholder, whose group named `name` is the
+input it stands for. If a match leaves the `name` group unmatched, weft ignores
+it, which is how a pattern skips text that only looks like a placeholder: the
+pattern `'[^']*'|\$(?<name>[A-Za-z_]\w*)` skips `'$userId'` inside a string literal and finds the bare `$userId`.
+Back-references are allowed (`\k<tag>`), so a pattern can skip everything up
+to the delimiter that matches its opening one, like SQL's `$tag$ ... $tag$`.
+
+When the program writes the text itself, in the node's settings or through
+`@file` ([files and reuse](../language/files-and-reuse.md)),
+every placeholder in it must be an input the program added
+(`placeholder-not-an-input`), and every input it added must appear in it
+(`input-not-a-placeholder`). Text that arrives on a wire or through `@asset`
+is only known when the node runs, so your node checks it then: find the
+placeholders in the text yourself and pass their names to
+`ctx.inputs.for_holes` (it calls them holes), which matches them to the inputs
+and fails on either mismatch. For its arguments, go and read [reading
+inputs](ctx.md#reading-inputs).
 
 ## firesWith
 
@@ -430,10 +485,3 @@ If you are reading older node code, the loader names these rather than saying
 | `features.optionalCustomInputs` | Write `features.join` instead: a node whose added inputs are optional is a join, which goes on with whichever of several branches arrived |
 | `features.isOutputDefault` | Remove it. Every node runs when it is reached, and `weft run --target <node>` narrows a run |
 | `features.catchErrors` | Remove it. Every node has the `_error` output, and a failure goes there when a program wires it |
-
-## A folder with no mod.rs
-
-That is not an error. The node is discovered, reported as pending, and left out
-of the build. A program that never names it builds fine, and a program that does
-gets told which folder is waiting for its code. Writing the metadata first and
-the Rust second is a supported way to work.

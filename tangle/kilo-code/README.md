@@ -45,7 +45,7 @@ shapes half-arsed work takes. A green claim that runs red is redispatched
 with the dishonesty named.
 
 Connections close the loop for users without VS Code: the editor's Run,
-Activate, and Resync buttons gate on the runtime rules before sending (the
+Turn on, and Resync gate on the runtime rules before sending (the
 bar's banner lists every finding), and the same power exists in the
 terminal through `weft connect`, so Tangle can pick a stored connection
 itself and hand the user the exact command for entering a new key, with no
@@ -66,7 +66,7 @@ commands are the expert's hand on the same loop.
 | `.kilo/skills/weft-models/` | on demand, before wiring an LLM call | reasoning on or off, `maxTokens`, an empty reply, what a model costs, prompt caching |
 | `.kilo/skills/weft-safety/` | on demand, when a program talks to a model or acts on the world | the swiss cheese model, the free layers built by default (a defensive prompt, one more key on the call already being made, limits at the interface), the layers that add a call or a person offered once when the stakes are real, the gate and human-check wiring |
 | `.kilo/skills/weft-node-authoring/` | on demand, around dispatches | the dispatch protocol and review checklist for Tangle, and the authoring manual the specialist reads |
-| `.kilo/skills/weft-running/` | on demand, when running | the CLI map, the daemon, the build and run flow, the deactivate modes, the infra verbs, how long each command takes |
+| `.kilo/skills/weft-running/` | on demand, when running | the CLI map, the daemon, waiting on a run, the build and run flow, what a broken part stops, turning triggers on and off, the infra verbs, how long each command takes |
 | `.kilo/skills/weft-debugging/` | on demand, when a run failed or did the wrong thing | reading a run (runs, logs, events), every skip and cancel reason, the debugging playbook |
 | `.kilo/skills/weft-sdp/` | on demand, when growing a program stage by stage | seeded runs, specs that run one piece with values handed in, firing a trigger without activating, the version tree, freezing and checking examples, every refusal and the verb that answers it |
 | `.kilo/skills/weft-editor/` | on demand, about the VS Code interface | the graph view: toolbar, action bar, palette, gestures, groups and loops, inspector, labels verbatim |

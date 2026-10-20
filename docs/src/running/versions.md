@@ -55,8 +55,9 @@ twelve-node program and nodes one to eight cost real money.
 
 If you want to reuse a different run, name it: `weft run --seed=<run-id>` takes
 any finished run of the project, including one a trigger started or one that
-failed. A run that is still going is refused until it ends or you `weft stop`
-it.
+failed. Keep the `=`: `weft run --seed <word>` reads the word as the name of
+a saved example, not as a run. A run that is still going is refused until it
+ends or you `weft stop` it.
 
 If a node that runs again waited for somebody in that run, the answers they
 gave it are replayed, so it carries on instead of asking again. That only
@@ -85,9 +86,11 @@ is either.
 
 ### When a reused node's file changed
 
-A saved result that names a stored file says what the file held then. If the
-file has been edited since (a later node added to it, another run changed it)
-or is gone, the run is refused before anything starts:
+A saved result that names a stored file says what the file held then. If a
+node that runs again would read it, and the file has been edited since (a
+later node added to it, another run changed it) or is gone, the run is refused
+before anything starts. A run that reuses the node and runs nothing that reads
+the file goes ahead:
 
 ```text
 --seed would reuse what 'ask' produced on 'historyFile', but the file it names,

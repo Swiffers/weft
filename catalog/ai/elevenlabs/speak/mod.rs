@@ -40,6 +40,7 @@ use serde_json::{json, Value};
 
 use weft::access::socket::SocketMessage;
 use weft::bus::{BusEntryKind, BusOptions, BusPayloadKind, WirePayload};
+use weft::stream_journal::JournalPolicy;
 use weft::context::PendingBus;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
@@ -413,7 +414,7 @@ impl Node for ElevenLabsSpeakNode {
         let mut audio_bus = ctx.pending_bus(
             "audio",
             BusOptions {
-                ephemeral: true,
+                journal: JournalPolicy::ephemeral(),
                 payload: BusPayloadKind::Bytes,
                 meta: bus_meta(&session.output_format),
                 ..Default::default()
@@ -424,7 +425,7 @@ impl Node for ElevenLabsSpeakNode {
         // transient as the frames it describes.
         let mut alignment_bus = session
             .timing
-            .map(|_| ctx.pending_bus("alignment", BusOptions { ephemeral: true, ..Default::default() }, "speaker"));
+            .map(|_| ctx.pending_bus("alignment", BusOptions { journal: JournalPolicy::ephemeral(), ..Default::default() }, "speaker"));
 
         let mut full: Vec<u8> = Vec::new();
         // Whether any chunk carried a pronounceable character.

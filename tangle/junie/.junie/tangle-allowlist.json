@@ -139,19 +139,35 @@
           "action": "allow"
         },
         {
-          "pattern": "weft cancel-running",
-          "action": "allow"
-        },
-        {
-          "prefix": "weft cancel-running ",
-          "action": "allow"
-        },
-        {
           "pattern": "weft stop",
           "action": "allow"
         },
         {
           "prefix": "weft stop ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft wait",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft wait ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft node-state",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft node-state ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft instances",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft instances ",
           "action": "allow"
         },
         {
@@ -176,14 +192,6 @@
         },
         {
           "prefix": "weft infra upgrade ",
-          "action": "allow"
-        },
-        {
-          "pattern": "weft infra node-stop",
-          "action": "allow"
-        },
-        {
-          "prefix": "weft infra node-stop ",
           "action": "allow"
         },
         {
@@ -248,6 +256,14 @@
         },
         {
           "prefix": "weft infra status ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra look",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra look ",
           "action": "allow"
         },
         {
